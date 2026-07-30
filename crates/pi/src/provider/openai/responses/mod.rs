@@ -71,6 +71,10 @@ impl ResponsesStreamFn {
 
 #[async_trait::async_trait]
 impl StreamFn for ResponsesStreamFn {
+    fn api(&self) -> &str {
+        "openai_responses"
+    }
+
     async fn stream(
         &self,
         context: &AgentContext,

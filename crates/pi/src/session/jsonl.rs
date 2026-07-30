@@ -639,4 +639,69 @@ mod tests {
         assert_eq!(path[0].id(), "c1");
         assert!(path[0].parent_id().is_none());
     }
+
+    #[tokio::test]
+    async fn test_loads_custom_entry_with_string_and_object_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // Real TS Pi sessions carry `custom` entries whose `data` is either a
+        // plain string or a JSON object. Both must load and expose id/parentId.
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"custom","id":"x1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","customType":"note","data":"a plain string"}"#,
+            "\n",
+            r#"{"type":"custom","id":"x2","parentId":"x1","timestamp":"2026-05-28T07:13:46.617Z","customType":"flag","data":{"on":true,"n":3}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let meta = JsonlSessionMetadata {
+            id: "s1".into(),
+            cwd: "/proj".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+        let entries = storage.get_entries().await.unwrap();
+        assert_eq!(entries.len(), 2);
+
+        match &entries[0] {
+            SessionTreeEntry::Custom {
+                id,
+                parent_id,
+                custom_type,
+                data,
+                ..
+            } => {
+                assert_eq!(id, "x1");
+                assert!(parent_id.is_none());
+                assert_eq!(custom_type, "note");
+                assert_eq!(data, &serde_json::json!("a plain string"));
+            }
+            other => panic!("expected Custom (string data), got {other:?}"),
+        }
+        match &entries[1] {
+            SessionTreeEntry::Custom {
+                id,
+                parent_id,
+                custom_type,
+                data,
+                ..
+            } => {
+                assert_eq!(id, "x2");
+                assert_eq!(parent_id.as_deref(), Some("x1"));
+                assert_eq!(custom_type, "flag");
+                assert_eq!(data, &serde_json::json!({"on": true, "n": 3}));
+            }
+            other => panic!("expected Custom (object data), got {other:?}"),
+        }
+
+        // Custom entries link into the ancestry tree via parentId like any
+        // other entry.
+        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[1].id(), "x2");
+        assert_eq!(path[1].parent_id(), Some("x1"));
+        assert_eq!(path[0].id(), "x1");
+    }
 }

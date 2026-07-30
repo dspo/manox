@@ -59,6 +59,10 @@ impl AnthropicStreamFn {
 
 #[async_trait::async_trait]
 impl StreamFn for AnthropicStreamFn {
+    fn api(&self) -> &str {
+        "anthropic"
+    }
+
     async fn stream(
         &self,
         context: &AgentContext,

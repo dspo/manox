@@ -60,7 +60,7 @@ pub enum ExecutionMode {
 /// report it through here. Tools with nothing to report simply never call it.
 pub trait ToolProgress: Send + Sync {
     /// Report an incremental update for the running tool call.
-    fn emit(&self, details: JsonValue);
+    fn emit(&self, partial_result: JsonValue);
 }
 
 /// The result of a tool execution.
@@ -337,17 +337,23 @@ async fn execute_parallel(
 }
 
 /// Forwards a tool's mid-execution emits to the loop's sink as
-/// `ToolExecutionUpdate` events, tagged with the call's id.
+/// `ToolExecutionUpdate` events, tagged with the call's id and carrying the
+/// call's name and arguments so a consumer can attach progress without
+/// cross-referencing history.
 struct SinkProgress<'a> {
     tool_call_id: String,
+    tool_name: String,
+    arguments: JsonValue,
     sink: &'a (dyn EventSink + Send + Sync),
 }
 
 impl<'a> ToolProgress for SinkProgress<'a> {
-    fn emit(&self, details: JsonValue) {
+    fn emit(&self, partial_result: JsonValue) {
         self.sink.emit(AgentEvent::ToolExecutionUpdate {
             tool_call_id: self.tool_call_id.clone(),
-            details,
+            tool_name: self.tool_name.clone(),
+            arguments: self.arguments.clone(),
+            partial_result,
         });
     }
 }
@@ -367,6 +373,7 @@ async fn execute_one(
     sink.emit(AgentEvent::ToolExecutionStart {
         tool_call_id: id.clone(),
         tool_name: name.clone(),
+        arguments: args.clone(),
     });
 
     // Find the tool by name.
@@ -377,6 +384,9 @@ async fn execute_one(
             let result_message = make_tool_result_message(&id, &name, &result);
             sink.emit(AgentEvent::ToolExecutionEnd {
                 tool_call_id: id.clone(),
+                tool_name: name.clone(),
+                result: result.content.clone(),
+                is_error: result.is_error,
             });
             return ExecutedToolCall {
                 tool_call_id: id,
@@ -395,6 +405,9 @@ async fn execute_one(
         let result_message = make_tool_result_message(&id, &name, &result);
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.content.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -414,6 +427,9 @@ async fn execute_one(
         let result_message = make_tool_result_message(&id, &name, &result);
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.content.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -431,6 +447,9 @@ async fn execute_one(
         let result_message = make_tool_result_message(&id, &name, &result);
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.content.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -444,6 +463,8 @@ async fn execute_one(
 
     let progress = SinkProgress {
         tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        arguments: args.clone(),
         sink,
     };
     let mut result = match tool
@@ -462,6 +483,9 @@ async fn execute_one(
     let result_message = make_tool_result_message(&id, &name, &result);
     sink.emit(AgentEvent::ToolExecutionEnd {
         tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        result: result.content.clone(),
+        is_error: result.is_error,
     });
 
     ExecutedToolCall {
@@ -748,10 +772,10 @@ mod tests {
             .position(|e| matches!(e, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call_1"));
         let update = events
             .iter()
-            .position(|e| matches!(e, AgentEvent::ToolExecutionUpdate { tool_call_id, details } if tool_call_id == "call_1" && details["step"] == "halfway"));
+            .position(|e| matches!(e, AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } if tool_call_id == "call_1" && partial_result["step"] == "halfway"));
         let end = events
             .iter()
-            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_call_id } if tool_call_id == "call_1"));
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "call_1"));
         // Start, update, end all present and in lifecycle order.
         let (start, update, end) = (
             start.expect("start"),
@@ -761,5 +785,73 @@ mod tests {
         assert!(start < update, "update must follow start");
         assert!(update < end, "end must follow update");
         assert!(!executed[0].result.is_error);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_events_carry_full_payload() {
+        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let signal = CancellationToken::new();
+        let args = serde_json::json!({"path": "/x"});
+
+        let _ = execute_tool_calls(
+            &[("call_1", "progress", args.clone())],
+            &tools,
+            signal,
+            &ctx,
+            &AgentLoopConfig::default(),
+            &sink,
+            false,
+        )
+        .await;
+
+        let events = sink.0.lock().unwrap();
+        let start = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } if tool_call_id == "call_1" => Some((tool_name, arguments)),
+            _ => None,
+        });
+        let (name, arguments) = start.expect("start payload");
+        assert_eq!(name, "progress");
+        assert_eq!(arguments, &args, "start must carry the call arguments");
+
+        let update = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                arguments,
+                partial_result,
+            } if tool_call_id == "call_1" => Some((tool_name, arguments, partial_result)),
+            _ => None,
+        });
+        let (name, arguments, partial_result) = update.expect("update payload");
+        assert_eq!(name, "progress");
+        assert_eq!(arguments, &args, "update must carry the call arguments");
+        assert_eq!(partial_result["step"], "halfway");
+
+        let end = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } if tool_call_id == "call_1" => Some((tool_name, result, is_error)),
+            _ => None,
+        });
+        let (name, result, is_error) = end.expect("end payload");
+        assert_eq!(name, "progress");
+        assert!(!is_error, "successful call ends with is_error=false");
+        assert!(
+            result.iter().any(
+                |b| matches!(b, crate::types::ContentBlock::Text { text, .. } if text == "done")
+            ),
+            "end must carry the final result content"
+        );
     }
 }

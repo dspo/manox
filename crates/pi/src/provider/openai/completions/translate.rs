@@ -17,8 +17,7 @@ use crate::provider::openai::{
     clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens,
 };
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Build the API request body from the agent context and stream options.
@@ -189,7 +188,7 @@ fn user_content(blocks: &[ContentBlock]) -> Option<UserContent> {
                 text.push_str(t);
                 parts.push(UserPart::Text { text: t.clone() });
             }
-            ContentBlock::Image { source } => parts.push(image_part(source)),
+            ContentBlock::Image { data, mime_type } => parts.push(image_part(data, mime_type)),
             // Tool calls/results and thinking don't appear in user messages.
             _ => {}
         }
@@ -253,7 +252,7 @@ fn tool_result_parts(blocks: &[ContentBlock]) -> (String, Vec<UserPart>) {
     for block in blocks {
         match block {
             ContentBlock::Text { text, .. } => texts.push(text.as_str()),
-            ContentBlock::Image { source } => images.push(image_part(source)),
+            ContentBlock::Image { data, mime_type } => images.push(image_part(data, mime_type)),
             _ => {}
         }
     }
@@ -268,11 +267,8 @@ fn tool_result_parts(blocks: &[ContentBlock]) -> (String, Vec<UserPart>) {
     (text, images)
 }
 
-fn image_part(source: &ImageSource) -> UserPart {
-    let url = match source {
-        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-        ImageSource::Url { url } => url.clone(),
-    };
+fn image_part(data: &str, mime_type: &str) -> UserPart {
+    let url = format!("data:{mime_type};base64,{data}");
     UserPart::ImageUrl {
         image_url: ImageUrlParam { url },
     }
@@ -317,7 +313,7 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens,
         cache_read_input_tokens: hit,
         cache_creation_input_tokens: 0,
-        cache_creation: None,
+        cache_write_1h: None,
         total_tokens: input_tokens + output_tokens + hit,
         reasoning_tokens: wire
             .completion_tokens_details
@@ -565,10 +561,8 @@ mod tests {
     #[test]
     fn tool_result_images_follow_in_a_user_message() {
         let image = vec![ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "AAAA".into(),
-            },
+            data: "AAAA".into(),
+            mime_type: "image/png".into(),
         }];
         let v = request(&ctx(
             vec![user("q"), tool_result("t1", image, false)],
@@ -594,9 +588,8 @@ mod tests {
                     signature: None,
                 },
                 ContentBlock::Image {
-                    source: ImageSource::Url {
-                        url: "https://x/y.png".into(),
-                    },
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -604,7 +597,7 @@ mod tests {
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
         let content = &v["messages"][1]["content"];
         assert_eq!(content[0], json!({"type": "text", "text": "what is this"}));
-        assert_eq!(content[1]["image_url"]["url"], "https://x/y.png");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     // ── endpoint-conditional fields ─────────────────────────────────────────

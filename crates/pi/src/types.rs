@@ -13,10 +13,11 @@ use std::sync::Arc;
 
 /// A content block within a message sent to or received from an LLM.
 ///
-/// Serde tags mirror the Anthropic Messages API wire format so that blocks
-/// round-trip without a lossy translation layer.
+/// Serialized in the TS Pi v3 message shape: `toolCall` carries `arguments`,
+/// `thinking` carries `thinkingSignature`, and `image` is flat (`data` +
+/// `mimeType`). Rust field names stay snake_case; serde renames map them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text {
@@ -30,11 +31,17 @@ pub enum ContentBlock {
         signature: Option<String>,
     },
     #[serde(rename = "image")]
-    Image { source: ImageSource },
-    #[serde(rename = "tool_use")]
+    Image {
+        /// Base64-encoded image bytes.
+        data: String,
+        /// MIME type, e.g. `image/png`.
+        mime_type: String,
+    },
+    #[serde(rename = "toolCall")]
     ToolUse {
         id: String,
         name: String,
+        #[serde(rename = "arguments")]
         input: JsonValue,
     },
     /// A model reasoning trace. `signature` is opaque provider data that must
@@ -42,35 +49,33 @@ pub enum ContentBlock {
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "thinkingSignature"
+        )]
         signature: Option<String>,
     },
     /// An encrypted reasoning trace whose content the provider redacted.
-    #[serde(rename = "redacted_thinking")]
+    #[serde(rename = "redacted_thinking", rename_all = "camelCase")]
     RedactedThinking { data: String },
 }
 
-/// Source of an image in a content block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ImageSource {
-    #[serde(rename = "base64")]
-    Base64 { media_type: String, data: String },
-    #[serde(rename = "url")]
-    Url { url: String },
-}
-
 /// A message in the agent conversation.
+///
+/// Serialized in the TS Pi v3 message shape: roles `user` / `assistant` /
+/// `toolResult`, with camelCase fields (`toolCallId`, `toolName`, `isError`,
+/// `stopReason`, `responseId`, `responseModel`, `errorMessage`, `customType`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role")]
+#[serde(tag = "role", rename_all = "camelCase")]
 pub enum AgentMessage {
-    #[serde(rename = "user")]
+    #[serde(rename = "user", rename_all = "camelCase")]
     User {
         content: Vec<ContentBlock>,
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
-    #[serde(rename = "assistant")]
+    #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
         model: String,
@@ -105,7 +110,7 @@ pub enum AgentMessage {
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
-    #[serde(rename = "toolResult")]
+    #[serde(rename = "toolResult", rename_all = "camelCase")]
     ToolResult {
         tool_call_id: String,
         tool_name: String,
@@ -118,7 +123,7 @@ pub enum AgentMessage {
         timestamp: DateTime<Utc>,
     },
     /// Extension point for custom message types.
-    #[serde(rename = "custom")]
+    #[serde(rename = "custom", rename_all = "camelCase")]
     Custom {
         custom_type: String,
         content: Vec<ContentBlock>,
@@ -176,20 +181,27 @@ pub enum StopReason {
 
 /// Token usage for a single assistant message.
 ///
-/// Field names mirror the Anthropic Messages API usage object.
+/// Serialized in the TS Pi v3 usage shape: `input` / `output` / `cacheRead` /
+/// `cacheWrite` / `totalTokens`, with an optional `cacheWrite1h` split and a
+/// `cost` breakdown. Rust field names stay snake_case; serde renames map them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, rename = "input")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "output")]
     pub output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "cacheRead")]
     pub cache_read_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "cacheWrite")]
     pub cache_creation_input_tokens: u64,
-    /// Breakdown of cache creation by TTL, when the provider reports it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation: Option<CacheCreation>,
+    /// The 1h-TTL portion of cache creation, when the provider reports it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "cacheWrite1h"
+    )]
+    pub cache_write_1h: Option<u64>,
     /// Reasoning/thinking tokens, when the provider reports them. A subset
     /// of `output_tokens`; `None` when the provider exposes no breakdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,17 +216,9 @@ pub struct Usage {
     pub cost: Option<Cost>,
 }
 
-/// Cache creation split by TTL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CacheCreation {
-    #[serde(default)]
-    pub ephemeral_1h_input_tokens: u64,
-    #[serde(default)]
-    pub ephemeral_5m_input_tokens: u64,
-}
-
 /// Monetary cost broken down by token class.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Cost {
     #[serde(default)]
     pub input: f64,
@@ -287,18 +291,31 @@ pub enum AgentEvent {
     MessageUpdate { message: Box<AgentMessage> },
     /// A message has finished streaming.
     MessageEnd { message: Box<AgentMessage> },
-    /// A tool call has started executing.
+    /// A tool call has started executing. Carries the arguments the model
+    /// supplied so consumers can reconstruct the call without walking history.
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,
+        arguments: JsonValue,
     },
-    /// A currently-executing tool emitted an update.
+    /// A currently-executing tool emitted a partial result. Repeats the call
+    /// identity and arguments alongside the partial payload so a consumer can
+    /// attach progress to the right call without cross-referencing history.
     ToolExecutionUpdate {
         tool_call_id: String,
-        details: JsonValue,
+        tool_name: String,
+        arguments: JsonValue,
+        partial_result: JsonValue,
     },
-    /// A tool call has finished executing.
-    ToolExecutionEnd { tool_call_id: String },
+    /// A tool call has finished executing. Carries the final result content
+    /// and whether it errored, so consumers can reconstruct the call's outcome
+    /// from the event stream alone.
+    ToolExecutionEnd {
+        tool_call_id: String,
+        tool_name: String,
+        result: Vec<ContentBlock>,
+        is_error: bool,
+    },
     /// A turn has completed.
     TurnEnd {
         message: Box<AgentMessage>,
@@ -442,8 +459,9 @@ pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + 
 pub type BeforeToolCallFn = Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 /// Patches a tool result after execution.
 pub type AfterToolCallFn = Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
-/// Observes the context right before it is sent to the provider.
-pub type BeforeProviderRequestFn = Box<dyn Fn(&AgentContext) + Send + Sync>;
+/// Observes the context right before it is sent to the provider and may
+/// return a mutated copy; the returned context is what the provider sees.
+pub type BeforeProviderRequestFn = Box<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 
 /// Configuration for a single agent loop invocation.
 #[derive(Default)]
@@ -524,3 +542,101 @@ pub struct StreamOptions {
 // ── Re-export from tool module ──────────────────────────────────────────────
 
 use super::tool::AgentToolResult;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The TS Pi v3 on-disk shape: assistant with a `toolCall` block and a
+    /// `toolResult` message, plus a usage block carrying `cacheRead`/`cost`.
+    /// Round-trips through serde with camelCase field names.
+    #[test]
+    fn assistant_with_toolcall_and_toolresult_roundtrips_ts_pi_v3_shape() {
+        let assistant = json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "tc_1",
+                "name": "read",
+                "arguments": {"path": "/etc/hosts"}
+            }],
+            "model": "claude-opus-4-7",
+            "provider": "anthropic",
+            "api": "anthropic",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": 120,
+                "output": 40,
+                "cacheRead": 800,
+                "cacheWrite": 0,
+                "totalTokens": 960,
+                "cost": {"input": 0.001, "output": 0.002, "cacheRead": 0.0005, "cacheWrite": 0.0, "total": 0.0035}
+            },
+            "timestamp": 1779952472751i64
+        });
+        let msg: AgentMessage = serde_json::from_value(assistant).unwrap();
+        match &msg {
+            AgentMessage::Assistant {
+                content,
+                stop_reason,
+                usage,
+                ..
+            } => {
+                assert_eq!(*stop_reason, Some(StopReason::ToolUse));
+                match &content[0] {
+                    ContentBlock::ToolUse { id, name, input } => {
+                        assert_eq!(id, "tc_1");
+                        assert_eq!(name, "read");
+                        assert_eq!(input, &json!({"path": "/etc/hosts"}));
+                    }
+                    other => panic!("expected ToolUse block, got {other:?}"),
+                }
+                assert_eq!(usage.input_tokens, 120);
+                assert_eq!(usage.output_tokens, 40);
+                assert_eq!(usage.cache_read_input_tokens, 800);
+                assert_eq!(usage.total_tokens, 960);
+                let cost = usage.cost.as_ref().expect("cost present");
+                assert_eq!(cost.total, 0.0035);
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+
+        // Re-serialize and the camelCase names survive the round trip.
+        let reround = serde_json::to_value(&msg).unwrap();
+        assert_eq!(reround["role"], "assistant");
+        assert_eq!(reround["content"][0]["type"], "toolCall");
+        assert_eq!(reround["content"][0]["arguments"]["path"], "/etc/hosts");
+        assert_eq!(reround["stopReason"], "toolUse");
+        assert_eq!(reround["usage"]["cacheRead"], 800);
+        assert_eq!(reround["usage"]["totalTokens"], 960);
+        assert_eq!(reround["usage"]["cost"]["cacheRead"], 0.0005);
+
+        let tool_result = json!({
+            "role": "toolResult",
+            "toolCallId": "tc_1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "127.0.0.1 localhost"}],
+            "isError": false
+        });
+        let tr: AgentMessage = serde_json::from_value(tool_result).unwrap();
+        match &tr {
+            AgentMessage::ToolResult {
+                tool_call_id,
+                tool_name,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc_1");
+                assert_eq!(tool_name, "read");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let tr_reround = serde_json::to_value(&tr).unwrap();
+        assert_eq!(tr_reround["role"], "toolResult");
+        assert_eq!(tr_reround["toolCallId"], "tc_1");
+        assert_eq!(tr_reround["toolName"], "read");
+        assert_eq!(tr_reround["isError"], false);
+    }
+}

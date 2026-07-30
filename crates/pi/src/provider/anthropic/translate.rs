@@ -9,8 +9,7 @@
 
 use super::wire::*;
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Map a thinking level to an adaptive-thinking effort.
@@ -231,8 +230,8 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
             text: text.clone(),
             cache_control: None,
         },
-        ContentBlock::Image { source } => ContentBlockParam::Image {
-            source: image_source(source),
+        ContentBlock::Image { data, mime_type } => ContentBlockParam::Image {
+            source: image_source(data, mime_type),
             cache_control: None,
         },
         // tool_use / thinking don't appear in user messages; degrade to text.
@@ -276,20 +275,19 @@ fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
         ContentBlock::RedactedThinking { data } => {
             Some(ContentBlockParam::RedactedThinking { data: data.clone() })
         }
-        ContentBlock::Image { source } => Some(ContentBlockParam::Image {
-            source: image_source(source),
+        ContentBlock::Image { data, mime_type } => Some(ContentBlockParam::Image {
+            source: image_source(data, mime_type),
             cache_control: None,
         }),
     }
 }
 
-fn image_source(source: &ImageSource) -> ImageSourceParam {
-    match source {
-        ImageSource::Base64 { media_type, data } => ImageSourceParam::Base64 {
-            media_type: media_type.clone(),
-            data: data.clone(),
-        },
-        ImageSource::Url { url } => ImageSourceParam::Url { url: url.clone() },
+/// Map a stored image block to the Anthropic wire source. TS Pi stores images
+/// flat (`data` + `mimeType`); the Anthropic API nests them under `source`.
+fn image_source(data: &str, mime_type: &str) -> ImageSourceParam {
+    ImageSourceParam::Base64 {
+        media_type: mime_type.to_string(),
+        data: data.to_string(),
     }
 }
 
@@ -322,13 +320,10 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
-        cache_creation: wire
+        cache_write_1h: wire
             .cache_creation
             .as_ref()
-            .map(|c| crate::types::CacheCreation {
-                ephemeral_1h_input_tokens: c.ephemeral_1h_input_tokens,
-                ephemeral_5m_input_tokens: c.ephemeral_5m_input_tokens,
-            }),
+            .map(|c| c.ephemeral_1h_input_tokens),
         total_tokens: input_tokens
             + output_tokens
             + cache_read_input_tokens

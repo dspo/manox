@@ -8,7 +8,7 @@ pub mod branch_summarization;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{AgentMessage, ContentBlock, Usage};
+use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
 /// Compaction settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,10 +65,14 @@ pub fn calculate_context_tokens(usage: &Usage) -> u64 {
 pub fn last_assistant_usage(messages: &[AgentMessage]) -> Option<&Usage> {
     messages.iter().rev().find_map(|m| match m {
         AgentMessage::Assistant {
-            stop_reason: Some(_),
+            stop_reason: Some(r),
             usage,
             ..
-        } if calculate_context_tokens(usage) > 0 => Some(&**usage),
+        } if !matches!(r, StopReason::Error | StopReason::Aborted)
+            && calculate_context_tokens(usage) > 0 =>
+        {
+            Some(&**usage)
+        }
         _ => None,
     })
 }
@@ -98,10 +102,14 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimat
         .rev()
         .find_map(|(i, m)| match m {
             AgentMessage::Assistant {
-                stop_reason: Some(_),
+                stop_reason: Some(r),
                 usage,
                 ..
-            } if calculate_context_tokens(usage) > 0 => Some((i, &**usage)),
+            } if !matches!(r, StopReason::Error | StopReason::Aborted)
+                && calculate_context_tokens(usage) > 0 =>
+            {
+                Some((i, &**usage))
+            }
             _ => None,
         });
 
@@ -416,6 +424,33 @@ mod tests {
     }
 
     #[test]
+    fn last_assistant_usage_skips_error_and_aborted_anchors() {
+        let usable = Usage {
+            total_tokens: 100,
+            ..Default::default()
+        };
+
+        // Error and Aborted terminations carry no trustworthy usage, so a
+        // clean Stop block further back must anchor instead.
+        let mut errored = assistant_with_usage(usable.clone());
+        if let AgentMessage::Assistant { stop_reason, .. } = &mut errored {
+            *stop_reason = Some(StopReason::Error);
+        }
+        let messages = vec![assistant_with_usage(usable.clone()), errored];
+        assert_eq!(
+            last_assistant_usage(&messages).map(|u| u.total_tokens),
+            Some(100)
+        );
+
+        // When every terminal assistant is Error/Aborted, there is no anchor.
+        let mut aborted = assistant_with_usage(usable);
+        if let AgentMessage::Assistant { stop_reason, .. } = &mut aborted {
+            *stop_reason = Some(StopReason::Aborted);
+        }
+        assert!(last_assistant_usage(&[aborted]).is_none());
+    }
+
+    #[test]
     fn estimate_context_tokens_anchors_on_last_usage() {
         let usage = Usage {
             total_tokens: 1000,
@@ -450,9 +485,8 @@ mod tests {
         // An image is a flat 4800 chars → 1200 tokens.
         let image = AgentMessage::User {
             content: vec![ContentBlock::Image {
-                source: crate::types::ImageSource::Url {
-                    url: "https://x/y.png".into(),
-                },
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
             }],
             timestamp: chrono::Utc::now(),
         };

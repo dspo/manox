@@ -44,6 +44,14 @@ pub trait StreamFn: Send + Sync {
         signal: CancellationToken,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error>;
+
+    /// The wire-API shape this stream speaks (`"anthropic"` /
+    /// `"openai_completions"` / `"openai_responses"`). Stamped onto a
+    /// locally built terminal message so a failed/aborted turn still carries
+    /// the model identity that was attempted.
+    fn api(&self) -> &str {
+        ""
+    }
 }
 
 /// Run the agent loop with new prompt messages.
@@ -346,17 +354,21 @@ async fn stream_assistant_response(
     config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<AgentMessage, anyhow::Error> {
-    // Fire the provider-request observer before the stream starts, so a
-    // registered hook sees the exact context about to be sent.
-    if let Some(before) = &config.before_provider_request {
-        before(context);
-    }
+    // Fire the provider-request hook before the stream starts. A handler may
+    // return a mutated context; that mutated context is what the provider sees.
+    let ctx = match &config.before_provider_request {
+        Some(before) => before(context),
+        None => context.clone(),
+    };
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
     // Clone what the spawned task needs.
-    let ctx = context.clone();
     let sig = signal.clone();
+
+    // The wire-API shape, captured before the Arc moves into the spawn so a
+    // locally built terminal message still stamps the attempted model identity.
+    let api = stream_fn.api().to_string();
 
     // Spawn the stream function so it can send events concurrently.
     let stream_handle = tokio::spawn(async move { stream_fn.stream(&ctx, sig, event_tx).await });
@@ -383,8 +395,13 @@ async fn stream_assistant_response(
     // failure from the event stream and the run can close out cleanly.
     let message = match stream_handle.await {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => terminal_message(signal, e.to_string()),
-        Err(join_err) => terminal_message(signal, format!("stream task failed: {join_err}")),
+        Ok(Err(e)) => terminal_message(context, signal, &api, e.to_string()),
+        Err(join_err) => terminal_message(
+            context,
+            signal,
+            &api,
+            format!("stream task failed: {join_err}"),
+        ),
     };
 
     // Emit message_start/message_end if not already emitted by the stream.
@@ -404,8 +421,15 @@ async fn stream_assistant_response(
 ///
 /// `Aborted` when the run was cancelled, `Error` otherwise — matching the TS
 /// Pi terminal stop reasons. The message carries no content and an
-/// `error_message` so downstream consumers can surface why the run ended.
-fn terminal_message(signal: &CancellationToken, error_message: String) -> AgentMessage {
+/// `error_message`, but keeps the model identity (`model`/`provider`/`api`)
+/// of the turn that was attempted, so a failed turn is still attributable to
+/// the model that was running it.
+fn terminal_message(
+    context: &AgentContext,
+    signal: &CancellationToken,
+    api: &str,
+    error_message: String,
+) -> AgentMessage {
     let stop_reason = if signal.is_cancelled() {
         StopReason::Aborted
     } else {
@@ -413,9 +437,9 @@ fn terminal_message(signal: &CancellationToken, error_message: String) -> AgentM
     };
     AgentMessage::Assistant {
         content: Vec::new(),
-        model: String::new(),
-        provider: String::new(),
-        api: String::new(),
+        model: context.model.id.clone(),
+        provider: context.model.provider.clone(),
+        api: api.to_string(),
         response_model: None,
         response_id: None,
         diagnostics: None,
@@ -437,10 +461,11 @@ fn fail_tool_calls_from_truncated(
     let mut executed = Vec::with_capacity(tool_calls.len());
     let mut messages = Vec::with_capacity(tool_calls.len());
 
-    for (id, name, _args) in tool_calls {
+    for (id, name, args) in tool_calls {
         sink.emit(AgentEvent::ToolExecutionStart {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
+            arguments: args.clone(),
         });
 
         let result = AgentToolResult::error(format!(
@@ -459,6 +484,9 @@ fn fail_tool_calls_from_truncated(
 
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            result: result.content.clone(),
+            is_error: result.is_error,
         });
 
         executed.push(crate::tool::ExecutedToolCall {
@@ -1363,6 +1391,10 @@ mod tests {
     struct ErrStreamFn;
     #[async_trait::async_trait]
     impl StreamFn for ErrStreamFn {
+        fn api(&self) -> &str {
+            "test_api"
+        }
+
         async fn stream(
             &self,
             _context: &AgentContext,
@@ -1411,15 +1443,28 @@ mod tests {
             AgentMessage::Assistant {
                 stop_reason,
                 error_message,
+                model,
+                provider,
+                api,
                 ..
-            } if *stop_reason == Some(StopReason::Error) => error_message.clone(),
+            } if *stop_reason == Some(StopReason::Error) => Some((
+                error_message.clone(),
+                model.clone(),
+                provider.clone(),
+                api.clone(),
+            )),
             _ => None,
         });
+        let (error_message, model, provider, api) = terminal.expect("terminal Error message");
         assert_eq!(
-            terminal.as_deref(),
+            error_message.as_deref(),
             Some("provider boom"),
             "error must materialize as a terminal Error assistant message"
         );
+        // The failed turn keeps the model identity that was attempted.
+        assert_eq!(model, "mock");
+        assert_eq!(provider, "mock");
+        assert_eq!(api, "test_api");
 
         let events = sink.events.lock().unwrap();
         assert!(

@@ -59,6 +59,10 @@ pub enum HookPoint {
 pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 
 /// Context passed to hook handlers.
+///
+/// Handlers return a (possibly mutated) copy; the harness threads selected
+/// fields back into the loop. `agent_context` feeds the provider request,
+/// `block_reason` gates a tool call, and `tool_result` patches a tool result.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// The hook point being triggered.
@@ -67,6 +71,11 @@ pub struct HookContext {
     pub agent_context: Option<AgentContext>,
     /// Arbitrary data attached to the hook event.
     pub data: serde_json::Value,
+    /// `Some(reason)` at the `ToolCall` point blocks the call before it runs.
+    pub block_reason: Option<String>,
+    /// A replacement `AgentToolResult` at the `ToolResult` point; when set it
+    /// supplants the result the tool produced.
+    pub tool_result: Option<AgentToolResult>,
 }
 
 impl HookContext {
@@ -75,6 +84,8 @@ impl HookContext {
             hook,
             agent_context: None,
             data: serde_json::Value::Null,
+            block_reason: None,
+            tool_result: None,
         }
     }
 
@@ -85,6 +96,16 @@ impl HookContext {
 
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = data;
+        self
+    }
+
+    pub fn with_tool_result(mut self, result: AgentToolResult) -> Self {
+        self.tool_result = Some(result);
+        self
+    }
+
+    pub fn with_block_reason(mut self, reason: impl Into<String>) -> Self {
+        self.block_reason = Some(reason.into());
         self
     }
 }
@@ -587,6 +608,10 @@ fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHoo
                 hc = handler(hc);
             }
         }
+        drop(list);
+        // A handler that replaced the context wins; otherwise the original
+        // context flows through unchanged.
+        hc.agent_context.unwrap_or_else(|| ctx.clone())
     });
 
     let tool = Arc::clone(&hooks);
@@ -603,22 +628,25 @@ fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHoo
                     hc = handler(hc);
                 }
             }
-            // Hooks observe tool calls; blocking is a separate concern.
-            None
+            drop(list);
+            hc.block_reason
         });
 
     let result = Arc::clone(&hooks);
     let after_tool_call: AfterToolCallHook = Arc::new(move |r: &AgentToolResult| {
-        let mut hc = HookContext::new(HookPoint::ToolResult).with_data(serde_json::json!({
-            "is_error": r.is_error,
-        }));
+        let mut hc = HookContext::new(HookPoint::ToolResult)
+            .with_data(serde_json::json!({
+                "is_error": r.is_error,
+            }))
+            .with_tool_result(r.clone());
         let list = result.lock().unwrap();
         for (point, handler) in list.iter() {
             if *point == HookPoint::ToolResult {
                 hc = handler(hc);
             }
         }
-        r.clone()
+        drop(list);
+        hc.tool_result.unwrap_or_else(|| r.clone())
     });
 
     LoopHooks {
@@ -1381,6 +1409,136 @@ mod tests {
             tool_result.load(Ordering::SeqCst),
             1,
             "ToolResult hook must fire once for the echo result"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_provider_request_mutation_reaches_the_provider() {
+        // A stream fn that records the context it actually received.
+        let received: Arc<std::sync::Mutex<Vec<AgentMessage>>> = Arc::default();
+        let captured = Arc::clone(&received);
+        struct CaptureStreamFn {
+            captured: Arc<std::sync::Mutex<Vec<AgentMessage>>>,
+        }
+        #[async_trait::async_trait]
+        impl StreamFn for CaptureStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                *self.captured.lock().unwrap() = context.messages.clone();
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "ok".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CaptureStreamFn { captured }),
+        );
+
+        // The hook appends a sentinel user message to the context the
+        // provider is about to see.
+        harness.on(
+            HookPoint::BeforeProviderRequest,
+            Arc::new(|mut ctx: HookContext| {
+                let mut ac = ctx.agent_context.take().expect("context present");
+                ac.messages.push(AgentMessage::user("SENTINEL_FROM_HOOK"));
+                ctx.agent_context = Some(ac);
+                ctx
+            }),
+        );
+
+        let _ = harness.prompt("hello").await.unwrap();
+        let received = received.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .any(|m| matches!(m, AgentMessage::User { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "SENTINEL_FROM_HOOK")))),
+            "a mutated context from BeforeProviderRequest must reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_hook_can_block_execution() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+        ]));
+
+        // Block every tool call with a reason.
+        harness.on(
+            HookPoint::ToolCall,
+            Arc::new(|ctx: HookContext| ctx.with_block_reason("denied by test hook")),
+        );
+
+        let messages = harness.prompt("run the echo tool").await.unwrap();
+        // The blocked call surfaces as an error tool result carrying the reason.
+        let blocked = messages.iter().any(|m| matches!(m, AgentMessage::ToolResult { is_error, content, .. } if *is_error && content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text.contains("denied by test hook")))));
+        assert!(
+            blocked,
+            "a ToolCall hook returning a block reason must abort the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_hook_can_patch_the_result() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+        ]));
+
+        // Replace whatever the tool produced with a fixed patched payload.
+        harness.on(
+            HookPoint::ToolResult,
+            Arc::new(|ctx: HookContext| {
+                ctx.with_tool_result(crate::tool::AgentToolResult::text("PATCHED_BY_HOOK"))
+            }),
+        );
+
+        let messages = harness.prompt("run the echo tool").await.unwrap();
+        let patched = messages.iter().any(|m| matches!(m, AgentMessage::ToolResult { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "PATCHED_BY_HOOK"))));
+        assert!(
+            patched,
+            "a ToolResult hook returning a replacement must patch the result"
         );
     }
 }

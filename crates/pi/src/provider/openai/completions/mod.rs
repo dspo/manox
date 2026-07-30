@@ -60,6 +60,10 @@ impl CompletionsStreamFn {
 
 #[async_trait::async_trait]
 impl StreamFn for CompletionsStreamFn {
+    fn api(&self) -> &str {
+        "openai_completions"
+    }
+
     async fn stream(
         &self,
         context: &AgentContext,

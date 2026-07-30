@@ -26,8 +26,7 @@ use serde_json::Value as JsonValue;
 use super::wire::*;
 use crate::provider::openai::clamp_cache_key;
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Build the API request body from the agent context and stream options.
@@ -310,13 +309,8 @@ fn push_text_item(
 fn user_part(block: &ContentBlock) -> Option<InputPart> {
     match block {
         ContentBlock::Text { text, .. } => Some(InputPart::Text { text: text.clone() }),
-        ContentBlock::Image { source } => {
-            let url = match source {
-                ImageSource::Base64 { media_type, data } => {
-                    format!("data:{media_type};base64,{data}")
-                }
-                ImageSource::Url { url } => url.clone(),
-            };
+        ContentBlock::Image { data, mime_type } => {
+            let url = format!("data:{mime_type};base64,{data}");
             Some(InputPart::Image {
                 image_url: url,
                 detail: "auto",
@@ -335,13 +329,8 @@ fn tool_result_output(blocks: &[ContentBlock]) -> FunctionOutput {
     for block in blocks {
         match block {
             ContentBlock::Text { text, .. } => texts.push(text.as_str()),
-            ContentBlock::Image { source } => {
-                let url = match source {
-                    ImageSource::Base64 { media_type, data } => {
-                        format!("data:{media_type};base64,{data}")
-                    }
-                    ImageSource::Url { url } => url.clone(),
-                };
+            ContentBlock::Image { data, mime_type } => {
+                let url = format!("data:{mime_type};base64,{data}");
                 images.push(InputPart::Image {
                     image_url: url,
                     detail: "auto",
@@ -502,7 +491,7 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens: wire.output_tokens.unwrap_or(0),
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: written,
-        cache_creation: None,
+        cache_write_1h: None,
         total_tokens: wire.total_tokens.unwrap_or(0),
         reasoning_tokens: wire
             .output_tokens_details
@@ -708,10 +697,8 @@ mod tests {
             content: vec![
                 text("what is this"),
                 ContentBlock::Image {
-                    source: ImageSource::Base64 {
-                        media_type: "image/png".into(),
-                        data: "AAAA".into(),
-                    },
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -973,10 +960,8 @@ mod tests {
 
         // Images switch the output to parts.
         let image = ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "AAAA".into(),
-            },
+            data: "AAAA".into(),
+            mime_type: "image/png".into(),
         };
         let v = request(&ctx(
             vec![user("q"), tool_result("c1", vec![image], false)],

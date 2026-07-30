@@ -96,7 +96,7 @@ impl EventSink for SubscriberSink {
 /// Held as `Arc<dyn Fn>` so `create_loop_config` can produce a fresh `Box`
 /// closure per run without owning the (un-`Clone`) originals. The harness
 /// fills these from its registered `HookPoint`s.
-pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) + Send + Sync>;
+pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
 

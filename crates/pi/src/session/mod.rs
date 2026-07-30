@@ -11,6 +11,7 @@ use crate::compaction::branch_summarization::BranchSummary;
 use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 /// A single entry in the session tree.
 ///
@@ -78,6 +79,16 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         summary: BranchSummary,
     },
+    /// Extension entry whose payload the harness does not interpret. `data` is
+    /// either a plain string or a JSON object, matching the TS Pi v3 schema.
+    #[serde(rename = "custom", rename_all = "camelCase")]
+    Custom {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        custom_type: String,
+        data: JsonValue,
+    },
     /// An extension message whose payload the harness does not interpret.
     #[serde(rename = "custom_message", rename_all = "camelCase")]
     CustomMessage {
@@ -119,6 +130,7 @@ impl SessionTreeEntry {
             | SessionTreeEntry::ActiveToolsChange { id, .. }
             | SessionTreeEntry::BranchSummary { id, .. }
             | SessionTreeEntry::CustomMessage { id, .. }
+            | SessionTreeEntry::Custom { id, .. }
             | SessionTreeEntry::Label { id, .. }
             | SessionTreeEntry::SessionInfo { id, .. } => id,
         }
@@ -133,6 +145,7 @@ impl SessionTreeEntry {
             | SessionTreeEntry::ActiveToolsChange { parent_id, .. }
             | SessionTreeEntry::BranchSummary { parent_id, .. }
             | SessionTreeEntry::CustomMessage { parent_id, .. }
+            | SessionTreeEntry::Custom { parent_id, .. }
             | SessionTreeEntry::Label { parent_id, .. }
             | SessionTreeEntry::SessionInfo { parent_id, .. } => parent_id.as_deref(),
         }
@@ -147,6 +160,7 @@ impl SessionTreeEntry {
             | SessionTreeEntry::ActiveToolsChange { timestamp, .. }
             | SessionTreeEntry::BranchSummary { timestamp, .. }
             | SessionTreeEntry::CustomMessage { timestamp, .. }
+            | SessionTreeEntry::Custom { timestamp, .. }
             | SessionTreeEntry::Label { timestamp, .. }
             | SessionTreeEntry::SessionInfo { timestamp, .. } => *timestamp,
         }
