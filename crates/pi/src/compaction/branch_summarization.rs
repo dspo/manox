@@ -197,13 +197,21 @@ pub async fn summarize_branch(
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
-    let response = stream_fn
-        .stream(&context, CancellationToken::new(), tx)
-        .await?;
-
-    // Drain the stream so senders never block; the assistant message itself
-    // is what carries the summary text.
-    while let Ok(_event) = rx.try_recv() {}
+    // Spawn the producer and drain concurrently: the channel caps at 64, so a
+    // longer stream would deadlock if the receiver only ran after it returned.
+    let stream_fn_for_task = Arc::clone(&stream_fn);
+    let handle = tokio::spawn(async move {
+        stream_fn_for_task
+            .stream(&context, CancellationToken::new(), tx)
+            .await
+    });
+    // The summary text rides on the final assistant message; events are discarded.
+    while rx.recv().await.is_some() {}
+    let response = match handle.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(join_err) => return Err(anyhow::Error::new(join_err)),
+    };
 
     let summary = assistant_text(&response).unwrap_or_default();
     Ok(BranchSummary {

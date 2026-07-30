@@ -453,19 +453,26 @@ impl<S: SessionStorage> AgentHarness<S> {
         };
         let signal = CancellationToken::new();
         let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
-        let summary_response = match self
-            .stream_fn
-            .stream(&summary_context, signal, event_tx)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
+        // Run the summarization stream concurrently with draining its events:
+        // the producer would block on the 64-cap channel once it fills, so the
+        // receiver must drain while it runs, not after.
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let stream_handle =
+            tokio::spawn(async move { stream_fn.stream(&summary_context, signal, event_tx).await });
+        // The harness does not surface summarization events; just keep the
+        // channel empty so the producer never blocks.
+        while event_rx.recv().await.is_some() {}
+        let summary_response = match stream_handle.await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
                 self.phase = AgentHarnessPhase::Idle;
                 return Err(e);
             }
+            Err(join_err) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(anyhow::Error::new(join_err));
+            }
         };
-        // Drain summarization events — the harness does not surface them.
-        while event_rx.recv().await.is_some() {}
 
         let (summary_text, usage) = extract_summary(&summary_response);
         let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
@@ -613,6 +620,45 @@ mod tests {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
                     text: "Test response".into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// A stream that emits more events than the channel capacity before
+    /// returning, exposing a deadlock if the harness drains only after the
+    /// producer returns.
+    struct ChattyStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for ChattyStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            for i in 0..200u32 {
+                let _ = event_tx
+                    .send(AgentEvent::MessageUpdate {
+                        message: Box::new(AgentMessage::user(format!("chunk {i}"))),
+                    })
+                    .await;
+            }
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "summary".into(),
                     signature: None,
                 }],
                 model: "test".into(),
@@ -814,6 +860,43 @@ mod tests {
             result.tokens_after
         );
         assert!(!harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_compact_drains_more_events_than_channel_capacity() {
+        // The summarization channel caps at 64 events; ChattyStreamFn emits
+        // 200. A harness that drains only after the producer returns would
+        // deadlock here (the test would hang and time out).
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ChattyStreamFn),
+        );
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+
+        let result = harness.compact().await.expect("compact must not deadlock");
+        assert_eq!(result.summary, "summary");
     }
 
     #[tokio::test]
