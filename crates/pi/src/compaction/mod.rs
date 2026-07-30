@@ -7,6 +7,7 @@
 pub mod branch_summarization;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
@@ -42,6 +43,12 @@ pub struct CompactionResult {
     pub tokens_before: u64,
     /// Token count after compaction.
     pub tokens_after: u64,
+    /// Token usage reported by the summarization call, or by a hook override.
+    pub usage: Option<Usage>,
+    /// Structured payload attached to the boundary (e.g. by a hook override).
+    pub details: Option<JsonValue>,
+    /// The messages kept intact across the compaction, stored verbatim.
+    pub retained_tail: Vec<AgentMessage>,
 }
 
 /// Total context tokens for one usage block: the provider-reported total
