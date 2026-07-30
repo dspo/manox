@@ -90,8 +90,8 @@ pub struct AgentHarness<S: SessionStorage> {
     compaction_settings: CompactionSettings,
     /// Timestamp of the latest compaction. Usage recorded at or before it
     /// measured a different message prefix, so it never anchors token
-    /// estimates for the rewritten transcript. In-memory only: a session
-    /// restored from storage starts without a boundary.
+    /// estimates for the rewritten transcript. Recovered from the persisted
+    /// session by [`AgentHarness::recover_boundary`].
     last_compaction_at: Option<chrono::DateTime<chrono::Utc>>,
     hooks: Vec<(HookPoint, HookHandler)>,
 }
@@ -260,9 +260,18 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.phase = AgentHarnessPhase::Idle;
     }
 
+    /// Load the compaction boundary from the persisted session.
+    ///
+    /// A harness constructed over an existing session must call this before
+    /// relying on [`AgentHarness::needs_compaction`]; a fresh session holds
+    /// no compaction entries and the boundary stays unset.
+    pub async fn recover_boundary(&mut self) -> Result<(), anyhow::Error> {
+        self.last_compaction_at = self.session.latest_compaction_timestamp().await?;
+        Ok(())
+    }
+
     /// Check whether compaction is needed based on current context size.
-    pub fn needs_compaction(&self) -> bool {
-        let tokens = self.estimate_current_tokens();
+    pub fn needs_compaction(&self) -> bool {        let tokens = self.estimate_current_tokens();
         compaction::should_compact(
             tokens,
             self.model.context_window as u64,
@@ -344,6 +353,16 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.agent.replace_transcript(new_messages);
         self.last_compaction_at = Some(chrono::Utc::now());
         let tokens_after = self.estimate_current_tokens();
+
+        // Persist the boundary so a rebuilt session stops at this point.
+        if let Err(e) = self
+            .session
+            .append_compaction(summary, None, tokens_before)
+            .await
+        {
+            self.phase = AgentHarnessPhase::Idle;
+            return Err(e);
+        }
 
         let result = CompactionResult {
             summary: summary.to_string(),
@@ -586,6 +605,89 @@ mod tests {
             result.tokens_after
         );
         assert!(!harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_compaction_boundary_survives_session_restore() {
+        use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = || JsonlSessionMetadata {
+            id: "s".into(),
+            cwd: "/test".into(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let stale_assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            },
+            timestamp: chrono::Utc::now(),
+        };
+
+        // Compact in a first harness over an on-disk session.
+        {
+            let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+            let session = Session::new(storage);
+            let mut harness = AgentHarness::new(
+                session,
+                "You are a test assistant.",
+                test_model(),
+                Arc::new(TestStreamFn),
+            );
+            harness
+                .agent_mut()
+                .replace_transcript(vec![AgentMessage::user("q"), stale_assistant.clone()]);
+            let result = harness.compact("summary").await.unwrap();
+            assert_eq!(result.tokens_before, 90_000);
+        }
+
+        // Reopen the session from disk: the compaction entry survived.
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let entries = storage.get_entries().await.unwrap();
+        let boundary = entries.iter().find_map(|e| match e {
+            SessionTreeEntry::Compaction {
+                summary,
+                tokens_before,
+                ..
+            } => Some((summary.clone(), *tokens_before)),
+            _ => None,
+        });
+        assert_eq!(boundary, Some(("summary".to_string(), 90_000)));
+
+        // A fresh harness over the restored session recovers the boundary, so
+        // a transcript whose usage predates the compaction cannot anchor.
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.recover_boundary().await.unwrap();
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), stale_assistant.clone()]);
+        assert!(!harness.needs_compaction());
+
+        // Without recovery the stale usage anchors and the threshold trips.
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), stale_assistant]);
+        assert!(harness.needs_compaction());
     }
 
     #[tokio::test]

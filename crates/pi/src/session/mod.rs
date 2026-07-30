@@ -160,6 +160,46 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
+    /// Append a compaction entry and return the entry ID.
+    ///
+    /// The leaf cursor moves to the entry, so later messages parent onto it
+    /// and a context rebuild stops at this boundary.
+    pub async fn append_compaction(
+        &self,
+        summary: &str,
+        first_kept_entry_id: Option<String>,
+        tokens_before: u64,
+    ) -> Result<String, anyhow::Error> {
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::Compaction {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            summary: summary.to_string(),
+            first_kept_entry_id,
+            tokens_before,
+        };
+        self.storage.append_entry(&entry).await?;
+        self.storage.set_leaf_id(Some(&id)).await?;
+        Ok(id)
+    }
+
+    /// Timestamp of the most recent compaction entry, if any.
+    pub async fn latest_compaction_timestamp(
+        &self,
+    ) -> Result<Option<DateTime<Utc>>, anyhow::Error> {
+        let entries = self.storage.get_entries().await?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Compaction { timestamp, .. } => Some(*timestamp),
+                _ => None,
+            })
+            .max())
+    }
+
     /// Build the context entries by walking the tree from leaf to root.
     pub async fn build_context(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
         let leaf_id = self.storage.get_leaf_id().await?;
