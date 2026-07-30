@@ -64,18 +64,20 @@ pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 /// A before-compact hook's full compaction result, mirroring the TS
 /// `CompactResult`. Persisted verbatim (`fromHook = true`) — the harness does
 /// not fall back to its own cut analysis on any field, so a TS hook returning
-/// a `CompactResult` migrates without behavioral drift. `summary` and
-/// `tokens_before` are required (matching TS); an empty summary is refused
-/// before persisting. The optional fields (`firstKeptEntryId`, `usage`,
-/// `retainedTail`, `details`) are persisted as supplied — `None` means absent,
-/// not "compute for me".
+/// a `CompactResult` migrates without behavioral drift. `summary`,
+/// `tokens_before`, and `retained_tail` are required (the hook owns the full
+/// result); an empty summary is refused before persisting. A hook that wants
+/// to keep the harness-computed tail passes through `preparation.retained_tail`
+/// — supplying `vec![]` deliberately erases it. The remaining optional fields
+/// (`firstKeptEntryId`, `usage`, `details`) are persisted as supplied — `None`
+/// means absent, not "compute for me".
 #[derive(Debug, Clone, Default)]
 pub struct BeforeCompactOverride {
     pub summary: String,
     pub first_kept_entry_id: Option<String>,
     pub tokens_before: u64,
     pub usage: Option<Usage>,
-    pub retained_tail: Option<Vec<AgentMessage>>,
+    pub retained_tail: Vec<AgentMessage>,
     pub details: Option<JsonValue>,
 }
 
@@ -600,7 +602,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                     self.phase = AgentHarnessPhase::Idle;
                     anyhow::bail!("before-compact hook supplied an empty summary");
                 }
-                let retained_tail = o.retained_tail.unwrap_or_default();
+                let retained_tail = o.retained_tail;
                 (
                     o.summary,
                     o.first_kept_entry_id,
@@ -1102,9 +1104,37 @@ mod tests {
         }
         async fn get_path_to_root_or_compaction(
             &self,
-            _leaf_id: Option<&str>,
+            leaf_id: Option<&str>,
         ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-            Ok(self.entries.lock().unwrap().clone())
+            // Mirror the JSONL backend: walk leaf → first compaction, stop
+            // there. Returning every entry regardless of the cursor would mask
+            // path-relative logic (e.g. `previousSummary` extraction).
+            let entries = self.entries.lock().unwrap();
+            let target_id = match leaf_id {
+                Some(id) => id.to_string(),
+                None => match self.leaf_id.lock().unwrap().clone() {
+                    Some(id) => id,
+                    None => return Ok(Vec::new()),
+                },
+            };
+            let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
+                entries.iter().map(|e| (e.id(), e)).collect();
+            let mut path: Vec<&SessionTreeEntry> = Vec::new();
+            let mut current_id: Option<&str> = Some(&target_id);
+            while let Some(id) = current_id {
+                let entry = match index.remove(id) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let is_compaction = matches!(entry, SessionTreeEntry::Compaction { .. });
+                current_id = entry.parent_id();
+                path.push(entry);
+                if is_compaction {
+                    break;
+                }
+            }
+            path.reverse();
+            Ok(path.into_iter().cloned().collect())
         }
     }
 
@@ -1486,7 +1516,7 @@ mod tests {
                     summary: "hook-authored summary".into(),
                     tokens_before: 90_000,
                     first_kept_entry_id: None,
-                    retained_tail: None,
+                    retained_tail: vec![],
                     details: Some(serde_json::json!({"files": ["a.rs", "b.rs"]})),
                     usage: Some(Usage {
                         total_tokens: 7,
@@ -1833,6 +1863,93 @@ mod tests {
         );
     }
 
+    /// A repeated compaction folds the prior summary in once (as
+    /// `previousSummary`) and excludes the synthetic `summary_message` from
+    /// `messagesToSummarize` — mirroring TS, whose `messagesToSummarize` starts
+    /// at the boundary's first kept entry, not the compaction entry. The prior
+    /// summary must not appear twice in the summarization prompt.
+    #[tokio::test]
+    async fn test_repeated_compaction_does_not_duplicate_prior_summary() {
+        use std::sync::Mutex;
+
+        struct CaptureStreamFn {
+            seen: Arc<Mutex<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StreamFn for CaptureStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if let Some(AgentMessage::User { content, .. }) = context.messages.first() {
+                    for b in content {
+                        if let ContentBlock::Text { text, .. } = b {
+                            *self.seen.lock().unwrap() = text.clone();
+                        }
+                    }
+                }
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "prior session covered the API".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CaptureStreamFn {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        let long = "x".repeat(4096);
+        harness.prompt(&long).await.unwrap();
+        harness.prompt(&long).await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 600,
+            ..Default::default()
+        });
+
+        // First compaction establishes a prior summary on the branch.
+        harness.compact(None).await.expect("first compact");
+        // Grow the transcript so a second compaction has a non-empty prefix.
+        harness.prompt(&long).await.unwrap();
+        harness.prompt(&long).await.unwrap();
+        harness.compact(None).await.expect("second compact");
+
+        let prompt = seen.lock().unwrap().clone();
+        // The prior summary is folded in once as <previous-summary>-style context.
+        assert!(
+            prompt.contains("Here is a summary of the earlier conversation"),
+            "previousSummary is folded into the prompt: {prompt}"
+        );
+        // The synthetic summary_message is excluded from messagesToSummarize —
+        // its wrapper must not leak into the prompt as a transcript line.
+        assert!(
+            !prompt.contains("<conversation_history_summary>"),
+            "the prior summary message is not double-counted: {prompt}"
+        );
+    }
+
     /// A hook override with an empty summary must not persist a compaction:
     /// the compacted prefix would be replaced with nothing and lost. Same
     /// invariant the model path enforces for empty model summaries.
@@ -1900,6 +2017,71 @@ mod tests {
             entries_before
         );
         assert_eq!(harness.agent_mut().state().messages.len(), 2);
+    }
+
+    /// A hook that overrides only the summary keeps the harness-computed tail
+    /// by passing `preparation.retained_tail` through verbatim. The required
+    /// `retained_tail` field makes erasure an explicit `vec![]`, not an
+    /// accidental omission — so a summary-only override still retains context.
+    #[tokio::test]
+    async fn test_before_compact_hook_passes_through_retained_tail() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let long = "x".repeat(2048);
+        harness.prompt(&long).await.unwrap();
+        harness.prompt(&long).await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 600,
+            ..Default::default()
+        });
+
+        harness.on(
+            HookPoint::SessionBeforeCompact,
+            Arc::new(|ctx: HookContext| {
+                // Pass the harness-computed tail through; supply a fresh summary
+                // and the preparation's token count so the override is complete.
+                let preparation = ctx
+                    .data
+                    .get("preparation")
+                    .unwrap_or(&serde_json::Value::Null);
+                let retained_tail: Vec<AgentMessage> = preparation
+                    .get("retainedTail")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let tokens_before = preparation
+                    .get("tokensBefore")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                ctx.with_compact_override(BeforeCompactOverride {
+                    summary: "hook summary that keeps the tail".into(),
+                    tokens_before,
+                    first_kept_entry_id: None,
+                    retained_tail,
+                    usage: None,
+                    details: None,
+                })
+            }),
+        );
+
+        let result = harness.compact(None).await.expect("compact");
+        // The hook's fresh summary replaces the prefix; the passed-through tail
+        // survives, so the rebuilt transcript is summary + retained messages.
+        assert!(
+            !result.retained_tail.is_empty(),
+            "tail was retained, not erased"
+        );
+        assert_eq!(
+            harness.agent().state().messages.len(),
+            1 + result.retained_tail.len(),
+            "transcript = summary + retained tail"
+        );
     }
 
     #[tokio::test]

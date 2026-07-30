@@ -411,15 +411,24 @@ pub fn build_preparation(
     tokens_before: u64,
     settings: &CompactionSettings,
 ) -> CompactionPreparation {
-    let messages_to_summarize = messages[..cut_point].to_vec();
-    let retained_tail = messages[cut_point..].to_vec();
-
     // The path starts at the last compaction boundary when one exists; its
-    // summary is the `previousSummary` the summarization folds in.
+    // summary is the `previousSummary` the summarization folds in. That summary
+    // also lives in the transcript as the leading synthetic `summary_message`,
+    // so it is excluded from `messages_to_summarize` — mirroring TS, where
+    // `messagesToSummarize` starts at the boundary's first kept entry, not the
+    // compaction entry itself. Folding it twice would duplicate the prior
+    // summary in the prompt.
     let previous_summary = match branch.first() {
         Some(SessionTreeEntry::Compaction { summary, .. }) => Some(summary.clone()),
         _ => None,
     };
+    let start = usize::from(previous_summary.is_some());
+    let end = cut_point.max(start);
+    let messages_to_summarize = messages
+        .get(start..end)
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
+    let retained_tail = messages[cut_point..].to_vec();
 
     let file_ops = extract_file_operations(&messages_to_summarize, branch);
 
