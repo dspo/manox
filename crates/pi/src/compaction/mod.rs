@@ -289,31 +289,24 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
 
 /// Adjust the cut point to a safe boundary.
 ///
-/// A safe boundary is after an assistant or tool-result message,
-/// not mid-turn (e.g., after a user message that hasn't been answered).
+/// A safe boundary is one where the retained tail starts on a message a
+/// provider accepts as the first message of a request — a `User` or
+/// `Assistant`, never a `ToolResult`. A `ToolResult` first message would be
+/// orphaned: its matching `ToolUse` was summarized into the prefix, so the
+/// provider sees a result with no preceding call and rejects the sequence.
+///
+/// Mirroring TS `findValidCutPoints`, the boundary is the first non-`ToolResult`
+/// message at or after the candidate. A tool chain therefore stays intact on
+/// whichever side of the cut it lands — the whole `Assistant(tool_use) →
+/// ToolResult` run is retained together or summarized together, never split.
 fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
-    if candidate >= messages.len() {
-        return messages.len();
-    }
-
-    // Walk forward from the candidate to find a safe boundary.
-    // A safe boundary is after an Assistant or ToolResult message.
-    let mut idx = candidate;
+    let mut idx = candidate.min(messages.len());
     while idx < messages.len() {
         match &messages[idx] {
-            AgentMessage::Assistant { .. } => return idx + 1,
-            AgentMessage::ToolResult { .. } => {
-                // Continue past tool results — they belong to the turn.
-                idx += 1;
-            }
-            AgentMessage::User { .. } => {
-                // A user message at the start means we keep from here.
-                return idx;
-            }
-            _ => idx += 1,
+            AgentMessage::ToolResult { .. } => idx += 1,
+            _ => return idx,
         }
     }
-
     messages.len()
 }
 
@@ -820,13 +813,98 @@ mod tests {
         let cut = find_cut_point(&msgs, 5);
         // The cut should be at a safe boundary, not mid-turn.
         assert!(cut > 0, "cut should be > 0, got {cut}");
-        // After cut, the first kept message should be a user or assistant.
+        // After cut, the first kept message is a user or assistant — never a
+        // tool result, which would orphan its tool_use in the prefix.
         if cut < msgs.len() {
             let first_kept = &msgs[cut];
             assert!(
-                matches!(first_kept, AgentMessage::User { .. }),
-                "first kept at {cut} should be a user message, got {first_kept:?}"
+                matches!(
+                    first_kept,
+                    AgentMessage::User { .. } | AgentMessage::Assistant { .. }
+                ),
+                "first kept at {cut} should start a valid request, got {first_kept:?}"
             );
+        }
+    }
+
+    fn make_tool_use_assistant(tool_id: &str, tool_name: &str, path: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: tool_id.into(),
+                name: tool_name.into(),
+                input: serde_json::json!({ "path": path }),
+                thought_signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Default::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn make_tool_result(tool_id: &str, tool_name: &str) -> AgentMessage {
+        AgentMessage::ToolResult {
+            tool_call_id: tool_id.into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::Text {
+                text: "ok".into(),
+                signature: None,
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// A multi-turn tool-call chain must never be split: the retained tail
+    /// never starts on a `ToolResult` (its `ToolUse` would be summarized into
+    /// the prefix, orphaning the result and producing an invalid provider
+    /// request). Mirrors TS `findValidCutPoints`, which excludes tool results
+    /// as cut indices. Covers `user → assistant(tool1) → result1 →
+    /// assistant(tool2) → result2 → assistant(final)` across budgets that land
+    /// the cut inside the tool-call region.
+    #[test]
+    fn find_cut_point_never_splits_tool_chain() {
+        let msgs = vec![
+            make_user("do the work"),
+            make_tool_use_assistant("t1", "read", "a.rs"),
+            make_tool_result("t1", "read"),
+            make_tool_use_assistant("t2", "edit", "b.rs"),
+            make_tool_result("t2", "edit"),
+            make_assistant("done"),
+        ];
+        // Dense budget sweep — the token estimates are [3,5,1,5,1,1] (sum 16),
+        // so the budget-exhaustion boundary walks across every message. The
+        // tool-call region is indices 1..=4; the cut must never land between an
+        // assistant(tool_use) and its result regardless of where the budget
+        // runs out.
+        for keep in 0..=24 {
+            let cut = find_cut_point(&msgs, keep);
+            if cut < msgs.len() {
+                assert!(
+                    !matches!(msgs[cut], AgentMessage::ToolResult { .. }),
+                    "keep={keep}: tail starts on a ToolResult at {cut}, orphaning its tool_use"
+                );
+            }
+            // If a tool result is retained, its tool_use assistant is retained
+            // too — the pair is never split across the boundary.
+            for (idx, msg) in msgs.iter().enumerate() {
+                if matches!(msg, AgentMessage::ToolResult { .. }) && idx >= cut {
+                    assert!(
+                        cut < idx,
+                        "keep={keep}: result at {idx} retained but its assistant at {} was cut into the prefix",
+                        idx - 1
+                    );
+                }
+            }
         }
     }
 
