@@ -39,8 +39,10 @@ pub fn guard_output(output: &str, config: &OutputGuardConfig) -> String {
 
     let truncated = if output.len() > config.max_guarded_length {
         let half = config.max_guarded_length / 2;
-        let head = &output[..half];
-        let tail = &output[output.len() - half..];
+        // Slice on UTF-8 char boundaries so multi-byte sequences never split
+        // mid-character (which would panic on `&str` indexing).
+        let head = &output[..output.floor_char_boundary(half)];
+        let tail = &output[output.ceil_char_boundary(output.len() - half)..];
         let skipped = output.len() - config.max_guarded_length;
         format!("{head}\n... [{skipped} bytes omitted] ...\n{tail}")
     } else {
@@ -93,5 +95,25 @@ mod tests {
         assert!(guarded.contains(GUARD_START));
         assert!(guarded.contains("out1"));
         assert!(guarded.contains("out2"));
+    }
+
+    #[test]
+    fn test_guard_truncates_on_char_boundary() {
+        // A max length that lands inside multi-byte sequences must not panic;
+        // the slice snaps to char boundaries and still wraps cleanly. Pick a
+        // max where the head and tail each retain at least one whole emoji.
+        let config = OutputGuardConfig {
+            enabled: true,
+            max_guarded_length: 9,
+        };
+        // Each emoji is 4 bytes; a 9-byte cut splits the second and the
+        // sixth sequence mid-way.
+        let output = "😀😁😂😃😄😅";
+        let guarded = guard_output(output, &config);
+        assert!(guarded.contains(GUARD_START));
+        assert!(guarded.contains("bytes omitted"));
+        // head (floor to byte 4) and tail (ceil to byte 20) are whole emojis.
+        assert!(guarded.contains("😀"), "head snaps to a char boundary");
+        assert!(guarded.contains("😅"), "tail snaps to a char boundary");
     }
 }
