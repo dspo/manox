@@ -71,7 +71,12 @@ pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 /// — supplying `vec![]` deliberately erases it. The remaining optional fields
 /// (`firstKeptEntryId`, `usage`, `details`) are persisted as supplied — `None`
 /// means absent, not "compute for me".
-#[derive(Debug, Clone, Default)]
+///
+/// `Default` is intentionally not derived: it would let a summary-only override
+/// silently erase the retained tail and report `tokens_before: 0`, which is
+/// exactly the partial-override footgun the full-result contract rules out.
+/// Every field must be set explicitly at the construction site.
+#[derive(Debug, Clone)]
 pub struct BeforeCompactOverride {
     pub summary: String,
     pub first_kept_entry_id: Option<String>,
@@ -1995,9 +2000,11 @@ mod tests {
             Arc::new(|ctx: HookContext| {
                 ctx.with_compact_override(BeforeCompactOverride {
                     summary: "   \n\t".into(),
+                    tokens_before: 0,
+                    first_kept_entry_id: None,
+                    retained_tail: vec![],
                     details: None,
                     usage: None,
-                    ..Default::default()
                 })
             }),
         );
