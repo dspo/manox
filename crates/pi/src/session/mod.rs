@@ -1,11 +1,13 @@
 // Session storage and context building.
 //
-// A session is a tree of entries (messages, compaction summaries, model
-// changes, etc.) persisted as JSONL. Each entry has an id and parentId,
-// forming a DAG that can be walked to reconstruct the conversation context.
+// A session is a tree of entries persisted as JSONL. Each entry has an id and
+// parentId, forming a DAG walked leafward to reconstruct the conversation
+// context. Variant tags and field names are snake_case (storage format v3);
+// there is no on-disk compatibility with the older camelCase layout.
 
 pub mod jsonl;
 
+use crate::compaction::branch_summarization::BranchSummary;
 use crate::types::AgentMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,6 @@ pub enum SessionTreeEntry {
     #[serde(rename = "message")]
     Message {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         message: AgentMessage,
@@ -26,46 +27,93 @@ pub enum SessionTreeEntry {
     #[serde(rename = "compaction")]
     Compaction {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         summary: String,
-        #[serde(rename = "firstKeptEntryId")]
         first_kept_entry_id: Option<String>,
-        #[serde(rename = "tokensBefore")]
         tokens_before: u64,
         /// The messages kept intact across the compaction, stored verbatim
         /// so a rebuilt context needs no walk past the boundary.
-        #[serde(rename = "retainedTail", default)]
+        #[serde(default)]
         retained_tail: Vec<AgentMessage>,
     },
     #[serde(rename = "leaf")]
     Leaf {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
-        #[serde(rename = "targetId")]
-        target_id: String,
+        /// The entry the cursor points at; `None` records that the leaf was
+        /// cleared (the last such `leaf` entry wins).
+        target_id: Option<String>,
     },
-    #[serde(rename = "modelChange")]
+    #[serde(rename = "model_change")]
     ModelChange {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         provider: String,
-        #[serde(rename = "modelId")]
         model_id: String,
     },
+    /// A change in reasoning depth for the following turns.
+    #[serde(rename = "thinking_level_change")]
+    ThinkingLevelChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        /// `None` disables reasoning; a tier string enables it at that depth.
+        level: Option<String>,
+    },
+    /// A change in the set of tools mounted for the following turns.
+    #[serde(rename = "active_tools_change")]
+    ActiveToolsChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        tools: Vec<String>,
+    },
+    /// A conversation- or branch-level summary produced by branch summarization.
+    #[serde(rename = "branch_summary")]
+    BranchSummary {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        summary: BranchSummary,
+    },
+    /// An extension message whose payload the harness does not interpret.
+    #[serde(rename = "custom_message")]
+    CustomMessage {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        custom_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<JsonValue>,
+    },
+    /// A short human-readable label attached to a point in the tree.
+    #[serde(rename = "label")]
+    Label {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        text: String,
+    },
+    /// Free-form session metadata (agent identity, environment, config snapshot).
+    #[serde(rename = "session_info")]
+    SessionInfo {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<JsonValue>,
+    },
+    /// Legacy extension point retained for callers that carry an opaque payload.
     #[serde(rename = "custom")]
     Custom {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
-        #[serde(rename = "customType")]
         custom_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<JsonValue>,
     },
 }
@@ -77,6 +125,12 @@ impl SessionTreeEntry {
             | SessionTreeEntry::Compaction { id, .. }
             | SessionTreeEntry::Leaf { id, .. }
             | SessionTreeEntry::ModelChange { id, .. }
+            | SessionTreeEntry::ThinkingLevelChange { id, .. }
+            | SessionTreeEntry::ActiveToolsChange { id, .. }
+            | SessionTreeEntry::BranchSummary { id, .. }
+            | SessionTreeEntry::CustomMessage { id, .. }
+            | SessionTreeEntry::Label { id, .. }
+            | SessionTreeEntry::SessionInfo { id, .. }
             | SessionTreeEntry::Custom { id, .. } => id,
         }
     }
@@ -87,6 +141,12 @@ impl SessionTreeEntry {
             | SessionTreeEntry::Compaction { parent_id, .. }
             | SessionTreeEntry::Leaf { parent_id, .. }
             | SessionTreeEntry::ModelChange { parent_id, .. }
+            | SessionTreeEntry::ThinkingLevelChange { parent_id, .. }
+            | SessionTreeEntry::ActiveToolsChange { parent_id, .. }
+            | SessionTreeEntry::BranchSummary { parent_id, .. }
+            | SessionTreeEntry::CustomMessage { parent_id, .. }
+            | SessionTreeEntry::Label { parent_id, .. }
+            | SessionTreeEntry::SessionInfo { parent_id, .. }
             | SessionTreeEntry::Custom { parent_id, .. } => parent_id.as_deref(),
         }
     }
@@ -97,6 +157,12 @@ impl SessionTreeEntry {
             | SessionTreeEntry::Compaction { timestamp, .. }
             | SessionTreeEntry::Leaf { timestamp, .. }
             | SessionTreeEntry::ModelChange { timestamp, .. }
+            | SessionTreeEntry::ThinkingLevelChange { timestamp, .. }
+            | SessionTreeEntry::ActiveToolsChange { timestamp, .. }
+            | SessionTreeEntry::BranchSummary { timestamp, .. }
+            | SessionTreeEntry::CustomMessage { timestamp, .. }
+            | SessionTreeEntry::Label { timestamp, .. }
+            | SessionTreeEntry::SessionInfo { timestamp, .. }
             | SessionTreeEntry::Custom { timestamp, .. } => *timestamp,
         }
     }
