@@ -206,6 +206,7 @@ fn convert_assistant(
             ContentBlock::Thinking {
                 thinking,
                 signature,
+                ..
             } => {
                 if same_model {
                     // Verbatim replay; the signature IS the reasoning item.
@@ -230,7 +231,9 @@ fn convert_assistant(
                 };
                 push_text_item(items, text, signature, msg_index, &mut text_block_index);
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 let effective = if same_model {
                     id.clone()
                 } else {
@@ -552,6 +555,8 @@ mod tests {
             content,
             is_error,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -783,6 +788,8 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some(item.to_string()),
+
+                redacted: None,
             },
             text("answer"),
         ]);
@@ -801,6 +808,8 @@ mod tests {
         let msg = assistant(vec![ContentBlock::Thinking {
             thinking: "hmm".into(),
             signature: None,
+
+            redacted: None,
         }]);
         let v = request(&ctx(
             vec![user("q"), msg, user("again")],
@@ -822,6 +831,8 @@ mod tests {
             vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some(r#"{"id":"rs_foreign","type":"reasoning","summary":[]}"#.into()),
+
+                redacted: None,
             }],
             "openai",
             "gpt-other",
@@ -842,6 +853,7 @@ mod tests {
             id: "call_1|fc_item1".into(),
             name: "read".into(),
             input: json!({"path": "x"}),
+            thought_signature: None,
         }]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let item = &v["input"][2];
@@ -859,6 +871,7 @@ mod tests {
                 id: "call_1|fc_item1".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "openai",
             "gpt-other",
@@ -891,6 +904,7 @@ mod tests {
                 id: "call_1|fc_item1".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "anthropic",
             "claude-x",
@@ -910,6 +924,7 @@ mod tests {
                 id: "toolu_01AbC".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "anthropic",
             "claude-x",
@@ -985,6 +1000,7 @@ mod tests {
             id: "call_1|fc_1".into(),
             name: "read".into(),
             input: json!({}),
+            thought_signature: None,
         }]);
         // No tool result between the call and the next user message.
         let v = request(&ctx(

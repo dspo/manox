@@ -57,6 +57,7 @@ impl StreamFn for ToolLoopMock {
                     id: "t1".into(),
                     name: "read".into(),
                     input: serde_json::json!({ "path": self.file_path }),
+                    thought_signature: None,
                 }],
                 Some(StopReason::ToolUse),
             )),

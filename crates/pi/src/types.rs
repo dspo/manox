@@ -13,11 +13,12 @@ use std::sync::Arc;
 
 /// A content block within a message sent to or received from an LLM.
 ///
-/// Serialized in the TS Pi v3 message shape: `toolCall` carries `arguments`,
-/// `thinking` carries `thinkingSignature`, and `image` is flat (`data` +
-/// `mimeType`). Rust field names stay snake_case; serde renames map them.
+/// Mirrors the TS Pi content shapes: `text` carries `textSignature`, `image`
+/// is flat with `mimeType`, `toolCall` carries `arguments` + `thoughtSignature`,
+/// and redacted reasoning is a `thinking` block with `redacted: true` (the
+/// opaque payload lives in `thinkingSignature`), not a separate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text {
@@ -27,7 +28,11 @@ pub enum ContentBlock {
         /// phase for the OpenAI Responses API). `None` for providers whose
         /// protocol carries no text identity, such as Anthropic and Chat
         /// Completions.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "textSignature"
+        )]
         signature: Option<String>,
     },
     #[serde(rename = "image")]
@@ -35,6 +40,7 @@ pub enum ContentBlock {
         /// Base64-encoded image bytes.
         data: String,
         /// MIME type, e.g. `image/png`.
+        #[serde(rename = "mimeType")]
         mime_type: String,
     },
     #[serde(rename = "toolCall")]
@@ -43,9 +49,18 @@ pub enum ContentBlock {
         name: String,
         #[serde(rename = "arguments")]
         input: JsonValue,
+        /// Opaque provider signature for reusing thought context (Google).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "thoughtSignature"
+        )]
+        thought_signature: Option<String>,
     },
     /// A model reasoning trace. `signature` is opaque provider data that must
     /// be echoed back verbatim on later turns to preserve thinking continuity.
+    /// `redacted` marks a trace the provider encrypted; its payload is stored
+    /// in `signature` and `thinking` is empty.
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
@@ -55,10 +70,9 @@ pub enum ContentBlock {
             rename = "thinkingSignature"
         )]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<bool>,
     },
-    /// An encrypted reasoning trace whose content the provider redacted.
-    #[serde(rename = "redacted_thinking", rename_all = "camelCase")]
-    RedactedThinking { data: String },
 }
 
 /// A message in the agent conversation.
@@ -71,6 +85,7 @@ pub enum ContentBlock {
 pub enum AgentMessage {
     #[serde(rename = "user", rename_all = "camelCase")]
     User {
+        #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
@@ -117,8 +132,20 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         #[serde(default)]
         is_error: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<JsonValue>,
+        /// Token usage attributed to the tool result, when the provider reports
+        /// per-call usage (e.g. Responses API `usage` on the output item).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        /// Tool names the call added to the session's allowed set, when the
+        /// provider reports additions (Responses API `added_tool_names`).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "addedToolNames"
+        )]
+        added_tool_names: Option<Vec<String>>,
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
@@ -126,6 +153,7 @@ pub enum AgentMessage {
     #[serde(rename = "custom", rename_all = "camelCase")]
     Custom {
         custom_type: String,
+        #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         #[serde(default)]
         details: Option<JsonValue>,
@@ -204,7 +232,7 @@ pub struct Usage {
     pub cache_write_1h: Option<u64>,
     /// Reasoning/thinking tokens, when the provider reports them. A subset
     /// of `output_tokens`; `None` when the provider exposes no breakdown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoning")]
     pub reasoning_tokens: Option<u64>,
     /// Total context tokens. Providers that report a total (Responses) use
     /// it verbatim; the other shapes compute the sum of all token classes
@@ -242,6 +270,31 @@ impl Usage {
 /// Serde default for the boxed `usage` field on `Assistant`.
 fn default_usage() -> Box<Usage> {
     Box::new(Usage::default())
+}
+
+/// Deserialize `User`/`Custom` message content, accepting either a plain
+/// string (wrapped in a single `text` block) or an array of content blocks —
+/// the two wire shapes TS Pi emits for user-typed and tool/image content.
+pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ContentBlock>, D::Error> {
+    use serde::de::Error;
+
+    let value = serde_json::Value::deserialize(d)?;
+    match value {
+        serde_json::Value::String(s) => Ok(vec![ContentBlock::Text {
+            text: s,
+            signature: None,
+        }]),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| serde_json::from_value::<ContentBlock>(item).map_err(Error::custom))
+            .collect(),
+        other => Err(Error::custom(format!(
+            "expected string or array of content blocks, got {}",
+            other
+        ))),
+    }
 }
 
 /// Serde for `AgentMessage` timestamps as epoch milliseconds — the on-disk
@@ -307,14 +360,14 @@ pub enum AgentEvent {
         arguments: JsonValue,
         partial_result: JsonValue,
     },
-    /// A tool call has finished executing. Carries the final result content
-    /// and whether it errored, so consumers can reconstruct the call's outcome
-    /// from the event stream alone.
+    /// A tool call has finished executing. Carries the full result — content,
+    /// details, per-call usage, added tool names, and the terminate signal —
+    /// so consumers can reconstruct the call's outcome from the event stream
+    /// alone, mirroring the TS Pi `AgentToolResult`.
     ToolExecutionEnd {
         tool_call_id: String,
         tool_name: String,
-        result: Vec<ContentBlock>,
-        is_error: bool,
+        result: AgentToolResult,
     },
     /// A turn has completed.
     TurnEnd {
@@ -585,7 +638,9 @@ mod tests {
             } => {
                 assert_eq!(*stop_reason, Some(StopReason::ToolUse));
                 match &content[0] {
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         assert_eq!(id, "tc_1");
                         assert_eq!(name, "read");
                         assert_eq!(input, &json!({"path": "/etc/hosts"}));

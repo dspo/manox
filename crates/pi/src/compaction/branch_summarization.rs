@@ -264,6 +264,7 @@ mod tests {
                 id: "t1".into(),
                 name: name.into(),
                 input,
+                thought_signature: None,
             }],
             model: "test".into(),
             provider: "test".into(),

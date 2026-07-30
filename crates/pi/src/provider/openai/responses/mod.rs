@@ -367,6 +367,7 @@ impl Accumulator {
                 self.blocks.push(ContentBlock::Thinking {
                     thinking: String::new(),
                     signature: None,
+                    redacted: None,
                 });
                 self.slots.insert(
                     output_index,
@@ -401,6 +402,7 @@ impl Accumulator {
                     id,
                     name: call.name,
                     input: JsonValue::Null,
+                    thought_signature: None,
                 });
                 self.slots.insert(
                     output_index,
@@ -841,6 +843,7 @@ mod tests {
         let ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } = &content[0]
         else {
             panic!("expected thinking")
@@ -886,7 +889,10 @@ mod tests {
             panic!("expected assistant")
         };
         assert_eq!(*stop_reason, Some(StopReason::ToolUse));
-        let ContentBlock::ToolUse { id, name, input } = &content[0] else {
+        let ContentBlock::ToolUse {
+            id, name, input, ..
+        } = &content[0]
+        else {
             panic!("expected tool_use")
         };
         // The block id keeps both halves of the wire identity.

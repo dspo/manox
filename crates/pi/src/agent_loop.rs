@@ -227,7 +227,10 @@ async fn run_loop_inner(
                 AgentMessage::Assistant { content, .. } => content
                     .iter()
                     .filter_map(|block| {
-                        if let ContentBlock::ToolUse { id, name, input } = block {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
                             Some((id.as_str(), name.as_str(), input.clone()))
                         } else {
                             None
@@ -479,14 +482,15 @@ fn fail_tool_calls_from_truncated(
             content: result.content.clone(),
             is_error: true,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         };
 
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
-            result: result.content.clone(),
-            is_error: result.is_error,
+            result: result.clone(),
         });
 
         executed.push(crate::tool::ExecutedToolCall {
@@ -850,6 +854,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
             }],
             model: "mock".into(),
             provider: "mock".into(),
@@ -951,6 +956,7 @@ mod tests {
                 id: "call_truncated".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"message": "incomplete"}),
+                thought_signature: None,
             }],
             model: "mock".into(),
             provider: "mock".into(),
@@ -1265,6 +1271,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
             }],
             model: "mock".into(),
             provider: "mock".into(),
@@ -1346,6 +1353,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "echo".into(),
                 input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
             }],
             model: "mock".into(),
             provider: "mock".into(),

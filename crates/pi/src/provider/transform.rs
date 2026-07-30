@@ -94,6 +94,8 @@ fn insert_synthetic_results(
             }],
             is_error: true,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         });
     }
@@ -144,6 +146,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             input: serde_json::json!({}),
+            thought_signature: None,
         }
     }
 
@@ -157,6 +160,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }

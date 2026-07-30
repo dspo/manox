@@ -239,12 +239,15 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
             text: format!("[tool_use: {name}]"),
             cache_control: None,
         },
-        ContentBlock::Thinking { thinking, .. } => ContentBlockParam::Text {
-            text: thinking.clone(),
+        ContentBlock::Thinking {
+            redacted: Some(true),
+            ..
+        } => ContentBlockParam::Text {
+            text: String::new(),
             cache_control: None,
         },
-        ContentBlock::RedactedThinking { .. } => ContentBlockParam::Text {
-            text: String::new(),
+        ContentBlock::Thinking { thinking, .. } => ContentBlockParam::Text {
+            text: thinking.clone(),
             cache_control: None,
         },
     }
@@ -253,28 +256,35 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
 /// Map an assistant content block. Thinking blocks round-trip with their
 /// signature intact — required for multi-turn thinking continuity. A thinking
 /// block without a signature is dropped, since the API rejects signatureless
-/// thinking params.
+/// thinking params. A redacted thinking block forwards its opaque payload.
 fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
     match block {
         ContentBlock::Text { text, .. } => Some(ContentBlockParam::Text {
             text: text.clone(),
             cache_control: None,
         }),
-        ContentBlock::ToolUse { id, name, input } => Some(ContentBlockParam::ToolUse {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Some(ContentBlockParam::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
         }),
         ContentBlock::Thinking {
+            signature,
+            redacted: Some(true),
+            ..
+        } => signature
+            .as_ref()
+            .map(|data| ContentBlockParam::RedactedThinking { data: data.clone() }),
+        ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => signature.as_ref().map(|sig| ContentBlockParam::Thinking {
             thinking: thinking.clone(),
             signature: sig.clone(),
         }),
-        ContentBlock::RedactedThinking { data } => {
-            Some(ContentBlockParam::RedactedThinking { data: data.clone() })
-        }
         ContentBlock::Image { data, mime_type } => Some(ContentBlockParam::Image {
             source: image_source(data, mime_type),
             cache_control: None,
@@ -365,6 +375,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -375,6 +387,7 @@ mod tests {
                 id: id.into(),
                 name: "read".into(),
                 input: json!({"path": "x"}),
+                thought_signature: None,
             }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
@@ -473,6 +486,8 @@ mod tests {
             content: vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig123".into()),
+
+                redacted: None,
             }],
             model: "m".into(),
             provider: "anthropic".into(),

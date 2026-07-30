@@ -17,7 +17,9 @@ use crate::compaction::{self, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
 use crate::session::{Session, SessionStorage};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
-use crate::types::{AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, Usage};
+use crate::types::{
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
+};
 use serde_json::Value as JsonValue;
 
 /// The phases the harness can be in.
@@ -511,6 +513,39 @@ impl<S: SessionStorage> AgentHarness<S> {
         };
 
         let (summary_text, usage) = extract_summary(&summary_response);
+        // A failed summarization must not persist an empty compaction: that
+        // would replace the compacted prefix with nothing and lose history.
+        // An Error/Aborted terminal or an empty summary is a failure; bail
+        // before touching the session or transcript so both stay intact.
+        let failed = match &summary_response {
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error | StopReason::Aborted),
+                ..
+            } => true,
+            _ => summary_text.trim().is_empty(),
+        };
+        if failed {
+            self.phase = AgentHarnessPhase::Idle;
+            let label = match &summary_response {
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                } => "error",
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Aborted),
+                    ..
+                } => "aborted",
+                _ => "no summary",
+            };
+            let detail = match &summary_response {
+                AgentMessage::Assistant {
+                    error_message: Some(msg),
+                    ..
+                } => format!(": {msg}"),
+                _ => String::new(),
+            };
+            return Err(anyhow::anyhow!("summarization failed ({label}){detail}"));
+        }
         let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
 
         // Persist the boundary first — the session is the durable record and
@@ -728,6 +763,34 @@ mod tests {
                 stop_reason: Some(StopReason::Stop),
                 usage: Box::new(Usage::default()),
                 error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// A stream whose summarization response is an `Aborted` terminal — the
+    /// shape a cancelled or failed compaction call produces.
+    struct AbortedSummaryStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for AbortedSummaryStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            Ok(AgentMessage::Assistant {
+                content: vec![],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Aborted),
+                usage: Box::new(Usage::default()),
+                error_message: Some("summarization was cancelled".into()),
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -957,6 +1020,74 @@ mod tests {
             result.tokens_after
         );
         assert!(!harness.needs_compaction());
+    }
+
+    /// A failed summarization (Error/Aborted terminal, or an empty summary)
+    /// must not persist a compaction entry nor rewrite the transcript — the
+    /// compacted prefix would otherwise be replaced with nothing and lost.
+    #[tokio::test]
+    async fn test_compact_rejects_failed_summary_without_persisting() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(AbortedSummaryStreamFn),
+        );
+
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+        assert!(harness.needs_compaction());
+
+        let entries_before = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        let transcript_before = harness.agent_mut().state().messages.len();
+
+        let err = harness.compact().await.unwrap_err();
+        assert!(
+            err.to_string().contains("summarization failed (aborted)"),
+            "{}",
+            err
+        );
+
+        // No compaction entry was persisted.
+        let entries_after = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(entries_after, entries_before);
+
+        // The transcript is untouched: the compacted prefix survives.
+        assert_eq!(
+            harness.agent_mut().state().messages.len(),
+            transcript_before
+        );
     }
 
     #[tokio::test]
@@ -1297,6 +1428,7 @@ mod tests {
                         id: "t1".into(),
                         name: "echo".into(),
                         input: serde_json::json!({"message": "hi"}),
+                        thought_signature: None,
                     }],
                     model: "test".into(),
                     provider: "test".into(),

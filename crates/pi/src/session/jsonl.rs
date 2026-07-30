@@ -2,13 +2,12 @@
 //
 // Layout of the single `session.jsonl` file:
 //   line 0 — a session header: `{"type":"session","version":3,"id":..,"timestamp":..,"cwd":..}`.
-//   line 1.. — session-tree entries, appended in occurrence order. The leaf
-//              cursor is the id of the last appended entry — there is no
-//              `leaf` entry, matching the TS Pi v3 schema. The file is
-//              strictly append-only: no field is ever rewritten. Branching
-//              (pointing the cursor at an older entry) is an in-memory
-//              override set via `set_leaf_id` and does not persist; the
-//              linear path a real session follows needs no override.
+//   line 1.. — session-tree entries, appended in occurrence order. A `leaf`
+//              entry records a cursor move to an older branch point
+//              (`targetId`); any other entry implicitly makes itself the
+//              cursor. The leaf cursor is `targetId` for a trailing leaf
+//              entry, otherwise the last entry's id. The file is strictly
+//              append-only: no field is ever rewritten.
 //
 // `open` validates line 0 is a v3 session header and errors on any mismatch
 // or corruption — there is no silent recovery from an older or damaged file.
@@ -49,8 +48,8 @@ pub struct JsonlSessionStorage {
     jsonl_path: PathBuf,
     /// All entries after the header, cached in memory.
     entries: Mutex<Vec<SessionTreeEntry>>,
-    /// Current leaf cursor. Defaults to the last appended entry; an
-    /// in-memory override via `set_leaf_id` (for branching) is not persisted.
+    /// Current leaf cursor. For a `leaf` entry this is its `targetId`;
+    /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
     /// Metadata read from the header (file is authoritative on reopen).
     pub metadata: JsonlSessionMetadata,
@@ -128,9 +127,9 @@ impl JsonlSessionStorage {
             let entry: SessionTreeEntry = serde_json::from_str(&line)?;
             entries.push(entry);
         }
-        // The leaf cursor is the last appended entry — there is no `leaf`
-        // entry in the v3 schema.
-        let leaf_id = entries.last().map(|e| e.id().to_string());
+        // The cursor follows the last entry: a trailing `leaf` entry
+        // redirects to its `targetId`, otherwise the last entry's own id.
+        let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
 
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
@@ -160,8 +159,9 @@ impl SessionStorage for JsonlSessionStorage {
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
         let line = serde_json::to_string(entry)? + "\n";
         self.append_line(&line).await?;
-        // The appended entry becomes the leaf cursor — no `leaf` entry.
-        *self.leaf_id.lock().await = Some(entry.id().to_string());
+        // The cursor follows this entry: a `leaf` entry redirects to its
+        // `targetId`, otherwise the entry becomes the cursor itself.
+        *self.leaf_id.lock().await = entry.leaf_cursor_after();
         self.entries.lock().await.push(entry.clone());
         Ok(())
     }
@@ -172,12 +172,37 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
-        Ok(self.leaf_id.lock().await.clone())
+        let leaf_id = self.leaf_id.lock().await.clone();
+        // A cursor pointing at a since-removed entry is corruption, not a
+        // branch — surface it rather than silently walking from nothing.
+        if let Some(id) = &leaf_id {
+            let exists = self.entries.lock().await.iter().any(|e| e.id() == id);
+            if !exists {
+                anyhow::bail!("leaf id {id} not found among session entries");
+            }
+        }
+        Ok(leaf_id)
     }
 
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
-        // In-memory override for branching; not persisted, matching a schema
-        // that records no `leaf` entry. The linear path needs no override.
+        // Validate the target exists before recording the move.
+        if let Some(id) = leaf_id {
+            let exists = self.entries.lock().await.iter().any(|e| e.id() == id);
+            if !exists {
+                anyhow::bail!("entry {id} not found");
+            }
+        }
+        let parent_id = self.leaf_id.lock().await.clone();
+        let id = self.create_entry_id().await?;
+        let entry = SessionTreeEntry::Leaf {
+            id: id.clone(),
+            parent_id,
+            timestamp: chrono::Utc::now(),
+            target_id: leaf_id.map(|s| s.to_string()),
+        };
+        let line = serde_json::to_string(&entry)? + "\n";
+        self.append_line(&line).await?;
+        self.entries.lock().await.push(entry);
         *self.leaf_id.lock().await = leaf_id.map(|s| s.to_string());
         Ok(())
     }
@@ -259,19 +284,48 @@ mod tests {
     #[tokio::test]
     async fn test_jsonl_leaf_tracking() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
         let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
 
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
-        // set_leaf_id is an in-memory override (no `leaf` entry is written).
-        storage.set_leaf_id(Some("entry-42")).await.unwrap();
-        assert_eq!(
-            storage.get_leaf_id().await.unwrap(),
-            Some("entry-42".into())
+        let msg = SessionTreeEntry::Message {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("hi"),
+        };
+        storage.append_entry(&msg).await.unwrap();
+        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
+
+        // set_leaf_id persists a `leaf` entry that redirects the cursor to the
+        // target, matching the TS Pi v3 schema (not an in-memory override).
+        storage.set_leaf_id(Some("m1")).await.unwrap();
+        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
+
+        // A trailing leaf entry redirects: reopening lands the cursor on the
+        // target id, not the leaf entry's own id.
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let leaf_line = on_disk
+            .lines()
+            .find(|l| l.contains(r#""type":"leaf""#))
+            .unwrap();
+        assert!(
+            leaf_line.contains(r#""targetId":"m1""#),
+            "expected leaf entry with targetId, got: {leaf_line}"
         );
 
+        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        assert_eq!(reopened.get_leaf_id().await.unwrap(), Some("m1".into()));
+
+        // set_leaf_id(None) records a cursor reset to null.
         storage.set_leaf_id(None).await.unwrap();
         assert!(storage.get_leaf_id().await.unwrap().is_none());
+
+        // Pointing the cursor at a non-existent entry is an error, not a
+        // silent override.
+        let err = storage.set_leaf_id(Some("missing")).await.unwrap_err();
+        assert!(err.to_string().contains("not found"), "{}", err);
     }
 
     #[tokio::test]
@@ -676,7 +730,7 @@ mod tests {
                 assert_eq!(id, "x1");
                 assert!(parent_id.is_none());
                 assert_eq!(custom_type, "note");
-                assert_eq!(data, &serde_json::json!("a plain string"));
+                assert_eq!(data, &Some(serde_json::json!("a plain string")));
             }
             other => panic!("expected Custom (string data), got {other:?}"),
         }
@@ -691,7 +745,7 @@ mod tests {
                 assert_eq!(id, "x2");
                 assert_eq!(parent_id.as_deref(), Some("x1"));
                 assert_eq!(custom_type, "flag");
-                assert_eq!(data, &serde_json::json!({"on": true, "n": 3}));
+                assert_eq!(data, &Some(serde_json::json!({"on": true, "n": 3})));
             }
             other => panic!("expected Custom (object data), got {other:?}"),
         }
@@ -703,5 +757,123 @@ mod tests {
         assert_eq!(path[1].id(), "x2");
         assert_eq!(path[1].parent_id(), Some("x1"));
         assert_eq!(path[0].id(), "x1");
+    }
+
+    /// A real TS Pi v3 session file may carry every entry kind in the flat
+    /// wire shape, including a trailing `leaf` entry that redirects the
+    /// cursor. Each must load into the matching variant with camelCase fields
+    /// mapped, and a trailing leaf must land the cursor on its `targetId`.
+    #[tokio::test]
+    async fn test_loads_all_entry_wire_shapes() {
+        use crate::types::ContentBlock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            // branch_summary: flat (summary is a string, fromId present),
+            // not a nested object.
+            r#"{"type":"branch_summary","id":"b1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","fromId":"b0","summary":"did work","details":{"files":["a.rs"]},"usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"total":3}},"fromHook":true}"#,
+            "\n",
+            // label: targetId + label (no `text`).
+            r#"{"type":"label","id":"l1","parentId":"b1","timestamp":"2026-05-28T07:13:46.617Z","targetId":"b1","label":"checkpoint"}"#,
+            "\n",
+            // custom_message: string content + display.
+            r#"{"type":"custom_message","id":"cm1","parentId":"l1","timestamp":"2026-05-28T07:13:46.617Z","customType":"note","content":"hi","display":true}"#,
+            "\n",
+            // custom_message: array content (text + image with mimeType).
+            r#"{"type":"custom_message","id":"cm2","parentId":"cm1","timestamp":"2026-05-28T07:13:46.617Z","customType":"attach","content":[{"type":"text","text":"see"},{"type":"image","data":"QkFE","mimeType":"image/png"}],"display":false}"#,
+            "\n",
+            // session_info: name omitted (optional).
+            r#"{"type":"session_info","id":"si1","parentId":"cm2","timestamp":"2026-05-28T07:13:46.617Z"}"#,
+            "\n",
+            // custom: data omitted (optional).
+            r#"{"type":"custom","id":"cu1","parentId":"si1","timestamp":"2026-05-28T07:13:46.617Z","customType":"marker"}"#,
+            "\n",
+            // trailing leaf entry: cursor redirects to targetId, not the
+            // leaf entry's own id.
+            r#"{"type":"leaf","id":"lf1","parentId":"cu1","timestamp":"2026-05-28T07:13:46.617Z","targetId":"b1"}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let meta = JsonlSessionMetadata {
+            id: "s1".into(),
+            cwd: "/proj".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+
+        // Trailing leaf redirects the cursor to its targetId.
+        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("b1".into()));
+
+        let entries = storage.get_entries().await.unwrap();
+        assert_eq!(entries.len(), 7);
+
+        match &entries[0] {
+            SessionTreeEntry::BranchSummary {
+                from_id,
+                summary,
+                details,
+                usage,
+                from_hook,
+                ..
+            } => {
+                assert_eq!(from_id, "b0");
+                assert_eq!(summary, "did work");
+                assert_eq!(details, &Some(serde_json::json!({"files": ["a.rs"]})));
+                assert!(usage.is_some());
+                assert_eq!(*from_hook, Some(true));
+            }
+            other => panic!("expected BranchSummary, got {other:?}"),
+        }
+        match &entries[1] {
+            SessionTreeEntry::Label {
+                target_id, label, ..
+            } => {
+                assert_eq!(target_id, "b1");
+                assert_eq!(label.as_deref(), Some("checkpoint"));
+            }
+            other => panic!("expected Label, got {other:?}"),
+        }
+        match &entries[2] {
+            SessionTreeEntry::CustomMessage {
+                content, display, ..
+            } => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "hi"));
+                assert!(*display);
+            }
+            other => panic!("expected CustomMessage (string), got {other:?}"),
+        }
+        match &entries[3] {
+            SessionTreeEntry::CustomMessage { content, .. } => {
+                assert_eq!(content.len(), 2);
+                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "see"));
+                assert!(
+                    matches!(&content[1], ContentBlock::Image { mime_type, .. } if mime_type == "image/png")
+                );
+            }
+            other => panic!("expected CustomMessage (array), got {other:?}"),
+        }
+        match &entries[4] {
+            SessionTreeEntry::SessionInfo { name, .. } => {
+                assert!(name.is_none());
+            }
+            other => panic!("expected SessionInfo, got {other:?}"),
+        }
+        match &entries[5] {
+            SessionTreeEntry::Custom { data, .. } => {
+                assert!(data.is_none());
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        match &entries[6] {
+            SessionTreeEntry::Leaf { target_id, .. } => {
+                assert_eq!(target_id.as_deref(), Some("b1"));
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
     }
 }

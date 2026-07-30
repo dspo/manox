@@ -224,10 +224,15 @@ impl Accumulator {
                         self.blocks[index] = ContentBlock::Thinking {
                             thinking: String::new(),
                             signature: None,
+                            redacted: None,
                         };
                     }
                     WireContentBlock::RedactedThinking { data } => {
-                        self.blocks[index] = ContentBlock::RedactedThinking { data };
+                        self.blocks[index] = ContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: Some(data),
+                            redacted: Some(true),
+                        };
                     }
                     WireContentBlock::ToolUse { id, name, .. } => {
                         self.open_json.insert(index, String::new());
@@ -235,6 +240,7 @@ impl Accumulator {
                             id,
                             name,
                             input: serde_json::Value::Null,
+                            thought_signature: None,
                         };
                     }
                     WireContentBlock::Other => {}
@@ -448,7 +454,9 @@ mod tests {
 
         match &msg {
             AgentMessage::Assistant { content, .. } => match &content[0] {
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     assert_eq!(id, "t1");
                     assert_eq!(name, "read");
                     assert_eq!(*input, serde_json::json!({"path": "x.rs"}));
@@ -504,6 +512,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    ..
                 } => {
                     assert_eq!(thinking, "hmm");
                     assert_eq!(signature.as_deref(), Some("sig!"));

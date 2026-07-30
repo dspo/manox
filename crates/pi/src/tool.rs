@@ -65,8 +65,10 @@ pub trait ToolProgress: Send + Sync {
 
 /// The result of a tool execution.
 ///
-/// The `content` is what gets sent back to the LLM. The `details` are
-/// structured data for the UI or logs.
+/// Mirrors the TS Pi `AgentToolResult`: `content` is what the model sees,
+/// `details` are structured UI/log data, `usage`/`added_tool_names` carry
+/// per-call token accounting when the provider reports it, and `terminate`
+/// signals the loop to stop after this turn.
 #[derive(Debug, Clone)]
 pub struct AgentToolResult {
     /// Content blocks to send back to the LLM.
@@ -77,6 +79,8 @@ pub struct AgentToolResult {
     pub is_error: bool,
     /// Token usage incurred by the tool itself.
     pub usage: Option<crate::types::Usage>,
+    /// Tool names this call added to the session's allowed set.
+    pub added_tool_names: Option<Vec<String>>,
     /// When true, signals the agent loop to stop after this turn.
     pub terminate: bool,
 }
@@ -92,6 +96,7 @@ impl AgentToolResult {
             details: None,
             is_error: false,
             usage: None,
+            added_tool_names: None,
             terminate: false,
         }
     }
@@ -106,6 +111,7 @@ impl AgentToolResult {
             details: None,
             is_error: true,
             usage: None,
+            added_tool_names: None,
             terminate: false,
         }
     }
@@ -385,8 +391,7 @@ async fn execute_one(
             sink.emit(AgentEvent::ToolExecutionEnd {
                 tool_call_id: id.clone(),
                 tool_name: name.clone(),
-                result: result.content.clone(),
-                is_error: result.is_error,
+                result: result.clone(),
             });
             return ExecutedToolCall {
                 tool_call_id: id,
@@ -406,8 +411,7 @@ async fn execute_one(
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
             tool_name: name.clone(),
-            result: result.content.clone(),
-            is_error: result.is_error,
+            result: result.clone(),
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -428,8 +432,7 @@ async fn execute_one(
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
             tool_name: name.clone(),
-            result: result.content.clone(),
-            is_error: result.is_error,
+            result: result.clone(),
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -448,8 +451,7 @@ async fn execute_one(
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
             tool_name: name.clone(),
-            result: result.content.clone(),
-            is_error: result.is_error,
+            result: result.clone(),
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -484,8 +486,7 @@ async fn execute_one(
     sink.emit(AgentEvent::ToolExecutionEnd {
         tool_call_id: id.clone(),
         tool_name: name.clone(),
-        result: result.content.clone(),
-        is_error: result.is_error,
+        result: result.clone(),
     });
 
     ExecutedToolCall {
@@ -509,6 +510,8 @@ fn make_tool_result_message(
         content: result.content.clone(),
         is_error: result.is_error,
         details: result.details.clone(),
+        usage: result.usage.clone(),
+        added_tool_names: result.added_tool_names.clone(),
         timestamp: chrono::Utc::now(),
     }
 }
@@ -840,15 +843,14 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 result,
-                is_error,
-            } if tool_call_id == "call_1" => Some((tool_name, result, is_error)),
+            } if tool_call_id == "call_1" => Some((tool_name, result)),
             _ => None,
         });
-        let (name, result, is_error) = end.expect("end payload");
+        let (name, result) = end.expect("end payload");
         assert_eq!(name, "progress");
-        assert!(!is_error, "successful call ends with is_error=false");
+        assert!(!result.is_error, "successful call ends with is_error=false");
         assert!(
-            result.iter().any(
+            result.content.iter().any(
                 |b| matches!(b, crate::types::ContentBlock::Text { text, .. } if text == "done")
             ),
             "end must carry the final result content"

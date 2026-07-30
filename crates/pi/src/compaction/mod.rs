@@ -502,11 +502,13 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "abcd".into(), // 4
                     signature: None,
+                    redacted: None,
                 },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "read".into(),                     // 4
                     input: serde_json::json!({"path": "x"}), // 12
+                    thought_signature: None,
                 },
             ],
             model: "test".into(),
@@ -533,6 +535,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         };
         assert_eq!(estimate_tokens(&result), 2);

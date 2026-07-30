@@ -214,7 +214,9 @@ fn assistant_param(blocks: &[ContentBlock], reasoning_backfill: bool) -> Option<
                 text: t,
                 signature: None,
             } => text.push_str(t),
-            ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCallParam {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => tool_calls.push(ToolCallParam {
                 id: id.clone(),
                 kind: "function",
                 function: ToolCallFunctionParam {
@@ -370,6 +372,8 @@ mod tests {
             content,
             is_error,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -446,6 +450,8 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig".into()),
+
+                redacted: None,
             },
             ContentBlock::Text {
                 text: "answer".into(),
@@ -472,6 +478,8 @@ mod tests {
         let msg = assistant(vec![ContentBlock::Thinking {
             thinking: "hmm".into(),
             signature: None,
+
+            redacted: None,
         }]);
         let v = request(&ctx(
             vec![user("q"), msg, user("again")],
@@ -498,6 +506,7 @@ mod tests {
                 id: "t1".into(),
                 name: "read".into(),
                 input: json!({"path": "x"}),
+                thought_signature: None,
             },
         ]);
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
@@ -547,6 +556,7 @@ mod tests {
             id: "t1".into(),
             name: "read".into(),
             input: json!({"path": "x"}),
+            thought_signature: None,
         }]);
         let v = request(&ctx(vec![user("q"), orphan], ThinkingKind::None, None));
         let msgs = v["messages"].as_array().unwrap();

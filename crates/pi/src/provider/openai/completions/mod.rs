@@ -330,6 +330,7 @@ impl Accumulator {
                 self.blocks.push(ContentBlock::Thinking {
                     thinking: String::new(),
                     signature: None,
+                    redacted: None,
                 });
                 let i = self.blocks.len() - 1;
                 self.open_thinking = Some(i);
@@ -348,6 +349,7 @@ impl Accumulator {
                 id: String::new(),
                 name: String::new(),
                 input: JsonValue::Null,
+                thought_signature: None,
             });
             self.tool_calls.push(ToolCallAcc {
                 block_index,
@@ -542,7 +544,7 @@ mod tests {
         };
         assert_eq!(content.len(), 2);
         assert!(
-            matches!(&content[0], ContentBlock::Thinking { thinking, signature }
+            matches!(&content[0], ContentBlock::Thinking { thinking, signature, .. }
             if thinking == "let me think" && signature.is_none())
         );
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
@@ -626,7 +628,9 @@ mod tests {
         assert_eq!(*stop_reason, Some(StopReason::ToolUse));
         assert_eq!(content.len(), 2);
         match &content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "c1");
                 assert_eq!(name, "read");
                 assert_eq!(*input, serde_json::json!({"path": "x"}));
@@ -634,7 +638,9 @@ mod tests {
             other => panic!("expected tool_use, got {other:?}"),
         }
         match &content[1] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "c2");
                 assert_eq!(name, "bash");
                 assert_eq!(*input, serde_json::json!({"cmd": "ls"}));
