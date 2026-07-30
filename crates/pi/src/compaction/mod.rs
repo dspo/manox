@@ -6,7 +6,7 @@
 
 pub mod branch_summarization;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -287,31 +287,75 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
     find_safe_cut(messages, cut)
 }
 
-/// Adjust the cut point to a safe boundary.
+/// Adjust the cut point to the first safe boundary at or after the candidate.
 ///
-/// A safe boundary is one where the retained tail starts on a `User` or
-/// `Assistant` — the only messages that both a provider accepts as the first
-/// message of a request and that cannot orphan a later `ToolResult`. Cutting
-/// at a `ToolResult` orphans its own `ToolUse` (summarized into the prefix);
-/// cutting at a `Custom` can orphan a later `ToolResult` whose `ToolUse` sits
-/// before the `Custom`. `Custom` is an unconstrained extension point —
-/// `repair_tool_flow` shows it can legitimately appear between a `tool_use`
-/// and its synthetic result — so it is never treated as a boundary.
+/// A boundary is safe when the retained tail both starts on a message a
+/// provider accepts as the first request message (`User`, `Assistant`, or
+/// `Custom`) and contains no `ToolResult` orphaned by the cut — a result
+/// whose `ToolUse` was left behind in the summarized prefix. The tail must
+/// never start on a `ToolResult` (its `ToolUse` precedes it), and a cut must
+/// not land between a `tool_use` and its result when a `Custom` sits between
+/// them: `repair_tool_flow` shows that is a legitimate position, since a
+/// `Custom` does not close a tool turn.
 ///
-/// This is more conservative than TS `findValidCutPoints`, which lists
-/// `custom` as a valid cut: TS pairs that selection with split-turn
-/// dual-summarization (`isSplitTurn`), which this Rust compaction does not
-/// implement (see `CompactionPreparation`). Without that safety net, only a
-/// `User` or `Assistant` is a provably safe cut.
+/// This is position-dependent, not type-dependent. A `Custom` at a turn
+/// boundary orphans nothing and is retained verbatim — extension state is
+/// not silently discarded into the summary. A `Custom` mid tool chain
+/// orphans the trailing result and is advanced past, taking the result and
+/// its call together into the prefix.
+///
+/// TS `findValidCutPoints` lists `custom` as a valid cut and relies on
+/// split-turn dual-summarization (`isSplitTurn`) to rescue a mid-turn cut;
+/// this Rust compaction does not implement split-turn (see
+/// `CompactionPreparation`), so orphaning is prevented at the cut itself.
 fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
+    let tooluse_pos = tooluse_positions(messages);
+
     let mut idx = candidate.min(messages.len());
     while idx < messages.len() {
-        match &messages[idx] {
-            AgentMessage::ToolResult { .. } | AgentMessage::Custom { .. } => idx += 1,
-            _ => return idx,
+        match first_orphaned_result(messages, idx, &tooluse_pos) {
+            // A result at or after `idx` whose call precedes `idx` would be
+            // orphaned by a cut here. Advance past it so the result and its
+            // call land together in the prefix, then re-check.
+            Some(orphan) => idx = orphan + 1,
+            None => return idx,
         }
     }
     messages.len()
+}
+
+/// Map each `ToolUse` id to the position of the `Assistant` carrying it.
+fn tooluse_positions(messages: &[AgentMessage]) -> HashMap<&str, usize> {
+    let mut map: HashMap<&str, usize> = HashMap::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if let AgentMessage::Assistant { content, .. } = msg {
+            for block in content {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    map.insert(id.as_str(), i);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The first `ToolResult` at or after `idx` whose `ToolUse` precedes `idx` —
+/// the result a cut at `idx` would orphan. A result with no matching call is
+/// always orphaned (no `ToolUse` exists to retain alongside it).
+fn first_orphaned_result(
+    messages: &[AgentMessage],
+    idx: usize,
+    tooluse_pos: &HashMap<&str, usize>,
+) -> Option<usize> {
+    messages.iter().enumerate().skip(idx).find_map(|(m, msg)| {
+        let AgentMessage::ToolResult { tool_call_id, .. } = msg else {
+            return None;
+        };
+        let orphaned = tooluse_pos
+            .get(tool_call_id.as_str())
+            .is_none_or(|&j| j < idx);
+        orphaned.then_some(m)
+    })
 }
 
 /// Build a compaction prompt for the LLM.
@@ -912,14 +956,14 @@ mod tests {
         }
     }
 
-    /// A `Custom` is never a safe cut boundary. Unlike TS, this Rust
-    /// compaction does not implement split-turn dual-summarization, so cutting
-    /// at a `Custom` that sits between a `tool_use` and its result would orphan
-    /// the result. `Custom` is an unconstrained extension point —
-    /// `repair_tool_flow` shows it can legitimately appear mid tool chain — so
-    /// `find_safe_cut` advances past it to the next `User` or `Assistant`.
+    /// `find_safe_cut` is position-dependent, not type-dependent. A `Custom`
+    /// mid tool chain (between a `tool_use` and its result — the shape
+    /// `repair_tool_flow` can produce) orphans the trailing result and is
+    /// advanced past. A `Custom` at a turn boundary orphans nothing and is
+    /// retained verbatim — recent extension state is not discarded into the
+    /// summary.
     #[test]
-    fn find_safe_cut_advances_past_custom() {
+    fn find_safe_cut_retains_safe_custom_skips_orphaning_one() {
         fn custom() -> AgentMessage {
             AgentMessage::Custom {
                 custom_type: "note".into(),
@@ -932,10 +976,9 @@ mod tests {
             }
         }
 
-        // Custom between a tool_use assistant and its result — the exact
-        // shape `repair_tool_flow` can produce. Cutting at the Custom would
-        // orphan the result; find_safe_cut advances past both the Custom and
-        // the result to the trailing user.
+        // Mid-chain Custom between a tool_use and its result: a cut here
+        // would orphan the result, so find_safe_cut advances past both the
+        // Custom and the result to the trailing user.
         let mid_chain = vec![
             make_tool_use_assistant("c1", "read", "a.rs"),
             custom(),
@@ -944,10 +987,16 @@ mod tests {
         ];
         assert_eq!(find_safe_cut(&mid_chain, 1), 3);
 
-        // A Custom at a turn boundary is still advanced past — the safe cut is
-        // the following user, never the Custom itself.
-        let at_boundary = vec![make_user("q"), make_assistant("a"), custom(), make_user("q2")];
-        assert_eq!(find_safe_cut(&at_boundary, 2), 3);
+        // Turn-boundary Custom: no result after it has its call before it,
+        // so cutting here orphans nothing — the Custom is retained, not
+        // summarized away.
+        let at_boundary = vec![
+            make_user("q"),
+            make_assistant("a"),
+            custom(),
+            make_user("q2"),
+        ];
+        assert_eq!(find_safe_cut(&at_boundary, 2), 2);
     }
 
     #[test]
