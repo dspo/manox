@@ -62,18 +62,9 @@ pub async fn run_loop(
     let signal = signal.unwrap_or_default();
     let mut new_messages: Vec<AgentMessage> = prompts.to_vec();
 
-    // Announce each initial prompt as a settled message so consumers see a
-    // MessageStart/MessageEnd pair for the user turn, mirroring TS Pi.
-    for msg in prompts {
-        sink.emit(AgentEvent::MessageStart {
-            message: Box::new(msg.clone()),
-        });
-        sink.emit(AgentEvent::MessageEnd {
-            message: Box::new(msg.clone()),
-        });
-    }
-
-    // Prepend prompts to the context.
+    // Prepend prompts to the context. Their MessageStart/MessageEnd lifecycle
+    // is emitted inside the first turn (after AgentStart/TurnStart), matching
+    // TS Pi's event order — a consumer never sees a prompt outside its run.
     let mut current_messages: Vec<AgentMessage> = context.messages.clone();
     current_messages.extend_from_slice(prompts);
     context.messages = current_messages;
@@ -163,6 +154,20 @@ async fn run_loop_inner(
 
             sink.emit(AgentEvent::TurnStart);
             turn_count += 1;
+
+            // On the first turn, announce the initial prompt messages after
+            // AgentStart/TurnStart so they belong to the run and turn that
+            // consume them, mirroring TS Pi's event order.
+            if turn_count == 1 {
+                for msg in new_messages.iter() {
+                    sink.emit(AgentEvent::MessageStart {
+                        message: Box::new(msg.clone()),
+                    });
+                    sink.emit(AgentEvent::MessageEnd {
+                        message: Box::new(msg.clone()),
+                    });
+                }
+            }
 
             // Inject pending steering messages before the next assistant response.
             if !pending_messages.is_empty() {
@@ -1160,6 +1165,36 @@ mod tests {
         });
         assert!(has_user_start, "initial prompt must emit MessageStart");
         assert!(has_user_end, "initial prompt must emit MessageEnd");
+
+        // TS Pi orders the run/turn lifecycle before the user message: the
+        // first MessageStart for a user prompt must follow AgentStart and the
+        // first TurnStart.
+        let user_start_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::MessageStart { message }
+                        if matches!(**message, AgentMessage::User { .. })
+                )
+            })
+            .expect("a user MessageStart");
+        let agent_start_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::AgentStart))
+            .expect("an AgentStart");
+        let turn_start_idx = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::TurnStart))
+            .expect("a TurnStart");
+        assert!(
+            agent_start_idx < user_start_idx,
+            "AgentStart must precede the user MessageStart"
+        );
+        assert!(
+            turn_start_idx < user_start_idx,
+            "TurnStart must precede the user MessageStart"
+        );
     }
 
     // ── #366: before/after tool call hooks ────────────────────────────────────
