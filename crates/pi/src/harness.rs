@@ -614,7 +614,9 @@ impl<S: SessionStorage> AgentHarness<S> {
                 )
             }
             None => {
-                let (summary, usage) = self.summarize_via_model(compacted).await?;
+                let (summary, usage) = self
+                    .summarize_via_model(compacted, custom_instructions)
+                    .await?;
                 (
                     summary,
                     first_kept_entry_id,
@@ -710,8 +712,9 @@ impl<S: SessionStorage> AgentHarness<S> {
     async fn summarize_via_model(
         &mut self,
         compacted: &[AgentMessage],
+        custom_instructions: Option<&str>,
     ) -> Result<(String, Option<Usage>), anyhow::Error> {
-        let prompt = compaction::build_compaction_prompt(compacted, None);
+        let prompt = compaction::build_compaction_prompt(compacted, None, custom_instructions);
         let summary_context = AgentContext {
             system_prompt:
                 "You compress a coding agent's conversation history into a concise summary.".into(),
@@ -797,7 +800,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         }
 
         let compacted = &messages[..cut_point];
-        let prompt = compaction::build_compaction_prompt(compacted, None);
+        let prompt = compaction::build_compaction_prompt(compacted, None, None);
         Some((prompt, cut_point))
     }
 }
@@ -1646,6 +1649,84 @@ mod tests {
         assert!(
             !branch_entries.is_empty(),
             "branchEntries holds the session entries of the branch"
+        );
+    }
+
+    /// `compact(Some(_))` folds custom instructions into the summarization
+    /// prompt on the default (no-override) path — they must not be silently
+    /// dropped merely because no hook supplied a summary.
+    #[tokio::test]
+    async fn test_compact_custom_instructions_reach_summarization_prompt() {
+        use std::sync::Mutex;
+
+        struct CaptureStreamFn {
+            seen: Arc<Mutex<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StreamFn for CaptureStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if let Some(AgentMessage::User { content, .. }) = context.messages.first() {
+                    for b in content {
+                        if let ContentBlock::Text { text, .. } = b {
+                            *self.seen.lock().unwrap() = text.clone();
+                        }
+                    }
+                }
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "summary".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let seen = Arc::new(Mutex::new(String::new()));
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CaptureStreamFn {
+                seen: Arc::clone(&seen),
+            }),
+        );
+        // A transcript large enough to compact a non-empty prefix past the
+        // keep-recent budget, so the summarization model is actually invoked.
+        let long = "x".repeat(2048);
+        harness.prompt(&long).await.unwrap();
+        harness.prompt(&long).await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 600,
+            ..Default::default()
+        });
+
+        harness
+            .compact(Some("emphasize the auth module"))
+            .await
+            .expect("compact");
+
+        let prompt = seen.lock().unwrap().clone();
+        assert!(
+            prompt.contains("Additional focus: emphasize the auth module"),
+            "custom instructions reach the summarization prompt, not dropped: {prompt}"
         );
     }
 

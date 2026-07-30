@@ -318,6 +318,7 @@ fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
 pub fn build_compaction_prompt(
     compacted_messages: &[AgentMessage],
     existing_summary: Option<&str>,
+    custom_instructions: Option<&str>,
 ) -> String {
     let prefix = if let Some(summary) = existing_summary {
         format!(
@@ -361,6 +362,14 @@ pub fn build_compaction_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    // Caller-supplied focus is appended after the conversation, mirroring the
+    // TS `Additional focus: ${customInstructions}` so the summarization model
+    // weights it instead of silently dropping it.
+    let additional_focus = match custom_instructions {
+        Some(ci) if !ci.trim().is_empty() => format!("\n\nAdditional focus: {ci}"),
+        _ => String::new(),
+    };
+
     format!(
         "{prefix}\
         You are summarizing a coding agent's conversation history to save context space. \
@@ -372,7 +381,7 @@ pub fn build_compaction_prompt(
         5. Any unfinished work or next steps\n\n\
         Do NOT repeat the full conversation. Focus on information that would be \
         essential for continuing the work without losing context.\n\n\
-        <conversation>\n{messages_text}\n</conversation>"
+        <conversation>\n{messages_text}\n</conversation>{additional_focus}"
     )
 }
 
@@ -769,9 +778,24 @@ mod tests {
             make_user("Write a hello world program"),
             make_assistant("I'll create a main.rs file with a hello world program."),
         ];
-        let prompt = build_compaction_prompt(&msgs, None);
+        let prompt = build_compaction_prompt(&msgs, None, None);
         assert!(prompt.contains("Write a hello world program"));
         assert!(prompt.contains("main.rs"));
         assert!(prompt.contains("summarizing a coding agent"));
+        // No custom instructions → no focus line.
+        assert!(!prompt.contains("Additional focus"));
+    }
+
+    #[test]
+    fn test_build_compaction_prompt_folds_custom_instructions() {
+        let msgs = vec![make_user("discuss the auth module")];
+        let prompt = build_compaction_prompt(&msgs, None, Some("prioritize token usage"));
+        assert!(
+            prompt.contains("Additional focus: prioritize token usage"),
+            "custom instructions are appended as a focus line: {prompt}"
+        );
+        // Whitespace-only instructions are dropped, not emitted as an empty focus.
+        let prompt = build_compaction_prompt(&msgs, None, Some("   \n\t"));
+        assert!(!prompt.contains("Additional focus"));
     }
 }
