@@ -71,8 +71,14 @@ pub struct FileOperations {
 /// The compaction preparation handed to the `session_before_compact` hook:
 /// the exact messages being summarized and kept, plus the surrounding context
 /// the summarization folds in (previous summary, file operations, settings).
-/// Mirrors the TS `CompactionPreparation`. The Rust port never splits a turn,
-/// so `turn_prefix_messages` is always empty and `is_split_turn` is false.
+///
+/// This is a *partial* mirror of the TS `CompactionPreparation`: split-turn
+/// compaction is not implemented (the Rust cut always lands on a whole-turn
+/// boundary), so `turn_prefix_messages` is always empty and `is_split_turn` is
+/// always false. A single turn that exceeds the keep-recent window is kept
+/// intact rather than split-and-merged; closing that gap is tracked separately
+/// — half-implementing the cut without the dual summarization would drop the
+/// prefix messages, so the field stays structurally present but inert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPreparation {
@@ -393,6 +399,10 @@ pub fn build_compaction_prompt(
 /// The previous compaction's summary (if the path starts at one) becomes
 /// `previous_summary`, and file operations are extracted from the summarized
 /// region plus any prior non-hook compaction's recorded file lists.
+///
+/// Split-turn is not implemented (see [`CompactionPreparation`]); the cut stays
+/// on a whole-turn boundary, so `turn_prefix_messages` is empty and
+/// `is_split_turn` is false.
 pub fn build_preparation(
     branch: &[SessionTreeEntry],
     messages: &[AgentMessage],
@@ -487,6 +497,45 @@ fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut FileOperation
                 _ => {}
             }
         }
+    }
+}
+
+/// Compute the sorted read-only and modified file lists from accumulated
+/// operations, mirroring the TS `computeFileLists`: modified = edited ∪
+/// written; readFiles = read minus modified.
+pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
+    let modified: BTreeSet<String> = file_ops.edited.union(&file_ops.written).cloned().collect();
+    let read_files: Vec<String> = file_ops
+        .read
+        .iter()
+        .filter(|f| !modified.contains(*f))
+        .cloned()
+        .collect();
+    let modified_files: Vec<String> = modified.into_iter().collect();
+    (read_files, modified_files)
+}
+
+/// Format the file lists as summary metadata tags, mirroring the TS
+/// `formatFileOperations`. Returns the empty string when there are no files,
+/// so the summary text is unchanged when no tool touched a file.
+pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !read_files.is_empty() {
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", sections.join("\n\n"))
     }
 }
 
@@ -797,5 +846,48 @@ mod tests {
         // Whitespace-only instructions are dropped, not emitted as an empty focus.
         let prompt = build_compaction_prompt(&msgs, None, Some("   \n\t"));
         assert!(!prompt.contains("Additional focus"));
+    }
+
+    #[test]
+    fn test_build_compaction_prompt_folds_previous_summary() {
+        let msgs = vec![make_user("continue the work")];
+        let prompt = build_compaction_prompt(&msgs, Some("prior session covered the API"), None);
+        assert!(
+            prompt.contains("Here is a summary of the earlier conversation"),
+            "previous summary is surfaced as context: {prompt}"
+        );
+        assert!(
+            prompt.contains("<summary>\nprior session covered the API\n</summary>"),
+            "the previous summary text is embedded verbatim: {prompt}"
+        );
+        // Absent previous summary leaves no stale summary block.
+        let prompt = build_compaction_prompt(&msgs, None, None);
+        assert!(!prompt.contains("Here is a summary of the earlier conversation"));
+    }
+
+    #[test]
+    fn test_compute_file_lists_splits_read_and_modified() {
+        let mut ops = FileOperations::default();
+        ops.read.insert("a.rs".into());
+        ops.read.insert("b.rs".into());
+        ops.edited.insert("a.rs".into());
+        ops.written.insert("c.rs".into());
+
+        let (read, modified) = compute_file_lists(&ops);
+        // `a.rs` is both read and edited → modified wins, leaves read-only.
+        assert_eq!(read, vec!["b.rs".to_string()]);
+        assert_eq!(modified, vec!["a.rs".to_string(), "c.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_format_file_operations_empty_when_no_files() {
+        assert_eq!(format_file_operations(&[], &[]), "");
+        let block = format_file_operations(
+            &["a.rs".to_string()],
+            &["b.rs".to_string(), "c.rs".to_string()],
+        );
+        assert!(block.starts_with("\n\n"));
+        assert!(block.contains("<read-files>\na.rs\n</read-files>"));
+        assert!(block.contains("<modified-files>\nb.rs\nc.rs\n</modified-files>"));
     }
 }
