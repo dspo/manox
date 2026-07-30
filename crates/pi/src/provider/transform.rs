@@ -94,8 +94,13 @@ mod tests {
             content,
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
-            usage: Usage::default(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }

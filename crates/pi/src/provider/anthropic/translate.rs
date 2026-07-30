@@ -695,8 +695,13 @@ mod tests {
             }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
-            stop_reason: Some(StopReason::EndTurn),
-            usage: Usage::default(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         let c = ctx(vec![text_assistant], ThinkingKind::None, None);
