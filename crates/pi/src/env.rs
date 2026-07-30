@@ -65,11 +65,8 @@ pub trait ExecutionEnv: Send + Sync {
     async fn remove(&self, path: &Path) -> Result<(), FileError>;
 
     /// Execute a shell command with a timeout.
-    async fn exec(
-        &self,
-        command: &str,
-        timeout: Duration,
-    ) -> Result<CommandResult, ExecutionError>;
+    async fn exec(&self, command: &str, timeout: Duration)
+    -> Result<CommandResult, ExecutionError>;
 }
 
 /// Errors from filesystem operations.
@@ -180,11 +177,12 @@ impl ExecutionEnv for TokioExecutionEnv {
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), FileError> {
         if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| map_io_error(e, parent))?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| map_io_error(e, parent))?;
+        }
         tokio::fs::write(path, content)
             .await
             .map_err(|e| map_io_error(e, path))
@@ -255,8 +253,6 @@ impl ExecutionEnv for TokioExecutionEnv {
         command: &str,
         timeout_dur: Duration,
     ) -> Result<CommandResult, ExecutionError> {
-        
-
         tokio::time::timeout(timeout_dur, async {
             let output = tokio::process::Command::new("sh")
                 .arg("-c")

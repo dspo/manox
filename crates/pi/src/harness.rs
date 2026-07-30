@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::agent_loop::StreamFn;
-use crate::compaction::{self, CompactionSettings, CompactionResult};
+use crate::compaction::{self, CompactionResult, CompactionSettings};
 use crate::session::{Session, SessionStorage};
-use crate::types::{AgentMessage, AgentContext, Model};
+use crate::types::{AgentContext, AgentMessage, Model};
 
 /// The phases the harness can be in.
 ///
@@ -170,15 +170,9 @@ impl<S: SessionStorage> AgentHarness<S> {
     ///
     /// Returns the messages produced during this turn. The messages are
     /// also persisted to the session.
-    pub async fn prompt(
-        &mut self,
-        text: &str,
-    ) -> Result<Vec<AgentMessage>, anyhow::Error> {
+    pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
-            anyhow::bail!(
-                "Cannot prompt while harness is in {:?} phase",
-                self.phase
-            );
+            anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
         }
 
         self.phase = AgentHarnessPhase::Turn;
@@ -231,10 +225,7 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Continue from the current transcript.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
-            anyhow::bail!(
-                "Cannot continue while harness is in {:?} phase",
-                self.phase
-            );
+            anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
         }
 
         self.phase = AgentHarnessPhase::Turn;
@@ -338,7 +329,8 @@ impl<S: SessionStorage> AgentHarness<S> {
     }
 
     /// Check whether compaction is needed based on current context size.
-    pub fn needs_compaction(&self) -> bool {        let tokens = self.estimate_current_tokens();
+    pub fn needs_compaction(&self) -> bool {
+        let tokens = self.estimate_current_tokens();
         compaction::should_compact(
             tokens,
             self.model.context_window as u64,
@@ -371,15 +363,9 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// This finds the cut point, builds a compaction prompt, and returns
     /// the compaction result. The caller is responsible for calling the
     /// LLM with the compaction prompt and providing the summary.
-    pub async fn compact(
-        &mut self,
-        summary: &str,
-    ) -> Result<CompactionResult, anyhow::Error> {
+    pub async fn compact(&mut self, summary: &str) -> Result<CompactionResult, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
-            anyhow::bail!(
-                "Cannot compact while harness is in {:?} phase",
-                self.phase
-            );
+            anyhow::bail!("Cannot compact while harness is in {:?} phase", self.phase);
         }
 
         self.phase = AgentHarnessPhase::Compaction;
@@ -393,10 +379,8 @@ impl<S: SessionStorage> AgentHarness<S> {
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
 
-        let cut_point = compaction::find_cut_point(
-            &messages,
-            self.compaction_settings.keep_recent_tokens,
-        );
+        let cut_point =
+            compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
 
         let _compacted = &messages[..cut_point];
         let kept = &messages[cut_point..];
@@ -437,12 +421,11 @@ impl<S: SessionStorage> AgentHarness<S> {
         // Run after-compact hooks.
         let _hook_ctx = self.run_hooks(
             HookPoint::SessionAfterCompact,
-            HookContext::new(HookPoint::SessionAfterCompact)
-                .with_data(serde_json::json!({
-                    "tokens_before": tokens_before,
-                    "tokens_after": tokens_after,
-                    "cut_point": cut_point,
-                })),
+            HookContext::new(HookPoint::SessionAfterCompact).with_data(serde_json::json!({
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "cut_point": cut_point,
+            })),
         );
 
         self.phase = AgentHarnessPhase::Idle;
@@ -459,10 +442,8 @@ impl<S: SessionStorage> AgentHarness<S> {
             return None;
         }
 
-        let cut_point = compaction::find_cut_point(
-            &messages,
-            self.compaction_settings.keep_recent_tokens,
-        );
+        let cut_point =
+            compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
 
         if cut_point == 0 {
             return None; // Nothing to compact.
@@ -477,10 +458,7 @@ impl<S: SessionStorage> AgentHarness<S> {
 /// The in-transcript carrier for a compaction summary: a tagged user
 /// message. Kept symmetric between compaction and restore so the summary
 /// reads identically whether it was just written or rebuilt from storage.
-fn summary_message(
-    summary: &str,
-    timestamp: chrono::DateTime<chrono::Utc>,
-) -> AgentMessage {
+fn summary_message(summary: &str, timestamp: chrono::DateTime<chrono::Utc>) -> AgentMessage {
     AgentMessage::User {
         content: vec![crate::types::ContentBlock::Text {
             text: format!(
@@ -572,7 +550,13 @@ mod tests {
             Ok(())
         }
         async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
-            Ok(self.entries.lock().unwrap().iter().find(|e| e.id() == id).cloned())
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id() == id)
+                .cloned())
         }
         async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
             Ok(self.leaf_id.lock().unwrap().clone())

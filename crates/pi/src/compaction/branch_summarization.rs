@@ -51,10 +51,7 @@ pub fn build_branch_summary_prompt(
 ) -> String {
     let files_list = if changed_files.len() > 50 {
         let mut truncated = changed_files[..50].to_vec();
-        truncated.push(format!(
-            "... and {} more files",
-            changed_files.len() - 50
-        ));
+        truncated.push(format!("... and {} more files", changed_files.len() - 50));
         truncated.join("\n")
     } else {
         changed_files.join("\n")

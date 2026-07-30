@@ -34,10 +34,7 @@ pub struct ProjectContext {
 
 /// Build the full system prompt by combining the base template with
 /// project context.
-pub fn build_system_prompt(
-    base_instructions: Option<&str>,
-    project: &ProjectContext,
-) -> String {
+pub fn build_system_prompt(base_instructions: Option<&str>, project: &ProjectContext) -> String {
     let instructions = base_instructions.unwrap_or(BASE_PROMPT);
 
     let mut parts = vec![instructions.to_string()];
@@ -53,9 +50,10 @@ pub fn build_system_prompt(
     }
 
     if let Some(ref status) = project.git_status
-        && !status.is_empty() {
-            context.push_str(&format!("\nGit status:\n{status}"));
-        }
+        && !status.is_empty()
+    {
+        context.push_str(&format!("\nGit status:\n{status}"));
+    }
 
     context.push_str("\n</project_context>");
     parts.push(context);
@@ -84,9 +82,10 @@ pub fn find_project_instructions(cwd: &Path) -> Option<String> {
     for candidate in &candidates {
         let path = cwd.join(candidate);
         if path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path) {
-                return Some(content);
-            }
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            return Some(content);
+        }
     }
 
     None

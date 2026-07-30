@@ -23,12 +23,12 @@ use std::collections::HashMap;
 
 use serde_json::Value as JsonValue;
 
+use super::wire::*;
 use crate::provider::openai::clamp_cache_key;
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
     ThinkingKind,
 };
-use super::wire::*;
 
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesParams {
@@ -109,7 +109,11 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
     // The system prompt leads as a convenient-form message; reasoning models
     // take it under the developer role.
     if !context.system_prompt.is_empty() {
-        let role = if context.model.supports_thinking() { "developer" } else { "system" };
+        let role = if context.model.supports_thinking() {
+            "developer"
+        } else {
+            "system"
+        };
         items.push(InputItem::Message(InputMessage {
             role,
             content: InputMessageContent::Text(context.system_prompt.clone()),
@@ -135,7 +139,12 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
                     content: InputMessageContent::Parts(parts),
                 }));
             }
-            AgentMessage::Assistant { content, model, provider, .. } => {
+            AgentMessage::Assistant {
+                content,
+                model,
+                provider,
+                ..
+            } => {
                 let before = items.len();
                 convert_assistant(
                     &mut items,
@@ -150,9 +159,17 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
                     continue;
                 }
             }
-            AgentMessage::ToolResult { tool_call_id, content, .. } => {
+            AgentMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
                 let effective = id_map.get(tool_call_id).unwrap_or(tool_call_id).clone();
-                let call_id = effective.split('|').next().unwrap_or(&effective).to_string();
+                let call_id = effective
+                    .split('|')
+                    .next()
+                    .unwrap_or(&effective)
+                    .to_string();
                 items.push(InputItem::Item(OutputItem::FunctionCallOutput {
                     call_id,
                     output: tool_result_output(content),
@@ -187,7 +204,10 @@ fn convert_assistant(
 
     for block in content {
         match block {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 if same_model {
                     // Verbatim replay; the signature IS the reasoning item.
                     if let Some(sig) = signature
@@ -204,7 +224,11 @@ fn convert_assistant(
             ContentBlock::Text { text, signature } => {
                 // Cross-model replay drops the text identity: the id and
                 // phase belong to the other model's turn.
-                let signature = if same_model { signature.as_deref() } else { None };
+                let signature = if same_model {
+                    signature.as_deref()
+                } else {
+                    None
+                };
                 push_text_item(items, text, signature, msg_index, &mut text_block_index);
             }
             ContentBlock::ToolUse { id, name, input } => {
@@ -293,7 +317,10 @@ fn user_part(block: &ContentBlock) -> Option<InputPart> {
                 }
                 ImageSource::Url { url } => url.clone(),
             };
-            Some(InputPart::Image { image_url: url, detail: "auto" })
+            Some(InputPart::Image {
+                image_url: url,
+                detail: "auto",
+            })
         }
         _ => None,
     }
@@ -315,7 +342,10 @@ fn tool_result_output(blocks: &[ContentBlock]) -> FunctionOutput {
                     }
                     ImageSource::Url { url } => url.clone(),
                 };
-                images.push(InputPart::Image { image_url: url, detail: "auto" });
+                images.push(InputPart::Image {
+                    image_url: url,
+                    detail: "auto",
+                });
             }
             _ => {}
         }
@@ -332,7 +362,9 @@ fn tool_result_output(blocks: &[ContentBlock]) -> FunctionOutput {
     if !joined.is_empty() {
         parts.push(InputPart::Text { text: joined });
     } else {
-        parts.push(InputPart::Text { text: "(see attached image)".to_string() });
+        parts.push(InputPart::Text {
+            text: "(see attached image)".to_string(),
+        });
     }
     parts.extend(images);
     FunctionOutput::Parts(parts)
@@ -377,7 +409,13 @@ fn normalize_tool_call_id(id: &str, model_provider: &str, source_provider: &str)
 fn normalize_id_part(part: &str) -> String {
     let sanitized: String = part
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let truncated: String = sanitized.chars().take(64).collect();
     truncated.trim_end_matches('_').to_string()
@@ -421,12 +459,8 @@ pub fn short_hash(s: &str) -> String {
         h1 = (h1 ^ unit as u32).wrapping_mul(2654435761);
         h2 = (h2 ^ unit as u32).wrapping_mul(1597334677);
     }
-    h1 = (h1 ^ (h1 >> 16))
-        .wrapping_mul(2246822507)
-        ^ (h2 ^ (h2 >> 13)).wrapping_mul(3266489909);
-    h2 = (h2 ^ (h2 >> 16))
-        .wrapping_mul(2246822507)
-        ^ (h1 ^ (h1 >> 13)).wrapping_mul(3266489909);
+    h1 = (h1 ^ (h1 >> 16)).wrapping_mul(2246822507) ^ (h2 ^ (h2 >> 13)).wrapping_mul(3266489909);
+    h2 = (h2 ^ (h2 >> 16)).wrapping_mul(2246822507) ^ (h1 ^ (h1 >> 13)).wrapping_mul(3266489909);
     format!("{}{}", to_base36(h2), to_base36(h1))
 }
 
@@ -454,11 +488,17 @@ fn to_base36(mut n: u32) -> String {
 /// total, taken verbatim.
 pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
     let (cached, written) = match &wire.input_tokens_details {
-        Some(d) => (d.cached_tokens.unwrap_or(0), d.cache_write_tokens.unwrap_or(0)),
+        Some(d) => (
+            d.cached_tokens.unwrap_or(0),
+            d.cache_write_tokens.unwrap_or(0),
+        ),
         None => (0, 0),
     };
     crate::types::Usage {
-        input_tokens: wire.input_tokens.unwrap_or(0).saturating_sub(cached + written),
+        input_tokens: wire
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_sub(cached + written),
         output_tokens: wire.output_tokens.unwrap_or(0),
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: written,
@@ -517,10 +557,17 @@ mod tests {
     }
 
     fn text(s: &str) -> ContentBlock {
-        ContentBlock::Text { text: s.into(), signature: None }
+        ContentBlock::Text {
+            text: s.into(),
+            signature: None,
+        }
     }
 
-    fn ctx(messages: Vec<AgentMessage>, thinking: ThinkingKind, level: Option<&str>) -> AgentContext {
+    fn ctx(
+        messages: Vec<AgentMessage>,
+        thinking: ThinkingKind,
+        level: Option<&str>,
+    ) -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
@@ -543,8 +590,16 @@ mod tests {
     fn level_turns_reasoning_on_for_both_kinds() {
         for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
             let v = request(&ctx(vec![user("hi")], kind, Some("high")));
-            assert_eq!(v["reasoning"], json!({"effort": "high", "summary": "auto"}), "{kind:?}");
-            assert_eq!(v["include"], json!(["reasoning.encrypted_content"]), "{kind:?}");
+            assert_eq!(
+                v["reasoning"],
+                json!({"effort": "high", "summary": "auto"}),
+                "{kind:?}"
+            );
+            assert_eq!(
+                v["include"],
+                json!(["reasoning.encrypted_content"]),
+                "{kind:?}"
+            );
         }
     }
 
@@ -568,15 +623,29 @@ mod tests {
 
     #[test]
     fn request_shell_fields() {
-        let opts = StreamOptions { max_tokens: Some(4), ..Default::default() };
-        let v = serde_json::to_value(to_request(&ctx(vec![user("hi")], ThinkingKind::None, None), &opts)).unwrap();
+        let opts = StreamOptions {
+            max_tokens: Some(4),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(to_request(
+            &ctx(vec![user("hi")], ThinkingKind::None, None),
+            &opts,
+        ))
+        .unwrap();
         assert_eq!(v["store"], false);
         assert_eq!(v["stream"], true);
         // The API floor for max_output_tokens is 16.
         assert_eq!(v["max_output_tokens"], 16);
 
-        let opts = StreamOptions { max_tokens: Some(1000), ..Default::default() };
-        let v = serde_json::to_value(to_request(&ctx(vec![user("hi")], ThinkingKind::None, None), &opts)).unwrap();
+        let opts = StreamOptions {
+            max_tokens: Some(1000),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(to_request(
+            &ctx(vec![user("hi")], ThinkingKind::None, None),
+            &opts,
+        ))
+        .unwrap();
         assert_eq!(v["max_output_tokens"], 1000);
 
         let v = request(&ctx(vec![user("hi")], ThinkingKind::None, None));
@@ -611,7 +680,10 @@ mod tests {
     #[test]
     fn system_prompt_role_follows_thinking_capability() {
         let v = request(&ctx(vec![user("hi")], ThinkingKind::Enabled, Some("high")));
-        assert_eq!(v["input"][0], json!({"role": "developer", "content": "sys"}));
+        assert_eq!(
+            v["input"][0],
+            json!({"role": "developer", "content": "sys"})
+        );
 
         let v = request(&ctx(vec![user("hi")], ThinkingKind::None, None));
         assert_eq!(v["input"][0], json!({"role": "system", "content": "sys"}));
@@ -635,7 +707,10 @@ mod tests {
         };
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
         let content = &v["input"][1]["content"];
-        assert_eq!(content[0], json!({"type": "input_text", "text": "what is this"}));
+        assert_eq!(
+            content[0],
+            json!({"type": "input_text", "text": "what is this"})
+        );
         assert_eq!(
             content[1],
             json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"})
@@ -647,7 +722,10 @@ mod tests {
     #[test]
     fn same_model_text_replays_with_signature_identity() {
         let sig = encode_text_signature("msg_abc", Some("final_answer"));
-        let msg = assistant(vec![ContentBlock::Text { text: "answer".into(), signature: Some(sig) }]);
+        let msg = assistant(vec![ContentBlock::Text {
+            text: "answer".into(),
+            signature: Some(sig),
+        }]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let item = &v["input"][2];
         assert_eq!(item["type"], "message");
@@ -665,7 +743,10 @@ mod tests {
     fn cross_model_text_falls_back_to_positional_id() {
         let sig = encode_text_signature("msg_abc", Some("commentary"));
         let msg = assistant_from(
-            vec![ContentBlock::Text { text: "answer".into(), signature: Some(sig) }],
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+                signature: Some(sig),
+            }],
             "openai",
             "gpt-other",
         );
@@ -680,7 +761,10 @@ mod tests {
     fn overlong_signature_id_hashes_down() {
         let long_id = "m".repeat(100);
         let sig = encode_text_signature(&long_id, None);
-        let msg = assistant(vec![ContentBlock::Text { text: "a".into(), signature: Some(sig) }]);
+        let msg = assistant(vec![ContentBlock::Text {
+            text: "a".into(),
+            signature: Some(sig),
+        }]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let id = v["input"][2]["id"].as_str().unwrap();
         assert_eq!(id, format!("msg_{}", short_hash(&long_id)));
@@ -704,7 +788,11 @@ mod tests {
             },
             text("answer"),
         ]);
-        let v = request(&ctx(vec![user("q"), msg], ThinkingKind::Enabled, Some("high")));
+        let v = request(&ctx(
+            vec![user("q"), msg],
+            ThinkingKind::Enabled,
+            Some("high"),
+        ));
         // The reasoning item is byte-identical to the captured signature.
         assert_eq!(v["input"][2], item);
         assert_eq!(v["input"][3]["type"], "message");
@@ -716,7 +804,11 @@ mod tests {
             thinking: "hmm".into(),
             signature: None,
         }]);
-        let v = request(&ctx(vec![user("q"), msg, user("again")], ThinkingKind::None, None));
+        let v = request(&ctx(
+            vec![user("q"), msg, user("again")],
+            ThinkingKind::None,
+            None,
+        ));
         let kinds: Vec<&str> = v["input"]
             .as_array()
             .unwrap()
@@ -774,7 +866,11 @@ mod tests {
             "gpt-other",
         );
         let v = request(&ctx(
-            vec![user("q"), msg, tool_result("call_1|fc_item1", vec![text("ok")], false)],
+            vec![
+                user("q"),
+                msg,
+                tool_result("call_1|fc_item1", vec![text("ok")], false),
+            ],
             ThinkingKind::None,
             None,
         ));
@@ -821,7 +917,11 @@ mod tests {
             "claude-x",
         );
         let v = request(&ctx(
-            vec![user("q"), msg, tool_result("toolu_01AbC", vec![text("ok")], false)],
+            vec![
+                user("q"),
+                msg,
+                tool_result("toolu_01AbC", vec![text("ok")], false),
+            ],
             ThinkingKind::None,
             None,
         ));
@@ -835,7 +935,10 @@ mod tests {
     fn tool_result_output_variants_without_error_fold() {
         // Plain text joins blocks.
         let v = request(&ctx(
-            vec![user("q"), tool_result("c1", vec![text("a"), text("b")], false)],
+            vec![
+                user("q"),
+                tool_result("c1", vec![text("a"), text("b")], false),
+            ],
             ThinkingKind::None,
             None,
         ));
@@ -859,7 +962,10 @@ mod tests {
 
         // Images switch the output to parts.
         let image = ContentBlock::Image {
-            source: ImageSource::Base64 { media_type: "image/png".into(), data: "AAAA".into() },
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
         };
         let v = request(&ctx(
             vec![user("q"), tool_result("c1", vec![image], false)],
@@ -867,7 +973,10 @@ mod tests {
             None,
         ));
         let output = &v["input"][2]["output"];
-        assert_eq!(output[0], json!({"type": "input_text", "text": "(see attached image)"}));
+        assert_eq!(
+            output[0],
+            json!({"type": "input_text", "text": "(see attached image)"})
+        );
         assert_eq!(
             output[1],
             json!({"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"})
@@ -882,7 +991,11 @@ mod tests {
             input: json!({}),
         }]);
         // No tool result between the call and the next user message.
-        let v = request(&ctx(vec![user("q"), msg, user("next")], ThinkingKind::None, None));
+        let v = request(&ctx(
+            vec![user("q"), msg, user("next")],
+            ThinkingKind::None,
+            None,
+        ));
         let output = &v["input"][3];
         assert_eq!(output["type"], "function_call_output");
         assert_eq!(output["call_id"], "call_1");
@@ -954,7 +1067,10 @@ mod tests {
     fn short_hash_matches_reference_vectors() {
         assert_eq!(short_hash(""), "k4n83c7h0j2b");
         assert_eq!(short_hash("fc_abc123"), "ia5uw610gdqii");
-        assert_eq!(short_hash(&format!("msg_{}", "x".repeat(100))), "19ce5491y36to1");
+        assert_eq!(
+            short_hash(&format!("msg_{}", "x".repeat(100))),
+            "19ce5491y36to1"
+        );
         assert_eq!(short_hash("call_1234|fc_item"), "giekm16a6r65");
         assert_eq!(short_hash("toolu_01AbC"), "di6khg1qi4mhq");
     }

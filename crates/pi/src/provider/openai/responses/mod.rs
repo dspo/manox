@@ -22,8 +22,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::StreamFn;
-use crate::provider::{ProviderError, overflow, retry};
 use crate::provider::sse::SseParser;
+use crate::provider::{ProviderError, overflow, retry};
 use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
 
 use translate::{encode_text_signature, to_request, to_usage};
@@ -138,7 +138,10 @@ fn apply_payload(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<(), anyhow::Error> {
     let value: JsonValue = serde_json::from_str(payload).map_err(ProviderError::Json)?;
-    let kind = value.get("type").and_then(JsonValue::as_str).map(str::to_string);
+    let kind = value
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string);
     let Some(kind) = kind else {
         if let Ok(err) = serde_json::from_value::<WireErrorPayload>(value.clone()) {
             let detail = err
@@ -150,8 +153,7 @@ fn apply_payload(
             return Err(overflow::mid_stream(detail).into());
         }
         if value.get("message").is_some() || value.get("code").is_some() {
-            let ev: WireErrorEvent =
-                serde_json::from_value(value).map_err(ProviderError::Json)?;
+            let ev: WireErrorEvent = serde_json::from_value(value).map_err(ProviderError::Json)?;
             let detail = ev.message.unwrap_or_else(|| {
                 ev.code
                     .map(|c| format!("error code {c}"))
@@ -166,10 +168,17 @@ fn apply_payload(
 
 /// The output slot an `output_index` currently holds.
 enum Slot {
-    Thinking { block: usize },
-    Text { block: usize },
+    Thinking {
+        block: usize,
+    },
+    Text {
+        block: usize,
+    },
     /// Argument JSON accumulates raw and is parsed once the item completes.
-    ToolCall { block: usize, args_json: String },
+    ToolCall {
+        block: usize,
+        args_json: String,
+    },
 }
 
 /// Folds a stream of response events into a complete assistant message
@@ -328,14 +337,24 @@ impl Accumulator {
                     thinking: String::new(),
                     signature: None,
                 });
-                self.slots.insert(output_index, Slot::Thinking { block: self.blocks.len() - 1 });
+                self.slots.insert(
+                    output_index,
+                    Slot::Thinking {
+                        block: self.blocks.len() - 1,
+                    },
+                );
             }
             Some("message") => {
                 self.blocks.push(ContentBlock::Text {
                     text: String::new(),
                     signature: None,
                 });
-                self.slots.insert(output_index, Slot::Text { block: self.blocks.len() - 1 });
+                self.slots.insert(
+                    output_index,
+                    Slot::Text {
+                        block: self.blocks.len() - 1,
+                    },
+                );
             }
             Some("function_call") => {
                 let Ok(call) = serde_json::from_value::<WireFunctionCall>(item.clone()) else {
@@ -354,7 +373,10 @@ impl Accumulator {
                 });
                 self.slots.insert(
                     output_index,
-                    Slot::ToolCall { block: self.blocks.len() - 1, args_json: call.arguments },
+                    Slot::ToolCall {
+                        block: self.blocks.len() - 1,
+                        args_json: call.arguments,
+                    },
                 );
             }
             // Server-side items (web search, file search, ...) are not
@@ -366,7 +388,11 @@ impl Accumulator {
     /// Close a slot on `output_item.done`: the done item is authoritative
     /// for text and arguments, and it carries the identities that become
     /// the block signatures.
-    fn finalize_slot(&mut self, output_index: usize, item: &JsonValue) -> Result<(), anyhow::Error> {
+    fn finalize_slot(
+        &mut self,
+        output_index: usize,
+        item: &JsonValue,
+    ) -> Result<(), anyhow::Error> {
         if !self.slots.contains_key(&output_index) {
             self.create_slot(output_index, item);
         }
@@ -410,9 +436,16 @@ impl Accumulator {
             (Some("function_call"), Slot::ToolCall { block, args_json }) => {
                 let call: WireFunctionCall =
                     serde_json::from_value(item.clone()).map_err(ProviderError::Json)?;
-                let source = if call.arguments.is_empty() { args_json } else { call.arguments };
+                let source = if call.arguments.is_empty() {
+                    args_json
+                } else {
+                    call.arguments
+                };
                 let input = parse_arguments(&source)?;
-                if let ContentBlock::ToolUse { input: slot_input, .. } = &mut self.blocks[block] {
+                if let ContentBlock::ToolUse {
+                    input: slot_input, ..
+                } = &mut self.blocks[block]
+                {
                     *slot_input = input;
                 }
             }
@@ -486,10 +519,17 @@ impl Accumulator {
             let Some(encrypted) = item.get("encrypted_content").filter(|v| !v.is_null()) else {
                 continue;
             };
-            let Some(id) = item["id"].as_str() else { continue };
-            let Some(&block) = self.reasoning_blocks.get(id) else { continue };
+            let Some(id) = item["id"].as_str() else {
+                continue;
+            };
+            let Some(&block) = self.reasoning_blocks.get(id) else {
+                continue;
+            };
             let merged = {
-                let ContentBlock::Thinking { signature: Some(sig), .. } = &self.blocks[block]
+                let ContentBlock::Thinking {
+                    signature: Some(sig),
+                    ..
+                } = &self.blocks[block]
                 else {
                     continue;
                 };
@@ -523,7 +563,10 @@ impl Accumulator {
         for (_, slot) in std::mem::take(&mut self.slots) {
             if let Slot::ToolCall { block, args_json } = slot {
                 let input = parse_arguments(&args_json)?;
-                if let ContentBlock::ToolUse { input: slot_input, .. } = &mut self.blocks[block] {
+                if let ContentBlock::ToolUse {
+                    input: slot_input, ..
+                } = &mut self.blocks[block]
+                {
                     *slot_input = input;
                 }
             }
@@ -552,7 +595,11 @@ fn response_failure(response: &WireResponse) -> String {
         let code = error
             .code
             .as_ref()
-            .map(|c| c.as_str().map(str::to_string).unwrap_or_else(|| c.to_string()))
+            .map(|c| {
+                c.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| c.to_string())
+            })
             .unwrap_or_else(|| "unknown".to_string());
         let message = error.message.as_deref().unwrap_or("no message");
         return format!("{code}: {message}");
@@ -574,7 +621,11 @@ fn reasoning_text(item: &JsonValue) -> Option<String> {
             .iter()
             .filter_map(|p| p["text"].as_str())
             .collect();
-        if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
     };
     join("summary").or_else(|| join("content"))
 }
@@ -617,7 +668,11 @@ mod tests {
         out
     }
 
-    fn feed(acc: &mut Accumulator, tx: &mpsc::Sender<AgentEvent>, payload: &str) -> Result<(), anyhow::Error> {
+    fn feed(
+        acc: &mut Accumulator,
+        tx: &mpsc::Sender<AgentEvent>,
+        payload: &str,
+    ) -> Result<(), anyhow::Error> {
         apply_payload(acc, payload, tx)
     }
 
@@ -633,15 +688,41 @@ mod tests {
         let (tx, rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.created","response":{"id":"r1"}}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.created","response":{"id":"r1"}}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":0,"delta":", world"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#,
+        )
+        .unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":", world"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"Hello, world","annotations":[]}],"status":"completed","phase":"final_answer"}}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":10,"output_tokens":5}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":10,"output_tokens":5}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, stop_reason, usage, .. } = &msg else {
+        let AgentMessage::Assistant {
+            content,
+            stop_reason,
+            usage,
+            ..
+        } = &msg
+        else {
             panic!("expected assistant")
         };
         assert_eq!(content.len(), 1);
@@ -660,8 +741,15 @@ mod tests {
         assert_eq!(phase.as_deref(), Some("final_answer"));
 
         let events = drain(rx);
-        assert!(matches!(events.first(), Some(AgentEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::MessageStart { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageUpdate { .. }))
+        );
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
@@ -671,19 +759,50 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"let me"}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"let me"}"#,
+        )
+        .unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#,
+        )
+        .unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"let me"},{"type":"summary_text","text":"think"}],"encrypted_content":"enc1"}}"#).unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":1,"delta":"answer"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"answer"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}],"status":"completed"}}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":1,"output_tokens":1}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(content.len(), 2);
-        let ContentBlock::Thinking { thinking, signature } = &content[0] else {
+        let ContentBlock::Thinking {
+            thinking,
+            signature,
+        } = &content[0]
+        else {
             panic!("expected thinking")
         };
         // The done item's joined summary is the final text.
@@ -702,13 +821,28 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":""}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pa"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pa"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"x\"}"}"#).unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":1,"output_tokens":1}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, stop_reason, .. } = &msg else {
+        let AgentMessage::Assistant {
+            content,
+            stop_reason,
+            ..
+        } = &msg
+        else {
             panic!("expected assistant")
         };
         assert_eq!(*stop_reason, Some(StopReason::ToolUse));
@@ -727,13 +861,27 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{bad"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{bad"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":"{\"a\":1}"}}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":1,"output_tokens":1}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
-        assert!(matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == json!({"a": 1})));
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        assert!(
+            matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == json!({"a": 1}))
+        );
     }
 
     #[test]
@@ -741,10 +889,17 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","usage":{"input_tokens":1,"output_tokens":1},"output":[]}}"#).unwrap();
         let msg = acc.finish(&tx).unwrap();
-        let AgentMessage::Assistant { stop_reason, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { stop_reason, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(*stop_reason, Some(StopReason::MaxTokens));
     }
 
@@ -766,8 +921,12 @@ mod tests {
     fn error_event_becomes_midstream_error() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        let err = feed(&mut acc, &tx, r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#)
-            .unwrap_err();
+        let err = feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#,
+        )
+        .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "slow down"));
     }
@@ -776,7 +935,12 @@ mod tests {
     fn bare_error_payload_and_typeless_payloads() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        let err = feed(&mut acc, &tx, r#"{"error":{"message":"boom","type":"server_error"}}"#).unwrap_err();
+        let err = feed(
+            &mut acc,
+            &tx,
+            r#"{"error":{"message":"boom","type":"server_error"}}"#,
+        )
+        .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "boom"));
 
@@ -804,7 +968,12 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
+        )
+        .unwrap();
         let err = acc.finish(&tx).unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m.contains("terminal")));
@@ -817,14 +986,23 @@ mod tests {
 
         // The done item lacks encrypted_content (the Azure behavior).
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm"}"#).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm"}"#,
+        )
+        .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}]}}"#).unwrap();
         // The completed response carries it.
         feed(&mut acc, &tx, r#"{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}],"encrypted_content":"enc-late"}]}}"#).unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
-        let ContentBlock::Thinking { signature, .. } = &content[0] else { panic!("expected thinking") };
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        let ContentBlock::Thinking { signature, .. } = &content[0] else {
+            panic!("expected thinking")
+        };
         let stored: JsonValue = serde_json::from_str(signature.as_deref().unwrap()).unwrap();
         assert_eq!(stored["encrypted_content"], "enc-late");
     }
@@ -837,11 +1015,20 @@ mod tests {
         // A terminal event can arrive before output_item.done.
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":2}"}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":1,"output_tokens":1}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
-        assert!(matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == json!({"a": 2})));
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        assert!(
+            matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == json!({"a": 2}))
+        );
     }
 
     #[test]
@@ -851,12 +1038,29 @@ mod tests {
 
         feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#).unwrap();
         // Deltas addressing the unmodelled slot must not create blocks.
-        feed(&mut acc, &tx, r#"{"type":"response.output_text.delta","output_index":0,"delta":"stray"}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.web_search_call.searching","output_index":0}"#).unwrap();
-        feed(&mut acc, &tx, &completed(r#"{"input_tokens":1,"output_tokens":1}"#)).unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"stray"}"#,
+        )
+        .unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            r#"{"type":"response.web_search_call.searching","output_index":0}"#,
+        )
+        .unwrap();
+        feed(
+            &mut acc,
+            &tx,
+            &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert!(content.is_empty());
     }
 }

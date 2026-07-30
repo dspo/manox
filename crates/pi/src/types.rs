@@ -219,17 +219,11 @@ pub enum AgentEvent {
     /// A new turn has started.
     TurnStart,
     /// A new message has started streaming.
-    MessageStart {
-        message: Box<AgentMessage>,
-    },
+    MessageStart { message: Box<AgentMessage> },
     /// A streaming message received an update delta.
-    MessageUpdate {
-        message: Box<AgentMessage>,
-    },
+    MessageUpdate { message: Box<AgentMessage> },
     /// A message has finished streaming.
-    MessageEnd {
-        message: Box<AgentMessage>,
-    },
+    MessageEnd { message: Box<AgentMessage> },
     /// A tool call has started executing.
     ToolExecutionStart {
         tool_call_id: String,
@@ -241,9 +235,7 @@ pub enum AgentEvent {
         details: JsonValue,
     },
     /// A tool call has finished executing.
-    ToolExecutionEnd {
-        tool_call_id: String,
-    },
+    ToolExecutionEnd { tool_call_id: String },
     /// A turn has completed.
     TurnEnd {
         message: Box<AgentMessage>,
@@ -413,7 +405,6 @@ pub struct AgentLoopConfig {
     /// Maximum number of turns before forcing a stop.
     pub max_turns: Option<usize>,
 }
-
 
 // ── Agent state ─────────────────────────────────────────────────────────────
 

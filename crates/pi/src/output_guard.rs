@@ -42,9 +42,7 @@ pub fn guard_output(output: &str, config: &OutputGuardConfig) -> String {
         let head = &output[..half];
         let tail = &output[output.len() - half..];
         let skipped = output.len() - config.max_guarded_length;
-        format!(
-            "{head}\n... [{skipped} bytes omitted] ...\n{tail}"
-        )
+        format!("{head}\n... [{skipped} bytes omitted] ...\n{tail}")
     } else {
         output.to_string()
     };

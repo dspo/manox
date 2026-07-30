@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{AgentToolResult, execute_tool_calls};
-use crate::types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, ContentBlock, StopReason};
+use crate::types::{
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, StopReason,
+};
 
 /// Sink for agent lifecycle events emitted during the loop.
 pub trait EventSink: Send {
@@ -80,7 +82,10 @@ pub async fn run_loop_continue(
     if context.messages.is_empty() {
         anyhow::bail!("Cannot continue: no messages in context");
     }
-    if matches!(context.messages.last(), Some(AgentMessage::Assistant { .. })) {
+    if matches!(
+        context.messages.last(),
+        Some(AgentMessage::Assistant { .. })
+    ) {
         anyhow::bail!("Cannot continue from message role: assistant");
     }
 
@@ -141,7 +146,8 @@ async fn run_loop_inner(
             }
 
             // Stream assistant response.
-            let message = stream_assistant_response(context, signal, Arc::clone(&stream_fn), sink).await?;
+            let message =
+                stream_assistant_response(context, signal, Arc::clone(&stream_fn), sink).await?;
 
             new_messages.push(message.clone());
             context.messages.push(message.clone());
@@ -220,30 +226,33 @@ async fn run_loop_inner(
 
             // Apply next-turn context update.
             if let Some(ref prepare_next_turn) = config.prepare_next_turn
-                && let Some(updated) = prepare_next_turn(context) {
-                    *context = updated;
-                }
+                && let Some(updated) = prepare_next_turn(context)
+            {
+                *context = updated;
+            }
 
             // Check early stop.
             if let Some(ref should_stop) = config.should_stop_after_turn {
                 let last_msg = context.messages.last().cloned();
                 if let Some(last_msg) = last_msg
-                    && should_stop(&last_msg, &tool_results) {
-                        sink.emit(AgentEvent::AgentEnd {
-                            messages: new_messages.clone(),
-                        });
-                        return Ok(());
-                    }
-            }
-
-            // Check max turns.
-            if let Some(max_turns) = config.max_turns
-                && turn_count >= max_turns {
+                    && should_stop(&last_msg, &tool_results)
+                {
                     sink.emit(AgentEvent::AgentEnd {
                         messages: new_messages.clone(),
                     });
                     return Ok(());
                 }
+            }
+
+            // Check max turns.
+            if let Some(max_turns) = config.max_turns
+                && turn_count >= max_turns
+            {
+                sink.emit(AgentEvent::AgentEnd {
+                    messages: new_messages.clone(),
+                });
+                return Ok(());
+            }
 
             // Poll steering queue.
             pending_messages = config
@@ -293,9 +302,7 @@ async fn stream_assistant_response(
     let sig = signal.clone();
 
     // Spawn the stream function so it can send events concurrently.
-    let stream_handle = tokio::spawn(async move {
-        stream_fn.stream(&ctx, sig, event_tx).await
-    });
+    let stream_handle = tokio::spawn(async move { stream_fn.stream(&ctx, sig, event_tx).await });
 
     // Accumulate streaming state on the receiver side.
     let mut first = true;
@@ -411,7 +418,9 @@ mod tests {
 
     impl MockSink {
         fn new() -> Self {
-            MockSink { events: Mutex::new(Vec::new()) }
+            MockSink {
+                events: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -486,7 +495,9 @@ mod tests {
 
         let events = sink.events.lock().unwrap();
         let has_agent_start = events.iter().any(|e| matches!(e, AgentEvent::AgentStart));
-        let has_agent_end = events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. }));
+        let has_agent_end = events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentEnd { .. }));
         assert!(has_agent_start, "expected AgentStart event");
         assert!(has_agent_end, "expected AgentEnd event");
     }
@@ -538,9 +549,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentTool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes input" }
-        fn is_read_only(&self) -> bool { true }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes input"
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
         fn parameters_schema(&self) -> JsonValue {
             serde_json::json!({
                 "type": "object",
@@ -619,10 +636,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![
-            tool_call_msg,
-            text_msg,
-        ]));
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg, text_msg]));
 
         let result = run_loop(
             &[AgentMessage::user("echo hello")],
@@ -638,9 +652,9 @@ mod tests {
         let messages = result.unwrap();
 
         // Should have: user, assistant(tool_call), tool_result, assistant(text)
-        let has_tool_result = messages.iter().any(|m| {
-            matches!(m, AgentMessage::ToolResult { .. })
-        });
+        let has_tool_result = messages
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult { .. }));
         assert!(has_tool_result, "expected a tool result message");
 
         let has_tool_call = messages.iter().any(|m| {
@@ -649,8 +663,14 @@ mod tests {
         assert!(has_tool_call, "expected a tool call message");
 
         let events = sink.events.lock().unwrap();
-        let turn_count = events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count();
-        assert!(turn_count >= 2, "expected at least 2 turns, got {turn_count}");
+        let turn_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count();
+        assert!(
+            turn_count >= 2,
+            "expected at least 2 turns, got {turn_count}"
+        );
     }
 
     // ── Truncation safety: stop_reason == Length fails all tool calls ────────
@@ -709,16 +729,27 @@ mod tests {
         let messages = result.unwrap();
 
         // The tool call should have been failed with an error result.
-        let tool_result = messages.iter().find(|m| {
-            matches!(m, AgentMessage::ToolResult { .. })
-        });
+        let tool_result = messages
+            .iter()
+            .find(|m| matches!(m, AgentMessage::ToolResult { .. }));
         assert!(tool_result.is_some(), "expected a tool result message");
 
-        if let Some(AgentMessage::ToolResult { is_error, content, .. }) = tool_result {
+        if let Some(AgentMessage::ToolResult {
+            is_error, content, ..
+        }) = tool_result
+        {
             assert!(is_error, "truncated tool call should be an error");
-            let text = content.iter().filter_map(|b| {
-                if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
-            }).collect::<Vec<_>>().join("");
+            let text = content
+                .iter()
+                .filter_map(|b| {
+                    if let ContentBlock::Text { text, .. } = b {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
             assert!(
                 text.contains("output token limit") || text.contains("truncated"),
                 "error should mention truncation, got: {text}"
@@ -769,8 +800,14 @@ mod tests {
         assert!(result.is_ok());
         let messages = result.unwrap();
         // The user message was prepended, but no assistant message should be produced.
-        let assistant_count = messages.iter().filter(|m| matches!(m, AgentMessage::Assistant { .. })).count();
-        assert_eq!(assistant_count, 0, "aborted loop should not produce assistant messages");
+        let assistant_count = messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .count();
+        assert_eq!(
+            assistant_count, 0,
+            "aborted loop should not produce assistant messages"
+        );
     }
 
     // ── Follow-up messages: outer loop continues ─────────────────────────────
@@ -837,12 +874,25 @@ mod tests {
         let messages = result.unwrap();
 
         // Should have: user(initial), assistant, user(follow-up), assistant
-        let user_count = messages.iter().filter(|m| matches!(m, AgentMessage::User { .. })).count();
+        let user_count = messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::User { .. }))
+            .count();
         assert_eq!(user_count, 2, "expected 2 user messages, got {user_count}");
 
-        let assistant_count = messages.iter().filter(|m| matches!(m, AgentMessage::Assistant { .. })).count();
-        assert_eq!(assistant_count, 2, "expected 2 assistant messages, got {assistant_count}");
+        let assistant_count = messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .count();
+        assert_eq!(
+            assistant_count, 2,
+            "expected 2 assistant messages, got {assistant_count}"
+        );
 
-        assert_eq!(follow_up_count.load(Ordering::SeqCst), 1, "follow-up should have been triggered once");
+        assert_eq!(
+            follow_up_count.load(Ordering::SeqCst),
+            1,
+            "follow-up should have been triggered once"
+        );
     }
 }

@@ -243,7 +243,10 @@ mod tests {
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
         storage.set_leaf_id(Some("entry-42")).await.unwrap();
-        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("entry-42".into()));
+        assert_eq!(
+            storage.get_leaf_id().await.unwrap(),
+            Some("entry-42".into())
+        );
 
         storage.set_leaf_id(None).await.unwrap();
         assert!(storage.get_leaf_id().await.unwrap().is_none());
@@ -334,10 +337,7 @@ mod tests {
         storage.append_entry(&post).await.unwrap();
         storage.set_leaf_id(Some("post")).await.unwrap();
 
-        let path = storage
-            .get_path_to_root_or_compaction(None)
-            .await
-            .unwrap();
+        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
 
         // Should include compaction and post, but NOT pre (stopped at compaction).
         assert_eq!(path.len(), 2);
@@ -382,9 +382,18 @@ mod tests {
             message: AgentMessage::user("root"),
         };
         storage.append_entry(&root).await.unwrap();
-        storage.append_entry(&compaction("compA", "root", 1)).await.unwrap();
-        storage.append_entry(&message("postA", "compA", 2)).await.unwrap();
-        storage.append_entry(&compaction("compB", "root", 3)).await.unwrap();
+        storage
+            .append_entry(&compaction("compA", "root", 1))
+            .await
+            .unwrap();
+        storage
+            .append_entry(&message("postA", "compA", 2))
+            .await
+            .unwrap();
+        storage
+            .append_entry(&compaction("compB", "root", 3))
+            .await
+            .unwrap();
 
         let session = Session::new(storage);
 

@@ -117,9 +117,18 @@ impl ContentBlockParam {
     /// left untouched.
     pub fn set_cache_control(&mut self, cache_control: CacheControl) {
         match self {
-            ContentBlockParam::Text { cache_control: slot, .. }
-            | ContentBlockParam::Image { cache_control: slot, .. }
-            | ContentBlockParam::ToolResult { cache_control: slot, .. } => {
+            ContentBlockParam::Text {
+                cache_control: slot,
+                ..
+            }
+            | ContentBlockParam::Image {
+                cache_control: slot,
+                ..
+            }
+            | ContentBlockParam::ToolResult {
+                cache_control: slot,
+                ..
+            } => {
                 *slot = Some(cache_control);
             }
             _ => {}
@@ -188,7 +197,10 @@ pub struct CacheControl {
 
 impl CacheControl {
     pub fn ephemeral() -> Self {
-        CacheControl { kind: "ephemeral", ttl: None }
+        CacheControl {
+            kind: "ephemeral",
+            ttl: None,
+        }
     }
 }
 
@@ -201,13 +213,19 @@ pub enum RawStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart { message: WireMessage },
     #[serde(rename = "content_block_start")]
-    ContentBlockStart { index: usize, content_block: WireContentBlock },
+    ContentBlockStart {
+        index: usize,
+        content_block: WireContentBlock,
+    },
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { index: usize, delta: WireDelta },
     #[serde(rename = "content_block_stop")]
     ContentBlockStop { index: usize },
     #[serde(rename = "message_delta")]
-    MessageDelta { delta: MessageDeltaBody, usage: Option<WireUsage> },
+    MessageDelta {
+        delta: MessageDeltaBody,
+        usage: Option<WireUsage>,
+    },
     #[serde(rename = "message_stop")]
     MessageStop,
     /// Heartbeat / keep-alive; carries no payload.

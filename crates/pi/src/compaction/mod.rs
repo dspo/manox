@@ -92,14 +92,18 @@ pub struct ContextUsageEstimate {
 /// messages need the character heuristic. Without an anchor the whole list
 /// is estimated.
 pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimate {
-    let anchor = messages.iter().enumerate().rev().find_map(|(i, m)| match m {
-        AgentMessage::Assistant {
-            stop_reason: Some(_),
-            usage,
-            ..
-        } if calculate_context_tokens(usage) > 0 => Some((i, usage)),
-        _ => None,
-    });
+    let anchor = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, m)| match m {
+            AgentMessage::Assistant {
+                stop_reason: Some(_),
+                usage,
+                ..
+            } if calculate_context_tokens(usage) > 0 => Some((i, usage)),
+            _ => None,
+        });
 
     let Some((index, usage)) = anchor else {
         let estimated = messages.iter().map(estimate_tokens).sum();
@@ -164,9 +168,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
             .iter()
             .map(|b| match b {
                 ContentBlock::Text { text, .. } => text.encode_utf16().count() as u64,
-                ContentBlock::Thinking { thinking, .. } => {
-                    thinking.encode_utf16().count() as u64
-                }
+                ContentBlock::Thinking { thinking, .. } => thinking.encode_utf16().count() as u64,
                 ContentBlock::ToolUse { name, input, .. } => {
                     name.encode_utf16().count() as u64
                         + serde_json::to_string(input)
@@ -190,10 +192,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
 ///
 /// Returns the index of the first message to keep (all messages before
 /// this index should be compacted).
-pub fn find_cut_point(
-    messages: &[AgentMessage],
-    keep_recent_tokens: usize,
-) -> usize {
+pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> usize {
     if messages.is_empty() {
         return 0;
     }
@@ -279,8 +278,7 @@ pub fn build_compaction_prompt(
                 }
             };
             let content = match m {
-                AgentMessage::User { content, .. }
-                | AgentMessage::Assistant { content, .. } => {
+                AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => {
                     content
                         .iter()
                         .filter_map(|b| {
@@ -463,7 +461,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(), // 4
+                    name: "read".into(),                     // 4
                     input: serde_json::json!({"path": "x"}), // 12
                 },
             ],

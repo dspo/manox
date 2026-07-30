@@ -34,9 +34,7 @@ pub fn repair_tool_flow(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                 let calls: Vec<(String, String)> = content
                     .iter()
                     .filter_map(|b| match b {
-                        ContentBlock::ToolUse { id, name, .. } => {
-                            Some((id.clone(), name.clone()))
-                        }
+                        ContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
                         _ => None,
                     })
                     .collect();

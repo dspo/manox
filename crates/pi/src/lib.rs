@@ -31,13 +31,15 @@ pub mod agent_loop;
 pub use agent::Agent;
 pub use agent::QueueMode;
 pub use agent_loop::run_loop;
-pub use agent_loop::{StreamFn, EventSink};
-pub use harness::AgentHarness;
-pub use types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, AgentState};
+pub use agent_loop::{EventSink, StreamFn};
 pub use env::ExecutionEnv;
+pub use harness::AgentHarness;
 pub use provider::ProviderError;
 pub use provider::anthropic::AnthropicStreamFn;
 pub use provider::openai::completions::CompletionsStreamFn;
 pub use provider::openai::responses::ResponsesStreamFn;
-pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext, ToolState};
+pub use tool::{
+    AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext, ToolState,
+};
 pub use tools::ToolRegistry;
+pub use types::{AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState};

@@ -95,9 +95,7 @@ pub fn truncate(output: &str, config: &TruncateConfig) -> TruncatedOutput {
             ""
         };
 
-        let skipped_bytes = original_bytes.saturating_sub(
-            head.len() + tail.len(),
-        );
+        let skipped_bytes = original_bytes.saturating_sub(head.len() + tail.len());
 
         truncated = format!(
             "{}\n\n... [{} bytes truncated] ...\n\n{}",
@@ -154,6 +152,10 @@ mod tests {
         let result = truncate(&input, &config);
         assert!(result.was_truncated);
         assert!(result.content.contains("bytes truncated"));
-        assert!(result.content.len() <= 200, "got {} bytes", result.content.len());
+        assert!(
+            result.content.len() <= 200,
+            "got {} bytes",
+            result.content.len()
+        );
     }
 }

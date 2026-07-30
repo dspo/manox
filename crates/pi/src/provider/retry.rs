@@ -385,7 +385,8 @@ mod tests {
             use tokio::io::AsyncWriteExt;
             while let Ok((mut socket, _)) = listener.accept().await {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = r#"{"error":{"message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
+                let body =
+                    r#"{"error":{"message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
                 let response = format!(
                     "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
@@ -409,6 +410,9 @@ mod tests {
             Some(ProviderError::Overflow(_))
         ));
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(rx.try_recv().is_err(), "no retry event for a terminal status");
+        assert!(
+            rx.try_recv().is_err(),
+            "no retry event for a terminal status"
+        );
     }
 }

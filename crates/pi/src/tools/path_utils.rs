@@ -29,27 +29,25 @@ fn expand_tilde(path_str: &str) -> String {
             return home.to_string_lossy().to_string() + &path_str[1..];
         }
     } else if path_str == "~"
-        && let Some(home) = dirs_home() {
-            return home.to_string_lossy().to_string();
-        }
+        && let Some(home) = dirs_home()
+    {
+        return home.to_string_lossy().to_string();
+    }
     path_str.to_string()
 }
 
 /// Get the user's home directory.
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or({
-            #[cfg(target_os = "windows")]
-            {
-                std::env::var("USERPROFILE").ok().map(PathBuf::from)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                None
-            }
-        })
+    std::env::var("HOME").ok().map(PathBuf::from).or({
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("USERPROFILE").ok().map(PathBuf::from)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
+    })
 }
 
 /// Check whether a path is within an allowed directory.
@@ -114,9 +112,6 @@ mod tests {
 
     #[test]
     fn test_is_not_within() {
-        assert!(!is_within(
-            Path::new("/etc/passwd"),
-            Path::new("/project")
-        ));
+        assert!(!is_within(Path::new("/etc/passwd"), Path::new("/project")));
     }
 }

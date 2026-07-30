@@ -69,7 +69,9 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(Args {
-        api_key: api_key.filter(|k| !k.is_empty()).ok_or("missing --api-key")?,
+        api_key: api_key
+            .filter(|k| !k.is_empty())
+            .ok_or("missing --api-key")?,
         base_url: base_url.filter(|u| !u.is_empty()),
         model: model.filter(|m| !m.is_empty()).ok_or("missing --model")?,
         prompt: prompt.unwrap_or_else(|| "Say hi in three words.".into()),

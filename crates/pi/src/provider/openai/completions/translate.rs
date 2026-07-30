@@ -12,12 +12,14 @@
 //   - tool-result images follow their run of tool messages in a separate
 //     user message, the only position that accepts image parts.
 
-use crate::provider::openai::{clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens};
+use super::wire::*;
+use crate::provider::openai::{
+    clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens,
+};
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
     ThinkingKind,
 };
-use super::wire::*;
 
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(
@@ -47,7 +49,9 @@ pub fn to_request(
             CacheRetention::Long => Some("24h"),
             _ => None,
         },
-        stream_options: WireStreamOptions { include_usage: true },
+        stream_options: WireStreamOptions {
+            include_usage: true,
+        },
     }
 }
 
@@ -107,7 +111,11 @@ fn tools_param(context: &AgentContext) -> Option<Vec<ToolParam>> {
     )
 }
 
-fn to_message_params(context: &AgentContext, messages: &[AgentMessage], base_url: &str) -> Vec<MessageParam> {
+fn to_message_params(
+    context: &AgentContext,
+    messages: &[AgentMessage],
+    base_url: &str,
+) -> Vec<MessageParam> {
     let mut out: Vec<MessageParam> = Vec::new();
     if !context.system_prompt.is_empty() {
         out.push(MessageParam::System {
@@ -134,9 +142,18 @@ fn to_message_params(context: &AgentContext, messages: &[AgentMessage], base_url
                     out.push(param);
                 }
             }
-            AgentMessage::ToolResult { tool_call_id, content, is_error, .. } => {
+            AgentMessage::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 let (text, images) = tool_result_parts(content);
-                let text = if *is_error { format!("[error] {text}") } else { text };
+                let text = if *is_error {
+                    format!("[error] {text}")
+                } else {
+                    text
+                };
                 out.push(MessageParam::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: text,
@@ -165,7 +182,10 @@ fn user_content(blocks: &[ContentBlock]) -> Option<UserContent> {
     let mut parts: Vec<UserPart> = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text: t, signature: None } => {
+            ContentBlock::Text {
+                text: t,
+                signature: None,
+            } => {
                 text.push_str(t);
                 parts.push(UserPart::Text { text: t.clone() });
             }
@@ -191,7 +211,10 @@ fn assistant_param(blocks: &[ContentBlock], reasoning_backfill: bool) -> Option<
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text: t, signature: None } => text.push_str(t),
+            ContentBlock::Text {
+                text: t,
+                signature: None,
+            } => text.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCallParam {
                 id: id.clone(),
                 kind: "function",
@@ -206,7 +229,11 @@ fn assistant_param(blocks: &[ContentBlock], reasoning_backfill: bool) -> Option<
         }
     }
     let content = if text.is_empty() { None } else { Some(text) };
-    let tool_calls = if tool_calls.is_empty() { None } else { Some(tool_calls) };
+    let tool_calls = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(tool_calls)
+    };
     if content.is_none() && tool_calls.is_none() {
         return None;
     }
@@ -337,7 +364,11 @@ mod tests {
         }
     }
 
-    fn ctx(messages: Vec<AgentMessage>, thinking: ThinkingKind, level: Option<&str>) -> AgentContext {
+    fn ctx(
+        messages: Vec<AgentMessage>,
+        thinking: ThinkingKind,
+        level: Option<&str>,
+    ) -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
@@ -406,15 +437,24 @@ mod tests {
                 thinking: "hmm".into(),
                 signature: Some("sig".into()),
             },
-            ContentBlock::Text { text: "answer".into(), signature: None },
+            ContentBlock::Text {
+                text: "answer".into(),
+                signature: None,
+            },
         ]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let m = &v["messages"][2];
         assert_eq!(m["role"], "assistant");
         assert_eq!(m["content"], "answer");
         let serialized = m.to_string();
-        assert!(!serialized.contains("hmm"), "thinking text must not appear: {serialized}");
-        assert!(!serialized.contains("sig"), "signature must not appear: {serialized}");
+        assert!(
+            !serialized.contains("hmm"),
+            "thinking text must not appear: {serialized}"
+        );
+        assert!(
+            !serialized.contains("sig"),
+            "signature must not appear: {serialized}"
+        );
     }
 
     #[test]
@@ -423,7 +463,11 @@ mod tests {
             thinking: "hmm".into(),
             signature: None,
         }]);
-        let v = request(&ctx(vec![user("q"), msg, user("again")], ThinkingKind::None, None));
+        let v = request(&ctx(
+            vec![user("q"), msg, user("again")],
+            ThinkingKind::None,
+            None,
+        ));
         let roles: Vec<&str> = v["messages"]
             .as_array()
             .unwrap()
@@ -436,7 +480,10 @@ mod tests {
     #[test]
     fn tool_calls_serialize_with_string_arguments_and_plain_content() {
         let msg = assistant(vec![
-            ContentBlock::Text { text: "checking".into(), signature: None },
+            ContentBlock::Text {
+                text: "checking".into(),
+                signature: None,
+            },
             ContentBlock::ToolUse {
                 id: "t1".into(),
                 name: "read".into(),
@@ -450,12 +497,20 @@ mod tests {
         assert_eq!(m["tool_calls"][0]["type"], "function");
         assert_eq!(m["tool_calls"][0]["id"], "t1");
         assert_eq!(m["tool_calls"][0]["function"]["name"], "read");
-        assert_eq!(m["tool_calls"][0]["function"]["arguments"], "{\"path\":\"x\"}");
+        assert_eq!(
+            m["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"x\"}"
+        );
     }
 
     #[test]
     fn tool_results_get_own_messages_and_error_folds() {
-        let text = |s: &str| vec![ContentBlock::Text { text: s.into(), signature: None }];
+        let text = |s: &str| {
+            vec![ContentBlock::Text {
+                text: s.into(),
+                signature: None,
+            }]
+        };
         let v = request(&ctx(
             vec![
                 user("q"),
@@ -520,9 +575,14 @@ mod tests {
     fn user_message_with_image_uses_parts_encoding() {
         let msg = AgentMessage::User {
             content: vec![
-                ContentBlock::Text { text: "what is this".into(), signature: None },
+                ContentBlock::Text {
+                    text: "what is this".into(),
+                    signature: None,
+                },
                 ContentBlock::Image {
-                    source: ImageSource::Url { url: "https://x/y.png".into() },
+                    source: ImageSource::Url {
+                        url: "https://x/y.png".into(),
+                    },
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -537,7 +597,10 @@ mod tests {
 
     #[test]
     fn max_tokens_field_follows_endpoint() {
-        let opts = StreamOptions { max_tokens: Some(1024), ..Default::default() };
+        let opts = StreamOptions {
+            max_tokens: Some(1024),
+            ..Default::default()
+        };
         let c = ctx(vec![user("hi")], ThinkingKind::None, None);
 
         let v = serde_json::to_value(to_request(&c, &opts, OPENAI)).unwrap();
@@ -545,7 +608,10 @@ mod tests {
         assert!(v.get("max_tokens").is_none());
 
         // Legacy-field endpoints, by URL or by provider id.
-        for base in ["https://api.moonshot.cn/v1", "https://integrate.api.nvidia.com/v1"] {
+        for base in [
+            "https://api.moonshot.cn/v1",
+            "https://integrate.api.nvidia.com/v1",
+        ] {
             let v = serde_json::to_value(to_request(&c, &opts, base)).unwrap();
             assert_eq!(v["max_tokens"], 1024, "{base}");
             assert!(v.get("max_completion_tokens").is_none(), "{base}");
@@ -598,9 +664,26 @@ mod tests {
 
     #[test]
     fn deepseek_backfills_empty_reasoning_content() {
-        let thinking_ctx = || ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into(), signature: None }])], ThinkingKind::Enabled, Some("high"));
+        let thinking_ctx = || {
+            ctx(
+                vec![
+                    user("q"),
+                    assistant(vec![ContentBlock::Text {
+                        text: "a".into(),
+                        signature: None,
+                    }]),
+                ],
+                ThinkingKind::Enabled,
+                Some("high"),
+            )
+        };
 
-        let v = serde_json::to_value(to_request(&thinking_ctx(), &StreamOptions::default(), "https://api.deepseek.com/v1")).unwrap();
+        let v = serde_json::to_value(to_request(
+            &thinking_ctx(),
+            &StreamOptions::default(),
+            "https://api.deepseek.com/v1",
+        ))
+        .unwrap();
         assert_eq!(v["messages"][2]["reasoning_content"], "");
 
         // Non-DeepSeek endpoints get no extra field.
@@ -608,8 +691,23 @@ mod tests {
         assert!(v["messages"][2].get("reasoning_content").is_none());
 
         // A non-thinking model never backfills, even against DeepSeek.
-        let plain = ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into(), signature: None }])], ThinkingKind::None, None);
-        let v = serde_json::to_value(to_request(&plain, &StreamOptions::default(), "https://api.deepseek.com/v1")).unwrap();
+        let plain = ctx(
+            vec![
+                user("q"),
+                assistant(vec![ContentBlock::Text {
+                    text: "a".into(),
+                    signature: None,
+                }]),
+            ],
+            ThinkingKind::None,
+            None,
+        );
+        let v = serde_json::to_value(to_request(
+            &plain,
+            &StreamOptions::default(),
+            "https://api.deepseek.com/v1",
+        ))
+        .unwrap();
         assert!(v["messages"][2].get("reasoning_content").is_none());
     }
 
@@ -635,7 +733,9 @@ mod tests {
             prompt_tokens: Some(1000),
             completion_tokens: Some(50),
             prompt_cache_hit_tokens: None,
-            prompt_tokens_details: Some(WirePromptTokensDetails { cached_tokens: Some(800) }),
+            prompt_tokens_details: Some(WirePromptTokensDetails {
+                cached_tokens: Some(800),
+            }),
         };
         let u = to_usage(&nested);
         assert_eq!(u.input_tokens, 200);
@@ -666,9 +766,11 @@ mod tests {
     #[test]
     fn system_prompt_leads_and_stream_options_always_on() {
         let v = request(&ctx(vec![user("hi")], ThinkingKind::None, None));
-        assert_eq!(v["messages"][0], json!({"role": "system", "content": "sys"}));
+        assert_eq!(
+            v["messages"][0],
+            json!({"role": "system", "content": "sys"})
+        );
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["stream"], true);
     }
 }
-

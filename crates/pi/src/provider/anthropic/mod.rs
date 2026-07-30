@@ -108,9 +108,10 @@ impl StreamFn for AnthropicStreamFn {
 
         // Drain any trailing unterminated event.
         if let Some(payload) = parser.finish()
-            && let Ok(event) = serde_json::from_str::<RawStreamEvent>(&payload) {
-                acc.apply(event, &event_tx)?;
-            }
+            && let Ok(event) = serde_json::from_str::<RawStreamEvent>(&payload)
+        {
+            acc.apply(event, &event_tx)?;
+        }
 
         acc.finish(&event_tx)
     }
@@ -168,11 +169,17 @@ impl Accumulator {
                     message: Box::new(self.current()),
                 });
             }
-            RawStreamEvent::ContentBlockStart { index, content_block } => {
+            RawStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 self.ensure_index(index);
                 match content_block {
                     WireContentBlock::Text { .. } => {
-                        self.blocks[index] = ContentBlock::Text { text: String::new(), signature: None };
+                        self.blocks[index] = ContentBlock::Text {
+                            text: String::new(),
+                            signature: None,
+                        };
                     }
                     WireContentBlock::Thinking { .. } => {
                         self.blocks[index] = ContentBlock::Thinking {
@@ -198,22 +205,31 @@ impl Accumulator {
                 self.ensure_index(index);
                 match delta {
                     WireDelta::Text { text } => {
-                        if let ContentBlock::Text { text: t, signature: None } = &mut self.blocks[index] {
+                        if let ContentBlock::Text {
+                            text: t,
+                            signature: None,
+                        } = &mut self.blocks[index]
+                        {
                             t.push_str(&text);
                         }
                     }
                     WireDelta::Thinking { thinking } => {
-                        if let ContentBlock::Thinking { thinking: t, .. } = &mut self.blocks[index] {
+                        if let ContentBlock::Thinking { thinking: t, .. } = &mut self.blocks[index]
+                        {
                             t.push_str(&thinking);
                         }
                     }
                     WireDelta::Signature { signature } => {
-                        if let ContentBlock::Thinking { signature: s, .. } = &mut self.blocks[index] {
+                        if let ContentBlock::Thinking { signature: s, .. } = &mut self.blocks[index]
+                        {
                             *s = Some(signature);
                         }
                     }
                     WireDelta::InputJson { partial_json } => {
-                        self.open_json.entry(index).or_default().push_str(&partial_json);
+                        self.open_json
+                            .entry(index)
+                            .or_default()
+                            .push_str(&partial_json);
                     }
                     WireDelta::Other => {}
                 }
@@ -269,7 +285,10 @@ impl Accumulator {
 
     fn ensure_index(&mut self, index: usize) {
         while self.blocks.len() <= index {
-            self.blocks.push(ContentBlock::Text { text: String::new(), signature: None });
+            self.blocks.push(ContentBlock::Text {
+                text: String::new(),
+                signature: None,
+            });
         }
     }
 
@@ -328,14 +347,21 @@ mod tests {
         acc.apply(block_start_text(0), &tx).unwrap();
         acc.apply(text_delta(0, "Hello"), &tx).unwrap();
         acc.apply(text_delta(0, ", world"), &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx).unwrap();
+        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .unwrap();
         acc.apply(message_delta("end_turn"), &tx).unwrap();
         let msg = acc.finish(&tx).unwrap();
 
         // Final text assembled.
         match &msg {
-            AgentMessage::Assistant { content, stop_reason, .. } => {
-                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world"));
+            AgentMessage::Assistant {
+                content,
+                stop_reason,
+                ..
+            } => {
+                assert!(
+                    matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
+                );
                 assert_eq!(*stop_reason, Some(StopReason::EndTurn));
             }
             _ => panic!("expected assistant"),
@@ -343,8 +369,15 @@ mod tests {
 
         // Lifecycle: MessageStart, >=1 MessageUpdate, MessageEnd.
         let events = drain(rx);
-        assert!(matches!(events.first(), Some(AgentEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::MessageStart { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageUpdate { .. }))
+        );
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
@@ -354,17 +387,22 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         acc.apply(start_event(), &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStart {
-            index: 0,
-            content_block: WireContentBlock::ToolUse {
-                id: "t1".into(),
-                name: "read".into(),
-                input: serde_json::Value::Null,
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: WireContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: serde_json::Value::Null,
+                },
             },
-        }, &tx).unwrap();
-        acc.apply(json_delta(0, "{\"path\":" ), &tx).unwrap();
+            &tx,
+        )
+        .unwrap();
+        acc.apply(json_delta(0, "{\"path\":"), &tx).unwrap();
         acc.apply(json_delta(0, "\"x.rs\"}"), &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx).unwrap();
+        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
         match &msg {
@@ -385,24 +423,47 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         acc.apply(start_event(), &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStart {
-            index: 0,
-            content_block: WireContentBlock::Thinking { thinking: String::new(), signature: None },
-        }, &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: WireDelta::Thinking { thinking: "hmm".into() },
-        }, &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: WireDelta::Signature { signature: "sig!".into() },
-        }, &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx).unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: WireContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: None,
+                },
+            },
+            &tx,
+        )
+        .unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: WireDelta::Thinking {
+                    thinking: "hmm".into(),
+                },
+            },
+            &tx,
+        )
+        .unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: WireDelta::Signature {
+                    signature: "sig!".into(),
+                },
+            },
+            &tx,
+        )
+        .unwrap();
+        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
         match &msg {
             AgentMessage::Assistant { content, .. } => match &content[0] {
-                ContentBlock::Thinking { thinking, signature } => {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
                     assert_eq!(thinking, "hmm");
                     assert_eq!(signature.as_deref(), Some("sig!"));
                 }
@@ -417,12 +478,18 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         acc.apply(start_event(), &tx).unwrap();
-        acc.apply(RawStreamEvent::ContentBlockStart {
-            index: 0,
-            content_block: WireContentBlock::ToolUse {
-                id: "t1".into(), name: "read".into(), input: serde_json::Value::Null,
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: WireContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: serde_json::Value::Null,
+                },
             },
-        }, &tx).unwrap();
+            &tx,
+        )
+        .unwrap();
         acc.apply(json_delta(0, "{not json"), &tx).unwrap();
         let err = acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx);
         assert!(err.is_err());
@@ -436,19 +503,23 @@ mod tests {
 
         // The delta reports output and cache classes but omits input: the
         // message_start input survives; the total is the merged sum.
-        acc.apply(RawStreamEvent::MessageDelta {
-            delta: wire::MessageDeltaBody {
-                stop_reason: Some("end_turn".into()),
-                stop_sequence: None,
+        acc.apply(
+            RawStreamEvent::MessageDelta {
+                delta: wire::MessageDeltaBody {
+                    stop_reason: Some("end_turn".into()),
+                    stop_sequence: None,
+                },
+                usage: Some(wire::WireUsage {
+                    input_tokens: None,
+                    output_tokens: Some(7),
+                    cache_read_input_tokens: Some(100),
+                    cache_creation_input_tokens: Some(20),
+                    cache_creation: None,
+                }),
             },
-            usage: Some(wire::WireUsage {
-                input_tokens: None,
-                output_tokens: Some(7),
-                cache_read_input_tokens: Some(100),
-                cache_creation_input_tokens: Some(20),
-                cache_creation: None,
-            }),
-        }, &tx).unwrap();
+            &tx,
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
         match &msg {
@@ -487,7 +558,9 @@ mod tests {
     fn block_start_text(index: usize) -> RawStreamEvent {
         RawStreamEvent::ContentBlockStart {
             index,
-            content_block: WireContentBlock::Text { text: String::new() },
+            content_block: WireContentBlock::Text {
+                text: String::new(),
+            },
         }
     }
 
@@ -501,7 +574,9 @@ mod tests {
     fn json_delta(index: usize, partial: &str) -> RawStreamEvent {
         RawStreamEvent::ContentBlockDelta {
             index,
-            delta: WireDelta::InputJson { partial_json: partial.into() },
+            delta: WireDelta::InputJson {
+                partial_json: partial.into(),
+            },
         }
     }
 

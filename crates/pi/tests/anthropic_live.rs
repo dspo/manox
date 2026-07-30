@@ -4,8 +4,8 @@
 // CI without credentials stays green. Run explicitly with:
 //   cargo test -p pi --test anthropic_live -- --ignored --nocapture
 
-use pi::provider::anthropic::AnthropicStreamFn;
 use pi::provider::ProviderError;
+use pi::provider::anthropic::AnthropicStreamFn;
 use pi::types::{Model, ThinkingKind};
 use pi::{AgentContext, AgentEvent, AgentMessage, StreamFn};
 use tokio::sync::mpsc;
@@ -14,8 +14,7 @@ use tokio_util::sync::CancellationToken;
 fn real_model() -> Model {
     Model {
         provider: "anthropic".into(),
-        id: std::env::var("ANTHROPIC_MODEL")
-            .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into()),
+        id: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into()),
         context_window: 200_000,
         max_tokens: 8_192,
         thinking: ThinkingKind::None,
@@ -37,7 +36,9 @@ fn ctx_with(prompt: &str) -> AgentContext {
 }
 
 fn stream_fn() -> Option<AnthropicStreamFn> {
-    let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty())?;
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())?;
     let mut f = AnthropicStreamFn::new(key);
     // The caller points the SDK at a gateway explicitly; the SDK reads no env.
     if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL")
@@ -65,7 +66,13 @@ async fn live_text_stream_completes_lifecycle() {
         .expect("stream should succeed");
 
     // A complete assistant message came back.
-    let AgentMessage::Assistant { content, stop_reason, usage, .. } = &msg else {
+    let AgentMessage::Assistant {
+        content,
+        stop_reason,
+        usage,
+        ..
+    } = &msg
+    else {
         panic!("expected assistant message");
     };
     assert!(!content.is_empty(), "expected non-empty content");
@@ -122,16 +129,20 @@ async fn abort_mid_stream_returns_aborted() {
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY and network"]
 async fn live_tool_use_roundtrip() {
-    use pi::types::ContentBlock;
     use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+    use pi::types::ContentBlock;
     use serde_json::Value as JsonValue;
 
     // A trivial tool the model can call.
     struct GetWeather;
     #[async_trait::async_trait]
     impl AgentTool for GetWeather {
-        fn name(&self) -> &str { "get_weather" }
-        fn description(&self) -> &str { "Get the weather for a city" }
+        fn name(&self) -> &str {
+            "get_weather"
+        }
+        fn description(&self) -> &str {
+            "Get the weather for a city"
+        }
         fn parameters_schema(&self) -> JsonValue {
             serde_json::json!({
                 "type": "object",
@@ -140,7 +151,11 @@ async fn live_tool_use_roundtrip() {
             })
         }
         async fn execute(
-            &self, _id: &str, _p: JsonValue, _s: CancellationToken, _c: &dyn ToolContext,
+            &self,
+            _id: &str,
+            _p: JsonValue,
+            _s: CancellationToken,
+            _c: &dyn ToolContext,
         ) -> Result<AgentToolResult, ToolError> {
             Ok(AgentToolResult::text("sunny"))
         }
@@ -161,7 +176,12 @@ async fn live_tool_use_roundtrip() {
         .expect("tool_use stream should succeed");
 
     // The model should have emitted a tool_use block with parsed arguments.
-    let AgentMessage::Assistant { content, stop_reason, .. } = &msg else {
+    let AgentMessage::Assistant {
+        content,
+        stop_reason,
+        ..
+    } = &msg
+    else {
         panic!("expected assistant");
     };
     let tool_use = content.iter().find_map(|b| match b {
@@ -170,7 +190,10 @@ async fn live_tool_use_roundtrip() {
     });
     let (name, input) = tool_use.expect("expected a tool_use block");
     assert_eq!(name, "get_weather");
-    assert!(input.get("city").is_some(), "expected parsed city arg, got {input}");
+    assert!(
+        input.get("city").is_some(),
+        "expected parsed city arg, got {input}"
+    );
     assert_eq!(*stop_reason, Some(pi::types::StopReason::ToolUse));
 
     eprintln!("tool_use: {name} input={input}");

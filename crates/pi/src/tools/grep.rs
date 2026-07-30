@@ -13,7 +13,7 @@ use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
-use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::truncate::{self, TruncateConfig};
 
 pub struct GrepTool;
@@ -121,13 +121,8 @@ impl AgentTool for GrepTool {
         let glob_set = build_glob_filter(glob_pattern)?;
 
         // Walk the directory tree and collect matches.
-        let (matches, matched_paths) = search_files(
-            &search_path,
-            &regex,
-            &glob_set,
-            context_lines,
-            limit,
-        );
+        let (matches, matched_paths) =
+            search_files(&search_path, &regex, &glob_set, context_lines, limit);
 
         if matches.is_empty() {
             return Ok(AgentToolResult::text("No matches found"));
@@ -232,9 +227,10 @@ fn search_files(
         let path = entry.path();
 
         if let Some(globs) = glob_set
-            && !globs.is_match(path) {
-                continue;
-            }
+            && !globs.is_match(path)
+        {
+            continue;
+        }
 
         if results.len() >= limit {
             break;
@@ -273,12 +269,7 @@ fn search_files(
 }
 
 /// Format a match with surrounding context lines.
-fn format_with_context(
-    lines: &[&str],
-    line_idx: usize,
-    context: usize,
-    path: &Path,
-) -> String {
+fn format_with_context(lines: &[&str], line_idx: usize, context: usize, path: &Path) -> String {
     let start = line_idx.saturating_sub(context);
     let end = (line_idx + context + 1).min(lines.len());
 

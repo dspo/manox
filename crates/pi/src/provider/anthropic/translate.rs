@@ -7,11 +7,11 @@
 //      messages are merged into one user message.
 //   2. Supplying defaults the API requires — `max_tokens`, thinking budgets.
 
+use super::wire::*;
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
     ThinkingKind,
 };
-use super::wire::*;
 
 /// Map a thinking level to an adaptive-thinking effort.
 ///
@@ -56,13 +56,19 @@ fn cache_control(context: &AgentContext) -> Option<CacheControl> {
     match context.cache_retention {
         CacheRetention::None => None,
         CacheRetention::Short => Some(CacheControl::ephemeral()),
-        CacheRetention::Long => Some(CacheControl { kind: "ephemeral", ttl: Some("1h") }),
+        CacheRetention::Long => Some(CacheControl {
+            kind: "ephemeral",
+            ttl: Some("1h"),
+        }),
     }
 }
 
 /// Tool definitions form a cacheable prefix; the breakpoint sits on the last
 /// one so the whole list is covered by a single marker.
-fn tools_param(context: &AgentContext, cache_control: Option<&CacheControl>) -> Option<Vec<ToolParam>> {
+fn tools_param(
+    context: &AgentContext,
+    cache_control: Option<&CacheControl>,
+) -> Option<Vec<ToolParam>> {
     if context.tools.is_empty() {
         return None;
     }
@@ -76,7 +82,11 @@ fn tools_param(context: &AgentContext, cache_control: Option<&CacheControl>) -> 
                 name: t.name().to_string(),
                 description: Some(t.description().to_string()),
                 input_schema: t.parameters_schema(),
-                cache_control: if i == last { cache_control.cloned() } else { None },
+                cache_control: if i == last {
+                    cache_control.cloned()
+                } else {
+                    None
+                },
             })
             .collect(),
     )
@@ -142,7 +152,12 @@ fn to_message_params(
 
     for msg in messages {
         match msg {
-            AgentMessage::ToolResult { tool_call_id, content, is_error, .. } => {
+            AgentMessage::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 pending_results.push(ContentBlockParam::ToolResult {
                     tool_use_id: tool_call_id.clone(),
                     content: content.iter().map(block_to_param).collect(),
@@ -161,7 +176,10 @@ fn to_message_params(
                 flush(&mut out, &mut pending_results);
                 out.push(MessageParam {
                     role: Role::Assistant,
-                    content: content.iter().filter_map(assistant_block_to_param).collect(),
+                    content: content
+                        .iter()
+                        .filter_map(assistant_block_to_param)
+                        .collect(),
                 });
             }
             AgentMessage::Custom { .. } => {
@@ -224,12 +242,13 @@ fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
             name: name.clone(),
             input: input.clone(),
         }),
-        ContentBlock::Thinking { thinking, signature } => signature
-            .as_ref()
-            .map(|sig| ContentBlockParam::Thinking {
-                thinking: thinking.clone(),
-                signature: sig.clone(),
-            }),
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => signature.as_ref().map(|sig| ContentBlockParam::Thinking {
+            thinking: thinking.clone(),
+            signature: sig.clone(),
+        }),
         ContentBlock::RedactedThinking { data } => {
             Some(ContentBlockParam::RedactedThinking { data: data.clone() })
         }
@@ -278,10 +297,13 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
-        cache_creation: wire.cache_creation.as_ref().map(|c| crate::types::CacheCreation {
-            ephemeral_1h_input_tokens: c.ephemeral_1h_input_tokens,
-            ephemeral_5m_input_tokens: c.ephemeral_5m_input_tokens,
-        }),
+        cache_creation: wire
+            .cache_creation
+            .as_ref()
+            .map(|c| crate::types::CacheCreation {
+                ephemeral_1h_input_tokens: c.ephemeral_1h_input_tokens,
+                ephemeral_5m_input_tokens: c.ephemeral_5m_input_tokens,
+            }),
         total_tokens: input_tokens
             + output_tokens
             + cache_read_input_tokens
@@ -314,7 +336,10 @@ mod tests {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
             tool_name: "read".into(),
-            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
             is_error: false,
             details: None,
             timestamp: chrono::Utc::now(),
@@ -336,7 +361,11 @@ mod tests {
         }
     }
 
-    fn ctx(messages: Vec<AgentMessage>, thinking: ThinkingKind, level: Option<&str>) -> AgentContext {
+    fn ctx(
+        messages: Vec<AgentMessage>,
+        thinking: ThinkingKind,
+        level: Option<&str>,
+    ) -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
@@ -392,10 +421,12 @@ mod tests {
         let merged = &req.messages[2];
         assert!(matches!(merged.role, Role::User));
         assert_eq!(merged.content.len(), 2);
-        assert!(merged
-            .content
-            .iter()
-            .all(|b| matches!(b, ContentBlockParam::ToolResult { .. })));
+        assert!(
+            merged
+                .content
+                .iter()
+                .all(|b| matches!(b, ContentBlockParam::ToolResult { .. }))
+        );
     }
 
     #[test]
@@ -434,11 +465,15 @@ mod tests {
         let req = to_request(&with, &StreamOptions::default());
         assert!(matches!(
             req.thinking,
-            Some(ThinkingConfig::Adaptive { display: Some(ThinkingDisplay::Summarized) })
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
         ));
         assert!(matches!(
             req.output_config,
-            Some(OutputConfig { effort: Some(Effort::High) })
+            Some(OutputConfig {
+                effort: Some(Effort::High)
+            })
         ));
 
         // A non-thinking model emits neither, even with a level set.
@@ -454,11 +489,15 @@ mod tests {
         let req = to_request(&ctx, &StreamOptions::default());
         assert!(matches!(
             req.thinking,
-            Some(ThinkingConfig::Enabled { display: Some(ThinkingDisplay::Summarized) })
+            Some(ThinkingConfig::Enabled {
+                display: Some(ThinkingDisplay::Summarized)
+            })
         ));
         assert!(matches!(
             req.output_config,
-            Some(OutputConfig { effort: Some(Effort::High) })
+            Some(OutputConfig {
+                effort: Some(Effort::High)
+            })
         ));
 
         // The enabled wire shape carries no budget_tokens — depth comes from effort.
@@ -472,7 +511,10 @@ mod tests {
         for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
             let ctx = ctx(vec![user("hi")], kind, Some("off"));
             let req = to_request(&ctx, &StreamOptions::default());
-            assert!(matches!(req.thinking, Some(ThinkingConfig::Disabled)), "{kind:?}");
+            assert!(
+                matches!(req.thinking, Some(ThinkingConfig::Disabled)),
+                "{kind:?}"
+            );
             assert!(req.output_config.is_none(), "{kind:?}");
         }
     }
@@ -498,7 +540,10 @@ mod tests {
             ("max", Effort::Max),
             ("unknown", Effort::High),
         ] {
-            assert!(matches!(map_effort(level), ref e if std::mem::discriminant(e) == std::mem::discriminant(&want)), "level {level}");
+            assert!(
+                matches!(map_effort(level), ref e if std::mem::discriminant(e) == std::mem::discriminant(&want)),
+                "level {level}"
+            );
         }
     }
 
@@ -548,10 +593,7 @@ mod tests {
         assert!(messages[0]["content"][0].get("cache_control").is_none());
         let last_user = messages.last().unwrap();
         let blocks = last_user["content"].as_array().unwrap();
-        assert_eq!(
-            blocks.last().unwrap()["cache_control"]["type"],
-            "ephemeral"
-        );
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -578,7 +620,11 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert!(v["system"][0].get("cache_control").is_none());
         assert!(v["tools"][0].get("cache_control").is_none());
-        assert!(v["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(
+            v["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test]
@@ -598,7 +644,10 @@ mod tests {
         // A text-only assistant stays last on the wire; one with an
         // unresolved tool call would be followed by its synthetic result.
         let text_assistant = AgentMessage::Assistant {
-            content: vec![ContentBlock::Text { text: "done".into(), signature: None }],
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+                signature: None,
+            }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
             stop_reason: Some(StopReason::EndTurn),

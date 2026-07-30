@@ -87,10 +87,7 @@ mod tests {
     #[test]
     fn test_new_trust_manager() {
         let tm = TrustManager::new();
-        assert_eq!(
-            tm.check(&PathBuf::from("/test")),
-            TrustStatus::Undecided
-        );
+        assert_eq!(tm.check(&PathBuf::from("/test")), TrustStatus::Undecided);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
-use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
 pub struct EditTool;
@@ -95,13 +95,9 @@ impl AgentTool for EditTool {
             // writer between read and write would stale the TAG and clobber.
             let _guard = ctx.tool_state().mutation_queue.lock(&path).await;
 
-            let raw = ctx
-                .env()
-                .read_file(&path, None, None)
-                .await
-                .map_err(|e| {
-                    ToolError::ExecutionFailed(format!("edit read failed {path_display}: {e}"))
-                })?;
+            let raw = ctx.env().read_file(&path, None, None).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("edit read failed {path_display}: {e}"))
+            })?;
             let had_bom = hashline::has_bom(&raw);
             let is_crlf = hashline::detect_crlf(&raw);
             let had_trailing_nl = raw.ends_with('\n');
@@ -111,9 +107,7 @@ impl AgentTool for EditTool {
             let new_text = if current_tag == fp.tag {
                 hashline::apply(&current, &fp.ops)
                     .map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "edit apply failed {path_display}: {e}"
-                        ))
+                        ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
                     })?
                     .text
             } else {

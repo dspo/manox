@@ -7,9 +7,9 @@
 pub mod jsonl;
 
 use crate::types::AgentMessage;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use chrono::{DateTime, Utc};
 
 /// A single entry in the session tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,10 +146,7 @@ impl<S: SessionStorage> Session<S> {
     }
 
     /// Append a message entry and return the entry ID.
-    pub async fn append_message(
-        &self,
-        message: AgentMessage,
-    ) -> Result<String, anyhow::Error> {
+    pub async fn append_message(&self, message: AgentMessage) -> Result<String, anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
 
@@ -213,6 +210,8 @@ impl<S: SessionStorage> Session<S> {
     /// Build the context entries by walking the tree from leaf to root.
     pub async fn build_context(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
         let leaf_id = self.storage.get_leaf_id().await?;
-        self.storage.get_path_to_root_or_compaction(leaf_id.as_deref()).await
+        self.storage
+            .get_path_to_root_or_compaction(leaf_id.as_deref())
+            .await
     }
 }

@@ -70,23 +70,51 @@ pub fn compute_diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
                     old_index,
                     new_index,
                     len,
-                } => (*old_index, old_index + len, *len, *new_index, new_index + len, *len),
+                } => (
+                    *old_index,
+                    old_index + len,
+                    *len,
+                    *new_index,
+                    new_index + len,
+                    *len,
+                ),
                 similar::DiffOp::Delete {
                     old_index,
                     old_len,
                     new_index,
-                } => (*old_index, old_index + old_len, *old_len, *new_index, *new_index, 0),
+                } => (
+                    *old_index,
+                    old_index + old_len,
+                    *old_len,
+                    *new_index,
+                    *new_index,
+                    0,
+                ),
                 similar::DiffOp::Insert {
                     old_index,
                     new_index,
                     new_len,
-                } => (*old_index, *old_index, 0, *new_index, new_index + new_len, *new_len),
+                } => (
+                    *old_index,
+                    *old_index,
+                    0,
+                    *new_index,
+                    new_index + new_len,
+                    *new_len,
+                ),
                 similar::DiffOp::Replace {
                     old_index,
                     old_len,
                     new_index,
                     new_len,
-                } => (*old_index, old_index + old_len, *old_len, *new_index, new_index + new_len, *new_len),
+                } => (
+                    *old_index,
+                    old_index + old_len,
+                    *old_len,
+                    *new_index,
+                    new_index + new_len,
+                    *new_len,
+                ),
             };
 
             if first {

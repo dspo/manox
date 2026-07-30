@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
-use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
 pub struct WriteTool;
@@ -91,9 +91,7 @@ impl AgentTool for WriteTool {
             let diff = edit_diff::compute_unified_diff(&old, &content, &path);
             if !edit_diff::is_diff_empty(&diff) {
                 let hunks = edit_diff::count_diff_hunks(&diff);
-                output.push_str(&format!(
-                    "\n\nDiff ({hunks} hunk(s)):\n```diff\n{diff}```"
-                ));
+                output.push_str(&format!("\n\nDiff ({hunks} hunk(s)):\n```diff\n{diff}```"));
             }
         } else {
             let line_count = content.lines().count();
@@ -103,7 +101,11 @@ impl AgentTool for WriteTool {
             ));
         }
 
-        output.push_str(&format!("\n[{path_display}#{tag}]", path_display = path.display(), tag = snap.tag));
+        output.push_str(&format!(
+            "\n[{path_display}#{tag}]",
+            path_display = path.display(),
+            tag = snap.tag
+        ));
 
         Ok(AgentToolResult::text(output))
     }

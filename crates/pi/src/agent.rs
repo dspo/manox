@@ -7,8 +7,11 @@
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::{run_loop, run_loop_continue, StreamFn, EventSink};
-use crate::types::{AgentState, AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, CacheRetention, Model, ContentBlock};
+use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
+use crate::types::{
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState, CacheRetention,
+    ContentBlock, Model,
+};
 
 /// Controls how queued messages are drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,9 +234,7 @@ impl Agent {
                 }
                 anyhow::bail!("Cannot continue from message role: assistant");
             }
-            Some(_) => {
-                self.run_continuation().await
-            }
+            Some(_) => self.run_continuation().await,
         }
     }
 
@@ -270,34 +271,42 @@ impl Agent {
         messages: &[AgentMessage],
     ) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let owned_messages = messages.to_vec();
-        let (messages, context) = self.run_with_lifecycle(|signal, agent| {
-            let mut context = agent.create_context_snapshot();
-            let config = agent.create_loop_config();
-            let stream_fn = Arc::clone(&agent.stream_fn);
-            let sink = agent.sink.clone();
-            let msgs = owned_messages.clone();
+        let (messages, context) = self
+            .run_with_lifecycle(|signal, agent| {
+                let mut context = agent.create_context_snapshot();
+                let config = agent.create_loop_config();
+                let stream_fn = Arc::clone(&agent.stream_fn);
+                let sink = agent.sink.clone();
+                let msgs = owned_messages.clone();
 
-            Box::pin(async move {
-                let msgs = run_loop(&msgs, &mut context, &config, Some(signal), stream_fn, &sink).await?;
-                Ok((msgs, context))
+                Box::pin(async move {
+                    let msgs =
+                        run_loop(&msgs, &mut context, &config, Some(signal), stream_fn, &sink)
+                            .await?;
+                    Ok((msgs, context))
+                })
             })
-        }).await?;
+            .await?;
         self.state.messages = context.messages;
         Ok(messages)
     }
 
     async fn run_continuation(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        let (messages, context) = self.run_with_lifecycle(|signal, agent| {
-            let mut context = agent.create_context_snapshot();
-            let config = agent.create_loop_config();
-            let stream_fn = Arc::clone(&agent.stream_fn);
-            let sink = agent.sink.clone();
+        let (messages, context) = self
+            .run_with_lifecycle(|signal, agent| {
+                let mut context = agent.create_context_snapshot();
+                let config = agent.create_loop_config();
+                let stream_fn = Arc::clone(&agent.stream_fn);
+                let sink = agent.sink.clone();
 
-            Box::pin(async move {
-                let msgs = run_loop_continue(&mut context, &config, Some(signal), stream_fn, &sink).await?;
-                Ok((msgs, context))
+                Box::pin(async move {
+                    let msgs =
+                        run_loop_continue(&mut context, &config, Some(signal), stream_fn, &sink)
+                            .await?;
+                    Ok((msgs, context))
+                })
             })
-        }).await?;
+            .await?;
         self.state.messages = context.messages;
         Ok(messages)
     }
@@ -307,7 +316,16 @@ impl Agent {
         executor: F,
     ) -> Result<(Vec<AgentMessage>, AgentContext), anyhow::Error>
     where
-        F: for<'a> FnOnce(CancellationToken, &'a mut Agent) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<AgentMessage>, AgentContext), anyhow::Error>> + 'a>>,
+        F: for<'a> FnOnce(
+            CancellationToken,
+            &'a mut Agent,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(Vec<AgentMessage>, AgentContext), anyhow::Error>,
+                    > + 'a,
+            >,
+        >,
     {
         if self.active_run.is_some() {
             anyhow::bail!("Agent is already processing.");

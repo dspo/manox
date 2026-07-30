@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
-use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::truncate::{self, TruncateConfig};
 
 pub struct BashTool {

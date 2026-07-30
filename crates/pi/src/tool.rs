@@ -76,7 +76,10 @@ impl AgentToolResult {
     /// Create a simple text result.
     pub fn text(text: impl Into<String>) -> Self {
         AgentToolResult {
-            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
             details: None,
             is_error: false,
             usage: None,
@@ -87,7 +90,10 @@ impl AgentToolResult {
     /// Create an error result.
     pub fn error(text: impl Into<String>) -> Self {
         AgentToolResult {
-            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
             details: None,
             is_error: true,
             usage: None,
@@ -369,19 +375,38 @@ mod tests {
         async fn absolute_path(&self, path: &Path) -> Result<PathBuf, crate::env::FileError> {
             Ok(path.to_path_buf())
         }
-        async fn read_file(&self, _path: &Path, _offset: Option<usize>, _limit: Option<usize>) -> Result<String, crate::env::FileError> {
+        async fn read_file(
+            &self,
+            _path: &Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, crate::env::FileError> {
             Ok("mock content".into())
         }
-        async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), crate::env::FileError> {
+        async fn write_file(
+            &self,
+            _path: &Path,
+            _content: &str,
+        ) -> Result<(), crate::env::FileError> {
             Ok(())
         }
         async fn exists(&self, _path: &Path) -> Result<bool, crate::env::FileError> {
             Ok(true)
         }
-        async fn file_info(&self, _path: &Path) -> Result<crate::env::FileInfo, crate::env::FileError> {
-            Ok(crate::env::FileInfo { path: _path.to_path_buf(), is_dir: false, size: 100 })
+        async fn file_info(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::env::FileInfo, crate::env::FileError> {
+            Ok(crate::env::FileInfo {
+                path: _path.to_path_buf(),
+                is_dir: false,
+                size: 100,
+            })
         }
-        async fn list_dir(&self, _path: &Path) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
             Ok(vec![])
         }
         async fn create_dir(&self, _path: &Path) -> Result<(), crate::env::FileError> {
@@ -390,8 +415,16 @@ mod tests {
         async fn remove(&self, _path: &Path) -> Result<(), crate::env::FileError> {
             Ok(())
         }
-        async fn exec(&self, _command: &str, _timeout: Duration) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
-            Ok(crate::env::CommandResult { stdout: "ok".into(), stderr: String::new(), exit_code: 0 })
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: Duration,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: "ok".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
         }
     }
 
@@ -411,8 +444,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentTool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes the input" }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes the input"
+        }
         fn parameters_schema(&self) -> JsonValue {
             serde_json::json!({
                 "type": "object",
@@ -422,7 +459,13 @@ mod tests {
                 "required": ["message"]
             })
         }
-        async fn execute(&self, _tool_call_id: &str, params: JsonValue, _signal: CancellationToken, _ctx: &dyn ToolContext) -> Result<AgentToolResult, ToolError> {
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            params: JsonValue,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
             let msg = params["message"].as_str().unwrap_or("no message");
             Ok(AgentToolResult::text(msg))
         }
@@ -442,7 +485,8 @@ mod tests {
             signal,
             &ctx,
             false,
-        ).await;
+        )
+        .await;
 
         assert_eq!(executed.len(), 1);
         assert_eq!(messages.len(), 1);
@@ -468,7 +512,8 @@ mod tests {
             signal,
             &ctx,
             false,
-        ).await;
+        )
+        .await;
 
         assert!(executed[0].result.is_error);
     }

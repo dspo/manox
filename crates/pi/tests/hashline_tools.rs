@@ -66,11 +66,19 @@ async fn read_edit_reedit_roundtrip() {
     let ctx = TestCtx::new(dir.path());
 
     let read_out = ReadTool
-        .execute("1", json!({"path": "main.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"path": "main.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let read_text = text_of(&read_out);
-    assert!(read_text.contains("1:fn main() {"), "numbered rows: {read_text}");
+    assert!(
+        read_text.contains("1:fn main() {"),
+        "numbered rows: {read_text}"
+    );
     let tag = tag_of(read_text).to_string();
 
     let patch = format!(
@@ -93,10 +101,19 @@ async fn read_edit_reedit_roundtrip() {
     assert_ne!(new_tag, tag);
     let patch2 = format!("[{}#{}]\nINS.TAIL:\n+main();", file.display(), new_tag);
     let edit_out2 = EditTool
-        .execute("3", json!({"patch": patch2}), CancellationToken::new(), &ctx)
+        .execute(
+            "3",
+            json!({"patch": patch2}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
-    assert!(!edit_out2.is_error, "re-edit failed: {}", text_of(&edit_out2));
+    assert!(
+        !edit_out2.is_error,
+        "re-edit failed: {}",
+        text_of(&edit_out2)
+    );
     assert!(
         std::fs::read_to_string(&file)
             .unwrap()
@@ -167,12 +184,20 @@ async fn write_strips_pasted_read_output() {
         .expect("snapshot recorded")
         .tag
         .clone();
-    let patch = format!("[{}#{}]\nSWAP 2.=2:\n+    println!(\"yo\");", file.display(), head);
+    let patch = format!(
+        "[{}#{}]\nSWAP 2.=2:\n+    println!(\"yo\");",
+        file.display(),
+        head
+    );
     let edit_out = EditTool
         .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
         .await
         .unwrap();
-    assert!(!edit_out.is_error, "edit after write failed: {}", text_of(&edit_out));
+    assert!(
+        !edit_out.is_error,
+        "edit after write failed: {}",
+        text_of(&edit_out)
+    );
 }
 
 #[tokio::test]
@@ -204,7 +229,11 @@ async fn grep_snapshots_matched_files_for_direct_edit() {
         .expect("grep recorded a snapshot")
         .tag
         .clone();
-    let patch = format!("[{}#{}]\nSWAP 2.=2:\n+    replacement();", file.display(), tag);
+    let patch = format!(
+        "[{}#{}]\nSWAP 2.=2:\n+    replacement();",
+        file.display(),
+        tag
+    );
     let edit_out = EditTool
         .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
         .await
@@ -228,7 +257,12 @@ async fn edit_restores_crlf_and_trailing_newline() {
     let ctx = TestCtx::new(dir.path());
 
     let read_out = ReadTool
-        .execute("1", json!({"path": "win.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"path": "win.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let tag = tag_of(text_of(&read_out)).to_string();

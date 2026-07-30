@@ -106,7 +106,10 @@ pub enum InputPart {
     #[serde(rename = "input_text")]
     Text { text: String },
     #[serde(rename = "input_image")]
-    Image { image_url: String, detail: &'static str },
+    Image {
+        image_url: String,
+        detail: &'static str,
+    },
 }
 
 /// A replayed output item (request direction).
@@ -142,7 +145,10 @@ pub enum OutputItem {
     /// A tool result. The schema has no error flag and no reasoning about
     /// the call — output content only.
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: FunctionOutput },
+    FunctionCallOutput {
+        call_id: String,
+        output: FunctionOutput,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

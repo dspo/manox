@@ -104,7 +104,10 @@ pub enum MessageParam {
     /// A tool result. The schema has no error flag; the error bit folds into
     /// the content as an `[error] ` prefix.
     #[serde(rename = "tool")]
-    Tool { tool_call_id: String, content: String },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 /// User content: a plain string, or parts when images are present.

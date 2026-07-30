@@ -230,10 +230,14 @@ impl Accumulator {
         }
         // Reasoning arrives under one of several spellings; at most one
         // carries content per chunk, so the first non-empty wins.
-        let reasoning = [delta.reasoning_content, delta.reasoning, delta.reasoning_text]
-            .into_iter()
-            .flatten()
-            .find(|s| !s.is_empty());
+        let reasoning = [
+            delta.reasoning_content,
+            delta.reasoning,
+            delta.reasoning_text,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty());
         if let Some(thinking) = reasoning {
             self.push_thinking(&thinking);
             mutated = true;
@@ -260,13 +264,20 @@ impl Accumulator {
         let index = match self.open_text {
             Some(i) => i,
             None => {
-                self.blocks.push(ContentBlock::Text { text: String::new(), signature: None });
+                self.blocks.push(ContentBlock::Text {
+                    text: String::new(),
+                    signature: None,
+                });
                 let i = self.blocks.len() - 1;
                 self.open_text = Some(i);
                 i
             }
         };
-        if let ContentBlock::Text { text: t, signature: None } = &mut self.blocks[index] {
+        if let ContentBlock::Text {
+            text: t,
+            signature: None,
+        } = &mut self.blocks[index]
+        {
             t.push_str(text);
         }
     }
@@ -329,8 +340,11 @@ impl Accumulator {
                 let a = &self.tool_calls[call.index];
                 (a.block_index, a.id.clone(), a.name.clone())
             };
-            if let ContentBlock::ToolUse { id: bid, name: bname, .. } =
-                &mut self.blocks[block_index]
+            if let ContentBlock::ToolUse {
+                id: bid,
+                name: bname,
+                ..
+            } = &mut self.blocks[block_index]
             {
                 *bid = id;
                 *bname = name;
@@ -409,10 +423,18 @@ mod tests {
     }
 
     fn text(s: &str) -> WireDelta {
-        WireDelta { content: Some(s.into()), ..Default::default() }
+        WireDelta {
+            content: Some(s.into()),
+            ..Default::default()
+        }
     }
 
-    fn tool_delta(index: usize, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> WireDelta {
+    fn tool_delta(
+        index: usize,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> WireDelta {
         WireDelta {
             tool_calls: Some(vec![WireToolCallDelta {
                 index,
@@ -432,20 +454,34 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         acc.apply(chunk(text("Hello"), None), &tx).unwrap();
-        acc.apply(chunk(text(", world"), Some("stop")), &tx).unwrap();
+        acc.apply(chunk(text(", world"), Some("stop")), &tx)
+            .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
         match &msg {
-            AgentMessage::Assistant { content, stop_reason, .. } => {
-                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world"));
+            AgentMessage::Assistant {
+                content,
+                stop_reason,
+                ..
+            } => {
+                assert!(
+                    matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
+                );
                 assert_eq!(*stop_reason, Some(StopReason::EndTurn));
             }
             _ => panic!("expected assistant"),
         }
 
         let events = drain(rx);
-        assert!(matches!(events.first(), Some(AgentEvent::MessageStart { .. })));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { .. })));
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::MessageStart { .. })
+        ));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageUpdate { .. }))
+        );
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
@@ -454,31 +490,58 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        let reasoning = |s: &str| WireDelta { reasoning_content: Some(s.into()), ..Default::default() };
+        let reasoning = |s: &str| WireDelta {
+            reasoning_content: Some(s.into()),
+            ..Default::default()
+        };
         acc.apply(chunk(reasoning("let me"), None), &tx).unwrap();
         acc.apply(chunk(reasoning(" think"), None), &tx).unwrap();
         acc.apply(chunk(text("answer"), Some("stop")), &tx).unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(content.len(), 2);
-        assert!(matches!(&content[0], ContentBlock::Thinking { thinking, signature }
-            if thinking == "let me think" && signature.is_none()));
+        assert!(
+            matches!(&content[0], ContentBlock::Thinking { thinking, signature }
+            if thinking == "let me think" && signature.is_none())
+        );
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
     }
 
     #[test]
     fn reasoning_spelling_variants_all_map_to_thinking() {
         for (field, value) in [
-            ("reasoning_content", WireDelta { reasoning_content: Some("r".into()), ..Default::default() }),
-            ("reasoning", WireDelta { reasoning: Some("r".into()), ..Default::default() }),
-            ("reasoning_text", WireDelta { reasoning_text: Some("r".into()), ..Default::default() }),
+            (
+                "reasoning_content",
+                WireDelta {
+                    reasoning_content: Some("r".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "reasoning",
+                WireDelta {
+                    reasoning: Some("r".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "reasoning_text",
+                WireDelta {
+                    reasoning_text: Some("r".into()),
+                    ..Default::default()
+                },
+            ),
         ] {
             let (tx, _rx) = chan();
             let mut acc = Accumulator::new(&ctx());
             acc.apply(chunk(value, Some("stop")), &tx).unwrap();
             let msg = acc.finish(&tx).unwrap();
-            let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
+            let AgentMessage::Assistant { content, .. } = &msg else {
+                panic!("expected assistant")
+            };
             assert!(
                 matches!(&content[0], ContentBlock::Thinking { thinking, .. } if thinking == "r"),
                 "{field} must map to a Thinking block"
@@ -491,12 +554,37 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        acc.apply(chunk(tool_delta(0, Some("c1"), Some("read"), Some("{\"pa")), None), &tx).unwrap();
-        acc.apply(chunk(tool_delta(1, Some("c2"), Some("bash"), Some("{\"cmd\":\"ls\"}")), None), &tx).unwrap();
-        acc.apply(chunk(tool_delta(0, None, None, Some("th\":\"x\"}")), Some("tool_calls")), &tx).unwrap();
+        acc.apply(
+            chunk(tool_delta(0, Some("c1"), Some("read"), Some("{\"pa")), None),
+            &tx,
+        )
+        .unwrap();
+        acc.apply(
+            chunk(
+                tool_delta(1, Some("c2"), Some("bash"), Some("{\"cmd\":\"ls\"}")),
+                None,
+            ),
+            &tx,
+        )
+        .unwrap();
+        acc.apply(
+            chunk(
+                tool_delta(0, None, None, Some("th\":\"x\"}")),
+                Some("tool_calls"),
+            ),
+            &tx,
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
 
-        let AgentMessage::Assistant { content, stop_reason, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant {
+            content,
+            stop_reason,
+            ..
+        } = &msg
+        else {
+            panic!("expected assistant")
+        };
         assert_eq!(*stop_reason, Some(StopReason::ToolUse));
         assert_eq!(content.len(), 2);
         match &content[0] {
@@ -521,17 +609,35 @@ mod tests {
     fn tool_call_without_arguments_defaults_to_empty_object() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(chunk(tool_delta(0, Some("c1"), Some("ping"), None), Some("tool_calls")), &tx).unwrap();
+        acc.apply(
+            chunk(
+                tool_delta(0, Some("c1"), Some("ping"), None),
+                Some("tool_calls"),
+            ),
+            &tx,
+        )
+        .unwrap();
         let msg = acc.finish(&tx).unwrap();
-        let AgentMessage::Assistant { content, .. } = &msg else { panic!("expected assistant") };
-        assert!(matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == serde_json::json!({})));
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        assert!(
+            matches!(&content[0], ContentBlock::ToolUse { input, .. } if *input == serde_json::json!({}))
+        );
     }
 
     #[test]
     fn malformed_tool_args_error_at_finish() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(chunk(tool_delta(0, Some("c1"), Some("read"), Some("{not json")), Some("tool_calls")), &tx).unwrap();
+        acc.apply(
+            chunk(
+                tool_delta(0, Some("c1"), Some("read"), Some("{not json")),
+                Some("tool_calls"),
+            ),
+            &tx,
+        )
+        .unwrap();
         assert!(acc.finish(&tx).is_err());
     }
 
@@ -541,7 +647,9 @@ mod tests {
             prompt_tokens: Some(100),
             completion_tokens: Some(10),
             prompt_cache_hit_tokens: None,
-            prompt_tokens_details: Some(WirePromptTokensDetails { cached_tokens: Some(40) }),
+            prompt_tokens_details: Some(WirePromptTokensDetails {
+                cached_tokens: Some(40),
+            }),
         };
 
         // On the chunk (the standard position).
@@ -551,7 +659,9 @@ mod tests {
         c.usage = Some(wire_usage());
         acc.apply(c, &tx).unwrap();
         let msg = acc.finish(&tx).unwrap();
-        let AgentMessage::Assistant { usage, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { usage, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(usage.input_tokens, 60);
         assert_eq!(usage.output_tokens, 10);
         assert_eq!(usage.cache_read_input_tokens, 40);
@@ -569,7 +679,9 @@ mod tests {
         };
         acc.apply(c, &tx).unwrap();
         let msg = acc.finish(&tx).unwrap();
-        let AgentMessage::Assistant { usage, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { usage, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(usage.input_tokens, 60);
     }
 
@@ -588,7 +700,9 @@ mod tests {
         };
         acc.apply(c, &tx).unwrap();
         let msg = acc.finish(&tx).unwrap();
-        let AgentMessage::Assistant { usage, .. } = &msg else { panic!("expected assistant") };
+        let AgentMessage::Assistant { usage, .. } = &msg else {
+            panic!("expected assistant")
+        };
         assert_eq!(usage.input_tokens, 5);
     }
 
@@ -616,4 +730,3 @@ mod tests {
         .unwrap();
     }
 }
-
