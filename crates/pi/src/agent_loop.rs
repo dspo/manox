@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::tool::{AgentToolResult, execute_tool_calls};
+use crate::tool::{AgentToolResult, ToolContext, execute_tool_calls};
 use crate::types::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, StopReason,
 };
@@ -55,6 +55,7 @@ pub async fn run_loop(
     config: &AgentLoopConfig,
     signal: Option<CancellationToken>,
     stream_fn: Arc<dyn StreamFn>,
+    tool_ctx: &dyn ToolContext,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
     let signal = signal.unwrap_or_default();
@@ -65,7 +66,16 @@ pub async fn run_loop(
     current_messages.extend_from_slice(prompts);
     context.messages = current_messages;
 
-    run_loop_inner(context, &mut new_messages, config, &signal, stream_fn, sink).await?;
+    run_loop_inner(
+        context,
+        &mut new_messages,
+        config,
+        &signal,
+        stream_fn,
+        tool_ctx,
+        sink,
+    )
+    .await?;
     Ok(new_messages)
 }
 
@@ -75,6 +85,7 @@ pub async fn run_loop_continue(
     config: &AgentLoopConfig,
     signal: Option<CancellationToken>,
     stream_fn: Arc<dyn StreamFn>,
+    tool_ctx: &dyn ToolContext,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
     let signal = signal.unwrap_or_default();
@@ -90,7 +101,16 @@ pub async fn run_loop_continue(
     }
 
     let mut new_messages: Vec<AgentMessage> = Vec::new();
-    run_loop_inner(context, &mut new_messages, config, &signal, stream_fn, sink).await?;
+    run_loop_inner(
+        context,
+        &mut new_messages,
+        config,
+        &signal,
+        stream_fn,
+        tool_ctx,
+        sink,
+    )
+    .await?;
     Ok(new_messages)
 }
 
@@ -101,6 +121,7 @@ async fn run_loop_inner(
     config: &AgentLoopConfig,
     signal: &CancellationToken,
     stream_fn: Arc<dyn StreamFn>,
+    tool_ctx: &dyn ToolContext,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<(), anyhow::Error> {
     sink.emit(AgentEvent::AgentStart);
@@ -192,9 +213,6 @@ async fn run_loop_inner(
 
             if !tool_calls.is_empty() {
                 // If the response was truncated, fail all tool calls.
-                let noop_ctx = NoopToolContext {
-                    tool_state: crate::tool::ToolState::new(),
-                };
                 let (executed, result_messages) = if stop_reason == Some(StopReason::Length) {
                     fail_tool_calls_from_truncated(&tool_calls, sink)
                 } else {
@@ -202,7 +220,7 @@ async fn run_loop_inner(
                         &tool_calls,
                         &context.tools,
                         signal.clone(),
-                        &noop_ctx,
+                        tool_ctx,
                         config.sequential_tool_execution,
                     )
                     .await
@@ -386,31 +404,14 @@ fn fail_tool_calls_from_truncated(
     (executed, messages)
 }
 
-/// No-op tool context for when tools don't need access to the execution env.
-/// Owns a real `ToolState` so hashline-aware tools keep a coherent snapshot
-/// store within a single tool batch.
-struct NoopToolContext {
-    tool_state: crate::tool::ToolState,
-}
-
-impl crate::tool::ToolContext for NoopToolContext {
-    fn env(&self) -> &dyn crate::env::ExecutionEnv {
-        unimplemented!("NoopToolContext::env() — real tools need a proper context")
-    }
-    fn cwd(&self) -> &std::path::Path {
-        std::path::Path::new(".")
-    }
-    fn tool_state(&self) -> &crate::tool::ToolState {
-        &self.tool_state
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+    use crate::env::ExecutionEnv;
+    use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError, ToolState};
     use crate::types::{Model, ThinkingKind, Usage};
     use serde_json::Value as JsonValue;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     struct MockSink {
@@ -428,6 +429,98 @@ mod tests {
     impl EventSink for MockSink {
         fn emit(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
+        }
+    }
+
+    // ── Test tool context ─────────────────────────────────────────────────────
+    //
+    // Loop tests drive the state machine, not the filesystem; tools under test
+    // (e.g. EchoTool) ignore `ctx`, so a stub env is sufficient. Production
+    // code uses `LocalToolContext` (see `tool.rs`).
+
+    struct TestEnv;
+
+    #[async_trait::async_trait]
+    impl ExecutionEnv for TestEnv {
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, crate::env::FileError> {
+            Ok(path.to_path_buf())
+        }
+        fn join_path(&self, parts: &[&str]) -> PathBuf {
+            parts.iter().collect()
+        }
+        async fn read_file(
+            &self,
+            _path: &Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, crate::env::FileError> {
+            Ok(String::new())
+        }
+        async fn write_file(
+            &self,
+            _path: &Path,
+            _content: &str,
+        ) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &Path) -> Result<bool, crate::env::FileError> {
+            Ok(false)
+        }
+        async fn file_info(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::env::FileInfo, crate::env::FileError> {
+            unreachable!("TestEnv fs ops are not exercised by loop tests")
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
+            Ok(vec![])
+        }
+        async fn create_dir(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn remove(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    struct TestToolContext {
+        state: ToolState,
+    }
+
+    impl TestToolContext {
+        fn new() -> Self {
+            Self {
+                state: ToolState::new(),
+            }
+        }
+    }
+
+    impl ToolContext for TestToolContext {
+        fn env(&self) -> &dyn ExecutionEnv {
+            &TestEnv
+        }
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        fn tool_state(&self) -> &ToolState {
+            &self.state
         }
     }
 
@@ -470,7 +563,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -491,6 +584,7 @@ mod tests {
             &config,
             None,
             Arc::new(MockStreamFn),
+            &TestToolContext::new(),
             &sink,
         )
         .await;
@@ -506,6 +600,37 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::AgentEnd { .. }));
         assert!(has_agent_start, "expected AgentStart event");
         assert!(has_agent_end, "expected AgentEnd event");
+    }
+
+    // Cloning the context (notably across the `tokio::spawn` boundary in the
+    // stream path) must preserve the mounted tool list — otherwise the
+    // provider would see an empty `tools` array and never emit tool_use.
+    #[test]
+    fn agent_context_clone_preserves_tools() {
+        let ctx = AgentContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
+            metadata: Default::default(),
+        };
+        let cloned = ctx.clone();
+        assert_eq!(cloned.tools.len(), 1, "clone must preserve mounted tools");
+        assert_eq!(
+            cloned.tools[0].name(),
+            "echo",
+            "clone must preserve the same tool identity"
+        );
     }
 
     // ── Stateful mock: returns different messages based on call count ─────────
@@ -605,7 +730,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: vec![Box::new(EchoTool)],
+            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -665,6 +790,7 @@ mod tests {
             &config,
             None,
             stream_fn,
+            &TestToolContext::new(),
             &sink,
         )
         .await;
@@ -704,7 +830,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: vec![Box::new(EchoTool)],
+            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -747,6 +873,7 @@ mod tests {
             &config,
             None,
             stream_fn,
+            &TestToolContext::new(),
             &sink,
         )
         .await;
@@ -794,7 +921,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -818,6 +945,7 @@ mod tests {
             &config,
             Some(signal),
             Arc::new(MockStreamFn),
+            &TestToolContext::new(),
             &sink,
         )
         .await;
@@ -869,7 +997,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -892,6 +1020,7 @@ mod tests {
             &config,
             None,
             stream_fn,
+            &TestToolContext::new(),
             &sink,
         )
         .await;

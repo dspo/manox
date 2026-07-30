@@ -319,6 +319,7 @@ mod tests {
     use super::*;
     use crate::types::{AgentMessage, ContentBlock, Model, StopReason, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn model(thinking: ThinkingKind) -> Model {
         Model {
@@ -377,7 +378,7 @@ mod tests {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
             cache_retention: Default::default(),
@@ -585,7 +586,10 @@ mod tests {
             ThinkingKind::None,
             None,
         );
-        c.tools = vec![Box::new(NamedTool("a")), Box::new(NamedTool("b"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>,
+            Box::new(NamedTool("b")) as Box<dyn crate::tool::AgentTool>,
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         // No explicit option: the model's own max_tokens is the default.
         assert_eq!(req.max_tokens, c.model.max_tokens);
@@ -628,7 +632,9 @@ mod tests {
     fn cache_retention_none_sends_no_markers() {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::None;
-        c.tools = vec![Box::new(NamedTool("a"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
         assert!(v["system"][0].get("cache_control").is_none());
@@ -644,7 +650,9 @@ mod tests {
     fn cache_retention_long_adds_one_hour_ttl() {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::Long;
-        c.tools = vec![Box::new(NamedTool("a"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["system"][0]["cache_control"]["ttl"], "1h");

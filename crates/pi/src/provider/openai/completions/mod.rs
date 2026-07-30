@@ -382,13 +382,14 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::types::{Model, StopReason, ThinkingKind};
+    use std::sync::Arc;
     use wire::{WireChoice, WireDelta, WireFunctionDelta, WirePromptTokensDetails, WireUsage};
 
     fn ctx() -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "openai".into(),
                 id: "gpt-test".into(),

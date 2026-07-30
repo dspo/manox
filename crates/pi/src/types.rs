@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── Message types ───────────────────────────────────────────────────────────
 
@@ -357,13 +358,16 @@ pub enum CacheRetention {
 }
 
 /// The context passed into the agent loop at the start of each turn.
+#[derive(Clone)]
 pub struct AgentContext {
     /// The current system prompt.
     pub system_prompt: String,
     /// All messages in the conversation (including historical).
     pub messages: Vec<AgentMessage>,
-    /// Tools available to the agent (not clonable — trait objects).
-    pub tools: Vec<Box<dyn super::AgentTool>>,
+    /// Tools available to the agent. Shared via `Arc` so cloning the context
+    /// (notably across the `tokio::spawn` boundary in the stream path) keeps
+    /// the tool list intact and the provider sees what the caller mounted.
+    pub tools: Arc<[Box<dyn super::AgentTool>]>,
     /// The model being used for this turn.
     pub model: Model,
     /// Current thinking level.
@@ -375,21 +379,6 @@ pub struct AgentContext {
     pub session_id: Option<String>,
     /// Additional context metadata.
     pub metadata: HashMap<String, JsonValue>,
-}
-
-impl Clone for AgentContext {
-    fn clone(&self) -> Self {
-        AgentContext {
-            system_prompt: self.system_prompt.clone(),
-            messages: self.messages.clone(),
-            tools: Vec::new(), // tools are not cloned — caller must re-set
-            model: self.model.clone(),
-            thinking_level: self.thinking_level.clone(),
-            cache_retention: self.cache_retention,
-            session_id: self.session_id.clone(),
-            metadata: self.metadata.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for AgentContext {

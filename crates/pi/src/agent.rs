@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
+use crate::tool::ToolContext;
 use crate::types::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState, CacheRetention,
     ContentBlock, Model,
@@ -98,6 +99,12 @@ pub struct Agent {
     active_run: Option<CancellationToken>,
     stream_fn: Arc<dyn StreamFn>,
     sink: SubscriberSink,
+    /// Tools mounted on the agent and forwarded into each turn's context.
+    tools: Arc<[Box<dyn crate::tool::AgentTool>]>,
+    /// Session-scoped execution context for tool calls. Backs the real
+    /// `ToolContext` (env + cwd + tool state) so tools reach the filesystem
+    /// and shell instead of panicking.
+    tool_ctx: Arc<dyn ToolContext>,
     /// Session identifier forwarded to providers that support session-based
     /// caching (`prompt_cache_key`).
     session_id: Option<String>,
@@ -107,10 +114,14 @@ pub struct Agent {
 
 impl Agent {
     /// Create a new agent with the given system prompt and model.
+    ///
+    /// `tool_ctx` backs all tool execution; pass a real `ToolContext`
+    /// (e.g. `LocalToolContext`) so fs/shell tools work instead of panicking.
     pub fn new(
         system_prompt: impl Into<String>,
         model: Model,
         stream_fn: Arc<dyn StreamFn>,
+        tool_ctx: Arc<dyn ToolContext>,
     ) -> Self {
         Agent {
             state: AgentState::new(system_prompt, model),
@@ -119,9 +130,23 @@ impl Agent {
             active_run: None,
             stream_fn,
             sink: SubscriberSink::new(),
+            tools: Arc::from(Vec::new()),
+            tool_ctx,
             session_id: None,
             cache_retention: CacheRetention::default(),
         }
+    }
+
+    /// Mount tools on the agent. They are forwarded into each turn's context
+    /// so the provider sees them and `execute_tool_calls` can dispatch.
+    pub fn with_tools(mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Replace the mounted tools.
+    pub fn set_tools(&mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) {
+        self.tools = tools;
     }
 
     /// Set the session identifier forwarded to providers for cache-aware
@@ -243,7 +268,7 @@ impl Agent {
         AgentContext {
             system_prompt: self.state.system_prompt.clone(),
             messages: self.state.messages.clone(),
-            tools: Vec::new(), // tools are set externally
+            tools: Arc::clone(&self.tools),
             model: self.state.model.clone(),
             thinking_level: self.state.thinking_level.clone(),
             cache_retention: self.cache_retention,
@@ -276,13 +301,21 @@ impl Agent {
                 let mut context = agent.create_context_snapshot();
                 let config = agent.create_loop_config();
                 let stream_fn = Arc::clone(&agent.stream_fn);
+                let tool_ctx = Arc::clone(&agent.tool_ctx);
                 let sink = agent.sink.clone();
                 let msgs = owned_messages.clone();
 
                 Box::pin(async move {
-                    let msgs =
-                        run_loop(&msgs, &mut context, &config, Some(signal), stream_fn, &sink)
-                            .await?;
+                    let msgs = run_loop(
+                        &msgs,
+                        &mut context,
+                        &config,
+                        Some(signal),
+                        stream_fn,
+                        &*tool_ctx,
+                        &sink,
+                    )
+                    .await?;
                     Ok((msgs, context))
                 })
             })
@@ -297,12 +330,19 @@ impl Agent {
                 let mut context = agent.create_context_snapshot();
                 let config = agent.create_loop_config();
                 let stream_fn = Arc::clone(&agent.stream_fn);
+                let tool_ctx = Arc::clone(&agent.tool_ctx);
                 let sink = agent.sink.clone();
 
                 Box::pin(async move {
-                    let msgs =
-                        run_loop_continue(&mut context, &config, Some(signal), stream_fn, &sink)
-                            .await?;
+                    let msgs = run_loop_continue(
+                        &mut context,
+                        &config,
+                        Some(signal),
+                        stream_fn,
+                        &*tool_ctx,
+                        &sink,
+                    )
+                    .await?;
                     Ok((msgs, context))
                 })
             })
@@ -359,7 +399,94 @@ impl Clone for SubscriberSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::ExecutionEnv;
+    use crate::tool::ToolState;
     use crate::types::{StopReason, ThinkingKind, Usage};
+    use std::path::{Path, PathBuf};
+
+    struct TestEnv;
+
+    #[async_trait::async_trait]
+    impl ExecutionEnv for TestEnv {
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, crate::env::FileError> {
+            Ok(path.to_path_buf())
+        }
+        fn join_path(&self, parts: &[&str]) -> PathBuf {
+            parts.iter().collect()
+        }
+        async fn read_file(
+            &self,
+            _path: &Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, crate::env::FileError> {
+            Ok(String::new())
+        }
+        async fn write_file(
+            &self,
+            _path: &Path,
+            _content: &str,
+        ) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &Path) -> Result<bool, crate::env::FileError> {
+            Ok(false)
+        }
+        async fn file_info(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::env::FileInfo, crate::env::FileError> {
+            unreachable!("TestEnv fs ops are not exercised by agent tests")
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
+            Ok(vec![])
+        }
+        async fn create_dir(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn remove(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    struct TestToolContext {
+        state: ToolState,
+    }
+
+    impl ToolContext for TestToolContext {
+        fn env(&self) -> &dyn ExecutionEnv {
+            &TestEnv
+        }
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        fn tool_state(&self) -> &ToolState {
+            &self.state
+        }
+    }
+
+    fn test_tool_ctx() -> Arc<dyn ToolContext> {
+        Arc::new(TestToolContext {
+            state: ToolState::new(),
+        })
+    }
 
     struct TestStreamFn;
 
@@ -407,6 +534,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
 
         let result = agent.prompt("Hello").await;
@@ -422,6 +550,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
         agent.abort();
         // Should not panic.
@@ -433,6 +562,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
 
         let _ = agent.prompt("Hello").await;
@@ -447,6 +577,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
         agent.steer(AgentMessage::user("steering message"));
         assert!(agent.has_queued_messages());

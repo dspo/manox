@@ -115,6 +115,43 @@ pub trait ToolContext: Send + Sync {
     fn tool_state(&self) -> &ToolState;
 }
 
+/// Production `ToolContext` shared across an entire session.
+///
+/// Backs every `execute_tool_calls` invocation from the agent loop so fs/shell
+/// tools reach a real `ExecutionEnv` and hashline snapshots plus the file
+/// mutation queue stay coherent across turns. Cheap to clone (`Arc` bump).
+pub struct LocalToolContext {
+    env: std::sync::Arc<dyn crate::env::ExecutionEnv>,
+    cwd: std::path::PathBuf,
+    tool_state: std::sync::Arc<ToolState>,
+}
+
+impl LocalToolContext {
+    pub fn new(
+        env: std::sync::Arc<dyn crate::env::ExecutionEnv>,
+        cwd: std::path::PathBuf,
+        tool_state: std::sync::Arc<ToolState>,
+    ) -> Self {
+        LocalToolContext {
+            env,
+            cwd,
+            tool_state,
+        }
+    }
+}
+
+impl ToolContext for LocalToolContext {
+    fn env(&self) -> &dyn crate::env::ExecutionEnv {
+        &*self.env
+    }
+    fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+    fn tool_state(&self) -> &ToolState {
+        &self.tool_state
+    }
+}
+
 /// A tool that the agent can invoke.
 ///
 /// Every tool has a name, description, JSON Schema for its parameters, and

@@ -640,12 +640,13 @@ mod tests {
     use super::*;
     use crate::types::{Model, StopReason, ThinkingKind};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn ctx() -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "openai".into(),
                 id: "gpt-test".into(),

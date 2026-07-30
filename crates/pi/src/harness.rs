@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::agent::Agent;
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionResult, CompactionSettings};
+use crate::env::{ExecutionEnv, TokioExecutionEnv};
 use crate::session::{Session, SessionStorage};
+use crate::tool::{LocalToolContext, ToolState};
 use crate::types::{AgentContext, AgentMessage, Model};
 
 /// The phases the harness can be in.
@@ -104,7 +106,15 @@ impl<S: SessionStorage> AgentHarness<S> {
         model: Model,
         stream_fn: Arc<dyn StreamFn>,
     ) -> Self {
-        let agent = Agent::new(system_prompt, model.clone(), stream_fn);
+        // Build the session-scoped execution context once and share it across
+        // every turn: a real env + cwd + ToolState so fs/shell tools work
+        // instead of panicking on `env()`.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
+        let tool_state = Arc::new(ToolState::new());
+        let tool_ctx: Arc<dyn crate::tool::ToolContext> =
+            Arc::new(LocalToolContext::new(env, cwd, tool_state));
+        let agent = Agent::new(system_prompt, model.clone(), stream_fn, tool_ctx);
         AgentHarness {
             agent,
             session,
@@ -114,6 +124,12 @@ impl<S: SessionStorage> AgentHarness<S> {
             last_compaction_at: None,
             hooks: Vec::new(),
         }
+    }
+
+    /// Mount tools on the underlying agent.
+    pub fn with_tools(mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) -> Self {
+        self.agent.set_tools(tools);
+        self
     }
 
     /// Current phase.

@@ -27,6 +27,7 @@
 use pi::provider::openai::responses::ResponsesStreamFn;
 use pi::types::{ContentBlock, Model, ThinkingKind};
 use pi::{AgentContext, AgentEvent, AgentMessage, StreamFn};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -98,7 +99,7 @@ async fn main() {
     let context = AgentContext {
         system_prompt: "You are a concise assistant.".into(),
         messages: vec![AgentMessage::user(&args.prompt)],
-        tools: Vec::new(),
+        tools: Arc::from(vec![]),
         model: Model {
             provider: "openai".into(),
             id: args.model.clone(),

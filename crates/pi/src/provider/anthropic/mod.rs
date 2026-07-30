@@ -310,12 +310,13 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::types::{Model, StopReason, ThinkingKind};
+    use std::sync::Arc;
 
     fn ctx() -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "anthropic".into(),
                 id: "claude-test".into(),

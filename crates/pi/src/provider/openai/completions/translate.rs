@@ -329,6 +329,7 @@ mod tests {
     use super::*;
     use crate::types::{AgentMessage, ContentBlock, Model, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     const OPENAI: &str = "https://api.openai.com/v1";
 
@@ -382,7 +383,7 @@ mod tests {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
             cache_retention: Default::default(),
