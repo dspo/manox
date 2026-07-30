@@ -195,11 +195,16 @@ impl<S: SessionStorage> AgentHarness<S> {
         match result {
             Ok(messages) => {
                 // Persist messages to session.
+                let mut persist_result = Ok(());
                 for msg in &messages {
-                    self.session.append_message(msg.clone()).await?;
+                    if let Err(e) = self.session.append_message(msg.clone()).await {
+                        persist_result = Err(e);
+                        break;
+                    }
                 }
 
                 self.phase = AgentHarnessPhase::Idle;
+                persist_result?;
 
                 // Check if compaction is needed.
                 let context_tokens = self.estimate_current_tokens();
@@ -235,10 +240,15 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         match result {
             Ok(messages) => {
+                let mut persist_result = Ok(());
                 for msg in &messages {
-                    self.session.append_message(msg.clone()).await?;
+                    if let Err(e) = self.session.append_message(msg.clone()).await {
+                        persist_result = Err(e);
+                        break;
+                    }
                 }
                 self.phase = AgentHarnessPhase::Idle;
+                persist_result?;
                 Ok(messages)
             }
             Err(e) => {
@@ -367,28 +377,31 @@ impl<S: SessionStorage> AgentHarness<S> {
         let _compacted = &messages[..cut_point];
         let kept = &messages[cut_point..];
 
-        // Build a new transcript: summary as system context + kept messages.
-        let mut new_messages = Vec::new();
-        new_messages.push(summary_message(summary, chrono::Utc::now()));
-        new_messages.extend_from_slice(kept);
-
-        // Replace the agent's transcript. The boundary is stamped before the
-        // post-compaction count so the stale retained usage cannot anchor it.
-        self.agent.reset();
-        self.agent.replace_transcript(new_messages);
-        self.last_compaction_at = Some(chrono::Utc::now());
-        let tokens_after = self.estimate_current_tokens();
-
-        // Persist the boundary so a rebuilt session stops at this point,
-        // with the retained tail embedded for the rebuild.
-        if let Err(e) = self
+        // Persist the boundary first — the session is the durable record and
+        // a failure here leaves the agent transcript untouched.
+        let boundary = match self
             .session
             .append_compaction(summary, None, tokens_before, kept.to_vec())
             .await
         {
-            self.phase = AgentHarnessPhase::Idle;
-            return Err(e);
-        }
+            Ok((_id, timestamp)) => timestamp,
+            Err(e) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(e);
+            }
+        };
+
+        // Build a new transcript: summary as system context + kept messages.
+        // The summary message carries the boundary instant, so a transcript
+        // rebuilt from storage equals this one exactly.
+        let mut new_messages = Vec::new();
+        new_messages.push(summary_message(summary, boundary));
+        new_messages.extend_from_slice(kept);
+
+        self.agent.reset();
+        self.agent.replace_transcript(new_messages);
+        self.last_compaction_at = Some(boundary);
+        let tokens_after = self.estimate_current_tokens();
 
         let result = CompactionResult {
             summary: summary.to_string(),
@@ -748,6 +761,7 @@ mod tests {
         };
 
         // Run a turn, compact, run another turn — all over an on-disk session.
+        let expected;
         {
             let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
             let session = Session::new(storage);
@@ -760,6 +774,7 @@ mod tests {
             harness.prompt("first").await.unwrap();
             harness.compact("summary").await.unwrap();
             harness.prompt("second").await.unwrap();
+            expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
         }
 
         // A fresh harness restores the full transcript: summary, retained
@@ -795,6 +810,11 @@ mod tests {
         assert!(matches!(&messages[2], AgentMessage::Assistant { .. }));
         assert_eq!(text_of(&messages[3]), "second");
         assert!(matches!(&messages[4], AgentMessage::Assistant { .. }));
+
+        // The restored transcript equals the post-compaction one exactly,
+        // summary timestamp included.
+        let restored = serde_json::to_value(messages).unwrap();
+        assert_eq!(restored, expected);
 
         // The estimation boundary came along: needs_compaction works without
         // a separate recover_boundary() call.

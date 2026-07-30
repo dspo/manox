@@ -164,24 +164,28 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
-    /// Append a compaction entry and return the entry ID.
+    /// Append a compaction entry and return the entry ID and timestamp.
     ///
     /// The leaf cursor moves to the entry, so later messages parent onto it
-    /// and a context rebuild stops at this boundary.
+    /// and a context rebuild stops at this boundary. The returned timestamp
+    /// is the boundary instant: the in-transcript summary message carries
+    /// the same one, so a restored transcript matches the post-compaction
+    /// one exactly.
     pub async fn append_compaction(
         &self,
         summary: &str,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
         retained_tail: Vec<AgentMessage>,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
+        let timestamp = Utc::now();
 
         let entry = SessionTreeEntry::Compaction {
             id: id.clone(),
             parent_id,
-            timestamp: Utc::now(),
+            timestamp,
             summary: summary.to_string(),
             first_kept_entry_id,
             tokens_before,
@@ -189,7 +193,7 @@ impl<S: SessionStorage> Session<S> {
         };
         self.storage.append_entry(&entry).await?;
         self.storage.set_leaf_id(Some(&id)).await?;
-        Ok(id)
+        Ok((id, timestamp))
     }
 
     /// Timestamp of the compaction bounding the current path, if any.
