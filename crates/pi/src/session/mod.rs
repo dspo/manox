@@ -34,6 +34,10 @@ pub enum SessionTreeEntry {
         first_kept_entry_id: Option<String>,
         #[serde(rename = "tokensBefore")]
         tokens_before: u64,
+        /// The messages kept intact across the compaction, stored verbatim
+        /// so a rebuilt context needs no walk past the boundary.
+        #[serde(rename = "retainedTail", default)]
+        retained_tail: Vec<AgentMessage>,
     },
     #[serde(rename = "leaf")]
     Leaf {
@@ -169,6 +173,7 @@ impl<S: SessionStorage> Session<S> {
         summary: &str,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
+        retained_tail: Vec<AgentMessage>,
     ) -> Result<String, anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
@@ -180,24 +185,25 @@ impl<S: SessionStorage> Session<S> {
             summary: summary.to_string(),
             first_kept_entry_id,
             tokens_before,
+            retained_tail,
         };
         self.storage.append_entry(&entry).await?;
         self.storage.set_leaf_id(Some(&id)).await?;
         Ok(id)
     }
 
-    /// Timestamp of the most recent compaction entry, if any.
+    /// Timestamp of the compaction bounding the current path, if any.
+    ///
+    /// The boundary is path-relative: only the latest compaction reachable
+    /// from the current leaf counts, never another branch's.
     pub async fn latest_compaction_timestamp(
         &self,
     ) -> Result<Option<DateTime<Utc>>, anyhow::Error> {
-        let entries = self.storage.get_entries().await?;
-        Ok(entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Compaction { timestamp, .. } => Some(*timestamp),
-                _ => None,
-            })
-            .max())
+        let path = self.build_context().await?;
+        Ok(match path.first() {
+            Some(SessionTreeEntry::Compaction { timestamp, .. }) => Some(*timestamp),
+            _ => None,
+        })
     }
 
     /// Build the context entries by walking the tree from leaf to root.

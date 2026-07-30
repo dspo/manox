@@ -320,6 +320,7 @@ mod tests {
             summary: "summarized".into(),
             first_kept_entry_id: None,
             tokens_before: 1000,
+            retained_tail: vec![AgentMessage::user("kept")],
         };
         let post = SessionTreeEntry::Message {
             id: "post".into(),
@@ -342,5 +343,64 @@ mod tests {
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].id(), "comp");
         assert_eq!(path[1].id(), "post");
+    }
+
+    #[tokio::test]
+    async fn test_compaction_boundary_is_path_relative() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = JsonlSessionMetadata {
+            id: uuid::Uuid::new_v4().to_string(),
+            cwd: "/test".into(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+        let base = chrono::Utc::now();
+        let compaction = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Compaction {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            timestamp: base + chrono::Duration::seconds(secs),
+            summary: id.into(),
+            first_kept_entry_id: None,
+            tokens_before: 0,
+            retained_tail: Vec::new(),
+        };
+        let message = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            timestamp: base + chrono::Duration::seconds(secs),
+            message: AgentMessage::user(id),
+        };
+
+        // Two branches off the root: A compacts early, B compacts late.
+        let root = SessionTreeEntry::Message {
+            id: "root".into(),
+            parent_id: None,
+            timestamp: base,
+            message: AgentMessage::user("root"),
+        };
+        storage.append_entry(&root).await.unwrap();
+        storage.append_entry(&compaction("compA", "root", 1)).await.unwrap();
+        storage.append_entry(&message("postA", "compA", 2)).await.unwrap();
+        storage.append_entry(&compaction("compB", "root", 3)).await.unwrap();
+
+        let session = Session::new(storage);
+
+        // Leaf on branch A: the boundary is compA, never the newer compB.
+        session.storage().set_leaf_id(Some("postA")).await.unwrap();
+        let ts = session.latest_compaction_timestamp().await.unwrap();
+        assert_eq!(ts, Some(base + chrono::Duration::seconds(1)));
+
+        // Leaf on branch B: the boundary is compB.
+        session.storage().set_leaf_id(Some("compB")).await.unwrap();
+        let ts = session.latest_compaction_timestamp().await.unwrap();
+        assert_eq!(ts, Some(base + chrono::Duration::seconds(3)));
+
+        // Leaf on the root: no compaction on this path at all.
+        session.storage().set_leaf_id(Some("root")).await.unwrap();
+        let ts = session.latest_compaction_timestamp().await.unwrap();
+        assert_eq!(ts, None);
     }
 }

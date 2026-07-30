@@ -354,10 +354,11 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.last_compaction_at = Some(chrono::Utc::now());
         let tokens_after = self.estimate_current_tokens();
 
-        // Persist the boundary so a rebuilt session stops at this point.
+        // Persist the boundary so a rebuilt session stops at this point,
+        // with the retained tail embedded for the rebuild.
         if let Err(e) = self
             .session
-            .append_compaction(summary, None, tokens_before)
+            .append_compaction(summary, None, tokens_before, kept.to_vec())
             .await
         {
             self.phase = AgentHarnessPhase::Idle;
@@ -647,18 +648,20 @@ mod tests {
             assert_eq!(result.tokens_before, 90_000);
         }
 
-        // Reopen the session from disk: the compaction entry survived.
+        // Reopen the session from disk: the compaction entry survived, with
+        // the retained tail embedded for a future context rebuild.
         let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
         let entries = storage.get_entries().await.unwrap();
         let boundary = entries.iter().find_map(|e| match e {
             SessionTreeEntry::Compaction {
                 summary,
                 tokens_before,
+                retained_tail,
                 ..
-            } => Some((summary.clone(), *tokens_before)),
+            } => Some((summary.clone(), *tokens_before, retained_tail.len())),
             _ => None,
         });
-        assert_eq!(boundary, Some(("summary".to_string(), 90_000)));
+        assert_eq!(boundary, Some(("summary".to_string(), 90_000, 2)));
 
         // A fresh harness over the restored session recovers the boundary, so
         // a transcript whose usage predates the compaction cannot anchor.
