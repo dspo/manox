@@ -879,7 +879,12 @@ mod tests {
                 anyhow::bail!("injected append failure");
             }
             drop(calls);
+            // Advance the cursor as part of the append, mirroring the JSONL
+            // backend's contract: a `get_leaf_id` right after reflects this
+            // entry without a separate `set_leaf_id`.
+            let cursor = entry.leaf_cursor_after();
             self.entries.lock().unwrap().push(entry.clone());
+            *self.leaf_id.lock().unwrap() = cursor;
             Ok(())
         }
         async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
@@ -1022,6 +1027,65 @@ mod tests {
         assert!(!harness.needs_compaction());
     }
 
+    /// Compaction appends exactly one entry — the `compaction` itself — and
+    /// the cursor advances to it via that single append. No companion `leaf`
+    /// entry is written, so a failed `append_entry` cannot leave a compacted
+    /// transcript with no boundary.
+    #[tokio::test]
+    async fn test_compact_appends_single_entry_and_advances_cursor() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+        assert!(harness.needs_compaction());
+
+        let before = *harness.session().storage().append_calls.lock().unwrap();
+        harness.compact().await.unwrap();
+        let after = *harness.session().storage().append_calls.lock().unwrap();
+
+        // One append_entry for the compaction; no spurious leaf write.
+        assert_eq!(after - before, 1);
+
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let compaction_id = match entries.last() {
+            Some(SessionTreeEntry::Compaction { id, .. }) => id.clone(),
+            other => panic!("expected a compaction entry, got {:?}", other),
+        };
+        // The cursor is the compaction's own id, not a leaf's target.
+        let leaf = harness
+            .session()
+            .storage()
+            .get_leaf_id()
+            .await
+            .unwrap()
+            .expect("cursor must advance to the compaction");
+        assert_eq!(leaf, compaction_id);
+    }
+
     /// A failed summarization (Error/Aborted terminal, or an empty summary)
     /// must not persist a compaction entry nor rewrite the transcript — the
     /// compacted prefix would otherwise be replaced with nothing and lost.
@@ -1136,6 +1200,8 @@ mod tests {
             id: "s".into(),
             cwd: "/test".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         };
 
         let stale_assistant = AgentMessage::Assistant {
@@ -1157,7 +1223,9 @@ mod tests {
 
         // Compact in a first harness over an on-disk session.
         {
-            let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+            let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+                .await
+                .unwrap();
             let session = Session::new(storage);
             let mut harness = AgentHarness::new(
                 session,
@@ -1174,7 +1242,9 @@ mod tests {
 
         // Reopen the session from disk: the compaction entry survived, with
         // the retained tail embedded for a future context rebuild.
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let entries = storage.get_entries().await.unwrap();
         let boundary = entries.iter().find_map(|e| match e {
             SessionTreeEntry::Compaction {
@@ -1203,7 +1273,9 @@ mod tests {
         assert!(!harness.needs_compaction());
 
         // Without recovery the stale usage anchors and the threshold trips.
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let session = Session::new(storage);
         let mut harness = AgentHarness::new(
             session,
@@ -1226,12 +1298,16 @@ mod tests {
             id: "s".into(),
             cwd: "/test".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         };
 
         // Run a turn, compact, run another turn — all over an on-disk session.
         let expected;
         {
-            let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+            let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+                .await
+                .unwrap();
             let session = Session::new(storage);
             let mut harness = AgentHarness::new(
                 session,
@@ -1247,7 +1323,9 @@ mod tests {
 
         // A fresh harness restores the full transcript: summary, retained
         // tail, and the post-compaction messages.
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let session = Session::new(storage);
         let mut harness = AgentHarness::new(
             session,

@@ -1,7 +1,9 @@
 // Append-only JSONL session storage (format version 3).
 //
-// Layout of the single `session.jsonl` file:
-//   line 0 — a session header: `{"type":"session","version":3,"id":..,"timestamp":..,"cwd":..}`.
+// Layout of a session file (the caller picks the path — typically a
+// `timestamp_sessionId.jsonl` under a per-cwd directory, matching the TS Pi
+// repo naming):
+//   line 0 — a session header: `{"type":"session","version":3,"id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`.
 //   line 1.. — session-tree entries, appended in occurrence order. A `leaf`
 //              entry records a cursor move to an older branch point
 //              (`targetId`); any other entry implicitly makes itself the
@@ -9,8 +11,9 @@
 //              entry, otherwise the last entry's id. The file is strictly
 //              append-only: no field is ever rewritten.
 //
-// `open` validates line 0 is a v3 session header and errors on any mismatch
-// or corruption — there is no silent recovery from an older or damaged file.
+// `open` takes the exact file path. A missing file is created with `metadata`
+// as its header; an existing file must begin with a valid v3 session header,
+// otherwise this errors rather than guessing at a repair.
 
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -18,21 +21,32 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::session::{SessionStorage, SessionTreeEntry};
+use serde_json::Value as JsonValue;
 
 /// Current on-disk session format version.
 const FORMAT_VERSION: u32 = 3;
 
 /// Session metadata written once as the file header and read back on reopen.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JsonlSessionMetadata {
     pub id: String,
     pub cwd: String,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Path of the session this one forked from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_path: Option<String>,
+    /// Free-form metadata carried in the header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonValue>,
 }
 
-/// The first line of a v3 session file.
+/// The first line of a v3 session file. Field names are camelCase to match the
+/// TS Pi header schema (multi-word fields like `parentSession` would otherwise
+/// leak snake_case onto disk).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionHeader {
     /// Discriminator fixed to `"session"`.
     #[serde(rename = "type")]
@@ -41,6 +55,10 @@ struct SessionHeader {
     id: String,
     timestamp: chrono::DateTime<chrono::Utc>,
     cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<JsonValue>,
 }
 
 /// JSONL session storage backed by a single append-only file.
@@ -56,34 +74,42 @@ pub struct JsonlSessionStorage {
 }
 
 impl JsonlSessionStorage {
-    /// Open or create a session file in `dir`.
+    /// Open the session file at `path`, creating it from `metadata` if absent.
     ///
-    /// A missing file is created with `metadata` as its header. An existing
-    /// file must begin with a valid v3 session header; otherwise this errors
-    /// rather than guessing at a repair.
-    pub async fn open(dir: &Path, metadata: JsonlSessionMetadata) -> Result<Self, anyhow::Error> {
-        tokio::fs::create_dir_all(dir).await?;
-        let jsonl_path = dir.join("session.jsonl");
+    /// The path is the exact file location — the caller owns the naming scheme
+    /// (the TS Pi repo writes `timestamp_sessionId.jsonl` under a per-cwd
+    /// directory). A missing parent directory is created. An existing file
+    /// must begin with a valid v3 session header; otherwise this errors
+    /// rather than guessing at a repair, and the passed `metadata` is
+    /// ignored (the file is authoritative on reopen).
+    pub async fn open(path: &Path, metadata: JsonlSessionMetadata) -> Result<Self, anyhow::Error> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
-        if !jsonl_path.exists() {
+        if !path.exists() {
             let header = SessionHeader {
                 type_tag: "session".into(),
                 version: FORMAT_VERSION,
                 id: metadata.id.clone(),
                 timestamp: metadata.created_at,
                 cwd: metadata.cwd.clone(),
+                parent_session: metadata.parent_session_path.clone(),
+                metadata: metadata.metadata.clone(),
             };
             let line = serde_json::to_string(&header)? + "\n";
-            tokio::fs::write(&jsonl_path, line).await?;
+            tokio::fs::write(path, line).await?;
             return Ok(JsonlSessionStorage {
-                jsonl_path,
+                jsonl_path: path.to_path_buf(),
                 entries: Mutex::new(Vec::new()),
                 leaf_id: Mutex::new(None),
                 metadata,
             });
         }
 
-        Self::load(&jsonl_path).await
+        Self::load(path).await
     }
 
     async fn load(path: &Path) -> Result<Self, anyhow::Error> {
@@ -117,6 +143,8 @@ impl JsonlSessionStorage {
             id: header.id,
             cwd: header.cwd,
             created_at: header.timestamp,
+            parent_session_path: header.parent_session,
+            metadata: header.metadata,
         };
 
         let mut entries = Vec::new();
@@ -256,13 +284,17 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             cwd: "/test".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         }
     }
 
     #[tokio::test]
     async fn test_jsonl_append_and_read() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
 
         let entry = SessionTreeEntry::Message {
             id: "test-1".into(),
@@ -284,7 +316,9 @@ mod tests {
     async fn test_jsonl_leaf_tracking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
 
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
@@ -314,7 +348,9 @@ mod tests {
             "expected leaf entry with targetId, got: {leaf_line}"
         );
 
-        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         assert_eq!(reopened.get_leaf_id().await.unwrap(), Some("m1".into()));
 
         // set_leaf_id(None) records a cursor reset to null.
@@ -333,7 +369,9 @@ mod tests {
         let path = dir.path().join("session.jsonl");
 
         {
-            let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+            let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+                .await
+                .unwrap();
             let msg = SessionTreeEntry::Message {
                 id: "m1".into(),
                 parent_id: None,
@@ -344,7 +382,9 @@ mod tests {
             // No `leaf` entry exists; the cursor is the last appended entry.
         }
 
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let entries = storage.get_entries().await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
@@ -361,10 +401,60 @@ mod tests {
         assert!(header_line.contains("\"version\":3"));
     }
 
+    /// A header carrying `parentSession` and `metadata` must write those as
+    /// camelCase on disk (multi-word fields would otherwise leak snake_case)
+    /// and round-trip them on reopen.
+    #[tokio::test]
+    async fn test_header_writes_camel_case_parent_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header_meta = JsonlSessionMetadata {
+            id: "fork".into(),
+            cwd: "/proj".into(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: Some("/sessions/parent.jsonl".into()),
+            metadata: Some(serde_json::json!({ "origin": "forked" })),
+        };
+        let _storage = JsonlSessionStorage::open(&path, header_meta).await.unwrap();
+
+        let header_line = tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            header_line.contains("\"parentSession\":\"/sessions/parent.jsonl\""),
+            "expected camelCase parentSession, got: {header_line}"
+        );
+        assert!(
+            !header_line.contains("parent_session"),
+            "snake_case parent_session leaked onto disk: {header_line}"
+        );
+        assert!(
+            header_line.contains("\"metadata\":{\"origin\":\"forked\"}"),
+            "expected metadata payload, got: {header_line}"
+        );
+
+        // Reopen: the file is authoritative, so the fork metadata survives.
+        let reopened = JsonlSessionStorage::open(&path, meta()).await.unwrap();
+        let m = &reopened.metadata;
+        assert_eq!(m.id, "fork");
+        assert_eq!(
+            m.parent_session_path.as_deref(),
+            Some("/sessions/parent.jsonl")
+        );
+        assert_eq!(
+            m.metadata.as_ref(),
+            Some(&serde_json::json!({ "origin": "forked" }))
+        );
+    }
+
     /// Open and surface the error string, sidestepping the `Debug` bound that
     /// `unwrap_err` would impose on the storage.
-    async fn open_err(dir: &Path, m: JsonlSessionMetadata) -> String {
-        match JsonlSessionStorage::open(dir, m).await {
+    async fn open_err(path: &Path, m: JsonlSessionMetadata) -> String {
+        match JsonlSessionStorage::open(path, m).await {
             Ok(_) => "ok".to_string(),
             Err(e) => e.to_string(),
         }
@@ -375,7 +465,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         tokio::fs::write(&path, "not json\n").await.unwrap();
-        let err = open_err(dir.path(), meta()).await;
+        let err = open_err(&path, meta()).await;
         assert!(err.contains("invalid session header"), "{err}");
     }
 
@@ -393,7 +483,7 @@ mod tests {
         tokio::fs::write(&path, format!("{header}\n"))
             .await
             .unwrap();
-        let err = open_err(dir.path(), meta()).await;
+        let err = open_err(&path, meta()).await;
         assert!(err.contains("not a session header"), "{err}");
     }
 
@@ -411,7 +501,7 @@ mod tests {
         tokio::fs::write(&path, format!("{header}\n"))
             .await
             .unwrap();
-        let err = open_err(dir.path(), meta()).await;
+        let err = open_err(&path, meta()).await;
         assert!(err.contains("version 2 is unsupported"), "{err}");
     }
 
@@ -420,14 +510,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         tokio::fs::write(&path, "").await.unwrap();
-        let err = open_err(dir.path(), meta()).await;
+        let err = open_err(&path, meta()).await;
         assert!(err.contains("no header line"), "{err}");
     }
 
     #[tokio::test]
     async fn test_path_to_root() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
 
         let root = SessionTreeEntry::Message {
             id: "root".into(),
@@ -466,7 +558,9 @@ mod tests {
     #[tokio::test]
     async fn test_path_stops_at_compaction() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
 
         let pre = SessionTreeEntry::Message {
             id: "pre".into(),
@@ -483,6 +577,8 @@ mod tests {
             tokens_before: 1000,
             usage: None,
             retained_tail: vec![AgentMessage::user("kept")],
+            details: None,
+            from_hook: None,
         };
         let post = SessionTreeEntry::Message {
             id: "post".into(),
@@ -507,7 +603,9 @@ mod tests {
         use crate::session::Session;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let base = chrono::Utc::now();
         let compaction = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Compaction {
             id: id.into(),
@@ -518,6 +616,8 @@ mod tests {
             tokens_before: 0,
             usage: None,
             retained_tail: Vec::new(),
+            details: None,
+            from_hook: None,
         };
         let message = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Message {
             id: id.into(),
@@ -569,7 +669,9 @@ mod tests {
     async fn test_message_entry_writes_camel_case_parent_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
 
         let root = SessionTreeEntry::Message {
             id: "root".into(),
@@ -601,7 +703,9 @@ mod tests {
         );
 
         // Ancestry survives the disk round-trip.
-        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let path = reopened.get_path_to_root_or_compaction(None).await.unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[1].parent_id(), Some("root"));
@@ -634,8 +738,12 @@ mod tests {
             id: "s1".into(),
             cwd: "/proj".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         };
-        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+            .await
+            .unwrap();
 
         let entries = storage.get_entries().await.unwrap();
         assert_eq!(entries.len(), 3);
@@ -652,7 +760,7 @@ mod tests {
         }
         match &entries[1] {
             SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
-                assert_eq!(thinking_level.as_deref(), Some("medium"));
+                assert_eq!(thinking_level, "medium");
             }
             other => panic!("expected ThinkingLevelChange, got {other:?}"),
         }
@@ -713,8 +821,12 @@ mod tests {
             id: "s1".into(),
             cwd: "/proj".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         };
-        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+            .await
+            .unwrap();
         let entries = storage.get_entries().await.unwrap();
         assert_eq!(entries.len(), 2);
 
@@ -801,8 +913,12 @@ mod tests {
             id: "s1".into(),
             cwd: "/proj".into(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         };
-        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+            .await
+            .unwrap();
 
         // Trailing leaf redirects the cursor to its targetId.
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("b1".into()));
@@ -881,7 +997,9 @@ mod tests {
     #[tokio::test]
     async fn test_label_entry_omits_unset_label_field() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let entry = SessionTreeEntry::Label {
             id: "lab1".into(),
             parent_id: None,
@@ -916,7 +1034,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
 
-        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         let session = Session::new(storage);
 
         let m1 = session
@@ -952,7 +1072,9 @@ mod tests {
         );
 
         // Reopen: the trailing message is the cursor, the leaf survives on disk.
-        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
         assert_eq!(reopened.get_leaf_id().await.unwrap(), Some(m2.clone()));
         assert_eq!(reopened.get_entries().await.unwrap().len(), 3);
 

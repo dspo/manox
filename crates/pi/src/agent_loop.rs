@@ -491,6 +491,7 @@ fn fail_tool_calls_from_truncated(
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
             result: result.clone(),
+            is_error: true,
         });
 
         executed.push(crate::tool::ExecutedToolCall {

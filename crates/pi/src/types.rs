@@ -362,12 +362,13 @@ pub enum AgentEvent {
     },
     /// A tool call has finished executing. Carries the full result — content,
     /// details, per-call usage, added tool names, and the terminate signal —
-    /// so consumers can reconstruct the call's outcome from the event stream
-    /// alone, mirroring the TS Pi `AgentToolResult`.
+    /// alongside a top-level error flag, mirroring the TS Pi event so a
+    /// consumer can branch on success without unpacking the result.
     ToolExecutionEnd {
         tool_call_id: String,
         tool_name: String,
         result: AgentToolResult,
+        is_error: bool,
     },
     /// A turn has completed.
     TurnEnd {

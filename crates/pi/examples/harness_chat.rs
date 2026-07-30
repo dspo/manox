@@ -116,8 +116,10 @@ async fn main() {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".into()),
         created_at: chrono::Utc::now(),
+        parent_session_path: None,
+        metadata: None,
     };
-    let storage = JsonlSessionStorage::open(dir.path(), meta)
+    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
         .await
         .expect("open");
     let session = Session::new(storage);

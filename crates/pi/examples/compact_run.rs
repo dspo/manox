@@ -68,9 +68,11 @@ async fn main() {
         id: "demo".into(),
         cwd: dir.path().to_string_lossy().into_owned(),
         created_at: chrono::Utc::now(),
+        parent_session_path: None,
+        metadata: None,
     };
 
-    let storage = JsonlSessionStorage::open(dir.path(), meta)
+    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
         .await
         .expect("open");
     let session = Session::new(storage);
@@ -97,6 +99,8 @@ async fn main() {
             id: "demo".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
         },
     )
     .await

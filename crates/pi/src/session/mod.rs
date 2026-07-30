@@ -43,6 +43,13 @@ pub enum SessionTreeEntry {
         /// so a rebuilt context needs no walk past the boundary.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         retained_tail: Vec<AgentMessage>,
+        /// Structured payload a summarization hook may attach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<JsonValue>,
+        /// Whether the boundary was written by a hook rather than the
+        /// harness's own compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_hook: Option<bool>,
     },
     /// A change of model for the following turns.
     #[serde(rename = "model_change", rename_all = "camelCase")]
@@ -59,8 +66,9 @@ pub enum SessionTreeEntry {
         id: String,
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
-        /// `None` disables reasoning; a tier string enables it at that depth.
-        thinking_level: Option<String>,
+        /// The reasoning tier for following turns, or `"off"` to disable it.
+        /// Always a string — `null` would drop the field on the wire.
+        thinking_level: String,
     },
     /// A change in the set of tools mounted for the following turns.
     #[serde(rename = "active_tools_change", rename_all = "camelCase")]
@@ -196,7 +204,7 @@ impl SessionTreeEntry {
 
     /// The leaf cursor after appending this entry: a `leaf` entry redirects to
     /// its `targetId`; every other entry's cursor is its own id.
-    fn leaf_cursor_after(&self) -> Option<String> {
+    pub(crate) fn leaf_cursor_after(&self) -> Option<String> {
         match self {
             SessionTreeEntry::Leaf { target_id, .. } => target_id.clone(),
             _ => Some(self.id().to_string()),
@@ -210,7 +218,14 @@ pub trait SessionStorage: Send + Sync {
     /// Generate a new unique entry ID.
     async fn create_entry_id(&self) -> Result<String, anyhow::Error>;
 
-    /// Append an entry to the session.
+    /// Append an entry to the session and synchronously advance the leaf
+    /// cursor to it.
+    ///
+    /// The cursor after the append is the entry's own id, except for a `leaf`
+    /// entry whose cursor is its `targetId`. Implementations must update their
+    /// persisted cursor within this call so a later `get_leaf_id` reflects the
+    /// append even if no further write follows — callers must not pair
+    /// `append_entry` with a separate `set_leaf_id` for the same cursor move.
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error>;
 
     /// Get an entry by ID.
@@ -219,7 +234,10 @@ pub trait SessionStorage: Send + Sync {
     /// Get the current leaf ID (cursor position).
     async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error>;
 
-    /// Set the current leaf ID.
+    /// Move the cursor to an older branch point by appending a `leaf` entry.
+    /// Implementations must validate that the target id exists before
+    /// persisting; the appended entry's cursor (its `targetId`) becomes the
+    /// new leaf.
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error>;
 
     /// Get all entries, optionally filtered.
@@ -290,9 +308,10 @@ impl<S: SessionStorage> Session<S> {
             tokens_before,
             usage,
             retained_tail,
+            details: None,
+            from_hook: None,
         };
         self.storage.append_entry(&entry).await?;
-        self.storage.set_leaf_id(Some(&id)).await?;
         Ok((id, timestamp))
     }
 

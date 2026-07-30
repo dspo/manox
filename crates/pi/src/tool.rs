@@ -392,6 +392,7 @@ async fn execute_one(
                 tool_call_id: id.clone(),
                 tool_name: name.clone(),
                 result: result.clone(),
+                is_error: result.is_error,
             });
             return ExecutedToolCall {
                 tool_call_id: id,
@@ -412,6 +413,7 @@ async fn execute_one(
             tool_call_id: id.clone(),
             tool_name: name.clone(),
             result: result.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -433,6 +435,7 @@ async fn execute_one(
             tool_call_id: id.clone(),
             tool_name: name.clone(),
             result: result.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -452,6 +455,7 @@ async fn execute_one(
             tool_call_id: id.clone(),
             tool_name: name.clone(),
             result: result.clone(),
+            is_error: result.is_error,
         });
         return ExecutedToolCall {
             tool_call_id: id,
@@ -487,6 +491,7 @@ async fn execute_one(
         tool_call_id: id.clone(),
         tool_name: name.clone(),
         result: result.clone(),
+        is_error: result.is_error,
     });
 
     ExecutedToolCall {
@@ -843,6 +848,7 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 result,
+                ..
             } if tool_call_id == "call_1" => Some((tool_name, result)),
             _ => None,
         });
