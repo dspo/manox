@@ -908,6 +908,40 @@ mod tests {
         }
     }
 
+    /// A `Custom` message is a valid cut boundary, mirroring TS
+    /// `findValidCutPoints`, which lists `custom` alongside `user` and
+    /// `assistant` and excludes only `toolResult`.
+    ///
+    /// Compaction reads the raw stored transcript (`harness::compact` clones
+    /// `agent.state().messages`), never the request-time `repair_tool_flow`
+    /// output — that transform is the only thing able to interleave a
+    /// `Custom` between a tool_use and its synthetic result, and it is not
+    /// persisted. The agent loop stores `Custom` only at turn boundaries, so a
+    /// `Custom` in compaction's input never sits mid tool chain and cutting
+    /// there orphans nothing. Locking this in keeps `find_safe_cut` faithful
+    /// to TS rather than advancing past `Custom`.
+    #[test]
+    fn find_safe_cut_treats_custom_as_valid_boundary() {
+        let custom = AgentMessage::Custom {
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "turn starter".into(),
+                signature: None,
+            }],
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let msgs = vec![
+            make_user("q"),
+            make_assistant("a"),
+            custom,
+            make_user("follow-up"),
+        ];
+        // Candidate at the Custom (index 2): `find_safe_cut` returns it
+        // rather than advancing, matching TS.
+        assert_eq!(find_safe_cut(&msgs, 2), 2);
+    }
+
     #[test]
     fn test_build_compaction_prompt() {
         let msgs = vec![
