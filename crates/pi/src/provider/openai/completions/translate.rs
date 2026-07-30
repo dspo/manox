@@ -267,7 +267,8 @@ pub fn parse_finish_reason(s: &str) -> crate::types::StopReason {
 /// The wire's `prompt_tokens` includes the cached subset, so the domain's
 /// non-cached `input_tokens` subtracts the hit — otherwise `total_input()`
 /// would count the hit twice. Completions-style caching has no creation
-/// event, so `cache_creation_input_tokens` stays zero.
+/// event, so `cache_creation_input_tokens` stays zero. The wire reports no
+/// total; `total_tokens` is the sum of all token classes.
 pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
     let hit = wire
         .prompt_cache_hit_tokens
@@ -276,14 +277,17 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
             .as_ref()
             .and_then(|d| d.cached_tokens))
         .unwrap_or(0);
+    // `saturating_sub`: a malformed payload with hit > prompt must not
+    // underflow into a fabricated huge count.
+    let input_tokens = wire.prompt_tokens.unwrap_or(0).saturating_sub(hit);
+    let output_tokens = wire.completion_tokens.unwrap_or(0);
     crate::types::Usage {
-        // `saturating_sub`: a malformed payload with hit > prompt must not
-        // underflow into a fabricated huge count.
-        input_tokens: wire.prompt_tokens.unwrap_or(0).saturating_sub(hit),
-        output_tokens: wire.completion_tokens.unwrap_or(0),
+        input_tokens,
+        output_tokens,
         cache_read_input_tokens: hit,
         cache_creation_input_tokens: 0,
         cache_creation: None,
+        total_tokens: input_tokens + output_tokens + hit,
     }
 }
 
@@ -300,6 +304,7 @@ mod tests {
             provider: "openai".into(),
             id: "gpt-test".into(),
             context_window: 200_000,
+            max_tokens: 16_384,
             thinking,
             metadata: Default::default(),
         }
@@ -606,6 +611,7 @@ mod tests {
         assert_eq!(u.cache_read_input_tokens, 800);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.total_input(), 1000);
+        assert_eq!(u.total_tokens, 1050);
 
         let nested = WireUsage {
             prompt_tokens: Some(1000),

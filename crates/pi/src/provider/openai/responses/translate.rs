@@ -484,7 +484,8 @@ fn to_base36(mut n: u32) -> String {
 ///
 /// The wire's `input_tokens` includes the cached and cache-write subsets,
 /// so the domain's non-cached `input_tokens` subtracts both — otherwise
-/// `total_input()` would count them twice.
+/// `total_input()` would count them twice. `total_tokens` is the wire's own
+/// total, taken verbatim.
 pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
     let (cached, written) = match &wire.input_tokens_details {
         Some(d) => (d.cached_tokens.unwrap_or(0), d.cache_write_tokens.unwrap_or(0)),
@@ -496,6 +497,7 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: written,
         cache_creation: None,
+        total_tokens: wire.total_tokens.unwrap_or(0),
     }
 }
 
@@ -510,6 +512,7 @@ mod tests {
             provider: "openai".into(),
             id: "gpt-test".into(),
             context_window: 200_000,
+            max_tokens: 16_384,
             thinking,
             metadata: Default::default(),
         }
@@ -928,6 +931,7 @@ mod tests {
         let wire = WireUsage {
             input_tokens: Some(1000),
             output_tokens: Some(50),
+            total_tokens: Some(1050),
             input_tokens_details: Some(WireInputTokensDetails {
                 cached_tokens: Some(700),
                 cache_write_tokens: Some(100),
@@ -939,11 +943,14 @@ mod tests {
         assert_eq!(u.cache_read_input_tokens, 700);
         assert_eq!(u.cache_creation_input_tokens, 100);
         assert_eq!(u.total_input(), 1000);
+        // The wire total is taken verbatim.
+        assert_eq!(u.total_tokens, 1050);
 
         // A malformed payload with subsets exceeding the total saturates.
         let bad = WireUsage {
             input_tokens: Some(10),
             output_tokens: None,
+            total_tokens: None,
             input_tokens_details: Some(WireInputTokensDetails {
                 cached_tokens: Some(99),
                 cache_write_tokens: None,

@@ -183,6 +183,11 @@ pub struct Usage {
     /// Breakdown of cache creation by TTL, when the provider reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
+    /// Total context tokens. Providers that report a total (Responses) use
+    /// it verbatim; the other shapes compute the sum of all token classes
+    /// at the wire boundary. Zero means no usage was reported at all.
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 /// Cache creation split by TTL.
@@ -277,6 +282,8 @@ pub struct Model {
     pub id: String,
     /// Maximum context window in tokens.
     pub context_window: usize,
+    /// Maximum output tokens the model can produce per response.
+    pub max_tokens: usize,
     /// How the model handles reasoning/thinking.
     pub thinking: ThinkingKind,
     /// Arbitrary provider-specific metadata.

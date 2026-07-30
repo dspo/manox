@@ -100,6 +100,7 @@ async fn main() {
             provider: "openai".into(),
             id: args.model.clone(),
             context_window: 200_000,
+            max_tokens: 16_384,
             thinking: args.thinking_kind,
             metadata: Default::default(),
         },

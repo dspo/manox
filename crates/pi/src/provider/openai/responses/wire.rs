@@ -251,6 +251,8 @@ pub struct WireUsage {
     #[serde(default)]
     pub output_tokens: Option<u64>,
     #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
     pub input_tokens_details: Option<WireInputTokensDetails>,
 }
 

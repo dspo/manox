@@ -239,13 +239,26 @@ impl Accumulator {
                     self.stop_reason = parse_stop_reason(sr);
                 }
                 if let Some(u) = &usage {
-                    // The delta usage carries cumulative output tokens; merge.
+                    // The delta usage carries cumulative counts, but any class
+                    // may be absent — merge only what is present so the values
+                    // captured at message_start survive.
                     let mut merged = self.usage.clone();
-                    let delta_usage = to_usage(u);
-                    merged.output_tokens = delta_usage.output_tokens;
-                    if delta_usage.input_tokens > 0 {
-                        merged.input_tokens = delta_usage.input_tokens;
+                    if let Some(v) = u.input_tokens {
+                        merged.input_tokens = v;
                     }
+                    if let Some(v) = u.output_tokens {
+                        merged.output_tokens = v;
+                    }
+                    if let Some(v) = u.cache_read_input_tokens {
+                        merged.cache_read_input_tokens = v;
+                    }
+                    if let Some(v) = u.cache_creation_input_tokens {
+                        merged.cache_creation_input_tokens = v;
+                    }
+                    merged.total_tokens = merged.input_tokens
+                        + merged.output_tokens
+                        + merged.cache_read_input_tokens
+                        + merged.cache_creation_input_tokens;
                     self.usage = merged;
                 }
             }
@@ -283,6 +296,7 @@ mod tests {
                 provider: "anthropic".into(),
                 id: "claude-test".into(),
                 context_window: 200_000,
+                max_tokens: 8_192,
                 thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
@@ -414,6 +428,41 @@ mod tests {
         assert!(err.is_err());
     }
 
+    #[test]
+    fn message_delta_merges_only_present_usage_classes() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).unwrap();
+
+        // The delta reports output and cache classes but omits input: the
+        // message_start input survives; the total is the merged sum.
+        acc.apply(RawStreamEvent::MessageDelta {
+            delta: wire::MessageDeltaBody {
+                stop_reason: Some("end_turn".into()),
+                stop_sequence: None,
+            },
+            usage: Some(wire::WireUsage {
+                input_tokens: None,
+                output_tokens: Some(7),
+                cache_read_input_tokens: Some(100),
+                cache_creation_input_tokens: Some(20),
+                cache_creation: None,
+            }),
+        }, &tx).unwrap();
+        let msg = acc.finish(&tx).unwrap();
+
+        match &msg {
+            AgentMessage::Assistant { usage, .. } => {
+                assert_eq!(usage.input_tokens, 10);
+                assert_eq!(usage.output_tokens, 7);
+                assert_eq!(usage.cache_read_input_tokens, 100);
+                assert_eq!(usage.cache_creation_input_tokens, 20);
+                assert_eq!(usage.total_tokens, 137);
+            }
+            _ => panic!("expected assistant"),
+        }
+    }
+
     // ── fixtures ────────────────────────────────────────────────────────────
 
     fn start_event() -> RawStreamEvent {
@@ -425,10 +474,10 @@ mod tests {
                 content: Vec::new(),
                 stop_reason: None,
                 usage: Some(wire::WireUsage {
-                    input_tokens: 10,
-                    output_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
+                    input_tokens: Some(10),
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
                     cache_creation: None,
                 }),
             },

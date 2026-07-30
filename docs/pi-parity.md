@@ -33,9 +33,9 @@
 | 能力 | manox 位置（规模） | pi 状态 | 说明 |
 |---|---|---|---|
 | 双流式 turn 循环 | thread.rs (10857 总量) | ✅ | pi agent_loop 双循环 + steering/follow-up 已具备 |
-| 取消传播 | thread.rs `cancel()` | 🟡 | pi 有 CancellationToken；manox 另有 pending oneshot 清理、leader→worker 级联 |
-| 空响应/工具未兑现恢复 | thread.rs（5 种 case） | 🔲 | 注入 nudge 重试，共享恢复预算 `MAX_RECOVERY_ATTEMPTS` |
-| 拒绝熔断 | thread.rs `MAX_CONSECUTIVE_TOOL_DENIALS` | 🔲 | 连续拒绝 → 注入收尾指令 → 二次触发硬停 |
+| 取消传播 | thread.rs `cancel()` | 🟡 | pi 有 CancellationToken；manox 另有 pending oneshot 清理、leader→worker 级联。**级联清理有意不移植（2026-07-29 拍板）：TS Pi 取消 = 纯 AbortSignal + 批次级 aborted 检查** |
+| 空响应/工具未兑现恢复 | thread.rs（5 种 case） | 🚫 | **有意不移植（2026-07-29 拍板）**：TS Pi agent-loop 无恢复 nudge；error/aborted 立即 agent_end |
+| 拒绝熔断 | thread.rs `MAX_CONSECUTIVE_TOOL_DENIALS` | 🚫 | **有意不移植（2026-07-29 拍板）**：TS Pi 无拒绝计数/熔断 |
 | MaxTokens 截断处理 | thread.rs | 🟡 | pi 目前 fail 掉全部 tool calls；manox 有更细的恢复路径 |
 | 子代理轮数上限 | thread.rs `max_turns` | 🟡 | pi 有全局 max_turns；manox 仅子代理受限 + 两次软着陆（先指令后硬停） |
 | 事件体系 | ThreadEvent (~40 变体) | 🟡 | pi AgentEvent 已覆盖主生命周期 + Retry；缺 PlanDelta/SubagentProgress/PrefixStability/TokenUsageUpdated 等产品化事件 |
@@ -44,9 +44,9 @@
 
 | 能力 | manox 位置（规模） | pi 状态 | 说明 |
 |---|---|---|---|
-| 自动压缩 | compact.rs + thread.rs | 🔲 | 阈值触发、delta-only 摘要（仅读上次 capsule 之后）、CompactionEnvelope（摘要+运行时状态 capsule） |
-| 溢出 compact-retry | thread.rs | 🔲 | 单次兜底：overflow 分类 → 压缩 → 重试一次 |
-| Token 计量 | token_meter.rs | 🟡 | pi 有 Usage 类型；manox 有累计/按消息/按模型三维计量 + DB 恢复 |
+| 自动压缩 | compact.rs + thread.rs | 🟡 | 子件 a（token 计量）已落地（2026-07-30，见下行）；子件 b+c（摘要载体+核心压缩）、d（触发路由）待做，对齐 TS Pi compaction.ts |
+| 溢出 compact-retry | thread.rs | 🔲 | 单次兜底：overflow 分类 → 压缩 → 重试一次（子件 d） |
+| Token 计量 | token_meter.rs | ✅ | 子件 a（2026-07-30）：`Usage.total_tokens` + `Model.max_tokens` 补齐（三 shape 落值：Anthropic/Completions 线边界折叠求和、Responses 取 wire 原值）；`calculate_context_tokens`（total>0 优先否则四类求和）、`estimate_context_tokens`（usage 锚定 + 尾部字符启发）、`estimate_tokens`（按消息形状：user/toolResult/custom=text+image(4800)，assistant=text+thinking+toolCall(name+JSON)，UTF-16 码元 ceil/4）、`should_compact`（i64 阈值减法）逐项对齐 TS Pi compaction.ts |
 | 前缀稳定性检测 | prefix_stability.rs | 🔲 | 请求指纹对比，检测 KV cache 破坏源（产品化观测，可后期） |
 
 ## 4. 审批与权限
@@ -137,8 +137,8 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 
 - [x] Provider：Completions + Responses 两形状补齐（2026-07-29）；retry + overflow 分类（2026-07-29）；prompt caching 策略对齐 TS Pi（2026-07-29）
 - [x] hashline 移植（read/write/edit/grep 配套，2026-07-29 完成）
-- [ ] 循环：恢复 nudge、拒绝熔断、取消级联清理
-- [ ] 上下文：自动压缩 + 溢出 compact-retry + 三维 token 计量
+- [x] ~~循环：恢复 nudge、拒绝熔断、取消级联清理~~ 有意不移植（2026-07-29 拍板：TS Pi agent-loop 三项皆无，属 manox 自创）
+- [ ] 上下文：自动压缩（子件 a token 计量 ✅ 2026-07-30；b+c 摘要载体与核心压缩、d 触发路由待做）+ 溢出 compact-retry（子件 d）
 - [ ] 工具：5a 其余项（Bash 持久 shell/后台、BashOutput/TaskStop/WebFetch）、Agent 子代理、worktree、Skill
 - [ ] 工具基础设施：循环层统一截断、schema 规整
 - [ ] 持久化：jsonl sessions 扩展（token 计量落盘、线程恢复）

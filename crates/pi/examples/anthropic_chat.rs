@@ -95,6 +95,7 @@ async fn main() {
             provider: "anthropic".into(),
             id: args.model.clone(),
             context_window: 200_000,
+            max_tokens: 8_192,
             thinking: args.thinking_kind,
             metadata: Default::default(),
         },

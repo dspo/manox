@@ -594,6 +594,7 @@ mod tests {
                 provider: "openai".into(),
                 id: "gpt-test".into(),
                 context_window: 200_000,
+                max_tokens: 16_384,
                 thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },

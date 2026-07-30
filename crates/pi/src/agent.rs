@@ -372,6 +372,7 @@ mod tests {
             provider: "test".into(),
             id: "test".into(),
             context_window: 100_000,
+            max_tokens: 8_192,
             thinking: ThinkingKind::None,
             metadata: Default::default(),
         }

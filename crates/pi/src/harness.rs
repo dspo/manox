@@ -199,7 +199,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 let context_tokens = self.estimate_current_tokens();
                 if compaction::should_compact(
                     context_tokens,
-                    self.model.context_window,
+                    self.model.context_window as u64,
                     &self.compaction_settings,
                 ) {
                     // Compaction is needed — caller should invoke compact().
@@ -259,14 +259,14 @@ impl<S: SessionStorage> AgentHarness<S> {
         let tokens = self.estimate_current_tokens();
         compaction::should_compact(
             tokens,
-            self.model.context_window,
+            self.model.context_window as u64,
             &self.compaction_settings,
         )
     }
 
     /// Estimate the current token usage of the conversation.
-    fn estimate_current_tokens(&self) -> usize {
-        compaction::estimate_context_tokens(&self.agent.state().messages)
+    fn estimate_current_tokens(&self) -> u64 {
+        compaction::estimate_context_tokens(&self.agent.state().messages).tokens
     }
 
     /// Run compaction on the current conversation.
@@ -294,7 +294,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         );
 
         let messages = self.agent.state().messages.clone();
-        let tokens_before = compaction::estimate_context_tokens(&messages) as u64;
+        let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
 
         let cut_point = compaction::find_cut_point(
             &messages,
@@ -317,7 +317,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         });
         new_messages.extend_from_slice(kept);
 
-        let tokens_after = compaction::estimate_context_tokens(&new_messages) as u64;
+        let tokens_after = compaction::estimate_context_tokens(&new_messages).tokens;
 
         // Replace the agent's transcript.
         self.agent.reset();
@@ -407,6 +407,7 @@ mod tests {
             provider: "test".into(),
             id: "test".into(),
             context_window: 100_000,
+            max_tokens: 8_192,
             thinking: ThinkingKind::None,
             metadata: Default::default(),
         }

@@ -277,16 +277,20 @@ pub struct MessageDeltaBody {
 }
 
 /// Token usage as reported by the API.
+///
+/// The counts stay optional: a `message_delta` usage often carries only the
+/// cumulative output, and an absent class must not overwrite the value
+/// captured at `message_start`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WireUsage {
     #[serde(default)]
-    pub input_tokens: u64,
+    pub input_tokens: Option<u64>,
     #[serde(default)]
-    pub output_tokens: u64,
+    pub output_tokens: Option<u64>,
     #[serde(default)]
-    pub cache_read_input_tokens: u64,
+    pub cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    pub cache_creation_input_tokens: u64,
+    pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_creation: Option<WireCacheCreation>,
 }

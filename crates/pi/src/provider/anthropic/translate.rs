@@ -13,9 +13,6 @@ use crate::types::{
 };
 use super::wire::*;
 
-/// Fallback max_tokens when the caller doesn't specify one.
-const DEFAULT_MAX_TOKENS: usize = 8192;
-
 /// Map a thinking level to an adaptive-thinking effort.
 ///
 /// pi reasons in named levels; adaptive models take an effort tier instead of
@@ -36,7 +33,7 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
     let cache_control = cache_control(context);
     MessageCreateParams {
         model: context.model.id.clone(),
-        max_tokens: options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        max_tokens: options.max_tokens.unwrap_or(context.model.max_tokens),
         system: Some(vec![SystemBlock {
             kind: "text",
             text: context.system_prompt.clone(),
@@ -267,17 +264,27 @@ pub fn parse_stop_reason(s: &str) -> Option<crate::types::StopReason> {
     })
 }
 
-/// Fold two usage reports (initial + delta) into the domain `Usage`.
+/// Fold a wire usage report into the domain `Usage`.
+///
+/// Anthropic reports no total; the total is the sum of all token classes.
 pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
+    let input_tokens = wire.input_tokens.unwrap_or(0);
+    let output_tokens = wire.output_tokens.unwrap_or(0);
+    let cache_read_input_tokens = wire.cache_read_input_tokens.unwrap_or(0);
+    let cache_creation_input_tokens = wire.cache_creation_input_tokens.unwrap_or(0);
     crate::types::Usage {
-        input_tokens: wire.input_tokens,
-        output_tokens: wire.output_tokens,
-        cache_read_input_tokens: wire.cache_read_input_tokens,
-        cache_creation_input_tokens: wire.cache_creation_input_tokens,
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
         cache_creation: wire.cache_creation.as_ref().map(|c| crate::types::CacheCreation {
             ephemeral_1h_input_tokens: c.ephemeral_1h_input_tokens,
             ephemeral_5m_input_tokens: c.ephemeral_5m_input_tokens,
         }),
+        total_tokens: input_tokens
+            + output_tokens
+            + cache_read_input_tokens
+            + cache_creation_input_tokens,
     }
 }
 
@@ -292,6 +299,7 @@ mod tests {
             provider: "anthropic".into(),
             id: "claude-test".into(),
             context_window: 200_000,
+            max_tokens: 8_192,
             thinking,
             metadata: Default::default(),
         }
@@ -520,7 +528,8 @@ mod tests {
         );
         c.tools = vec![Box::new(NamedTool("a")), Box::new(NamedTool("b"))];
         let req = to_request(&c, &StreamOptions::default());
-        assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
+        // No explicit option: the model's own max_tokens is the default.
+        assert_eq!(req.max_tokens, c.model.max_tokens);
 
         // Breakpoint 1: the system block.
         let system = serde_json::to_value(&req.system).unwrap();
