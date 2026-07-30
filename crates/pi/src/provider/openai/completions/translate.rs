@@ -278,15 +278,18 @@ fn image_part(source: &ImageSource) -> UserPart {
     }
 }
 
-/// Map a protocol finish_reason into the domain enum. Unknown reasons read
-/// as a natural stop — a vendor-invented reason still ends the turn.
+/// Map a protocol finish_reason into the domain enum, faithful to the TS Pi
+/// map. content_filter/network_error collapse to `Error` (the detail surfaces
+/// as `error_message`); unknown reasons also read as `Error` rather than a
+/// silent natural stop, so a vendor failure never looks like completion.
 pub fn parse_finish_reason(s: &str) -> crate::types::StopReason {
     use crate::types::StopReason::*;
     match s {
-        "length" => MaxTokens,
+        "" | "stop" | "end" => Stop,
+        "length" => Length,
         "tool_calls" | "function_call" => ToolUse,
-        "content_filter" => Refusal,
-        _ => EndTurn,
+        "content_filter" | "network_error" => Error,
+        _ => Error,
     }
 }
 
@@ -754,13 +757,16 @@ mod tests {
     #[test]
     fn finish_reason_maps_known_and_unknown() {
         use crate::types::StopReason::*;
-        assert_eq!(parse_finish_reason("stop"), EndTurn);
-        assert_eq!(parse_finish_reason("length"), MaxTokens);
+        assert_eq!(parse_finish_reason(""), Stop);
+        assert_eq!(parse_finish_reason("stop"), Stop);
+        assert_eq!(parse_finish_reason("end"), Stop);
+        assert_eq!(parse_finish_reason("length"), Length);
         assert_eq!(parse_finish_reason("tool_calls"), ToolUse);
         assert_eq!(parse_finish_reason("function_call"), ToolUse);
-        assert_eq!(parse_finish_reason("content_filter"), Refusal);
-        // Vendor-invented reasons read as a natural stop.
-        assert_eq!(parse_finish_reason("vendor_reason"), EndTurn);
+        assert_eq!(parse_finish_reason("content_filter"), Error);
+        assert_eq!(parse_finish_reason("network_error"), Error);
+        // Vendor-invented reasons read as a failure, not a silent completion.
+        assert_eq!(parse_finish_reason("vendor_reason"), Error);
     }
 
     #[test]

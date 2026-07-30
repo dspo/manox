@@ -157,10 +157,11 @@ async fn run_loop_inner(
                 _ => None,
             };
 
-            // A refusal carries no tool calls; end the run without executing.
-            // Local interruptions (abort, transport error) surface through the
-            // error channel, not through a protocol stop_reason.
-            if stop_reason == Some(StopReason::Refusal) {
+            // An error stop reason carries no tool calls; end the run without
+            // executing. Local interrupts (abort, transport error) reach here
+            // as an `Error`/`Aborted` terminal message built by the stream
+            // error handler.
+            if stop_reason == Some(StopReason::Error) {
                 sink.emit(AgentEvent::TurnEnd {
                     message: Box::new(message),
                     tool_results: Vec::new(),
@@ -194,7 +195,7 @@ async fn run_loop_inner(
                 let noop_ctx = NoopToolContext {
                     tool_state: crate::tool::ToolState::new(),
                 };
-                let (executed, result_messages) = if stop_reason == Some(StopReason::MaxTokens) {
+                let (executed, result_messages) = if stop_reason == Some(StopReason::Length) {
                     fail_tool_calls_from_truncated(&tool_calls, sink)
                 } else {
                     execute_tool_calls(
@@ -449,7 +450,7 @@ mod tests {
                 }],
                 model: "mock".into(),
                 provider: "mock".into(),
-                stop_reason: Some(StopReason::EndTurn),
+                stop_reason: Some(StopReason::Stop),
                 usage: Usage::default(),
                 timestamp: chrono::Utc::now(),
             })
@@ -534,7 +535,7 @@ mod tests {
                     }],
                     model: "mock".into(),
                     provider: "mock".into(),
-                    stop_reason: Some(StopReason::EndTurn),
+                    stop_reason: Some(StopReason::Stop),
                     usage: Usage::default(),
                     timestamp: chrono::Utc::now(),
                 });
@@ -631,7 +632,7 @@ mod tests {
             }],
             model: "mock".into(),
             provider: "mock".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage: Usage::default(),
             timestamp: chrono::Utc::now(),
         };
@@ -708,7 +709,7 @@ mod tests {
             }],
             model: "mock".into(),
             provider: "mock".into(),
-            stop_reason: Some(StopReason::MaxTokens),
+            stop_reason: Some(StopReason::Length),
             usage: Usage::default(),
             timestamp: chrono::Utc::now(),
         };

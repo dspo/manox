@@ -467,7 +467,7 @@ mod tests {
                 assert!(
                     matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
                 );
-                assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+                assert_eq!(*stop_reason, Some(StopReason::Stop));
             }
             _ => panic!("expected assistant"),
         }

@@ -74,9 +74,9 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         model: String,
         provider: String,
-        /// The protocol stop_reason reported by the provider. `None` while the
-        /// message is still streaming or when the run ended without one
-        /// (aborted, errored) — see [`Termination`].
+        /// The stop reason reported for this turn. `None` only while the
+        /// message is still streaming; a finalized message always carries one
+        /// — `Error`/`Aborted` cover provider failures and local interrupts.
         #[serde(default)]
         stop_reason: Option<StopReason>,
         #[serde(default)]
@@ -131,40 +131,26 @@ impl AgentMessage {
     }
 }
 
-/// Why the assistant stopped generating, as reported by the provider.
+/// Why the assistant stopped generating, as reported by the provider or set
+/// locally on interruption.
 ///
-/// Mirrors the Anthropic Messages API `stop_reason` values exactly. Local
-/// interruptions (user abort, provider error) are NOT represented here — they
-/// surface through [`Termination`] and the error channel instead.
+/// Mirrors the TS Pi `StopReason`: `Stop`/`Length`/`ToolUse` come from the
+/// provider's protocol stop reason; `Error` covers provider-reported failures
+/// (refusal, content filter, context-window overflow) and transport errors;
+/// `Aborted` covers user/system cancellation. An `Error`/`Aborted` message
+/// carries `error_message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum StopReason {
-    /// Natural completion.
-    EndTurn,
-    /// Output token limit reached.
-    MaxTokens,
-    /// A stop sequence was hit.
-    StopSequence,
-    /// The model requested a tool call.
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "length")]
+    Length,
+    #[serde(rename = "toolUse")]
     ToolUse,
-    /// The model paused a long-running turn (may be resumed).
-    PauseTurn,
-    /// The model refused the request.
-    Refusal,
-    /// The model's context window was exceeded.
-    ModelContextWindowExceeded,
-}
-
-/// Why a run ended without a protocol `stop_reason`.
-///
-/// These are local interruptions, distinct from anything the provider reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Termination {
-    /// Aborted by the user or system.
-    Aborted,
-    /// The provider or transport errored.
+    #[serde(rename = "error")]
     Error,
+    #[serde(rename = "aborted")]
+    Aborted,
 }
 
 /// Token usage for a single assistant message.

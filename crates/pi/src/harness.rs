@@ -495,7 +495,7 @@ mod tests {
                 }],
                 model: "test".into(),
                 provider: "test".into(),
-                stop_reason: Some(StopReason::EndTurn),
+                stop_reason: Some(StopReason::Stop),
                 usage: Usage::default(),
                 timestamp: chrono::Utc::now(),
             })
@@ -660,7 +660,7 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage: Usage {
                 total_tokens: 90_000,
                 ..Default::default()
@@ -699,7 +699,7 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage: Usage {
                 total_tokens: 90_000,
                 ..Default::default()

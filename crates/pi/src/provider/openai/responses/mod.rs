@@ -488,16 +488,16 @@ impl Accumulator {
             self.usage = to_usage(usage);
         }
         self.stop_reason = match response.status.as_deref() {
-            Some("incomplete") => Some(crate::types::StopReason::MaxTokens),
+            Some("incomplete") => Some(crate::types::StopReason::Length),
             Some("failed") | Some("cancelled") => {
                 return Err(overflow::mid_stream(response_failure(response)).into());
             }
             // completed, in_progress, queued, and anything unrecognized.
-            _ => Some(crate::types::StopReason::EndTurn),
+            _ => Some(crate::types::StopReason::Stop),
         };
         // A response that emitted tool calls ended for tool use, whatever
         // the status says.
-        if self.stop_reason == Some(crate::types::StopReason::EndTurn)
+        if self.stop_reason == Some(crate::types::StopReason::Stop)
             && self
                 .blocks
                 .iter()
@@ -731,7 +731,7 @@ mod tests {
         };
         assert_eq!(text, "Hello, world");
         assert!(signature.is_some());
-        assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
 
@@ -900,7 +900,7 @@ mod tests {
         let AgentMessage::Assistant { stop_reason, .. } = &msg else {
             panic!("expected assistant")
         };
-        assert_eq!(*stop_reason, Some(StopReason::MaxTokens));
+        assert_eq!(*stop_reason, Some(StopReason::Length));
     }
 
     #[test]

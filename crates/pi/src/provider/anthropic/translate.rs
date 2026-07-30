@@ -270,18 +270,19 @@ fn image_source(source: &ImageSource) -> ImageSourceParam {
 }
 
 /// Parse a protocol stop_reason string into the domain enum.
-pub fn parse_stop_reason(s: &str) -> Option<crate::types::StopReason> {
+///
+/// Faithful to the TS Pi map: refusal/sensitive/overflow collapse to `Error`
+/// (the refusal explanation surfaces as `error_message` on the message, set by
+/// the accumulator); pause_turn/stop_sequence read as a natural `Stop`.
+pub fn parse_stop_reason(s: &str) -> crate::types::StopReason {
     use crate::types::StopReason::*;
-    Some(match s {
-        "end_turn" => EndTurn,
-        "max_tokens" => MaxTokens,
-        "stop_sequence" => StopSequence,
+    match s {
+        "end_turn" | "pause_turn" | "stop_sequence" => Stop,
+        "max_tokens" => Length,
         "tool_use" => ToolUse,
-        "pause_turn" => PauseTurn,
-        "refusal" => Refusal,
-        "model_context_window_exceeded" => ModelContextWindowExceeded,
-        _ => return None,
-    })
+        // refusal/sensitive/overflow are failure stop reasons.
+        _ => Error,
+    }
 }
 
 /// Fold a wire usage report into the domain `Usage`.
@@ -687,16 +688,17 @@ mod tests {
     fn stop_reason_parses_all_protocol_values() {
         use crate::types::StopReason::*;
         for (s, want) in [
-            ("end_turn", EndTurn),
-            ("max_tokens", MaxTokens),
-            ("stop_sequence", StopSequence),
+            ("end_turn", Stop),
+            ("max_tokens", Length),
+            ("stop_sequence", Stop),
             ("tool_use", ToolUse),
-            ("pause_turn", PauseTurn),
-            ("refusal", Refusal),
-            ("model_context_window_exceeded", ModelContextWindowExceeded),
+            ("pause_turn", Stop),
+            ("refusal", Error),
+            ("model_context_window_exceeded", Error),
+            ("sensitive", Error),
+            ("nonsense", Error),
         ] {
-            assert_eq!(parse_stop_reason(s), Some(want));
+            assert_eq!(parse_stop_reason(s), want);
         }
-        assert_eq!(parse_stop_reason("nonsense"), None);
     }
 }

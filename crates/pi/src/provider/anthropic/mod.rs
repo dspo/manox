@@ -252,7 +252,7 @@ impl Accumulator {
             }
             RawStreamEvent::MessageDelta { delta, usage } => {
                 if let Some(sr) = &delta.stop_reason {
-                    self.stop_reason = parse_stop_reason(sr);
+                    self.stop_reason = Some(parse_stop_reason(sr));
                 }
                 if let Some(u) = &usage {
                     // The delta usage carries cumulative counts, but any class
@@ -362,7 +362,7 @@ mod tests {
                 assert!(
                     matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
                 );
-                assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+                assert_eq!(*stop_reason, Some(StopReason::Stop));
             }
             _ => panic!("expected assistant"),
         }

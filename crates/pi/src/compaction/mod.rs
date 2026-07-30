@@ -336,7 +336,7 @@ mod tests {
             }],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
             timestamp: chrono::Utc::now(),
         }
@@ -347,7 +347,7 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage,
             timestamp: chrono::Utc::now(),
         }
@@ -467,7 +467,7 @@ mod tests {
             ],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
             timestamp: chrono::Utc::now(),
         };
