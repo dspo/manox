@@ -94,8 +94,15 @@ impl EventSink for SubscriberSink {
 /// subscription, and message queuing (steering / follow-up).
 pub struct Agent {
     state: AgentState,
-    steering_queue: PendingMessageQueue,
-    follow_up_queue: PendingMessageQueue,
+    /// Mid-turn steering queue, drained by the loop's `get_steering_messages`
+    /// callback. Shared via `Arc<Mutex<..>>` so the closure cloned into the
+    /// loop config can drain it from within the spawned run while the Agent
+    /// still receives `steer()` calls from the outside.
+    steering_queue: Arc<Mutex<PendingMessageQueue>>,
+    /// Post-stop follow-up queue, drained by the loop's
+    /// `get_follow_up_messages` callback to resume a run that would otherwise
+    /// have ended.
+    follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
     active_run: Option<CancellationToken>,
     stream_fn: Arc<dyn StreamFn>,
     sink: SubscriberSink,
@@ -125,8 +132,8 @@ impl Agent {
     ) -> Self {
         Agent {
             state: AgentState::new(system_prompt, model),
-            steering_queue: PendingMessageQueue::new(QueueMode::OneAtATime),
-            follow_up_queue: PendingMessageQueue::new(QueueMode::OneAtATime),
+            steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
+            follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             active_run: None,
             stream_fn,
             sink: SubscriberSink::new(),
@@ -172,27 +179,28 @@ impl Agent {
 
     /// Queue a message to be injected after the current assistant turn finishes.
     pub fn steer(&mut self, message: AgentMessage) {
-        self.steering_queue.enqueue(message);
+        self.steering_queue.lock().unwrap().enqueue(message);
     }
 
     /// Queue a message to run only after the agent would otherwise stop.
     pub fn follow_up(&mut self, message: AgentMessage) {
-        self.follow_up_queue.enqueue(message);
+        self.follow_up_queue.lock().unwrap().enqueue(message);
     }
 
     /// Remove all queued steering messages.
     pub fn clear_steering_queue(&mut self) {
-        self.steering_queue.clear();
+        self.steering_queue.lock().unwrap().clear();
     }
 
     /// Remove all queued follow-up messages.
     pub fn clear_follow_up_queue(&mut self) {
-        self.follow_up_queue.clear();
+        self.follow_up_queue.lock().unwrap().clear();
     }
 
     /// Whether either queue has pending messages.
     pub fn has_queued_messages(&self) -> bool {
-        self.steering_queue.has_items() || self.follow_up_queue.has_items()
+        self.steering_queue.lock().unwrap().has_items()
+            || self.follow_up_queue.lock().unwrap().has_items()
     }
 
     /// Abort the current run, if one is active.
@@ -209,8 +217,8 @@ impl Agent {
         self.state.streaming_message = None;
         self.state.pending_tool_calls.clear();
         self.state.error_message = None;
-        self.steering_queue.clear();
-        self.follow_up_queue.clear();
+        self.steering_queue.lock().unwrap().clear();
+        self.follow_up_queue.lock().unwrap().clear();
     }
 
     /// Replace the entire transcript with new messages.
@@ -249,11 +257,11 @@ impl Agent {
             None => anyhow::bail!("No messages to continue from"),
             Some(AgentMessage::Assistant { .. }) => {
                 // Try draining steering/follow-up queues first.
-                let steering = self.steering_queue.drain();
+                let steering = self.steering_queue.lock().unwrap().drain();
                 if !steering.is_empty() {
                     return self.run_prompt_messages(&steering).await;
                 }
-                let follow_up = self.follow_up_queue.drain();
+                let follow_up = self.follow_up_queue.lock().unwrap().drain();
                 if !follow_up.is_empty() {
                     return self.run_prompt_messages(&follow_up).await;
                 }
@@ -278,10 +286,17 @@ impl Agent {
     }
 
     /// Build the loop config from the current agent state.
+    ///
+    /// The steering and follow-up queues are handed to the loop as draining
+    /// callbacks so messages queued mid-run (via `steer`) or after a natural
+    /// stop (via `follow_up`) are injected by the loop itself rather than
+    /// requiring the caller to manually resume.
     fn create_loop_config(&self) -> AgentLoopConfig {
+        let steering = Arc::clone(&self.steering_queue);
+        let follow_up = Arc::clone(&self.follow_up_queue);
         AgentLoopConfig {
-            get_steering_messages: None,
-            get_follow_up_messages: None,
+            get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
+            get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
             prepare_next_turn: None,
             should_stop_after_turn: None,
             before_tool_call: None,
@@ -583,5 +598,33 @@ mod tests {
         assert!(agent.has_queued_messages());
         agent.clear_steering_queue();
         assert!(!agent.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn steering_queued_before_run_is_injected_by_loop() {
+        // #367: a steering message queued before the run starts must be
+        // drained by the loop's `get_steering_messages` callback and injected
+        // into the transcript between the user prompt and the assistant
+        // response — not left sitting in the queue.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+            test_tool_ctx(),
+        );
+        agent.steer(AgentMessage::user("STEER"));
+
+        let messages = agent.prompt("hi").await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::User { content, .. }
+                    if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "STEER")))),
+            "steering message must appear in the run's new messages"
+        );
+        assert!(
+            !agent.has_queued_messages(),
+            "steering queue must be drained after the run"
+        );
     }
 }
