@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hashline::SnapshotStore;
 use crate::tools::file_mutation_queue::FileMutationQueue;
-use crate::types::ContentBlock;
+use crate::types::{AgentEvent, AgentLoopConfig, ContentBlock, EventSink};
 
 // ── Tool state ─────────────────────────────────────────────────────────────
 
@@ -235,18 +235,22 @@ pub struct ExecutedToolCall {
 /// Execute a batch of tool calls using the full pipeline.
 ///
 /// Returns the executed calls and the combined result messages to append to
-/// the conversation.
+/// the conversation. Each call emits a matched `ToolExecutionStart` /
+/// `ToolExecutionEnd` pair and runs the optional `before_tool_call` /
+/// `after_tool_call` hooks from `config`.
 pub async fn execute_tool_calls(
     tool_calls: &[(&str, &str, JsonValue)],
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &dyn EventSink,
     sequential: bool,
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     if sequential {
-        execute_sequential(tool_calls, tools, signal, ctx).await
+        execute_sequential(tool_calls, tools, signal, ctx, config, sink).await
     } else {
-        execute_parallel(tool_calls, tools, signal, ctx).await
+        execute_parallel(tool_calls, tools, signal, ctx, config, sink).await
     }
 }
 
@@ -255,12 +259,14 @@ async fn execute_sequential(
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &dyn EventSink,
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let mut executed = Vec::with_capacity(tool_calls.len());
     let mut messages = Vec::with_capacity(tool_calls.len());
 
     for (id, name, args) in tool_calls {
-        let outcome = execute_one(id, name, args, tools, signal.clone(), ctx).await;
+        let outcome = execute_one((id, name, args), tools, signal.clone(), ctx, config, sink).await;
         messages.push(outcome.result_message.clone());
         executed.push(outcome);
     }
@@ -273,10 +279,14 @@ async fn execute_parallel(
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &dyn EventSink,
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let futures: Vec<_> = tool_calls
         .iter()
-        .map(|(id, name, args)| execute_one(id, name, args, tools, signal.clone(), ctx))
+        .map(|(id, name, args)| {
+            execute_one((id, name, args), tools, signal.clone(), ctx, config, sink)
+        })
         .collect();
 
     let outcomes = futures::future::join_all(futures).await;
@@ -293,24 +303,35 @@ async fn execute_parallel(
 }
 
 async fn execute_one(
-    tool_call_id: &str,
-    tool_name: &str,
-    args: &JsonValue,
+    call: (&str, &str, &JsonValue),
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &dyn EventSink,
 ) -> ExecutedToolCall {
-    // Find the tool by name.
-    let tool = tools.iter().find(|t| t.name() == tool_name);
+    let (tool_call_id, tool_name, args) = call;
+    let id = tool_call_id.to_string();
+    let name = tool_name.to_string();
 
-    let tool = match tool {
+    sink.emit(AgentEvent::ToolExecutionStart {
+        tool_call_id: id.clone(),
+        tool_name: name.clone(),
+    });
+
+    // Find the tool by name.
+    let tool = match tools.iter().find(|t| t.name() == tool_name) {
         Some(t) => t,
         None => {
             let result = AgentToolResult::error(format!("Tool not found: {tool_name}"));
+            let result_message = make_tool_result_message(&id, &name, &result);
+            sink.emit(AgentEvent::ToolExecutionEnd {
+                tool_call_id: id.clone(),
+            });
             return ExecutedToolCall {
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+                tool_call_id: id,
+                tool_name: name,
+                result_message,
                 result,
                 blocked: false,
                 block_reason: None,
@@ -321,39 +342,74 @@ async fn execute_one(
     // Validate arguments against the tool's JSON Schema.
     if let Err(e) = validate_tool_args(tool.parameters_schema(), args.clone()) {
         let result = AgentToolResult::error(format!("Invalid arguments: {e}"));
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+        });
         return ExecutedToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
             result,
             blocked: false,
             block_reason: None,
+        };
+    }
+
+    // before_tool_call hook: `Some(reason)` blocks before execution.
+    if let Some(before) = &config.before_tool_call
+        && let Some(reason) = before(tool_call_id, tool_name, args)
+    {
+        let result = AgentToolResult::error(format!("blocked: {reason}"));
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+        });
+        return ExecutedToolCall {
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
+            result,
+            blocked: true,
+            block_reason: Some(reason),
         };
     }
 
     // Execute the tool.
     if signal.is_cancelled() {
         let result = AgentToolResult::error("aborted");
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+        });
         return ExecutedToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
             result,
             blocked: false,
             block_reason: None,
         };
     }
 
-    let result = match tool.execute(tool_call_id, args.clone(), signal, ctx).await {
+    let mut result = match tool.execute(tool_call_id, args.clone(), signal, ctx).await {
         Ok(r) => r,
         Err(e) => AgentToolResult::error(format!("{e}")),
     };
 
-    let result_message = make_tool_result_message(tool_call_id, tool_name, &result);
+    // after_tool_call hook: patches the result.
+    if let Some(after) = &config.after_tool_call {
+        result = after(&result);
+    }
+
+    let result_message = make_tool_result_message(&id, &name, &result);
+    sink.emit(AgentEvent::ToolExecutionEnd {
+        tool_call_id: id.clone(),
+    });
 
     ExecutedToolCall {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
+        tool_call_id: id,
+        tool_name: name,
         result_message,
         result,
         blocked: false,
@@ -392,6 +448,12 @@ fn validate_tool_args(schema: JsonValue, args: JsonValue) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A sink that discards events; pipeline tests don't assert lifecycle.
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn emit(&self, _event: AgentEvent) {}
+    }
     use crate::env::ExecutionEnv;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -521,6 +583,8 @@ mod tests {
             &tools,
             signal,
             &ctx,
+            &AgentLoopConfig::default(),
+            &NullSink,
             false,
         )
         .await;
@@ -548,6 +612,8 @@ mod tests {
             &tools,
             signal,
             &ctx,
+            &AgentLoopConfig::default(),
+            &NullSink,
             false,
         )
         .await;

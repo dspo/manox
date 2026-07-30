@@ -17,13 +17,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tool::{AgentToolResult, ToolContext, execute_tool_calls};
 use crate::types::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, StopReason,
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, StopReason, Usage,
 };
 
 /// Sink for agent lifecycle events emitted during the loop.
-pub trait EventSink: Send {
-    fn emit(&self, event: AgentEvent);
-}
+///
+/// Defined in [`crate::types`] next to [`AgentEvent`] so the tool execution
+/// pipeline can emit lifecycle events without depending on the loop module.
+pub use crate::types::EventSink;
 
 /// The function that streams an assistant response from an LLM.
 ///
@@ -60,6 +61,17 @@ pub async fn run_loop(
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
     let signal = signal.unwrap_or_default();
     let mut new_messages: Vec<AgentMessage> = prompts.to_vec();
+
+    // Announce each initial prompt as a settled message so consumers see a
+    // MessageStart/MessageEnd pair for the user turn, mirroring TS Pi.
+    for msg in prompts {
+        sink.emit(AgentEvent::MessageStart {
+            message: Box::new(msg.clone()),
+        });
+        sink.emit(AgentEvent::MessageEnd {
+            message: Box::new(msg.clone()),
+        });
+    }
 
     // Prepend prompts to the context.
     let mut current_messages: Vec<AgentMessage> = context.messages.clone();
@@ -178,11 +190,14 @@ async fn run_loop_inner(
                 _ => None,
             };
 
-            // An error stop reason carries no tool calls; end the run without
-            // executing. Local interrupts (abort, transport error) reach here
-            // as an `Error`/`Aborted` terminal message built by the stream
-            // error handler.
-            if stop_reason == Some(StopReason::Error) {
+            // An error or abort stop reason carries no tool calls; end the
+            // run without executing. Provider errors and local interrupts
+            // (abort, transport error) reach here as a terminal `Error`/
+            // `Aborted` message built by the stream error handler.
+            if matches!(
+                stop_reason,
+                Some(StopReason::Error) | Some(StopReason::Aborted)
+            ) {
                 sink.emit(AgentEvent::TurnEnd {
                     message: Box::new(message),
                     tool_results: Vec::new(),
@@ -221,6 +236,8 @@ async fn run_loop_inner(
                         &context.tools,
                         signal.clone(),
                         tool_ctx,
+                        config,
+                        sink,
                         config.sequential_tool_execution,
                     )
                     .await
@@ -339,8 +356,15 @@ async fn stream_assistant_response(
         sink.emit(event);
     }
 
-    // Wait for the stream to complete and get the final message.
-    let message = stream_handle.await??;
+    // Wait for the stream to complete. A provider error or an abort never
+    // propagates as `Result::Err` — it is materialized as a terminal assistant
+    // message with `stop_reason = Error | Aborted` so consumers learn of the
+    // failure from the event stream and the run can close out cleanly.
+    let message = match stream_handle.await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(e)) => terminal_message(signal, e.to_string()),
+        Err(join_err) => terminal_message(signal, format!("stream task failed: {join_err}")),
+    };
 
     // Emit message_start/message_end if not already emitted by the stream.
     if first {
@@ -353,6 +377,32 @@ async fn stream_assistant_response(
     });
 
     Ok(message)
+}
+
+/// Build a terminal assistant message for a provider error or abort.
+///
+/// `Aborted` when the run was cancelled, `Error` otherwise — matching the TS
+/// Pi terminal stop reasons. The message carries no content and an
+/// `error_message` so downstream consumers can surface why the run ended.
+fn terminal_message(signal: &CancellationToken, error_message: String) -> AgentMessage {
+    let stop_reason = if signal.is_cancelled() {
+        StopReason::Aborted
+    } else {
+        StopReason::Error
+    };
+    AgentMessage::Assistant {
+        content: Vec::new(),
+        model: String::new(),
+        provider: String::new(),
+        api: String::new(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        stop_reason: Some(stop_reason),
+        usage: Box::new(Usage::default()),
+        error_message: Some(error_message),
+        timestamp: chrono::Utc::now(),
+    }
 }
 
 /// Fail all tool calls from a truncated assistant message.
@@ -1048,6 +1098,321 @@ mod tests {
             follow_up_count.load(Ordering::SeqCst),
             1,
             "follow-up should have been triggered once"
+        );
+    }
+
+    // ── #365: initial prompt lifecycle ────────────────────────────────────────
+
+    fn minimal_context() -> AgentContext {
+        AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_prompt_emits_message_lifecycle() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let result = run_loop(
+            &[AgentMessage::user("hello")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(MockStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let events = sink.events.lock().unwrap();
+        // The initial user prompt must be announced with a matched
+        // MessageStart/MessageEnd pair.
+        let has_user_start = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message }
+                if matches!(**message, AgentMessage::User { .. })
+            )
+        });
+        let has_user_end = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageEnd { message }
+                if matches!(**message, AgentMessage::User { .. })
+            )
+        });
+        assert!(has_user_start, "initial prompt must emit MessageStart");
+        assert!(has_user_end, "initial prompt must emit MessageEnd");
+    }
+
+    // ── #366: before/after tool call hooks ────────────────────────────────────
+
+    #[tokio::test]
+    async fn before_tool_call_blocks_execution() {
+        let sink = MockSink::new();
+        // Block the "echo" tool with a reason.
+        let config = AgentLoopConfig {
+            before_tool_call: Some(Box::new(|_id, name, _args| {
+                if name == "echo" {
+                    Some("blocked by test".into())
+                } else {
+                    None
+                }
+            })),
+            max_turns: Some(2),
+            ..Default::default()
+        };
+        let mut context = minimal_context();
+
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"message": "hello"}),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg]));
+
+        run_loop(
+            &[AgentMessage::user("echo hello")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // The blocked tool result is appended to the transcript as an error.
+        let blocked_result = context.messages.iter().find_map(|m| match m {
+            AgentMessage::ToolResult {
+                content, is_error, ..
+            } if content.iter().any(
+                |b| matches!(b, ContentBlock::Text { text, .. } if text.contains("blocked")),
+            ) =>
+            {
+                Some(*is_error)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            blocked_result,
+            Some(true),
+            "blocked tool call must produce an error tool_result"
+        );
+
+        // Start/End must still be paired so the UI sees a clean boundary.
+        let events = sink.events.lock().unwrap();
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .count();
+        assert_eq!(starts, 1, "one ToolExecutionStart for the blocked call");
+        assert_eq!(ends, 1, "one ToolExecutionEnd for the blocked call");
+    }
+
+    #[tokio::test]
+    async fn after_tool_call_patches_result() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig {
+            after_tool_call: Some(Box::new(|r: &AgentToolResult| {
+                let mut patched = r.clone();
+                if let Some(crate::types::ContentBlock::Text { text, .. }) =
+                    patched.content.get_mut(0)
+                {
+                    *text = "patched".into();
+                }
+                patched
+            })),
+            max_turns: Some(2),
+            ..Default::default()
+        };
+        let mut context = minimal_context();
+
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"message": "hello"}),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg]));
+
+        run_loop(
+            &[AgentMessage::user("echo hello")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        // The patched content replaces the tool's own "hello" output.
+        let patched = context.messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::ToolResult { content, .. }
+                if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "patched"))
+            )
+        });
+        assert!(
+            patched,
+            "after_tool_call must rewrite the tool result content"
+        );
+    }
+
+    // ── #368: provider error / abort terminal message ────────────────────────
+
+    struct ErrStreamFn;
+    #[async_trait::async_trait]
+    impl StreamFn for ErrStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            Err(anyhow::anyhow!("provider boom"))
+        }
+    }
+
+    struct AbortStreamFn;
+    #[async_trait::async_trait]
+    impl StreamFn for AbortStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            signal: CancellationToken,
+            _event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            signal.cancel();
+            Err(anyhow::anyhow!("aborted by mock"))
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_produces_terminal_error_message() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let result = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(ErrStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await;
+
+        // The run closes out cleanly (Ok), surfacing the failure as a
+        // terminal assistant message rather than a propagated Err.
+        let messages = result.unwrap();
+        let terminal = messages.iter().find_map(|m| match m {
+            AgentMessage::Assistant {
+                stop_reason,
+                error_message,
+                ..
+            } if *stop_reason == Some(StopReason::Error) => error_message.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            terminal.as_deref(),
+            Some("provider boom"),
+            "error must materialize as a terminal Error assistant message"
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnEnd { .. })),
+            "error path must emit TurnEnd"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "error path must emit AgentEnd"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_produces_terminal_aborted_message() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(AbortStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let aborted = messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::Assistant { stop_reason, .. }
+                if *stop_reason == Some(StopReason::Aborted)
+            )
+        });
+        assert!(
+            aborted,
+            "abort must materialize as a terminal Aborted assistant message"
         );
     }
 }
