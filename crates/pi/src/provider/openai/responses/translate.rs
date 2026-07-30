@@ -19,7 +19,7 @@
 //   - tool calls left without a result (edited or truncated history) gain a
 //     synthetic error output, because the API rejects unpaired calls.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde_json::Value as JsonValue;
 
@@ -33,9 +33,10 @@ use super::wire::*;
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesParams {
     let (reasoning, include) = reasoning_params(context);
+    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
     ResponsesParams {
         model: context.model.id.clone(),
-        input: to_input(context),
+        input: to_input(context, &messages),
         stream: true,
         store: false,
         // The API rejects max_output_tokens below 16.
@@ -103,7 +104,7 @@ fn tools_param(context: &AgentContext) -> Option<Vec<ToolParam>> {
 }
 
 /// Convert the conversation into the flat `input` array.
-fn to_input(context: &AgentContext) -> Vec<InputItem> {
+fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem> {
     let mut items: Vec<InputItem> = Vec::new();
     // The system prompt leads as a convenient-form message; reasoning models
     // take it under the developer role.
@@ -121,15 +122,10 @@ fn to_input(context: &AgentContext) -> Vec<InputItem> {
     // Original tool call id -> normalized id, filled while converting
     // cross-model assistant turns so their results can follow.
     let mut id_map: HashMap<String, String> = HashMap::new();
-    // Tool calls of the most recent assistant turn, by effective id,
-    // awaiting their results.
-    let mut pending_calls: Vec<String> = Vec::new();
-    let mut resolved_calls: HashSet<String> = HashSet::new();
 
-    for msg in &context.messages {
+    for msg in messages {
         match msg {
             AgentMessage::User { content, .. } => {
-                flush_orphans(&mut items, &mut pending_calls, &mut resolved_calls, &mut msg_index);
                 let parts: Vec<InputPart> = content.iter().filter_map(user_part).collect();
                 if parts.is_empty() {
                     continue;
@@ -140,7 +136,6 @@ fn to_input(context: &AgentContext) -> Vec<InputItem> {
                 }));
             }
             AgentMessage::Assistant { content, model, provider, .. } => {
-                flush_orphans(&mut items, &mut pending_calls, &mut resolved_calls, &mut msg_index);
                 let before = items.len();
                 convert_assistant(
                     &mut items,
@@ -150,7 +145,6 @@ fn to_input(context: &AgentContext) -> Vec<InputItem> {
                     context,
                     msg_index,
                     &mut id_map,
-                    &mut pending_calls,
                 );
                 if items.len() == before {
                     continue;
@@ -158,7 +152,6 @@ fn to_input(context: &AgentContext) -> Vec<InputItem> {
             }
             AgentMessage::ToolResult { tool_call_id, content, .. } => {
                 let effective = id_map.get(tool_call_id).unwrap_or(tool_call_id).clone();
-                resolved_calls.insert(effective.clone());
                 let call_id = effective.split('|').next().unwrap_or(&effective).to_string();
                 items.push(InputItem::Item(OutputItem::FunctionCallOutput {
                     call_id,
@@ -170,38 +163,13 @@ fn to_input(context: &AgentContext) -> Vec<InputItem> {
         }
         msg_index += 1;
     }
-    flush_orphans(&mut items, &mut pending_calls, &mut resolved_calls, &mut msg_index);
     items
-}
-
-/// Emit synthetic error outputs for tool calls that never got a result.
-/// The API rejects an unpaired function call, so an interrupted or edited
-/// history must not replay one bare.
-fn flush_orphans(
-    items: &mut Vec<InputItem>,
-    pending: &mut Vec<String>,
-    resolved: &mut HashSet<String>,
-    msg_index: &mut usize,
-) {
-    for id in pending.drain(..) {
-        if resolved.contains(&id) {
-            continue;
-        }
-        let call_id = id.split('|').next().unwrap_or(&id).to_string();
-        items.push(InputItem::Item(OutputItem::FunctionCallOutput {
-            call_id,
-            output: FunctionOutput::Text("No result provided".to_string()),
-        }));
-        *msg_index += 1;
-    }
-    resolved.clear();
 }
 
 /// Convert one assistant turn into its output items. `is_same_model`
 /// decides what may be replayed verbatim: only the model that produced an
 /// item may see it again — reasoning items, text identities, and `fc_` call
 /// ids are all server-side state of a specific model's turn.
-#[allow(clippy::too_many_arguments)]
 fn convert_assistant(
     items: &mut Vec<InputItem>,
     content: &[ContentBlock],
@@ -210,7 +178,6 @@ fn convert_assistant(
     context: &AgentContext,
     msg_index: usize,
     id_map: &mut HashMap<String, String>,
-    pending_calls: &mut Vec<String>,
 ) {
     let same_model = msg_model == context.model.id && msg_provider == context.model.provider;
     // Same provider, different model: the message's items are
@@ -251,7 +218,6 @@ fn convert_assistant(
                         })
                         .clone()
                 };
-                pending_calls.push(effective.clone());
 
                 let mut parts = effective.split('|');
                 let call_id = parts.next().unwrap_or("").to_string();

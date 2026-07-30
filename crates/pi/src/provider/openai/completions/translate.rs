@@ -31,9 +31,10 @@ pub fn to_request(
         None => (None, None),
     };
     let (thinking, reasoning_effort) = thinking_params(context);
+    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
     ChatCompletionParams {
         model: context.model.id.clone(),
-        messages: to_message_params(context, base_url),
+        messages: to_message_params(context, &messages, base_url),
         stream: true,
         max_tokens,
         max_completion_tokens,
@@ -106,7 +107,7 @@ fn tools_param(context: &AgentContext) -> Option<Vec<ToolParam>> {
     )
 }
 
-fn to_message_params(context: &AgentContext, base_url: &str) -> Vec<MessageParam> {
+fn to_message_params(context: &AgentContext, messages: &[AgentMessage], base_url: &str) -> Vec<MessageParam> {
     let mut out: Vec<MessageParam> = Vec::new();
     if !context.system_prompt.is_empty() {
         out.push(MessageParam::System {
@@ -119,7 +120,7 @@ fn to_message_params(context: &AgentContext, base_url: &str) -> Vec<MessageParam
     // message after the run.
     let mut pending_images: Vec<UserPart> = Vec::new();
 
-    for msg in &context.messages {
+    for msg in messages {
         match msg {
             AgentMessage::User { content, .. } => {
                 flush_images(&mut out, &mut pending_images);
@@ -473,6 +474,23 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "t2");
         // The error bit has no wire field; it folds into the content.
         assert_eq!(msgs[3]["content"], "[error] boom");
+    }
+
+    #[test]
+    fn orphaned_tool_call_gains_synthetic_error_result() {
+        let orphan = assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "read".into(),
+            input: json!({"path": "x"}),
+        }]);
+        let v = request(&ctx(vec![user("q"), orphan], ThinkingKind::None, None));
+        let msgs = v["messages"].as_array().unwrap();
+        // The unpaired call is followed by a synthetic tool message, so the
+        // request satisfies the pairing requirement.
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "tool");
+        assert_eq!(last["tool_call_id"], "t1");
+        assert_eq!(last["content"], "[error] No result provided");
     }
 
     #[test]

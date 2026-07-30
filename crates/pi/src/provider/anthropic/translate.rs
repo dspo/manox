@@ -31,6 +31,7 @@ fn map_effort(level: &str) -> Effort {
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCreateParams {
     let cache_control = cache_control(context);
+    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
     MessageCreateParams {
         model: context.model.id.clone(),
         max_tokens: options.max_tokens.unwrap_or(context.model.max_tokens),
@@ -39,7 +40,7 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
             text: context.system_prompt.clone(),
             cache_control: cache_control.clone(),
         }]),
-        messages: to_message_params(&context.messages, cache_control.as_ref()),
+        messages: to_message_params(&messages, cache_control.as_ref()),
         tools: tools_param(context, cache_control.as_ref()),
         thinking: thinking_config(context),
         output_config: output_config(context),
@@ -594,13 +595,43 @@ mod tests {
 
     #[test]
     fn trailing_assistant_message_gets_no_breakpoint() {
-        let c = ctx(vec![assistant_tool_call("t1")], ThinkingKind::None, None);
+        // A text-only assistant stays last on the wire; one with an
+        // unresolved tool call would be followed by its synthetic result.
+        let text_assistant = AgentMessage::Assistant {
+            content: vec![ContentBlock::Text { text: "done".into(), signature: None }],
+            model: "claude-test".into(),
+            provider: "anthropic".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage::default(),
+            timestamp: chrono::Utc::now(),
+        };
+        let c = ctx(vec![text_assistant], ThinkingKind::None, None);
         let req = to_request(&c, &StreamOptions::default());
         let messages = serde_json::to_value(&req.messages).unwrap();
         let messages = messages.as_array().unwrap();
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "assistant");
         assert!(last["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn orphaned_tool_call_gains_synthetic_error_result() {
+        let c = ctx(
+            vec![user("q"), assistant_tool_call("t1")],
+            ThinkingKind::None,
+            None,
+        );
+        let req = to_request(&c, &StreamOptions::default());
+        let messages = serde_json::to_value(&req.messages).unwrap();
+        let last = messages.as_array().unwrap().last().unwrap();
+        // The unpaired call is followed by a synthetic tool_result inside a
+        // user message, so the request satisfies the pairing requirement.
+        assert_eq!(last["role"], "user");
+        let block = &last["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "t1");
+        assert_eq!(block["is_error"], true);
+        assert_eq!(block["content"][0]["text"], "No result provided");
     }
 
     #[test]

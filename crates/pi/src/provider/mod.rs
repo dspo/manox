@@ -4,14 +4,16 @@
 // provider's protocol exactly. Wire types are never shared across providers;
 // the cross-provider representation is the domain types in `crate::types`.
 // The SSE parser (`sse`) is transport-level and is shared, as are the
-// handshake retry loop (`retry`) and the context-overflow classifier
-// (`overflow`) — both shape-agnostic.
+// handshake retry loop (`retry`), the context-overflow classifier
+// (`overflow`), and the transcript repair (`transform`) — all
+// shape-agnostic.
 
 pub mod anthropic;
 pub mod openai;
 pub mod overflow;
 pub mod retry;
 pub mod sse;
+pub mod transform;
 
 use thiserror::Error;
 
