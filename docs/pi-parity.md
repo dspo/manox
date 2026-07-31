@@ -131,6 +131,7 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 | Slash commands | command.rs (374) | 🔲(后期) | frontmatter + $ARGUMENTS 渲染 + allowed-tools 门控。**后期补（2026-07-29）** |
 | team 多智能体 | team/ (1758) | 🔲(二期) | TaskList 实体 + 点对点消息 + 授权冒泡，建立在子代理之上（2026-07-29 确认二期） |
 | hashline | hashline/ (2569) | ✅ | 已移植（2026-07-29）：hash/block/parser/apply/recovery/snapshot 六模块逐行移植 + 集成测试（tempfile 化，剥 gpui 提及）；全局 OnceLock 快照存储改为注入式——`tool::ToolState { snapshots: Mutex<SnapshotStore>, mutation_queue: FileMutationQueue }` 经 `ToolContext::tool_state()` 下发；LineRange 内置于 hashline（manox 的 path_selector 不搬）；xxh32 低 16 位 4-hex tag |
+| Hook 系统（22 事件） | — | 🟡 | 结果承载 hook 全对齐（2026-07-31）：`before_agent_start` 结果生效——`messages` 注入接在用户消息之后进 transcript 并持久化（TS agent-harness.ts:605），`systemPrompt` 覆盖只达本 run 初始 context（TS prepareNextTurn 重建 turnState 后回退；Rust 用「临时 set + run 后恢复」同义实现）；`tool_call` block、`tool_result` 全字段 patch（含 terminate + 批次级全 terminate 停循环）、`session_before_compact` cancel/override 均已具备。`context`（TS transformContext）不设独立 hook 点：现有 `BeforeProviderRequest`（逐 provider 调用变换整个 AgentContext）是其超集接缝。有意推迟：`before_provider_payload`/`after_provider_response`（provider 层无接缝，属 provider 工作范畴）、`session_before_tree`/`session_tree`（harness 无 tree 操作）、`retry_*`（循环内无重试）、`model_update`/`thinking_level_update`/`resources_update`/`tools_update`（harness 无对应 setter，无 fire 点；激进纪律不留无 fire 点的死变体） |
 
 ## 8. 成熟判据（MVP 切换集）
 

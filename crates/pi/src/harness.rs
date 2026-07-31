@@ -61,6 +61,20 @@ pub enum HookPoint {
 /// A hook handler receives context about the event and can mutate it.
 pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 
+/// The typed `before_agent_start` hook event, mirroring the TS
+/// `BeforeAgentStartEvent`. Serialized into [`HookContext::data`] so a handler
+/// receives the TS-shaped fields rather than an ad-hoc payload. TS also
+/// carries `images` and `resources`; neither exists on the Rust harness (no
+/// image prompt input, no resource registry), so the payload omits them.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeAgentStartEvent<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub prompt: &'a str,
+    pub system_prompt: &'a str,
+}
+
 /// A before-compact hook's full compaction result, mirroring the TS
 /// `CompactResult`. Persisted verbatim (`fromHook = true`) — the harness does
 /// not fall back to its own cut analysis on any field, so a TS hook returning
@@ -108,8 +122,10 @@ pub struct SessionBeforeCompactEvent<'a> {
 ///
 /// Handlers return a (possibly mutated) copy; the harness threads selected
 /// fields back into the loop. `agent_context` feeds the provider request,
-/// `block_reason` gates a tool call, `tool_result` patches a tool result, and
-/// `cancel_compaction`/`compact_override` steer the compaction flow.
+/// `block_reason` gates a tool call, `tool_result` patches a tool result,
+/// `cancel_compaction`/`compact_override` steer the compaction flow, and
+/// `inject_messages`/`system_prompt_override` carry the `before_agent_start`
+/// effects.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// The hook point being triggered.
@@ -129,6 +145,14 @@ pub struct HookContext {
     /// At the `SessionBeforeCompact` point, supplies the summary directly so
     /// the harness skips the summarization model call.
     pub compact_override: Option<BeforeCompactOverride>,
+    /// At the `BeforeAgentStart` point, extra messages appended to the prompt
+    /// batch after the user message; they enter the transcript and session
+    /// like any prompt message.
+    pub inject_messages: Vec<AgentMessage>,
+    /// At the `BeforeAgentStart` point, the system prompt the run's initial
+    /// context carries. Only that first context sees the override — steering
+    /// and follow-up turns snapshot the agent's configured prompt again.
+    pub system_prompt_override: Option<String>,
 }
 
 impl HookContext {
@@ -141,6 +165,8 @@ impl HookContext {
             tool_result: None,
             cancel_compaction: false,
             compact_override: None,
+            inject_messages: Vec::new(),
+            system_prompt_override: None,
         }
     }
 
@@ -174,6 +200,21 @@ impl HookContext {
     /// summarization model call. The persisted entry carries `fromHook`.
     pub fn with_compact_override(mut self, override_: BeforeCompactOverride) -> Self {
         self.compact_override = Some(override_);
+        self
+    }
+
+    /// At `BeforeAgentStart`, append extra messages to the prompt batch,
+    /// after the user message.
+    pub fn with_inject_messages(mut self, messages: Vec<AgentMessage>) -> Self {
+        self.inject_messages = messages;
+        self
+    }
+
+    /// At `BeforeAgentStart`, replace the system prompt the run's initial
+    /// context carries. The override does not stick: the next turn snapshots
+    /// the agent's configured prompt again.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt_override = Some(system_prompt.into());
         self
     }
 }
@@ -315,14 +356,39 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         self.phase = AgentHarnessPhase::Turn;
 
-        // Run before-agent-start hooks.
-        let _hook_ctx = self.run_hooks(
+        // Run before-agent-start hooks. Their result steers the run: injected
+        // messages extend the prompt batch after the user message, and a
+        // system prompt override reaches the run's initial context only.
+        let hook_ctx = self.run_hooks(
             HookPoint::BeforeAgentStart,
-            HookContext::new(HookPoint::BeforeAgentStart)
-                .with_data(serde_json::json!({"text": text})),
+            HookContext::new(HookPoint::BeforeAgentStart).with_data(
+                serde_json::to_value(BeforeAgentStartEvent {
+                    kind: "before_agent_start",
+                    prompt: text,
+                    system_prompt: &self.agent.state().system_prompt,
+                })
+                .expect("BeforeAgentStartEvent serializes"),
+            ),
         );
 
-        let result = self.agent.prompt(text).await;
+        let user_message = AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                signature: None,
+            }],
+            timestamp: chrono::Utc::now(),
+        };
+        let mut batch = vec![user_message];
+        batch.extend(hook_ctx.inject_messages);
+
+        let prior_system_prompt = self.agent.state().system_prompt.clone();
+        if let Some(override_) = &hook_ctx.system_prompt_override {
+            self.agent.set_system_prompt(override_.clone());
+        }
+        let result = self.agent.prompt_messages(&batch).await;
+        if hook_ctx.system_prompt_override.is_some() {
+            self.agent.set_system_prompt(prior_system_prompt);
+        }
 
         match result {
             Ok(messages) => {
@@ -2802,5 +2868,153 @@ mod tests {
             patched,
             "a ToolResult hook returning a replacement must patch the result"
         );
+    }
+
+    /// A stream that records the system prompt of every context it sees, so
+    /// tests can tell which prompt each provider call carried.
+    struct SystemPromptSpy {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for SystemPromptSpy {
+        async fn stream(
+            &self,
+            context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(context.system_prompt.clone());
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "spy response".into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_messages_join_the_prompt_batch() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        harness.on(
+            HookPoint::BeforeAgentStart,
+            Arc::new(|ctx: HookContext| {
+                ctx.with_inject_messages(vec![AgentMessage::user("INJECTED_BY_HOOK")])
+            }),
+        );
+
+        let messages = harness.prompt("Hello").await.unwrap();
+        let positions: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User { content, .. } => content.iter().find_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            ["Hello", "INJECTED_BY_HOOK"],
+            "hook messages are appended after the user message, before the response"
+        );
+
+        // Injected messages persist like any prompt message.
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let persisted: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message {
+                    message: AgentMessage::User { content, .. },
+                    ..
+                } => content.iter().find_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(persisted, ["Hello", "INJECTED_BY_HOOK"]);
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_system_prompt_reaches_the_first_context_only() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "base prompt",
+            test_model(),
+            Arc::new(SystemPromptSpy {
+                seen: Arc::clone(&seen),
+            }),
+        );
+
+        harness.on(
+            HookPoint::BeforeAgentStart,
+            Arc::new(|ctx: HookContext| ctx.with_system_prompt("override prompt")),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+
+        // The hook fires on every prompt, so both runs see the override in
+        // their initial context...
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["override prompt", "override prompt"]
+        );
+        // ...but the agent state is untouched between runs: an override never
+        // becomes the configured prompt.
+        assert_eq!(harness.agent().state().system_prompt, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn before_agent_start_without_override_keeps_the_original_prompt() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "base prompt",
+            test_model(),
+            Arc::new(SystemPromptSpy {
+                seen: Arc::clone(&seen),
+            }),
+        );
+
+        // A handler that observes the event but returns no result fields.
+        harness.on(
+            HookPoint::BeforeAgentStart,
+            Arc::new(|ctx: HookContext| ctx),
+        );
+
+        let messages = harness.prompt("Hello").await.unwrap();
+        assert_eq!(messages.len(), 2, "user message plus the response");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["base prompt"]);
     }
 }

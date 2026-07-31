@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,500 行 Rust，327 个测试，零警告。
+**当前规模：** ~25,600 行 Rust，330 个测试，零警告。
 
 ## 架构设计
 
@@ -164,7 +164,8 @@ pub trait AgentTool: Send + Sync {
    - 并发保护：结构化操作只能在 idle 时执行
 2. ✅ 实现 hook 系统
    - `on()` 注册 hook handler
-   - hook 点：before_agent_start, context, before_provider_request, tool_call, tool_result, session_before_compact 等
+   - hook 点：before_agent_start（结果生效：messages 注入进 prompt 批次、systemPrompt 覆盖只达本 run 初始 context）, before_provider_request（逐 provider 调用变换整个 context，覆盖 TS `context` transform 接缝）, tool_call（block）, tool_result（全字段 patch 含 terminate）, session_before_compact（cancel/全量 override）, session_after_compact
+   - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/pi-parity.md §7「Hook 系统」行
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
 5. ✅ 实现 session 写入缓冲 —— 活跃 turn 期间缓冲写入，turn 边界刷新

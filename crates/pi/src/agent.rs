@@ -246,6 +246,11 @@ impl Agent {
         self.state.thinking_level = thinking_level;
     }
 
+    /// Replace the system prompt the next turn's context snapshot carries.
+    pub fn set_system_prompt(&mut self, system_prompt: impl Into<String>) {
+        self.state.system_prompt = system_prompt.into();
+    }
+
     /// Current agent state.
     pub fn state(&self) -> &AgentState {
         &self.state
@@ -374,6 +379,18 @@ impl Agent {
             timestamp: chrono::Utc::now(),
         };
         self.run_prompt_messages(&[user_message]).await
+    }
+
+    /// Start a new prompt from a batch of messages, appended to the
+    /// transcript in order.
+    pub async fn prompt_messages(
+        &mut self,
+        messages: &[AgentMessage],
+    ) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        if self.is_running() {
+            anyhow::bail!("Agent is already processing a prompt.");
+        }
+        self.run_prompt_messages(messages).await
     }
 
     /// Continue from the current transcript.
