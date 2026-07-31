@@ -43,7 +43,10 @@ async fn main() {
         .await
         .expect("append");
 
-    print_path("linear", &session.build_context().await.expect("context"));
+    print_path(
+        "linear",
+        &session.build_context_entries().await.expect("context"),
+    );
 
     // Switch the leaf back to the first answer and grow a branch from it.
     session
@@ -57,7 +60,7 @@ async fn main() {
         .expect("append");
     print_path(
         "branched from m2",
-        &session.build_context().await.expect("context"),
+        &session.build_context_entries().await.expect("context"),
     );
 
     // Reopen from disk: the leaf and all entries survived.

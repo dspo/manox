@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,000 行 Rust，323 个测试，零警告。
+**当前规模：** ~25,500 行 Rust，327 个测试，零警告。
 
 ## 架构设计
 
@@ -144,10 +144,13 @@ pub trait AgentTool: Send + Sync {
 
 **文件：** `session/mod.rs`, `session/jsonl.rs`, `compaction/`
 
-1. ✅ 定义 `SessionTreeEntry` enum（所有 entry 类型）
+1. ✅ 定义 `SessionTreeEntry` enum（所有 entry 类型，v3 schema 与 TS 逐字段对齐——持久化 CompactionEntry **无 retainedTail**）
 2. ✅ 定义 `SessionStorage` trait + `SessionRepo` trait
 3. ✅ 实现 `JsonlSessionStorage`（追加写入 JSONL，leaf 游标管理）
 4. ✅ 实现 `Session` struct（context 构建、entry 追加、tree navigation）
+   - `get_path`：全路径 walk（leaf→root 跨压缩边界；显式未知 leaf 回退最新 entry，`None`→空路径，对齐 TS `buildSessionPath`）
+   - `get_branch` / `build_context_entries` / `build_session_context`：对齐 TS `getBranch`/`buildContextEntries`/`buildSessionContext`——最新压缩边界领衔 + 从 `first_kept_entry_id` 走树重建 kept 段；全变体投影（CustomMessage/BranchSummary/Compaction 各归其位），设置类 entry（thinking_level/model_change/assistant 见证）经 `SessionContext` 上报
+   - 摘要载体统一走 TS tag 常量（`COMPACTION_SUMMARY_*`/`BRANCH_SUMMARY_*`），压缩写入与恢复投影同形
 5. ✅ 实现 `find_cut_point()` —— 从尾向头遍历找安全切点
 6. ✅ 实现 `estimate_tokens()` —— 字符数/4 + provider usage
 7. ✅ 实现 `prepare_compaction()` + `compact()` —— 调用 stream_fn 生成摘要
@@ -234,7 +237,7 @@ pub trait AgentTool: Send + Sync {
 ## 验证计划
 
 1. ✅ `cargo build -p pi` 编译通过
-2. ✅ `cargo test -p pi` 所有测试通过（67 个，零警告）
+2. ✅ `cargo test -p pi` 所有测试通过（计数见文首「当前规模」，随实现滚动更新）
 3. ✅ 用 mock `StreamFn` 运行完整 agent loop，验证双循环状态机行为（5 个测试覆盖）
 4. ✅ 用临时目录测试 JSONL session 持久化（4 个测试覆盖）
 5. ✅ 用 mock `ExecutionEnv` 测试工具执行管道

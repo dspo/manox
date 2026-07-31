@@ -268,6 +268,7 @@ mod tests {
             AgentMessage::Custom {
                 custom_type: "note".into(),
                 content: vec![],
+                display: false,
                 details: None,
                 timestamp: chrono::Utc::now(),
             },

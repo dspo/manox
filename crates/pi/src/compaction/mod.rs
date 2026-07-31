@@ -52,7 +52,9 @@ pub struct CompactionResult {
     pub usage: Option<Usage>,
     /// Structured payload attached to the boundary (e.g. by a hook override).
     pub details: Option<JsonValue>,
-    /// The messages kept intact across the compaction, stored verbatim.
+    /// The messages kept intact across the compaction. An in-memory flow
+    /// value only — the session reconstructs the kept segment by walking the
+    /// tree from `first_kept_entry_id`.
     pub retained_tail: Vec<AgentMessage>,
 }
 
@@ -434,12 +436,12 @@ pub fn build_compaction_prompt(
 
 /// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
 ///
-/// `branch` is the session path (last compaction … leaf) — the same entries TS
+/// `branch` is the full session path to the root — the same entries TS
 /// exposes as `branchEntries`. `messages` is the flat transcript the harness
-/// compacts; `cut_point` splits it into `messages_to_summarize` / `retained_tail`.
-/// The previous compaction's summary (if the path starts at one) becomes
+/// compacts; `cut_point` splits it into `messages_to_summarize` /
+/// `retained_tail`. The latest compaction on the path contributes
 /// `previous_summary`, and file operations are extracted from the summarized
-/// region plus any prior non-hook compaction's recorded file lists.
+/// region plus that boundary's recorded file lists.
 ///
 /// Split-turn is not implemented (see [`CompactionPreparation`]); the cut stays
 /// on a whole-turn boundary, so `turn_prefix_messages` is empty and
@@ -452,17 +454,17 @@ pub fn build_preparation(
     tokens_before: u64,
     settings: &CompactionSettings,
 ) -> CompactionPreparation {
-    // The path starts at the last compaction boundary when one exists; its
-    // summary is the `previousSummary` the summarization folds in. That summary
-    // also lives in the transcript as the leading synthetic `summary_message`,
-    // so it is excluded from `messages_to_summarize` — mirroring TS, where
-    // `messagesToSummarize` starts at the boundary's first kept entry, not the
-    // compaction entry itself. Folding it twice would duplicate the prior
-    // summary in the prompt.
-    let previous_summary = match branch.first() {
-        Some(SessionTreeEntry::Compaction { summary, .. }) => Some(summary.clone()),
+    // The latest compaction on the path bounds the active context; its
+    // summary is the `previousSummary` the summarization folds in. That
+    // summary also lives in the transcript as the leading synthetic carrier
+    // message, so it is excluded from `messages_to_summarize` — mirroring TS,
+    // where `messagesToSummarize` starts at the boundary's first kept entry,
+    // not the compaction entry itself. Folding it twice would duplicate the
+    // prior summary in the prompt.
+    let previous_summary = branch.iter().rev().find_map(|e| match e {
+        SessionTreeEntry::Compaction { summary, .. } => Some(summary.clone()),
         _ => None,
-    };
+    });
     let start = usize::from(previous_summary.is_some());
     let end = cut_point.max(start);
     let messages_to_summarize = messages
@@ -496,24 +498,27 @@ fn extract_file_operations(
     branch: &[SessionTreeEntry],
 ) -> FileOperations {
     let mut ops = FileOperations::default();
+    // The latest compaction on the path seeds the accumulator with the file
+    // lists it recorded. A hook-authored boundary owns its own details shape;
+    // only the harness's `{readFiles, modifiedFiles}` payload carries forward.
     if let Some(SessionTreeEntry::Compaction {
         details: Some(d),
         from_hook,
         ..
-    }) = branch.first()
+    }) = branch
+        .iter()
+        .rev()
+        .find(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+        && *from_hook != Some(true)
     {
-        // A hook-authored boundary owns its own details shape; only the
-        // harness's `{readFiles, modifiedFiles}` payload carries forward here.
-        if *from_hook != Some(true) {
-            if let Some(arr) = d.get("readFiles").and_then(|v| v.as_array()) {
-                for f in arr.iter().filter_map(|v| v.as_str()) {
-                    ops.read.insert(f.to_string());
-                }
+        if let Some(arr) = d.get("readFiles").and_then(|v| v.as_array()) {
+            for f in arr.iter().filter_map(|v| v.as_str()) {
+                ops.read.insert(f.to_string());
             }
-            if let Some(arr) = d.get("modifiedFiles").and_then(|v| v.as_array()) {
-                for f in arr.iter().filter_map(|v| v.as_str()) {
-                    ops.edited.insert(f.to_string());
-                }
+        }
+        if let Some(arr) = d.get("modifiedFiles").and_then(|v| v.as_array()) {
+            for f in arr.iter().filter_map(|v| v.as_str()) {
+                ops.edited.insert(f.to_string());
             }
         }
     }
@@ -971,6 +976,7 @@ mod tests {
                     text: "x".into(),
                     signature: None,
                 }],
+                display: false,
                 details: None,
                 timestamp: chrono::Utc::now(),
             }

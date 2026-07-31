@@ -92,6 +92,10 @@ pub enum AgentMessage {
     },
     #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
+        /// Content blocks of the turn. Accepts the same string-or-array wire
+        /// shapes as user content; a null/missing content reads as empty,
+        /// matching how the TS session layer guards damaged entries.
+        #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         model: String,
         provider: String,
@@ -155,6 +159,10 @@ pub enum AgentMessage {
         custom_type: String,
         #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
+        /// Whether the message renders in the UI. Context projection does not
+        /// branch on it — a custom message joins the context either way.
+        #[serde(default)]
+        display: bool,
         #[serde(default)]
         details: Option<JsonValue>,
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
@@ -272,9 +280,11 @@ fn default_usage() -> Box<Usage> {
     Box::new(Usage::default())
 }
 
-/// Deserialize `User`/`Custom` message content, accepting either a plain
-/// string (wrapped in a single `text` block) or an array of content blocks —
-/// the two wire shapes TS Pi emits for user-typed and tool/image content.
+/// Deserialize message content, accepting either a plain string (wrapped in a
+/// single `text` block) or an array of content blocks — the two wire shapes
+/// TS Pi emits for user-typed and tool/image content. A null content (TS
+/// writes `{...message, content: []}` for damaged entries, and hand-edited
+/// files may carry null) reads as no blocks.
 pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<ContentBlock>, D::Error> {
@@ -282,6 +292,7 @@ pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
 
     let value = serde_json::Value::deserialize(d)?;
     match value {
+        serde_json::Value::Null => Ok(Vec::new()),
         serde_json::Value::String(s) => Ok(vec![ContentBlock::Text {
             text: s,
             signature: None,

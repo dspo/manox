@@ -1,7 +1,8 @@
 // Drive the harness through a prompt and a compaction, then verify the
-// persisted Compaction entry carries a real first-kept entry id, the
-// summarization usage, and the retained tail (#374). A mock StreamFn stands
-// in for the model so no API key is needed.
+// persisted Compaction entry carries a real first-kept entry id and the
+// summarization usage (#374). The kept segment is not persisted — the
+// example rebuilds it by walking the tree, the same way a restore does. A
+// mock StreamFn stands in for the model so no API key is needed.
 //
 // Usage:
 //   cargo run -p pi --example compact_run
@@ -102,7 +103,6 @@ async fn main() {
             first_kept_entry_id,
             tokens_before,
             usage,
-            retained_tail,
             ..
         } = &entry
         {
@@ -110,23 +110,31 @@ async fn main() {
                 first_kept_entry_id.clone(),
                 *tokens_before,
                 usage.as_ref().map(|u| u.total_tokens),
-                retained_tail.len(),
             ));
         }
     }
-    let (id, tb, ut, tail) = found.expect("compaction entry persisted");
+    let (id, tb, ut) = found.expect("compaction entry persisted");
     println!(
-        "persisted compaction: first_kept_entry_id={id:?} tokens_before={tb} usage_total={ut:?} retained_tail_len={tail}"
+        "persisted compaction: first_kept_entry_id={id:?} tokens_before={tb} usage_total={ut:?}"
     );
 
+    // The kept segment is rebuilt by walking the tree: the context projection
+    // yields the compaction boundary followed by every kept message.
+    let session = Session::new(storage);
+    let kept = session
+        .build_context_entries()
+        .await
+        .expect("context entries")
+        .len()
+        .saturating_sub(1);
+    println!("rebuilt kept segment: {kept} messages");
+
+    assert_eq!((id, tb), (result.first_kept_entry_id, result.tokens_before));
     assert_eq!(
-        (id, tb, tail),
-        (
-            result.first_kept_entry_id,
-            result.tokens_before,
-            harness.agent().state().messages.len().saturating_sub(1)
-        )
+        kept,
+        harness.agent().state().messages.len().saturating_sub(1),
+        "rebuilt kept segment must equal the in-memory retained tail"
     );
     assert_eq!(ut, Some(42));
-    println!("OK: real entry id, usage, and retained tail survived compaction");
+    println!("OK: real entry id, usage, and the rebuilt kept segment survived compaction");
 }

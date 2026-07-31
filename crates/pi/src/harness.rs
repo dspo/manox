@@ -424,41 +424,22 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Rebuild the agent transcript from the persisted session.
     ///
-    /// The context walk stops at the latest compaction boundary; that entry
-    /// contributes the summary message and its retained tail, and later
-    /// entries contribute their messages verbatim. The compaction boundary
-    /// used by token estimation is recovered alongside.
+    /// Every message-producing entry variant on the active path projects into
+    /// the transcript: messages verbatim, custom messages as `Custom`,
+    /// branch/compaction summaries as their tagged user-text carriers. The
+    /// kept segment behind a compaction boundary is reconstructed by walking
+    /// the tree from its `first_kept_entry_id`, never from the boundary
+    /// itself. The reasoning tier the path carries is applied to the agent;
+    /// the model the path carries is reported by the session context but not
+    /// applied — resolving it needs the provider registry, which lives at the
+    /// facade layer. The compaction boundary used by token estimation is
+    /// recovered alongside.
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
-        let entries = self.session.build_context().await?;
-        let mut messages = Vec::new();
-        let mut entry_ids: Vec<Option<String>> = Vec::new();
-        for entry in &entries {
-            match entry {
-                crate::session::SessionTreeEntry::Compaction {
-                    summary,
-                    retained_tail,
-                    timestamp,
-                    ..
-                } => {
-                    // The summary is a synthetic carrier; the retained tail is
-                    // folded into the entry, so neither has a standalone id.
-                    entry_ids.push(None);
-                    for _ in retained_tail {
-                        entry_ids.push(None);
-                    }
-                    messages.push(summary_message(summary, *timestamp));
-                    messages.extend(retained_tail.iter().cloned());
-                }
-                crate::session::SessionTreeEntry::Message { id, message, .. } => {
-                    entry_ids.push(Some(id.clone()));
-                    messages.push(message.clone());
-                }
-                _ => {}
-            }
-        }
+        let context = self.session.build_session_context().await?;
         self.agent.reset();
-        self.agent.replace_transcript(messages);
-        self.message_entry_ids = entry_ids;
+        self.agent.replace_transcript(context.messages);
+        self.agent.set_thinking_level(context.thinking_level);
+        self.message_entry_ids = context.message_entry_ids;
         self.recover_boundary().await?;
         Ok(())
     }
@@ -518,8 +499,10 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Finds the cut point, asks the model (via the harness stream function)
     /// to summarize the compacted prefix, and persists a `Compaction` entry
     /// carrying the real first-kept entry id, the pre-compaction token count,
-    /// the summarization usage, and the retained tail. The agent transcript is
-    /// rewritten to the summary message plus the retained tail. A
+    /// and the summarization usage. The retained tail is an in-memory flow
+    /// value only: the session reconstructs it by walking the tree from the
+    /// first-kept entry id. The agent transcript is rewritten to the summary
+    /// message plus the retained tail. A
     /// `session_before_compact` hook receives the typed [`CompactionPreparation`]
     /// and the session branch entries, and may cancel or supply a full
     /// [`BeforeCompactOverride`] persisted verbatim. `custom_instructions`
@@ -539,8 +522,9 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.phase = AgentHarnessPhase::Compaction;
 
         // The session branch the harness is compacting — the same entries TS
-        // exposes as `branchEntries` on the `session_before_compact` event.
-        let branch_entries = match self.session.build_context().await {
+        // exposes as `branchEntries` on the `session_before_compact` event:
+        // the full path to the root, across compaction boundaries.
+        let branch_entries = match self.session.get_branch().await {
             Ok(entries) => entries,
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
@@ -648,7 +632,6 @@ impl<S: SessionStorage> AgentHarness<S> {
                 first_kept_entry_id.clone(),
                 tokens_before,
                 usage.clone(),
-                retained_tail.clone(),
                 authorship,
             )
             .await
@@ -664,7 +647,10 @@ impl<S: SessionStorage> AgentHarness<S> {
         // summary message carries the boundary instant, so a transcript
         // rebuilt from storage equals this one exactly.
         let mut new_messages = Vec::with_capacity(retained_tail.len() + 1);
-        new_messages.push(summary_message(&summary_text, boundary));
+        new_messages.push(crate::session::compaction_summary_message(
+            &summary_text,
+            boundary,
+        ));
         new_messages.extend_from_slice(&retained_tail);
 
         self.agent.reset();
@@ -892,21 +878,6 @@ fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHoo
     }
 }
 
-/// The in-transcript carrier for a compaction summary: a tagged user
-/// message. Kept symmetric between compaction and restore so the summary
-/// reads identically whether it was just written or rebuilt from storage.
-fn summary_message(summary: &str, timestamp: chrono::DateTime<chrono::Utc>) -> AgentMessage {
-    AgentMessage::User {
-        content: vec![crate::types::ContentBlock::Text {
-            text: format!(
-                "<conversation_history_summary>\n{summary}\n</conversation_history_summary>"
-            ),
-            signature: None,
-        }],
-        timestamp,
-    }
-}
-
 /// Pull the summary text and token usage out of the summarization response.
 ///
 /// Only a completed assistant turn carries trustworthy usage; an unfinished
@@ -1111,18 +1082,20 @@ mod tests {
         async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
             Ok(self.entries.lock().unwrap().clone())
         }
-        async fn get_path_to_root_or_compaction(
+        async fn get_path(
             &self,
             leaf_id: Option<&str>,
         ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-            // Mirror the JSONL backend: walk leaf → first compaction, stop
-            // there. Returning every entry regardless of the cursor would mask
-            // path-relative logic (e.g. `previousSummary` extraction).
+            // Mirror the JSONL backend: walk the full path to the root, with
+            // the same unknown-leaf fallback. Returning every entry
+            // regardless of the cursor would mask path-relative logic (e.g.
+            // `previousSummary` extraction).
             let entries = self.entries.lock().unwrap();
             let target_id = match leaf_id {
-                Some(id) => id.to_string(),
-                None => match self.leaf_id.lock().unwrap().clone() {
-                    Some(id) => id,
+                None => return Ok(Vec::new()),
+                Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
+                Some(_) => match entries.last() {
+                    Some(e) => e.id().to_string(),
                     None => return Ok(Vec::new()),
                 },
             };
@@ -1135,12 +1108,8 @@ mod tests {
                     Some(e) => e,
                     None => break,
                 };
-                let is_compaction = matches!(entry, SessionTreeEntry::Compaction { .. });
                 current_id = entry.parent_id();
                 path.push(entry);
-                if is_compaction {
-                    break;
-                }
             }
             path.reverse();
             Ok(path.into_iter().cloned().collect())
@@ -1554,7 +1523,6 @@ mod tests {
                     from_hook,
                     details,
                     usage,
-                    retained_tail,
                     tokens_before,
                     ..
                 } => Some((
@@ -1562,7 +1530,6 @@ mod tests {
                     *from_hook,
                     details.clone(),
                     usage.clone(),
-                    retained_tail.len(),
                     *tokens_before,
                 )),
                 _ => None,
@@ -1576,18 +1543,17 @@ mod tests {
         );
         assert_eq!(compaction.3.map(|u| u.total_tokens), Some(7));
         // tokens_before is persisted verbatim from the hook, not recomputed.
-        assert_eq!(compaction.5, 90_000);
+        assert_eq!(compaction.4, 90_000);
 
-        // The returned result mirrors the hook's authorship and the same
-        // retained tail that was persisted, so callers need not re-read
-        // storage to recover them.
+        // The returned result mirrors the hook's authorship, so callers need
+        // not re-read storage to recover it.
         assert_eq!(result.summary, "hook-authored summary");
         assert_eq!(result.usage.map(|u| u.total_tokens), Some(7));
         assert_eq!(
             result.details,
             Some(serde_json::json!({"files": ["a.rs", "b.rs"]}))
         );
-        assert_eq!(result.retained_tail.len(), compaction.4);
+        assert!(result.retained_tail.is_empty());
     }
 
     /// The before-compact hook receives the TS-shaped `preparation` and the
@@ -1951,10 +1917,12 @@ mod tests {
             prompt.contains("Here is a summary of the earlier conversation"),
             "previousSummary is folded into the prompt: {prompt}"
         );
-        // The synthetic summary_message is excluded from messagesToSummarize —
+        // The synthetic summary carrier is excluded from messagesToSummarize —
         // its wrapper must not leak into the prompt as a transcript line.
         assert!(
-            !prompt.contains("<conversation_history_summary>"),
+            !prompt.contains(
+                "The conversation history before this point was compacted into the following summary:"
+            ),
             "the prior summary message is not double-counted: {prompt}"
         );
     }
@@ -2184,8 +2152,9 @@ mod tests {
             assert_eq!(result.tokens_before, 90_000);
         }
 
-        // Reopen the session from disk: the compaction entry survived, with
-        // the retained tail embedded for a future context rebuild.
+        // Reopen the session from disk: the compaction entry survived; the
+        // kept segment behind it is reconstructed by walking the tree from
+        // its first-kept entry id, not read off the boundary.
         let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
@@ -2194,12 +2163,11 @@ mod tests {
             SessionTreeEntry::Compaction {
                 summary,
                 tokens_before,
-                retained_tail,
                 ..
-            } => Some((summary.clone(), *tokens_before, retained_tail.len())),
+            } => Some((summary.clone(), *tokens_before)),
             _ => None,
         });
-        assert_eq!(boundary, Some(("Test response".to_string(), 90_000, 2)));
+        assert_eq!(boundary, Some(("Test response".to_string(), 90_000)));
 
         // A fresh harness over the restored session recovers the boundary, so
         // a transcript whose usage predates the compaction cannot anchor.
@@ -2294,7 +2262,7 @@ mod tests {
         assert_eq!(messages.len(), 5, "{messages:?}");
         assert_eq!(
             text_of(&messages[0]),
-            "<conversation_history_summary>\nTest response\n</conversation_history_summary>"
+            "The conversation history before this point was compacted into the following summary:\n\n<summary>\nTest response\n</summary>"
         );
         assert_eq!(text_of(&messages[1]), "first");
         assert!(matches!(&messages[2], AgentMessage::Assistant { .. }));
@@ -2309,6 +2277,123 @@ mod tests {
         // The estimation boundary came along: needs_compaction works without
         // a separate recover_boundary() call.
         assert!(!harness.needs_compaction());
+    }
+
+    /// Restore projects every message-producing entry variant — messages,
+    /// custom messages, branch summaries — and applies the reasoning tier the
+    /// path carries. Display/state entries stay out of the transcript.
+    #[tokio::test]
+    async fn test_restore_projects_all_entry_variants_and_settings() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let storage = session.storage();
+
+        storage
+            .append_entry(&SessionTreeEntry::ThinkingLevelChange {
+                id: "t1".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                thinking_level: "high".into(),
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::ModelChange {
+                id: "mc".into(),
+                parent_id: Some("t1".into()),
+                timestamp: chrono::Utc::now(),
+                provider: "anthropic".into(),
+                model_id: "claude-opus".into(),
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::Message {
+                id: "m1".into(),
+                parent_id: Some("mc".into()),
+                timestamp: chrono::Utc::now(),
+                message: AgentMessage::user("hello"),
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::CustomMessage {
+                id: "cm1".into(),
+                parent_id: Some("m1".into()),
+                timestamp: chrono::Utc::now(),
+                custom_type: "notice".into(),
+                content: vec![ContentBlock::Text {
+                    text: "heads up".into(),
+                    signature: None,
+                }],
+                details: None,
+                display: true,
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::BranchSummary {
+                id: "bs1".into(),
+                parent_id: Some("cm1".into()),
+                timestamp: chrono::Utc::now(),
+                from_id: "m1".into(),
+                summary: "explored a side branch".into(),
+                details: None,
+                usage: None,
+                from_hook: None,
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::Message {
+                id: "m2".into(),
+                parent_id: Some("bs1".into()),
+                timestamp: chrono::Utc::now(),
+                message: AgentMessage::user("after"),
+            })
+            .await
+            .unwrap();
+
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.restore().await.unwrap();
+
+        let messages = &harness.agent().state().messages;
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(matches!(&messages[0], AgentMessage::User { .. }));
+        match &messages[1] {
+            AgentMessage::Custom {
+                custom_type,
+                display,
+                ..
+            } => {
+                assert_eq!(custom_type, "notice");
+                assert!(display);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        match &messages[2] {
+            AgentMessage::User { content, .. } => match &content[0] {
+                ContentBlock::Text { text, .. } => assert_eq!(
+                    text,
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nexplored a side branch</summary>"
+                ),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected User, got {other:?}"),
+        }
+        assert!(matches!(&messages[3], AgentMessage::User { .. }));
+
+        // The reasoning tier on the path reaches the agent; the model stays
+        // untouched (resolving it is the facade layer's job).
+        assert_eq!(
+            harness.agent().state().thinking_level.as_deref(),
+            Some("high")
+        );
     }
 
     #[tokio::test]
@@ -2333,7 +2418,14 @@ mod tests {
         // Nothing persisted, so the reverted transcript is empty too —
         // identical to what a fresh harness would restore from this session.
         assert!(harness.agent().state().messages.is_empty());
-        assert!(harness.session().build_context().await.unwrap().is_empty());
+        assert!(
+            harness
+                .session()
+                .build_context_entries()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2361,7 +2453,15 @@ mod tests {
         let messages = &harness.agent().state().messages;
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(matches!(&messages[0], AgentMessage::User { .. }));
-        assert_eq!(harness.session().build_context().await.unwrap().len(), 1);
+        assert_eq!(
+            harness
+                .session()
+                .build_context_entries()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // With the failure spent, continuing answers the pending user
         // message — the conversation continues coherently, not forked.
@@ -2372,7 +2472,15 @@ mod tests {
                 .any(|m| matches!(m, AgentMessage::Assistant { .. }))
         );
         assert_eq!(harness.agent().state().messages.len(), 2);
-        assert_eq!(harness.session().build_context().await.unwrap().len(), 2);
+        assert_eq!(
+            harness
+                .session()
+                .build_context_entries()
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

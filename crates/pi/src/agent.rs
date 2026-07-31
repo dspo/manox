@@ -239,6 +239,13 @@ impl Agent {
         self.loop_hooks = hooks;
     }
 
+    /// Set the reasoning tier forwarded into each turn's context. `None`
+    /// means the provider default — the `"off"` tier a session path carries
+    /// never reaches the provider.
+    pub fn set_thinking_level(&mut self, thinking_level: Option<String>) {
+        self.state.thinking_level = thinking_level;
+    }
+
     /// Current agent state.
     pub fn state(&self) -> &AgentState {
         &self.state

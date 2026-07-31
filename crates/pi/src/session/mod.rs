@@ -39,10 +39,6 @@ pub enum SessionTreeEntry {
         /// Token usage reported by the summarization call, when recorded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
-        /// The messages kept intact across the compaction, stored verbatim
-        /// so a rebuilt context needs no walk past the boundary.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        retained_tail: Vec<AgentMessage>,
         /// Structured payload a summarization hook may attach.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<JsonValue>,
@@ -243,12 +239,12 @@ pub trait SessionStorage: Send + Sync {
     /// Get all entries, optionally filtered.
     async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
 
-    /// Walk from the leaf to root (or last compaction), returning entries
-    /// in chronological order.
-    async fn get_path_to_root_or_compaction(
-        &self,
-        leaf_id: Option<&str>,
-    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
+    /// Walk from the leaf to the root, returning the full path in
+    /// chronological order. Compaction boundaries do not stop the walk —
+    /// callers decide how to project them. An explicit `leaf_id` unknown to
+    /// storage falls back to the latest entry; `None` yields an empty path.
+    async fn get_path(&self, leaf_id: Option<&str>)
+    -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
 }
 
 /// A session wraps a SessionStorage with context-building logic.
@@ -292,18 +288,18 @@ impl<S: SessionStorage> Session<S> {
 
     /// Append a compaction entry and return the entry ID and timestamp.
     ///
-    /// The leaf cursor moves to the entry, so later messages parent onto it
-    /// and a context rebuild stops at this boundary. The returned timestamp
-    /// is the boundary instant: the in-transcript summary message carries
-    /// the same one, so a restored transcript matches the post-compaction
-    /// one exactly.
+    /// The leaf cursor moves to the entry, so later messages parent onto it.
+    /// The kept segment is never persisted: a context rebuild reconstructs it
+    /// by walking the tree from `first_kept_entry_id`, so the session file
+    /// stays the single source of truth. The returned timestamp is the
+    /// boundary instant: the in-transcript summary message carries the same
+    /// one, so a restored transcript matches the post-compaction one exactly.
     pub async fn append_compaction(
         &self,
         summary: &str,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
         usage: Option<Usage>,
-        retained_tail: Vec<AgentMessage>,
         authorship: CompactionAuthorship,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
@@ -318,7 +314,6 @@ impl<S: SessionStorage> Session<S> {
             first_kept_entry_id,
             tokens_before,
             usage,
-            retained_tail,
             details: authorship.details,
             from_hook: Some(authorship.from_hook),
         };
@@ -333,18 +328,494 @@ impl<S: SessionStorage> Session<S> {
     pub async fn latest_compaction_timestamp(
         &self,
     ) -> Result<Option<DateTime<Utc>>, anyhow::Error> {
-        let path = self.build_context().await?;
-        Ok(match path.first() {
+        let entries = self.build_context_entries().await?;
+        Ok(match entries.first() {
             Some(SessionTreeEntry::Compaction { timestamp, .. }) => Some(*timestamp),
             _ => None,
         })
     }
 
-    /// Build the context entries by walking the tree from leaf to root.
-    pub async fn build_context(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+    /// Walk from the current leaf to the root, returning every entry on the
+    /// active path in chronological order — all entry types, across however
+    /// many compaction boundaries the path spans.
+    pub async fn get_branch(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
         let leaf_id = self.storage.get_leaf_id().await?;
-        self.storage
-            .get_path_to_root_or_compaction(leaf_id.as_deref())
-            .await
+        self.storage.get_path(leaf_id.as_deref()).await
+    }
+
+    /// Build the active, compaction-aware entry list.
+    ///
+    /// When the active path contains a compaction, the latest one heads the
+    /// list, followed by the kept entries from its `first_kept_entry_id`
+    /// onward (reconstructed from the tree, never from the boundary itself)
+    /// and every entry after the boundary. Older summarized entries are
+    /// omitted. Without a compaction this is the whole branch.
+    pub async fn build_context_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        let path = self.get_branch().await?;
+        Ok(build_context_entries(path))
+    }
+
+    /// Build the session context: the messages a restored agent continues
+    /// with, plus the settings the active path carries.
+    pub async fn build_session_context(&self) -> Result<SessionContext, anyhow::Error> {
+        let path = self.get_branch().await?;
+        let (thinking_level, model) = context_settings(&path);
+        let entries = build_context_entries(path);
+        let mut messages = Vec::new();
+        let mut message_entry_ids = Vec::new();
+        for entry in &entries {
+            let projected = session_entry_to_context_messages(entry);
+            if !projected.is_empty() {
+                message_entry_ids.push(Some(entry.id().to_string()));
+                messages.extend(projected);
+            }
+        }
+        Ok(SessionContext {
+            messages,
+            message_entry_ids,
+            thinking_level,
+            model,
+        })
+    }
+}
+
+/// The projected session state an agent is restored from.
+pub struct SessionContext {
+    /// Messages projected from the compaction-aware entry list.
+    pub messages: Vec<AgentMessage>,
+    /// The entry that produced each message, parallel to `messages`. Drives
+    /// `first_kept_entry_id` resolution when the next compaction cuts the
+    /// restored transcript.
+    pub message_entry_ids: Vec<Option<String>>,
+    /// The reasoning tier for following turns; `None` when the path left it
+    /// at (or never changed it from) `"off"`.
+    pub thinking_level: Option<String>,
+    /// The model the session was last driven with — from the latest
+    /// `model_change` entry, or the latest assistant message's own identity.
+    pub model: Option<SessionModelRef>,
+}
+
+/// A model reference carried by the session path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModelRef {
+    pub provider: String,
+    pub model_id: String,
+}
+
+/// The compaction-aware projection over an active path: latest compaction
+/// first, kept segment reconstructed from `first_kept_entry_id`, then
+/// everything after the boundary.
+fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
+    let Some(compaction_idx) = path
+        .iter()
+        .rposition(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+    else {
+        return path;
+    };
+    let SessionTreeEntry::Compaction {
+        first_kept_entry_id,
+        ..
+    } = &path[compaction_idx]
+    else {
+        unreachable!("rposition matched a compaction");
+    };
+
+    let mut context_entries = vec![path[compaction_idx].clone()];
+    // A `first_kept_entry_id` absent from the path keeps nothing — the same
+    // outcome an undefined id produces in a hand-edited TS session file.
+    let mut found_first_kept = false;
+    for entry in &path[..compaction_idx] {
+        if Some(entry.id()) == first_kept_entry_id.as_deref() {
+            found_first_kept = true;
+        }
+        if found_first_kept {
+            context_entries.push(entry.clone());
+        }
+    }
+    context_entries.extend_from_slice(&path[compaction_idx + 1..]);
+    context_entries
+}
+
+/// The settings the active path carries: the reasoning tier from the latest
+/// `thinking_level_change`, and the model from the latest `model_change`
+/// (an assistant message's own identity is a fresher witness than an older
+/// `model_change`, matching the TS projection).
+fn context_settings(path: &[SessionTreeEntry]) -> (Option<String>, Option<SessionModelRef>) {
+    let mut thinking_level = None;
+    let mut model = None;
+    for entry in path {
+        match entry {
+            SessionTreeEntry::ThinkingLevelChange {
+                thinking_level: l, ..
+            } => {
+                thinking_level = (l != "off").then(|| l.clone());
+            }
+            SessionTreeEntry::ModelChange {
+                provider, model_id, ..
+            } => {
+                model = Some(SessionModelRef {
+                    provider: provider.clone(),
+                    model_id: model_id.clone(),
+                });
+            }
+            SessionTreeEntry::Message {
+                message:
+                    AgentMessage::Assistant {
+                        provider, model: m, ..
+                    },
+                ..
+            } => {
+                model = Some(SessionModelRef {
+                    provider: provider.clone(),
+                    model_id: m.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    (thinking_level, model)
+}
+
+/// Project one session entry into context messages. Display/state entries
+/// (model/thinking/tool changes, labels, custom data, the cursor) produce
+/// nothing.
+pub fn session_entry_to_context_messages(entry: &SessionTreeEntry) -> Vec<AgentMessage> {
+    match entry {
+        SessionTreeEntry::Message { message, .. } => vec![message.clone()],
+        SessionTreeEntry::CustomMessage {
+            custom_type,
+            content,
+            details,
+            display,
+            timestamp,
+            ..
+        } => vec![AgentMessage::Custom {
+            custom_type: custom_type.clone(),
+            content: content.clone(),
+            details: details.clone(),
+            display: *display,
+            timestamp: *timestamp,
+        }],
+        SessionTreeEntry::BranchSummary {
+            summary, timestamp, ..
+        } if !summary.is_empty() => vec![branch_summary_message(summary, *timestamp)],
+        SessionTreeEntry::Compaction {
+            summary, timestamp, ..
+        } => vec![compaction_summary_message(summary, *timestamp)],
+        _ => Vec::new(),
+    }
+}
+
+/// The in-transcript carrier for a compaction summary: a tagged user
+/// message. Kept symmetric between compaction and restore so the summary
+/// reads identically whether it was just written or rebuilt from storage.
+pub fn compaction_summary_message(summary: &str, timestamp: DateTime<Utc>) -> AgentMessage {
+    AgentMessage::User {
+        content: vec![crate::types::ContentBlock::Text {
+            text: format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
+            signature: None,
+        }],
+        timestamp,
+    }
+}
+
+/// The in-transcript carrier for a branch summary: a tagged user message.
+pub fn branch_summary_message(summary: &str, timestamp: DateTime<Utc>) -> AgentMessage {
+    AgentMessage::User {
+        content: vec![crate::types::ContentBlock::Text {
+            text: format!("{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"),
+            signature: None,
+        }],
+        timestamp,
+    }
+}
+
+/// Tag wrapping a compaction summary in the transcript.
+pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Tag wrapping a branch summary in the transcript.
+pub const BRANCH_SUMMARY_PREFIX: &str =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ContentBlock;
+
+    fn message(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            timestamp: Utc::now(),
+            message: AgentMessage::user(text),
+        }
+    }
+
+    fn compaction(
+        id: &str,
+        parent: Option<&str>,
+        first_kept_entry_id: Option<&str>,
+    ) -> SessionTreeEntry {
+        SessionTreeEntry::Compaction {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            timestamp: Utc::now(),
+            summary: format!("summary-{id}"),
+            first_kept_entry_id: first_kept_entry_id.map(Into::into),
+            tokens_before: 0,
+            usage: None,
+            details: None,
+            from_hook: None,
+        }
+    }
+
+    fn ids(entries: &[SessionTreeEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.id()).collect()
+    }
+
+    #[test]
+    fn context_entries_reconstruct_the_kept_segment_from_the_tree() {
+        // m1 m2 m3 [comp keeps from m2] m4: the context is the boundary, the
+        // kept entries m2..m3 walked out of the pre-boundary path, then m4.
+        let path = vec![
+            message("m1", None, "one"),
+            message("m2", Some("m1"), "two"),
+            message("m3", Some("m2"), "three"),
+            compaction("c1", Some("m3"), Some("m2")),
+            message("m4", Some("c1"), "four"),
+        ];
+        let entries = build_context_entries(path);
+        assert_eq!(ids(&entries), ["c1", "m2", "m3", "m4"]);
+    }
+
+    #[test]
+    fn context_entries_last_compaction_wins() {
+        // m1 [c1 keeps m1] m2 [c2 keeps nothing-known] m3: only the latest
+        // boundary heads the context; the older one is summarized away.
+        let path = vec![
+            message("m1", None, "one"),
+            compaction("c1", Some("m1"), Some("m1")),
+            message("m2", Some("c1"), "two"),
+            compaction("c2", Some("m2"), Some("m1")),
+            message("m3", Some("c2"), "three"),
+        ];
+        let entries = build_context_entries(path);
+        // c2's first_kept (m1) precedes c2 on the path, so the scan finds it
+        // and keeps m1, c1, m2 — everything from m1 up to the boundary.
+        assert_eq!(ids(&entries), ["c2", "m1", "c1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn context_entries_unknown_first_kept_keeps_nothing() {
+        // A first_kept_entry_id that never appears on the path keeps no
+        // pre-boundary entry at all.
+        let path = vec![
+            message("m1", None, "one"),
+            message("m2", Some("m1"), "two"),
+            compaction("c1", Some("m2"), Some("ghost")),
+            message("m3", Some("c1"), "three"),
+        ];
+        let entries = build_context_entries(path);
+        assert_eq!(ids(&entries), ["c1", "m3"]);
+    }
+
+    #[test]
+    fn context_settings_take_the_latest_witness() {
+        let assistant = |id: &str, parent: &str| SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            timestamp: Utc::now(),
+            message: AgentMessage::Assistant {
+                content: vec![],
+                model: "claude-opus".into(),
+                provider: "anthropic".into(),
+                api: "anthropic".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: None,
+                usage: Box::default(),
+                error_message: None,
+                timestamp: Utc::now(),
+            },
+        };
+        let path = vec![
+            SessionTreeEntry::ModelChange {
+                id: "mc".into(),
+                parent_id: None,
+                timestamp: Utc::now(),
+                provider: "openai".into(),
+                model_id: "gpt-5".into(),
+            },
+            SessionTreeEntry::ThinkingLevelChange {
+                id: "t1".into(),
+                parent_id: Some("mc".into()),
+                timestamp: Utc::now(),
+                thinking_level: "medium".into(),
+            },
+            assistant("a1", "t1"),
+            SessionTreeEntry::ThinkingLevelChange {
+                id: "t2".into(),
+                parent_id: Some("a1".into()),
+                timestamp: Utc::now(),
+                thinking_level: "off".into(),
+            },
+        ];
+        let (thinking_level, model) = context_settings(&path);
+        // The trailing "off" change resets the tier to the provider default.
+        assert_eq!(thinking_level, None);
+        // An assistant message is a fresher model witness than an older
+        // model_change.
+        assert_eq!(
+            model,
+            Some(SessionModelRef {
+                provider: "anthropic".into(),
+                model_id: "claude-opus".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn entry_projection_covers_every_variant() {
+        let ts = Utc::now();
+        let custom_message = SessionTreeEntry::CustomMessage {
+            id: "cm".into(),
+            parent_id: None,
+            timestamp: ts,
+            custom_type: "notice".into(),
+            content: vec![ContentBlock::Text {
+                text: "heads up".into(),
+                signature: None,
+            }],
+            details: Some(serde_json::json!({"level": 1})),
+            display: true,
+        };
+        let projected = session_entry_to_context_messages(&custom_message);
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            AgentMessage::Custom {
+                custom_type,
+                display,
+                details,
+                ..
+            } => {
+                assert_eq!(custom_type, "notice");
+                assert!(display);
+                assert_eq!(details, &Some(serde_json::json!({"level": 1})));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+
+        let branch_summary = SessionTreeEntry::BranchSummary {
+            id: "bs".into(),
+            parent_id: None,
+            timestamp: ts,
+            from_id: "x".into(),
+            summary: "came back".into(),
+            details: None,
+            usage: None,
+            from_hook: None,
+        };
+        let projected = session_entry_to_context_messages(&branch_summary);
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            AgentMessage::User { content, .. } => match &content[0] {
+                ContentBlock::Text { text, .. } => assert_eq!(
+                    text,
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\ncame back</summary>"
+                ),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected User, got {other:?}"),
+        }
+
+        // An empty branch summary produces nothing.
+        let empty_summary = SessionTreeEntry::BranchSummary {
+            id: "bs2".into(),
+            parent_id: None,
+            timestamp: ts,
+            from_id: "x".into(),
+            summary: String::new(),
+            details: None,
+            usage: None,
+            from_hook: None,
+        };
+        assert!(session_entry_to_context_messages(&empty_summary).is_empty());
+
+        // Display/state entries never enter the context.
+        for entry in [
+            SessionTreeEntry::ModelChange {
+                id: "mc".into(),
+                parent_id: None,
+                timestamp: ts,
+                provider: "p".into(),
+                model_id: "m".into(),
+            },
+            SessionTreeEntry::ThinkingLevelChange {
+                id: "tl".into(),
+                parent_id: None,
+                timestamp: ts,
+                thinking_level: "high".into(),
+            },
+            SessionTreeEntry::ActiveToolsChange {
+                id: "at".into(),
+                parent_id: None,
+                timestamp: ts,
+                active_tool_names: vec![],
+            },
+            SessionTreeEntry::Custom {
+                id: "cu".into(),
+                parent_id: None,
+                timestamp: ts,
+                custom_type: "state".into(),
+                data: None,
+            },
+            SessionTreeEntry::Label {
+                id: "la".into(),
+                parent_id: None,
+                timestamp: ts,
+                target_id: "x".into(),
+                label: None,
+            },
+            SessionTreeEntry::SessionInfo {
+                id: "si".into(),
+                parent_id: None,
+                timestamp: ts,
+                name: None,
+            },
+            SessionTreeEntry::Leaf {
+                id: "le".into(),
+                parent_id: None,
+                timestamp: ts,
+                target_id: None,
+            },
+        ] {
+            assert!(
+                session_entry_to_context_messages(&entry).is_empty(),
+                "{entry:?} must not project into the context"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_projection_uses_the_summary_tags() {
+        let entry = compaction("c1", None, None);
+        let projected = session_entry_to_context_messages(&entry);
+        assert_eq!(projected.len(), 1);
+        match &projected[0] {
+            AgentMessage::User { content, timestamp } => {
+                assert_eq!(*timestamp, entry.timestamp());
+                match &content[0] {
+                    ContentBlock::Text { text, .. } => assert_eq!(
+                        text,
+                        "The conversation history before this point was compacted into the following summary:\n\n<summary>\nsummary-c1\n</summary>"
+                    ),
+                    other => panic!("expected text, got {other:?}"),
+                }
+            }
+            other => panic!("expected User, got {other:?}"),
+        }
     }
 }

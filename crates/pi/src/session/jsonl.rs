@@ -251,35 +251,37 @@ impl SessionStorage for JsonlSessionStorage {
         Ok(self.entries.lock().await.clone())
     }
 
-    async fn get_path_to_root_or_compaction(
+    async fn get_path(
         &self,
         leaf_id: Option<&str>,
     ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        let entries = self.entries.lock().await;
+
         let target_id = match leaf_id {
-            Some(id) => id.to_string(),
-            None => match self.get_leaf_id().await? {
-                Some(id) => id,
+            None => return Ok(Vec::new()),
+            Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
+            // An explicit id unknown to storage walks from the latest entry,
+            // matching the TS buildSessionPath fallback.
+            Some(_) => match entries.last() {
+                Some(e) => e.id().to_string(),
                 None => return Ok(Vec::new()),
             },
         };
 
-        let entries = self.entries.lock().await;
         let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
             entries.iter().map(|e| (e.id(), e)).collect();
 
         let mut path: Vec<&SessionTreeEntry> = Vec::new();
         let mut current_id: Option<&str> = Some(&target_id);
         while let Some(id) = current_id {
+            // `remove` doubles as cycle protection: each entry is visited at
+            // most once even if parent ids form a loop.
             let entry = match index.remove(id) {
                 Some(e) => e,
                 None => break,
             };
-            let is_compaction = matches!(entry, SessionTreeEntry::Compaction { .. });
             current_id = entry.parent_id();
             path.push(entry);
-            if is_compaction {
-                break;
-            }
         }
 
         path.reverse();
@@ -560,18 +562,19 @@ mod tests {
         storage.append_entry(&leaf).await.unwrap();
         storage.set_leaf_id(Some("leaf")).await.unwrap();
 
-        let path = storage
-            .get_path_to_root_or_compaction(Some("leaf"))
-            .await
-            .unwrap();
+        let path = storage.get_path(Some("leaf")).await.unwrap();
         assert_eq!(path.len(), 3);
         assert_eq!(path[0].id(), "root");
         assert_eq!(path[1].id(), "child");
         assert_eq!(path[2].id(), "leaf");
     }
 
+    /// The walk crosses compaction boundaries: projection onto the active
+    /// context is the session layer's job, not the walk's.
     #[tokio::test]
-    async fn test_path_stops_at_compaction() {
+    async fn test_path_walks_past_compaction() {
+        use crate::session::Session;
+
         let dir = tempfile::tempdir().unwrap();
         let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
             .await
@@ -591,7 +594,6 @@ mod tests {
             first_kept_entry_id: None,
             tokens_before: 1000,
             usage: None,
-            retained_tail: vec![AgentMessage::user("kept")],
             details: None,
             from_hook: None,
         };
@@ -607,10 +609,19 @@ mod tests {
         storage.append_entry(&post).await.unwrap();
         storage.set_leaf_id(Some("post")).await.unwrap();
 
-        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
-        assert_eq!(path.len(), 2);
-        assert_eq!(path[0].id(), "comp");
-        assert_eq!(path[1].id(), "post");
+        let path = storage.get_path(Some("post")).await.unwrap();
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].id(), "pre");
+        assert_eq!(path[1].id(), "comp");
+        assert_eq!(path[2].id(), "post");
+
+        // The context projection keeps the compaction plus everything after
+        // it; with no first_kept_entry_id, nothing before it survives.
+        let session = Session::new(storage);
+        let ctx = session.build_context_entries().await.unwrap();
+        assert_eq!(ctx.len(), 2);
+        assert_eq!(ctx[0].id(), "comp");
+        assert_eq!(ctx[1].id(), "post");
     }
 
     #[tokio::test]
@@ -630,7 +641,6 @@ mod tests {
             first_kept_entry_id: None,
             tokens_before: 0,
             usage: None,
-            retained_tail: Vec::new(),
             details: None,
             from_hook: None,
         };
@@ -721,7 +731,7 @@ mod tests {
         let reopened = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
-        let path = reopened.get_path_to_root_or_compaction(None).await.unwrap();
+        let path = reopened.get_path(Some("child")).await.unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[1].parent_id(), Some("root"));
     }
@@ -798,7 +808,7 @@ mod tests {
         // The full ancestry chain must survive a load: walking from the leaf
         // reaches the model_change and thinking_level_change entries via
         // camelCase `parentId`.
-        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
+        let path = storage.get_path(Some("m1")).await.unwrap();
         assert_eq!(path.len(), 3);
         assert_eq!(path[2].id(), "m1");
         assert_eq!(path[2].parent_id(), Some("t1"));
@@ -860,7 +870,7 @@ mod tests {
 
         // Custom entries link into the ancestry tree via parentId like any
         // other entry.
-        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
+        let path = storage.get_path(Some("x2")).await.unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[1].id(), "x2");
         assert_eq!(path[1].parent_id(), Some("x1"));
@@ -1014,7 +1024,7 @@ mod tests {
     /// append → branch back via `set_leaf_id` → append again → reopen → walk.
     /// The later message parents onto the leaf's `targetId` (the cursor), and
     /// the leaf entry never appears in the walked context — matching TS
-    /// `setLeafId` / `leafIdAfterEntry` / `getPathToRootOrCompaction`.
+    /// `setLeafId` / `leafIdAfterEntry` / `buildSessionPath`.
     #[tokio::test]
     async fn test_branch_lifecycle_round_trips_consistently() {
         use crate::session::Session;
@@ -1068,7 +1078,7 @@ mod tests {
 
         // The walked context skips the leaf entry: m2 → m1, no leaf in path.
         let session = Session::new(reopened);
-        let ctx = session.build_context().await.unwrap();
+        let ctx = session.build_context_entries().await.unwrap();
         assert_eq!(ctx.len(), 2);
         assert_eq!(ctx[0].id(), m1);
         assert_eq!(ctx[1].id(), m2);
@@ -1095,5 +1105,120 @@ mod tests {
             .collect();
         assert_eq!(types.remove(0), "session");
         assert_eq!(types, vec!["message", "leaf", "message"]);
+    }
+
+    /// A TS-written session file carries no retained tail on its compaction
+    /// entries: the kept segment is reconstructed by walking the tree from
+    /// `firstKeptEntryId`. Loading such a file must rebuild the full context —
+    /// summary carrier, kept messages, and post-boundary messages — with each
+    /// message traced to the entry that produced it.
+    #[tokio::test]
+    async fn test_ts_file_without_retained_tail_rebuilds_the_kept_segment() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // Mirrors a real TS Pi session after one compaction: messages m1..m3,
+        // a compaction keeping from m2 onward (firstKeptEntryId, no tail
+        // payload), then a post-compaction message. No `leaf` entry.
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"first question"}],"timestamp":1779952440000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"first answer"}],"timestamp":1779952450000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-05-28T07:14:20.000Z","message":{"role":"user","content":[{"type":"text","text":"follow up"}],"timestamp":1779952460000}}"#,
+            "\n",
+            r#"{"type":"compaction","id":"c1","parentId":"m3","timestamp":"2026-05-28T07:15:00.000Z","summary":"prior turns summarized","firstKeptEntryId":"m2","tokensBefore":9000}"#,
+            "\n",
+            r#"{"type":"message","id":"m4","parentId":"c1","timestamp":"2026-05-28T07:15:30.000Z","message":{"role":"user","content":[{"type":"text","text":"after compaction"}],"timestamp":1779952530000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let session = Session::new(storage);
+        let context = session.build_session_context().await.unwrap();
+
+        fn text_of(m: &AgentMessage) -> &str {
+            match m {
+                AgentMessage::User { content, .. } => match &content[0] {
+                    crate::types::ContentBlock::Text { text, .. } => text.as_str(),
+                    _ => "",
+                },
+                _ => "",
+            }
+        }
+
+        // Summary carrier first, then the kept m2..m3 walked out of the tree,
+        // then the post-boundary m4. m1 was summarized away.
+        assert_eq!(context.messages.len(), 4, "{:?}", context.messages);
+        assert_eq!(
+            text_of(&context.messages[0]),
+            "The conversation history before this point was compacted into the following summary:\n\n<summary>\nprior turns summarized\n</summary>"
+        );
+        assert_eq!(text_of(&context.messages[1]), "first answer");
+        assert_eq!(text_of(&context.messages[2]), "follow up");
+        assert_eq!(text_of(&context.messages[3]), "after compaction");
+
+        // Every message traces to the entry that produced it — the summary to
+        // the compaction entry itself — so a later compaction can resolve a
+        // first-kept id for any position.
+        assert_eq!(
+            context.message_entry_ids,
+            vec![
+                Some("c1".to_string()),
+                Some("m2".to_string()),
+                Some("m3".to_string()),
+                Some("m4".to_string()),
+            ]
+        );
+        assert_eq!(context.thinking_level, None);
+        assert_eq!(context.model, None);
+    }
+
+    /// A TS-written file may carry settings entries and damaged messages: a
+    /// null message content reads as empty, and the context surfaces the
+    /// reasoning tier and the model the path carries.
+    #[tokio::test]
+    async fn test_ts_file_settings_and_null_content_project() {
+        use crate::session::{Session, SessionModelRef};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"model_change","id":"mc","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","provider":"anthropic","modelId":"claude-opus-4-7"}"#,
+            "\n",
+            r#"{"type":"thinking_level_change","id":"tl","parentId":"mc","timestamp":"2026-05-28T07:13:46.617Z","thinkingLevel":"high"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":"tl","timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1779952440000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"assistant","content":null,"model":"claude-opus-4-7","provider":"anthropic","api":"anthropic","stopReason":"stop","timestamp":1779952450000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        let session = Session::new(storage);
+        let context = session.build_session_context().await.unwrap();
+
+        // Settings entries contribute no message; the null-content assistant
+        // survives as an empty message.
+        assert_eq!(context.messages.len(), 2, "{:?}", context.messages);
+        match &context.messages[1] {
+            AgentMessage::Assistant { content, .. } => assert!(content.is_empty()),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        assert_eq!(context.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            context.model,
+            Some(SessionModelRef {
+                provider: "anthropic".into(),
+                model_id: "claude-opus-4-7".into(),
+            })
+        );
     }
 }
