@@ -1,8 +1,9 @@
-# pi ↔ manox agent 能力对等清单
+# pi → manox 切换清单
 
 > 目的：定义「pi crate 何时成熟到可以替换 manox `agent` crate」的可核对条件。
+> 姊妹文档：TS Pi → crate pi 的行为对齐核验见 [ts-pi-parity.md](ts-pi-parity.md)（含对齐基线 SHA）；本文件只追踪替换旧 harness 所需的 manox 产品能力。
 > 状态图例：✅ 已对等 · 🟡 pi 已有但浅 · 🔲 缺失需移植 · 🚫 有意不做（不面向历史和负债） · ❓ 待决策
-> 规模列为 manox 侧行数，用于估算移植成本。pi 当前共 ~25.9k 行（src 24.6k + examples 1.3k），agent 共 54.5k 行。
+> 规模列为 manox 侧行数，用于估算移植成本。pi 当前共 ~27.9k 行（src 26.6k + examples 1.3k），agent 共 54.5k 行。
 > 更新方式：随 pi 落地逐项翻转状态；全部 ✅/🚫 之日即切换入场之时。
 
 ## 关键结构发现（影响移植策略）
@@ -44,8 +45,8 @@
 
 | 能力 | manox 位置（规模） | pi 状态 | 说明 |
 |---|---|---|---|
-| 自动压缩 | compact.rs + thread.rs | 🟡 | 子件 a（token 计量）已落地（2026-07-30，见下行）；harness 已先行落地 TS Pi 触发层的压缩边界 timestamp guard，边界经 `SessionTreeEntry::Compaction` 持久化（summary/firstKeptEntryId/tokensBefore/usage/details/fromHook/retainedTail?，与 TS Pi agent 包 CompactionEntry 同 schema——retainedTail 存在时直接投影（hook 提供的 tail 也随边界落盘），缺失时由 buildContextEntries 从 firstKeptEntryId 走树重建，session 文件为唯一事实源），`restore()` 经 buildSessionContext 投影全部 v3 entry 变体（Message 原样 / CustomMessage→Custom(含 display) / BranchSummary·Compaction→TS tag 包装的 user 文本 / 设置类 entry 不进上下文），并恢复 thinkingLevel（model 留给 facade 层 registry）与压缩边界（分支隔离）；回合消息持久化中途失败时以 session 为准重建内存 transcript（对齐 TS Pi「session 为事实源、agent 状态由其派生」agent-session.ts:2150），两视图不分叉；摘要请求已逐字对齐 TS `generateSummaryWithUsage`（2026-07-31）：`serialize_conversation` 全消息形状（thinking/文本/tool call 名+JSON 参数/tool result 截 2000 字符/custom 折叠为 user 行）+ `SUMMARIZATION_SYSTEM_PROMPT` + 双模板（`<previous-summary>` 切换 UPDATE 变体）；子件 b+c 已落地，余项为 split-turn（turn prefix 摘要，cut 恒在整轮边界，P2）与 d（触发路由） |
-| 溢出 compact-retry | thread.rs | 🔲 | 单次兜底：overflow 分类 → 压缩 → 重试一次（子件 d） |
+| 自动压缩 | compact.rs + thread.rs | 🟡 | 子件 a（token 计量）已落地（2026-07-30，见下行）；harness 已先行落地 TS Pi 触发层的压缩边界 timestamp guard，边界经 `SessionTreeEntry::Compaction` 持久化（summary/firstKeptEntryId/tokensBefore/usage/details/fromHook/retainedTail?，与 TS Pi agent 包 CompactionEntry 同 schema——retainedTail 存在时直接投影（hook 提供的 tail 也随边界落盘），缺失时由 buildContextEntries 从 firstKeptEntryId 走树重建，session 文件为唯一事实源），`restore()` 经 buildSessionContext 投影全部 v3 entry 变体（Message 原样 / CustomMessage→Custom(含 display) / BranchSummary·Compaction→TS tag 包装的 user 文本 / 设置类 entry 不进上下文），并恢复 thinkingLevel（model 留给 facade 层 registry）与压缩边界（分支隔离）；回合消息持久化中途失败时以 session 为准重建内存 transcript（对齐 TS Pi「session 为事实源、agent 状态由其派生」agent-session.ts:2150），两视图不分叉；摘要请求已逐字对齐 TS `generateSummaryWithUsage`（2026-07-31）：`serialize_conversation` 全消息形状（thinking/文本/tool call 名+JSON 参数/tool result 截 2000 字符/custom 折叠为 user 行）+ `SUMMARIZATION_SYSTEM_PROMPT` + 双模板（`<previous-summary>` 切换 UPDATE 变体）；子件 b+c 已落地，余项为 split-turn（turn prefix 摘要，cut 恒在整轮边界，P2）；d（触发路由）已随下行一并落地 |
+| 溢出/阈值 compact 触发路由 | thread.rs | ✅ | 已实现（2026-07-31，子件 d）：两条独立路径对齐 TS `_checkCompaction`——overflow compact-retry（一次性预算 + 同模型/stale/aborted 守卫 + 摘除失败终端后重试一次）与 threshold compact-no-retry（settled 回合计量超阈值即为下一回合压缩，不重试；维护性压缩失败只记日志不拖垮已完结回合）；压缩只替换 transcript、从不清 steering/follow-up 队列，压缩期间入队的消息由一次 drain continuation 立即投递（对齐 TS `hasQueuedMessages()` 续跑） |
 | Token 计量 | token_meter.rs | ✅ | 子件 a（2026-07-30）：`Usage.total_tokens` + `Model.max_tokens` 补齐（三 shape 落值：Anthropic/Completions 线边界折叠求和、Responses 取 wire 原值）；`calculate_context_tokens`（total>0 优先否则四类求和）、`estimate_context_tokens`（usage 锚定 + 尾部字符启发）、`estimate_tokens`（按消息形状：user/toolResult/custom=text+image(4800)，assistant=text+thinking+toolCall(name+JSON)，UTF-16 码元 ceil/4）、`should_compact`（i64 阈值减法）逐项对齐 TS Pi compaction.ts |
 | 前缀稳定性检测 | prefix_stability.rs | 🔲 | 请求指纹对比，检测 KV cache 破坏源（产品化观测，可后期） |
 
@@ -131,7 +132,7 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 | Slash commands | command.rs (374) | 🔲(后期) | frontmatter + $ARGUMENTS 渲染 + allowed-tools 门控。**后期补（2026-07-29）** |
 | team 多智能体 | team/ (1758) | 🔲(二期) | TaskList 实体 + 点对点消息 + 授权冒泡，建立在子代理之上（2026-07-29 确认二期） |
 | hashline | hashline/ (2569) | ✅ | 已移植（2026-07-29）：hash/block/parser/apply/recovery/snapshot 六模块逐行移植 + 集成测试（tempfile 化，剥 gpui 提及）；全局 OnceLock 快照存储改为注入式——`tool::ToolState { snapshots: Mutex<SnapshotStore>, mutation_queue: FileMutationQueue }` 经 `ToolContext::tool_state()` 下发；LineRange 内置于 hashline（manox 的 path_selector 不搬）；xxh32 低 16 位 4-hex tag |
-| Hook 系统（22 事件） | — | 🟡 | 结果承载 hook 全对齐（2026-07-31）：`before_agent_start` 结果生效——`messages` 注入接在用户消息之后进 transcript 并持久化（TS agent-harness.ts:605），`systemPrompt` 覆盖只达本 run 初始 context（TS prepareNextTurn 重建 turnState 后回退；Rust 用「临时 set + run 后恢复」同义实现）；`tool_call` block、`tool_result` 全字段 patch（含 terminate + 批次级全 terminate 停循环）、`session_before_compact` cancel/override 均已具备。`context`（TS transformContext）不设独立 hook 点：现有 `BeforeProviderRequest`（逐 provider 调用变换整个 AgentContext）是其超集接缝。有意推迟：`before_provider_payload`/`after_provider_response`（provider 层无接缝，属 provider 工作范畴）、`session_before_tree`/`session_tree`（harness 无 tree 操作）、`retry_*`（循环内无重试）、`model_update`/`thinking_level_update`/`resources_update`/`tools_update`（harness 无对应 setter，无 fire 点；激进纪律不留无 fire 点的死变体） |
+| Hook 系统（22 事件） | — | 🟡 | 结果承载 hook 全对齐（2026-07-31）：`before_agent_start` 结果生效——`messages` 注入接在用户消息之后进 transcript 并持久化（TS agent-harness.ts:605），`systemPrompt` 覆盖只达本 run 初始 context（TS prepareNextTurn 重建 turnState 后回退；Rust 用「临时 set + run 后恢复」同义实现）；`tool_call` block、`tool_result` 全字段 patch（含 terminate + 批次级全 terminate 停循环）、`session_before_compact` cancel/override 均已具备。`context`（TS transformContext）不设独立 hook 点：现有 `BeforeProviderRequest`（逐 provider 调用变换整个 AgentContext）是其超集接缝。有意推迟：`before_provider_payload`/`after_provider_response`（provider 层无接缝，属 provider 工作范畴）、`session_before_tree`/`session_tree`（harness 无 tree 操作）、`retry_*`（循环内无重试）、`model_update`/`tools_update`（set_model/set_active_tools 已具备并可作 fire 点，hook 变体未接线）、`thinking_level_update`/`resources_update`（无对应 setter 面，无 fire 点；激进纪律不留无 fire 点的死变体） |
 
 ## 8. 成熟判据（MVP 切换集）
 
@@ -141,11 +142,11 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 - [x] hashline 移植（read/write/edit/grep 配套，2026-07-29 完成）
 - [x] ~~循环：恢复 nudge、拒绝熔断、取消级联清理~~ 有意不移植（2026-07-29 拍板：TS Pi agent-loop 三项皆无，属 manox 自创）
 - [x] 循环：取消中断正在执行的工具（2026-07-31：exec 进程组树杀 + bash signal 透传）
-- [x] 上下文：自动压缩核心（2026-07-31：摘要请求逐字对齐 TS serializeConversation + 双模板；恢复投影全部 entry 变体 2026-07-30）；余项：split-turn（P2）、溢出 compact-retry 触发路由
+- [x] 上下文：自动压缩核心（2026-07-31：摘要请求逐字对齐 TS serializeConversation + 双模板；恢复投影全部 entry 变体 2026-07-30；触发路由 2026-07-31：overflow compact-retry + threshold compact-no-retry + 压缩期队列保留与 drain continuation）；余项：split-turn（P2）
 - [x] Hook 系统：结果承载 hook 全对齐（2026-07-31：before_agent_start 结果生效 + tool_call/tool_result/session_before_compact）
 - [ ] 工具：5a 其余项（Bash 持久 shell/后台、BashOutput/TaskStop/WebFetch）、Agent 子代理、worktree、Skill
 - [ ] 工具基础设施：循环层统一截断、schema 规整
-- [x] 持久化：jsonl sessions 恢复（2026-07-30：restore 投影全部 v3 entry 变体 + thinkingLevel 恢复 + 压缩边界恢复）；余项：model 恢复（需 facade registry）、按消息 token 索引落盘
+- [x] 持久化：jsonl sessions 恢复（2026-07-30：restore 投影全部 v3 entry 变体 + thinkingLevel 恢复 + 压缩边界恢复；2026-07-31：model 恢复经 consumer 插接的 `ModelResolver` 落地，crate 保持 registry-free）；余项：按消息 token 索引落盘
 - [ ] 事件体系：补齐 agent-ui 消费所需的事件变体
 - [ ] gpui 边界设计文档（事件订阅、线程生命周期对接）
 

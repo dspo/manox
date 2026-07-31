@@ -464,6 +464,10 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// context that stays oversized after compaction surfaces its second
     /// overflow error instead of looping. The returned messages include the
     /// retry's output.
+    ///
+    /// A settled turn whose context crossed the compaction threshold is
+    /// compacted for the next turn without a retry; a failed maintenance
+    /// compaction never turns the settled turn into an error.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
@@ -514,7 +518,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 self.note_run_outcome(&messages);
 
                 let mut all_messages = messages;
-                all_messages.extend(self.run_overflow_recovery().await?);
+                all_messages.extend(self.settle_after_run().await?);
                 Ok(all_messages)
             }
             Err(e) => {
@@ -528,7 +532,8 @@ impl<S: SessionStorage> AgentHarness<S> {
     ///
     /// The same one-shot overflow recovery as [`AgentHarness::prompt`]
     /// applies: an overflow terminal from the current model is compacted and
-    /// retried once per error episode.
+    /// retried once per error episode. A settled turn over the compaction
+    /// threshold is compacted for the next turn without a retry.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
@@ -544,7 +549,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 self.note_run_outcome(&messages);
 
                 let mut all_messages = messages;
-                all_messages.extend(self.run_overflow_recovery().await?);
+                all_messages.extend(self.settle_after_run().await?);
                 Ok(all_messages)
             }
             Err(e) => {
@@ -601,6 +606,66 @@ impl<S: SessionStorage> AgentHarness<S> {
             produced.extend(retry_messages);
         }
         Ok(produced)
+    }
+
+    /// Post-run maintenance shared by `prompt` and `continue_`: overflow
+    /// compact-and-retry first, then threshold compaction. A threshold
+    /// compaction that ran while messages were queued is followed by one
+    /// continuation delivering them, and that continuation's own outcome
+    /// settles through another iteration — the same shape as the TS
+    /// `while (handlePostAgentRun()) continue()` loop.
+    async fn settle_after_run(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        let mut produced = Vec::new();
+        loop {
+            produced.extend(self.run_overflow_recovery().await?);
+            let drained = self.run_threshold_compaction().await?;
+            let ran_continuation = !drained.is_empty();
+            produced.extend(drained);
+            if !ran_continuation {
+                return Ok(produced);
+            }
+        }
+    }
+
+    /// Threshold compaction after a settled run: the turn already completed,
+    /// so the conversation is compacted for the next turn and never
+    /// retried. Returns the messages of the one continuation run to deliver
+    /// anything queued while compaction was in flight — empty when no
+    /// compaction ran or nothing was waiting. A failed maintenance
+    /// compaction only logs: the settled turn keeps its result, and the
+    /// next turn's settle re-attempts the compaction.
+    async fn run_threshold_compaction(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        // A user-aborted turn stays exactly where the user stopped it.
+        if matches!(
+            self.agent.state().messages.last(),
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Aborted),
+                ..
+            })
+        ) {
+            return Ok(Vec::new());
+        }
+        if !self.needs_compaction() {
+            return Ok(Vec::new());
+        }
+        match self.compact(None).await {
+            Ok(_) => {}
+            Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => {}
+            Err(e) => {
+                tracing::warn!("threshold compaction failed: {e:#}");
+                return Ok(Vec::new());
+            }
+        }
+        if !self.agent.has_queued_messages() {
+            return Ok(Vec::new());
+        }
+        self.phase = AgentHarnessPhase::Turn;
+        let result = self.agent.continue_().await;
+        self.phase = AgentHarnessPhase::Idle;
+        let messages = result?;
+        self.persist_turn_messages(&messages).await?;
+        self.note_run_outcome(&messages);
+        Ok(messages)
     }
 
     /// One overflow recovery step over the finished run.
@@ -736,7 +801,7 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// recovered alongside.
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
         let context = self.session.build_session_context().await?;
-        self.agent.reset();
+        self.agent.clear_transcript_state();
         self.agent.replace_transcript(context.messages);
         self.agent.set_thinking_level(context.thinking_level);
         self.active_tool_names = context.active_tool_names;
@@ -822,6 +887,10 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// summary — is refused with [`compaction::NothingToCompact`] before the
     /// phase changes, any hook fires, or the model is called; the session and
     /// transcript stay untouched.
+    ///
+    /// Only the transcript is rebuilt; the steering and follow-up queues are
+    /// user input and survive compaction. A full clear of both transcript
+    /// and queues is [`AgentHarness::reset`].
     pub async fn compact(
         &mut self,
         custom_instructions: Option<&str>,
@@ -972,7 +1041,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         ));
         new_messages.extend_from_slice(&retained_tail);
 
-        self.agent.reset();
+        self.agent.clear_transcript_state();
         self.agent.replace_transcript(new_messages);
         // The summary is synthetic (no entry id). A hook-supplied tail carries
         // unknown entry ids (the hook's messages need not be the harness's
@@ -1647,6 +1716,65 @@ mod tests {
         assert_eq!(leaf, compaction_id);
     }
 
+    /// Compaction swaps the transcript but never the queues: steering and
+    /// follow-up messages pending at compaction time stay deliverable, where
+    /// a full reset would silently drop them. TS pairs this with one
+    /// continuation after auto-compaction so the surviving queue drains.
+    #[tokio::test]
+    async fn test_compact_preserves_queued_messages() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        harness
+            .agent_mut()
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
+
+        harness.agent_mut().steer(AgentMessage::user("steered in"));
+        harness
+            .agent_mut()
+            .follow_up(AgentMessage::user("followed up"));
+        assert!(harness.agent().has_queued_messages());
+
+        harness.compact(None).await.unwrap();
+        assert!(
+            harness.agent().has_queued_messages(),
+            "compaction must not drop queued user input"
+        );
+
+        // Both queues drain into the next run, steering before follow-up.
+        harness.continue_().await.unwrap();
+        assert!(!harness.agent().has_queued_messages());
+        let user_texts: Vec<&str> = harness
+            .agent()
+            .state()
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User { content, .. } => match &content[0] {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let steered = user_texts
+            .iter()
+            .position(|t| *t == "steered in")
+            .expect("steering message delivered");
+        let followed = user_texts
+            .iter()
+            .position(|t| *t == "followed up")
+            .expect("follow-up message delivered");
+        assert!(steered < followed);
+    }
+
     /// A transcript that fits inside the keep-recent window has nothing to
     /// summarize: compact refuses with [`compaction::NothingToCompact`]
     /// before the phase changes, any hook fires, or the model is called, and
@@ -1772,11 +1900,18 @@ mod tests {
     struct ScriptedStreamFn {
         script: std::sync::Mutex<std::collections::VecDeque<ScriptedTurn>>,
         summaries: Arc<std::sync::atomic::AtomicUsize>,
+        fail_summaries: bool,
+        /// Runs inside the summarization call, e.g. to queue a follow-up
+        /// while compaction is in flight.
+        on_summary: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     enum ScriptedTurn {
         /// A completed assistant reply whose text is `0`-repeated `x` bytes.
         Answer(usize),
+        /// A completed one-token reply reporting `total_tokens` of context
+        /// usage, anchoring the token estimate above the threshold.
+        AnswerWithUsage { total_tokens: u64 },
         /// A provider failure classified as context overflow.
         OverflowError,
         /// An overflow terminal stamped with a different model's identity.
@@ -1790,9 +1925,21 @@ mod tests {
                 ScriptedStreamFn {
                     script: std::sync::Mutex::new(script.into()),
                     summaries: Arc::clone(&summaries),
+                    fail_summaries: false,
+                    on_summary: None,
                 },
                 summaries,
             )
+        }
+
+        fn failing_summaries(mut self) -> Self {
+            self.fail_summaries = true;
+            self
+        }
+
+        fn on_summary(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+            self.on_summary = Some(Arc::new(f));
+            self
         }
     }
 
@@ -1826,11 +1973,24 @@ mod tests {
             if context.system_prompt == compaction::SUMMARIZATION_SYSTEM_PROMPT {
                 self.summaries
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(on_summary) = &self.on_summary {
+                    on_summary();
+                }
+                if self.fail_summaries {
+                    return Err(anyhow::anyhow!("summarization boom"));
+                }
                 return Ok(scripted_assistant("summary".into(), "test", "test"));
             }
             match self.script.lock().unwrap().pop_front() {
                 Some(ScriptedTurn::Answer(len)) => {
                     Ok(scripted_assistant("x".repeat(len), "test", "test"))
+                }
+                Some(ScriptedTurn::AnswerWithUsage { total_tokens }) => {
+                    let mut message = scripted_assistant("x".into(), "test", "test");
+                    if let AgentMessage::Assistant { usage, .. } = &mut message {
+                        usage.total_tokens = total_tokens;
+                    }
+                    Ok(message)
                 }
                 Some(ScriptedTurn::OverflowError) => Err(anyhow::anyhow!(
                     "http 400: prompt is too long: 213462 tokens > 200000 maximum"
@@ -2133,6 +2293,140 @@ mod tests {
             ),
             "the untouched error stands"
         );
+    }
+
+    /// A settled turn whose reported usage crosses the threshold is
+    /// compacted for the next turn — without a retry: the returned messages
+    /// are the turn's own, and the transcript is rebuilt behind one
+    /// compaction boundary.
+    #[tokio::test]
+    async fn test_threshold_compaction_fires_after_settled_turn() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::AnswerWithUsage {
+                total_tokens: 90_000,
+            },
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        // No retry: exactly the turn's own user message and reply.
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Stop),
+                ..
+            })
+        ));
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(compaction_entries(&harness).await.len(), 1);
+        // The transcript was rebuilt: summary carrier first, the 90k-usage
+        // reply retained in the tail.
+        let transcript = &harness.agent().state().messages;
+        assert!(transcript.len() < 4, "{transcript:?}");
+        assert!(matches!(
+            transcript.last(),
+            Some(AgentMessage::Assistant { .. })
+        ));
+    }
+
+    /// A failed maintenance compaction leaves the settled turn's result
+    /// intact: prompt resolves with the turn's messages, nothing is
+    /// persisted, and the transcript keeps the full conversation.
+    #[tokio::test]
+    async fn test_threshold_compaction_failure_keeps_turn_result() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::AnswerWithUsage {
+                total_tokens: 90_000,
+            },
+        ]);
+        let stream_fn = stream_fn.failing_summaries();
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(compaction_entries(&harness).await.is_empty());
+        assert_eq!(harness.agent().state().messages.len(), 4);
+    }
+
+    /// A follow-up queued while threshold compaction runs is delivered by
+    /// one continuation immediately after — compaction never waits for the
+    /// next explicit prompt to drain the queue.
+    #[tokio::test]
+    async fn test_threshold_compaction_delivers_queued_follow_up() {
+        let handle_slot: Arc<std::sync::Mutex<Option<crate::agent::RunHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_in_summary = Arc::clone(&handle_slot);
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::AnswerWithUsage {
+                total_tokens: 90_000,
+            },
+            ScriptedTurn::Answer(8),
+        ]);
+        let stream_fn = stream_fn.on_summary(move || {
+            if let Some(handle) = slot_in_summary.lock().unwrap().as_ref() {
+                handle.follow_up(AgentMessage::user("while compacting"));
+            }
+        });
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        *handle_slot.lock().unwrap() = Some(harness.agent().run_handle());
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        // Turn output plus the drain continuation's follow-up and reply.
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::User { content, .. }
+                    if matches!(&content[0], ContentBlock::Text { text, .. } if text == "while compacting")
+            )),
+            "the queued follow-up was delivered: {messages:?}"
+        );
+        assert!(!harness.agent().has_queued_messages());
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
 
     /// A failed summarization (Error/Aborted terminal, or an empty summary)

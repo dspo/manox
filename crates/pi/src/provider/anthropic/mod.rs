@@ -219,19 +219,24 @@ impl Accumulator {
             } => {
                 self.ensure_index(index);
                 let event = match content_block {
-                    WireContentBlock::Text { .. } => {
+                    WireContentBlock::Text { text } => {
+                        // The start event may already carry content; deltas
+                        // append onto it.
                         self.blocks[index] = ContentBlock::Text {
-                            text: String::new(),
+                            text,
                             signature: None,
                         };
                         AssistantMessageEvent::TextStart {
                             content_index: index,
                         }
                     }
-                    WireContentBlock::Thinking { .. } => {
+                    WireContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
                         self.blocks[index] = ContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: None,
+                            thinking,
+                            signature,
                             redacted: None,
                         };
                         AssistantMessageEvent::ThinkingStart {
@@ -298,9 +303,11 @@ impl Accumulator {
                     WireDelta::Signature { signature } => {
                         // Signatures accumulate silently: no incremental event
                         // exists for them, matching the TS Pi event surface.
+                        // The start block may already carry a signature the
+                        // delta appends onto.
                         if let ContentBlock::Thinking { signature: s, .. } = &mut self.blocks[index]
                         {
-                            *s = Some(signature);
+                            s.get_or_insert_with(String::new).push_str(&signature);
                         }
                         return Ok(());
                     }
@@ -657,6 +664,92 @@ mod tests {
                 assert_eq!(usage.cache_read_input_tokens, 100);
                 assert_eq!(usage.cache_creation_input_tokens, 20);
                 assert_eq!(usage.total_tokens, 137);
+            }
+            _ => panic!("expected assistant"),
+        }
+    }
+
+    /// A content_block_start may already carry text, thinking, and a
+    /// signature; the deltas that follow append onto those initial values
+    /// rather than replacing them.
+    #[tokio::test]
+    async fn content_block_start_initial_content_is_preserved() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: WireContentBlock::Text {
+                    text: "Initial text".into(),
+                },
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.apply(text_delta(0, " plus delta"), &tx).await.unwrap();
+        acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .await
+            .unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: WireContentBlock::Thinking {
+                    thinking: "Initial thinking".into(),
+                    signature: Some("initial signature".into()),
+                },
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: WireDelta::Thinking {
+                    thinking: " plus delta".into(),
+                },
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: WireDelta::Signature {
+                    signature: " plus delta".into(),
+                },
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        acc.apply(RawStreamEvent::ContentBlockStop { index: 1 }, &tx)
+            .await
+            .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+
+        match &msg {
+            AgentMessage::Assistant { content, .. } => {
+                match &content[0] {
+                    ContentBlock::Text { text, .. } => {
+                        assert_eq!(text, "Initial text plus delta");
+                    }
+                    other => panic!("expected text, got {other:?}"),
+                }
+                match &content[1] {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                        ..
+                    } => {
+                        assert_eq!(thinking, "Initial thinking plus delta");
+                        assert_eq!(signature.as_deref(), Some("initial signature plus delta"));
+                    }
+                    other => panic!("expected thinking, got {other:?}"),
+                }
             }
             _ => panic!("expected assistant"),
         }

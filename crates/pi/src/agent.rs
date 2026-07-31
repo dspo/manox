@@ -355,13 +355,21 @@ impl Agent {
         }
     }
 
-    /// Reset the agent's transcript and queues.
-    pub fn reset(&mut self) {
+    /// Clear transcript and run-state leftovers, keeping the steering and
+    /// follow-up queues. Queued messages are user input, not transcript
+    /// state, so transcript rebuilds (compaction, session restore) must not
+    /// drop them.
+    pub fn clear_transcript_state(&mut self) {
         self.state.messages.clear();
         self.state.is_streaming = false;
         self.state.streaming_message = None;
         self.state.pending_tool_calls.clear();
         self.state.error_message = None;
+    }
+
+    /// Reset the agent's transcript and queues.
+    pub fn reset(&mut self) {
+        self.clear_transcript_state();
         self.steering_queue.lock().unwrap().clear();
         self.follow_up_queue.lock().unwrap().clear();
     }
@@ -876,9 +884,26 @@ mod tests {
         );
 
         let _ = agent.prompt("Hello").await;
+        agent.steer(AgentMessage::user("queued"));
         agent.reset();
         assert!(agent.state().messages.is_empty());
         assert!(!agent.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn clear_transcript_state_keeps_queued_messages() {
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+            test_tool_ctx(),
+        );
+
+        let _ = agent.prompt("Hello").await;
+        agent.steer(AgentMessage::user("queued"));
+        agent.clear_transcript_state();
+        assert!(agent.state().messages.is_empty());
+        assert!(agent.has_queued_messages());
     }
 
     #[tokio::test]

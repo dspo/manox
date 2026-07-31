@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~27,500 行 Rust（src 26.2k + examples 1.3k），362 个测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~27,900 行 Rust（src 26.6k + examples 1.3k），368 个测试（另 3 个 live 测试 ignored），零警告。
 
 ## 架构设计
 
@@ -168,7 +168,7 @@ pub trait AgentTool: Send + Sync {
 2. ✅ 实现 hook 系统
    - `on()` 注册 hook handler
    - hook 点：before_agent_start（结果生效：messages 注入进 prompt 批次、systemPrompt 覆盖只达本 run 初始 context）, before_provider_request（逐 provider 调用变换整个 context，覆盖 TS `context` transform 接缝）, tool_call（block）, tool_result（全字段 patch 含 terminate）, session_before_compact（cancel/全量 override）, session_after_compact
-   - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/pi-parity.md §7「Hook 系统」行
+   - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/ts-pi-parity.md §8「有意偏离」
    - 取消传播到执行层：`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时 SIGKILL 整个进程树（对齐 TS `killProcessTree`），bash 工具透传 signal
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
@@ -178,7 +178,10 @@ pub trait AgentTool: Send + Sync {
    - assistant 错误消息经 `is_context_overflow` 三判据分类（错误消息模式 / Stop 但 input+cacheRead 超窗 / Length 且 output=0 且 input ≥99% 窗）
    - 同模型守卫、stale 守卫（错误不晚于最近一次压缩）、aborted 不恢复
    - 一次性预算（TS `_overflowRecoveryAttempted`）：失败终端从 transcript 摘除（session 保留）→ 压缩 → `continue_()` 重试一次；新 user prompt 或任何非错误 assistant 消息重新武装
-7. ✅ 运行配置 API 与 restore 回放
+7. ✅ 实现 threshold compact-no-retry 与压缩期队列安全
+   - settled 回合（成功/错误）后计量超阈值即为下一回合压缩、不重试（对齐 TS `_checkCompaction` 第二路径）；维护性压缩失败只记日志，不拖垮已完结回合
+   - 压缩只替换 transcript：`Agent::clear_transcript_state` 与全清队列的 `reset` 分离，压缩/restore 走前者——steering/follow-up 队列在压缩窗口不丢消息；压缩后队列非空则续跑一次 drain continuation 投递
+8. ✅ 运行配置 API 与 restore 回放
    - `set_model` / `set_active_tools`：应用并持久化 `model_change` / `active_tools_change` entry（未知工具名拒绝）
    - `restore()` 回放 path 携带的完整运行配置：thinking tier、active tools 子集（经全量挂载集过滤）、model（经 consumer 插接的 `ModelResolver`——crate 保持 registry-free，无 resolver 时保留构造期 model）；restore 不追加任何 entry
 
@@ -219,13 +222,14 @@ pub trait AgentTool: Send + Sync {
 
 ### 待完成
 
-TS Pi 对齐的已知余项（逐项对齐核验见 `docs/pi-parity.md`，该文件为准）：
+TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
 
 - [ ] 压缩 split-turn（turn prefix 摘要）：cut 恒在整轮边界，单轮超 keep-recent 窗口时整轮保留而非切分——极端工具轮可能在压缩后仍然溢出
 - [ ] session 逐条 append：TS 在 `message_end` 时即持久化，crate pi 在 turn 末批量追加，turn 中途崩溃丢失该 turn 消息
+- [ ] pre-prompt 压缩检查：TS `prompt()` 发送前 `_checkCompaction(lastAssistant, skipAbortedCheck=false)` 兜住 aborted 回合；crate pi 只有回合后检查
 - [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳
 - [ ] Completions 流交错块模型：TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块（Phase 2 已知偏离）
-- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（无 fire 点，见 pi-parity §7）
+- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §8）
 
 工程化余项：
 
