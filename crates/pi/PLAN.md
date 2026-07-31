@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,600 行 Rust，330 个测试，零警告。
+**当前规模：** ~25,800 行 Rust，331 个测试，零警告。
 
 ## 架构设计
 
@@ -154,6 +154,8 @@ pub trait AgentTool: Send + Sync {
 5. ✅ 实现 `find_cut_point()` —— 从尾向头遍历找安全切点
 6. ✅ 实现 `estimate_tokens()` —— 字符数/4 + provider usage
 7. ✅ 实现 `prepare_compaction()` + `compact()` —— 调用 stream_fn 生成摘要
+   - 摘要请求逐字对齐 TS `generateSummaryWithUsage`：`serialize_conversation`（user/custom 文本、assistant thinking/文本/tool calls（name+k=JSON 参数）、tool result 截 2000 字符）、`SUMMARIZATION_SYSTEM_PROMPT` 常量、`SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT` 双模板经 `<previous-summary>` 切换
+   - 未对齐项：split-turn（turn prefix 摘要）——cut 恒在整轮边界
 
 ### Phase 4: AgentHarness 编排层 ✅
 

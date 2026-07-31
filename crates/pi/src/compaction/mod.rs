@@ -360,78 +360,209 @@ fn first_orphaned_result(
     })
 }
 
+/// Maximum characters of a tool result kept in a serialized summary.
+const TOOL_RESULT_MAX_CHARS: usize = 2000;
+
+/// Truncate for summarization: keep the head and append a marker counting the
+/// dropped characters.
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    format!(
+        "{}\n\n[... {} more characters truncated]",
+        &text[..max_chars],
+        text.len() - max_chars
+    )
+}
+
+/// Text blocks of a message, joined by newlines — the TS `contentText`.
+fn content_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Serialize messages to text for summarization so the model reads them as
+/// material rather than a conversation to continue. Custom messages fold to
+/// their content as user lines — the TS `convertToLlm` mapping — and tool
+/// results are truncated to keep the request within budget.
+pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for msg in messages {
+        match msg {
+            AgentMessage::User { content, .. } | AgentMessage::Custom { content, .. } => {
+                let text = content_text(content);
+                if !text.is_empty() {
+                    parts.push(format!("[User]: {text}"));
+                }
+            }
+            AgentMessage::Assistant { content, .. } => {
+                let thinking: Vec<&str> = content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let tool_calls: Vec<String> = content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { name, input, .. } => {
+                            let args = input
+                                .as_object()
+                                .map(|obj| {
+                                    obj.iter()
+                                        .map(|(k, v)| format!("{k}={v}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            Some(format!("{name}({args})"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !thinking.is_empty() {
+                    parts.push(format!("[Assistant thinking]: {}", thinking.join("\n")));
+                }
+                if content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }))
+                {
+                    parts.push(format!("[Assistant]: {}", content_text(content)));
+                }
+                if !tool_calls.is_empty() {
+                    parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
+                }
+            }
+            AgentMessage::ToolResult { content, .. } => {
+                let text = content_text(content);
+                if !text.is_empty() {
+                    parts.push(format!(
+                        "[Tool result]: {}",
+                        truncate_for_summary(&text, TOOL_RESULT_MAX_CHARS)
+                    ));
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// System prompt for every summarization call: the model produces the
+/// structured summary and nothing else.
+pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
+/// Instruction block for a first compaction.
+pub const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."#;
+
+/// Instruction block for folding new messages into an existing summary.
+pub const UPDATE_SUMMARIZATION_PROMPT: &str = r#"The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+Update the existing structured summary with new information. RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+- UPDATE "Next Steps" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Use this EXACT format:
+
+## Goal
+[Preserve existing goals, add new ones if the task expanded]
+
+## Constraints & Preferences
+- [Preserve existing, add new ones discovered]
+
+## Progress
+### Done
+- [x] [Include previously done items AND newly completed items]
+
+### In Progress
+- [ ] [Current work - update based on progress]
+
+### Blocked
+- [Current blockers - remove if resolved]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Next Steps
+1. [Update based on current state]
+
+## Critical Context
+- [Preserve important context, add new if needed]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages."#;
+
 /// Build a compaction prompt for the LLM.
 ///
-/// The summary should capture the key decisions, changes, and context
-/// from the compacted messages so the model can continue coherently.
+/// The conversation is serialized to text and wrapped in `<conversation>`
+/// tags; a previous summary rides in `<previous-summary>` tags and switches
+/// the instruction block to the update variant, so iterative compactions
+/// extend the checkpoint instead of restarting it.
 pub fn build_compaction_prompt(
     compacted_messages: &[AgentMessage],
     existing_summary: Option<&str>,
     custom_instructions: Option<&str>,
 ) -> String {
-    let prefix = if let Some(summary) = existing_summary {
-        format!(
-            "Here is a summary of the earlier conversation:\n<summary>\n{summary}\n</summary>\n\n"
-        )
-    } else {
-        String::new()
+    let conversation_text = serialize_conversation(compacted_messages);
+    let mut prompt = format!("<conversation>\n{conversation_text}\n</conversation>\n\n");
+    let base = match existing_summary {
+        Some(summary) => {
+            prompt.push_str(&format!(
+                "<previous-summary>\n{summary}\n</previous-summary>\n\n"
+            ));
+            UPDATE_SUMMARIZATION_PROMPT
+        }
+        None => SUMMARIZATION_PROMPT,
     };
-
-    let messages_text: String = compacted_messages
-        .iter()
-        .map(|m| {
-            let role = match m {
-                AgentMessage::User { .. } => "User",
-                AgentMessage::Assistant { .. } => "Assistant",
-                AgentMessage::ToolResult { tool_name, .. } => {
-                    return format!("Tool result ({tool_name}): (omitted)");
-                }
-                AgentMessage::Custom { custom_type, .. } => {
-                    return format!("Custom ({custom_type}): (omitted)");
-                }
-            };
-            let content = match m {
-                AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => {
-                    content
-                        .iter()
-                        .filter_map(|b| {
-                            if let crate::types::ContentBlock::Text { text, .. } = b {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                _ => String::new(),
-            };
-            format!("{role}: {content}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    // Caller-supplied focus is appended after the conversation, mirroring the
-    // TS `Additional focus: ${customInstructions}` so the summarization model
-    // weights it instead of silently dropping it.
-    let additional_focus = match custom_instructions {
-        Some(ci) if !ci.trim().is_empty() => format!("\n\nAdditional focus: {ci}"),
-        _ => String::new(),
-    };
-
-    format!(
-        "{prefix}\
-        You are summarizing a coding agent's conversation history to save context space. \
-        Write a concise summary (≤500 words) covering:\n\
-        1. The user's main requests and goals\n\
-        2. Key decisions, architecture, and trade-offs made\n\
-        3. Files modified, created, or deleted (with paths)\n\
-        4. Errors encountered and how they were resolved\n\
-        5. Any unfinished work or next steps\n\n\
-        Do NOT repeat the full conversation. Focus on information that would be \
-        essential for continuing the work without losing context.\n\n\
-        <conversation>\n{messages_text}\n</conversation>{additional_focus}"
-    )
+    prompt.push_str(base);
+    match custom_instructions {
+        Some(ci) if !ci.trim().is_empty() => {
+            prompt.push_str(&format!("\n\nAdditional focus: {ci}"));
+        }
+        _ => {}
+    }
+    prompt
 }
 
 /// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
@@ -1012,11 +1143,84 @@ mod tests {
             make_assistant("I'll create a main.rs file with a hello world program."),
         ];
         let prompt = build_compaction_prompt(&msgs, None, None);
-        assert!(prompt.contains("Write a hello world program"));
+        assert!(prompt.contains("[User]: Write a hello world program"));
         assert!(prompt.contains("main.rs"));
-        assert!(prompt.contains("summarizing a coding agent"));
+        assert!(prompt.contains(SUMMARIZATION_PROMPT));
+        // First compaction has no previous-summary block and no update rules.
+        assert!(!prompt.contains("<previous-summary>"));
+        assert!(!prompt.contains(UPDATE_SUMMARIZATION_PROMPT));
         // No custom instructions → no focus line.
         assert!(!prompt.contains("Additional focus"));
+    }
+
+    #[test]
+    fn test_serialize_conversation_covers_every_message_shape() {
+        let long_result = "r".repeat(2100);
+        let msgs = vec![
+            make_user("plain question"),
+            AgentMessage::Custom {
+                custom_type: "notice".into(),
+                content: vec![ContentBlock::Text {
+                    text: "custom payload".into(),
+                    signature: None,
+                }],
+                display: false,
+                details: None,
+                timestamp: chrono::Utc::now(),
+            },
+            AgentMessage::Assistant {
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "weighing options".into(),
+                        signature: None,
+                        redacted: None,
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path": "a.rs", "offset": 3}),
+                        thought_signature: None,
+                    },
+                ],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Default::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            },
+            AgentMessage::ToolResult {
+                tool_call_id: "t1".into(),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text {
+                    text: long_result.clone(),
+                    signature: None,
+                }],
+                is_error: false,
+                details: None,
+                usage: None,
+                added_tool_names: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        let text = serialize_conversation(&msgs);
+        assert!(text.contains("[User]: plain question"));
+        // A custom message folds to its content as a user line.
+        assert!(text.contains("[User]: custom payload"));
+        assert!(text.contains("[Assistant thinking]: weighing options"));
+        assert!(text.contains("[Assistant]: answer"));
+        assert!(text.contains("[Assistant tool calls]: read(offset=3, path=\"a.rs\")"));
+        // Tool results survive, truncated to the budget with a drop marker.
+        assert!(text.contains(&format!("[Tool result]: {}", "r".repeat(2000))));
+        assert!(text.contains("[... 100 more characters truncated]"));
     }
 
     #[test]
@@ -1037,16 +1241,18 @@ mod tests {
         let msgs = vec![make_user("continue the work")];
         let prompt = build_compaction_prompt(&msgs, Some("prior session covered the API"), None);
         assert!(
-            prompt.contains("Here is a summary of the earlier conversation"),
-            "previous summary is surfaced as context: {prompt}"
-        );
-        assert!(
-            prompt.contains("<summary>\nprior session covered the API\n</summary>"),
+            prompt
+                .contains("<previous-summary>\nprior session covered the API\n</previous-summary>"),
             "the previous summary text is embedded verbatim: {prompt}"
         );
+        assert!(
+            prompt.contains(UPDATE_SUMMARIZATION_PROMPT),
+            "a previous summary switches the instructions to the update variant: {prompt}"
+        );
+        assert!(!prompt.contains(SUMMARIZATION_PROMPT));
         // Absent previous summary leaves no stale summary block.
         let prompt = build_compaction_prompt(&msgs, None, None);
-        assert!(!prompt.contains("Here is a summary of the earlier conversation"));
+        assert!(!prompt.contains("<previous-summary>"));
     }
 
     #[test]

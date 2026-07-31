@@ -787,8 +787,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             custom_instructions,
         );
         let summary_context = AgentContext {
-            system_prompt:
-                "You compress a coding agent's conversation history into a concise summary.".into(),
+            system_prompt: compaction::SUMMARIZATION_SYSTEM_PROMPT.into(),
             messages: vec![AgentMessage::user(prompt)],
             tools: Arc::from(Vec::new()),
             model: self.model.clone(),
@@ -1978,9 +1977,10 @@ mod tests {
         harness.compact(None).await.expect("second compact");
 
         let prompt = seen.lock().unwrap().clone();
-        // The prior summary is folded in once as <previous-summary>-style context.
+        // The prior summary is folded in once as <previous-summary> context.
         assert!(
-            prompt.contains("Here is a summary of the earlier conversation"),
+            prompt
+                .contains("<previous-summary>\nprior session covered the API\n</previous-summary>"),
             "previousSummary is folded into the prompt: {prompt}"
         );
         // The synthetic summary carrier is excluded from messagesToSummarize —
