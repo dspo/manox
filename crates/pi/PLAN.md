@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,800 行 Rust，331 个测试，零警告。
+**当前规模：** ~25,900 行 Rust，335 个测试，零警告。
 
 ## 架构设计
 
@@ -59,7 +59,7 @@ crates/pi/src/
 | 错误处理 | thiserror（领域错误）+ anyhow（胶水代码） | 匹配 manox 现有模式 |
 | 事件系统 | `#[async_trait] EventSink` + `mpsc` 有界通道（容量 1） | 循环 await 每次发射，慢消费者直接背压循环；对齐 TS Pi 每次 `await emit(...)` 的顺序保证 |
 | StreamFn | `Arc<dyn StreamFn>` + mpsc channel | Arc 为 tokio::spawn 提供 'static lifetime |
-| 生产 ExecutionEnv | `TokioExecutionEnv`（tokio::fs + tokio::process::Command） | 真实文件系统 + shell，超时通过 tokio::time::timeout |
+| 生产 ExecutionEnv | `TokioExecutionEnv`（tokio::fs + tokio::process::Command） | 真实文件系统 + shell；exec 带 CancellationToken——独占进程组（process_group(0)），超时或取消时 SIGKILL 整个进程树（对齐 TS killProcessTree 的负 pid 组杀），stdout/stderr 并发排空防管道死锁 |
 | grep/find | 进程内实现（ignore + regex + globset） | 消除 shell 注入，不依赖系统 grep/find |
 | edit 工具 | `similar` crate 做 diff-based 模糊匹配 | 处理 LLM 缩进/空白漂移 |
 | edit_diff | `similar` crate 计算统一 diff | 编辑后返回 diff 展示变更 |

@@ -33,7 +33,7 @@
 | 能力 | manox 位置（规模） | pi 状态 | 说明 |
 |---|---|---|---|
 | 双流式 turn 循环 | thread.rs (10857 总量) | ✅ | pi agent_loop 双循环 + steering/follow-up 已具备 |
-| 取消传播 | thread.rs `cancel()` | 🟡 | pi 有 CancellationToken；manox 另有 pending oneshot 清理、leader→worker 级联。**级联清理有意不移植（2026-07-29 拍板）：TS Pi 取消 = 纯 AbortSignal + 批次级 aborted 检查** |
+| 取消传播 | thread.rs `cancel()` | ✅ | pi 取消与 TS Pi 同义（2026-07-31 补齐执行中断）：纯 token + 批次级 aborted 检查（循环侧早已具备），且取消**中断正在执行的工具**——`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时时 SIGKILL 整个进程树（对齐 TS killProcessTree 负 pid 组杀），bash 工具透传 signal，stdout/stderr 并发排空防管道死锁；manox 的 pending oneshot 清理、leader→worker 级联**有意不移植（2026-07-29 拍板）** |
 | 空响应/工具未兑现恢复 | thread.rs（5 种 case） | 🚫 | **有意不移植（2026-07-29 拍板）**：TS Pi agent-loop 无恢复 nudge；error/aborted 立即 agent_end |
 | 拒绝熔断 | thread.rs `MAX_CONSECUTIVE_TOOL_DENIALS` | 🚫 | **有意不移植（2026-07-29 拍板）**：TS Pi 无拒绝计数/熔断 |
 | MaxTokens 截断处理 | thread.rs | 🟡 | pi 目前 fail 掉全部 tool calls；manox 有更细的恢复路径 |

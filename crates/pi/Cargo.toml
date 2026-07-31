@@ -24,6 +24,7 @@ tracing.workspace = true
 xxhash-rust.workspace = true
 async-trait = "0.1"
 jsonschema.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "fs", "net", "io-util"] }

@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 /// The result of a shell command execution.
 #[derive(Debug, Clone)]
 pub struct CommandResult {
@@ -64,9 +66,14 @@ pub trait ExecutionEnv: Send + Sync {
     /// Remove a file or directory.
     async fn remove(&self, path: &Path) -> Result<(), FileError>;
 
-    /// Execute a shell command with a timeout.
-    async fn exec(&self, command: &str, timeout: Duration)
-    -> Result<CommandResult, ExecutionError>;
+    /// Execute a shell command with a timeout. A cancelled `signal` kills the
+    /// process tree rather than waiting for the command to finish.
+    async fn exec(
+        &self,
+        command: &str,
+        timeout: Duration,
+        signal: CancellationToken,
+    ) -> Result<CommandResult, ExecutionError>;
 }
 
 /// Errors from filesystem operations.
@@ -93,6 +100,10 @@ pub enum FileError {
 pub enum ExecutionError {
     #[error("command timed out after {0:?}")]
     Timeout(Duration),
+    /// The cancellation token fired while the command ran; the process tree
+    /// was killed.
+    #[error("aborted")]
+    Aborted,
     #[error("command exited with code {exit_code}: {stderr}")]
     NonZeroExit { exit_code: i32, stderr: String },
     #[error("spawn error: {0}")]
@@ -252,25 +263,83 @@ impl ExecutionEnv for TokioExecutionEnv {
         &self,
         command: &str,
         timeout_dur: Duration,
+        signal: CancellationToken,
     ) -> Result<CommandResult, ExecutionError> {
-        tokio::time::timeout(timeout_dur, async {
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&self.cwd)
-                .output()
-                .await
-                .map_err(|e| ExecutionError::Spawn(format!("{e}")))?;
+        use tokio::io::AsyncReadExt;
 
-            Ok::<_, ExecutionError>(CommandResult {
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                exit_code: output.status.code().unwrap_or(-1),
-            })
+        if signal.is_cancelled() {
+            return Err(ExecutionError::Aborted);
+        }
+        // Own process group: the whole tree the command spawns dies together
+        // on timeout or cancellation.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.cwd)
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ExecutionError::Spawn(format!("{e}")))?;
+
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        // The pipes fill independently of the wait, so both drain concurrently
+        // or a chatty child deadlocks against a full buffer.
+        let out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            buf
+        });
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let status = tokio::select! {
+            status = child.wait() => status.map_err(|e| ExecutionError::Spawn(format!("{e}")))?,
+            () = tokio::time::sleep(timeout_dur) => {
+                kill_process_tree(&mut child).await;
+                let _ = child.wait().await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err(ExecutionError::Timeout(timeout_dur));
+            }
+            () = signal.cancelled() => {
+                kill_process_tree(&mut child).await;
+                let _ = child.wait().await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err(ExecutionError::Aborted);
+            }
+        };
+
+        let stdout = out_task
+            .await
+            .map_err(|e| ExecutionError::Other(format!("{e}")))?;
+        let stderr = err_task
+            .await
+            .map_err(|e| ExecutionError::Other(format!("{e}")))?;
+        Ok(CommandResult {
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
+            exit_code: status.code().unwrap_or(-1),
         })
-        .await
-        .map_err(|_| ExecutionError::Timeout(timeout_dur))?
     }
+}
+
+/// SIGKILL the child's whole process group, falling back to the child alone
+/// when the group is already gone.
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // Negative pid signals the process group — the same tree kill the TS
+        // harness performs on abort/timeout.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill().await;
 }
 
 fn map_io_error(e: io::Error, path: &Path) -> FileError {
@@ -281,5 +350,100 @@ fn map_io_error(e: io::Error, path: &Path) -> FileError {
         }
         io::ErrorKind::IsADirectory => FileError::IsDirectory(format!("{}", path.display())),
         _ => FileError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_env() -> TokioExecutionEnv {
+        TokioExecutionEnv::new(std::env::temp_dir())
+    }
+
+    #[tokio::test]
+    async fn exec_cancel_kills_the_running_command() {
+        let env = test_env();
+        let token = CancellationToken::new();
+        let signal = token.clone();
+        let started = std::time::Instant::now();
+        let exec =
+            tokio::spawn(
+                async move { env.exec("sleep 30", Duration::from_secs(60), signal).await },
+            );
+        // Cancel shortly after the child starts; without the signal the exec
+        // would run for the full 30s.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+        let result = exec.await.unwrap();
+        assert!(
+            matches!(result, Err(ExecutionError::Aborted)),
+            "cancellation surfaces as Aborted: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the sleeping command is killed, not awaited"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_cancel_kills_the_whole_process_tree() {
+        let env = test_env();
+        let token = CancellationToken::new();
+        let signal = token.clone();
+        // The grandchild writes a marker after the shell and its direct child
+        // have been killed; a tree kill prevents the write.
+        let dir = std::env::temp_dir().join(format!("pi-exec-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-survived");
+        let cmd = format!("sh -c 'sleep 2; touch {}' & sleep 30", marker.display());
+        let exec =
+            tokio::spawn(async move { env.exec(&cmd, Duration::from_secs(60), signal).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+        let result = exec.await.unwrap();
+        assert!(matches!(result, Err(ExecutionError::Aborted)));
+        // Wait past the grandchild's scheduled write; the tree kill must have
+        // taken it down with the rest.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the detached grandchild dies with the process group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_kills_the_command() {
+        let env = test_env();
+        let started = std::time::Instant::now();
+        let result = env
+            .exec(
+                "sleep 30",
+                Duration::from_millis(100),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ExecutionError::Timeout(_))),
+            "a slow command surfaces as Timeout: {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn exec_collects_stdout_and_stderr() {
+        let env = test_env();
+        let result = env
+            .exec(
+                "echo out; echo err >&2",
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout.trim(), "out");
+        assert_eq!(result.stderr.trim(), "err");
     }
 }

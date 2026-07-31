@@ -639,6 +639,7 @@ mod tests {
             &self,
             _command: &str,
             _timeout: Duration,
+            _signal: CancellationToken,
         ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
             Ok(crate::env::CommandResult {
                 stdout: "ok".into(),

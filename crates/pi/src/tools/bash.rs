@@ -67,7 +67,7 @@ impl AgentTool for BashTool {
         &self,
         _tool_call_id: &str,
         params: JsonValue,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let command = params["command"]
@@ -83,7 +83,7 @@ impl AgentTool for BashTool {
 
         let result = ctx
             .env()
-            .exec(&command, Duration::from_millis(timeout_ms))
+            .exec(&command, Duration::from_millis(timeout_ms), signal)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
 
