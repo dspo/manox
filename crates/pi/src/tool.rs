@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline::SnapshotStore;
@@ -271,7 +272,7 @@ pub struct ExecutedToolCall {
 /// `after_tool_call` hooks from `config`.
 pub async fn execute_tool_calls(
     tool_calls: &[(&str, &str, JsonValue)],
-    tools: &[Box<dyn AgentTool>],
+    tools: &[Arc<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
@@ -296,7 +297,7 @@ pub async fn execute_tool_calls(
 
 async fn execute_sequential(
     tool_calls: &[(&str, &str, JsonValue)],
-    tools: &[Box<dyn AgentTool>],
+    tools: &[Arc<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
@@ -316,7 +317,7 @@ async fn execute_sequential(
 
 async fn execute_parallel(
     tool_calls: &[(&str, &str, JsonValue)],
-    tools: &[Box<dyn AgentTool>],
+    tools: &[Arc<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
@@ -342,56 +343,41 @@ async fn execute_parallel(
     (executed, messages)
 }
 
-/// Buffers a tool's mid-execution progress reports as `ToolExecutionUpdate`
-/// events, tagged with the call's id and carrying the call's name and
+/// Forwards a tool's mid-execution progress reports to the loop's sink as
+/// they arrive, tagged with the call's id and carrying the call's name and
 /// arguments so a consumer can attach progress without cross-referencing
 /// history.
 ///
 /// The tool-facing [`ToolProgress`] callback is synchronous while the loop's
-/// sink is awaited, so updates queue here and are drained through the sink
-/// once execution settles — every update a tool reported is emitted before
-/// its `ToolExecutionEnd`, the same ordering TS Pi's settled `updateEvents`
-/// provide.
-struct BufferingProgress {
+/// sink is awaited, so reports travel an unbounded channel drained by a
+/// forwarding future running concurrently with execution. Awaiting the
+/// forwarder once execution settles — after closing the channel — emits
+/// every reported update before the call's `ToolExecutionEnd`, the same
+/// ordering TS Pi's settled `updateEvents` provide, while consumers watch
+/// progress in real time instead of after the fact.
+struct ChannelingProgress {
     tool_call_id: String,
     tool_name: String,
     arguments: JsonValue,
-    pending: std::sync::Mutex<Vec<AgentEvent>>,
+    tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
 }
 
-impl BufferingProgress {
-    fn new(tool_call_id: String, tool_name: String, arguments: JsonValue) -> Self {
-        BufferingProgress {
-            tool_call_id,
-            tool_name,
-            arguments,
-            pending: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Queued updates in arrival order.
-    fn drain(&self) -> Vec<AgentEvent> {
-        std::mem::take(&mut *self.pending.lock().unwrap())
-    }
-}
-
-impl ToolProgress for BufferingProgress {
+impl ToolProgress for ChannelingProgress {
     fn emit(&self, partial_result: JsonValue) {
-        self.pending
-            .lock()
-            .unwrap()
-            .push(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: self.tool_call_id.clone(),
-                tool_name: self.tool_name.clone(),
-                arguments: self.arguments.clone(),
-                partial_result,
-            });
+        // A send failure means the forwarder is gone, which only happens
+        // after execution settled — the update has nowhere left to land.
+        let _ = self.tx.send(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            arguments: self.arguments.clone(),
+            partial_result,
+        });
     }
 }
 
 async fn execute_one(
     call: (&str, &str, &JsonValue),
-    tools: &[Box<dyn AgentTool>],
+    tools: &[Arc<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
@@ -497,19 +483,37 @@ async fn execute_one(
         };
     }
 
-    let progress = BufferingProgress::new(id.clone(), name.clone(), args.clone());
-    let mut result = match tool
-        .execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => AgentToolResult::error(format!("{e}")),
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let progress = ChannelingProgress {
+        tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        arguments: args.clone(),
+        tx: progress_tx,
     };
-
-    // Settle the tool's queued progress updates before its end event.
-    for update in progress.drain() {
-        sink.emit(update).await;
-    }
+    let mut forward_progress = Box::pin(async {
+        while let Some(update) = progress_rx.recv().await {
+            sink.emit(update).await;
+        }
+    });
+    let mut result = {
+        let execution =
+            tool.execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress);
+        tokio::pin!(execution);
+        tokio::select! {
+            outcome = &mut execution => match outcome {
+                Ok(r) => r,
+                Err(e) => AgentToolResult::error(format!("{e}")),
+            },
+            // The forwarder ends only when the sender closes, and the sender
+            // lives in `progress`, borrowed by the running execution — so
+            // this arm is unreachable while execution is in flight.
+            _ = &mut forward_progress => AgentToolResult::error("progress forwarder stopped"),
+        }
+    };
+    // Close the channel, then the forwarder flushes every queued update
+    // before the end event.
+    drop(progress);
+    forward_progress.await;
 
     // after_tool_call hook: patches the result.
     if let Some(after) = &config.after_tool_call {
@@ -694,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_single_tool() {
-        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(EchoTool)];
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(EchoTool)];
         let ctx = MockCtx {
             state: ToolState::new(),
         };
@@ -723,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_not_found() {
-        let tools: Vec<Box<dyn AgentTool>> = vec![];
+        let tools: Vec<Arc<dyn AgentTool>> = vec![];
         let ctx = MockCtx {
             state: ToolState::new(),
         };
@@ -790,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_emit_surfaces_as_tool_execution_update() {
-        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(ProgressTool)];
         let ctx = MockCtx {
             state: ToolState::new(),
         };
@@ -829,9 +833,96 @@ mod tests {
         assert!(!executed[0].result.is_error);
     }
 
+    /// A tool that emits progress, then parks on a gate until the test
+    /// releases it — standing in for a long-running call.
+    struct GatedProgressTool {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for GatedProgressTool {
+        fn name(&self) -> &str {
+            "gated-progress"
+        }
+        fn description(&self) -> &str {
+            "Emits progress then waits on a gate"
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            unreachable!("execute_with_progress must be used when present")
+        }
+        async fn execute_with_progress(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+            progress: &dyn ToolProgress,
+        ) -> Result<AgentToolResult, ToolError> {
+            progress.emit(serde_json::json!({"step": "before-gate"}));
+            self.release.notified().await;
+            Ok(AgentToolResult::text("done"))
+        }
+    }
+
+    /// A sink that signals when a `ToolExecutionUpdate` lands.
+    struct UpdateWatchSink {
+        seen: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for UpdateWatchSink {
+        async fn emit(&self, event: AgentEvent) {
+            if matches!(event, AgentEvent::ToolExecutionUpdate { .. }) {
+                self.seen.notify_one();
+            }
+        }
+    }
+
+    /// Progress reaches the sink while the tool is still running — not
+    /// buffered until execution settles.
+    #[tokio::test]
+    async fn progress_streams_while_execution_is_in_flight() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(tokio::sync::Notify::new());
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(GatedProgressTool {
+            release: Arc::clone(&release),
+        })];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let sink = UpdateWatchSink {
+            seen: Arc::clone(&seen),
+        };
+        let signal = CancellationToken::new();
+        let calls = [("call_1", "gated-progress", serde_json::json!({}))];
+        let config = AgentLoopConfig::default();
+
+        let execution = execute_tool_calls(&calls, &tools, signal, &ctx, &config, &sink, false);
+        tokio::pin!(execution);
+
+        // The update must land while the tool still waits on its gate;
+        // execution settling first would mean the update was buffered.
+        tokio::select! {
+            _ = seen.notified() => {}
+            _ = &mut execution => panic!("execution settled before its progress arrived"),
+        }
+        release.notify_one();
+        let (executed, _) = execution.await;
+        assert!(!executed[0].result.is_error);
+    }
+
     #[tokio::test]
     async fn tool_execution_events_carry_full_payload() {
-        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(ProgressTool)];
         let ctx = MockCtx {
             state: ToolState::new(),
         };

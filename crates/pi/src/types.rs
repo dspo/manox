@@ -534,7 +534,7 @@ pub struct AgentContext {
     /// Tools available to the agent. Shared via `Arc` so cloning the context
     /// (notably across the `tokio::spawn` boundary in the stream path) keeps
     /// the tool list intact and the provider sees what the caller mounted.
-    pub tools: Arc<[Box<dyn super::AgentTool>]>,
+    pub tools: Arc<[Arc<dyn super::AgentTool>]>,
     /// The model being used for this turn.
     pub model: Model,
     /// Current thinking level.

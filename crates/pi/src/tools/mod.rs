@@ -17,10 +17,11 @@ pub mod write;
 
 use crate::tool::AgentTool;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A registry of tools, keyed by name.
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn AgentTool>>,
+    tools: HashMap<String, Arc<dyn AgentTool>>,
 }
 
 impl ToolRegistry {
@@ -30,7 +31,7 @@ impl ToolRegistry {
         }
     }
 
-    pub fn register(&mut self, tool: Box<dyn AgentTool>) {
+    pub fn register(&mut self, tool: Arc<dyn AgentTool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
@@ -56,13 +57,13 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     /// Register all default built-in tools.
     pub fn register_defaults(&mut self) {
-        self.register(Box::new(read::ReadTool));
-        self.register(Box::new(write::WriteTool));
-        self.register(Box::new(edit::EditTool));
-        self.register(Box::new(bash::BashTool::new(None)));
-        self.register(Box::new(grep::GrepTool));
-        self.register(Box::new(find::FindTool));
-        self.register(Box::new(ls::LsTool));
+        self.register(Arc::new(read::ReadTool));
+        self.register(Arc::new(write::WriteTool));
+        self.register(Arc::new(edit::EditTool));
+        self.register(Arc::new(bash::BashTool::new(None)));
+        self.register(Arc::new(grep::GrepTool));
+        self.register(Arc::new(find::FindTool));
+        self.register(Arc::new(ls::LsTool));
     }
 }
 
@@ -73,7 +74,7 @@ mod tests {
     #[test]
     fn test_tool_registry() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(read::ReadTool));
+        registry.register(Arc::new(read::ReadTool));
         assert_eq!(registry.names(), vec!["read"]);
         assert!(registry.get("read").is_some());
         assert!(registry.get("nonexistent").is_none());

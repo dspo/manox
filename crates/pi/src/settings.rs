@@ -5,6 +5,53 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Project-scope compaction overrides.
+///
+/// Every field is optional, so a settings file only carries the values it
+/// explicitly sets; the merge applies those field-wise over the base,
+/// mirroring the recursive merge of TS `deepMergeSettings` instead of
+/// replacing the whole section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompactionOverrides {
+    /// Whether compaction is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Tokens to reserve for the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<usize>,
+    /// Tokens to keep from the recent conversation tail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_tokens: Option<usize>,
+}
+
+impl CompactionOverrides {
+    /// Fold another override set into this one; explicitly set fields win.
+    fn merge_from(&mut self, other: &CompactionOverrides) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.reserve_tokens.is_some() {
+            self.reserve_tokens = other.reserve_tokens;
+        }
+        if other.keep_recent_tokens.is_some() {
+            self.keep_recent_tokens = other.keep_recent_tokens;
+        }
+    }
+
+    /// Apply the explicitly set fields over `base`.
+    fn apply_to(&self, base: &mut crate::compaction::CompactionSettings) {
+        if let Some(enabled) = self.enabled {
+            base.enabled = enabled;
+        }
+        if let Some(reserve_tokens) = self.reserve_tokens {
+            base.reserve_tokens = reserve_tokens;
+        }
+        if let Some(keep_recent_tokens) = self.keep_recent_tokens {
+            base.keep_recent_tokens = keep_recent_tokens;
+        }
+    }
+}
+
 /// Application settings with global and project-level overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -17,12 +64,14 @@ pub struct Settings {
     /// Default thinking level.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
-    /// Compaction settings.
-    #[serde(default)]
-    pub compaction: crate::compaction::CompactionSettings,
-    /// Whether to show cache miss notices.
-    #[serde(default)]
-    pub show_cache_miss_notices: bool,
+    /// Compaction overrides; absent leaves the other scope's values
+    /// untouched on merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionOverrides>,
+    /// Whether to show cache miss notices; absent leaves the other scope's
+    /// value untouched on merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_cache_miss_notices: Option<bool>,
     /// Shell command prefix (e.g. "sudo").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell_command_prefix: Option<String>,
@@ -33,7 +82,7 @@ pub struct Settings {
 
 impl Settings {
     /// Merge project-level overrides into global settings.
-    /// Project settings take precedence for non-None values.
+    /// Project settings take precedence for explicitly set values only.
     pub fn merge(&mut self, project: &Settings) {
         if project.default_provider.is_some() {
             self.default_provider = project.default_provider.clone();
@@ -50,9 +99,23 @@ impl Settings {
         if project.external_editor.is_some() {
             self.external_editor = project.external_editor.clone();
         }
-        // Compaction is always overwritten if explicitly set
-        self.compaction = project.compaction.clone();
-        self.show_cache_miss_notices = project.show_cache_miss_notices;
+        if let Some(overrides) = &project.compaction {
+            self.compaction
+                .get_or_insert_with(Default::default)
+                .merge_from(overrides);
+        }
+        if project.show_cache_miss_notices.is_some() {
+            self.show_cache_miss_notices = project.show_cache_miss_notices;
+        }
+    }
+
+    /// The compaction settings with defaults under the explicit overrides.
+    pub fn resolved_compaction(&self) -> crate::compaction::CompactionSettings {
+        let mut resolved = crate::compaction::CompactionSettings::default();
+        if let Some(overrides) = &self.compaction {
+            overrides.apply_to(&mut resolved);
+        }
+        resolved
     }
 
     /// Load settings from a JSON string.
@@ -92,6 +155,64 @@ mod tests {
     fn test_default_settings() {
         let settings = Settings::default();
         assert!(settings.default_model.is_none());
-        assert!(settings.compaction.enabled);
+        assert!(settings.resolved_compaction().enabled);
+    }
+
+    #[test]
+    fn test_merge_keeps_global_compaction_when_project_is_silent() {
+        let mut global = Settings {
+            compaction: Some(CompactionOverrides {
+                enabled: Some(false),
+                keep_recent_tokens: Some(5000),
+                ..Default::default()
+            }),
+            show_cache_miss_notices: Some(true),
+            ..Default::default()
+        };
+        // A project file that never mentions compaction or notices.
+        let project = Settings::from_json(r#"{"default_model": "gpt-5"}"#).unwrap();
+
+        global.merge(&project);
+        let compaction = global.compaction.unwrap();
+        assert_eq!(compaction.enabled, Some(false));
+        assert_eq!(compaction.keep_recent_tokens, Some(5000));
+        assert_eq!(global.show_cache_miss_notices, Some(true));
+    }
+
+    #[test]
+    fn test_merge_applies_only_the_explicitly_set_compaction_fields() {
+        let mut global = Settings {
+            compaction: Some(CompactionOverrides {
+                enabled: Some(false),
+                reserve_tokens: Some(1000),
+                keep_recent_tokens: Some(5000),
+            }),
+            ..Default::default()
+        };
+        let project =
+            Settings::from_json(r#"{"compaction": {"keep_recent_tokens": 8000}}"#).unwrap();
+
+        global.merge(&project);
+        // The explicit field overrides; the untouched ones survive.
+        let resolved = global.resolved_compaction();
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.reserve_tokens, 1000);
+        assert_eq!(resolved.keep_recent_tokens, 8000);
+    }
+
+    #[test]
+    fn test_merge_project_compaction_lands_when_global_is_silent() {
+        let mut global = Settings::default();
+        let project = Settings::from_json(
+            r#"{"compaction": {"enabled": false}, "show_cache_miss_notices": true}"#,
+        )
+        .unwrap();
+
+        global.merge(&project);
+        let resolved = global.resolved_compaction();
+        assert!(!resolved.enabled);
+        // Unmentioned fields fall back to the defaults.
+        assert_eq!(resolved.reserve_tokens, 16384);
+        assert_eq!(global.show_cache_miss_notices, Some(true));
     }
 }

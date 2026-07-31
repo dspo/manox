@@ -354,7 +354,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let signal = CancellationToken::new();
         let sig = signal.clone();
-        let client = reqwest::Client::new();
+        // Loopback must bypass any system proxy from the environment; the
+        // default client honors proxy env vars and would never reach port 1.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let handle = tokio::spawn(async move {
             send_with_retry(
                 || client.post("http://127.0.0.1:1/").body("x".to_string()),
@@ -396,7 +398,10 @@ mod tests {
             }
         });
         let (tx, mut rx) = mpsc::channel(8);
-        let client = reqwest::Client::new();
+        // Loopback must bypass any system proxy from the environment; the
+        // default client honors proxy env vars and would route the fixture
+        // server through it.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://{addr}/");
         let err = send_with_retry(
             || client.post(&url).body("x".to_string()),

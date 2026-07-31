@@ -168,7 +168,7 @@ async fn live_tool_use_roundtrip() {
     };
 
     let mut ctx = ctx_with("What's the weather in Paris? You must call get_weather.");
-    ctx.tools = Arc::from(vec![Box::new(GetWeather) as Box<dyn AgentTool>]);
+    ctx.tools = Arc::from(vec![Arc::new(GetWeather) as Arc<dyn AgentTool>]);
 
     let (tx, _rx) = mpsc::channel::<AgentEvent>(256);
     let msg = sf

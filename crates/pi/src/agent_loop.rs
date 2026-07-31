@@ -748,7 +748,7 @@ mod tests {
         let ctx = AgentContext {
             system_prompt: String::new(),
             messages: Vec::new(),
-            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -868,7 +868,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -969,7 +969,7 @@ mod tests {
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
@@ -1197,7 +1197,7 @@ mod tests {
         AgentContext {
             system_prompt: "You are a test assistant.".into(),
             messages: Vec::new(),
-            tools: Arc::from(vec![Box::new(EchoTool) as Box<dyn AgentTool>]),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),

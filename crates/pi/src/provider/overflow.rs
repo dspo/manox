@@ -84,6 +84,50 @@ pub fn mid_stream(message: String) -> ProviderError {
     }
 }
 
+/// Whether an assistant message signals a context-window overflow, mirroring
+/// the TS `isContextOverflow` three-case check:
+///
+/// 1. Error-based: `Error` stop reason whose message classifies as overflow.
+/// 2. Silent: a completed response whose reported input (plus cache reads)
+///    exceeds the window — some providers accept oversized input silently.
+/// 3. Length-stop: the server truncated the input to fill the window,
+///    leaving no room for output (`Length` stop, zero output tokens, input
+///    at ≥99% of the window).
+pub fn is_context_overflow(message: &crate::types::AgentMessage, context_window: u64) -> bool {
+    let crate::types::AgentMessage::Assistant {
+        stop_reason,
+        error_message,
+        usage,
+        ..
+    } = message
+    else {
+        return false;
+    };
+
+    if *stop_reason == Some(crate::types::StopReason::Error)
+        && error_message
+            .as_deref()
+            .is_some_and(|msg| classify(None, msg))
+    {
+        return true;
+    }
+
+    if context_window > 0 {
+        let input_tokens = usage.input_tokens + usage.cache_read_input_tokens;
+        if *stop_reason == Some(crate::types::StopReason::Stop) && input_tokens > context_window {
+            return true;
+        }
+        if *stop_reason == Some(crate::types::StopReason::Length)
+            && usage.output_tokens == 0
+            && input_tokens >= context_window * 99 / 100
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +187,86 @@ mod tests {
         assert!(matches!(err, ProviderError::Overflow(_)));
         let err = mid_stream("connection reset by peer".to_string());
         assert!(matches!(err, ProviderError::MidStream(_)));
+    }
+
+    fn assistant(
+        stop_reason: crate::types::StopReason,
+        error_message: Option<&str>,
+        usage: crate::types::Usage,
+    ) -> crate::types::AgentMessage {
+        crate::types::AgentMessage::Assistant {
+            content: Vec::new(),
+            model: "m".into(),
+            provider: "p".into(),
+            api: "a".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(stop_reason),
+            usage: Box::new(usage),
+            error_message: error_message.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn error_message_overflow_is_detected() {
+        let msg = assistant(
+            crate::types::StopReason::Error,
+            Some("prompt is too long: 213462 tokens > 200000 maximum"),
+            crate::types::Usage::default(),
+        );
+        assert!(is_context_overflow(&msg, 200_000));
+    }
+
+    #[test]
+    fn rate_limit_error_is_not_overflow() {
+        let msg = assistant(
+            crate::types::StopReason::Error,
+            Some("rate limit exceeded, please retry later"),
+            crate::types::Usage::default(),
+        );
+        assert!(!is_context_overflow(&msg, 200_000));
+    }
+
+    #[test]
+    fn silent_overflow_is_detected_from_usage() {
+        let msg = assistant(
+            crate::types::StopReason::Stop,
+            None,
+            crate::types::Usage {
+                input_tokens: 150_000,
+                cache_read_input_tokens: 60_000,
+                ..Default::default()
+            },
+        );
+        assert!(is_context_overflow(&msg, 200_000));
+        assert!(!is_context_overflow(&msg, 0));
+    }
+
+    #[test]
+    fn length_stop_with_full_window_and_no_output_is_overflow() {
+        let msg = assistant(
+            crate::types::StopReason::Length,
+            None,
+            crate::types::Usage {
+                input_tokens: 199_000,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        );
+        assert!(is_context_overflow(&msg, 200_000));
+
+        // Room left for output means an ordinary length stop, not truncation.
+        let msg = assistant(
+            crate::types::StopReason::Length,
+            None,
+            crate::types::Usage {
+                input_tokens: 199_000,
+                output_tokens: 500,
+                ..Default::default()
+            },
+        );
+        assert!(!is_context_overflow(&msg, 200_000));
     }
 }

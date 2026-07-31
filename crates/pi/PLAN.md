@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~26,100 行 Rust（src 24.8k + examples 1.3k），344 个测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~27,500 行 Rust（src 26.2k + examples 1.3k），362 个测试（另 3 个 live 测试 ignored），零警告。
 
 ## 架构设计
 
@@ -120,6 +120,7 @@ pub trait AgentTool: Send + Sync {
 5. ✅ 定义 `ExecutionEnv` trait
 6. ✅ 定义 `AgentTool` trait + `AgentToolResult` struct
 7. ✅ 实现工具执行管道（prepare → validate → before_hook → execute → after_hook → finalize）
+   - 工具 progress 实时转发：同步 `emit` 经 unbounded channel 由并发转发 future 排空到 sink（TS `updateEvents` 同序保证——全部 update 先于 `ToolExecutionEnd` 结算，且消费者实时可见而非执行结束后回放）
 
 ### Phase 2: 核心引擎 ✅
 
@@ -148,12 +149,13 @@ pub trait AgentTool: Send + Sync {
 3. ✅ 实现 `JsonlSessionStorage`（追加写入 JSONL，leaf 游标管理）
 4. ✅ 实现 `Session` struct（context 构建、typed entry 追加）
    - `get_path`：全路径 walk（leaf→root 跨压缩边界；显式未知 leaf 或断链 parent 显式报错，`None`→空路径，对齐 TS agent 包 jsonl-storage 的 `not_found`/`invalid_session`）
-   - `get_branch` / `build_context_entries` / `build_session_context`：对齐 TS `getBranch`/`buildContextEntries`/`buildSessionContext`——最新压缩边界领衔 + `retainedTail` 存在时直接投影、缺失时从 `first_kept_entry_id` 走树重建 kept 段；全变体投影（CustomMessage/BranchSummary/Compaction 各归其位），设置类 entry（thinking_level/model_change/assistant 见证）经 `SessionContext` 上报
+   - `get_branch` / `build_context_entries` / `build_session_context`：对齐 TS `getBranch`/`buildContextEntries`/`buildSessionContext`——最新压缩边界领衔 + `retainedTail` 存在时直接投影、缺失时从 `first_kept_entry_id` 走树重建 kept 段；全变体投影（CustomMessage/BranchSummary/Compaction 各归其位），设置类 entry（thinking_level/model_change/active_tools_change/assistant 见证）经 `SessionContext` 上报
    - 摘要载体统一走 TS tag 常量（`COMPACTION_SUMMARY_*`/`BRANCH_SUMMARY_*`），压缩写入与恢复投影同形
 5. ✅ 实现 `find_cut_point()` —— 从尾向头遍历找安全切点
 6. ✅ 实现 `estimate_tokens()` —— 字符数/4 + provider usage
 7. ✅ 实现 `prepare_compaction()` + `compact()` —— 调用 stream_fn 生成摘要
    - 摘要请求逐字对齐 TS `generateSummaryWithUsage`：`serialize_conversation`（user/custom 文本、assistant thinking/文本/tool calls（name+k=JSON 参数）、tool result 截 2000 字符）、`SUMMARIZATION_SYSTEM_PROMPT` 常量、`SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT` 双模板经 `<previous-summary>` 切换
+   - 无可摘要范围时拒绝（`NothingToCompact`，对齐 TS `prepareCompaction` 返回 `undefined`）：tiny transcript 在默认 keep-recent 下切点恒为 0，不再产出空摘要
    - 已知余项：split-turn（turn prefix 摘要，cut 恒在整轮边界）
 
 ### Phase 4: AgentHarness 编排层 ✅
@@ -170,7 +172,15 @@ pub trait AgentTool: Send + Sync {
    - 取消传播到执行层：`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时 SIGKILL 整个进程树（对齐 TS `killProcessTree`），bash 工具透传 signal
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
-5. ✅ 实现 session 写入缓冲 —— 活跃 turn 期间缓冲写入，turn 边界刷新
+5. ✅ 实现 session 持久化 —— turn 结束后批量追加该 turn 全部消息（持久化失败时 transcript 回滚到 session 已持久化前缀）
+   - 与 TS 的逐条 append 不同：进程在 turn 中途崩溃会丢失该 turn 未持久化的消息——对齐项见「待完成」
+6. ✅ 实现 overflow → compact → retry 闭环
+   - assistant 错误消息经 `is_context_overflow` 三判据分类（错误消息模式 / Stop 但 input+cacheRead 超窗 / Length 且 output=0 且 input ≥99% 窗）
+   - 同模型守卫、stale 守卫（错误不晚于最近一次压缩）、aborted 不恢复
+   - 一次性预算（TS `_overflowRecoveryAttempted`）：失败终端从 transcript 摘除（session 保留）→ 压缩 → `continue_()` 重试一次；新 user prompt 或任何非错误 assistant 消息重新武装
+7. ✅ 运行配置 API 与 restore 回放
+   - `set_model` / `set_active_tools`：应用并持久化 `model_change` / `active_tools_change` entry（未知工具名拒绝）
+   - `restore()` 回放 path 携带的完整运行配置：thinking tier、active tools 子集（经全量挂载集过滤）、model（经 consumer 插接的 `ModelResolver`——crate 保持 registry-free，无 resolver 时保留构造期 model）；restore 不追加任何 entry
 
 ### Phase 5: 内置工具 ✅
 
@@ -194,7 +204,7 @@ pub trait AgentTool: Send + Sync {
 
 1. ✅ `settings.rs` —— Settings struct + global/project 合并（serde 序列化助手，文件加载/保存由接线方负责）
 2. ✅ `trust.rs` —— 项目信任决策管理（内存态，无持久化）
-3. ✅ `cache_stats.rs` —— 逐 turn 扫描 usage 字段，检测 cache miss 和浪费金额
+3. ✅ `cache_stats.rs` —— 逐 turn 扫描 usage 字段检测 cache miss（token 维度：missed_tokens + miss 计数，带 noise floor）；金额与 idle 未实现（`missed_cost` 恒 0、`idle_ms` 占位、`ModelPriceSource` 未接线——见「待完成」）
 4. ✅ `system_prompt.rs` —— 系统提示词构建（项目上下文 + CLAUDE.md 加载）
 5. ✅ `output_guard.rs` —— 工具输出标记（防注入攻击）
 
@@ -211,9 +221,9 @@ pub trait AgentTool: Send + Sync {
 
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/pi-parity.md`，该文件为准）：
 
-- [ ] 压缩 split-turn（turn prefix 摘要）：cut 恒在整轮边界，单轮超 keep-recent 窗口时整轮保留而非切分
-- [ ] 压缩触发路由：上下文溢出 → 压缩 → 重试一次（provider 层溢出分类已就绪，循环层路由未接）
-- [ ] restore 恢复 path 上的 model：需 facade 层 provider registry 解析 `SessionModelRef`
+- [ ] 压缩 split-turn（turn prefix 摘要）：cut 恒在整轮边界，单轮超 keep-recent 窗口时整轮保留而非切分——极端工具轮可能在压缩后仍然溢出
+- [ ] session 逐条 append：TS 在 `message_end` 时即持久化，crate pi 在 turn 末批量追加，turn 中途崩溃丢失该 turn 消息
+- [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳
 - [ ] Completions 流交错块模型：TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块（Phase 2 已知偏离）
 - [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（无 fire 点，见 pi-parity §7）
 

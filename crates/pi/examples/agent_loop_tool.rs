@@ -117,8 +117,8 @@ async fn main() {
         file_path: file_path.to_string_lossy().into_owned(),
     });
 
-    let tools: Arc<[Box<dyn AgentTool>]> =
-        Arc::from(vec![Box::new(ReadTool) as Box<dyn AgentTool>]);
+    let tools: Arc<[Arc<dyn AgentTool>]> =
+        Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]);
 
     let mut agent = Agent::new(
         "You are a tool-using test agent.",

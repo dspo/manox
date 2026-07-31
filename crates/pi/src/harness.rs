@@ -219,6 +219,12 @@ impl HookContext {
     }
 }
 
+/// Consumer-plugged registry lookup resolving a session-carried model
+/// reference into a concrete model. Returning `None` leaves the
+/// construction-time model in place on restore.
+pub type ModelResolver =
+    Arc<dyn Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync>;
+
 /// The orchestration layer wrapping the agent loop.
 pub struct AgentHarness<S: SessionStorage> {
     agent: Agent,
@@ -244,6 +250,23 @@ pub struct AgentHarness<S: SessionStorage> {
     /// standalone `Message` entry. Drives the real `first_kept_entry_id`
     /// recorded by `compact()`.
     message_entry_ids: Vec<Option<String>>,
+    /// The one-shot budget for overflow recovery: set when an overflow turn
+    /// was compacted and retried, cleared by a new user prompt or any
+    /// non-error assistant message. Mirrors the TS
+    /// `_overflowRecoveryAttempted` flag — a context that stays oversized
+    /// after one compact-and-retry surfaces its error instead of looping.
+    overflow_recovery_attempted: bool,
+    /// Every mounted tool, including ones the active selection currently
+    /// hides from the model. The agent receives only the active subset.
+    all_tools: Arc<[Arc<dyn crate::tool::AgentTool>]>,
+    /// The tool subset the model sees, from the latest explicit selection
+    /// (persisted as an `active_tools_change` entry); `None` mounts the full
+    /// set.
+    active_tool_names: Option<Vec<String>>,
+    /// Resolves the model reference a restored session path carries. The
+    /// crate stays registry-free, so the consumer plugs in its registry;
+    /// without one a restore keeps the construction-time model.
+    model_resolver: Option<ModelResolver>,
 }
 
 impl<S: SessionStorage> AgentHarness<S> {
@@ -280,12 +303,32 @@ impl<S: SessionStorage> AgentHarness<S> {
             hooks,
             stream_fn,
             message_entry_ids: Vec::new(),
+            overflow_recovery_attempted: false,
+            all_tools: Arc::from(Vec::new()),
+            active_tool_names: None,
+            model_resolver: None,
         }
     }
 
     /// Mount tools on the underlying agent.
-    pub fn with_tools(mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) -> Self {
-        self.agent.set_tools(tools);
+    ///
+    /// The harness keeps the full set; the agent receives only the active
+    /// subset (all of them until [`AgentHarness::set_active_tools`] narrows
+    /// the selection).
+    pub fn with_tools(mut self, tools: Arc<[Arc<dyn crate::tool::AgentTool>]>) -> Self {
+        self.all_tools = tools;
+        self.apply_active_tools();
+        self
+    }
+
+    /// Plug in the registry lookup used to resolve the model reference a
+    /// restored session carries. Without a resolver, restore keeps the
+    /// construction-time model.
+    pub fn with_model_resolver(
+        mut self,
+        resolver: impl Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync + 'static,
+    ) -> Self {
+        self.model_resolver = Some(Arc::new(resolver));
         self
     }
 
@@ -329,6 +372,69 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.compaction_settings = settings;
     }
 
+    /// The active tool subset; `None` when the full mounted set is in play.
+    pub fn active_tool_names(&self) -> Option<&[String]> {
+        self.active_tool_names.as_deref()
+    }
+
+    /// Switch the model the next turn runs against, persisting a
+    /// `model_change` entry so a later restore projects the same choice.
+    pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot set model while harness is in {:?} phase",
+                self.phase
+            );
+        }
+        self.session
+            .append_model_change(&model.provider, &model.id)
+            .await?;
+        self.agent.set_model(model.clone());
+        self.model = model;
+        Ok(())
+    }
+
+    /// Narrow the tools the model sees to a subset of the mounted set,
+    /// persisting an `active_tools_change` entry so a later restore projects
+    /// the same selection.
+    pub async fn set_active_tools(
+        &mut self,
+        active_tool_names: Vec<String>,
+    ) -> Result<(), anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot set active tools while harness is in {:?} phase",
+                self.phase
+            );
+        }
+        for name in &active_tool_names {
+            if !self.all_tools.iter().any(|t| t.name() == name) {
+                anyhow::bail!("Cannot activate unknown tool: {name}");
+            }
+        }
+        self.session
+            .append_active_tools_change(&active_tool_names)
+            .await?;
+        self.active_tool_names = Some(active_tool_names);
+        self.apply_active_tools();
+        Ok(())
+    }
+
+    /// Re-derive the agent's tool list from the mounted set and the active
+    /// selection. The full set mounts when no selection ever narrowed it.
+    fn apply_active_tools(&mut self) {
+        let tools: Vec<Arc<dyn crate::tool::AgentTool>> = match &self.active_tool_names {
+            Some(names) => self
+                .all_tools
+                .iter()
+                .filter(|t| names.iter().any(|n| n == t.name()))
+                .cloned()
+                .collect(),
+            None => self.all_tools.to_vec(),
+        };
+        self.agent.set_tools(tools.into());
+    }
+
     /// Register a hook handler.
     pub fn on(&mut self, hook: HookPoint, handler: HookHandler) {
         self.hooks.lock().unwrap().push((hook, handler));
@@ -349,12 +455,23 @@ impl<S: SessionStorage> AgentHarness<S> {
     ///
     /// Returns the messages produced during this turn. The messages are
     /// also persisted to the session.
+    ///
+    /// A turn that ends in a context-overflow error from the current model is
+    /// recovered in place: the failed turn's terminal message stays persisted
+    /// but leaves the transcript, the conversation is compacted, and the turn
+    /// is retried once from the compacted context. The recovery is one-shot
+    /// per error episode — a successful assistant message rearms it — so a
+    /// context that stays oversized after compaction surfaces its second
+    /// overflow error instead of looping. The returned messages include the
+    /// retry's output.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
         }
 
         self.phase = AgentHarnessPhase::Turn;
+        // A new user message rearms the one-shot overflow recovery.
+        self.overflow_recovery_attempted = false;
 
         // Run before-agent-start hooks. Their result steers the run: injected
         // messages extend the prompt batch after the user message, and a
@@ -392,36 +509,13 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         match result {
             Ok(messages) => {
-                // Persist messages to session, tracking the entry id of each
-                // so `compact()` can record the real first-kept entry.
-                let mut persist_result = Ok(());
-                for msg in &messages {
-                    match self.session.append_message(msg.clone()).await {
-                        Ok(id) => self.message_entry_ids.push(Some(id)),
-                        Err(e) => {
-                            persist_result = Err(e);
-                            break;
-                        }
-                    }
-                }
-
                 self.phase = AgentHarnessPhase::Idle;
-                if let Err(e) = persist_result {
-                    return Err(self.revert_transcript_after_persist_failure(e).await);
-                }
+                self.persist_turn_messages(&messages).await?;
+                self.note_run_outcome(&messages);
 
-                // Check if compaction is needed.
-                let context_tokens = self.estimate_current_tokens();
-                if compaction::should_compact(
-                    context_tokens,
-                    self.model.context_window as u64,
-                    &self.compaction_settings,
-                ) {
-                    // Compaction is needed — caller should invoke compact().
-                    // We don't auto-compact to avoid surprise latency.
-                }
-
-                Ok(messages)
+                let mut all_messages = messages;
+                all_messages.extend(self.run_overflow_recovery().await?);
+                Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
@@ -431,6 +525,10 @@ impl<S: SessionStorage> AgentHarness<S> {
     }
 
     /// Continue from the current transcript.
+    ///
+    /// The same one-shot overflow recovery as [`AgentHarness::prompt`]
+    /// applies: an overflow terminal from the current model is compacted and
+    /// retried once per error episode.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
@@ -441,26 +539,160 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         match result {
             Ok(messages) => {
-                let mut persist_result = Ok(());
-                for msg in &messages {
-                    match self.session.append_message(msg.clone()).await {
-                        Ok(id) => self.message_entry_ids.push(Some(id)),
-                        Err(e) => {
-                            persist_result = Err(e);
-                            break;
-                        }
-                    }
-                }
                 self.phase = AgentHarnessPhase::Idle;
-                if let Err(e) = persist_result {
-                    return Err(self.revert_transcript_after_persist_failure(e).await);
-                }
-                Ok(messages)
+                self.persist_turn_messages(&messages).await?;
+                self.note_run_outcome(&messages);
+
+                let mut all_messages = messages;
+                all_messages.extend(self.run_overflow_recovery().await?);
+                Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
                 Err(e)
             }
+        }
+    }
+
+    /// Persist a finished run's messages to the session, tracking the entry
+    /// id of each so [`AgentHarness::compact`] can record the real first-kept
+    /// entry. A mid-batch persistence failure reverts the transcript to the
+    /// persisted session before the error surfaces.
+    async fn persist_turn_messages(
+        &mut self,
+        messages: &[AgentMessage],
+    ) -> Result<(), anyhow::Error> {
+        for msg in messages {
+            match self.session.append_message(msg.clone()).await {
+                Ok(id) => self.message_entry_ids.push(Some(id)),
+                Err(e) => return Err(self.revert_transcript_after_persist_failure(e).await),
+            }
+        }
+        Ok(())
+    }
+
+    /// Rearm the one-shot overflow recovery when a run produced any
+    /// non-error assistant message — the recovery budget applies per error
+    /// episode, and a completed assistant reply ends the episode.
+    fn note_run_outcome(&mut self, messages: &[AgentMessage]) {
+        let succeeded = messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::Assistant { stop_reason, .. } if *stop_reason != Some(StopReason::Error)
+            )
+        });
+        if succeeded {
+            self.overflow_recovery_attempted = false;
+        }
+    }
+
+    /// Drive the overflow → compact → retry loop after a finished run.
+    ///
+    /// Each iteration inspects the transcript's last message; a retryable
+    /// overflow runs one compact-and-retry and the loop re-examines the
+    /// retry's outcome, so a second overflow (recovery budget spent) or a
+    /// clean reply ends the loop. Returns every message the retry turns
+    /// produced, oldest first.
+    async fn run_overflow_recovery(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        let mut produced = Vec::new();
+        while let Some(retry_messages) = self.recover_overflow_once().await? {
+            self.persist_turn_messages(&retry_messages).await?;
+            self.note_run_outcome(&retry_messages);
+            produced.extend(retry_messages);
+        }
+        Ok(produced)
+    }
+
+    /// One overflow recovery step over the finished run.
+    ///
+    /// Returns `None` when the transcript does not end in a recoverable
+    /// overflow — including the terminal states TS settles on: a context
+    /// compaction cannot shrink further ([`compaction::NothingToCompact`]),
+    /// or the recovery budget for this error episode is already spent.
+    /// Otherwise drops the failed turn's terminal message from the
+    /// transcript (it stays persisted, mirroring TS), compacts, runs one
+    /// retry turn, and returns the retry's messages.
+    async fn recover_overflow_once(&mut self) -> Result<Option<Vec<AgentMessage>>, anyhow::Error> {
+        let Some(will_retry) = self.overflow_will_retry() else {
+            return Ok(None);
+        };
+
+        if !will_retry {
+            // A completed answer that silently exceeded the window: compact
+            // for the next turn. The turn itself cannot be retried — the
+            // transcript ends on its assistant reply, which `continue_`
+            // refuses.
+            return match self.compact(None).await {
+                Ok(_) => Ok(None),
+                Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => Ok(None),
+                Err(e) => Err(e),
+            };
+        }
+
+        if self.overflow_recovery_attempted {
+            return Ok(None);
+        }
+        self.overflow_recovery_attempted = true;
+
+        // The failed turn's terminal message must not reach the retry's
+        // context; the session keeps it for history.
+        let mut messages = self.agent.state().messages.clone();
+        debug_assert!(
+            matches!(messages.last(), Some(AgentMessage::Assistant { .. })),
+            "overflow check passed on the last message"
+        );
+        messages.pop();
+        self.agent.replace_transcript(messages);
+        self.message_entry_ids.pop();
+
+        match self.compact(None).await {
+            Ok(_) => {}
+            Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+
+        self.phase = AgentHarnessPhase::Turn;
+        let result = self.agent.continue_().await;
+        self.phase = AgentHarnessPhase::Idle;
+        Ok(Some(result?))
+    }
+
+    /// Whether the transcript's last message is a context overflow from the
+    /// current model, and whether the turn may be retried after compaction.
+    ///
+    /// The guards mirror TS: an aborted message never triggers recovery, an
+    /// error attributed to a different model is not this model's overflow,
+    /// and a message recorded at or before the latest compaction measured a
+    /// context that no longer exists. A completed (`Stop`) answer compacts
+    /// but cannot retry.
+    fn overflow_will_retry(&self) -> Option<bool> {
+        let message = self.agent.state().messages.last()?;
+        let AgentMessage::Assistant {
+            stop_reason,
+            provider,
+            model,
+            timestamp,
+            ..
+        } = message
+        else {
+            return None;
+        };
+        if *stop_reason == Some(StopReason::Aborted) {
+            return None;
+        }
+        if provider != &self.model.provider || model != &self.model.id {
+            return None;
+        }
+        if self.last_compaction_at.is_some_and(|at| timestamp <= &at) {
+            return None;
+        }
+        if crate::provider::overflow::is_context_overflow(message, self.model.context_window as u64)
+        {
+            Some(*stop_reason != Some(StopReason::Stop))
+        } else {
+            None
         }
     }
 
@@ -495,16 +727,26 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// branch/compaction summaries as their tagged user-text carriers. The
     /// kept segment behind a compaction boundary is reconstructed by walking
     /// the tree from its `first_kept_entry_id`, never from the boundary
-    /// itself. The reasoning tier the path carries is applied to the agent;
-    /// the model the path carries is reported by the session context but not
-    /// applied — resolving it needs the provider registry, which lives at the
-    /// facade layer. The compaction boundary used by token estimation is
+    /// itself. The reasoning tier the path carries is applied to the agent,
+    /// the active tool selection narrows the mounted set, and the model the
+    /// path carries is applied when a model resolver is plugged in —
+    /// resolving it needs the provider registry, which lives at the facade
+    /// layer. Restore never appends entries: the session already records
+    /// these choices. The compaction boundary used by token estimation is
     /// recovered alongside.
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
         let context = self.session.build_session_context().await?;
         self.agent.reset();
         self.agent.replace_transcript(context.messages);
         self.agent.set_thinking_level(context.thinking_level);
+        self.active_tool_names = context.active_tool_names;
+        self.apply_active_tools();
+        if let (Some(resolver), Some(model_ref)) = (&self.model_resolver, &context.model)
+            && let Some(model) = resolver(model_ref)
+        {
+            self.agent.set_model(model.clone());
+            self.model = model;
+        }
         self.message_entry_ids = context.message_entry_ids;
         self.recover_boundary().await?;
         Ok(())
@@ -574,6 +816,12 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// [`BeforeCompactOverride`] persisted verbatim. `custom_instructions`
     /// mirrors the TS `compact(customInstructions?)` argument and is surfaced
     /// on the hook event.
+    ///
+    /// A transcript whose summarizable range is empty — everything fits in the
+    /// keep-recent window, or is already folded into the latest boundary's
+    /// summary — is refused with [`compaction::NothingToCompact`] before the
+    /// phase changes, any hook fires, or the model is called; the session and
+    /// transcript stay untouched.
     pub async fn compact(
         &mut self,
         custom_instructions: Option<&str>,
@@ -585,18 +833,10 @@ impl<S: SessionStorage> AgentHarness<S> {
             anyhow::bail!("Cannot compact an empty transcript");
         }
 
-        self.phase = AgentHarnessPhase::Compaction;
-
         // The session branch the harness is compacting — the same entries TS
         // exposes as `branchEntries` on the `session_before_compact` event:
         // the full path to the root, across compaction boundaries.
-        let branch_entries = match self.session.get_branch().await {
-            Ok(entries) => entries,
-            Err(e) => {
-                self.phase = AgentHarnessPhase::Idle;
-                return Err(e);
-            }
-        };
+        let branch_entries = self.session.get_branch().await?;
 
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
@@ -605,20 +845,30 @@ impl<S: SessionStorage> AgentHarness<S> {
         let kept = &messages[cut_point..];
         let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
 
-        // The hook fires after the cut analysis — mirroring TS, which prepares
-        // the compaction then emits the event with `preparation` +
-        // `branchEntries` — so the handler decides on the specific content.
-        // The typed event carries the full TS `CompactionPreparation`
-        // (split-turn is always false here) plus the session branch and custom
-        // instructions, rather than a trimmed ad-hoc payload.
-        let preparation = compaction::build_preparation(
+        // The preparation doubles as the emptiness guard: an empty
+        // summarizable range is refused here — before the phase change, the
+        // hook, and the model call — mirroring TS, where `prepareCompaction`
+        // returning `undefined` ends the attempt with "Nothing to compact".
+        let preparation = match compaction::build_preparation(
             &branch_entries,
             &messages,
             cut_point,
             first_kept_entry_id.clone(),
             tokens_before,
             &self.compaction_settings,
-        );
+        ) {
+            Some(p) => p,
+            None => return Err(compaction::NothingToCompact.into()),
+        };
+
+        self.phase = AgentHarnessPhase::Compaction;
+
+        // The hook fires after the cut analysis — mirroring TS, which prepares
+        // the compaction then emits the event with `preparation` +
+        // `branchEntries` — so the handler decides on the specific content.
+        // The typed event carries the full TS `CompactionPreparation`
+        // (split-turn is always false here) plus the session branch and custom
+        // instructions, rather than a trimmed ad-hoc payload.
         let event = SessionBeforeCompactEvent {
             kind: "session_before_compact",
             preparation: &preparation,
@@ -865,7 +1115,9 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Build a compaction prompt for the current conversation.
     ///
     /// Returns the prompt that should be sent to the LLM to generate a
-    /// summary, along with the cut point index.
+    /// summary, along with the cut point index. `None` when the summarizable
+    /// range is empty — everything fits in the keep-recent window, or only
+    /// the leading summary carrier would be cut.
     pub fn build_compaction_prompt(&self) -> Option<(String, usize)> {
         let messages = self.agent.state().messages.clone();
         if messages.is_empty() {
@@ -875,11 +1127,18 @@ impl<S: SessionStorage> AgentHarness<S> {
         let cut_point =
             compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
 
-        if cut_point == 0 {
+        // A leading compaction-summary carrier is folded into the
+        // summarization as `previous_summary`, never re-summarized — the same
+        // exclusion `build_preparation` derives from the session branch.
+        let start = usize::from(messages.first().is_some_and(|m| {
+            matches!(m, AgentMessage::User { content, .. }
+                if matches!(content.first(), Some(ContentBlock::Text { text, .. }) if text.starts_with(crate::session::COMPACTION_SUMMARY_PREFIX)))
+        }));
+        if cut_point <= start {
             return None; // Nothing to compact.
         }
 
-        let compacted = &messages[..cut_point];
+        let compacted = &messages[start..cut_point];
         let prompt = compaction::build_compaction_prompt(compacted, None, None);
         Some((prompt, cut_point))
     }
@@ -1090,6 +1349,72 @@ mod tests {
         }
     }
 
+    /// The model a session `model_change` resolves to in tests, distinct
+    /// from [`test_model`] so a restore's model application is observable.
+    fn resolved_model() -> Model {
+        Model {
+            provider: "anthropic".into(),
+            id: "claude-opus".into(),
+            context_window: 200_000,
+            max_tokens: 16_384,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// A resolver for the `anthropic/claude-opus` reference the test
+    /// sessions carry.
+    fn test_model_resolver()
+    -> impl Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync + 'static {
+        |mref: &crate::session::SessionModelRef| {
+            (mref.provider == "anthropic" && mref.model_id == "claude-opus").then(resolved_model)
+        }
+    }
+
+    /// A transcript `find_cut_point` splits mid-way under
+    /// [`compact_test_settings`]: four messages of ~100 estimated tokens
+    /// each, so the 150-token keep-recent budget retains only the trailing
+    /// assistant and leaves a three-message prefix to summarize. The
+    /// assistants' 90_000-token usage anchors `needs_compaction` against the
+    /// 100_000-token test model.
+    fn compactable_transcript() -> Vec<AgentMessage> {
+        let long = "x".repeat(400);
+        let assistant = |text: String| AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text,
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        vec![
+            AgentMessage::user(long.clone()),
+            assistant(long.clone()),
+            AgentMessage::user(long.clone()),
+            assistant(long),
+        ]
+    }
+
+    /// The keep-recent budget that cuts [`compactable_transcript`] after the
+    /// second user message.
+    fn compact_test_settings() -> CompactionSettings {
+        CompactionSettings {
+            keep_recent_tokens: 150,
+            ..Default::default()
+        }
+    }
+
     // In-memory session storage for testing.
     struct MemStorage {
         entries: std::sync::Mutex<Vec<SessionTreeEntry>>,
@@ -1260,26 +1585,10 @@ mod tests {
             Arc::new(TestStreamFn),
         );
 
-        // An assistant whose usage exceeds the threshold anchors the estimate.
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
         assert!(harness.needs_compaction());
 
         // After compaction the retained usage measured a different prefix, so
@@ -1309,25 +1618,10 @@ mod tests {
             Arc::new(TestStreamFn),
         );
 
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
         assert!(harness.needs_compaction());
 
         let before = *harness.session().storage().append_calls.lock().unwrap();
@@ -1353,6 +1647,494 @@ mod tests {
         assert_eq!(leaf, compaction_id);
     }
 
+    /// A transcript that fits inside the keep-recent window has nothing to
+    /// summarize: compact refuses with [`compaction::NothingToCompact`]
+    /// before the phase changes, any hook fires, or the model is called, and
+    /// nothing persists. Mirrors TS `prepareCompaction` returning `undefined`.
+    #[tokio::test]
+    async fn test_compact_refuses_when_nothing_to_summarize() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingStreamFn {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl StreamFn for CountingStreamFn {
+            async fn stream(
+                &self,
+                _context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "MUST NOT BE CALLED".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CountingStreamFn {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        // Two short messages fit the default keep-recent window whole.
+        harness.prompt("hello").await.unwrap();
+        // The prompt turn consumed one stream call; only compaction's own
+        // summarization would add another.
+        calls.store(0, Ordering::SeqCst);
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        harness.on(HookPoint::SessionBeforeCompact, {
+            let hook_calls = Arc::clone(&hook_calls);
+            Arc::new(move |ctx: HookContext| {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                ctx
+            })
+        });
+
+        let err = harness.compact(None).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<compaction::NothingToCompact>().is_some(),
+            "typed refusal, got: {err:#}"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 0, "no hook fired");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no model call");
+        assert!(
+            harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| !matches!(e, SessionTreeEntry::Compaction { .. })),
+            "no compaction entry persisted"
+        );
+        // The transcript is untouched.
+        assert_eq!(harness.agent().state().messages.len(), 2);
+    }
+
+    /// After a compaction, a transcript of summary carrier + retained tail
+    /// that still fits the keep-recent window is refused too: the carrier is
+    /// folded in as `previous_summary`, never re-summarized, so the
+    /// summarizable range is empty.
+    #[tokio::test]
+    async fn test_compact_refuses_when_only_summary_carrier_would_be_cut() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness
+            .agent_mut()
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
+        harness.compact(None).await.unwrap();
+
+        // The post-compaction transcript (summary + one retained assistant)
+        // fits the window: a second compact finds nothing new to summarize.
+        let err = harness.compact(None).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<compaction::NothingToCompact>().is_some(),
+            "typed refusal, got: {err:#}"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+        assert_eq!(harness.agent().state().messages.len(), 2);
+    }
+
+    /// A stream fn playing a scripted sequence of conversation outcomes.
+    /// The summarization call — recognized by its system prompt — bypasses
+    /// the script and always succeeds with a fixed summary.
+    struct ScriptedStreamFn {
+        script: std::sync::Mutex<std::collections::VecDeque<ScriptedTurn>>,
+        summaries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    enum ScriptedTurn {
+        /// A completed assistant reply whose text is `0`-repeated `x` bytes.
+        Answer(usize),
+        /// A provider failure classified as context overflow.
+        OverflowError,
+        /// An overflow terminal stamped with a different model's identity.
+        ForeignModelOverflow,
+    }
+
+    impl ScriptedStreamFn {
+        fn new(script: Vec<ScriptedTurn>) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                ScriptedStreamFn {
+                    script: std::sync::Mutex::new(script.into()),
+                    summaries: Arc::clone(&summaries),
+                },
+                summaries,
+            )
+        }
+    }
+
+    fn scripted_assistant(text: String, provider: &str, model: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text,
+                signature: None,
+            }],
+            model: model.into(),
+            provider: provider.into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ScriptedStreamFn {
+        async fn stream(
+            &self,
+            context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            if context.system_prompt == compaction::SUMMARIZATION_SYSTEM_PROMPT {
+                self.summaries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(scripted_assistant("summary".into(), "test", "test"));
+            }
+            match self.script.lock().unwrap().pop_front() {
+                Some(ScriptedTurn::Answer(len)) => {
+                    Ok(scripted_assistant("x".repeat(len), "test", "test"))
+                }
+                Some(ScriptedTurn::OverflowError) => Err(anyhow::anyhow!(
+                    "http 400: prompt is too long: 213462 tokens > 200000 maximum"
+                )),
+                Some(ScriptedTurn::ForeignModelOverflow) => Ok(AgentMessage::Assistant {
+                    content: Vec::new(),
+                    model: "other".into(),
+                    provider: "other".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Error),
+                    usage: Box::new(Usage::default()),
+                    error_message: Some(
+                        "prompt is too long: 213462 tokens > 200000 maximum".into(),
+                    ),
+                    timestamp: chrono::Utc::now(),
+                }),
+                None => panic!("script exhausted"),
+            }
+        }
+    }
+
+    async fn compaction_entries(harness: &AgentHarness<MemStorage>) -> Vec<SessionTreeEntry> {
+        harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .expect("entries")
+            .into_iter()
+            .filter(|e| matches!(e, SessionTreeEntry::Compaction { .. }))
+            .collect()
+    }
+
+    /// The core closed loop: a turn ending in a context overflow drops its
+    /// terminal message from the transcript, compacts, and retries once —
+    /// the session keeps the failed turn for history.
+    #[tokio::test]
+    async fn test_overflow_compacts_and_retries() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::OverflowError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        // The failed turn's output plus the retry's reply are returned
+        // together: user, overflow terminal, recovered assistant.
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &messages[2],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Stop),
+                ..
+            }
+        ));
+
+        // The transcript holds no error: summary carrier, retained prompt,
+        // recovered reply.
+        let transcript = &harness.agent().state().messages;
+        assert_eq!(transcript.len(), 3, "{transcript:?}");
+        assert!(
+            transcript.iter().all(|m| !matches!(
+                m,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                }
+            )),
+            "the failed terminal left the transcript: {transcript:?}"
+        );
+
+        // The session keeps the failed turn and exactly one boundary.
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::Message {
+                    message: AgentMessage::Assistant {
+                        stop_reason: Some(StopReason::Error),
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "the overflow error stays persisted: {entries:?}"
+        );
+        assert_eq!(compaction_entries(&harness).await.len(), 1);
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The recovery budget is one-shot per error episode: when the retry
+    /// overflows again, the second error surfaces instead of another
+    /// compact-and-retry.
+    #[tokio::test]
+    async fn test_overflow_recovery_is_one_shot() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::OverflowError,
+            ScriptedTurn::OverflowError,
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        // Both overflow terminals are returned; no third conversation call
+        // happened (the script held exactly two overflow entries).
+        assert!(
+            matches!(
+                messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                })
+            ),
+            "{messages:?}"
+        );
+        assert_eq!(compaction_entries(&harness).await.len(), 1);
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                harness.agent().state().messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                })
+            ),
+            "the second overflow error stands"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    /// A successful retry rearms the recovery budget: a later overflow gets
+    /// its own compact-and-retry.
+    #[tokio::test]
+    async fn test_overflow_recovery_rearms_after_success() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::OverflowError,
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::OverflowError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        harness.prompt("second").await.unwrap();
+        let messages = harness.prompt("third").await.unwrap();
+        assert!(
+            matches!(
+                messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Stop),
+                    ..
+                })
+            ),
+            "the second episode recovered too: {messages:?}"
+        );
+        assert_eq!(compaction_entries(&harness).await.len(), 2);
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            harness.agent().state().messages.iter().all(|m| !matches!(
+                m,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                }
+            )),
+            "no error survives in the transcript"
+        );
+    }
+
+    /// An overflow with nothing summarizable cannot shrink the context: the
+    /// failed terminal leaves the transcript, no boundary is persisted, and
+    /// no retry runs.
+    #[tokio::test]
+    async fn test_overflow_without_summarizable_range_surfaces_error() {
+        let (stream_fn, summaries) =
+            ScriptedStreamFn::new(vec![ScriptedTurn::Answer(8), ScriptedTurn::OverflowError]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        let messages = harness.prompt("second").await.unwrap();
+        assert!(
+            matches!(
+                messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                })
+            ),
+            "{messages:?}"
+        );
+        assert!(compaction_entries(&harness).await.is_empty());
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The failed terminal left the transcript (the session keeps it);
+        // the transcript ends on the second prompt.
+        let transcript = &harness.agent().state().messages;
+        assert!(matches!(transcript.last(), Some(AgentMessage::User { .. })));
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    /// An overflow terminal attributed to a different model is not this
+    /// model's error to recover: no compaction, no retry.
+    #[tokio::test]
+    async fn test_overflow_from_other_model_is_not_recovered() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::ForeignModelOverflow,
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+        let messages = harness.prompt("second").await.unwrap();
+        assert!(
+            matches!(
+                messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                })
+            ),
+            "{messages:?}"
+        );
+        assert!(compaction_entries(&harness).await.is_empty());
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The foreign error message stays in the transcript.
+        assert!(
+            matches!(
+                harness.agent().state().messages.last(),
+                Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                })
+            ),
+            "the untouched error stands"
+        );
+    }
+
     /// A failed summarization (Error/Aborted terminal, or an empty summary)
     /// must not persist a compaction entry nor rewrite the transcript — the
     /// compacted prefix would otherwise be replaced with nothing and lost.
@@ -1367,25 +2149,10 @@ mod tests {
             Arc::new(AbortedSummaryStreamFn),
         );
 
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
         assert!(harness.needs_compaction());
 
         let entries_before = harness
@@ -1433,25 +2200,10 @@ mod tests {
             test_model(),
             Arc::new(TestStreamFn),
         );
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
         let entries_before = harness
             .session()
             .storage()
@@ -1480,7 +2232,7 @@ mod tests {
             entries_before
         );
         // The transcript is untouched.
-        assert_eq!(harness.agent_mut().state().messages.len(), 2);
+        assert_eq!(harness.agent_mut().state().messages.len(), 4);
     }
 
     /// A `SessionBeforeCompact` hook can supply the summary directly: the
@@ -1532,25 +2284,10 @@ mod tests {
                 calls: Arc::clone(&calls),
             }),
         );
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
 
         harness.on(
             HookPoint::SessionBeforeCompact,
@@ -2006,25 +2743,10 @@ mod tests {
             test_model(),
             Arc::new(TestStreamFn),
         );
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
         let entries_before = harness
             .session()
             .storage()
@@ -2061,7 +2783,7 @@ mod tests {
                 .len(),
             entries_before
         );
-        assert_eq!(harness.agent_mut().state().messages.len(), 2);
+        assert_eq!(harness.agent_mut().state().messages.len(), 4);
     }
 
     /// A hook that overrides only the summary keeps the harness-computed tail
@@ -2142,25 +2864,10 @@ mod tests {
             test_model(),
             Arc::new(ChattyStreamFn),
         );
-        let assistant = AgentMessage::Assistant {
-            content: vec![],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
         harness
             .agent_mut()
-            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
 
         let result = harness
             .compact(None)
@@ -2213,7 +2920,8 @@ mod tests {
             );
             harness
                 .agent_mut()
-                .replace_transcript(vec![AgentMessage::user("q"), stale_assistant.clone()]);
+                .replace_transcript(compactable_transcript());
+            harness.set_compaction_settings(compact_test_settings());
             let result = harness.compact(None).await.unwrap();
             assert_eq!(result.tokens_before, 90_000);
         }
@@ -2280,7 +2988,10 @@ mod tests {
             metadata: None,
         };
 
-        // Run a turn, compact, run another turn — all over an on-disk session.
+        // Run a turn, compact, run another turn — all over an on-disk
+        // session. The first prompt is long and the keep-recent budget
+        // narrow, so the cut retains only the first turn's assistant reply:
+        // the post-compaction transcript is summary + assistant.
         let expected;
         {
             let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
@@ -2293,7 +3004,11 @@ mod tests {
                 test_model(),
                 Arc::new(TestStreamFn),
             );
-            harness.prompt("first").await.unwrap();
+            harness.set_compaction_settings(CompactionSettings {
+                keep_recent_tokens: 100,
+                ..Default::default()
+            });
+            harness.prompt(&"f".repeat(2048)).await.unwrap();
             harness.compact(None).await.unwrap();
             harness.prompt("second").await.unwrap();
             expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
@@ -2325,15 +3040,14 @@ mod tests {
             }
         }
         let messages = &harness.agent().state().messages;
-        assert_eq!(messages.len(), 5, "{messages:?}");
+        assert_eq!(messages.len(), 4, "{messages:?}");
         assert_eq!(
             text_of(&messages[0]),
             "The conversation history before this point was compacted into the following summary:\n\n<summary>\nTest response\n</summary>"
         );
-        assert_eq!(text_of(&messages[1]), "first");
-        assert!(matches!(&messages[2], AgentMessage::Assistant { .. }));
-        assert_eq!(text_of(&messages[3]), "second");
-        assert!(matches!(&messages[4], AgentMessage::Assistant { .. }));
+        assert!(matches!(&messages[1], AgentMessage::Assistant { .. }));
+        assert_eq!(text_of(&messages[2]), "second");
+        assert!(matches!(&messages[3], AgentMessage::Assistant { .. }));
 
         // The restored transcript equals the post-compaction one exactly,
         // summary timestamp included.
@@ -2389,25 +3103,10 @@ mod tests {
                     })
                 }),
             );
-            let assistant = AgentMessage::Assistant {
-                content: vec![],
-                model: "test".into(),
-                provider: "test".into(),
-                api: "test".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                stop_reason: Some(StopReason::Stop),
-                usage: Box::new(Usage {
-                    total_tokens: 90_000,
-                    ..Default::default()
-                }),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            };
             harness
                 .agent_mut()
-                .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+                .replace_transcript(compactable_transcript());
+            harness.set_compaction_settings(compact_test_settings());
             harness.compact(None).await.unwrap();
             expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
         }
@@ -2433,8 +3132,10 @@ mod tests {
     }
 
     /// Restore projects every message-producing entry variant — messages,
-    /// custom messages, branch summaries — and applies the reasoning tier the
-    /// path carries. Display/state entries stay out of the transcript.
+    /// custom messages, branch summaries — and replays the run configuration
+    /// the path carries (reasoning tier, model, active tools) without
+    /// appending new entries. Display/state entries stay out of the
+    /// transcript.
     #[tokio::test]
     async fn test_restore_projects_all_entry_variants_and_settings() {
         let storage = MemStorage::new();
@@ -2506,13 +3207,24 @@ mod tests {
             })
             .await
             .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::ActiveToolsChange {
+                id: "at1".into(),
+                parent_id: Some("m2".into()),
+                timestamp: chrono::Utc::now(),
+                active_tool_names: vec!["echo".into()],
+            })
+            .await
+            .unwrap();
 
         let mut harness = AgentHarness::new(
             session,
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
-        );
+        )
+        .with_tools(two_tools())
+        .with_model_resolver(test_model_resolver());
         harness.restore().await.unwrap();
 
         let messages = &harness.agent().state().messages;
@@ -2541,12 +3253,159 @@ mod tests {
         }
         assert!(matches!(&messages[3], AgentMessage::User { .. }));
 
-        // The reasoning tier on the path reaches the agent; the model stays
-        // untouched (resolving it is the facade layer's job).
+        // The reasoning tier on the path reaches the agent, the resolver
+        // swaps in the session's model, and the active-tool selection narrows
+        // the mounted set — restore replays the run configuration without
+        // appending anything.
         assert_eq!(
             harness.agent().state().thinking_level.as_deref(),
             Some("high")
         );
+        assert_eq!(harness.model().id, "claude-opus");
+        assert_eq!(harness.agent().state().model.id, "claude-opus");
+        assert_eq!(mounted_names(&harness), ["echo"]);
+        assert_eq!(harness.active_tool_names(), Some(&["echo".to_string()][..]));
+        let entry_count = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        harness.restore().await.unwrap();
+        assert_eq!(
+            harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .len(),
+            entry_count
+        );
+    }
+
+    /// Without a resolver the session's model reference is unresolvable, so
+    /// restore keeps the construction-time model.
+    #[tokio::test]
+    async fn test_restore_without_resolver_keeps_construction_model() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        session
+            .storage()
+            .append_entry(&SessionTreeEntry::ModelChange {
+                id: "mc".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                provider: "anthropic".into(),
+                model_id: "claude-opus".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.restore().await.unwrap();
+        assert_eq!(harness.model().id, "test");
+        assert_eq!(harness.agent().state().model.id, "test");
+    }
+
+    /// `set_model` persists a `model_change` entry, and a restore replays it
+    /// through the resolver even after the in-memory model was scrambled.
+    #[tokio::test]
+    async fn test_set_model_persists_and_replays() {
+        let session = Session::new(MemStorage::new());
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_model_resolver(test_model_resolver());
+
+        harness.set_model(resolved_model()).await.unwrap();
+        assert_eq!(harness.model().id, "claude-opus");
+        assert_eq!(harness.agent().state().model.id, "claude-opus");
+
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        match entries.last() {
+            Some(SessionTreeEntry::ModelChange {
+                provider, model_id, ..
+            }) => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model_id, "claude-opus");
+            }
+            other => panic!("expected a trailing ModelChange, got {other:?}"),
+        }
+
+        // Scramble the in-memory model; restore replays the persisted choice.
+        harness.agent_mut().set_model(test_model());
+        harness.restore().await.unwrap();
+        assert_eq!(harness.model().id, "claude-opus");
+        assert_eq!(harness.agent().state().model.id, "claude-opus");
+    }
+
+    /// `set_active_tools` rejects names outside the mounted set, filters the
+    /// agent's tools, persists an `active_tools_change` entry, and a restore
+    /// replays the selection after the in-memory set was scrambled.
+    #[tokio::test]
+    async fn test_set_active_tools_validates_filters_and_replays() {
+        let session = Session::new(MemStorage::new());
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_tools(two_tools());
+        assert_eq!(mounted_names(&harness), ["echo", "other"]);
+
+        // An unknown name is refused and persists nothing.
+        let before = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        let err = harness
+            .set_active_tools(vec!["bogus".to_string()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err:?}");
+        assert_eq!(
+            harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+        assert_eq!(mounted_names(&harness), ["echo", "other"]);
+
+        harness
+            .set_active_tools(vec!["echo".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(mounted_names(&harness), ["echo"]);
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        match entries.last() {
+            Some(SessionTreeEntry::ActiveToolsChange {
+                active_tool_names, ..
+            }) => assert_eq!(active_tool_names, &["echo".to_string()]),
+            other => panic!("expected a trailing ActiveToolsChange, got {other:?}"),
+        }
+
+        // Scramble the in-memory tool list; restore replays the selection.
+        harness.agent_mut().set_tools(two_tools());
+        harness.restore().await.unwrap();
+        assert_eq!(mounted_names(&harness), ["echo"]);
     }
 
     #[tokio::test]
@@ -2690,6 +3549,50 @@ mod tests {
         }
     }
 
+    // A tool whose only distinguishing feature is its name, for exercising
+    // the active-tool filter.
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "named"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            _ctx: &dyn crate::tool::ToolContext,
+        ) -> Result<crate::tool::AgentToolResult, crate::tool::ToolError> {
+            Ok(crate::tool::AgentToolResult::text("ok"))
+        }
+    }
+
+    /// The two-tool mounted set used by active-tool tests: `echo` plus a
+    /// second name to filter away.
+    fn two_tools() -> Arc<[Arc<dyn crate::tool::AgentTool>]> {
+        Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>,
+            Arc::new(NamedTool("other")),
+        ])
+    }
+
+    fn mounted_names(harness: &AgentHarness<MemStorage>) -> Vec<String> {
+        harness
+            .agent()
+            .tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
     // A stream fn that issues one tool call then stops, so a single prompt
     // drives a full tool-execution round through the harness.
     struct ToolUseStreamFn {
@@ -2788,7 +3691,7 @@ mod tests {
             }),
         )
         .with_tools(Arc::from(vec![
-            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
         ]));
 
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2907,7 +3810,7 @@ mod tests {
             }),
         )
         .with_tools(Arc::from(vec![
-            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
         ]));
 
         // Block every tool call with a reason.
@@ -2938,7 +3841,7 @@ mod tests {
             }),
         )
         .with_tools(Arc::from(vec![
-            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
         ]));
 
         // Replace whatever the tool produced with a fixed patched payload.

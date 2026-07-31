@@ -66,15 +66,15 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn default_tools() -> Arc<[Box<dyn AgentTool>]> {
+fn default_tools() -> Arc<[Arc<dyn AgentTool>]> {
     Arc::from(vec![
-        Box::new(ReadTool) as Box<dyn AgentTool>,
-        Box::new(WriteTool),
-        Box::new(EditTool),
-        Box::new(BashTool::new(None)),
-        Box::new(GrepTool),
-        Box::new(FindTool),
-        Box::new(LsTool),
+        Arc::new(ReadTool) as Arc<dyn AgentTool>,
+        Arc::new(WriteTool),
+        Arc::new(EditTool),
+        Arc::new(BashTool::new(None)),
+        Arc::new(GrepTool),
+        Arc::new(FindTool),
+        Arc::new(LsTool),
     ])
 }
 

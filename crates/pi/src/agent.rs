@@ -169,7 +169,7 @@ pub struct Agent {
     next_listener_id: Arc<AtomicU64>,
     stream_fn: Arc<dyn StreamFn>,
     /// Tools mounted on the agent and forwarded into each turn's context.
-    tools: Arc<[Box<dyn crate::tool::AgentTool>]>,
+    tools: Arc<[Arc<dyn crate::tool::AgentTool>]>,
     /// Session-scoped execution context for tool calls. Backs the real
     /// `ToolContext` (env + cwd + tool state) so tools reach the filesystem
     /// and shell instead of panicking.
@@ -213,14 +213,19 @@ impl Agent {
 
     /// Mount tools on the agent. They are forwarded into each turn's context
     /// so the provider sees them and `execute_tool_calls` can dispatch.
-    pub fn with_tools(mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) -> Self {
+    pub fn with_tools(mut self, tools: Arc<[Arc<dyn crate::tool::AgentTool>]>) -> Self {
         self.tools = tools;
         self
     }
 
     /// Replace the mounted tools.
-    pub fn set_tools(&mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) {
+    pub fn set_tools(&mut self, tools: Arc<[Arc<dyn crate::tool::AgentTool>]>) {
         self.tools = tools;
+    }
+
+    /// The tools currently forwarded into each turn's context.
+    pub fn tools(&self) -> &[Arc<dyn crate::tool::AgentTool>] {
+        &self.tools
     }
 
     /// Set the session identifier forwarded to providers for cache-aware
@@ -249,6 +254,11 @@ impl Agent {
     /// Replace the system prompt the next turn's context snapshot carries.
     pub fn set_system_prompt(&mut self, system_prompt: impl Into<String>) {
         self.state.system_prompt = system_prompt.into();
+    }
+
+    /// Replace the model the next turn runs against.
+    pub fn set_model(&mut self, model: crate::types::Model) {
+        self.state.model = model;
     }
 
     /// Current agent state.
@@ -1373,7 +1383,7 @@ mod tests {
             test_tool_ctx(),
         )
         .with_tools(Arc::from(vec![
-            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
         ]));
 
         let log = Arc::new(Mutex::new(Vec::new()));

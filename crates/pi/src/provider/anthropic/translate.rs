@@ -621,8 +621,8 @@ mod tests {
             None,
         );
         c.tools = Arc::from(vec![
-            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>,
-            Box::new(NamedTool("b")) as Box<dyn crate::tool::AgentTool>,
+            Arc::new(NamedTool("a")) as Arc<dyn crate::tool::AgentTool>,
+            Arc::new(NamedTool("b")) as Arc<dyn crate::tool::AgentTool>,
         ]);
         let req = to_request(&c, &StreamOptions::default());
         // No explicit option: the model's own max_tokens is the default.
@@ -667,7 +667,7 @@ mod tests {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::None;
         c.tools = Arc::from(vec![
-            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+            Arc::new(NamedTool("a")) as Arc<dyn crate::tool::AgentTool>
         ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
@@ -685,7 +685,7 @@ mod tests {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::Long;
         c.tools = Arc::from(vec![
-            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+            Arc::new(NamedTool("a")) as Arc<dyn crate::tool::AgentTool>
         ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();

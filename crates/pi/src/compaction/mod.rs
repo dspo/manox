@@ -577,9 +577,11 @@ pub fn build_compaction_prompt(
 /// `previous_summary`, and file operations are extracted from the summarized
 /// region plus that boundary's recorded file lists.
 ///
-/// Split-turn is not implemented (see [`CompactionPreparation`]); the cut stays
-/// on a whole-turn boundary, so `turn_prefix_messages` is empty and
-/// `is_split_turn` is false.
+/// Returns `None` when nothing would be summarized — mirroring TS
+/// `prepareCompaction` returning `undefined`, which the session layer answers
+/// with "Nothing to compact". Split-turn is not implemented (see
+/// [`CompactionPreparation`]); the cut stays on a whole-turn boundary, so
+/// `turn_prefix_messages` is empty and `is_split_turn` is false.
 pub fn build_preparation(
     branch: &[SessionTreeEntry],
     messages: &[AgentMessage],
@@ -587,7 +589,7 @@ pub fn build_preparation(
     first_kept_entry_id: Option<String>,
     tokens_before: u64,
     settings: &CompactionSettings,
-) -> CompactionPreparation {
+) -> Option<CompactionPreparation> {
     // The latest compaction on the path bounds the active context; its
     // summary is the `previousSummary` the summarization folds in. That
     // summary also lives in the transcript as the leading synthetic carrier
@@ -605,11 +607,14 @@ pub fn build_preparation(
         .get(start..end)
         .map(|s| s.to_vec())
         .unwrap_or_default();
+    if messages_to_summarize.is_empty() {
+        return None;
+    }
     let retained_tail = messages[cut_point..].to_vec();
 
     let file_ops = extract_file_operations(&messages_to_summarize, branch);
 
-    CompactionPreparation {
+    Some(CompactionPreparation {
         first_kept_entry_id,
         messages_to_summarize,
         turn_prefix_messages: Vec::new(),
@@ -619,8 +624,25 @@ pub fn build_preparation(
         previous_summary,
         file_ops,
         settings: settings.clone(),
+    })
+}
+
+/// The transcript holds nothing a compaction would summarize: either the
+/// whole conversation fits inside the keep-recent window, or everything
+/// beyond it is already folded into the latest boundary's summary. Surfaced
+/// by [`crate::harness::AgentHarness::compact`] before any hook or model
+/// call, so an overflow recovery can tell "compaction cannot shrink this
+/// context" apart from a summarization failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingToCompact;
+
+impl std::fmt::Display for NothingToCompact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing to compact (session too small)")
     }
 }
+
+impl std::error::Error for NothingToCompact {}
 
 /// File paths touched by the compacted region, mirroring the TS
 /// `extractFileOperations`: assistant tool calls with a `path` argument are

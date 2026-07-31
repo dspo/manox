@@ -293,6 +293,44 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
+    /// Append a `model_change` entry and return the entry ID.
+    pub async fn append_model_change(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<String, anyhow::Error> {
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::ModelChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Append an `active_tools_change` entry and return the entry ID.
+    pub async fn append_active_tools_change(
+        &self,
+        active_tool_names: &[String],
+    ) -> Result<String, anyhow::Error> {
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::ActiveToolsChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            active_tool_names: active_tool_names.to_vec(),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
     /// Append a compaction entry and return the entry ID and timestamp.
     ///
     /// The leaf cursor moves to the entry, so later messages parent onto it.
@@ -369,7 +407,7 @@ impl<S: SessionStorage> Session<S> {
     /// with, plus the settings the active path carries.
     pub async fn build_session_context(&self) -> Result<SessionContext, anyhow::Error> {
         let path = self.get_branch().await?;
-        let (thinking_level, model) = context_settings(&path);
+        let (thinking_level, model, active_tool_names) = context_settings(&path);
         let entries = build_context_entries(path);
         let mut messages = Vec::new();
         let mut message_entry_ids = Vec::new();
@@ -388,6 +426,7 @@ impl<S: SessionStorage> Session<S> {
             message_entry_ids,
             thinking_level,
             model,
+            active_tool_names,
         })
     }
 }
@@ -406,6 +445,9 @@ pub struct SessionContext {
     /// The model the session was last driven with — from the latest
     /// `model_change` entry, or the latest assistant message's own identity.
     pub model: Option<SessionModelRef>,
+    /// The active tool subset from the latest `active_tools_change` entry;
+    /// `None` when the path never narrowed the mounted set.
+    pub active_tool_names: Option<Vec<String>>,
 }
 
 /// A model reference carried by the session path.
@@ -455,12 +497,16 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 }
 
 /// The settings the active path carries: the reasoning tier from the latest
-/// `thinking_level_change`, and the model from the latest `model_change`
-/// (an assistant message's own identity is a fresher witness than an older
-/// `model_change`, matching the TS projection).
-fn context_settings(path: &[SessionTreeEntry]) -> (Option<String>, Option<SessionModelRef>) {
+/// `thinking_level_change`, the model from the latest `model_change` (an
+/// assistant message's own identity is a fresher witness than an older
+/// `model_change`, matching the TS projection), and the active tool subset
+/// from the latest `active_tools_change`.
+fn context_settings(
+    path: &[SessionTreeEntry],
+) -> (Option<String>, Option<SessionModelRef>, Option<Vec<String>>) {
     let mut thinking_level = None;
     let mut model = None;
+    let mut active_tool_names = None;
     for entry in path {
         match entry {
             SessionTreeEntry::ThinkingLevelChange {
@@ -488,10 +534,16 @@ fn context_settings(path: &[SessionTreeEntry]) -> (Option<String>, Option<Sessio
                     model_id: m.clone(),
                 });
             }
+            SessionTreeEntry::ActiveToolsChange {
+                active_tool_names: names,
+                ..
+            } => {
+                active_tool_names = Some(names.clone());
+            }
             _ => {}
         }
     }
-    (thinking_level, model)
+    (thinking_level, model, active_tool_names)
 }
 
 /// Project one session entry into context messages. Display/state entries
@@ -687,14 +739,20 @@ mod tests {
                 thinking_level: "medium".into(),
             },
             assistant("a1", "t1"),
+            SessionTreeEntry::ActiveToolsChange {
+                id: "at".into(),
+                parent_id: Some("a1".into()),
+                timestamp: Utc::now(),
+                active_tool_names: vec!["read".into(), "bash".into()],
+            },
             SessionTreeEntry::ThinkingLevelChange {
                 id: "t2".into(),
-                parent_id: Some("a1".into()),
+                parent_id: Some("at".into()),
                 timestamp: Utc::now(),
                 thinking_level: "off".into(),
             },
         ];
-        let (thinking_level, model) = context_settings(&path);
+        let (thinking_level, model, active_tool_names) = context_settings(&path);
         // The trailing "off" change resets the tier to the provider default.
         assert_eq!(thinking_level, None);
         // An assistant message is a fresher model witness than an older
@@ -705,6 +763,11 @@ mod tests {
                 provider: "anthropic".into(),
                 model_id: "claude-opus".into(),
             })
+        );
+        // The latest active_tools_change carries the narrowed subset.
+        assert_eq!(
+            active_tool_names,
+            Some(vec!["read".to_string(), "bash".to_string()])
         );
     }
 
