@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,900 行 Rust（src 24.6k + examples 1.3k），335 个测试，零警告。
+**当前规模：** ~26,100 行 Rust（src 24.8k + examples 1.3k），344 个测试（另 3 个 live 测试 ignored），零警告。
 
 ## 架构设计
 
@@ -25,8 +25,8 @@ crates/pi/src/
   tool.rs                -- AgentTool trait、工具执行管道
   env.rs                 -- ExecutionEnv trait + TokioExecutionEnv 生产实现
   cache_stats.rs         -- Cache miss 检测
-  settings.rs            -- Settings 管理（global/project 合并、文件持久化）
-  trust.rs               -- Trust 管理
+  settings.rs            -- Settings 管理（global/project 合并、serde 序列化助手）
+  trust.rs               -- Trust 管理（内存态）
   system_prompt.rs       -- 系统提示词构建（项目上下文 + CLAUDE.md 加载）
   output_guard.rs        -- 工具输出标记（防注入攻击）
   session/
@@ -39,7 +39,7 @@ crates/pi/src/
     mod.rs               -- 工具注册表
     read.rs              -- 文件读取（行号格式化、截断）
     write.rs             -- 文件写入（diff 输出）
-    edit.rs              -- 文件编辑（search-and-replace + diff-based 模糊匹配）
+    edit.rs              -- 文件编辑（hashline 锚定补丁：行号 + TAG 校验，stale TAG 时 3-way merge 恢复）
     edit_diff.rs         -- 统一 diff 计算（similar crate）
     bash.rs              -- Shell 命令执行（输出截断）
     grep.rs              -- 内容搜索（进程内：ignore + regex + globset）
@@ -47,7 +47,6 @@ crates/pi/src/
     ls.rs                -- 目录列表（人类可读大小、截断）
     file_mutation_queue.rs  -- 同文件并发写入串行化（正确性设施）
     truncate.rs          -- 输出截断（按行 + 按字节，保留 head+tail）
-    output_accumulator.rs   -- 大输出溢写到临时文件
     path_utils.rs        -- 路径解析、~ 展开、安全边界检查
 ```
 
@@ -57,11 +56,11 @@ crates/pi/src/
 |--------|------|------|
 | 异步运行时 | tokio | manox 已使用 tokio |
 | 错误处理 | thiserror（领域错误）+ anyhow（胶水代码） | 匹配 manox 现有模式 |
-| 事件系统 | `#[async_trait] EventSink` + `mpsc` 有界通道（容量 1） | 循环 await 每次发射，慢消费者直接背压循环；对齐 TS Pi 每次 `await emit(...)` 的顺序保证 |
+| 事件系统 | `#[async_trait] EventSink` + `mpsc` 有界通道（容量 64） | 发送方 await 每次发射，慢消费者直接背压发射者；对齐 TS Pi 每次 `await emit(...)` 的顺序保证 |
 | StreamFn | `Arc<dyn StreamFn>` + mpsc channel | Arc 为 tokio::spawn 提供 'static lifetime |
 | 生产 ExecutionEnv | `TokioExecutionEnv`（tokio::fs + tokio::process::Command） | 真实文件系统 + shell；exec 带 CancellationToken——独占进程组（process_group(0)），超时或取消时 SIGKILL 整个进程树（对齐 TS killProcessTree 的负 pid 组杀），stdout/stderr 并发排空防管道死锁 |
 | grep/find | 进程内实现（ignore + regex + globset） | 消除 shell 注入，不依赖系统 grep/find |
-| edit 工具 | `similar` crate 做 diff-based 模糊匹配 | 处理 LLM 缩进/空白漂移 |
+| edit 工具 | hashline 锚定补丁（行号 + TAG 校验，stale TAG 时 3-way merge 恢复） | 编辑以 read 输出的行号为锚，规避 search-and-replace 的歧义匹配 |
 | edit_diff | `similar` crate 计算统一 diff | 编辑后返回 diff 展示变更 |
 | 输出截断 | `truncate.rs` 共享函数，所有工具统一调用 | 避免上下文窗口溢出 |
 | Message 类型 | enum + `#[non_exhaustive]` Custom 变体 | 替代 TS declaration merging |
@@ -144,12 +143,12 @@ pub trait AgentTool: Send + Sync {
 
 **文件：** `session/mod.rs`, `session/jsonl.rs`, `compaction/`
 
-1. ✅ 定义 `SessionTreeEntry` enum（所有 entry 类型，v3 schema 与 TS 逐字段对齐——持久化 CompactionEntry **无 retainedTail**）
-2. ✅ 定义 `SessionStorage` trait + `SessionRepo` trait
+1. ✅ 定义 `SessionTreeEntry` enum（所有 entry 类型，v3 schema 与 TS 逐字段对齐——CompactionEntry 含可选 `retainedTail`）
+2. ✅ 定义 `SessionStorage` trait
 3. ✅ 实现 `JsonlSessionStorage`（追加写入 JSONL，leaf 游标管理）
-4. ✅ 实现 `Session` struct（context 构建、entry 追加、tree navigation）
-   - `get_path`：全路径 walk（leaf→root 跨压缩边界；显式未知 leaf 回退最新 entry，`None`→空路径，对齐 TS `buildSessionPath`）
-   - `get_branch` / `build_context_entries` / `build_session_context`：对齐 TS `getBranch`/`buildContextEntries`/`buildSessionContext`——最新压缩边界领衔 + 从 `first_kept_entry_id` 走树重建 kept 段；全变体投影（CustomMessage/BranchSummary/Compaction 各归其位），设置类 entry（thinking_level/model_change/assistant 见证）经 `SessionContext` 上报
+4. ✅ 实现 `Session` struct（context 构建、typed entry 追加）
+   - `get_path`：全路径 walk（leaf→root 跨压缩边界；显式未知 leaf 或断链 parent 显式报错，`None`→空路径，对齐 TS agent 包 jsonl-storage 的 `not_found`/`invalid_session`）
+   - `get_branch` / `build_context_entries` / `build_session_context`：对齐 TS `getBranch`/`buildContextEntries`/`buildSessionContext`——最新压缩边界领衔 + `retainedTail` 存在时直接投影、缺失时从 `first_kept_entry_id` 走树重建 kept 段；全变体投影（CustomMessage/BranchSummary/Compaction 各归其位），设置类 entry（thinking_level/model_change/assistant 见证）经 `SessionContext` 上报
    - 摘要载体统一走 TS tag 常量（`COMPACTION_SUMMARY_*`/`BRANCH_SUMMARY_*`），压缩写入与恢复投影同形
 5. ✅ 实现 `find_cut_point()` —— 从尾向头遍历找安全切点
 6. ✅ 实现 `estimate_tokens()` —— 字符数/4 + provider usage
@@ -187,15 +186,14 @@ pub trait AgentTool: Send + Sync {
 - ✅ `edit_diff.rs` —— 统一 diff 计算，edit/write 工具返回 diff 展示变更
 - ✅ `file_mutation_queue.rs` —— 同文件并发写入串行化
 - ✅ `truncate.rs` —— 共享输出截断，保留 head+tail
-- ✅ `output_accumulator.rs` —— 大输出溢写到临时文件
 - ✅ `path_utils.rs` —— 路径解析、安全边界检查
 
 ### Phase 6: 辅助模块 ✅
 
 **文件：** `settings.rs`, `trust.rs`, `cache_stats.rs`, `system_prompt.rs`, `output_guard.rs`
 
-1. ✅ `settings.rs` —— Settings struct + global/project 合并 + JSON 文件持久化
-2. ✅ `trust.rs` —— 项目信任决策管理
+1. ✅ `settings.rs` —— Settings struct + global/project 合并（serde 序列化助手，文件加载/保存由接线方负责）
+2. ✅ `trust.rs` —— 项目信任决策管理（内存态，无持久化）
 3. ✅ `cache_stats.rs` —— 逐 turn 扫描 usage 字段，检测 cache miss 和浪费金额
 4. ✅ `system_prompt.rs` —— 系统提示词构建（项目上下文 + CLAUDE.md 加载）
 5. ✅ `output_guard.rs` —— 工具输出标记（防注入攻击）
@@ -221,10 +219,7 @@ TS Pi 对齐的已知余项（逐项对齐核验见 `docs/pi-parity.md`，该文
 
 工程化余项：
 
-- [ ] `pi` crate 加入 workspace members（需在 manox 根 Cargo.toml 添加 `crates/pi`）
-- [ ] 集成测试（`crates/pi/tests/` 目录，真实 tokio 环境）
 - [ ] 与 Pi TS 的差分测试（相同输入 → 相同输出）
-- [ ] `OutputAccumulator` 接入流式 exec（需 ExecutionEnv 支持流式输出）
 - [ ] `schemars` 生成工具 JSON Schema（从 Rust struct 派生，替代手写 serde_json::json!）
 
 ## 与 manox 现有 `agent` crate 的关系
@@ -252,9 +247,9 @@ TS Pi 对齐的已知余项（逐项对齐核验见 `docs/pi-parity.md`，该文
 
 1. ✅ `cargo build -p pi` 编译通过
 2. ✅ `cargo test -p pi` 所有测试通过（计数见文首「当前规模」，随实现滚动更新）
-3. ✅ 用 mock `StreamFn` 运行完整 agent loop，验证双循环状态机行为（5 个测试覆盖）
-4. ✅ 用临时目录测试 JSONL session 持久化（4 个测试覆盖）
+3. ✅ 用 mock `StreamFn` 运行完整 agent loop，验证双循环状态机行为
+4. ✅ 用临时目录测试 JSONL session 持久化
 5. ✅ 用 mock `ExecutionEnv` 测试工具执行管道
-6. ✅ 测试 compaction 切点选择和摘要生成（6 个测试覆盖）
+6. ✅ 测试 compaction 切点选择和摘要生成
 7. ⬜ 差分测试：相同输入下 Pi TS 与 Pi Rust 输出一致性
-8. ⬜ 集成测试：`TokioExecutionEnv` + 真实文件系统 + 多轮 agent loop
+8. ✅ 集成测试：`crates/pi/tests/`（hashline 工具真实文件系统 5 个 + anthropic live 3 个 ignored）；`examples/` 提供多轮 loop 手动验证入口

@@ -36,6 +36,12 @@ pub enum SessionTreeEntry {
         summary: String,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
+        /// Materialized messages kept after the boundary — a self-contained
+        /// checkpoint: a context rebuild reads them straight from the entry
+        /// instead of walking the tree from `first_kept_entry_id`. Absent on
+        /// older session files, where the tree walk remains the fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retained_tail: Option<Vec<AgentMessage>>,
         /// Token usage reported by the summarization call, when recorded.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
@@ -241,8 +247,9 @@ pub trait SessionStorage: Send + Sync {
 
     /// Walk from the leaf to the root, returning the full path in
     /// chronological order. Compaction boundaries do not stop the walk —
-    /// callers decide how to project them. An explicit `leaf_id` unknown to
-    /// storage falls back to the latest entry; `None` yields an empty path.
+    /// callers decide how to project them. `None` yields an empty path. An
+    /// explicit `leaf_id` unknown to storage is an error, as is a parent id
+    /// with no entry: a truncated path would silently drop history.
     async fn get_path(&self, leaf_id: Option<&str>)
     -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
 }
@@ -289,11 +296,12 @@ impl<S: SessionStorage> Session<S> {
     /// Append a compaction entry and return the entry ID and timestamp.
     ///
     /// The leaf cursor moves to the entry, so later messages parent onto it.
-    /// The kept segment is never persisted: a context rebuild reconstructs it
-    /// by walking the tree from `first_kept_entry_id`, so the session file
-    /// stays the single source of truth. The returned timestamp is the
-    /// boundary instant: the in-transcript summary message carries the same
-    /// one, so a restored transcript matches the post-compaction one exactly.
+    /// The retained tail persists with the boundary, making it a
+    /// self-contained checkpoint; `first_kept_entry_id` stays as the tree-walk
+    /// fallback for boundaries written without one. The returned timestamp is
+    /// the boundary instant: the in-transcript summary message carries the
+    /// same one, so a restored transcript matches the post-compaction one
+    /// exactly.
     pub async fn append_compaction(
         &self,
         summary: &str,
@@ -301,6 +309,7 @@ impl<S: SessionStorage> Session<S> {
         tokens_before: u64,
         usage: Option<Usage>,
         authorship: CompactionAuthorship,
+        retained_tail: Option<Vec<AgentMessage>>,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
@@ -313,6 +322,7 @@ impl<S: SessionStorage> Session<S> {
             summary: summary.to_string(),
             first_kept_entry_id,
             tokens_before,
+            retained_tail,
             usage,
             details: authorship.details,
             from_hook: Some(authorship.from_hook),
@@ -367,6 +377,9 @@ impl<S: SessionStorage> Session<S> {
             let projected = session_entry_to_context_messages(entry);
             if !projected.is_empty() {
                 message_entry_ids.push(Some(entry.id().to_string()));
+                // Messages materialized inside the entry (a compaction's
+                // retained tail) have no entry ids of their own.
+                message_entry_ids.extend((1..projected.len()).map(|_| None));
                 messages.extend(projected);
             }
         }
@@ -403,8 +416,10 @@ pub struct SessionModelRef {
 }
 
 /// The compaction-aware projection over an active path: latest compaction
-/// first, kept segment reconstructed from `first_kept_entry_id`, then
-/// everything after the boundary.
+/// first, then everything after the boundary. A boundary carrying a
+/// `retained_tail` is a self-contained checkpoint — the kept segment is not
+/// walked; without one, the kept segment is reconstructed from
+/// `first_kept_entry_id`.
 fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
     let Some(compaction_idx) = path
         .iter()
@@ -414,6 +429,7 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
     };
     let SessionTreeEntry::Compaction {
         first_kept_entry_id,
+        retained_tail,
         ..
     } = &path[compaction_idx]
     else {
@@ -423,13 +439,15 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
     let mut context_entries = vec![path[compaction_idx].clone()];
     // A `first_kept_entry_id` absent from the path keeps nothing — the same
     // outcome an undefined id produces in a hand-edited TS session file.
-    let mut found_first_kept = false;
-    for entry in &path[..compaction_idx] {
-        if Some(entry.id()) == first_kept_entry_id.as_deref() {
-            found_first_kept = true;
-        }
-        if found_first_kept {
-            context_entries.push(entry.clone());
+    if retained_tail.is_none() {
+        let mut found_first_kept = false;
+        for entry in &path[..compaction_idx] {
+            if Some(entry.id()) == first_kept_entry_id.as_deref() {
+                found_first_kept = true;
+            }
+            if found_first_kept {
+                context_entries.push(entry.clone());
+            }
         }
     }
     context_entries.extend_from_slice(&path[compaction_idx + 1..]);
@@ -500,8 +518,20 @@ pub fn session_entry_to_context_messages(entry: &SessionTreeEntry) -> Vec<AgentM
             summary, timestamp, ..
         } if !summary.is_empty() => vec![branch_summary_message(summary, *timestamp)],
         SessionTreeEntry::Compaction {
-            summary, timestamp, ..
-        } => vec![compaction_summary_message(summary, *timestamp)],
+            summary,
+            timestamp,
+            retained_tail,
+            ..
+        } => {
+            // The summary carrier heads the projection; a persisted tail
+            // follows it, exactly as it did in the post-compaction transcript.
+            let mut messages = Vec::with_capacity(1 + retained_tail.as_ref().map_or(0, Vec::len));
+            messages.push(compaction_summary_message(summary, *timestamp));
+            if let Some(tail) = retained_tail {
+                messages.extend(tail.iter().cloned());
+            }
+            messages
+        }
         _ => Vec::new(),
     }
 }
@@ -565,6 +595,7 @@ mod tests {
             summary: format!("summary-{id}"),
             first_kept_entry_id: first_kept_entry_id.map(Into::into),
             tokens_before: 0,
+            retained_tail: None,
             usage: None,
             details: None,
             from_hook: None,
@@ -817,5 +848,44 @@ mod tests {
             }
             other => panic!("expected User, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compaction_with_retained_tail_projects_summary_then_tail() {
+        let mut entry = compaction("c1", None, Some("m2"));
+        let SessionTreeEntry::Compaction { retained_tail, .. } = &mut entry else {
+            unreachable!()
+        };
+        *retained_tail = Some(vec![
+            AgentMessage::user("kept one"),
+            AgentMessage::user("kept two"),
+        ]);
+
+        let projected = session_entry_to_context_messages(&entry);
+        assert_eq!(projected.len(), 3);
+        let AgentMessage::User { content, .. } = &projected[1] else {
+            panic!("tail message must project verbatim")
+        };
+        assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "kept one"));
+    }
+
+    #[test]
+    fn context_entries_retained_tail_skips_the_kept_walk() {
+        // m1 m2 [c1 keeps m2 AND carries a materialized tail] m3: the tail
+        // makes c1 self-contained — m2 is not walked out of the tree even
+        // though first_kept_entry_id names it.
+        let mut boundary = compaction("c1", Some("m2"), Some("m2"));
+        let SessionTreeEntry::Compaction { retained_tail, .. } = &mut boundary else {
+            unreachable!()
+        };
+        *retained_tail = Some(vec![AgentMessage::user("kept")]);
+        let path = vec![
+            message("m1", None, "one"),
+            message("m2", Some("m1"), "two"),
+            boundary,
+            message("m3", Some("c1"), "three"),
+        ];
+        let entries = build_context_entries(path);
+        assert_eq!(ids(&entries), ["c1", "m3"]);
     }
 }

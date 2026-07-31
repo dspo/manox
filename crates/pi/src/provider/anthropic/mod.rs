@@ -109,7 +109,7 @@ impl StreamFn for AnthropicStreamFn {
                 }
                 let event: RawStreamEvent =
                     serde_json::from_str(&payload).map_err(ProviderError::Json)?;
-                acc.apply(event, &event_tx)?;
+                acc.apply(event, &event_tx).await?;
             }
         }
 
@@ -117,10 +117,10 @@ impl StreamFn for AnthropicStreamFn {
         if let Some(payload) = parser.finish()
             && let Ok(event) = serde_json::from_str::<RawStreamEvent>(&payload)
         {
-            acc.apply(event, &event_tx)?;
+            acc.apply(event, &event_tx).await?;
         }
 
-        acc.finish(&event_tx)
+        acc.finish(&event_tx).await
     }
 }
 
@@ -189,7 +189,7 @@ impl Accumulator {
         }
     }
 
-    fn apply(
+    async fn apply(
         &mut self,
         event: RawStreamEvent,
         tx: &mpsc::Sender<AgentEvent>,
@@ -207,9 +207,11 @@ impl Accumulator {
                     self.response_model = Some(m.clone());
                 }
                 self.started = true;
-                let _ = tx.try_send(AgentEvent::MessageStart {
-                    message: Box::new(self.current()),
-                });
+                let _ = tx
+                    .send(AgentEvent::MessageStart {
+                        message: Box::new(self.current()),
+                    })
+                    .await;
             }
             RawStreamEvent::ContentBlockStart {
                 index,
@@ -260,10 +262,12 @@ impl Accumulator {
                     }
                     WireContentBlock::Other => return Ok(()),
                 };
-                let _ = tx.try_send(AgentEvent::MessageUpdate {
-                    message: Box::new(self.current()),
-                    assistant_message_event: event,
-                });
+                let _ = tx
+                    .send(AgentEvent::MessageUpdate {
+                        message: Box::new(self.current()),
+                        assistant_message_event: event,
+                    })
+                    .await;
             }
             RawStreamEvent::ContentBlockDelta { index, delta } => {
                 self.ensure_index(index);
@@ -312,10 +316,12 @@ impl Accumulator {
                     }
                     WireDelta::Other => return Ok(()),
                 };
-                let _ = tx.try_send(AgentEvent::MessageUpdate {
-                    message: Box::new(self.current()),
-                    assistant_message_event: event,
-                });
+                let _ = tx
+                    .send(AgentEvent::MessageUpdate {
+                        message: Box::new(self.current()),
+                        assistant_message_event: event,
+                    })
+                    .await;
             }
             RawStreamEvent::ContentBlockStop { index } => {
                 self.ensure_index(index);
@@ -347,10 +353,12 @@ impl Accumulator {
                     }
                     _ => return Ok(()),
                 };
-                let _ = tx.try_send(AgentEvent::MessageUpdate {
-                    message: Box::new(self.current()),
-                    assistant_message_event: event,
-                });
+                let _ = tx
+                    .send(AgentEvent::MessageUpdate {
+                        message: Box::new(self.current()),
+                        assistant_message_event: event,
+                    })
+                    .await;
             }
             RawStreamEvent::MessageDelta { delta, usage } => {
                 if let Some(sr) = &delta.stop_reason {
@@ -395,11 +403,13 @@ impl Accumulator {
         }
     }
 
-    fn finish(self, tx: &mpsc::Sender<AgentEvent>) -> Result<AgentMessage, anyhow::Error> {
+    async fn finish(self, tx: &mpsc::Sender<AgentEvent>) -> Result<AgentMessage, anyhow::Error> {
         let message = self.current();
-        let _ = tx.try_send(AgentEvent::MessageEnd {
-            message: Box::new(message.clone()),
-        });
+        let _ = tx
+            .send(AgentEvent::MessageEnd {
+                message: Box::new(message.clone()),
+            })
+            .await;
         Ok(message)
     }
 }
@@ -442,19 +452,20 @@ mod tests {
         out
     }
 
-    #[test]
-    fn text_stream_produces_lifecycle_events() {
+    #[tokio::test]
+    async fn text_stream_produces_lifecycle_events() {
         let (tx, rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        acc.apply(start_event(), &tx).unwrap();
-        acc.apply(block_start_text(0), &tx).unwrap();
-        acc.apply(text_delta(0, "Hello"), &tx).unwrap();
-        acc.apply(text_delta(0, ", world"), &tx).unwrap();
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(block_start_text(0), &tx).await.unwrap();
+        acc.apply(text_delta(0, "Hello"), &tx).await.unwrap();
+        acc.apply(text_delta(0, ", world"), &tx).await.unwrap();
         acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .await
             .unwrap();
-        acc.apply(message_delta("end_turn"), &tx).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        acc.apply(message_delta("end_turn"), &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         // Final text assembled.
         match &msg {
@@ -485,12 +496,12 @@ mod tests {
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
-    #[test]
-    fn tool_use_partial_json_accumulates_and_parses() {
+    #[tokio::test]
+    async fn tool_use_partial_json_accumulates_and_parses() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        acc.apply(start_event(), &tx).unwrap();
+        acc.apply(start_event(), &tx).await.unwrap();
         acc.apply(
             RawStreamEvent::ContentBlockStart {
                 index: 0,
@@ -502,12 +513,14 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
-        acc.apply(json_delta(0, "{\"path\":"), &tx).unwrap();
-        acc.apply(json_delta(0, "\"x.rs\"}"), &tx).unwrap();
+        acc.apply(json_delta(0, "{\"path\":"), &tx).await.unwrap();
+        acc.apply(json_delta(0, "\"x.rs\"}"), &tx).await.unwrap();
         acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .await
             .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         match &msg {
             AgentMessage::Assistant { content, .. } => match &content[0] {
@@ -524,11 +537,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn thinking_block_keeps_signature() {
+    #[tokio::test]
+    async fn thinking_block_keeps_signature() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(start_event(), &tx).unwrap();
+        acc.apply(start_event(), &tx).await.unwrap();
         acc.apply(
             RawStreamEvent::ContentBlockStart {
                 index: 0,
@@ -539,6 +552,7 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
         acc.apply(
             RawStreamEvent::ContentBlockDelta {
@@ -549,6 +563,7 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
         acc.apply(
             RawStreamEvent::ContentBlockDelta {
@@ -559,10 +574,12 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
         acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .await
             .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         match &msg {
             AgentMessage::Assistant { content, .. } => match &content[0] {
@@ -580,11 +597,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn malformed_tool_json_errors() {
+    #[tokio::test]
+    async fn malformed_tool_json_errors() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(start_event(), &tx).unwrap();
+        acc.apply(start_event(), &tx).await.unwrap();
         acc.apply(
             RawStreamEvent::ContentBlockStart {
                 index: 0,
@@ -596,17 +613,20 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
-        acc.apply(json_delta(0, "{not json"), &tx).unwrap();
-        let err = acc.apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx);
+        acc.apply(json_delta(0, "{not json"), &tx).await.unwrap();
+        let err = acc
+            .apply(RawStreamEvent::ContentBlockStop { index: 0 }, &tx)
+            .await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn message_delta_merges_only_present_usage_classes() {
+    #[tokio::test]
+    async fn message_delta_merges_only_present_usage_classes() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(start_event(), &tx).unwrap();
+        acc.apply(start_event(), &tx).await.unwrap();
 
         // The delta reports output and cache classes but omits input: the
         // message_start input survives; the total is the merged sum.
@@ -626,8 +646,9 @@ mod tests {
             },
             &tx,
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         match &msg {
             AgentMessage::Assistant { usage, .. } => {

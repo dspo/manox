@@ -107,7 +107,7 @@ impl StreamFn for CompletionsStreamFn {
                 if payload == "[DONE]" {
                     continue;
                 }
-                apply_payload(&mut acc, &payload, &event_tx)?;
+                apply_payload(&mut acc, &payload, &event_tx).await?;
             }
         }
 
@@ -115,17 +115,17 @@ impl StreamFn for CompletionsStreamFn {
         if let Some(payload) = parser.finish()
             && payload != "[DONE]"
         {
-            apply_payload(&mut acc, &payload, &event_tx)?;
+            apply_payload(&mut acc, &payload, &event_tx).await?;
         }
 
-        acc.finish(&event_tx)
+        acc.finish(&event_tx).await
     }
 }
 
 /// Parse one `data:` payload and fold it into the accumulator. A 2xx stream
 /// can still carry an error object as data; that is the only payload shape
 /// besides chunks.
-fn apply_payload(
+async fn apply_payload(
     acc: &mut Accumulator,
     payload: &str,
     tx: &mpsc::Sender<AgentEvent>,
@@ -140,7 +140,7 @@ fn apply_payload(
         return Err(overflow::mid_stream(detail).into());
     }
     let chunk: WireChunk = serde_json::from_str(payload).map_err(ProviderError::Json)?;
-    acc.apply(chunk, tx)
+    acc.apply(chunk, tx).await
 }
 
 /// Folds a stream of completion chunks into a complete assistant message
@@ -225,7 +225,7 @@ impl Accumulator {
         }
     }
 
-    fn apply(
+    async fn apply(
         &mut self,
         chunk: WireChunk,
         tx: &mpsc::Sender<AgentEvent>,
@@ -247,9 +247,11 @@ impl Accumulator {
         }
         if !self.started {
             self.started = true;
-            let _ = tx.try_send(AgentEvent::MessageStart {
-                message: Box::new(self.current()),
-            });
+            let _ = tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(self.current()),
+                })
+                .await;
         }
 
         let Some(choice) = chunk.choices.into_iter().next() else {
@@ -287,10 +289,12 @@ impl Accumulator {
         }
 
         for assistant_message_event in events {
-            let _ = tx.try_send(AgentEvent::MessageUpdate {
-                message: Box::new(self.current()),
-                assistant_message_event,
-            });
+            let _ = tx
+                .send(AgentEvent::MessageUpdate {
+                    message: Box::new(self.current()),
+                    assistant_message_event,
+                })
+                .await;
         }
         Ok(())
     }
@@ -417,7 +421,10 @@ impl Accumulator {
         });
     }
 
-    fn finish(mut self, tx: &mpsc::Sender<AgentEvent>) -> Result<AgentMessage, anyhow::Error> {
+    async fn finish(
+        mut self,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
         // Resolve every tool call's accumulated argument JSON now that the
         // stream is complete.
         for call in &self.tool_calls {
@@ -447,15 +454,19 @@ impl Accumulator {
                 },
                 _ => continue,
             };
-            let _ = tx.try_send(AgentEvent::MessageUpdate {
-                message: Box::new(self.current()),
-                assistant_message_event,
-            });
+            let _ = tx
+                .send(AgentEvent::MessageUpdate {
+                    message: Box::new(self.current()),
+                    assistant_message_event,
+                })
+                .await;
         }
         let message = self.current();
-        let _ = tx.try_send(AgentEvent::MessageEnd {
-            message: Box::new(message.clone()),
-        });
+        let _ = tx
+            .send(AgentEvent::MessageEnd {
+                message: Box::new(message.clone()),
+            })
+            .await;
         Ok(message)
     }
 }
@@ -536,15 +547,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn text_stream_produces_lifecycle_events() {
+    #[tokio::test]
+    async fn text_stream_produces_lifecycle_events() {
         let (tx, rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        acc.apply(chunk(text("Hello"), None), &tx).unwrap();
+        acc.apply(chunk(text("Hello"), None), &tx).await.unwrap();
         acc.apply(chunk(text(", world"), Some("stop")), &tx)
+            .await
             .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         match &msg {
             AgentMessage::Assistant {
@@ -573,8 +585,8 @@ mod tests {
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
-    #[test]
-    fn reasoning_then_text_becomes_two_blocks() {
+    #[tokio::test]
+    async fn reasoning_then_text_becomes_two_blocks() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
@@ -582,10 +594,16 @@ mod tests {
             reasoning_content: Some(s.into()),
             ..Default::default()
         };
-        acc.apply(chunk(reasoning("let me"), None), &tx).unwrap();
-        acc.apply(chunk(reasoning(" think"), None), &tx).unwrap();
-        acc.apply(chunk(text("answer"), Some("stop")), &tx).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        acc.apply(chunk(reasoning("let me"), None), &tx)
+            .await
+            .unwrap();
+        acc.apply(chunk(reasoning(" think"), None), &tx)
+            .await
+            .unwrap();
+        acc.apply(chunk(text("answer"), Some("stop")), &tx)
+            .await
+            .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
@@ -598,8 +616,8 @@ mod tests {
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
     }
 
-    #[test]
-    fn reasoning_spelling_variants_all_map_to_thinking() {
+    #[tokio::test]
+    async fn reasoning_spelling_variants_all_map_to_thinking() {
         for (field, value) in [
             (
                 "reasoning_content",
@@ -625,8 +643,8 @@ mod tests {
         ] {
             let (tx, _rx) = chan();
             let mut acc = Accumulator::new(&ctx());
-            acc.apply(chunk(value, Some("stop")), &tx).unwrap();
-            let msg = acc.finish(&tx).unwrap();
+            acc.apply(chunk(value, Some("stop")), &tx).await.unwrap();
+            let msg = acc.finish(&tx).await.unwrap();
             let AgentMessage::Assistant { content, .. } = &msg else {
                 panic!("expected assistant")
             };
@@ -637,8 +655,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parallel_tool_calls_assemble_across_deltas() {
+    #[tokio::test]
+    async fn parallel_tool_calls_assemble_across_deltas() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
@@ -646,6 +664,7 @@ mod tests {
             chunk(tool_delta(0, Some("c1"), Some("read"), Some("{\"pa")), None),
             &tx,
         )
+        .await
         .unwrap();
         acc.apply(
             chunk(
@@ -654,6 +673,7 @@ mod tests {
             ),
             &tx,
         )
+        .await
         .unwrap();
         acc.apply(
             chunk(
@@ -662,8 +682,9 @@ mod tests {
             ),
             &tx,
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant {
             content,
@@ -697,8 +718,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_call_without_arguments_defaults_to_empty_object() {
+    #[tokio::test]
+    async fn tool_call_without_arguments_defaults_to_empty_object() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         acc.apply(
@@ -708,8 +729,9 @@ mod tests {
             ),
             &tx,
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
         };
@@ -718,8 +740,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn malformed_tool_args_error_at_finish() {
+    #[tokio::test]
+    async fn malformed_tool_args_error_at_finish() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         acc.apply(
@@ -729,12 +751,13 @@ mod tests {
             ),
             &tx,
         )
+        .await
         .unwrap();
-        assert!(acc.finish(&tx).is_err());
+        assert!(acc.finish(&tx).await.is_err());
     }
 
-    #[test]
-    fn usage_comes_from_final_chunk_or_choice() {
+    #[tokio::test]
+    async fn usage_comes_from_final_chunk_or_choice() {
         let wire_usage = || WireUsage {
             prompt_tokens: Some(100),
             completion_tokens: Some(10),
@@ -750,8 +773,8 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
         let mut c = chunk(text("hi"), Some("stop"));
         c.usage = Some(wire_usage());
-        acc.apply(c, &tx).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        acc.apply(c, &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
         let AgentMessage::Assistant { usage, .. } = &msg else {
             panic!("expected assistant")
         };
@@ -770,19 +793,21 @@ mod tests {
             }],
             ..Default::default()
         };
-        acc.apply(c, &tx).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        acc.apply(c, &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
         let AgentMessage::Assistant { usage, .. } = &msg else {
             panic!("expected assistant")
         };
         assert_eq!(usage.input_tokens, 60);
     }
 
-    #[test]
-    fn usage_only_chunk_without_choices_is_accepted() {
+    #[tokio::test]
+    async fn usage_only_chunk_without_choices_is_accepted() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        acc.apply(chunk(text("hi"), Some("stop")), &tx).unwrap();
+        acc.apply(chunk(text("hi"), Some("stop")), &tx)
+            .await
+            .unwrap();
         let c = WireChunk {
             usage: Some(WireUsage {
                 prompt_tokens: Some(5),
@@ -791,16 +816,16 @@ mod tests {
             }),
             ..Default::default()
         };
-        acc.apply(c, &tx).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        acc.apply(c, &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
         let AgentMessage::Assistant { usage, .. } = &msg else {
             panic!("expected assistant")
         };
         assert_eq!(usage.input_tokens, 5);
     }
 
-    #[test]
-    fn error_payload_mid_stream_becomes_midstream_error() {
+    #[tokio::test]
+    async fn error_payload_mid_stream_becomes_midstream_error() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         let err = apply_payload(
@@ -808,6 +833,7 @@ mod tests {
             "{\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}",
             &tx,
         )
+        .await
         .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "boom"));
@@ -820,6 +846,7 @@ mod tests {
             "{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}",
             &tx,
         )
+        .await
         .unwrap();
     }
 }

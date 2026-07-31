@@ -38,6 +38,11 @@ pub trait StreamFn: Send + Sync {
     ///
     /// Sends lifecycle events through `event_tx` as the response streams in.
     /// Returns the final assistant message when the stream completes.
+    ///
+    /// `MessageStart`/`MessageEnd` ownership is single: a stream that emits
+    /// them (real providers do) owns them, and the loop only emits the ones
+    /// the stream never sent. A stream must never emit `MessageEnd` for a
+    /// message other than the one it returns.
     async fn stream(
         &self,
         context: &AgentContext,
@@ -388,8 +393,12 @@ async fn stream_assistant_response(
     // Spawn the stream function so it can send events concurrently.
     let stream_handle = tokio::spawn(async move { stream_fn.stream(&ctx, sig, event_tx).await });
 
-    // Accumulate streaming state on the receiver side.
+    // Accumulate streaming state on the receiver side. The stream may emit
+    // its own MessageStart/MessageEnd; the loop only backstops the lifecycle
+    // events the stream never sent, so exactly one of each reaches the sink
+    // per assistant message.
     let mut first = true;
+    let mut saw_end = false;
 
     // Process events as they arrive from the channel.
     // The channel closes when the sender is dropped (stream completes or errors).
@@ -398,7 +407,9 @@ async fn stream_assistant_response(
             AgentEvent::MessageStart { .. } => {
                 first = false;
             }
-            AgentEvent::MessageUpdate { .. } => {}
+            AgentEvent::MessageEnd { .. } => {
+                saw_end = true;
+            }
             _ => {}
         }
         sink.emit(event).await;
@@ -419,17 +430,22 @@ async fn stream_assistant_response(
         ),
     };
 
-    // Emit message_start/message_end if not already emitted by the stream.
+    // Backstop only the lifecycle events the stream never sent. A provider
+    // that emitted its own MessageEnd owns it — emitting another here would
+    // append the assistant message to reducers twice. A stream that failed
+    // before closing the lifecycle gets its terminal message announced now.
     if first {
         sink.emit(AgentEvent::MessageStart {
             message: Box::new(message.clone()),
         })
         .await;
     }
-    sink.emit(AgentEvent::MessageEnd {
-        message: Box::new(message.clone()),
-    })
-    .await;
+    if !saw_end {
+        sink.emit(AgentEvent::MessageEnd {
+            message: Box::new(message.clone()),
+        })
+        .await;
+    }
 
     Ok(message)
 }
@@ -1536,6 +1552,108 @@ mod tests {
         assert!(
             aborted,
             "abort must materialize as a terminal Aborted assistant message"
+        );
+    }
+
+    /// A stream that emits the full message lifecycle itself, as the real
+    /// providers (Anthropic / OpenAI completions / responses) do.
+    struct LifecycleStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for LifecycleStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let message = AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "streamed".into(),
+                    signature: None,
+                }],
+                model: "mock".into(),
+                provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentEvent::MessageUpdate {
+                    message: Box::new(message.clone()),
+                    assistant_message_event: crate::types::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "streamed".into(),
+                    },
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentEvent::MessageEnd {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            Ok(message)
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_owned_message_lifecycle_is_not_duplicated() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(LifecycleStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let assistant_count = messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .count();
+        assert_eq!(assistant_count, 1, "the run returns one assistant message");
+
+        let events = sink.events.lock().unwrap();
+        let assistant_lifecycle = |kind: fn(&AgentEvent) -> bool| -> usize {
+            events
+                .iter()
+                .filter(|e| {
+                    kind(e)
+                        && matches!(
+                            e,
+                            AgentEvent::MessageStart { message }
+                            | AgentEvent::MessageEnd { message }
+                            if matches!(message.as_ref(), AgentMessage::Assistant { .. })
+                        )
+                })
+                .count()
+        };
+        assert_eq!(
+            assistant_lifecycle(|e| matches!(e, AgentEvent::MessageStart { .. })),
+            1,
+            "the assistant message_start the stream sent is the only one"
+        );
+        assert_eq!(
+            assistant_lifecycle(|e| matches!(e, AgentEvent::MessageEnd { .. })),
+            1,
+            "the loop must not append a second message_end after the stream's own"
         );
     }
 }

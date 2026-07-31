@@ -260,12 +260,10 @@ impl SessionStorage for JsonlSessionStorage {
         let target_id = match leaf_id {
             None => return Ok(Vec::new()),
             Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
-            // An explicit id unknown to storage walks from the latest entry,
-            // matching the TS buildSessionPath fallback.
-            Some(_) => match entries.last() {
-                Some(e) => e.id().to_string(),
-                None => return Ok(Vec::new()),
-            },
+            // An explicit id unknown to storage is an error — the TS
+            // storage's `not_found`. Silently walking from another entry
+            // would fabricate a path the caller never asked for.
+            Some(id) => anyhow::bail!("entry {id} not found"),
         };
 
         let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
@@ -275,10 +273,13 @@ impl SessionStorage for JsonlSessionStorage {
         let mut current_id: Option<&str> = Some(&target_id);
         while let Some(id) = current_id {
             // `remove` doubles as cycle protection: each entry is visited at
-            // most once even if parent ids form a loop.
+            // most once. A miss is either a parent id with no entry — the TS
+            // storage's `invalid_session` — or a parent-id cycle; both mean
+            // the chain is broken, and a truncated path would silently drop
+            // history, so this is an error, never a partial result.
             let entry = match index.remove(id) {
                 Some(e) => e,
-                None => break,
+                None => anyhow::bail!("entry {id} not found: session chain is broken"),
             };
             current_id = entry.parent_id();
             path.push(entry);
@@ -593,6 +594,7 @@ mod tests {
             summary: "summarized".into(),
             first_kept_entry_id: None,
             tokens_before: 1000,
+            retained_tail: None,
             usage: None,
             details: None,
             from_hook: None,
@@ -640,6 +642,7 @@ mod tests {
             summary: id.into(),
             first_kept_entry_id: None,
             tokens_before: 0,
+            retained_tail: None,
             usage: None,
             details: None,
             from_hook: None,
@@ -1220,5 +1223,41 @@ mod tests {
                 model_id: "claude-opus-4-7".into(),
             })
         );
+    }
+
+    /// A walk that cannot complete loudly fails: an explicit leaf unknown to
+    /// storage, or a parent id with no entry, never yields a truncated path.
+    #[tokio::test]
+    async fn test_broken_session_chain_errors_instead_of_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","parentId":"ghost","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+
+        // Unknown explicit leaf.
+        let err = storage.get_path(Some("no-such-entry")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no-such-entry"),
+            "the error names the missing leaf: {err}"
+        );
+
+        // A parent id with no entry breaks the chain mid-walk.
+        let err = storage.get_path(Some("m2")).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ghost"),
+            "the error names the missing parent: {err}"
+        );
+
+        // A well-formed chain still walks.
+        let path = storage.get_path(Some("m1")).await.unwrap();
+        assert_eq!(path.len(), 1);
     }
 }

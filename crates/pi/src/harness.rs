@@ -690,7 +690,9 @@ impl<S: SessionStorage> AgentHarness<S> {
         };
 
         // Persist the boundary first — the session is the durable record and
-        // a failure here leaves the agent transcript untouched.
+        // a failure here leaves the agent transcript untouched. The retained
+        // tail persists with it, so a restore reads the same messages the
+        // transcript is about to be rebuilt from.
         let boundary = match self
             .session
             .append_compaction(
@@ -699,6 +701,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 tokens_before,
                 usage.clone(),
                 authorship,
+                Some(retained_tail.clone()),
             )
             .await
         {
@@ -1152,17 +1155,14 @@ mod tests {
             leaf_id: Option<&str>,
         ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
             // Mirror the JSONL backend: walk the full path to the root, with
-            // the same unknown-leaf fallback. Returning every entry
-            // regardless of the cursor would mask path-relative logic (e.g.
-            // `previousSummary` extraction).
+            // the same loud errors for an unknown leaf or a broken chain.
+            // Returning every entry regardless of the cursor would mask
+            // path-relative logic (e.g. `previousSummary` extraction).
             let entries = self.entries.lock().unwrap();
             let target_id = match leaf_id {
                 None => return Ok(Vec::new()),
                 Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
-                Some(_) => match entries.last() {
-                    Some(e) => e.id().to_string(),
-                    None => return Ok(Vec::new()),
-                },
+                Some(id) => anyhow::bail!("entry {id} not found"),
             };
             let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
                 entries.iter().map(|e| (e.id(), e)).collect();
@@ -1171,7 +1171,7 @@ mod tests {
             while let Some(id) = current_id {
                 let entry = match index.remove(id) {
                     Some(e) => e,
-                    None => break,
+                    None => anyhow::bail!("entry {id} not found: session chain is broken"),
                 };
                 current_id = entry.parent_id();
                 path.push(entry);
@@ -2343,6 +2343,93 @@ mod tests {
         // The estimation boundary came along: needs_compaction works without
         // a separate recover_boundary() call.
         assert!(!harness.needs_compaction());
+    }
+
+    /// A hook-supplied retained tail persists with the boundary: the restored
+    /// transcript replays it even though the hook's messages were never
+    /// session entries, so a first-kept tree walk could never find them.
+    #[tokio::test]
+    async fn test_hook_supplied_retained_tail_survives_restore() {
+        use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = || JsonlSessionMetadata {
+            id: "s".into(),
+            cwd: "/test".into(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
+        };
+
+        let expected;
+        {
+            let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
+                .await
+                .unwrap();
+            let session = Session::new(storage);
+            let mut harness = AgentHarness::new(
+                session,
+                "You are a test assistant.",
+                test_model(),
+                Arc::new(TestStreamFn),
+            );
+            harness.on(
+                HookPoint::SessionBeforeCompact,
+                Arc::new(|ctx: HookContext| {
+                    ctx.with_compact_override(BeforeCompactOverride {
+                        summary: "hook summary".into(),
+                        tokens_before: 90_000,
+                        first_kept_entry_id: None,
+                        retained_tail: vec![
+                            AgentMessage::user("hook-kept question"),
+                            AgentMessage::user("hook-kept answer"),
+                        ],
+                        details: None,
+                        usage: None,
+                    })
+                }),
+            );
+            let assistant = AgentMessage::Assistant {
+                content: vec![],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage {
+                    total_tokens: 90_000,
+                    ..Default::default()
+                }),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            };
+            harness
+                .agent_mut()
+                .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+            harness.compact(None).await.unwrap();
+            expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
+        }
+
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
+            .await
+            .unwrap();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.restore().await.unwrap();
+
+        let messages = &harness.agent().state().messages;
+        // Summary carrier + both hook-authored tail messages.
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        // The restored transcript equals the post-compaction one exactly.
+        let restored = serde_json::to_value(messages).unwrap();
+        assert_eq!(restored, expected);
     }
 
     /// Restore projects every message-producing entry variant — messages,

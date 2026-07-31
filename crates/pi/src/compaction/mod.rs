@@ -364,15 +364,18 @@ fn first_orphaned_result(
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
 /// Truncate for summarization: keep the head and append a marker counting the
-/// dropped characters.
+/// dropped characters. The limit counts chars (Unicode scalar values — the
+/// Rust analogue of the TS string length, which counts UTF-16 code units),
+/// never bytes, so a multi-byte char is never split.
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let Some((end, _)) = text.char_indices().nth(max_chars) else {
         return text.to_string();
-    }
+    };
+    let remaining = text[end..].chars().count();
     format!(
         "{}\n\n[... {} more characters truncated]",
-        &text[..max_chars],
-        text.len() - max_chars
+        &text[..end],
+        remaining
     )
 }
 
@@ -1221,6 +1224,26 @@ mod tests {
         // Tool results survive, truncated to the budget with a drop marker.
         assert!(text.contains(&format!("[Tool result]: {}", "r".repeat(2000))));
         assert!(text.contains("[... 100 more characters truncated]"));
+    }
+
+    #[test]
+    fn truncate_for_summary_counts_chars_never_splits_a_multibyte_char() {
+        // 2100 chars of 3 bytes each: a byte-indexed cut at 2000 would land
+        // inside a char and panic; the char-indexed cut keeps 2000 whole
+        // chars and counts the remaining 100.
+        let text = "中".repeat(2100);
+        let truncated = truncate_for_summary(&text, TOOL_RESULT_MAX_CHARS);
+        assert!(truncated.starts_with(&"中".repeat(2000)));
+        assert!(truncated.ends_with("[... 100 more characters truncated]"));
+
+        // Exactly at the limit: no truncation, no marker.
+        let exact = "界".repeat(TOOL_RESULT_MAX_CHARS);
+        assert_eq!(truncate_for_summary(&exact, TOOL_RESULT_MAX_CHARS), exact);
+
+        // An astral char (4 bytes, one scalar value) counts as one char.
+        let emoji = "🦀".repeat(2100);
+        let truncated = truncate_for_summary(&emoji, TOOL_RESULT_MAX_CHARS);
+        assert!(truncated.ends_with("[... 100 more characters truncated]"));
     }
 
     #[test]

@@ -118,7 +118,7 @@ impl StreamFn for ResponsesStreamFn {
                 if payload == "[DONE]" {
                     continue;
                 }
-                apply_payload(&mut acc, &payload, &event_tx)?;
+                apply_payload(&mut acc, &payload, &event_tx).await?;
             }
         }
 
@@ -126,10 +126,10 @@ impl StreamFn for ResponsesStreamFn {
         if let Some(payload) = parser.finish()
             && payload != "[DONE]"
         {
-            apply_payload(&mut acc, &payload, &event_tx)?;
+            apply_payload(&mut acc, &payload, &event_tx).await?;
         }
 
-        acc.finish(&event_tx)
+        acc.finish(&event_tx).await
     }
 }
 
@@ -139,7 +139,7 @@ impl StreamFn for ResponsesStreamFn {
 /// or a bare `{"code", "message"}` pair) as data on a 2xx response — or not
 /// ours to interpret. Unknown event kinds are skipped: the API adds event
 /// types over time, and ignoring them keeps the stream forward-compatible.
-fn apply_payload(
+async fn apply_payload(
     acc: &mut Accumulator,
     payload: &str,
     tx: &mpsc::Sender<AgentEvent>,
@@ -170,7 +170,7 @@ fn apply_payload(
         }
         return Ok(());
     };
-    acc.apply(&kind, value, tx)
+    acc.apply(&kind, value, tx).await
 }
 
 /// The output slot an `output_index` currently holds.
@@ -249,7 +249,7 @@ impl Accumulator {
         }
     }
 
-    fn apply(
+    async fn apply(
         &mut self,
         kind: &str,
         value: JsonValue,
@@ -257,9 +257,11 @@ impl Accumulator {
     ) -> Result<(), anyhow::Error> {
         if !self.started {
             self.started = true;
-            let _ = tx.try_send(AgentEvent::MessageStart {
-                message: Box::new(self.current()),
-            });
+            let _ = tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(self.current()),
+                })
+                .await;
         }
 
         let mut events: Vec<AssistantMessageEvent> = Vec::new();
@@ -367,10 +369,12 @@ impl Accumulator {
         }
 
         for assistant_message_event in events {
-            let _ = tx.try_send(AgentEvent::MessageUpdate {
-                message: Box::new(self.current()),
-                assistant_message_event,
-            });
+            let _ = tx
+                .send(AgentEvent::MessageUpdate {
+                    message: Box::new(self.current()),
+                    assistant_message_event,
+                })
+                .await;
         }
         Ok(())
     }
@@ -639,7 +643,10 @@ impl Accumulator {
         }
     }
 
-    fn finish(mut self, tx: &mpsc::Sender<AgentEvent>) -> Result<AgentMessage, anyhow::Error> {
+    async fn finish(
+        mut self,
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
         if !self.terminal_seen {
             return Err(ProviderError::MidStream(
                 "stream ended before a terminal response event".to_string(),
@@ -660,9 +667,11 @@ impl Accumulator {
             }
         }
         let message = self.current();
-        let _ = tx.try_send(AgentEvent::MessageEnd {
-            message: Box::new(message.clone()),
-        });
+        let _ = tx
+            .send(AgentEvent::MessageEnd {
+                message: Box::new(message.clone()),
+            })
+            .await;
         Ok(message)
     }
 }
@@ -757,12 +766,12 @@ mod tests {
         out
     }
 
-    fn feed(
+    async fn feed(
         acc: &mut Accumulator,
         tx: &mpsc::Sender<AgentEvent>,
         payload: &str,
     ) -> Result<(), anyhow::Error> {
-        apply_payload(acc, payload, tx)
+        apply_payload(acc, payload, tx).await
     }
 
     /// The standard terminal event.
@@ -772,8 +781,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn text_stream_produces_lifecycle_events() {
+    #[tokio::test]
+    async fn text_stream_produces_lifecycle_events() {
         let (tx, rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
@@ -782,28 +791,32 @@ mod tests {
             &tx,
             r#"{"type":"response.created","response":{"id":"r1"}}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#,
         )
+        .await
         .unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":0,"delta":", world"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"Hello, world","annotations":[]}],"status":"completed","phase":"final_answer"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"Hello, world","annotations":[]}],"status":"completed","phase":"final_answer"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":10,"output_tokens":5}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant {
             content,
@@ -842,46 +855,51 @@ mod tests {
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
     }
 
-    #[test]
-    fn reasoning_stream_captures_raw_item_as_signature() {
+    #[tokio::test]
+    async fn reasoning_stream_captures_raw_item_as_signature() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"let me"}"#,
         )
+        .await
         .unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#,
         )
+        .await
         .unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"think"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"let me"},{"type":"summary_text","text":"think"}],"encrypted_content":"enc1"}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"let me"},{"type":"summary_text","text":"think"}],"encrypted_content":"enc1"}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[],"status":"in_progress"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":1,"delta":"answer"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}],"status":"completed"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[]}],"status":"completed"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
@@ -905,27 +923,29 @@ mod tests {
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
     }
 
-    #[test]
-    fn function_call_assembles_and_stops_tool_use() {
+    #[tokio::test]
+    async fn function_call_assembles_and_stops_tool_use() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":""}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":""}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pa"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"x\"}"}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"x\"}"}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant {
             content,
@@ -948,26 +968,28 @@ mod tests {
         assert_eq!(*input, json!({"path": "x"}));
     }
 
-    #[test]
-    fn done_item_arguments_win_over_deltas() {
+    #[tokio::test]
+    async fn done_item_arguments_win_over_deltas() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{bad"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":"{\"a\":1}"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":"{\"a\":1}"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
@@ -977,41 +999,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn incomplete_maps_to_max_tokens() {
+    #[tokio::test]
+    async fn incomplete_maps_to_max_tokens() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","usage":{"input_tokens":1,"output_tokens":1},"output":[]}}"#).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.incomplete","response":{"id":"r","status":"incomplete","usage":{"input_tokens":1,"output_tokens":1},"output":[]}}"#).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
         let AgentMessage::Assistant { stop_reason, .. } = &msg else {
             panic!("expected assistant")
         };
         assert_eq!(*stop_reason, Some(StopReason::Length));
     }
 
-    #[test]
-    fn failed_event_becomes_midstream_error() {
+    #[tokio::test]
+    async fn failed_event_becomes_midstream_error() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         let err = feed(
             &mut acc,
             &tx,
             r#"{"type":"response.failed","response":{"id":"r","status":"failed","error":{"code":"server_error","message":"boom"}}}"#,
-        )
+        ).await
         .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "server_error: boom"));
     }
 
-    #[test]
-    fn error_event_becomes_midstream_error() {
+    #[tokio::test]
+    async fn error_event_becomes_midstream_error() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         let err = feed(
@@ -1019,13 +1042,14 @@ mod tests {
             &tx,
             r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#,
         )
+        .await
         .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "slow down"));
     }
 
-    #[test]
-    fn bare_error_payload_and_typeless_payloads() {
+    #[tokio::test]
+    async fn bare_error_payload_and_typeless_payloads() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
         let err = feed(
@@ -1033,6 +1057,7 @@ mod tests {
             &tx,
             r#"{"error":{"message":"boom","type":"server_error"}}"#,
         )
+        .await
         .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "boom"));
@@ -1046,6 +1071,7 @@ mod tests {
             &tx,
             r#"{"code":"InvalidParameter","message":"Unsupported model: 'x'.","request_id":"r1"}"#,
         )
+        .await
         .unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m == "Unsupported model: 'x'."));
@@ -1053,42 +1079,46 @@ mod tests {
         // A payload without a type and without an error is ignored.
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        feed(&mut acc, &tx, r#"{"some":"vendor extension"}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"some":"vendor extension"}"#)
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn missing_terminal_event_is_an_error() {
+    #[tokio::test]
+    async fn missing_terminal_event_is_an_error() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m","role":"assistant","content":[]}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
         )
+        .await
         .unwrap();
-        let err = acc.finish(&tx).unwrap_err();
+        let err = acc.finish(&tx).await.unwrap_err();
         let e = err.downcast_ref::<ProviderError>().expect("ProviderError");
         assert!(matches!(e, ProviderError::MidStream(m) if m.contains("terminal")));
     }
 
-    #[test]
-    fn encrypted_content_backfilled_from_completed_response() {
+    #[tokio::test]
+    async fn encrypted_content_backfilled_from_completed_response() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
         // The done item lacks encrypted_content (the Azure behavior).
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"hmm"}"#,
         )
+        .await
         .unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}]}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}]}}"#).await.unwrap();
         // The completed response carries it.
-        feed(&mut acc, &tx, r#"{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}],"encrypted_content":"enc-late"}]}}"#).unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"hmm"}],"encrypted_content":"enc-late"}]}}"#).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
@@ -1100,21 +1130,22 @@ mod tests {
         assert_eq!(stored["encrypted_content"], "enc-late");
     }
 
-    #[test]
-    fn leftover_tool_call_slot_resolves_at_finish() {
+    #[tokio::test]
+    async fn leftover_tool_call_slot_resolves_at_finish() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
         // A terminal event can arrive before output_item.done.
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":2}"}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","id":"fc_1","name":"f","arguments":""}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":2}"}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")
@@ -1124,32 +1155,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_events_and_server_side_items_are_ignored() {
+    #[tokio::test]
+    async fn unknown_events_and_server_side_items_are_ignored() {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#).unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#).await.unwrap();
         // Deltas addressing the unmodelled slot must not create blocks.
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.output_text.delta","output_index":0,"delta":"stray"}"#,
         )
+        .await
         .unwrap();
         feed(
             &mut acc,
             &tx,
             r#"{"type":"response.web_search_call.searching","output_index":0}"#,
         )
+        .await
         .unwrap();
         feed(
             &mut acc,
             &tx,
             &completed(r#"{"input_tokens":1,"output_tokens":1}"#),
         )
+        .await
         .unwrap();
-        let msg = acc.finish(&tx).unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
 
         let AgentMessage::Assistant { content, .. } = &msg else {
             panic!("expected assistant")

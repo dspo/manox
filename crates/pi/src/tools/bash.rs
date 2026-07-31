@@ -1,7 +1,6 @@
 // Bash tool — shell command execution with output truncation.
 //
-// Output is truncated to avoid overwhelming the context window. Large outputs
-// are spilled to temp files via OutputAccumulator.
+// Output is truncated to avoid overwhelming the context window.
 
 use std::time::Duration;
 
