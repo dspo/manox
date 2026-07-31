@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~25,900 行 Rust，335 个测试，零警告。
+**当前规模：** ~25,900 行 Rust（src 24.6k + examples 1.3k），335 个测试，零警告。
 
 ## 架构设计
 
@@ -155,7 +155,7 @@ pub trait AgentTool: Send + Sync {
 6. ✅ 实现 `estimate_tokens()` —— 字符数/4 + provider usage
 7. ✅ 实现 `prepare_compaction()` + `compact()` —— 调用 stream_fn 生成摘要
    - 摘要请求逐字对齐 TS `generateSummaryWithUsage`：`serialize_conversation`（user/custom 文本、assistant thinking/文本/tool calls（name+k=JSON 参数）、tool result 截 2000 字符）、`SUMMARIZATION_SYSTEM_PROMPT` 常量、`SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT` 双模板经 `<previous-summary>` 切换
-   - 未对齐项：split-turn（turn prefix 摘要）——cut 恒在整轮边界
+   - 已知余项：split-turn（turn prefix 摘要，cut 恒在整轮边界）
 
 ### Phase 4: AgentHarness 编排层 ✅
 
@@ -168,6 +168,7 @@ pub trait AgentTool: Send + Sync {
    - `on()` 注册 hook handler
    - hook 点：before_agent_start（结果生效：messages 注入进 prompt 批次、systemPrompt 覆盖只达本 run 初始 context）, before_provider_request（逐 provider 调用变换整个 context，覆盖 TS `context` transform 接缝）, tool_call（block）, tool_result（全字段 patch 含 terminate）, session_before_compact（cancel/全量 override）, session_after_compact
    - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/pi-parity.md §7「Hook 系统」行
+   - 取消传播到执行层：`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时 SIGKILL 整个进程树（对齐 TS `killProcessTree`），bash 工具透传 signal
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
 5. ✅ 实现 session 写入缓冲 —— 活跃 turn 期间缓冲写入，turn 边界刷新
@@ -208,7 +209,17 @@ pub trait AgentTool: Send + Sync {
 5. ✅ edit_diff 单元测试（统一 diff 计算、空 diff、hunk 计数）
 6. ✅ 单元测试全通过，零警告（计数见文首「当前规模」，随实现滚动更新）
 
-## 待完成
+### 待完成
+
+TS Pi 对齐的已知余项（逐项对齐核验见 `docs/pi-parity.md`，该文件为准）：
+
+- [ ] 压缩 split-turn（turn prefix 摘要）：cut 恒在整轮边界，单轮超 keep-recent 窗口时整轮保留而非切分
+- [ ] 压缩触发路由：上下文溢出 → 压缩 → 重试一次（provider 层溢出分类已就绪，循环层路由未接）
+- [ ] restore 恢复 path 上的 model：需 facade 层 provider registry 解析 `SessionModelRef`
+- [ ] Completions 流交错块模型：TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块（Phase 2 已知偏离）
+- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（无 fire 点，见 pi-parity §7）
+
+工程化余项：
 
 - [ ] `pi` crate 加入 workspace members（需在 manox 根 Cargo.toml 添加 `crates/pi`）
 - [ ] 集成测试（`crates/pi/tests/` 目录，真实 tokio 环境）
