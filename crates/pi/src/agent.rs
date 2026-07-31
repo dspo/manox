@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
+use crate::tool::{AgentToolResult, ToolContext};
 use crate::types::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState, CacheRetention,
-    ContentBlock, Model,
+    AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState,
+    BeforeProviderRequestFn, BeforeToolCallFn, CacheRetention, ContentBlock, Model,
 };
+use serde_json::Value as JsonValue;
 
 /// Controls how queued messages are drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,39 +91,92 @@ impl EventSink for SubscriberSink {
     }
 }
 
+/// Per-run observation hooks cloned into each turn's `AgentLoopConfig`.
+///
+/// Held as `Arc<dyn Fn>` so `create_loop_config` can produce a fresh `Box`
+/// closure per run without owning the (un-`Clone`) originals. The harness
+/// fills these from its registered `HookPoint`s.
+pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
+pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
+pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+
+#[derive(Default)]
+pub struct LoopHooks {
+    pub before_provider_request: Option<BeforeProviderRequestHook>,
+    pub before_tool_call: Option<BeforeToolCallHook>,
+    pub after_tool_call: Option<AfterToolCallHook>,
+}
+
 /// The Agent wraps the raw agent loop with state management, event
 /// subscription, and message queuing (steering / follow-up).
 pub struct Agent {
     state: AgentState,
-    steering_queue: PendingMessageQueue,
-    follow_up_queue: PendingMessageQueue,
-    active_run: Option<CancellationToken>,
+    /// Mid-turn steering queue, drained by the loop's `get_steering_messages`
+    /// callback. Shared via `Arc<Mutex<..>>` so the closure cloned into the
+    /// loop config can drain it from within the spawned run while the Agent
+    /// still receives `steer()` calls from the outside.
+    steering_queue: Arc<Mutex<PendingMessageQueue>>,
+    /// Post-stop follow-up queue, drained by the loop's
+    /// `get_follow_up_messages` callback to resume a run that would otherwise
+    /// have ended.
+    follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
+    /// The active run's cancel token, shared with [`RunHandle`] so `abort`
+    /// can cancel a run in flight without an `&mut self` borrow on the Agent.
+    active_run: Arc<Mutex<Option<CancellationToken>>>,
     stream_fn: Arc<dyn StreamFn>,
     sink: SubscriberSink,
+    /// Tools mounted on the agent and forwarded into each turn's context.
+    tools: Arc<[Box<dyn crate::tool::AgentTool>]>,
+    /// Session-scoped execution context for tool calls. Backs the real
+    /// `ToolContext` (env + cwd + tool state) so tools reach the filesystem
+    /// and shell instead of panicking.
+    tool_ctx: Arc<dyn ToolContext>,
     /// Session identifier forwarded to providers that support session-based
     /// caching (`prompt_cache_key`).
     session_id: Option<String>,
     /// Prompt cache retention preference forwarded to providers.
     cache_retention: CacheRetention,
+    /// Observation hooks forwarded into each turn's loop config. The harness
+    /// fills these so its registered `HookPoint`s fire inside the loop.
+    loop_hooks: LoopHooks,
 }
 
 impl Agent {
     /// Create a new agent with the given system prompt and model.
+    ///
+    /// `tool_ctx` backs all tool execution; pass a real `ToolContext`
+    /// (e.g. `LocalToolContext`) so fs/shell tools work instead of panicking.
     pub fn new(
         system_prompt: impl Into<String>,
         model: Model,
         stream_fn: Arc<dyn StreamFn>,
+        tool_ctx: Arc<dyn ToolContext>,
     ) -> Self {
         Agent {
             state: AgentState::new(system_prompt, model),
-            steering_queue: PendingMessageQueue::new(QueueMode::OneAtATime),
-            follow_up_queue: PendingMessageQueue::new(QueueMode::OneAtATime),
-            active_run: None,
+            steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
+            follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
+            active_run: Arc::new(Mutex::new(None)),
             stream_fn,
             sink: SubscriberSink::new(),
+            tools: Arc::from(Vec::new()),
+            tool_ctx,
             session_id: None,
             cache_retention: CacheRetention::default(),
+            loop_hooks: LoopHooks::default(),
         }
+    }
+
+    /// Mount tools on the agent. They are forwarded into each turn's context
+    /// so the provider sees them and `execute_tool_calls` can dispatch.
+    pub fn with_tools(mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Replace the mounted tools.
+    pub fn set_tools(&mut self, tools: Arc<[Box<dyn crate::tool::AgentTool>]>) {
+        self.tools = tools;
     }
 
     /// Set the session identifier forwarded to providers for cache-aware
@@ -133,6 +188,11 @@ impl Agent {
     /// Set the prompt cache retention preference forwarded to providers.
     pub fn set_cache_retention(&mut self, retention: CacheRetention) {
         self.cache_retention = retention;
+    }
+
+    /// Set the per-run observation hooks forwarded into the loop config.
+    pub fn set_loop_hooks(&mut self, hooks: LoopHooks) {
+        self.loop_hooks = hooks;
     }
 
     /// Current agent state.
@@ -147,33 +207,53 @@ impl Agent {
 
     /// Queue a message to be injected after the current assistant turn finishes.
     pub fn steer(&mut self, message: AgentMessage) {
-        self.steering_queue.enqueue(message);
+        self.steering_queue.lock().unwrap().enqueue(message);
     }
 
     /// Queue a message to run only after the agent would otherwise stop.
     pub fn follow_up(&mut self, message: AgentMessage) {
-        self.follow_up_queue.enqueue(message);
+        self.follow_up_queue.lock().unwrap().enqueue(message);
     }
 
     /// Remove all queued steering messages.
     pub fn clear_steering_queue(&mut self) {
-        self.steering_queue.clear();
+        self.steering_queue.lock().unwrap().clear();
     }
 
     /// Remove all queued follow-up messages.
     pub fn clear_follow_up_queue(&mut self) {
-        self.follow_up_queue.clear();
+        self.follow_up_queue.lock().unwrap().clear();
     }
 
     /// Whether either queue has pending messages.
     pub fn has_queued_messages(&self) -> bool {
-        self.steering_queue.has_items() || self.follow_up_queue.has_items()
+        self.steering_queue.lock().unwrap().has_items()
+            || self.follow_up_queue.lock().unwrap().has_items()
     }
 
     /// Abort the current run, if one is active.
-    pub fn abort(&mut self) {
-        if let Some(token) = self.active_run.take() {
+    pub fn abort(&self) {
+        if let Some(token) = self.active_run.lock().unwrap().take() {
             token.cancel();
+        }
+    }
+
+    /// Whether a run is currently in flight.
+    fn is_running(&self) -> bool {
+        self.active_run.lock().unwrap().is_some()
+    }
+
+    /// A decoupled handle for mid-run control.
+    ///
+    /// `prompt`/`continue_` take `&mut self` for the whole run, so the Agent's
+    /// own `steer`/`follow_up`/`abort` cannot be called while a run is in
+    /// flight. The handle shares the same `Arc`-backed queues and cancel slot,
+    /// exposing `&self` methods callable from another task during the run.
+    pub fn run_handle(&self) -> RunHandle {
+        RunHandle {
+            steering_queue: Arc::clone(&self.steering_queue),
+            follow_up_queue: Arc::clone(&self.follow_up_queue),
+            active_run: Arc::clone(&self.active_run),
         }
     }
 
@@ -184,8 +264,8 @@ impl Agent {
         self.state.streaming_message = None;
         self.state.pending_tool_calls.clear();
         self.state.error_message = None;
-        self.steering_queue.clear();
-        self.follow_up_queue.clear();
+        self.steering_queue.lock().unwrap().clear();
+        self.follow_up_queue.lock().unwrap().clear();
     }
 
     /// Replace the entire transcript with new messages.
@@ -198,7 +278,7 @@ impl Agent {
 
     /// Start a new prompt from text.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing a prompt.");
         }
 
@@ -215,7 +295,7 @@ impl Agent {
 
     /// Continue from the current transcript.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing.");
         }
 
@@ -224,11 +304,11 @@ impl Agent {
             None => anyhow::bail!("No messages to continue from"),
             Some(AgentMessage::Assistant { .. }) => {
                 // Try draining steering/follow-up queues first.
-                let steering = self.steering_queue.drain();
+                let steering = self.steering_queue.lock().unwrap().drain();
                 if !steering.is_empty() {
                     return self.run_prompt_messages(&steering).await;
                 }
-                let follow_up = self.follow_up_queue.drain();
+                let follow_up = self.follow_up_queue.lock().unwrap().drain();
                 if !follow_up.is_empty() {
                     return self.run_prompt_messages(&follow_up).await;
                 }
@@ -243,7 +323,7 @@ impl Agent {
         AgentContext {
             system_prompt: self.state.system_prompt.clone(),
             messages: self.state.messages.clone(),
-            tools: Vec::new(), // tools are set externally
+            tools: Arc::clone(&self.tools),
             model: self.state.model.clone(),
             thinking_level: self.state.thinking_level.clone(),
             cache_retention: self.cache_retention,
@@ -253,14 +333,35 @@ impl Agent {
     }
 
     /// Build the loop config from the current agent state.
+    ///
+    /// The steering and follow-up queues are handed to the loop as draining
+    /// callbacks so messages queued mid-run (via `steer`) or after a natural
+    /// stop (via `follow_up`) are injected by the loop itself rather than
+    /// requiring the caller to manually resume.
     fn create_loop_config(&self) -> AgentLoopConfig {
+        let steering = Arc::clone(&self.steering_queue);
+        let follow_up = Arc::clone(&self.follow_up_queue);
+        let before_provider = self.loop_hooks.before_provider_request.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |ctx: &AgentContext| h(ctx)) as BeforeProviderRequestFn
+        });
+        let before_tool = self.loop_hooks.before_tool_call.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |id: &str, name: &str, args: &JsonValue| h(id, name, args))
+                as BeforeToolCallFn
+        });
+        let after_tool = self.loop_hooks.after_tool_call.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |r: &AgentToolResult| h(r)) as AfterToolCallFn
+        });
         AgentLoopConfig {
-            get_steering_messages: None,
-            get_follow_up_messages: None,
+            get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
+            get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
             prepare_next_turn: None,
             should_stop_after_turn: None,
-            before_tool_call: None,
-            after_tool_call: None,
+            before_tool_call: before_tool,
+            after_tool_call: after_tool,
+            before_provider_request: before_provider,
             sequential_tool_execution: false,
             max_turns: None,
         }
@@ -276,13 +377,21 @@ impl Agent {
                 let mut context = agent.create_context_snapshot();
                 let config = agent.create_loop_config();
                 let stream_fn = Arc::clone(&agent.stream_fn);
+                let tool_ctx = Arc::clone(&agent.tool_ctx);
                 let sink = agent.sink.clone();
                 let msgs = owned_messages.clone();
 
                 Box::pin(async move {
-                    let msgs =
-                        run_loop(&msgs, &mut context, &config, Some(signal), stream_fn, &sink)
-                            .await?;
+                    let msgs = run_loop(
+                        &msgs,
+                        &mut context,
+                        &config,
+                        Some(signal),
+                        stream_fn,
+                        &*tool_ctx,
+                        &sink,
+                    )
+                    .await?;
                     Ok((msgs, context))
                 })
             })
@@ -297,12 +406,19 @@ impl Agent {
                 let mut context = agent.create_context_snapshot();
                 let config = agent.create_loop_config();
                 let stream_fn = Arc::clone(&agent.stream_fn);
+                let tool_ctx = Arc::clone(&agent.tool_ctx);
                 let sink = agent.sink.clone();
 
                 Box::pin(async move {
-                    let msgs =
-                        run_loop_continue(&mut context, &config, Some(signal), stream_fn, &sink)
-                            .await?;
+                    let msgs = run_loop_continue(
+                        &mut context,
+                        &config,
+                        Some(signal),
+                        stream_fn,
+                        &*tool_ctx,
+                        &sink,
+                    )
+                    .await?;
                     Ok((msgs, context))
                 })
             })
@@ -327,12 +443,12 @@ impl Agent {
             >,
         >,
     {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing.");
         }
 
         let token = CancellationToken::new();
-        self.active_run = Some(token.clone());
+        *self.active_run.lock().unwrap() = Some(token.clone());
         self.state.is_streaming = true;
         self.state.streaming_message = None;
         self.state.error_message = None;
@@ -342,7 +458,7 @@ impl Agent {
         self.state.is_streaming = false;
         self.state.streaming_message = None;
         self.state.error_message = None;
-        self.active_run = None;
+        *self.active_run.lock().unwrap() = None;
 
         result
     }
@@ -356,10 +472,144 @@ impl Clone for SubscriberSink {
     }
 }
 
+/// Decoupled, cloneable handle for mid-run control of an [`Agent`].
+///
+/// Shares the agent's steering/follow-up queues and cancel slot via `Arc`, so
+/// `steer`/`follow_up`/`abort` work from another task while `prompt` holds the
+/// exclusive borrow on the Agent.
+#[derive(Clone)]
+pub struct RunHandle {
+    steering_queue: Arc<Mutex<PendingMessageQueue>>,
+    follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
+    active_run: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl RunHandle {
+    /// Queue a steering message injected into the current or next turn.
+    pub fn steer(&self, message: AgentMessage) {
+        self.steering_queue.lock().unwrap().enqueue(message);
+    }
+
+    /// Queue a follow-up message that resumes a run that would otherwise stop.
+    pub fn follow_up(&self, message: AgentMessage) {
+        self.follow_up_queue.lock().unwrap().enqueue(message);
+    }
+
+    /// Cancel the active run, if one is in flight.
+    pub fn abort(&self) {
+        if let Some(token) = self.active_run.lock().unwrap().take() {
+            token.cancel();
+        }
+    }
+
+    /// Whether either queue has pending messages.
+    pub fn has_queued_messages(&self) -> bool {
+        self.steering_queue.lock().unwrap().has_items()
+            || self.follow_up_queue.lock().unwrap().has_items()
+    }
+
+    /// Remove all queued steering messages.
+    pub fn clear_steering_queue(&self) {
+        self.steering_queue.lock().unwrap().clear();
+    }
+
+    /// Remove all queued follow-up messages.
+    pub fn clear_follow_up_queue(&self) {
+        self.follow_up_queue.lock().unwrap().clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::ExecutionEnv;
+    use crate::tool::ToolState;
     use crate::types::{StopReason, ThinkingKind, Usage};
+    use std::path::{Path, PathBuf};
+
+    struct TestEnv;
+
+    #[async_trait::async_trait]
+    impl ExecutionEnv for TestEnv {
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, crate::env::FileError> {
+            Ok(path.to_path_buf())
+        }
+        fn join_path(&self, parts: &[&str]) -> PathBuf {
+            parts.iter().collect()
+        }
+        async fn read_file(
+            &self,
+            _path: &Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, crate::env::FileError> {
+            Ok(String::new())
+        }
+        async fn write_file(
+            &self,
+            _path: &Path,
+            _content: &str,
+        ) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &Path) -> Result<bool, crate::env::FileError> {
+            Ok(false)
+        }
+        async fn file_info(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::env::FileInfo, crate::env::FileError> {
+            unreachable!("TestEnv fs ops are not exercised by agent tests")
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<crate::env::FileInfo>, crate::env::FileError> {
+            Ok(vec![])
+        }
+        async fn create_dir(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn remove(&self, _path: &Path) -> Result<(), crate::env::FileError> {
+            Ok(())
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    struct TestToolContext {
+        state: ToolState,
+    }
+
+    impl ToolContext for TestToolContext {
+        fn env(&self) -> &dyn ExecutionEnv {
+            &TestEnv
+        }
+        fn cwd(&self) -> &Path {
+            Path::new("/test")
+        }
+        fn tool_state(&self) -> &ToolState {
+            &self.state
+        }
+    }
+
+    fn test_tool_ctx() -> Arc<dyn ToolContext> {
+        Arc::new(TestToolContext {
+            state: ToolState::new(),
+        })
+    }
 
     struct TestStreamFn;
 
@@ -378,8 +628,13 @@ mod tests {
                 }],
                 model: "test".into(),
                 provider: "test".into(),
-                stop_reason: Some(StopReason::EndTurn),
-                usage: Usage::default(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage::default()),
+                error_message: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -402,6 +657,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
 
         let result = agent.prompt("Hello").await;
@@ -413,10 +669,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_abort() {
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
         agent.abort();
         // Should not panic.
@@ -428,6 +685,7 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
 
         let _ = agent.prompt("Hello").await;
@@ -442,10 +700,134 @@ mod tests {
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
+            test_tool_ctx(),
         );
         agent.steer(AgentMessage::user("steering message"));
         assert!(agent.has_queued_messages());
         agent.clear_steering_queue();
         assert!(!agent.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn steering_queued_before_run_is_injected_by_loop() {
+        // #367: a steering message queued before the run starts must be
+        // drained by the loop's `get_steering_messages` callback and injected
+        // into the transcript between the user prompt and the assistant
+        // response — not left sitting in the queue.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+            test_tool_ctx(),
+        );
+        agent.steer(AgentMessage::user("STEER"));
+
+        let messages = agent.prompt("hi").await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::User { content, .. }
+                    if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "STEER")))),
+            "steering message must appear in the run's new messages"
+        );
+        assert!(
+            !agent.has_queued_messages(),
+            "steering queue must be drained after the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_via_run_handle_shares_steering_queue() {
+        // F3: RunHandle must share the same steering queue the loop drains,
+        // so a message enqueued through the handle before a run is injected.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+            test_tool_ctx(),
+        );
+        let handle = agent.run_handle();
+        handle.steer(AgentMessage::user("STEER-HANDLE"));
+
+        let messages = agent.prompt("hi").await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::User { content, .. }
+                    if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "STEER-HANDLE")))),
+            "handle-steered message must appear in the run's new messages"
+        );
+        assert!(
+            !agent.has_queued_messages(),
+            "shared steering queue must be drained after the run"
+        );
+    }
+
+    /// Stream fn that blocks until the run is cancelled, then surfaces an
+    /// `Aborted` terminal — lets an abort test exercise a run in flight.
+    struct BlockingStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for BlockingStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            signal.cancelled().await;
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "aborted".into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Aborted),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_via_run_handle_terminates_run_in_flight() {
+        // F3: RunHandle::abort must cancel a run in flight via the shared
+        // cancel slot, without needing an &mut self on the Agent (which prompt
+        // holds for the whole run).
+        //
+        // `prompt`'s future is not `Send` (the loop's pinned executor future
+        // borrows `&mut AgentContext`), so drive it on a `LocalSet` instead of
+        // a multi-threaded `tokio::spawn`.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(BlockingStreamFn),
+            test_tool_ctx(),
+        );
+        let handle = agent.run_handle();
+
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                let join = tokio::task::spawn_local(async move { agent.prompt("hi").await });
+                // Let the run register its cancel token in the shared slot.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                handle.abort();
+                tokio::time::timeout(std::time::Duration::from_secs(2), join)
+                    .await
+                    .expect("abort did not terminate the run within timeout")
+                    .expect("spawned task panicked")
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "aborted run must complete with Ok, got: {:?}",
+            result.err()
+        );
     }
 }

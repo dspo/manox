@@ -60,6 +60,10 @@ impl CompletionsStreamFn {
 
 #[async_trait::async_trait]
 impl StreamFn for CompletionsStreamFn {
+    fn api(&self) -> &str {
+        "openai_completions"
+    }
+
     async fn stream(
         &self,
         context: &AgentContext,
@@ -146,6 +150,13 @@ fn apply_payload(
 struct Accumulator {
     model: String,
     provider: String,
+    /// Response id reported in the first chunk, surfaced as `response_id`.
+    response_id: Option<String>,
+    /// Model reported in a chunk when the upstream reroutes the request.
+    response_model: Option<String>,
+    /// Raw `finish_reason` retained so a failure stop reason carries an
+    /// `error_message` derived from it.
+    raw_finish_reason: Option<String>,
     blocks: Vec<ContentBlock>,
     /// Block currently receiving text deltas; reset when another kind
     /// interrupts the run.
@@ -156,7 +167,7 @@ struct Accumulator {
     /// parsed once the stream completes.
     tool_calls: Vec<ToolCallAcc>,
     stop_reason: Option<crate::types::StopReason>,
-    usage: Usage,
+    usage: Box<Usage>,
     started: bool,
 }
 
@@ -173,23 +184,40 @@ impl Accumulator {
         Accumulator {
             model: context.model.id.clone(),
             provider: context.model.provider.clone(),
+            response_id: None,
+            response_model: None,
+            raw_finish_reason: None,
             blocks: Vec::new(),
             open_text: None,
             open_thinking: None,
             tool_calls: Vec::new(),
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             started: false,
         }
     }
 
     fn current(&self) -> AgentMessage {
+        // A failure finish reason (content_filter/network_error) surfaces its
+        // raw label as the message's `error_message`.
+        let error_message = match self.stop_reason {
+            Some(crate::types::StopReason::Error) => Some(format!(
+                "provider finish reason: {}",
+                self.raw_finish_reason.as_deref().unwrap_or("error")
+            )),
+            _ => None,
+        };
         AgentMessage::Assistant {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            api: "openai_completions".into(),
+            response_model: self.response_model.clone(),
+            response_id: self.response_id.clone(),
+            diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
+            error_message,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -204,7 +232,15 @@ impl Accumulator {
             .as_ref()
             .or_else(|| chunk.choices.first().and_then(|c| c.usage.as_ref()))
         {
-            self.usage = to_usage(usage);
+            *self.usage = to_usage(usage);
+        }
+        // Capture the response id and (possibly rerouted) model from the
+        // first chunk that carries them.
+        if let Some(id) = &chunk.id {
+            self.response_id = Some(id.clone());
+        }
+        if let Some(m) = &chunk.model {
+            self.response_model = Some(m.clone());
         }
         if !self.started {
             self.started = true;
@@ -217,6 +253,7 @@ impl Accumulator {
             return Ok(());
         };
         if let Some(reason) = &choice.finish_reason {
+            self.raw_finish_reason = Some(reason.clone());
             self.stop_reason = Some(parse_finish_reason(reason));
         }
         let Some(delta) = choice.delta else {
@@ -293,6 +330,7 @@ impl Accumulator {
                 self.blocks.push(ContentBlock::Thinking {
                     thinking: String::new(),
                     signature: None,
+                    redacted: None,
                 });
                 let i = self.blocks.len() - 1;
                 self.open_thinking = Some(i);
@@ -311,6 +349,7 @@ impl Accumulator {
                 id: String::new(),
                 name: String::new(),
                 input: JsonValue::Null,
+                thought_signature: None,
             });
             self.tool_calls.push(ToolCallAcc {
                 block_index,
@@ -377,13 +416,14 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::types::{Model, StopReason, ThinkingKind};
+    use std::sync::Arc;
     use wire::{WireChoice, WireDelta, WireFunctionDelta, WirePromptTokensDetails, WireUsage};
 
     fn ctx() -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "openai".into(),
                 id: "gpt-test".into(),
@@ -467,7 +507,7 @@ mod tests {
                 assert!(
                     matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
                 );
-                assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+                assert_eq!(*stop_reason, Some(StopReason::Stop));
             }
             _ => panic!("expected assistant"),
         }
@@ -504,7 +544,7 @@ mod tests {
         };
         assert_eq!(content.len(), 2);
         assert!(
-            matches!(&content[0], ContentBlock::Thinking { thinking, signature }
+            matches!(&content[0], ContentBlock::Thinking { thinking, signature, .. }
             if thinking == "let me think" && signature.is_none())
         );
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
@@ -588,7 +628,9 @@ mod tests {
         assert_eq!(*stop_reason, Some(StopReason::ToolUse));
         assert_eq!(content.len(), 2);
         match &content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "c1");
                 assert_eq!(name, "read");
                 assert_eq!(*input, serde_json::json!({"path": "x"}));
@@ -596,7 +638,9 @@ mod tests {
             other => panic!("expected tool_use, got {other:?}"),
         }
         match &content[1] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "c2");
                 assert_eq!(name, "bash");
                 assert_eq!(*input, serde_json::json!({"cmd": "ls"}));
@@ -650,6 +694,7 @@ mod tests {
             prompt_tokens_details: Some(WirePromptTokensDetails {
                 cached_tokens: Some(40),
             }),
+            completion_tokens_details: None,
         };
 
         // On the chunk (the standard position).

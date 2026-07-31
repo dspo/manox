@@ -155,18 +155,24 @@ pub struct ToolParam {
     pub cache_control: Option<CacheControl>,
 }
 
-/// The `thinking` request field. All three protocol variants are supported;
-/// `budget_tokens` is intentionally omitted — reasoning depth is controlled by
-/// `output_config.effort`, not by a token budget.
+/// The `thinking` request field. Adaptive models take `display` + an effort
+/// tier in `output_config`; enabled (non-adaptive) models take a `budget_tokens`
+/// cap that controls reasoning depth, mirroring the TS Pi wire shape.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ThinkingConfig {
-    /// Enable thinking without a token budget (the gateway/model decides how
-    /// much to think; effort is set separately in `output_config`).
+    /// Enable thinking with a token budget. `budget_tokens` is the depth knob
+    /// for non-adaptive models (adaptive models use `output_config.effort`
+    /// instead, so they take the `Adaptive` variant).
     #[serde(rename = "enabled")]
     Enabled {
         #[serde(skip_serializing_if = "Option::is_none")]
         display: Option<ThinkingDisplay>,
+        /// Reasoning token budget. Always sent for enabled models, clamped to
+        /// the request's `max_tokens` so the API's `budget < max_tokens` rule
+        /// holds.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_tokens: Option<u64>,
     },
     /// Explicitly disable thinking. Omitting the field entirely leaves the
     /// server default in place; this variant forces thinking off.

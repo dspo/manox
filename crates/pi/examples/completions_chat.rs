@@ -26,6 +26,7 @@
 use pi::provider::openai::completions::CompletionsStreamFn;
 use pi::types::{ContentBlock, Model, ThinkingKind};
 use pi::{AgentContext, AgentEvent, AgentMessage, StreamFn};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -97,7 +98,7 @@ async fn main() {
     let context = AgentContext {
         system_prompt: "You are a concise assistant.".into(),
         messages: vec![AgentMessage::user(&args.prompt)],
-        tools: Vec::new(),
+        tools: Arc::from(vec![]),
         model: Model {
             provider: "openai".into(),
             id: args.model.clone(),
@@ -141,8 +142,11 @@ async fn main() {
                     for (i, block) in content.iter().enumerate() {
                         let (dim, text) = match block {
                             ContentBlock::Text { text, .. } => (false, text.as_str()),
+                            ContentBlock::Thinking {
+                                redacted: Some(true),
+                                ..
+                            } => (true, "[redacted thinking]"),
                             ContentBlock::Thinking { thinking, .. } => (true, thinking.as_str()),
-                            ContentBlock::RedactedThinking { .. } => (true, "[redacted thinking]"),
                             ContentBlock::ToolUse { name, input, .. } => {
                                 if i >= block_lens.len() {
                                     if dim_open {

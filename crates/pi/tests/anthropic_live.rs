@@ -8,6 +8,7 @@ use pi::provider::ProviderError;
 use pi::provider::anthropic::AnthropicStreamFn;
 use pi::types::{Model, ThinkingKind};
 use pi::{AgentContext, AgentEvent, AgentMessage, StreamFn};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +27,7 @@ fn ctx_with(prompt: &str) -> AgentContext {
     AgentContext {
         system_prompt: "You are a concise assistant. Answer in a few words.".into(),
         messages: vec![AgentMessage::user(prompt)],
-        tools: Vec::new(),
+        tools: Arc::from(vec![]),
         model: real_model(),
         thinking_level: None,
         cache_retention: Default::default(),
@@ -167,7 +168,7 @@ async fn live_tool_use_roundtrip() {
     };
 
     let mut ctx = ctx_with("What's the weather in Paris? You must call get_weather.");
-    ctx.tools = vec![Box::new(GetWeather)];
+    ctx.tools = Arc::from(vec![Box::new(GetWeather) as Box<dyn AgentTool>]);
 
     let (tx, _rx) = mpsc::channel::<AgentEvent>(256);
     let msg = sf

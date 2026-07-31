@@ -7,13 +7,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── Message types ───────────────────────────────────────────────────────────
 
 /// A content block within a message sent to or received from an LLM.
 ///
-/// Serde tags mirror the Anthropic Messages API wire format so that blocks
-/// round-trip without a lossy translation layer.
+/// Mirrors the TS Pi content shapes: `text` carries `textSignature`, `image`
+/// is flat with `mimeType`, `toolCall` carries `arguments` + `thoughtSignature`,
+/// and redacted reasoning is a `thinking` block with `redacted: true` (the
+/// opaque payload lives in `thinkingSignature`), not a separate type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
@@ -25,85 +28,136 @@ pub enum ContentBlock {
         /// phase for the OpenAI Responses API). `None` for providers whose
         /// protocol carries no text identity, such as Anthropic and Chat
         /// Completions.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "textSignature"
+        )]
         signature: Option<String>,
     },
     #[serde(rename = "image")]
-    Image { source: ImageSource },
-    #[serde(rename = "tool_use")]
+    Image {
+        /// Base64-encoded image bytes.
+        data: String,
+        /// MIME type, e.g. `image/png`.
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "toolCall")]
     ToolUse {
         id: String,
         name: String,
+        #[serde(rename = "arguments")]
         input: JsonValue,
+        /// Opaque provider signature for reusing thought context (Google).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "thoughtSignature"
+        )]
+        thought_signature: Option<String>,
     },
     /// A model reasoning trace. `signature` is opaque provider data that must
     /// be echoed back verbatim on later turns to preserve thinking continuity.
+    /// `redacted` marks a trace the provider encrypted; its payload is stored
+    /// in `signature` and `thinking` is empty.
     #[serde(rename = "thinking")]
     Thinking {
         thinking: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "thinkingSignature"
+        )]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<bool>,
     },
-    /// An encrypted reasoning trace whose content the provider redacted.
-    #[serde(rename = "redacted_thinking")]
-    RedactedThinking { data: String },
-}
-
-/// Source of an image in a content block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ImageSource {
-    #[serde(rename = "base64")]
-    Base64 { media_type: String, data: String },
-    #[serde(rename = "url")]
-    Url { url: String },
 }
 
 /// A message in the agent conversation.
+///
+/// Serialized in the TS Pi v3 message shape: roles `user` / `assistant` /
+/// `toolResult`, with camelCase fields (`toolCallId`, `toolName`, `isError`,
+/// `stopReason`, `responseId`, `responseModel`, `errorMessage`, `customType`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role")]
+#[serde(tag = "role", rename_all = "camelCase")]
 pub enum AgentMessage {
-    #[serde(rename = "user")]
+    #[serde(rename = "user", rename_all = "camelCase")]
     User {
+        #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
-    #[serde(rename = "assistant")]
+    #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
         content: Vec<ContentBlock>,
         model: String,
         provider: String,
-        /// The protocol stop_reason reported by the provider. `None` while the
-        /// message is still streaming or when the run ended without one
-        /// (aborted, errored) — see [`Termination`].
+        /// The wire API shape used for this turn ("anthropic",
+        /// "openai_completions", "openai_responses", ...). Distinct from
+        /// `provider`, which names the vendor.
+        api: String,
+        /// Concrete `chunk.model` when the upstream returns a different one
+        /// than requested (e.g. OpenRouter `auto` -> `anthropic/...`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_model: Option<String>,
+        /// Provider-specific response/message identifier when exposed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// Redacted provider/runtime diagnostics for failures and recoveries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<Vec<JsonValue>>,
+        /// The stop reason reported for this turn. `None` only while the
+        /// message is still streaming; a finalized message always carries one
+        /// — `Error`/`Aborted` cover provider failures and local interrupts.
         #[serde(default)]
         stop_reason: Option<StopReason>,
-        #[serde(default)]
-        usage: Usage,
-        #[serde(default = "chrono::Utc::now")]
+        /// Boxed so the `Assistant` variant — by far the largest, carrying the
+        /// provider's full response payload — stays off the enum's inline size.
+        /// `Box<Usage>` derefs to `Usage`, so reads are transparent.
+        #[serde(default = "default_usage")]
+        usage: Box<Usage>,
+        /// Failure explanation when `stop_reason` is `Error`/`Aborted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
-    #[serde(rename = "toolResult")]
+    #[serde(rename = "toolResult", rename_all = "camelCase")]
     ToolResult {
         tool_call_id: String,
         tool_name: String,
         content: Vec<ContentBlock>,
         #[serde(default)]
         is_error: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<JsonValue>,
-        #[serde(default = "chrono::Utc::now")]
+        /// Token usage attributed to the tool result, when the provider reports
+        /// per-call usage (e.g. Responses API `usage` on the output item).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        /// Tool names the call added to the session's allowed set, when the
+        /// provider reports additions (Responses API `added_tool_names`).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "addedToolNames"
+        )]
+        added_tool_names: Option<Vec<String>>,
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
     /// Extension point for custom message types.
-    #[serde(rename = "custom")]
+    #[serde(rename = "custom", rename_all = "camelCase")]
     Custom {
         custom_type: String,
+        #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         #[serde(default)]
         details: Option<JsonValue>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
 }
@@ -131,78 +185,144 @@ impl AgentMessage {
     }
 }
 
-/// Why the assistant stopped generating, as reported by the provider.
+/// Why the assistant stopped generating, as reported by the provider or set
+/// locally on interruption.
 ///
-/// Mirrors the Anthropic Messages API `stop_reason` values exactly. Local
-/// interruptions (user abort, provider error) are NOT represented here — they
-/// surface through [`Termination`] and the error channel instead.
+/// Mirrors the TS Pi `StopReason`: `Stop`/`Length`/`ToolUse` come from the
+/// provider's protocol stop reason; `Error` covers provider-reported failures
+/// (refusal, content filter, context-window overflow) and transport errors;
+/// `Aborted` covers user/system cancellation. An `Error`/`Aborted` message
+/// carries `error_message`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum StopReason {
-    /// Natural completion.
-    EndTurn,
-    /// Output token limit reached.
-    MaxTokens,
-    /// A stop sequence was hit.
-    StopSequence,
-    /// The model requested a tool call.
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "length")]
+    Length,
+    #[serde(rename = "toolUse")]
     ToolUse,
-    /// The model paused a long-running turn (may be resumed).
-    PauseTurn,
-    /// The model refused the request.
-    Refusal,
-    /// The model's context window was exceeded.
-    ModelContextWindowExceeded,
-}
-
-/// Why a run ended without a protocol `stop_reason`.
-///
-/// These are local interruptions, distinct from anything the provider reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Termination {
-    /// Aborted by the user or system.
-    Aborted,
-    /// The provider or transport errored.
+    #[serde(rename = "error")]
     Error,
+    #[serde(rename = "aborted")]
+    Aborted,
 }
 
 /// Token usage for a single assistant message.
 ///
-/// Field names mirror the Anthropic Messages API usage object.
+/// Serialized in the TS Pi v3 usage shape: `input` / `output` / `cacheRead` /
+/// `cacheWrite` / `totalTokens`, with an optional `cacheWrite1h` split and a
+/// `cost` breakdown. Rust field names stay snake_case; serde renames map them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Usage {
-    #[serde(default)]
+    #[serde(default, rename = "input")]
     pub input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "output")]
     pub output_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "cacheRead")]
     pub cache_read_input_tokens: u64,
-    #[serde(default)]
+    #[serde(default, rename = "cacheWrite")]
     pub cache_creation_input_tokens: u64,
-    /// Breakdown of cache creation by TTL, when the provider reports it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation: Option<CacheCreation>,
+    /// The 1h-TTL portion of cache creation, when the provider reports it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "cacheWrite1h"
+    )]
+    pub cache_write_1h: Option<u64>,
+    /// Reasoning/thinking tokens, when the provider reports them. A subset
+    /// of `output_tokens`; `None` when the provider exposes no breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoning")]
+    pub reasoning_tokens: Option<u64>,
     /// Total context tokens. Providers that report a total (Responses) use
     /// it verbatim; the other shapes compute the sum of all token classes
     /// at the wire boundary. Zero means no usage was reported at all.
     #[serde(default)]
     pub total_tokens: u64,
+    /// Monetary cost for this response, when a rate card was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
 }
 
-/// Cache creation split by TTL.
+/// Monetary cost broken down by token class.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CacheCreation {
+#[serde(rename_all = "camelCase")]
+pub struct Cost {
     #[serde(default)]
-    pub ephemeral_1h_input_tokens: u64,
+    pub input: f64,
     #[serde(default)]
-    pub ephemeral_5m_input_tokens: u64,
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+    #[serde(default)]
+    pub total: f64,
 }
 
 impl Usage {
     /// Total input tokens: direct input plus cache reads and writes.
     pub fn total_input(&self) -> u64 {
         self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+}
+
+/// Serde default for the boxed `usage` field on `Assistant`.
+fn default_usage() -> Box<Usage> {
+    Box::new(Usage::default())
+}
+
+/// Deserialize `User`/`Custom` message content, accepting either a plain
+/// string (wrapped in a single `text` block) or an array of content blocks —
+/// the two wire shapes TS Pi emits for user-typed and tool/image content.
+pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ContentBlock>, D::Error> {
+    use serde::de::Error;
+
+    let value = serde_json::Value::deserialize(d)?;
+    match value {
+        serde_json::Value::String(s) => Ok(vec![ContentBlock::Text {
+            text: s,
+            signature: None,
+        }]),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| serde_json::from_value::<ContentBlock>(item).map_err(Error::custom))
+            .collect(),
+        other => Err(Error::custom(format!(
+            "expected string or array of content blocks, got {}",
+            other
+        ))),
+    }
+}
+
+/// Serde for `AgentMessage` timestamps as epoch milliseconds — the on-disk
+/// shape TS Pi v3 stores for a message's own timestamp (entry-level
+/// timestamps stay ISO strings). Used only for session storage; the wire
+/// formats build their own request structs and never touch this.
+mod ts_millis {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i64(dt.timestamp_millis())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Number(n) => {
+                let ms = n.as_i64().ok_or_else(|| {
+                    serde::de::Error::custom("timestamp must be integer milliseconds")
+                })?;
+                DateTime::<Utc>::from_timestamp_millis(ms)
+                    .ok_or_else(|| serde::de::Error::custom("timestamp millis out of range"))
+            }
+            _ => Err(serde::de::Error::custom(
+                "timestamp must be integer milliseconds",
+            )),
+        }
     }
 }
 
@@ -224,18 +344,32 @@ pub enum AgentEvent {
     MessageUpdate { message: Box<AgentMessage> },
     /// A message has finished streaming.
     MessageEnd { message: Box<AgentMessage> },
-    /// A tool call has started executing.
+    /// A tool call has started executing. Carries the arguments the model
+    /// supplied so consumers can reconstruct the call without walking history.
     ToolExecutionStart {
         tool_call_id: String,
         tool_name: String,
+        arguments: JsonValue,
     },
-    /// A currently-executing tool emitted an update.
+    /// A currently-executing tool emitted a partial result. Repeats the call
+    /// identity and arguments alongside the partial payload so a consumer can
+    /// attach progress to the right call without cross-referencing history.
     ToolExecutionUpdate {
         tool_call_id: String,
-        details: JsonValue,
+        tool_name: String,
+        arguments: JsonValue,
+        partial_result: JsonValue,
     },
-    /// A tool call has finished executing.
-    ToolExecutionEnd { tool_call_id: String },
+    /// A tool call has finished executing. Carries the full result — content,
+    /// details, per-call usage, added tool names, and the terminate signal —
+    /// alongside a top-level error flag, mirroring the TS Pi event so a
+    /// consumer can branch on success without unpacking the result.
+    ToolExecutionEnd {
+        tool_call_id: String,
+        tool_name: String,
+        result: AgentToolResult,
+        is_error: bool,
+    },
     /// A turn has completed.
     TurnEnd {
         message: Box<AgentMessage>,
@@ -261,6 +395,13 @@ pub enum AgentEvent {
         /// All new messages produced during this run.
         messages: Vec<AgentMessage>,
     },
+}
+
+/// Sink for agent lifecycle events emitted during the loop and the tool
+/// execution pipeline. Implementations forward events to subscribers or
+/// capture them in tests.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, event: AgentEvent);
 }
 
 // ── Agent context and configuration ─────────────────────────────────────────
@@ -324,13 +465,16 @@ pub enum CacheRetention {
 }
 
 /// The context passed into the agent loop at the start of each turn.
+#[derive(Clone)]
 pub struct AgentContext {
     /// The current system prompt.
     pub system_prompt: String,
     /// All messages in the conversation (including historical).
     pub messages: Vec<AgentMessage>,
-    /// Tools available to the agent (not clonable — trait objects).
-    pub tools: Vec<Box<dyn super::AgentTool>>,
+    /// Tools available to the agent. Shared via `Arc` so cloning the context
+    /// (notably across the `tokio::spawn` boundary in the stream path) keeps
+    /// the tool list intact and the provider sees what the caller mounted.
+    pub tools: Arc<[Box<dyn super::AgentTool>]>,
     /// The model being used for this turn.
     pub model: Model,
     /// Current thinking level.
@@ -342,21 +486,6 @@ pub struct AgentContext {
     pub session_id: Option<String>,
     /// Additional context metadata.
     pub metadata: HashMap<String, JsonValue>,
-}
-
-impl Clone for AgentContext {
-    fn clone(&self) -> Self {
-        AgentContext {
-            system_prompt: self.system_prompt.clone(),
-            messages: self.messages.clone(),
-            tools: Vec::new(), // tools are not cloned — caller must re-set
-            model: self.model.clone(),
-            thinking_level: self.thinking_level.clone(),
-            cache_retention: self.cache_retention,
-            session_id: self.session_id.clone(),
-            metadata: self.metadata.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for AgentContext {
@@ -384,6 +513,9 @@ pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + 
 pub type BeforeToolCallFn = Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 /// Patches a tool result after execution.
 pub type AfterToolCallFn = Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+/// Observes the context right before it is sent to the provider and may
+/// return a mutated copy; the returned context is what the provider sees.
+pub type BeforeProviderRequestFn = Box<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 
 /// Configuration for a single agent loop invocation.
 #[derive(Default)]
@@ -400,6 +532,8 @@ pub struct AgentLoopConfig {
     pub before_tool_call: Option<BeforeToolCallFn>,
     /// Called after a tool call executes to patch the result.
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// Called right before the context is handed to the provider, each turn.
+    pub before_provider_request: Option<BeforeProviderRequestFn>,
     /// Whether tools execute sequentially (default: parallel).
     pub sequential_tool_execution: bool,
     /// Maximum number of turns before forcing a stop.
@@ -462,3 +596,103 @@ pub struct StreamOptions {
 // ── Re-export from tool module ──────────────────────────────────────────────
 
 use super::tool::AgentToolResult;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The TS Pi v3 on-disk shape: assistant with a `toolCall` block and a
+    /// `toolResult` message, plus a usage block carrying `cacheRead`/`cost`.
+    /// Round-trips through serde with camelCase field names.
+    #[test]
+    fn assistant_with_toolcall_and_toolresult_roundtrips_ts_pi_v3_shape() {
+        let assistant = json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "tc_1",
+                "name": "read",
+                "arguments": {"path": "/etc/hosts"}
+            }],
+            "model": "claude-opus-4-7",
+            "provider": "anthropic",
+            "api": "anthropic",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": 120,
+                "output": 40,
+                "cacheRead": 800,
+                "cacheWrite": 0,
+                "totalTokens": 960,
+                "cost": {"input": 0.001, "output": 0.002, "cacheRead": 0.0005, "cacheWrite": 0.0, "total": 0.0035}
+            },
+            "timestamp": 1779952472751i64
+        });
+        let msg: AgentMessage = serde_json::from_value(assistant).unwrap();
+        match &msg {
+            AgentMessage::Assistant {
+                content,
+                stop_reason,
+                usage,
+                ..
+            } => {
+                assert_eq!(*stop_reason, Some(StopReason::ToolUse));
+                match &content[0] {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
+                        assert_eq!(id, "tc_1");
+                        assert_eq!(name, "read");
+                        assert_eq!(input, &json!({"path": "/etc/hosts"}));
+                    }
+                    other => panic!("expected ToolUse block, got {other:?}"),
+                }
+                assert_eq!(usage.input_tokens, 120);
+                assert_eq!(usage.output_tokens, 40);
+                assert_eq!(usage.cache_read_input_tokens, 800);
+                assert_eq!(usage.total_tokens, 960);
+                let cost = usage.cost.as_ref().expect("cost present");
+                assert_eq!(cost.total, 0.0035);
+            }
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+
+        // Re-serialize and the camelCase names survive the round trip.
+        let reround = serde_json::to_value(&msg).unwrap();
+        assert_eq!(reround["role"], "assistant");
+        assert_eq!(reround["content"][0]["type"], "toolCall");
+        assert_eq!(reround["content"][0]["arguments"]["path"], "/etc/hosts");
+        assert_eq!(reround["stopReason"], "toolUse");
+        assert_eq!(reround["usage"]["cacheRead"], 800);
+        assert_eq!(reround["usage"]["totalTokens"], 960);
+        assert_eq!(reround["usage"]["cost"]["cacheRead"], 0.0005);
+
+        let tool_result = json!({
+            "role": "toolResult",
+            "toolCallId": "tc_1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "127.0.0.1 localhost"}],
+            "isError": false
+        });
+        let tr: AgentMessage = serde_json::from_value(tool_result).unwrap();
+        match &tr {
+            AgentMessage::ToolResult {
+                tool_call_id,
+                tool_name,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc_1");
+                assert_eq!(tool_name, "read");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let tr_reround = serde_json::to_value(&tr).unwrap();
+        assert_eq!(tr_reround["role"], "toolResult");
+        assert_eq!(tr_reround["toolCallId"], "tc_1");
+        assert_eq!(tr_reround["toolName"], "read");
+        assert_eq!(tr_reround["isError"], false);
+    }
+}

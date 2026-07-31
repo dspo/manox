@@ -9,8 +9,7 @@
 
 use super::wire::*;
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Map a thinking level to an adaptive-thinking effort.
@@ -28,13 +27,30 @@ fn map_effort(level: &str) -> Effort {
     }
 }
 
+/// Map a thinking level to a reasoning token budget for enabled (non-adaptive)
+/// models, clamped below the request's `max_tokens` so the API's
+/// `budget_tokens < max_tokens` rule holds. The floor is the protocol minimum
+/// of 1024.
+fn map_budget(level: &str, max_tokens: usize) -> u64 {
+    let mapped = match level {
+        "minimal" | "low" => 2_048,
+        "medium" => 4_096,
+        "xhigh" => 12_288,
+        "max" => 16_384,
+        _ => 8_192, // "high" and any unknown level
+    };
+    let cap = (max_tokens.saturating_sub(256)).max(1024) as u64;
+    mapped.clamp(1024, cap)
+}
+
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCreateParams {
     let cache_control = cache_control(context);
     let messages = crate::provider::transform::repair_tool_flow(&context.messages);
+    let max_tokens = options.max_tokens.unwrap_or(context.model.max_tokens);
     MessageCreateParams {
         model: context.model.id.clone(),
-        max_tokens: options.max_tokens.unwrap_or(context.model.max_tokens),
+        max_tokens,
         system: Some(vec![SystemBlock {
             kind: "text",
             text: context.system_prompt.clone(),
@@ -42,7 +58,7 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
         }]),
         messages: to_message_params(&messages, cache_control.as_ref()),
         tools: tools_param(context, cache_control.as_ref()),
-        thinking: thinking_config(context),
+        thinking: thinking_config(context, max_tokens),
         output_config: output_config(context),
         temperature: options.temperature,
         stop_sequences: None,
@@ -95,27 +111,34 @@ fn tools_param(
 /// The thinking field mirrors the model's thinking protocol: `"off"` forces
 /// `disabled`, a set level picks `adaptive` or `enabled` per the model's
 /// [`ThinkingKind`], and no level at all omits the field (server default).
-/// Thinking text comes back summarized; its signature is always preserved for
-/// multi-turn continuity.
-fn thinking_config(context: &AgentContext) -> Option<ThinkingConfig> {
+/// Enabled (non-adaptive) models carry a `budget_tokens` cap derived from the
+/// level and clamped below `max_tokens`; adaptive models defer depth to
+/// `output_config.effort`. Thinking text comes back summarized; its signature
+/// is always preserved for multi-turn continuity.
+fn thinking_config(context: &AgentContext, max_tokens: usize) -> Option<ThinkingConfig> {
     let display = Some(ThinkingDisplay::Summarized);
     match context.model.thinking {
         ThinkingKind::None => None,
         kind => match context.thinking_level.as_deref() {
             None => None,
             Some("off") => Some(ThinkingConfig::Disabled),
-            Some(_) => Some(match kind {
+            Some(level) => Some(match kind {
                 ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
-                ThinkingKind::Enabled => ThinkingConfig::Enabled { display },
+                ThinkingKind::Enabled => ThinkingConfig::Enabled {
+                    display,
+                    budget_tokens: Some(map_budget(level, max_tokens)),
+                },
                 ThinkingKind::None => unreachable!(),
             }),
         },
     }
 }
 
-/// The effort tier lives in `output_config`, separate from `thinking`.
+/// The effort tier lives in `output_config`, separate from `thinking`. It is
+/// the depth knob for adaptive models only; enabled (non-adaptive) models
+/// govern depth via `thinking.budget_tokens` and carry no effort tier.
 fn output_config(context: &AgentContext) -> Option<OutputConfig> {
-    if !context.model.supports_thinking() {
+    if !matches!(context.model.thinking, ThinkingKind::Adaptive) {
         return None;
     }
     let level = context.thinking_level.as_deref()?;
@@ -207,8 +230,8 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
             text: text.clone(),
             cache_control: None,
         },
-        ContentBlock::Image { source } => ContentBlockParam::Image {
-            source: image_source(source),
+        ContentBlock::Image { data, mime_type } => ContentBlockParam::Image {
+            source: image_source(data, mime_type),
             cache_control: None,
         },
         // tool_use / thinking don't appear in user messages; degrade to text.
@@ -216,12 +239,15 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
             text: format!("[tool_use: {name}]"),
             cache_control: None,
         },
-        ContentBlock::Thinking { thinking, .. } => ContentBlockParam::Text {
-            text: thinking.clone(),
+        ContentBlock::Thinking {
+            redacted: Some(true),
+            ..
+        } => ContentBlockParam::Text {
+            text: String::new(),
             cache_control: None,
         },
-        ContentBlock::RedactedThinking { .. } => ContentBlockParam::Text {
-            text: String::new(),
+        ContentBlock::Thinking { thinking, .. } => ContentBlockParam::Text {
+            text: thinking.clone(),
             cache_control: None,
         },
     }
@@ -230,58 +256,65 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
 /// Map an assistant content block. Thinking blocks round-trip with their
 /// signature intact — required for multi-turn thinking continuity. A thinking
 /// block without a signature is dropped, since the API rejects signatureless
-/// thinking params.
+/// thinking params. A redacted thinking block forwards its opaque payload.
 fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
     match block {
         ContentBlock::Text { text, .. } => Some(ContentBlockParam::Text {
             text: text.clone(),
             cache_control: None,
         }),
-        ContentBlock::ToolUse { id, name, input } => Some(ContentBlockParam::ToolUse {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => Some(ContentBlockParam::ToolUse {
             id: id.clone(),
             name: name.clone(),
             input: input.clone(),
         }),
         ContentBlock::Thinking {
+            signature,
+            redacted: Some(true),
+            ..
+        } => signature
+            .as_ref()
+            .map(|data| ContentBlockParam::RedactedThinking { data: data.clone() }),
+        ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => signature.as_ref().map(|sig| ContentBlockParam::Thinking {
             thinking: thinking.clone(),
             signature: sig.clone(),
         }),
-        ContentBlock::RedactedThinking { data } => {
-            Some(ContentBlockParam::RedactedThinking { data: data.clone() })
-        }
-        ContentBlock::Image { source } => Some(ContentBlockParam::Image {
-            source: image_source(source),
+        ContentBlock::Image { data, mime_type } => Some(ContentBlockParam::Image {
+            source: image_source(data, mime_type),
             cache_control: None,
         }),
     }
 }
 
-fn image_source(source: &ImageSource) -> ImageSourceParam {
-    match source {
-        ImageSource::Base64 { media_type, data } => ImageSourceParam::Base64 {
-            media_type: media_type.clone(),
-            data: data.clone(),
-        },
-        ImageSource::Url { url } => ImageSourceParam::Url { url: url.clone() },
+/// Map a stored image block to the Anthropic wire source. TS Pi stores images
+/// flat (`data` + `mimeType`); the Anthropic API nests them under `source`.
+fn image_source(data: &str, mime_type: &str) -> ImageSourceParam {
+    ImageSourceParam::Base64 {
+        media_type: mime_type.to_string(),
+        data: data.to_string(),
     }
 }
 
 /// Parse a protocol stop_reason string into the domain enum.
-pub fn parse_stop_reason(s: &str) -> Option<crate::types::StopReason> {
+///
+/// Faithful to the TS Pi map: refusal/sensitive/overflow collapse to `Error`
+/// (the refusal explanation surfaces as `error_message` on the message, set by
+/// the accumulator); pause_turn/stop_sequence read as a natural `Stop`.
+pub fn parse_stop_reason(s: &str) -> crate::types::StopReason {
     use crate::types::StopReason::*;
-    Some(match s {
-        "end_turn" => EndTurn,
-        "max_tokens" => MaxTokens,
-        "stop_sequence" => StopSequence,
+    match s {
+        "end_turn" | "pause_turn" | "stop_sequence" => Stop,
+        "max_tokens" => Length,
         "tool_use" => ToolUse,
-        "pause_turn" => PauseTurn,
-        "refusal" => Refusal,
-        "model_context_window_exceeded" => ModelContextWindowExceeded,
-        _ => return None,
-    })
+        // refusal/sensitive/overflow are failure stop reasons.
+        _ => Error,
+    }
 }
 
 /// Fold a wire usage report into the domain `Usage`.
@@ -297,17 +330,16 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
-        cache_creation: wire
+        cache_write_1h: wire
             .cache_creation
             .as_ref()
-            .map(|c| crate::types::CacheCreation {
-                ephemeral_1h_input_tokens: c.ephemeral_1h_input_tokens,
-                ephemeral_5m_input_tokens: c.ephemeral_5m_input_tokens,
-            }),
+            .map(|c| c.ephemeral_1h_input_tokens),
         total_tokens: input_tokens
             + output_tokens
             + cache_read_input_tokens
             + cache_creation_input_tokens,
+        reasoning_tokens: None,
+        cost: None,
     }
 }
 
@@ -316,6 +348,7 @@ mod tests {
     use super::*;
     use crate::types::{AgentMessage, ContentBlock, Model, StopReason, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn model(thinking: ThinkingKind) -> Model {
         Model {
@@ -342,6 +375,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -352,11 +387,17 @@ mod tests {
                 id: id.into(),
                 name: "read".into(),
                 input: json!({"path": "x"}),
+                thought_signature: None,
             }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -369,7 +410,7 @@ mod tests {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
             cache_retention: Default::default(),
@@ -445,11 +486,18 @@ mod tests {
             content: vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig123".into()),
+
+                redacted: None,
             }],
             model: "m".into(),
             provider: "anthropic".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         let ctx = ctx(vec![msg], ThinkingKind::None, None);
@@ -484,26 +532,26 @@ mod tests {
     }
 
     #[test]
-    fn enabled_kind_uses_enabled_shape_without_budget() {
+    fn enabled_kind_emits_budget_tokens() {
         let ctx = ctx(vec![user("hi")], ThinkingKind::Enabled, Some("high"));
         let req = to_request(&ctx, &StreamOptions::default());
         assert!(matches!(
             req.thinking,
             Some(ThinkingConfig::Enabled {
-                display: Some(ThinkingDisplay::Summarized)
+                display: Some(ThinkingDisplay::Summarized),
+                budget_tokens: Some(_),
             })
         ));
-        assert!(matches!(
-            req.output_config,
-            Some(OutputConfig {
-                effort: Some(Effort::High)
-            })
-        ));
+        // Enabled models take no effort tier — depth is governed by budget.
+        assert!(req.output_config.is_none());
 
-        // The enabled wire shape carries no budget_tokens — depth comes from effort.
+        // The enabled wire shape carries a budget_tokens, clamped below
+        // max_tokens (the model's default of 8_192 caps "high" → 7_936).
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["thinking"]["type"], "enabled");
-        assert!(v["thinking"].get("budget_tokens").is_none());
+        let budget = v["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget >= 1024);
+        assert!(budget < 8_192);
     }
 
     #[test]
@@ -572,7 +620,10 @@ mod tests {
             ThinkingKind::None,
             None,
         );
-        c.tools = vec![Box::new(NamedTool("a")), Box::new(NamedTool("b"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>,
+            Box::new(NamedTool("b")) as Box<dyn crate::tool::AgentTool>,
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         // No explicit option: the model's own max_tokens is the default.
         assert_eq!(req.max_tokens, c.model.max_tokens);
@@ -615,7 +666,9 @@ mod tests {
     fn cache_retention_none_sends_no_markers() {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::None;
-        c.tools = vec![Box::new(NamedTool("a"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
         assert!(v["system"][0].get("cache_control").is_none());
@@ -631,7 +684,9 @@ mod tests {
     fn cache_retention_long_adds_one_hour_ttl() {
         let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
         c.cache_retention = crate::types::CacheRetention::Long;
-        c.tools = vec![Box::new(NamedTool("a"))];
+        c.tools = Arc::from(vec![
+            Box::new(NamedTool("a")) as Box<dyn crate::tool::AgentTool>
+        ]);
         let req = to_request(&c, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["system"][0]["cache_control"]["ttl"], "1h");
@@ -650,8 +705,13 @@ mod tests {
             }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
-            stop_reason: Some(StopReason::EndTurn),
-            usage: Usage::default(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         let c = ctx(vec![text_assistant], ThinkingKind::None, None);
@@ -687,16 +747,17 @@ mod tests {
     fn stop_reason_parses_all_protocol_values() {
         use crate::types::StopReason::*;
         for (s, want) in [
-            ("end_turn", EndTurn),
-            ("max_tokens", MaxTokens),
-            ("stop_sequence", StopSequence),
+            ("end_turn", Stop),
+            ("max_tokens", Length),
+            ("stop_sequence", Stop),
             ("tool_use", ToolUse),
-            ("pause_turn", PauseTurn),
-            ("refusal", Refusal),
-            ("model_context_window_exceeded", ModelContextWindowExceeded),
+            ("pause_turn", Stop),
+            ("refusal", Error),
+            ("model_context_window_exceeded", Error),
+            ("sensitive", Error),
+            ("nonsense", Error),
         ] {
-            assert_eq!(parse_stop_reason(s), Some(want));
+            assert_eq!(parse_stop_reason(s), want);
         }
-        assert_eq!(parse_stop_reason("nonsense"), None);
     }
 }

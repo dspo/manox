@@ -17,8 +17,7 @@ use crate::provider::openai::{
     clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens,
 };
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Build the API request body from the agent context and stream options.
@@ -189,7 +188,7 @@ fn user_content(blocks: &[ContentBlock]) -> Option<UserContent> {
                 text.push_str(t);
                 parts.push(UserPart::Text { text: t.clone() });
             }
-            ContentBlock::Image { source } => parts.push(image_part(source)),
+            ContentBlock::Image { data, mime_type } => parts.push(image_part(data, mime_type)),
             // Tool calls/results and thinking don't appear in user messages.
             _ => {}
         }
@@ -215,7 +214,9 @@ fn assistant_param(blocks: &[ContentBlock], reasoning_backfill: bool) -> Option<
                 text: t,
                 signature: None,
             } => text.push_str(t),
-            ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCallParam {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => tool_calls.push(ToolCallParam {
                 id: id.clone(),
                 kind: "function",
                 function: ToolCallFunctionParam {
@@ -253,7 +254,7 @@ fn tool_result_parts(blocks: &[ContentBlock]) -> (String, Vec<UserPart>) {
     for block in blocks {
         match block {
             ContentBlock::Text { text, .. } => texts.push(text.as_str()),
-            ContentBlock::Image { source } => images.push(image_part(source)),
+            ContentBlock::Image { data, mime_type } => images.push(image_part(data, mime_type)),
             _ => {}
         }
     }
@@ -268,25 +269,25 @@ fn tool_result_parts(blocks: &[ContentBlock]) -> (String, Vec<UserPart>) {
     (text, images)
 }
 
-fn image_part(source: &ImageSource) -> UserPart {
-    let url = match source {
-        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-        ImageSource::Url { url } => url.clone(),
-    };
+fn image_part(data: &str, mime_type: &str) -> UserPart {
+    let url = format!("data:{mime_type};base64,{data}");
     UserPart::ImageUrl {
         image_url: ImageUrlParam { url },
     }
 }
 
-/// Map a protocol finish_reason into the domain enum. Unknown reasons read
-/// as a natural stop — a vendor-invented reason still ends the turn.
+/// Map a protocol finish_reason into the domain enum, faithful to the TS Pi
+/// map. content_filter/network_error collapse to `Error` (the detail surfaces
+/// as `error_message`); unknown reasons also read as `Error` rather than a
+/// silent natural stop, so a vendor failure never looks like completion.
 pub fn parse_finish_reason(s: &str) -> crate::types::StopReason {
     use crate::types::StopReason::*;
     match s {
-        "length" => MaxTokens,
+        "" | "stop" | "end" => Stop,
+        "length" => Length,
         "tool_calls" | "function_call" => ToolUse,
-        "content_filter" => Refusal,
-        _ => EndTurn,
+        "content_filter" | "network_error" => Error,
+        _ => Error,
     }
 }
 
@@ -314,8 +315,13 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens,
         cache_read_input_tokens: hit,
         cache_creation_input_tokens: 0,
-        cache_creation: None,
+        cache_write_1h: None,
         total_tokens: input_tokens + output_tokens + hit,
+        reasoning_tokens: wire
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
+        cost: None,
     }
 }
 
@@ -324,6 +330,7 @@ mod tests {
     use super::*;
     use crate::types::{AgentMessage, ContentBlock, Model, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     const OPENAI: &str = "https://api.openai.com/v1";
 
@@ -347,8 +354,13 @@ mod tests {
             content,
             model: "gpt-test".into(),
             provider: "openai".into(),
+            api: "openai_completions".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -360,6 +372,8 @@ mod tests {
             content,
             is_error,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -372,7 +386,7 @@ mod tests {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
             cache_retention: Default::default(),
@@ -436,6 +450,8 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig".into()),
+
+                redacted: None,
             },
             ContentBlock::Text {
                 text: "answer".into(),
@@ -462,6 +478,8 @@ mod tests {
         let msg = assistant(vec![ContentBlock::Thinking {
             thinking: "hmm".into(),
             signature: None,
+
+            redacted: None,
         }]);
         let v = request(&ctx(
             vec![user("q"), msg, user("again")],
@@ -488,6 +506,7 @@ mod tests {
                 id: "t1".into(),
                 name: "read".into(),
                 input: json!({"path": "x"}),
+                thought_signature: None,
             },
         ]);
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
@@ -537,6 +556,7 @@ mod tests {
             id: "t1".into(),
             name: "read".into(),
             input: json!({"path": "x"}),
+            thought_signature: None,
         }]);
         let v = request(&ctx(vec![user("q"), orphan], ThinkingKind::None, None));
         let msgs = v["messages"].as_array().unwrap();
@@ -551,10 +571,8 @@ mod tests {
     #[test]
     fn tool_result_images_follow_in_a_user_message() {
         let image = vec![ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "AAAA".into(),
-            },
+            data: "AAAA".into(),
+            mime_type: "image/png".into(),
         }];
         let v = request(&ctx(
             vec![user("q"), tool_result("t1", image, false)],
@@ -580,9 +598,8 @@ mod tests {
                     signature: None,
                 },
                 ContentBlock::Image {
-                    source: ImageSource::Url {
-                        url: "https://x/y.png".into(),
-                    },
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -590,7 +607,7 @@ mod tests {
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
         let content = &v["messages"][1]["content"];
         assert_eq!(content[0], json!({"type": "text", "text": "what is this"}));
-        assert_eq!(content[1]["image_url"]["url"], "https://x/y.png");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     // ── endpoint-conditional fields ─────────────────────────────────────────
@@ -720,6 +737,7 @@ mod tests {
             completion_tokens: Some(50),
             prompt_cache_hit_tokens: Some(800),
             prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         let u = to_usage(&flat);
         assert_eq!(u.input_tokens, 200);
@@ -736,6 +754,7 @@ mod tests {
             prompt_tokens_details: Some(WirePromptTokensDetails {
                 cached_tokens: Some(800),
             }),
+            completion_tokens_details: None,
         };
         let u = to_usage(&nested);
         assert_eq!(u.input_tokens, 200);
@@ -747,6 +766,7 @@ mod tests {
             completion_tokens: None,
             prompt_cache_hit_tokens: Some(99),
             prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         assert_eq!(to_usage(&bad).input_tokens, 0);
     }
@@ -754,13 +774,16 @@ mod tests {
     #[test]
     fn finish_reason_maps_known_and_unknown() {
         use crate::types::StopReason::*;
-        assert_eq!(parse_finish_reason("stop"), EndTurn);
-        assert_eq!(parse_finish_reason("length"), MaxTokens);
+        assert_eq!(parse_finish_reason(""), Stop);
+        assert_eq!(parse_finish_reason("stop"), Stop);
+        assert_eq!(parse_finish_reason("end"), Stop);
+        assert_eq!(parse_finish_reason("length"), Length);
         assert_eq!(parse_finish_reason("tool_calls"), ToolUse);
         assert_eq!(parse_finish_reason("function_call"), ToolUse);
-        assert_eq!(parse_finish_reason("content_filter"), Refusal);
-        // Vendor-invented reasons read as a natural stop.
-        assert_eq!(parse_finish_reason("vendor_reason"), EndTurn);
+        assert_eq!(parse_finish_reason("content_filter"), Error);
+        assert_eq!(parse_finish_reason("network_error"), Error);
+        // Vendor-invented reasons read as a failure, not a silent completion.
+        assert_eq!(parse_finish_reason("vendor_reason"), Error);
     }
 
     #[test]

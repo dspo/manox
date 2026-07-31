@@ -59,6 +59,10 @@ impl AnthropicStreamFn {
 
 #[async_trait::async_trait]
 impl StreamFn for AnthropicStreamFn {
+    fn api(&self) -> &str {
+        "anthropic"
+    }
+
     async fn stream(
         &self,
         context: &AgentContext,
@@ -122,11 +126,21 @@ impl StreamFn for AnthropicStreamFn {
 struct Accumulator {
     model: String,
     provider: String,
+    /// Response id reported in `message_start`, echoed back to callers as
+    /// `response_id` on the finalized assistant message.
+    response_id: Option<String>,
+    /// Model reported in `message_start` when the upstream routes to a
+    /// different one than requested (e.g. an alias). `None` until the first
+    /// event arrives.
+    response_model: Option<String>,
+    /// Raw protocol stop-reason string retained so a failure stop reason can
+    /// carry an `error_message` derived from it.
+    raw_stop_reason: Option<String>,
     blocks: Vec<ContentBlock>,
     /// Raw partial JSON for the tool_use block currently streaming, by index.
     open_json: std::collections::HashMap<usize, String>,
     stop_reason: Option<crate::types::StopReason>,
-    usage: Usage,
+    usage: Box<Usage>,
     started: bool,
 }
 
@@ -135,21 +149,39 @@ impl Accumulator {
         Accumulator {
             model: context.model.id.clone(),
             provider: context.model.provider.clone(),
+            response_id: None,
+            response_model: None,
+            raw_stop_reason: None,
             blocks: Vec::new(),
             open_json: std::collections::HashMap::new(),
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             started: false,
         }
     }
 
     fn current(&self) -> AgentMessage {
+        // A failure stop reason (refusal/sensitive/overflow) surfaces its raw
+        // protocol label as the message's `error_message` so callers can tell
+        // why the turn failed without parsing stop_reason alone.
+        let error_message = match self.stop_reason {
+            Some(crate::types::StopReason::Error) => Some(format!(
+                "provider stop reason: {}",
+                self.raw_stop_reason.as_deref().unwrap_or("error")
+            )),
+            _ => None,
+        };
         AgentMessage::Assistant {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            api: "anthropic".into(),
+            response_model: self.response_model.clone(),
+            response_id: self.response_id.clone(),
+            diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
+            error_message,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -162,7 +194,14 @@ impl Accumulator {
         match event {
             RawStreamEvent::MessageStart { message } => {
                 if let Some(u) = &message.usage {
-                    self.usage = to_usage(u);
+                    *self.usage = to_usage(u);
+                }
+                // Capture the upstream-assigned id and (possibly rerouted)
+                // model so the finalized message carries them as response_id
+                // and response_model.
+                self.response_id = message.id.clone();
+                if let Some(m) = &message.model {
+                    self.response_model = Some(m.clone());
                 }
                 self.started = true;
                 let _ = tx.try_send(AgentEvent::MessageStart {
@@ -185,10 +224,15 @@ impl Accumulator {
                         self.blocks[index] = ContentBlock::Thinking {
                             thinking: String::new(),
                             signature: None,
+                            redacted: None,
                         };
                     }
                     WireContentBlock::RedactedThinking { data } => {
-                        self.blocks[index] = ContentBlock::RedactedThinking { data };
+                        self.blocks[index] = ContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: Some(data),
+                            redacted: Some(true),
+                        };
                     }
                     WireContentBlock::ToolUse { id, name, .. } => {
                         self.open_json.insert(index, String::new());
@@ -196,6 +240,7 @@ impl Accumulator {
                             id,
                             name,
                             input: serde_json::Value::Null,
+                            thought_signature: None,
                         };
                     }
                     WireContentBlock::Other => {}
@@ -252,7 +297,8 @@ impl Accumulator {
             }
             RawStreamEvent::MessageDelta { delta, usage } => {
                 if let Some(sr) = &delta.stop_reason {
-                    self.stop_reason = parse_stop_reason(sr);
+                    self.raw_stop_reason = Some(sr.clone());
+                    self.stop_reason = Some(parse_stop_reason(sr));
                 }
                 if let Some(u) = &usage {
                     // The delta usage carries cumulative counts, but any class
@@ -305,12 +351,13 @@ impl Accumulator {
 mod tests {
     use super::*;
     use crate::types::{Model, StopReason, ThinkingKind};
+    use std::sync::Arc;
 
     fn ctx() -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: Model {
                 provider: "anthropic".into(),
                 id: "claude-test".into(),
@@ -362,7 +409,7 @@ mod tests {
                 assert!(
                     matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world")
                 );
-                assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+                assert_eq!(*stop_reason, Some(StopReason::Stop));
             }
             _ => panic!("expected assistant"),
         }
@@ -407,7 +454,9 @@ mod tests {
 
         match &msg {
             AgentMessage::Assistant { content, .. } => match &content[0] {
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
                     assert_eq!(id, "t1");
                     assert_eq!(name, "read");
                     assert_eq!(*input, serde_json::json!({"path": "x.rs"}));
@@ -463,6 +512,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    ..
                 } => {
                     assert_eq!(thinking, "hmm");
                     assert_eq!(signature.as_deref(), Some("sig!"));

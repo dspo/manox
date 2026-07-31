@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hashline::SnapshotStore;
 use crate::tools::file_mutation_queue::FileMutationQueue;
-use crate::types::ContentBlock;
+use crate::types::{AgentEvent, AgentLoopConfig, ContentBlock, EventSink};
 
 // ── Tool state ─────────────────────────────────────────────────────────────
 
@@ -54,10 +54,21 @@ pub enum ExecutionMode {
     Sequential,
 }
 
+/// Mid-execution progress channel for a tool. The loop supplies an
+/// implementation that forwards each emit as a `ToolExecutionUpdate` event;
+/// tools that produce incremental output (a streaming shell, a long copy)
+/// report it through here. Tools with nothing to report simply never call it.
+pub trait ToolProgress: Send + Sync {
+    /// Report an incremental update for the running tool call.
+    fn emit(&self, partial_result: JsonValue);
+}
+
 /// The result of a tool execution.
 ///
-/// The `content` is what gets sent back to the LLM. The `details` are
-/// structured data for the UI or logs.
+/// Mirrors the TS Pi `AgentToolResult`: `content` is what the model sees,
+/// `details` are structured UI/log data, `usage`/`added_tool_names` carry
+/// per-call token accounting when the provider reports it, and `terminate`
+/// signals the loop to stop after this turn.
 #[derive(Debug, Clone)]
 pub struct AgentToolResult {
     /// Content blocks to send back to the LLM.
@@ -68,6 +79,8 @@ pub struct AgentToolResult {
     pub is_error: bool,
     /// Token usage incurred by the tool itself.
     pub usage: Option<crate::types::Usage>,
+    /// Tool names this call added to the session's allowed set.
+    pub added_tool_names: Option<Vec<String>>,
     /// When true, signals the agent loop to stop after this turn.
     pub terminate: bool,
 }
@@ -83,6 +96,7 @@ impl AgentToolResult {
             details: None,
             is_error: false,
             usage: None,
+            added_tool_names: None,
             terminate: false,
         }
     }
@@ -97,6 +111,7 @@ impl AgentToolResult {
             details: None,
             is_error: true,
             usage: None,
+            added_tool_names: None,
             terminate: false,
         }
     }
@@ -113,6 +128,43 @@ pub trait ToolContext: Send + Sync {
     fn cwd(&self) -> &std::path::Path;
     /// Session-scoped tool state (hashline snapshots + file mutation queue).
     fn tool_state(&self) -> &ToolState;
+}
+
+/// Production `ToolContext` shared across an entire session.
+///
+/// Backs every `execute_tool_calls` invocation from the agent loop so fs/shell
+/// tools reach a real `ExecutionEnv` and hashline snapshots plus the file
+/// mutation queue stay coherent across turns. Cheap to clone (`Arc` bump).
+pub struct LocalToolContext {
+    env: std::sync::Arc<dyn crate::env::ExecutionEnv>,
+    cwd: std::path::PathBuf,
+    tool_state: std::sync::Arc<ToolState>,
+}
+
+impl LocalToolContext {
+    pub fn new(
+        env: std::sync::Arc<dyn crate::env::ExecutionEnv>,
+        cwd: std::path::PathBuf,
+        tool_state: std::sync::Arc<ToolState>,
+    ) -> Self {
+        LocalToolContext {
+            env,
+            cwd,
+            tool_state,
+        }
+    }
+}
+
+impl ToolContext for LocalToolContext {
+    fn env(&self) -> &dyn crate::env::ExecutionEnv {
+        &*self.env
+    }
+    fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+    fn tool_state(&self) -> &ToolState {
+        &self.tool_state
+    }
 }
 
 /// A tool that the agent can invoke.
@@ -161,6 +213,22 @@ pub trait AgentTool: Send + Sync {
         signal: CancellationToken,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError>;
+
+    /// Execute with a progress reporter. Tools that emit incremental output
+    /// override this and call `progress.emit(...)`; the default delegates to
+    /// [`execute`](Self::execute) so tools with nothing to report are
+    /// unchanged.
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: JsonValue,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+        progress: &dyn ToolProgress,
+    ) -> Result<AgentToolResult, ToolError> {
+        let _ = progress;
+        self.execute(tool_call_id, params, signal, ctx).await
+    }
 }
 
 // ── Tool error ──────────────────────────────────────────────────────────────
@@ -198,18 +266,31 @@ pub struct ExecutedToolCall {
 /// Execute a batch of tool calls using the full pipeline.
 ///
 /// Returns the executed calls and the combined result messages to append to
-/// the conversation.
+/// the conversation. Each call emits a matched `ToolExecutionStart` /
+/// `ToolExecutionEnd` pair and runs the optional `before_tool_call` /
+/// `after_tool_call` hooks from `config`.
 pub async fn execute_tool_calls(
     tool_calls: &[(&str, &str, JsonValue)],
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &(dyn EventSink + Send + Sync),
     sequential: bool,
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
+    // A tool that declares itself Sequential forces the whole batch to run
+    // one call at a time, so its per-call ordering holds.
+    let any_tool_sequential = tool_calls.iter().any(|(_, name, _)| {
+        tools
+            .iter()
+            .find(|t| t.name() == *name)
+            .is_some_and(|t| t.execution_mode() == ExecutionMode::Sequential)
+    });
+    let sequential = sequential || any_tool_sequential;
     if sequential {
-        execute_sequential(tool_calls, tools, signal, ctx).await
+        execute_sequential(tool_calls, tools, signal, ctx, config, sink).await
     } else {
-        execute_parallel(tool_calls, tools, signal, ctx).await
+        execute_parallel(tool_calls, tools, signal, ctx, config, sink).await
     }
 }
 
@@ -218,12 +299,14 @@ async fn execute_sequential(
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let mut executed = Vec::with_capacity(tool_calls.len());
     let mut messages = Vec::with_capacity(tool_calls.len());
 
     for (id, name, args) in tool_calls {
-        let outcome = execute_one(id, name, args, tools, signal.clone(), ctx).await;
+        let outcome = execute_one((id, name, args), tools, signal.clone(), ctx, config, sink).await;
         messages.push(outcome.result_message.clone());
         executed.push(outcome);
     }
@@ -236,10 +319,14 @@ async fn execute_parallel(
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let futures: Vec<_> = tool_calls
         .iter()
-        .map(|(id, name, args)| execute_one(id, name, args, tools, signal.clone(), ctx))
+        .map(|(id, name, args)| {
+            execute_one((id, name, args), tools, signal.clone(), ctx, config, sink)
+        })
         .collect();
 
     let outcomes = futures::future::join_all(futures).await;
@@ -255,25 +342,62 @@ async fn execute_parallel(
     (executed, messages)
 }
 
+/// Forwards a tool's mid-execution emits to the loop's sink as
+/// `ToolExecutionUpdate` events, tagged with the call's id and carrying the
+/// call's name and arguments so a consumer can attach progress without
+/// cross-referencing history.
+struct SinkProgress<'a> {
+    tool_call_id: String,
+    tool_name: String,
+    arguments: JsonValue,
+    sink: &'a (dyn EventSink + Send + Sync),
+}
+
+impl<'a> ToolProgress for SinkProgress<'a> {
+    fn emit(&self, partial_result: JsonValue) {
+        self.sink.emit(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            tool_name: self.tool_name.clone(),
+            arguments: self.arguments.clone(),
+            partial_result,
+        });
+    }
+}
+
 async fn execute_one(
-    tool_call_id: &str,
-    tool_name: &str,
-    args: &JsonValue,
+    call: (&str, &str, &JsonValue),
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
+    config: &AgentLoopConfig,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> ExecutedToolCall {
-    // Find the tool by name.
-    let tool = tools.iter().find(|t| t.name() == tool_name);
+    let (tool_call_id, tool_name, args) = call;
+    let id = tool_call_id.to_string();
+    let name = tool_name.to_string();
 
-    let tool = match tool {
+    sink.emit(AgentEvent::ToolExecutionStart {
+        tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        arguments: args.clone(),
+    });
+
+    // Find the tool by name.
+    let tool = match tools.iter().find(|t| t.name() == tool_name) {
         Some(t) => t,
         None => {
             let result = AgentToolResult::error(format!("Tool not found: {tool_name}"));
+            let result_message = make_tool_result_message(&id, &name, &result);
+            sink.emit(AgentEvent::ToolExecutionEnd {
+                tool_call_id: id.clone(),
+                tool_name: name.clone(),
+                result: result.clone(),
+                is_error: result.is_error,
+            });
             return ExecutedToolCall {
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+                tool_call_id: id,
+                tool_name: name,
+                result_message,
                 result,
                 blocked: false,
                 block_reason: None,
@@ -284,39 +408,95 @@ async fn execute_one(
     // Validate arguments against the tool's JSON Schema.
     if let Err(e) = validate_tool_args(tool.parameters_schema(), args.clone()) {
         let result = AgentToolResult::error(format!("Invalid arguments: {e}"));
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.clone(),
+            is_error: result.is_error,
+        });
         return ExecutedToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
             result,
             blocked: false,
             block_reason: None,
+        };
+    }
+
+    // before_tool_call hook: `Some(reason)` blocks before execution.
+    if let Some(before) = &config.before_tool_call
+        && let Some(reason) = before(tool_call_id, tool_name, args)
+    {
+        let result = AgentToolResult::error(format!("blocked: {reason}"));
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.clone(),
+            is_error: result.is_error,
+        });
+        return ExecutedToolCall {
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
+            result,
+            blocked: true,
+            block_reason: Some(reason),
         };
     }
 
     // Execute the tool.
     if signal.is_cancelled() {
         let result = AgentToolResult::error("aborted");
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.clone(),
+            is_error: result.is_error,
+        });
         return ExecutedToolCall {
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            result_message: make_tool_result_message(tool_call_id, tool_name, &result),
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
             result,
             blocked: false,
             block_reason: None,
         };
     }
 
-    let result = match tool.execute(tool_call_id, args.clone(), signal, ctx).await {
+    let progress = SinkProgress {
+        tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        arguments: args.clone(),
+        sink,
+    };
+    let mut result = match tool
+        .execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress)
+        .await
+    {
         Ok(r) => r,
         Err(e) => AgentToolResult::error(format!("{e}")),
     };
 
-    let result_message = make_tool_result_message(tool_call_id, tool_name, &result);
+    // after_tool_call hook: patches the result.
+    if let Some(after) = &config.after_tool_call {
+        result = after(&result);
+    }
+
+    let result_message = make_tool_result_message(&id, &name, &result);
+    sink.emit(AgentEvent::ToolExecutionEnd {
+        tool_call_id: id.clone(),
+        tool_name: name.clone(),
+        result: result.clone(),
+        is_error: result.is_error,
+    });
 
     ExecutedToolCall {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: tool_name.to_string(),
+        tool_call_id: id,
+        tool_name: name,
         result_message,
         result,
         blocked: false,
@@ -335,6 +515,8 @@ fn make_tool_result_message(
         content: result.content.clone(),
         is_error: result.is_error,
         details: result.details.clone(),
+        usage: result.usage.clone(),
+        added_tool_names: result.added_tool_names.clone(),
         timestamp: chrono::Utc::now(),
     }
 }
@@ -355,6 +537,12 @@ fn validate_tool_args(schema: JsonValue, args: JsonValue) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A sink that discards events; pipeline tests don't assert lifecycle.
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn emit(&self, _event: AgentEvent) {}
+    }
     use crate::env::ExecutionEnv;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -484,6 +672,8 @@ mod tests {
             &tools,
             signal,
             &ctx,
+            &AgentLoopConfig::default(),
+            &NullSink,
             false,
         )
         .await;
@@ -511,10 +701,165 @@ mod tests {
             &tools,
             signal,
             &ctx,
+            &AgentLoopConfig::default(),
+            &NullSink,
             false,
         )
         .await;
 
         assert!(executed[0].result.is_error);
+    }
+
+    // A sink that records every emitted event for lifecycle assertions.
+    struct RecordingSink(std::sync::Mutex<Vec<AgentEvent>>);
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// A tool that reports mid-execution progress before completing.
+    struct ProgressTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress"
+        }
+        fn description(&self) -> &str {
+            "Emits progress then returns text"
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            unreachable!("execute_with_progress must be used when present")
+        }
+        async fn execute_with_progress(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+            progress: &dyn ToolProgress,
+        ) -> Result<AgentToolResult, ToolError> {
+            progress.emit(serde_json::json!({"step": "halfway"}));
+            Ok(AgentToolResult::text("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_emit_surfaces_as_tool_execution_update() {
+        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let signal = CancellationToken::new();
+
+        let (executed, _messages) = execute_tool_calls(
+            &[("call_1", "progress", serde_json::json!({}))],
+            &tools,
+            signal,
+            &ctx,
+            &AgentLoopConfig::default(),
+            &sink,
+            false,
+        )
+        .await;
+
+        let events = sink.0.lock().unwrap();
+        let start = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call_1"));
+        let update = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } if tool_call_id == "call_1" && partial_result["step"] == "halfway"));
+        let end = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "call_1"));
+        // Start, update, end all present and in lifecycle order.
+        let (start, update, end) = (
+            start.expect("start"),
+            update.expect("update"),
+            end.expect("end"),
+        );
+        assert!(start < update, "update must follow start");
+        assert!(update < end, "end must follow update");
+        assert!(!executed[0].result.is_error);
+    }
+
+    #[tokio::test]
+    async fn tool_execution_events_carry_full_payload() {
+        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let signal = CancellationToken::new();
+        let args = serde_json::json!({"path": "/x"});
+
+        let _ = execute_tool_calls(
+            &[("call_1", "progress", args.clone())],
+            &tools,
+            signal,
+            &ctx,
+            &AgentLoopConfig::default(),
+            &sink,
+            false,
+        )
+        .await;
+
+        let events = sink.0.lock().unwrap();
+        let start = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } if tool_call_id == "call_1" => Some((tool_name, arguments)),
+            _ => None,
+        });
+        let (name, arguments) = start.expect("start payload");
+        assert_eq!(name, "progress");
+        assert_eq!(arguments, &args, "start must carry the call arguments");
+
+        let update = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                arguments,
+                partial_result,
+            } if tool_call_id == "call_1" => Some((tool_name, arguments, partial_result)),
+            _ => None,
+        });
+        let (name, arguments, partial_result) = update.expect("update payload");
+        assert_eq!(name, "progress");
+        assert_eq!(arguments, &args, "update must carry the call arguments");
+        assert_eq!(partial_result["step"], "halfway");
+
+        let end = events.iter().find_map(|e| match e {
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                ..
+            } if tool_call_id == "call_1" => Some((tool_name, result)),
+            _ => None,
+        });
+        let (name, result) = end.expect("end payload");
+        assert_eq!(name, "progress");
+        assert!(!result.is_error, "successful call ends with is_error=false");
+        assert!(
+            result.content.iter().any(
+                |b| matches!(b, crate::types::ContentBlock::Text { text, .. } if text == "done")
+            ),
+            "end must carry the final result content"
+        );
     }
 }

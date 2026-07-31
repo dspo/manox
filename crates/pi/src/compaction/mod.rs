@@ -6,12 +6,18 @@
 
 pub mod branch_summarization;
 
+use std::collections::{BTreeSet, HashMap};
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
-use crate::types::{AgentMessage, ContentBlock, Usage};
+use crate::session::SessionTreeEntry;
+use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
-/// Compaction settings.
+/// Compaction settings. Serializes as camelCase to match the TS Pi
+/// `settings.json` on-disk shape (`reserveTokens`, `keepRecentTokens`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     /// Whether compaction is enabled.
     pub enabled: bool,
@@ -42,6 +48,61 @@ pub struct CompactionResult {
     pub tokens_before: u64,
     /// Token count after compaction.
     pub tokens_after: u64,
+    /// Token usage reported by the summarization call, or by a hook override.
+    pub usage: Option<Usage>,
+    /// Structured payload attached to the boundary (e.g. by a hook override).
+    pub details: Option<JsonValue>,
+    /// The messages kept intact across the compaction, stored verbatim.
+    pub retained_tail: Vec<AgentMessage>,
+}
+
+/// File paths touched by the compacted region, grouped by operation kind.
+/// Mirrors the TS `FileOperations`; the sets serialize as JSON arrays.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileOperations {
+    /// Files inspected by `read` tool calls.
+    pub read: BTreeSet<String>,
+    /// Files produced by `write` tool calls.
+    pub written: BTreeSet<String>,
+    /// Files changed by `edit` tool calls.
+    pub edited: BTreeSet<String>,
+}
+
+/// The compaction preparation handed to the `session_before_compact` hook:
+/// the exact messages being summarized and kept, plus the surrounding context
+/// the summarization folds in (previous summary, file operations, settings).
+///
+/// This is a *partial* mirror of the TS `CompactionPreparation`: split-turn
+/// compaction is not implemented (the Rust cut always lands on a whole-turn
+/// boundary), so `turn_prefix_messages` is always empty and `is_split_turn` is
+/// always false. A single turn that exceeds the keep-recent window is kept
+/// intact rather than split-and-merged; closing that gap is tracked separately
+/// — half-implementing the cut without the dual summarization would drop the
+/// prefix messages, so the field stays structurally present but inert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPreparation {
+    /// The first entry kept intact; `None` when the whole transcript is
+    /// summarized (the wire field is then omitted, matching TS optionality).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub first_kept_entry_id: Option<String>,
+    /// The messages replaced by the summary.
+    pub messages_to_summarize: Vec<AgentMessage>,
+    /// Messages prefixing a split turn's retained suffix — always empty here.
+    pub turn_prefix_messages: Vec<AgentMessage>,
+    /// The messages kept intact after the boundary.
+    pub retained_tail: Vec<AgentMessage>,
+    /// Whether the cut splits an in-progress turn — always false here.
+    pub is_split_turn: bool,
+    /// Estimated context tokens before compaction.
+    pub tokens_before: u64,
+    /// The previous compaction's summary, when this branch already compacted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub previous_summary: Option<String>,
+    /// File paths touched across the summarized messages.
+    pub file_ops: FileOperations,
+    /// The settings governing this compaction.
+    pub settings: CompactionSettings,
 }
 
 /// Total context tokens for one usage block: the provider-reported total
@@ -65,10 +126,14 @@ pub fn calculate_context_tokens(usage: &Usage) -> u64 {
 pub fn last_assistant_usage(messages: &[AgentMessage]) -> Option<&Usage> {
     messages.iter().rev().find_map(|m| match m {
         AgentMessage::Assistant {
-            stop_reason: Some(_),
+            stop_reason: Some(r),
             usage,
             ..
-        } if calculate_context_tokens(usage) > 0 => Some(usage),
+        } if !matches!(r, StopReason::Error | StopReason::Aborted)
+            && calculate_context_tokens(usage) > 0 =>
+        {
+            Some(&**usage)
+        }
         _ => None,
     })
 }
@@ -98,10 +163,14 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimat
         .rev()
         .find_map(|(i, m)| match m {
             AgentMessage::Assistant {
-                stop_reason: Some(_),
+                stop_reason: Some(r),
                 usage,
                 ..
-            } if calculate_context_tokens(usage) > 0 => Some((i, usage)),
+            } if !matches!(r, StopReason::Error | StopReason::Aborted)
+                && calculate_context_tokens(usage) > 0 =>
+            {
+                Some((i, &**usage))
+            }
             _ => None,
         });
 
@@ -218,34 +287,75 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
     find_safe_cut(messages, cut)
 }
 
-/// Adjust the cut point to a safe boundary.
+/// Adjust the cut point to the first safe boundary at or after the candidate.
 ///
-/// A safe boundary is after an assistant or tool-result message,
-/// not mid-turn (e.g., after a user message that hasn't been answered).
+/// A boundary is safe when the retained tail both starts on a message a
+/// provider accepts as the first request message (`User`, `Assistant`, or
+/// `Custom`) and contains no `ToolResult` orphaned by the cut — a result
+/// whose `ToolUse` was left behind in the summarized prefix. The tail must
+/// never start on a `ToolResult` (its `ToolUse` precedes it), and a cut must
+/// not land between a `tool_use` and its result when a `Custom` sits between
+/// them: `repair_tool_flow` shows that is a legitimate position, since a
+/// `Custom` does not close a tool turn.
+///
+/// This is position-dependent, not type-dependent. A `Custom` at a turn
+/// boundary orphans nothing and is retained verbatim — extension state is
+/// not silently discarded into the summary. A `Custom` mid tool chain
+/// orphans the trailing result and is advanced past, taking the result and
+/// its call together into the prefix.
+///
+/// TS `findValidCutPoints` lists `custom` as a valid cut and relies on
+/// split-turn dual-summarization (`isSplitTurn`) to rescue a mid-turn cut;
+/// this Rust compaction does not implement split-turn (see
+/// `CompactionPreparation`), so orphaning is prevented at the cut itself.
 fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
-    if candidate >= messages.len() {
-        return messages.len();
-    }
+    let tooluse_pos = tooluse_positions(messages);
 
-    // Walk forward from the candidate to find a safe boundary.
-    // A safe boundary is after an Assistant or ToolResult message.
-    let mut idx = candidate;
+    let mut idx = candidate.min(messages.len());
     while idx < messages.len() {
-        match &messages[idx] {
-            AgentMessage::Assistant { .. } => return idx + 1,
-            AgentMessage::ToolResult { .. } => {
-                // Continue past tool results — they belong to the turn.
-                idx += 1;
-            }
-            AgentMessage::User { .. } => {
-                // A user message at the start means we keep from here.
-                return idx;
-            }
-            _ => idx += 1,
+        match first_orphaned_result(messages, idx, &tooluse_pos) {
+            // A result at or after `idx` whose call precedes `idx` would be
+            // orphaned by a cut here. Advance past it so the result and its
+            // call land together in the prefix, then re-check.
+            Some(orphan) => idx = orphan + 1,
+            None => return idx,
         }
     }
-
     messages.len()
+}
+
+/// Map each `ToolUse` id to the position of the `Assistant` carrying it.
+fn tooluse_positions(messages: &[AgentMessage]) -> HashMap<&str, usize> {
+    let mut map: HashMap<&str, usize> = HashMap::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if let AgentMessage::Assistant { content, .. } = msg {
+            for block in content {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    map.insert(id.as_str(), i);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// The first `ToolResult` at or after `idx` whose `ToolUse` precedes `idx` —
+/// the result a cut at `idx` would orphan. A result with no matching call is
+/// always orphaned (no `ToolUse` exists to retain alongside it).
+fn first_orphaned_result(
+    messages: &[AgentMessage],
+    idx: usize,
+    tooluse_pos: &HashMap<&str, usize>,
+) -> Option<usize> {
+    messages.iter().enumerate().skip(idx).find_map(|(m, msg)| {
+        let AgentMessage::ToolResult { tool_call_id, .. } = msg else {
+            return None;
+        };
+        let orphaned = tooluse_pos
+            .get(tool_call_id.as_str())
+            .is_none_or(|&j| j < idx);
+        orphaned.then_some(m)
+    })
 }
 
 /// Build a compaction prompt for the LLM.
@@ -255,6 +365,7 @@ fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
 pub fn build_compaction_prompt(
     compacted_messages: &[AgentMessage],
     existing_summary: Option<&str>,
+    custom_instructions: Option<&str>,
 ) -> String {
     let prefix = if let Some(summary) = existing_summary {
         format!(
@@ -298,6 +409,14 @@ pub fn build_compaction_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    // Caller-supplied focus is appended after the conversation, mirroring the
+    // TS `Additional focus: ${customInstructions}` so the summarization model
+    // weights it instead of silently dropping it.
+    let additional_focus = match custom_instructions {
+        Some(ci) if !ci.trim().is_empty() => format!("\n\nAdditional focus: {ci}"),
+        _ => String::new(),
+    };
+
     format!(
         "{prefix}\
         You are summarizing a coding agent's conversation history to save context space. \
@@ -309,8 +428,165 @@ pub fn build_compaction_prompt(
         5. Any unfinished work or next steps\n\n\
         Do NOT repeat the full conversation. Focus on information that would be \
         essential for continuing the work without losing context.\n\n\
-        <conversation>\n{messages_text}\n</conversation>"
+        <conversation>\n{messages_text}\n</conversation>{additional_focus}"
     )
+}
+
+/// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
+///
+/// `branch` is the session path (last compaction … leaf) — the same entries TS
+/// exposes as `branchEntries`. `messages` is the flat transcript the harness
+/// compacts; `cut_point` splits it into `messages_to_summarize` / `retained_tail`.
+/// The previous compaction's summary (if the path starts at one) becomes
+/// `previous_summary`, and file operations are extracted from the summarized
+/// region plus any prior non-hook compaction's recorded file lists.
+///
+/// Split-turn is not implemented (see [`CompactionPreparation`]); the cut stays
+/// on a whole-turn boundary, so `turn_prefix_messages` is empty and
+/// `is_split_turn` is false.
+pub fn build_preparation(
+    branch: &[SessionTreeEntry],
+    messages: &[AgentMessage],
+    cut_point: usize,
+    first_kept_entry_id: Option<String>,
+    tokens_before: u64,
+    settings: &CompactionSettings,
+) -> CompactionPreparation {
+    // The path starts at the last compaction boundary when one exists; its
+    // summary is the `previousSummary` the summarization folds in. That summary
+    // also lives in the transcript as the leading synthetic `summary_message`,
+    // so it is excluded from `messages_to_summarize` — mirroring TS, where
+    // `messagesToSummarize` starts at the boundary's first kept entry, not the
+    // compaction entry itself. Folding it twice would duplicate the prior
+    // summary in the prompt.
+    let previous_summary = match branch.first() {
+        Some(SessionTreeEntry::Compaction { summary, .. }) => Some(summary.clone()),
+        _ => None,
+    };
+    let start = usize::from(previous_summary.is_some());
+    let end = cut_point.max(start);
+    let messages_to_summarize = messages
+        .get(start..end)
+        .map(|s| s.to_vec())
+        .unwrap_or_default();
+    let retained_tail = messages[cut_point..].to_vec();
+
+    let file_ops = extract_file_operations(&messages_to_summarize, branch);
+
+    CompactionPreparation {
+        first_kept_entry_id,
+        messages_to_summarize,
+        turn_prefix_messages: Vec::new(),
+        retained_tail,
+        is_split_turn: false,
+        tokens_before,
+        previous_summary,
+        file_ops,
+        settings: settings.clone(),
+    }
+}
+
+/// File paths touched by the compacted region, mirroring the TS
+/// `extractFileOperations`: assistant tool calls with a `path` argument are
+/// classified as read / written / edited, and a previous (non-hook) compaction
+/// carrying `{readFiles, modifiedFiles}` details seeds the accumulator so file
+/// operations survive across repeated compactions.
+fn extract_file_operations(
+    messages: &[AgentMessage],
+    branch: &[SessionTreeEntry],
+) -> FileOperations {
+    let mut ops = FileOperations::default();
+    if let Some(SessionTreeEntry::Compaction {
+        details: Some(d),
+        from_hook,
+        ..
+    }) = branch.first()
+    {
+        // A hook-authored boundary owns its own details shape; only the
+        // harness's `{readFiles, modifiedFiles}` payload carries forward here.
+        if *from_hook != Some(true) {
+            if let Some(arr) = d.get("readFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.read.insert(f.to_string());
+                }
+            }
+            if let Some(arr) = d.get("modifiedFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.edited.insert(f.to_string());
+                }
+            }
+        }
+    }
+    for msg in messages {
+        extract_file_ops_from_message(msg, &mut ops);
+    }
+    ops
+}
+
+/// Classify a message's assistant tool calls into the file-operation sets.
+/// Only `read`, `write`, and `edit` calls carrying a `path` argument count.
+fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut FileOperations) {
+    let AgentMessage::Assistant { content, .. } = message else {
+        return;
+    };
+    for block in content {
+        if let ContentBlock::ToolUse { name, input, .. } = block {
+            let Some(path) = input.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match name.as_str() {
+                "read" => {
+                    ops.read.insert(path.to_string());
+                }
+                "write" => {
+                    ops.written.insert(path.to_string());
+                }
+                "edit" => {
+                    ops.edited.insert(path.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Compute the sorted read-only and modified file lists from accumulated
+/// operations, mirroring the TS `computeFileLists`: modified = edited ∪
+/// written; readFiles = read minus modified.
+pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
+    let modified: BTreeSet<String> = file_ops.edited.union(&file_ops.written).cloned().collect();
+    let read_files: Vec<String> = file_ops
+        .read
+        .iter()
+        .filter(|f| !modified.contains(*f))
+        .cloned()
+        .collect();
+    let modified_files: Vec<String> = modified.into_iter().collect();
+    (read_files, modified_files)
+}
+
+/// Format the file lists as summary metadata tags, mirroring the TS
+/// `formatFileOperations`. Returns the empty string when there are no files,
+/// so the summary text is unchanged when no tool touched a file.
+pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !read_files.is_empty() {
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
+    }
+    if !modified_files.is_empty() {
+        sections.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified_files.join("\n")
+        ));
+    }
+    if sections.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", sections.join("\n\n"))
+    }
 }
 
 #[cfg(test)]
@@ -336,8 +612,13 @@ mod tests {
             }],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -347,8 +628,13 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
-            usage,
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(usage),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -406,6 +692,33 @@ mod tests {
     }
 
     #[test]
+    fn last_assistant_usage_skips_error_and_aborted_anchors() {
+        let usable = Usage {
+            total_tokens: 100,
+            ..Default::default()
+        };
+
+        // Error and Aborted terminations carry no trustworthy usage, so a
+        // clean Stop block further back must anchor instead.
+        let mut errored = assistant_with_usage(usable.clone());
+        if let AgentMessage::Assistant { stop_reason, .. } = &mut errored {
+            *stop_reason = Some(StopReason::Error);
+        }
+        let messages = vec![assistant_with_usage(usable.clone()), errored];
+        assert_eq!(
+            last_assistant_usage(&messages).map(|u| u.total_tokens),
+            Some(100)
+        );
+
+        // When every terminal assistant is Error/Aborted, there is no anchor.
+        let mut aborted = assistant_with_usage(usable);
+        if let AgentMessage::Assistant { stop_reason, .. } = &mut aborted {
+            *stop_reason = Some(StopReason::Aborted);
+        }
+        assert!(last_assistant_usage(&[aborted]).is_none());
+    }
+
+    #[test]
     fn estimate_context_tokens_anchors_on_last_usage() {
         let usage = Usage {
             total_tokens: 1000,
@@ -440,9 +753,8 @@ mod tests {
         // An image is a flat 4800 chars → 1200 tokens.
         let image = AgentMessage::User {
             content: vec![ContentBlock::Image {
-                source: crate::types::ImageSource::Url {
-                    url: "https://x/y.png".into(),
-                },
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
             }],
             timestamp: chrono::Utc::now(),
         };
@@ -458,17 +770,24 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "abcd".into(), // 4
                     signature: None,
+                    redacted: None,
                 },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "read".into(),                     // 4
                     input: serde_json::json!({"path": "x"}), // 12
+                    thought_signature: None,
                 },
             ],
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         // (4 + 4 + 4 + 12) / 4 = 6
@@ -484,6 +803,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         };
         assert_eq!(estimate_tokens(&result), 2);
@@ -540,14 +861,142 @@ mod tests {
         let cut = find_cut_point(&msgs, 5);
         // The cut should be at a safe boundary, not mid-turn.
         assert!(cut > 0, "cut should be > 0, got {cut}");
-        // After cut, the first kept message should be a user or assistant.
+        // After cut, the first kept message is a user or assistant — never a
+        // tool result, which would orphan its tool_use in the prefix.
         if cut < msgs.len() {
             let first_kept = &msgs[cut];
             assert!(
-                matches!(first_kept, AgentMessage::User { .. }),
-                "first kept at {cut} should be a user message, got {first_kept:?}"
+                matches!(
+                    first_kept,
+                    AgentMessage::User { .. } | AgentMessage::Assistant { .. }
+                ),
+                "first kept at {cut} should start a valid request, got {first_kept:?}"
             );
         }
+    }
+
+    fn make_tool_use_assistant(tool_id: &str, tool_name: &str, path: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: tool_id.into(),
+                name: tool_name.into(),
+                input: serde_json::json!({ "path": path }),
+                thought_signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Default::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn make_tool_result(tool_id: &str, tool_name: &str) -> AgentMessage {
+        AgentMessage::ToolResult {
+            tool_call_id: tool_id.into(),
+            tool_name: tool_name.into(),
+            content: vec![ContentBlock::Text {
+                text: "ok".into(),
+                signature: None,
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// A multi-turn tool-call chain must never be split: the retained tail
+    /// never starts on a `ToolResult` (its `ToolUse` would be summarized into
+    /// the prefix, orphaning the result and producing an invalid provider
+    /// request). Mirrors TS `findValidCutPoints`, which excludes tool results
+    /// as cut indices. Covers `user → assistant(tool1) → result1 →
+    /// assistant(tool2) → result2 → assistant(final)` across budgets that land
+    /// the cut inside the tool-call region.
+    #[test]
+    fn find_cut_point_never_splits_tool_chain() {
+        let msgs = vec![
+            make_user("do the work"),
+            make_tool_use_assistant("t1", "read", "a.rs"),
+            make_tool_result("t1", "read"),
+            make_tool_use_assistant("t2", "edit", "b.rs"),
+            make_tool_result("t2", "edit"),
+            make_assistant("done"),
+        ];
+        // Dense budget sweep — the token estimates are [3,5,1,5,1,1] (sum 16),
+        // so the budget-exhaustion boundary walks across every message. The
+        // tool-call region is indices 1..=4; the cut must never land between an
+        // assistant(tool_use) and its result regardless of where the budget
+        // runs out.
+        for keep in 0..=24 {
+            let cut = find_cut_point(&msgs, keep);
+            if cut < msgs.len() {
+                assert!(
+                    !matches!(msgs[cut], AgentMessage::ToolResult { .. }),
+                    "keep={keep}: tail starts on a ToolResult at {cut}, orphaning its tool_use"
+                );
+            }
+            // If a tool result is retained, its tool_use assistant is retained
+            // too — the pair is never split across the boundary.
+            for (idx, msg) in msgs.iter().enumerate() {
+                if matches!(msg, AgentMessage::ToolResult { .. }) && idx >= cut {
+                    assert!(
+                        cut < idx,
+                        "keep={keep}: result at {idx} retained but its assistant at {} was cut into the prefix",
+                        idx - 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// `find_safe_cut` is position-dependent, not type-dependent. A `Custom`
+    /// mid tool chain (between a `tool_use` and its result — the shape
+    /// `repair_tool_flow` can produce) orphans the trailing result and is
+    /// advanced past. A `Custom` at a turn boundary orphans nothing and is
+    /// retained verbatim — recent extension state is not discarded into the
+    /// summary.
+    #[test]
+    fn find_safe_cut_retains_safe_custom_skips_orphaning_one() {
+        fn custom() -> AgentMessage {
+            AgentMessage::Custom {
+                custom_type: "note".into(),
+                content: vec![ContentBlock::Text {
+                    text: "x".into(),
+                    signature: None,
+                }],
+                details: None,
+                timestamp: chrono::Utc::now(),
+            }
+        }
+
+        // Mid-chain Custom between a tool_use and its result: a cut here
+        // would orphan the result, so find_safe_cut advances past both the
+        // Custom and the result to the trailing user.
+        let mid_chain = vec![
+            make_tool_use_assistant("c1", "read", "a.rs"),
+            custom(),
+            make_tool_result("c1", "read"),
+            make_user("next"),
+        ];
+        assert_eq!(find_safe_cut(&mid_chain, 1), 3);
+
+        // Turn-boundary Custom: no result after it has its call before it,
+        // so cutting here orphans nothing — the Custom is retained, not
+        // summarized away.
+        let at_boundary = vec![
+            make_user("q"),
+            make_assistant("a"),
+            custom(),
+            make_user("q2"),
+        ];
+        assert_eq!(find_safe_cut(&at_boundary, 2), 2);
     }
 
     #[test]
@@ -556,9 +1005,67 @@ mod tests {
             make_user("Write a hello world program"),
             make_assistant("I'll create a main.rs file with a hello world program."),
         ];
-        let prompt = build_compaction_prompt(&msgs, None);
+        let prompt = build_compaction_prompt(&msgs, None, None);
         assert!(prompt.contains("Write a hello world program"));
         assert!(prompt.contains("main.rs"));
         assert!(prompt.contains("summarizing a coding agent"));
+        // No custom instructions → no focus line.
+        assert!(!prompt.contains("Additional focus"));
+    }
+
+    #[test]
+    fn test_build_compaction_prompt_folds_custom_instructions() {
+        let msgs = vec![make_user("discuss the auth module")];
+        let prompt = build_compaction_prompt(&msgs, None, Some("prioritize token usage"));
+        assert!(
+            prompt.contains("Additional focus: prioritize token usage"),
+            "custom instructions are appended as a focus line: {prompt}"
+        );
+        // Whitespace-only instructions are dropped, not emitted as an empty focus.
+        let prompt = build_compaction_prompt(&msgs, None, Some("   \n\t"));
+        assert!(!prompt.contains("Additional focus"));
+    }
+
+    #[test]
+    fn test_build_compaction_prompt_folds_previous_summary() {
+        let msgs = vec![make_user("continue the work")];
+        let prompt = build_compaction_prompt(&msgs, Some("prior session covered the API"), None);
+        assert!(
+            prompt.contains("Here is a summary of the earlier conversation"),
+            "previous summary is surfaced as context: {prompt}"
+        );
+        assert!(
+            prompt.contains("<summary>\nprior session covered the API\n</summary>"),
+            "the previous summary text is embedded verbatim: {prompt}"
+        );
+        // Absent previous summary leaves no stale summary block.
+        let prompt = build_compaction_prompt(&msgs, None, None);
+        assert!(!prompt.contains("Here is a summary of the earlier conversation"));
+    }
+
+    #[test]
+    fn test_compute_file_lists_splits_read_and_modified() {
+        let mut ops = FileOperations::default();
+        ops.read.insert("a.rs".into());
+        ops.read.insert("b.rs".into());
+        ops.edited.insert("a.rs".into());
+        ops.written.insert("c.rs".into());
+
+        let (read, modified) = compute_file_lists(&ops);
+        // `a.rs` is both read and edited → modified wins, leaves read-only.
+        assert_eq!(read, vec!["b.rs".to_string()]);
+        assert_eq!(modified, vec!["a.rs".to_string(), "c.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_format_file_operations_empty_when_no_files() {
+        assert_eq!(format_file_operations(&[], &[]), "");
+        let block = format_file_operations(
+            &["a.rs".to_string()],
+            &["b.rs".to_string(), "c.rs".to_string()],
+        );
+        assert!(block.starts_with("\n\n"));
+        assert!(block.contains("<read-files>\na.rs\n</read-files>"));
+        assert!(block.contains("<modified-files>\nb.rs\nc.rs\n</modified-files>"));
     }
 }

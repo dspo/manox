@@ -1,72 +1,155 @@
 // Session storage and context building.
 //
-// A session is a tree of entries (messages, compaction summaries, model
-// changes, etc.) persisted as JSONL. Each entry has an id and parentId,
-// forming a DAG that can be walked to reconstruct the conversation context.
+// A session is a tree of entries persisted as JSONL. Each entry has an id and
+// parentId, forming a DAG walked leafward to reconstruct the conversation
+// context. Variant `type` tags are snake_case and field names are camelCase,
+// matching the TS Pi v3 on-disk schema exactly so real session files load.
 
 pub mod jsonl;
 
-use crate::types::AgentMessage;
+use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 /// A single entry in the session tree.
+///
+/// Field names serialize as camelCase to match the TS Pi v3 schema. A `leaf`
+/// entry records a cursor move to an older branch point: its `targetId` is the
+/// entry the cursor now points at, and the leaf entry itself is never walked
+/// (the cursor is `targetId`, not the leaf entry's own id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SessionTreeEntry {
-    #[serde(rename = "message")]
+    #[serde(rename = "message", rename_all = "camelCase")]
     Message {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         message: AgentMessage,
     },
-    #[serde(rename = "compaction")]
+    #[serde(rename = "compaction", rename_all = "camelCase")]
     Compaction {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         summary: String,
-        #[serde(rename = "firstKeptEntryId")]
         first_kept_entry_id: Option<String>,
-        #[serde(rename = "tokensBefore")]
         tokens_before: u64,
+        /// Token usage reported by the summarization call, when recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
         /// The messages kept intact across the compaction, stored verbatim
         /// so a rebuilt context needs no walk past the boundary.
-        #[serde(rename = "retainedTail", default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         retained_tail: Vec<AgentMessage>,
+        /// Structured payload a summarization hook may attach.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<JsonValue>,
+        /// Whether the boundary was written by a hook rather than the
+        /// harness's own compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_hook: Option<bool>,
     },
-    #[serde(rename = "leaf")]
-    Leaf {
-        id: String,
-        #[serde(rename = "parentId")]
-        parent_id: Option<String>,
-        timestamp: DateTime<Utc>,
-        #[serde(rename = "targetId")]
-        target_id: String,
-    },
-    #[serde(rename = "modelChange")]
+    /// A change of model for the following turns.
+    #[serde(rename = "model_change", rename_all = "camelCase")]
     ModelChange {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         provider: String,
-        #[serde(rename = "modelId")]
         model_id: String,
     },
-    #[serde(rename = "custom")]
-    Custom {
+    /// A change in reasoning depth for the following turns.
+    #[serde(rename = "thinking_level_change", rename_all = "camelCase")]
+    ThinkingLevelChange {
         id: String,
-        #[serde(rename = "parentId")]
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
-        #[serde(rename = "customType")]
+        /// The reasoning tier for following turns, or `"off"` to disable it.
+        /// Always a string — `null` would drop the field on the wire.
+        thinking_level: String,
+    },
+    /// A change in the set of tools mounted for the following turns.
+    #[serde(rename = "active_tools_change", rename_all = "camelCase")]
+    ActiveToolsChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        active_tool_names: Vec<String>,
+    },
+    /// A conversation- or branch-level summary produced by branch summarization.
+    /// Flat (not nested): `summary` is the prose string, `details` carries any
+    /// structured payload (e.g. files changed).
+    #[serde(rename = "branch_summary", rename_all = "camelCase")]
+    BranchSummary {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        from_id: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<JsonValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_hook: Option<bool>,
+    },
+    /// Extension entry whose payload the harness does not interpret.
+    #[serde(rename = "custom", rename_all = "camelCase")]
+    Custom {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
         custom_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<JsonValue>,
+    },
+    /// An extension message whose payload the harness does not interpret.
+    /// `content` is a plain string or an array of text/image blocks, matching
+    /// the v3 schema.
+    #[serde(rename = "custom_message", rename_all = "camelCase")]
+    CustomMessage {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        custom_type: String,
+        #[serde(default, deserialize_with = "crate::types::deserialize_content_blocks")]
+        content: Vec<crate::types::ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<JsonValue>,
+        #[serde(default)]
+        display: bool,
+    },
+    /// A short human-readable label attached to a point in the tree.
+    #[serde(rename = "label", rename_all = "camelCase")]
+    Label {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        target_id: String,
+        // TS types `label` as `string | undefined` and omits it when unset;
+        // skip-on-None keeps Rust output byte-identical to a TS-written entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Free-form session metadata (agent identity, environment, config snapshot).
+    #[serde(rename = "session_info", rename_all = "camelCase")]
+    SessionInfo {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// A cursor move: the leaf points at `targetId` (an older entry) for
+    /// branching. Appended by `set_leaf_id`; never the walk start.
+    #[serde(rename = "leaf", rename_all = "camelCase")]
+    Leaf {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        target_id: Option<String>,
     },
 }
 
@@ -75,9 +158,15 @@ impl SessionTreeEntry {
         match self {
             SessionTreeEntry::Message { id, .. }
             | SessionTreeEntry::Compaction { id, .. }
-            | SessionTreeEntry::Leaf { id, .. }
             | SessionTreeEntry::ModelChange { id, .. }
-            | SessionTreeEntry::Custom { id, .. } => id,
+            | SessionTreeEntry::ThinkingLevelChange { id, .. }
+            | SessionTreeEntry::ActiveToolsChange { id, .. }
+            | SessionTreeEntry::BranchSummary { id, .. }
+            | SessionTreeEntry::CustomMessage { id, .. }
+            | SessionTreeEntry::Custom { id, .. }
+            | SessionTreeEntry::Label { id, .. }
+            | SessionTreeEntry::SessionInfo { id, .. }
+            | SessionTreeEntry::Leaf { id, .. } => id,
         }
     }
 
@@ -85,9 +174,15 @@ impl SessionTreeEntry {
         match self {
             SessionTreeEntry::Message { parent_id, .. }
             | SessionTreeEntry::Compaction { parent_id, .. }
-            | SessionTreeEntry::Leaf { parent_id, .. }
             | SessionTreeEntry::ModelChange { parent_id, .. }
-            | SessionTreeEntry::Custom { parent_id, .. } => parent_id.as_deref(),
+            | SessionTreeEntry::ThinkingLevelChange { parent_id, .. }
+            | SessionTreeEntry::ActiveToolsChange { parent_id, .. }
+            | SessionTreeEntry::BranchSummary { parent_id, .. }
+            | SessionTreeEntry::CustomMessage { parent_id, .. }
+            | SessionTreeEntry::Custom { parent_id, .. }
+            | SessionTreeEntry::Label { parent_id, .. }
+            | SessionTreeEntry::SessionInfo { parent_id, .. }
+            | SessionTreeEntry::Leaf { parent_id, .. } => parent_id.as_deref(),
         }
     }
 
@@ -95,9 +190,24 @@ impl SessionTreeEntry {
         match self {
             SessionTreeEntry::Message { timestamp, .. }
             | SessionTreeEntry::Compaction { timestamp, .. }
-            | SessionTreeEntry::Leaf { timestamp, .. }
             | SessionTreeEntry::ModelChange { timestamp, .. }
-            | SessionTreeEntry::Custom { timestamp, .. } => *timestamp,
+            | SessionTreeEntry::ThinkingLevelChange { timestamp, .. }
+            | SessionTreeEntry::ActiveToolsChange { timestamp, .. }
+            | SessionTreeEntry::BranchSummary { timestamp, .. }
+            | SessionTreeEntry::CustomMessage { timestamp, .. }
+            | SessionTreeEntry::Custom { timestamp, .. }
+            | SessionTreeEntry::Label { timestamp, .. }
+            | SessionTreeEntry::SessionInfo { timestamp, .. }
+            | SessionTreeEntry::Leaf { timestamp, .. } => *timestamp,
+        }
+    }
+
+    /// The leaf cursor after appending this entry: a `leaf` entry redirects to
+    /// its `targetId`; every other entry's cursor is its own id.
+    pub(crate) fn leaf_cursor_after(&self) -> Option<String> {
+        match self {
+            SessionTreeEntry::Leaf { target_id, .. } => target_id.clone(),
+            _ => Some(self.id().to_string()),
         }
     }
 }
@@ -108,7 +218,14 @@ pub trait SessionStorage: Send + Sync {
     /// Generate a new unique entry ID.
     async fn create_entry_id(&self) -> Result<String, anyhow::Error>;
 
-    /// Append an entry to the session.
+    /// Append an entry to the session and synchronously advance the leaf
+    /// cursor to it.
+    ///
+    /// The cursor after the append is the entry's own id, except for a `leaf`
+    /// entry whose cursor is its `targetId`. Implementations must update their
+    /// persisted cursor within this call so a later `get_leaf_id` reflects the
+    /// append even if no further write follows — callers must not pair
+    /// `append_entry` with a separate `set_leaf_id` for the same cursor move.
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error>;
 
     /// Get an entry by ID.
@@ -117,7 +234,10 @@ pub trait SessionStorage: Send + Sync {
     /// Get the current leaf ID (cursor position).
     async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error>;
 
-    /// Set the current leaf ID.
+    /// Move the cursor to an older branch point by appending a `leaf` entry.
+    /// Implementations must validate that the target id exists before
+    /// persisting; the appended entry's cursor (its `targetId`) becomes the
+    /// new leaf.
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error>;
 
     /// Get all entries, optionally filtered.
@@ -134,6 +254,16 @@ pub trait SessionStorage: Send + Sync {
 /// A session wraps a SessionStorage with context-building logic.
 pub struct Session<S: SessionStorage> {
     storage: S,
+}
+
+/// Authorship of a persisted compaction: whether a before-compact hook
+/// supplied the summary (skipping the summarization model call), and the
+/// structured payload it attached. The model path passes `from_hook: false`
+/// with no `details`.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionAuthorship {
+    pub details: Option<JsonValue>,
+    pub from_hook: bool,
 }
 
 impl<S: SessionStorage> Session<S> {
@@ -157,7 +287,6 @@ impl<S: SessionStorage> Session<S> {
             message,
         };
         self.storage.append_entry(&entry).await?;
-        self.storage.set_leaf_id(Some(&id)).await?;
         Ok(id)
     }
 
@@ -173,7 +302,9 @@ impl<S: SessionStorage> Session<S> {
         summary: &str,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
+        usage: Option<Usage>,
         retained_tail: Vec<AgentMessage>,
+        authorship: CompactionAuthorship,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
@@ -186,10 +317,12 @@ impl<S: SessionStorage> Session<S> {
             summary: summary.to_string(),
             first_kept_entry_id,
             tokens_before,
+            usage,
             retained_tail,
+            details: authorship.details,
+            from_hook: Some(authorship.from_hook),
         };
         self.storage.append_entry(&entry).await?;
-        self.storage.set_leaf_id(Some(&id)).await?;
         Ok((id, timestamp))
     }
 

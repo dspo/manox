@@ -221,6 +221,10 @@ pub struct WireResponseEvent {
 pub struct WireResponse {
     #[serde(default)]
     pub id: Option<String>,
+    /// Model the upstream routed to, reported on `response.created` (and
+    /// echoed on terminal events). `None` when the endpoint omits it.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -260,6 +264,9 @@ pub struct WireUsage {
     pub total_tokens: Option<u64>,
     #[serde(default)]
     pub input_tokens_details: Option<WireInputTokensDetails>,
+    /// Breakdown of output tokens, when the endpoint reports it.
+    #[serde(default)]
+    pub output_tokens_details: Option<WireOutputTokensDetails>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -268,6 +275,14 @@ pub struct WireInputTokensDetails {
     pub cached_tokens: Option<u64>,
     #[serde(default)]
     pub cache_write_tokens: Option<u64>,
+}
+
+/// Output-token breakdown. `reasoning_tokens` is the subset of
+/// `output_tokens` spent on reasoning, when the endpoint reports it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WireOutputTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// A `message` output item (decode direction, from `WireOutputItemEvent`).

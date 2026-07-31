@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use crate::types::{AgentMessage, ContentBlock};
+use crate::types::{AgentMessage, ContentBlock, StopReason};
 
 /// The body of the synthetic result standing in for a tool call whose
 /// result never made it into the transcript.
@@ -29,8 +29,24 @@ pub fn repair_tool_flow(messages: &[AgentMessage]) -> Vec<AgentMessage> {
 
     for msg in messages {
         match msg {
-            AgentMessage::Assistant { content, .. } => {
+            AgentMessage::Assistant {
+                content,
+                stop_reason,
+                ..
+            } => {
+                // Close out the previous turn's tool calls first — a terminal
+                // assistant still marks the end of the prior turn.
                 insert_synthetic_results(&mut result, &mut pending, &mut resolved);
+                // TS Pi's transformMessages drops assistants that ended in
+                // `Error`/`Aborted`: their reasoning and tool calls may be
+                // incomplete and must not be replayed, so neither the message
+                // nor its calls enter the wire transcript.
+                if matches!(
+                    stop_reason,
+                    Some(StopReason::Error) | Some(StopReason::Aborted)
+                ) {
+                    continue;
+                }
                 let calls: Vec<(String, String)> = content
                     .iter()
                     .filter_map(|b| match b {
@@ -78,6 +94,8 @@ fn insert_synthetic_results(
             }],
             is_error: true,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         });
     }
@@ -94,8 +112,31 @@ mod tests {
             content,
             model: "test".into(),
             provider: "test".into(),
-            stop_reason: Some(StopReason::EndTurn),
-            usage: Usage::default(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// An assistant that ended mid-turn in `Error`/`Aborted` — its content may
+    /// be partial and must not survive the wire transform.
+    fn terminal_assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AgentMessage {
+        AgentMessage::Assistant {
+            content,
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(stop_reason),
+            usage: Box::new(Usage::default()),
+            error_message: Some("interrupted".into()),
             timestamp: chrono::Utc::now(),
         }
     }
@@ -105,6 +146,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             input: serde_json::json!({}),
+            thought_signature: None,
         }
     }
 
@@ -118,6 +160,8 @@ mod tests {
             }],
             is_error: false,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -234,5 +278,46 @@ mod tests {
         // custom one — the custom message itself does not end the tool turn.
         assert_eq!(repaired.len(), 4);
         synthetic_at(&repaired, 2);
+    }
+
+    #[test]
+    fn error_assistant_is_dropped_with_its_tool_calls() {
+        // An aborted turn with a tool call: both the assistant and its call
+        // vanish — the call is partial and must not be paired or replayed.
+        let messages = vec![
+            AgentMessage::user("q"),
+            terminal_assistant(vec![tool_use("c1", "read")], StopReason::Aborted),
+            AgentMessage::user("retry"),
+        ];
+        let repaired = repair_tool_flow(&messages);
+        assert_eq!(repaired.len(), 2);
+        assert!(matches!(&repaired[0], AgentMessage::User { .. }));
+        assert!(matches!(&repaired[1], AgentMessage::User { .. }));
+    }
+
+    #[test]
+    fn error_assistant_still_closes_the_prior_turns_pending() {
+        // A prior normal turn's unresolved call is paired before the terminal
+        // assistant is dropped — the dropped turn still ends the prior one.
+        let messages = vec![
+            assistant(vec![tool_use("c1", "read")]),
+            terminal_assistant(
+                vec![ContentBlock::Text {
+                    text: "boom".into(),
+                    signature: None,
+                }],
+                StopReason::Error,
+            ),
+            AgentMessage::user("retry"),
+        ];
+        let repaired = repair_tool_flow(&messages);
+        // user(prompt?) no — assistant1, synthetic for c1, user retry. The
+        // terminal assistant is gone; its own (none) calls not paired.
+        assert_eq!(repaired.len(), 3);
+        match synthetic_at(&repaired, 1) {
+            AgentMessage::ToolResult { tool_call_id, .. } => assert_eq!(tool_call_id, "c1"),
+            _ => unreachable!(),
+        }
+        assert!(matches!(&repaired[2], AgentMessage::User { .. }));
     }
 }

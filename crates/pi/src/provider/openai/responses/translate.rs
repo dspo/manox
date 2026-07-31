@@ -26,8 +26,7 @@ use serde_json::Value as JsonValue;
 use super::wire::*;
 use crate::provider::openai::clamp_cache_key;
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
-    ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
 
 /// Build the API request body from the agent context and stream options.
@@ -207,6 +206,7 @@ fn convert_assistant(
             ContentBlock::Thinking {
                 thinking,
                 signature,
+                ..
             } => {
                 if same_model {
                     // Verbatim replay; the signature IS the reasoning item.
@@ -231,7 +231,9 @@ fn convert_assistant(
                 };
                 push_text_item(items, text, signature, msg_index, &mut text_block_index);
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 let effective = if same_model {
                     id.clone()
                 } else {
@@ -310,13 +312,8 @@ fn push_text_item(
 fn user_part(block: &ContentBlock) -> Option<InputPart> {
     match block {
         ContentBlock::Text { text, .. } => Some(InputPart::Text { text: text.clone() }),
-        ContentBlock::Image { source } => {
-            let url = match source {
-                ImageSource::Base64 { media_type, data } => {
-                    format!("data:{media_type};base64,{data}")
-                }
-                ImageSource::Url { url } => url.clone(),
-            };
+        ContentBlock::Image { data, mime_type } => {
+            let url = format!("data:{mime_type};base64,{data}");
             Some(InputPart::Image {
                 image_url: url,
                 detail: "auto",
@@ -335,13 +332,8 @@ fn tool_result_output(blocks: &[ContentBlock]) -> FunctionOutput {
     for block in blocks {
         match block {
             ContentBlock::Text { text, .. } => texts.push(text.as_str()),
-            ContentBlock::Image { source } => {
-                let url = match source {
-                    ImageSource::Base64 { media_type, data } => {
-                        format!("data:{media_type};base64,{data}")
-                    }
-                    ImageSource::Url { url } => url.clone(),
-                };
+            ContentBlock::Image { data, mime_type } => {
+                let url = format!("data:{mime_type};base64,{data}");
                 images.push(InputPart::Image {
                     image_url: url,
                     detail: "auto",
@@ -502,8 +494,13 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         output_tokens: wire.output_tokens.unwrap_or(0),
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: written,
-        cache_creation: None,
+        cache_write_1h: None,
         total_tokens: wire.total_tokens.unwrap_or(0),
+        reasoning_tokens: wire
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
+        cost: None,
     }
 }
 
@@ -512,6 +509,7 @@ mod tests {
     use super::*;
     use crate::types::{AgentMessage, ContentBlock, Model, Usage};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn model(thinking: ThinkingKind) -> Model {
         Model {
@@ -539,8 +537,13 @@ mod tests {
             content,
             model: model_id.into(),
             provider: provider.into(),
+            api: "openai_responses".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -552,6 +555,8 @@ mod tests {
             content,
             is_error,
             details: None,
+            usage: None,
+            added_tool_names: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -571,7 +576,7 @@ mod tests {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
-            tools: Vec::new(),
+            tools: Arc::from(vec![]),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
             cache_retention: Default::default(),
@@ -697,10 +702,8 @@ mod tests {
             content: vec![
                 text("what is this"),
                 ContentBlock::Image {
-                    source: ImageSource::Base64 {
-                        media_type: "image/png".into(),
-                        data: "AAAA".into(),
-                    },
+                    data: "AAAA".into(),
+                    mime_type: "image/png".into(),
                 },
             ],
             timestamp: chrono::Utc::now(),
@@ -785,6 +788,8 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some(item.to_string()),
+
+                redacted: None,
             },
             text("answer"),
         ]);
@@ -803,6 +808,8 @@ mod tests {
         let msg = assistant(vec![ContentBlock::Thinking {
             thinking: "hmm".into(),
             signature: None,
+
+            redacted: None,
         }]);
         let v = request(&ctx(
             vec![user("q"), msg, user("again")],
@@ -824,6 +831,8 @@ mod tests {
             vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some(r#"{"id":"rs_foreign","type":"reasoning","summary":[]}"#.into()),
+
+                redacted: None,
             }],
             "openai",
             "gpt-other",
@@ -844,6 +853,7 @@ mod tests {
             id: "call_1|fc_item1".into(),
             name: "read".into(),
             input: json!({"path": "x"}),
+            thought_signature: None,
         }]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let item = &v["input"][2];
@@ -861,6 +871,7 @@ mod tests {
                 id: "call_1|fc_item1".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "openai",
             "gpt-other",
@@ -893,6 +904,7 @@ mod tests {
                 id: "call_1|fc_item1".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "anthropic",
             "claude-x",
@@ -912,6 +924,7 @@ mod tests {
                 id: "toolu_01AbC".into(),
                 name: "read".into(),
                 input: json!({}),
+                thought_signature: None,
             }],
             "anthropic",
             "claude-x",
@@ -962,10 +975,8 @@ mod tests {
 
         // Images switch the output to parts.
         let image = ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "AAAA".into(),
-            },
+            data: "AAAA".into(),
+            mime_type: "image/png".into(),
         };
         let v = request(&ctx(
             vec![user("q"), tool_result("c1", vec![image], false)],
@@ -989,6 +1000,7 @@ mod tests {
             id: "call_1|fc_1".into(),
             name: "read".into(),
             input: json!({}),
+            thought_signature: None,
         }]);
         // No tool result between the call and the next user message.
         let v = request(&ctx(
@@ -1015,6 +1027,7 @@ mod tests {
                 cached_tokens: Some(700),
                 cache_write_tokens: Some(100),
             }),
+            output_tokens_details: None,
         };
         let u = to_usage(&wire);
         assert_eq!(u.input_tokens, 200);
@@ -1034,6 +1047,7 @@ mod tests {
                 cached_tokens: Some(99),
                 cache_write_tokens: None,
             }),
+            output_tokens_details: None,
         };
         assert_eq!(to_usage(&bad).input_tokens, 0);
     }
