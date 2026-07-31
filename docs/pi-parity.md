@@ -115,7 +115,7 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 | 能力 | manox（规模） | pi 状态 | 说明 |
 |---|---|---|---|
 | 会话存储抽象 | — | ✅ | pi session trait + jsonl 实现，runtime-agnostic |
-| 悬空工具调用修复 | — | ✅ | 请求线边界共享修复 `provider/transform::repair_tool_flow`（2026-07-30）：未配对 tool call 一律补合成错误结果（"No result provided" + is_error），对齐 TS Pi transformMessages 第二趟（transform-messages.ts:158 起：下一 assistant/user 前及序列末尾各 flush 一次）；三 shape 统一走共享机制，responses 形状原自带的 flush_orphans 随之移除（TS Pi 各形状无本地兜底）；部分持久化/中断留下悬空调用时请求仍可发出，会话不会锁死；TS Pi 同层的 error/aborted 丢弃规则不移植——crate pi 在记录层保证残损 assistant 不入 transcript（agent_loop 中断不产生 assistant 消息） |
+| 悬空工具调用修复 | — | ✅ | 请求线边界共享修复 `provider/transform::repair_tool_flow`（2026-07-30）：未配对 tool call 一律补合成错误结果（"No result provided" + is_error），对齐 TS Pi transformMessages 第二趟（transform-messages.ts:158 起：下一 assistant/user 前及序列末尾各 flush 一次）；三 shape 统一走共享机制，responses 形状原自带的 flush_orphans 随之移除（TS Pi 各形状无本地兜底）；部分持久化/中断留下悬空调用时请求仍可发出，会话不会锁死；TS Pi 同层的 error/aborted 丢弃规则已随 #377 一并移植（transform 第一趟剥离 Error/Aborted assistant 的 thinking/tool calls），与记录层「残损 assistant 不入 transcript」形成双保险 |
 | SQLite 线程持久化 | db/ (2216)：threads/thread_data(zstd BLOB)/events/goals/token_usage/terminals/ui_notes/projects | 🚫 | **决策（2026-07-29）：不移植 SQLite 方案，沿用 pi 风格 jsonl sessions**。zstd BLOB/revision 防竞态等机制随之放弃，jsonl 缺失的能力（按消息 token 索引、ui_notes）届时在 jsonl 上补或在 manox 侧适配 |
 | 会话事件审计流 | db/events.rs | ❓ | Goal/压缩/模型变更审计，二期 |
 

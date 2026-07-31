@@ -1014,6 +1014,10 @@ mod tests {
                 let _ = event_tx
                     .send(AgentEvent::MessageUpdate {
                         message: Box::new(AgentMessage::user(format!("chunk {i}"))),
+                        assistant_message_event: crate::types::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: format!("chunk {i}"),
+                        },
                     })
                     .await;
             }

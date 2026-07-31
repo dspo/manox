@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~6,200 行 Rust，67 个测试，零警告。
+**当前规模：** ~25,000 行 Rust，323 个测试，零警告。
 
 ## 架构设计
 
@@ -57,7 +57,7 @@ crates/pi/src/
 |--------|------|------|
 | 异步运行时 | tokio | manox 已使用 tokio |
 | 错误处理 | thiserror（领域错误）+ anyhow（胶水代码） | 匹配 manox 现有模式 |
-| 事件系统 | `tokio::mpsc::Sender<AgentEvent>` | 比 callback trait 更 Rust 惯用，天然支持背压 |
+| 事件系统 | `#[async_trait] EventSink` + `mpsc` 有界通道（容量 1） | 循环 await 每次发射，慢消费者直接背压循环；对齐 TS Pi 每次 `await emit(...)` 的顺序保证 |
 | StreamFn | `Arc<dyn StreamFn>` + mpsc channel | Arc 为 tokio::spawn 提供 'static lifetime |
 | 生产 ExecutionEnv | `TokioExecutionEnv`（tokio::fs + tokio::process::Command） | 真实文件系统 + shell，超时通过 tokio::time::timeout |
 | grep/find | 进程内实现（ignore + regex + globset） | 消除 shell 注入，不依赖系统 grep/find |
@@ -133,10 +133,12 @@ pub trait AgentTool: Send + Sync {
    - 截断安全：stop_reason == "length" 时 fail 所有 tool calls
    - 中止检查：每个 tool call 边界检查 CancellationToken
 2. ✅ 实现 `Agent` struct
-   - 状态管理（MutableAgentState）
-   - 事件订阅（`subscribe()`）
-   - 队列管理（steering + follow-up + next_turn）
+   - 状态归约（`process_event` 对齐 TS `processEvents`：transcript 仅经 `MessageEnd` 增长，`streaming_message`/`pending_tool_calls`/`error_message` 随事件更新）
+   - 事件订阅（`subscribe()` → `Subscription`，监听器按注册序 await，`agent_end` 监听器结算后才算 idle）
+   - `MessageUpdate` 携带 `AssistantMessageEvent`（9 个流中变体：text/thinking/toolcall 的 start/delta/end），三 provider 形状各自映射
+   - 队列管理（steering + follow-up）
    - 生命周期（prompt / continue / abort / reset / wait_for_idle）
+   - 已知偏离：Completions 形状块模型与 TS 不同——TS 每条流只合并一个 textBlock/thinkingBlock（交错并入同一块），crate pi 交错时关闭当前块另开新块，终态 content 形状不同（后续 triage）
 
 ### Phase 3: Session + Compaction ✅
 
@@ -198,7 +200,7 @@ pub trait AgentTool: Send + Sync {
 3. ✅ 截断接入所有输出工具（read/write/bash/ls/grep/find）
 4. ✅ agent_loop 核心测试：单轮、多轮 tool call、截断安全、abort、follow-up
 5. ✅ edit_diff 单元测试（统一 diff 计算、空 diff、hunk 计数）
-6. ✅ 67 个单元测试全通过，零警告
+6. ✅ 单元测试全通过，零警告（计数见文首「当前规模」，随实现滚动更新）
 
 ## 待完成
 

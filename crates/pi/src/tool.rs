@@ -342,25 +342,50 @@ async fn execute_parallel(
     (executed, messages)
 }
 
-/// Forwards a tool's mid-execution emits to the loop's sink as
-/// `ToolExecutionUpdate` events, tagged with the call's id and carrying the
-/// call's name and arguments so a consumer can attach progress without
-/// cross-referencing history.
-struct SinkProgress<'a> {
+/// Buffers a tool's mid-execution progress reports as `ToolExecutionUpdate`
+/// events, tagged with the call's id and carrying the call's name and
+/// arguments so a consumer can attach progress without cross-referencing
+/// history.
+///
+/// The tool-facing [`ToolProgress`] callback is synchronous while the loop's
+/// sink is awaited, so updates queue here and are drained through the sink
+/// once execution settles — every update a tool reported is emitted before
+/// its `ToolExecutionEnd`, the same ordering TS Pi's settled `updateEvents`
+/// provide.
+struct BufferingProgress {
     tool_call_id: String,
     tool_name: String,
     arguments: JsonValue,
-    sink: &'a (dyn EventSink + Send + Sync),
+    pending: std::sync::Mutex<Vec<AgentEvent>>,
 }
 
-impl<'a> ToolProgress for SinkProgress<'a> {
+impl BufferingProgress {
+    fn new(tool_call_id: String, tool_name: String, arguments: JsonValue) -> Self {
+        BufferingProgress {
+            tool_call_id,
+            tool_name,
+            arguments,
+            pending: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queued updates in arrival order.
+    fn drain(&self) -> Vec<AgentEvent> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+}
+
+impl ToolProgress for BufferingProgress {
     fn emit(&self, partial_result: JsonValue) {
-        self.sink.emit(AgentEvent::ToolExecutionUpdate {
-            tool_call_id: self.tool_call_id.clone(),
-            tool_name: self.tool_name.clone(),
-            arguments: self.arguments.clone(),
-            partial_result,
-        });
+        self.pending
+            .lock()
+            .unwrap()
+            .push(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: self.tool_call_id.clone(),
+                tool_name: self.tool_name.clone(),
+                arguments: self.arguments.clone(),
+                partial_result,
+            });
     }
 }
 
@@ -380,7 +405,8 @@ async fn execute_one(
         tool_call_id: id.clone(),
         tool_name: name.clone(),
         arguments: args.clone(),
-    });
+    })
+    .await;
 
     // Find the tool by name.
     let tool = match tools.iter().find(|t| t.name() == tool_name) {
@@ -393,7 +419,8 @@ async fn execute_one(
                 tool_name: name.clone(),
                 result: result.clone(),
                 is_error: result.is_error,
-            });
+            })
+            .await;
             return ExecutedToolCall {
                 tool_call_id: id,
                 tool_name: name,
@@ -414,7 +441,8 @@ async fn execute_one(
             tool_name: name.clone(),
             result: result.clone(),
             is_error: result.is_error,
-        });
+        })
+        .await;
         return ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
@@ -436,7 +464,8 @@ async fn execute_one(
             tool_name: name.clone(),
             result: result.clone(),
             is_error: result.is_error,
-        });
+        })
+        .await;
         return ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
@@ -456,7 +485,8 @@ async fn execute_one(
             tool_name: name.clone(),
             result: result.clone(),
             is_error: result.is_error,
-        });
+        })
+        .await;
         return ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
@@ -467,12 +497,7 @@ async fn execute_one(
         };
     }
 
-    let progress = SinkProgress {
-        tool_call_id: id.clone(),
-        tool_name: name.clone(),
-        arguments: args.clone(),
-        sink,
-    };
+    let progress = BufferingProgress::new(id.clone(), name.clone(), args.clone());
     let mut result = match tool
         .execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress)
         .await
@@ -480,6 +505,11 @@ async fn execute_one(
         Ok(r) => r,
         Err(e) => AgentToolResult::error(format!("{e}")),
     };
+
+    // Settle the tool's queued progress updates before its end event.
+    for update in progress.drain() {
+        sink.emit(update).await;
+    }
 
     // after_tool_call hook: patches the result.
     if let Some(after) = &config.after_tool_call {
@@ -492,7 +522,8 @@ async fn execute_one(
         tool_name: name.clone(),
         result: result.clone(),
         is_error: result.is_error,
-    });
+    })
+    .await;
 
     ExecutedToolCall {
         tool_call_id: id,
@@ -540,8 +571,9 @@ mod tests {
 
     // A sink that discards events; pipeline tests don't assert lifecycle.
     struct NullSink;
+    #[async_trait::async_trait]
     impl EventSink for NullSink {
-        fn emit(&self, _event: AgentEvent) {}
+        async fn emit(&self, _event: AgentEvent) {}
     }
     use crate::env::ExecutionEnv;
     use std::path::{Path, PathBuf};
@@ -712,8 +744,9 @@ mod tests {
 
     // A sink that records every emitted event for lifecycle assertions.
     struct RecordingSink(std::sync::Mutex<Vec<AgentEvent>>);
+    #[async_trait::async_trait]
     impl EventSink for RecordingSink {
-        fn emit(&self, event: AgentEvent) {
+        async fn emit(&self, event: AgentEvent) {
             self.0.lock().unwrap().push(event);
         }
     }

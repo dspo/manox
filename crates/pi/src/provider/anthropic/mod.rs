@@ -14,7 +14,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::StreamFn;
 use crate::provider::sse::SseParser;
 use crate::provider::{ProviderError, retry};
-use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
+use crate::types::{
+    AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, StreamOptions,
+    Usage,
+};
 
 use translate::{parse_stop_reason, to_request, to_usage};
 use wire::{RawStreamEvent, WireContentBlock, WireDelta};
@@ -213,12 +216,15 @@ impl Accumulator {
                 content_block,
             } => {
                 self.ensure_index(index);
-                match content_block {
+                let event = match content_block {
                     WireContentBlock::Text { .. } => {
                         self.blocks[index] = ContentBlock::Text {
                             text: String::new(),
                             signature: None,
                         };
+                        AssistantMessageEvent::TextStart {
+                            content_index: index,
+                        }
                     }
                     WireContentBlock::Thinking { .. } => {
                         self.blocks[index] = ContentBlock::Thinking {
@@ -226,6 +232,9 @@ impl Accumulator {
                             signature: None,
                             redacted: None,
                         };
+                        AssistantMessageEvent::ThinkingStart {
+                            content_index: index,
+                        }
                     }
                     WireContentBlock::RedactedThinking { data } => {
                         self.blocks[index] = ContentBlock::Thinking {
@@ -233,6 +242,9 @@ impl Accumulator {
                             signature: Some(data),
                             redacted: Some(true),
                         };
+                        AssistantMessageEvent::ThinkingStart {
+                            content_index: index,
+                        }
                     }
                     WireContentBlock::ToolUse { id, name, .. } => {
                         self.open_json.insert(index, String::new());
@@ -242,13 +254,20 @@ impl Accumulator {
                             input: serde_json::Value::Null,
                             thought_signature: None,
                         };
+                        AssistantMessageEvent::ToolCallStart {
+                            content_index: index,
+                        }
                     }
-                    WireContentBlock::Other => {}
-                }
+                    WireContentBlock::Other => return Ok(()),
+                };
+                let _ = tx.try_send(AgentEvent::MessageUpdate {
+                    message: Box::new(self.current()),
+                    assistant_message_event: event,
+                });
             }
             RawStreamEvent::ContentBlockDelta { index, delta } => {
                 self.ensure_index(index);
-                match delta {
+                let event = match delta {
                     WireDelta::Text { text } => {
                         if let ContentBlock::Text {
                             text: t,
@@ -257,32 +276,49 @@ impl Accumulator {
                         {
                             t.push_str(&text);
                         }
+                        AssistantMessageEvent::TextDelta {
+                            content_index: index,
+                            delta: text,
+                        }
                     }
                     WireDelta::Thinking { thinking } => {
                         if let ContentBlock::Thinking { thinking: t, .. } = &mut self.blocks[index]
                         {
                             t.push_str(&thinking);
                         }
+                        AssistantMessageEvent::ThinkingDelta {
+                            content_index: index,
+                            delta: thinking,
+                        }
                     }
                     WireDelta::Signature { signature } => {
+                        // Signatures accumulate silently: no incremental event
+                        // exists for them, matching the TS Pi event surface.
                         if let ContentBlock::Thinking { signature: s, .. } = &mut self.blocks[index]
                         {
                             *s = Some(signature);
                         }
+                        return Ok(());
                     }
                     WireDelta::InputJson { partial_json } => {
                         self.open_json
                             .entry(index)
                             .or_default()
                             .push_str(&partial_json);
+                        AssistantMessageEvent::ToolCallDelta {
+                            content_index: index,
+                            delta: partial_json,
+                        }
                     }
-                    WireDelta::Other => {}
-                }
+                    WireDelta::Other => return Ok(()),
+                };
                 let _ = tx.try_send(AgentEvent::MessageUpdate {
                     message: Box::new(self.current()),
+                    assistant_message_event: event,
                 });
             }
             RawStreamEvent::ContentBlockStop { index } => {
+                self.ensure_index(index);
                 // Resolve a tool_use block's accumulated partial JSON.
                 if let Some(raw) = self.open_json.remove(&index) {
                     let input = if raw.trim().is_empty() {
@@ -294,6 +330,27 @@ impl Accumulator {
                         *slot = input;
                     }
                 }
+                let event = match &self.blocks[index] {
+                    ContentBlock::Text { text, .. } => AssistantMessageEvent::TextEnd {
+                        content_index: index,
+                        content: text.clone(),
+                    },
+                    ContentBlock::Thinking { thinking, .. } => AssistantMessageEvent::ThinkingEnd {
+                        content_index: index,
+                        content: thinking.clone(),
+                    },
+                    tool_call @ ContentBlock::ToolUse { .. } => {
+                        AssistantMessageEvent::ToolCallEnd {
+                            content_index: index,
+                            tool_call: tool_call.clone(),
+                        }
+                    }
+                    _ => return Ok(()),
+                };
+                let _ = tx.try_send(AgentEvent::MessageUpdate {
+                    message: Box::new(self.current()),
+                    assistant_message_event: event,
+                });
             }
             RawStreamEvent::MessageDelta { delta, usage } => {
                 if let Some(sr) = &delta.stop_reason {

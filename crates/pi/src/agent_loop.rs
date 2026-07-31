@@ -135,7 +135,7 @@ async fn run_loop_inner(
     tool_ctx: &dyn ToolContext,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<(), anyhow::Error> {
-    sink.emit(AgentEvent::AgentStart);
+    sink.emit(AgentEvent::AgentStart).await;
     let mut turn_count: usize = 0;
 
     // Check for steering messages at start (may have been queued while idle).
@@ -160,7 +160,7 @@ async fn run_loop_inner(
                 break;
             }
 
-            sink.emit(AgentEvent::TurnStart);
+            sink.emit(AgentEvent::TurnStart).await;
             turn_count += 1;
 
             // On the first turn, announce the initial prompt messages after
@@ -170,10 +170,12 @@ async fn run_loop_inner(
                 for msg in new_messages.iter() {
                     sink.emit(AgentEvent::MessageStart {
                         message: Box::new(msg.clone()),
-                    });
+                    })
+                    .await;
                     sink.emit(AgentEvent::MessageEnd {
                         message: Box::new(msg.clone()),
-                    });
+                    })
+                    .await;
                 }
             }
 
@@ -182,10 +184,12 @@ async fn run_loop_inner(
                 for msg in pending_messages.drain(..) {
                     sink.emit(AgentEvent::MessageStart {
                         message: Box::new(msg.clone()),
-                    });
+                    })
+                    .await;
                     sink.emit(AgentEvent::MessageEnd {
                         message: Box::new(msg.clone()),
-                    });
+                    })
+                    .await;
                     context.messages.push(msg.clone());
                     new_messages.push(msg);
                 }
@@ -215,10 +219,12 @@ async fn run_loop_inner(
                 sink.emit(AgentEvent::TurnEnd {
                     message: Box::new(message),
                     tool_results: Vec::new(),
-                });
+                })
+                .await;
                 sink.emit(AgentEvent::AgentEnd {
                     messages: new_messages.clone(),
-                });
+                })
+                .await;
                 return Ok(());
             }
 
@@ -246,7 +252,7 @@ async fn run_loop_inner(
             if !tool_calls.is_empty() {
                 // If the response was truncated, fail all tool calls.
                 let (executed, result_messages) = if stop_reason == Some(StopReason::Length) {
-                    fail_tool_calls_from_truncated(&tool_calls, sink)
+                    fail_tool_calls_from_truncated(&tool_calls, sink).await
                 } else {
                     execute_tool_calls(
                         &tool_calls,
@@ -271,19 +277,22 @@ async fn run_loop_inner(
                     // it a matched MessageStart/MessageEnd pair like TS Pi.
                     sink.emit(AgentEvent::MessageStart {
                         message: Box::new(result.clone()),
-                    });
+                    })
+                    .await;
                     context.messages.push(result.clone());
                     new_messages.push(result.clone());
                     sink.emit(AgentEvent::MessageEnd {
                         message: Box::new(result.clone()),
-                    });
+                    })
+                    .await;
                 }
             }
 
             sink.emit(AgentEvent::TurnEnd {
                 message: Box::new(message),
                 tool_results: tool_results.clone(),
-            });
+            })
+            .await;
 
             // Apply next-turn context update.
             if let Some(ref prepare_next_turn) = config.prepare_next_turn
@@ -300,7 +309,8 @@ async fn run_loop_inner(
                 {
                     sink.emit(AgentEvent::AgentEnd {
                         messages: new_messages.clone(),
-                    });
+                    })
+                    .await;
                     return Ok(());
                 }
             }
@@ -311,7 +321,8 @@ async fn run_loop_inner(
             {
                 sink.emit(AgentEvent::AgentEnd {
                     messages: new_messages.clone(),
-                });
+                })
+                .await;
                 return Ok(());
             }
 
@@ -340,7 +351,8 @@ async fn run_loop_inner(
 
     sink.emit(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
-    });
+    })
+    .await;
     Ok(())
 }
 
@@ -389,7 +401,7 @@ async fn stream_assistant_response(
             AgentEvent::MessageUpdate { .. } => {}
             _ => {}
         }
-        sink.emit(event);
+        sink.emit(event).await;
     }
 
     // Wait for the stream to complete. A provider error or an abort never
@@ -411,11 +423,13 @@ async fn stream_assistant_response(
     if first {
         sink.emit(AgentEvent::MessageStart {
             message: Box::new(message.clone()),
-        });
+        })
+        .await;
     }
     sink.emit(AgentEvent::MessageEnd {
         message: Box::new(message.clone()),
-    });
+    })
+    .await;
 
     Ok(message)
 }
@@ -457,7 +471,7 @@ fn terminal_message(
 ///
 /// When the response hits the output token limit, streamed tool-call arguments
 /// may be incomplete. We fail them all and ask the model to re-issue.
-fn fail_tool_calls_from_truncated(
+async fn fail_tool_calls_from_truncated(
     tool_calls: &[(&str, &str, serde_json::Value)],
     sink: &(dyn EventSink + Send + Sync),
 ) -> (Vec<crate::tool::ExecutedToolCall>, Vec<AgentMessage>) {
@@ -469,7 +483,8 @@ fn fail_tool_calls_from_truncated(
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
             arguments: args.clone(),
-        });
+        })
+        .await;
 
         let result = AgentToolResult::error(format!(
             "Tool call \"{name}\" was not executed: the response hit the output token limit, \
@@ -492,7 +507,8 @@ fn fail_tool_calls_from_truncated(
             tool_name: name.to_string(),
             result: result.clone(),
             is_error: true,
-        });
+        })
+        .await;
 
         executed.push(crate::tool::ExecutedToolCall {
             tool_call_id: id.to_string(),
@@ -530,8 +546,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl EventSink for MockSink {
-        fn emit(&self, event: AgentEvent) {
+        async fn emit(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
         }
     }

@@ -328,6 +328,47 @@ mod ts_millis {
 
 // ── Event types ─────────────────────────────────────────────────────────────
 
+/// Incremental stream event attached to [`AgentEvent::MessageUpdate`].
+///
+/// Mirrors the TS Pi `AssistantMessageEvent` variants that a `message_update`
+/// can carry: `content_index` addresses the block in the partial assistant
+/// message's content array, `delta` holds the just-arrived fragment, and the
+/// `*_end` variants carry the block's finalized content. The TS `start`,
+/// `done`, and `error` variants have no counterpart here — the Rust stream
+/// boundary delivers them as the message lifecycle (`MessageStart`) and the
+/// stream function's return value instead.
+#[derive(Debug, Clone)]
+pub enum AssistantMessageEvent {
+    /// A text block began streaming.
+    TextStart { content_index: usize },
+    /// A text block received a fragment.
+    TextDelta { content_index: usize, delta: String },
+    /// A text block finished; `content` is its full text.
+    TextEnd {
+        content_index: usize,
+        content: String,
+    },
+    /// A thinking block began streaming.
+    ThinkingStart { content_index: usize },
+    /// A thinking block received a fragment.
+    ThinkingDelta { content_index: usize, delta: String },
+    /// A thinking block finished; `content` is its full text.
+    ThinkingEnd {
+        content_index: usize,
+        content: String,
+    },
+    /// A tool call block began streaming.
+    ToolCallStart { content_index: usize },
+    /// A tool call block received a fragment of its arguments JSON.
+    ToolCallDelta { content_index: usize, delta: String },
+    /// A tool call block finished; `tool_call` is always the
+    /// [`ContentBlock::ToolUse`] variant with resolved arguments.
+    ToolCallEnd {
+        content_index: usize,
+        tool_call: ContentBlock,
+    },
+}
+
 /// Events emitted during an agent run.
 ///
 /// These form the complete lifecycle: `agent_start` → repeated `turn_start`
@@ -341,7 +382,10 @@ pub enum AgentEvent {
     /// A new message has started streaming.
     MessageStart { message: Box<AgentMessage> },
     /// A streaming message received an update delta.
-    MessageUpdate { message: Box<AgentMessage> },
+    MessageUpdate {
+        message: Box<AgentMessage>,
+        assistant_message_event: AssistantMessageEvent,
+    },
     /// A message has finished streaming.
     MessageEnd { message: Box<AgentMessage> },
     /// A tool call has started executing. Carries the arguments the model
@@ -400,8 +444,13 @@ pub enum AgentEvent {
 /// Sink for agent lifecycle events emitted during the loop and the tool
 /// execution pipeline. Implementations forward events to subscribers or
 /// capture them in tests.
+///
+/// `emit` is async so a slow consumer backpressures the loop: the loop awaits
+/// each emission, so state reduction and subscribed listeners settle before
+/// the run advances — the same ordering TS Pi's awaited `emit` provides.
+#[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
-    fn emit(&self, event: AgentEvent);
+    async fn emit(&self, event: AgentEvent);
 }
 
 // ── Agent context and configuration ─────────────────────────────────────────

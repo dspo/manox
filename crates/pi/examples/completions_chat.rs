@@ -135,7 +135,7 @@ async fn main() {
                     tool_inputs.clear();
                     dim_open = false;
                 }
-                AgentEvent::MessageUpdate { message } => {
+                AgentEvent::MessageUpdate { message, .. } => {
                     let AgentMessage::Assistant { content, .. } = &*message else {
                         continue;
                     };

@@ -24,7 +24,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::StreamFn;
 use crate::provider::sse::SseParser;
 use crate::provider::{ProviderError, overflow, retry};
-use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
+use crate::types::{
+    AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, StreamOptions,
+    Usage,
+};
 
 use translate::{encode_text_signature, to_request, to_usage};
 use wire::{
@@ -259,58 +262,71 @@ impl Accumulator {
             });
         }
 
-        let mutated = match kind {
+        let mut events: Vec<AssistantMessageEvent> = Vec::new();
+        match kind {
             "response.output_item.added" => {
                 let ev: WireOutputItemEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
-                self.create_slot(ev.output_index, &ev.item);
-                true
+                events.extend(self.create_slot(ev.output_index, &ev.item));
             }
             "response.output_item.done" => {
                 let ev: WireOutputItemEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
-                self.finalize_slot(ev.output_index, &ev.item)?;
-                true
+                // A done without a preceding added still opens the slot, so
+                // the start event fires first.
+                if !self.slots.contains_key(&ev.output_index) {
+                    events.extend(self.create_slot(ev.output_index, &ev.item));
+                }
+                events.extend(self.finalize_slot(ev.output_index, &ev.item)?);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 let ev: WireDeltaEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
-                self.push_thinking(ev.output_index, &ev.delta)
+                events.extend(self.push_thinking(ev.output_index, &ev.delta));
             }
             "response.reasoning_summary_part.done" => {
                 let ev: WireIndexEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
                 // The boundary between summary parts reads as a paragraph
                 // break.
-                self.push_thinking(ev.output_index, "\n\n")
+                events.extend(self.push_thinking(ev.output_index, "\n\n"));
             }
             "response.output_text.delta" | "response.refusal.delta" => {
                 let ev: WireDeltaEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
-                self.push_text(ev.output_index, &ev.delta)
+                events.extend(self.push_text(ev.output_index, &ev.delta));
             }
             "response.function_call_arguments.delta" => {
                 let ev: WireDeltaEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
-                match self.slots.get_mut(&ev.output_index) {
-                    Some(Slot::ToolCall { args_json, .. }) => {
-                        args_json.push_str(&ev.delta);
-                        true
-                    }
-                    _ => false,
+                if let Some(Slot::ToolCall { block, args_json }) =
+                    self.slots.get_mut(&ev.output_index)
+                {
+                    args_json.push_str(&ev.delta);
+                    events.push(AssistantMessageEvent::ToolCallDelta {
+                        content_index: *block,
+                        delta: ev.delta,
+                    });
                 }
             }
             "response.function_call_arguments.done" => {
                 let ev: WireArgumentsDoneEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
                 // The done payload is authoritative; it replaces whatever
-                // the deltas accumulated.
-                match self.slots.get_mut(&ev.output_index) {
-                    Some(Slot::ToolCall { args_json, .. }) => {
-                        *args_json = ev.arguments;
-                        true
+                // the deltas accumulated. Only the suffix beyond what the
+                // deltas already streamed surfaces as a delta event.
+                if let Some(Slot::ToolCall { block, args_json }) =
+                    self.slots.get_mut(&ev.output_index)
+                {
+                    let previous = std::mem::replace(args_json, ev.arguments.clone());
+                    if let Some(suffix) = ev.arguments.strip_prefix(&previous)
+                        && !suffix.is_empty()
+                    {
+                        events.push(AssistantMessageEvent::ToolCallDelta {
+                            content_index: *block,
+                            delta: suffix.to_string(),
+                        });
                     }
-                    _ => false,
                 }
             }
             "response.created" | "response.in_progress" | "response.queued" => {
@@ -324,13 +340,11 @@ impl Accumulator {
                 if let Some(m) = &ev.response.model {
                     self.response_model = Some(m.clone());
                 }
-                false
             }
             "response.completed" | "response.incomplete" => {
                 let ev: WireResponseEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
                 self.finalize_response(&ev.response)?;
-                true
             }
             "response.failed" => {
                 let ev: WireResponseEvent =
@@ -349,19 +363,25 @@ impl Accumulator {
                 return Err(overflow::mid_stream(detail).into());
             }
             // response.created and event kinds we do not model.
-            _ => false,
-        };
+            _ => {}
+        }
 
-        if mutated {
+        for assistant_message_event in events {
             let _ = tx.try_send(AgentEvent::MessageUpdate {
                 message: Box::new(self.current()),
+                assistant_message_event,
             });
         }
         Ok(())
     }
 
-    /// Open the slot for a new output item and push its block.
-    fn create_slot(&mut self, output_index: usize, item: &JsonValue) {
+    /// Open the slot for a new output item and push its block. The returned
+    /// event is the block's start; server-side items get no slot and no event.
+    fn create_slot(
+        &mut self,
+        output_index: usize,
+        item: &JsonValue,
+    ) -> Option<AssistantMessageEvent> {
         match item["type"].as_str() {
             Some("reasoning") => {
                 self.blocks.push(ContentBlock::Thinking {
@@ -369,28 +389,26 @@ impl Accumulator {
                     signature: None,
                     redacted: None,
                 });
-                self.slots.insert(
-                    output_index,
-                    Slot::Thinking {
-                        block: self.blocks.len() - 1,
-                    },
-                );
+                let block = self.blocks.len() - 1;
+                self.slots.insert(output_index, Slot::Thinking { block });
+                Some(AssistantMessageEvent::ThinkingStart {
+                    content_index: block,
+                })
             }
             Some("message") => {
                 self.blocks.push(ContentBlock::Text {
                     text: String::new(),
                     signature: None,
                 });
-                self.slots.insert(
-                    output_index,
-                    Slot::Text {
-                        block: self.blocks.len() - 1,
-                    },
-                );
+                let block = self.blocks.len() - 1;
+                self.slots.insert(output_index, Slot::Text { block });
+                Some(AssistantMessageEvent::TextStart {
+                    content_index: block,
+                })
             }
             Some("function_call") => {
                 let Ok(call) = serde_json::from_value::<WireFunctionCall>(item.clone()) else {
-                    return;
+                    return None;
                 };
                 // The block id carries both halves of the wire identity so
                 // replay can split them apart again.
@@ -404,33 +422,37 @@ impl Accumulator {
                     input: JsonValue::Null,
                     thought_signature: None,
                 });
+                let block = self.blocks.len() - 1;
                 self.slots.insert(
                     output_index,
                     Slot::ToolCall {
-                        block: self.blocks.len() - 1,
+                        block,
                         args_json: call.arguments,
                     },
                 );
+                Some(AssistantMessageEvent::ToolCallStart {
+                    content_index: block,
+                })
             }
             // Server-side items (web search, file search, ...) are not
             // modelled; their deltas address this slot and are skipped.
-            _ => {}
+            _ => None,
         }
     }
 
     /// Close a slot on `output_item.done`: the done item is authoritative
     /// for text and arguments, and it carries the identities that become
-    /// the block signatures.
+    /// the block signatures. The returned event is the block's end.
     fn finalize_slot(
         &mut self,
         output_index: usize,
         item: &JsonValue,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Option<AssistantMessageEvent>, anyhow::Error> {
         if !self.slots.contains_key(&output_index) {
             self.create_slot(output_index, item);
         }
         let Some(slot) = self.slots.remove(&output_index) else {
-            return Ok(());
+            return Ok(None);
         };
         match (item["type"].as_str(), slot) {
             (Some("reasoning"), Slot::Thinking { block }) => {
@@ -446,6 +468,14 @@ impl Accumulator {
                 if let Some(id) = item["id"].as_str() {
                     self.reasoning_blocks.insert(id.to_string(), block);
                 }
+                let content = match &self.blocks[block] {
+                    ContentBlock::Thinking { thinking, .. } => thinking.clone(),
+                    _ => String::new(),
+                };
+                Ok(Some(AssistantMessageEvent::ThinkingEnd {
+                    content_index: block,
+                    content,
+                }))
             }
             (Some("message"), Slot::Text { block }) => {
                 let msg: WireOutputMessage =
@@ -465,6 +495,14 @@ impl Accumulator {
                 if let ContentBlock::Text { signature, .. } = &mut self.blocks[block] {
                     *signature = Some(encode_text_signature(&msg.id, msg.phase.as_deref()));
                 }
+                let content = match &self.blocks[block] {
+                    ContentBlock::Text { text, .. } => text.clone(),
+                    _ => String::new(),
+                };
+                Ok(Some(AssistantMessageEvent::TextEnd {
+                    content_index: block,
+                    content,
+                }))
             }
             (Some("function_call"), Slot::ToolCall { block, args_json }) => {
                 let call: WireFunctionCall =
@@ -481,34 +519,43 @@ impl Accumulator {
                 {
                     *slot_input = input;
                 }
+                Ok(Some(AssistantMessageEvent::ToolCallEnd {
+                    content_index: block,
+                    tool_call: self.blocks[block].clone(),
+                }))
             }
             // Item kind and slot kind disagree; keep the accumulated state.
-            _ => {}
+            _ => Ok(None),
         }
-        Ok(())
     }
 
-    fn push_thinking(&mut self, output_index: usize, delta: &str) -> bool {
+    fn push_thinking(&mut self, output_index: usize, delta: &str) -> Option<AssistantMessageEvent> {
         match self.slots.get(&output_index) {
             Some(Slot::Thinking { block }) => {
                 if let ContentBlock::Thinking { thinking, .. } = &mut self.blocks[*block] {
                     thinking.push_str(delta);
                 }
-                true
+                Some(AssistantMessageEvent::ThinkingDelta {
+                    content_index: *block,
+                    delta: delta.to_string(),
+                })
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    fn push_text(&mut self, output_index: usize, delta: &str) -> bool {
+    fn push_text(&mut self, output_index: usize, delta: &str) -> Option<AssistantMessageEvent> {
         match self.slots.get(&output_index) {
             Some(Slot::Text { block }) => {
                 if let ContentBlock::Text { text, .. } = &mut self.blocks[*block] {
                     text.push_str(delta);
                 }
-                true
+                Some(AssistantMessageEvent::TextDelta {
+                    content_index: *block,
+                    delta: delta.to_string(),
+                })
             }
-            _ => false,
+            _ => None,
         }
     }
 

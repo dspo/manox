@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_loop::StreamFn;
 use crate::provider::sse::SseParser;
 use crate::provider::{ProviderError, overflow, retry};
-use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
+use crate::types::{
+    AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, StreamOptions,
+    Usage,
+};
 
 use translate::{parse_finish_reason, to_request, to_usage};
 use wire::{WireChunk, WireErrorPayload, WireToolCallDelta};
@@ -260,10 +263,9 @@ impl Accumulator {
             return Ok(());
         };
 
-        let mut mutated = false;
+        let mut events: Vec<AssistantMessageEvent> = Vec::new();
         if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
-            self.push_text(&text);
-            mutated = true;
+            self.push_text(&text, &mut events);
         }
         // Reasoning arrives under one of several spellings; at most one
         // carries content per chunk, so the first non-empty wins.
@@ -276,25 +278,24 @@ impl Accumulator {
         .flatten()
         .find(|s| !s.is_empty());
         if let Some(thinking) = reasoning {
-            self.push_thinking(&thinking);
-            mutated = true;
+            self.push_thinking(&thinking, &mut events);
         }
         if let Some(calls) = delta.tool_calls {
             for call in calls {
-                self.apply_tool_call(call);
+                self.apply_tool_call(call, &mut events);
             }
-            mutated = true;
         }
 
-        if mutated {
+        for assistant_message_event in events {
             let _ = tx.try_send(AgentEvent::MessageUpdate {
                 message: Box::new(self.current()),
+                assistant_message_event,
             });
         }
         Ok(())
     }
 
-    fn push_text(&mut self, text: &str) {
+    fn push_text(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
         // A text delta closes any open reasoning block: interleaved kinds
         // become consecutive blocks.
         self.open_thinking = None;
@@ -307,6 +308,7 @@ impl Accumulator {
                 });
                 let i = self.blocks.len() - 1;
                 self.open_text = Some(i);
+                events.push(AssistantMessageEvent::TextStart { content_index: i });
                 i
             }
         };
@@ -317,9 +319,13 @@ impl Accumulator {
         {
             t.push_str(text);
         }
+        events.push(AssistantMessageEvent::TextDelta {
+            content_index: index,
+            delta: text.to_string(),
+        });
     }
 
-    fn push_thinking(&mut self, thinking: &str) {
+    fn push_thinking(&mut self, thinking: &str, events: &mut Vec<AssistantMessageEvent>) {
         self.open_text = None;
         let index = match self.open_thinking {
             Some(i) => i,
@@ -334,15 +340,24 @@ impl Accumulator {
                 });
                 let i = self.blocks.len() - 1;
                 self.open_thinking = Some(i);
+                events.push(AssistantMessageEvent::ThinkingStart { content_index: i });
                 i
             }
         };
         if let ContentBlock::Thinking { thinking: t, .. } = &mut self.blocks[index] {
             t.push_str(thinking);
         }
+        events.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: index,
+            delta: thinking.to_string(),
+        });
     }
 
-    fn apply_tool_call(&mut self, call: WireToolCallDelta) {
+    fn apply_tool_call(
+        &mut self,
+        call: WireToolCallDelta,
+        events: &mut Vec<AssistantMessageEvent>,
+    ) {
         while self.tool_calls.len() <= call.index {
             let block_index = self.blocks.len();
             self.blocks.push(ContentBlock::ToolUse {
@@ -357,8 +372,12 @@ impl Accumulator {
                 name: String::new(),
                 args_json: String::new(),
             });
+            events.push(AssistantMessageEvent::ToolCallStart {
+                content_index: block_index,
+            });
         }
 
+        let mut args_delta = String::new();
         let acc = &mut self.tool_calls[call.index];
         let mut identity_changed = false;
         if let Some(id) = call.id {
@@ -372,6 +391,7 @@ impl Accumulator {
             }
             if let Some(args) = function.arguments {
                 acc.args_json.push_str(&args);
+                args_delta = args;
             }
         }
         if identity_changed {
@@ -389,6 +409,12 @@ impl Accumulator {
                 *bname = name;
             }
         }
+        // One delta event per wire delta, even when it carried only identity
+        // fields (the fragment is empty then).
+        events.push(AssistantMessageEvent::ToolCallDelta {
+            content_index: self.tool_calls[call.index].block_index,
+            delta: args_delta,
+        });
     }
 
     fn finish(mut self, tx: &mpsc::Sender<AgentEvent>) -> Result<AgentMessage, anyhow::Error> {
@@ -403,6 +429,28 @@ impl Accumulator {
             if let ContentBlock::ToolUse { input: slot, .. } = &mut self.blocks[call.block_index] {
                 *slot = input;
             }
+        }
+        // Content blocks end only at stream end, one *_end per block in order.
+        for (index, block) in self.blocks.iter().enumerate() {
+            let assistant_message_event = match block {
+                ContentBlock::Text { text, .. } => AssistantMessageEvent::TextEnd {
+                    content_index: index,
+                    content: text.clone(),
+                },
+                ContentBlock::Thinking { thinking, .. } => AssistantMessageEvent::ThinkingEnd {
+                    content_index: index,
+                    content: thinking.clone(),
+                },
+                ContentBlock::ToolUse { .. } => AssistantMessageEvent::ToolCallEnd {
+                    content_index: index,
+                    tool_call: block.clone(),
+                },
+                _ => continue,
+            };
+            let _ = tx.try_send(AgentEvent::MessageUpdate {
+                message: Box::new(self.current()),
+                assistant_message_event,
+            });
         }
         let message = self.current();
         let _ = tx.try_send(AgentEvent::MessageEnd {

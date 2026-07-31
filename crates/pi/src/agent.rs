@@ -3,8 +3,17 @@
 // Owns the conversation transcript, manages event subscriptions, and exposes
 // queueing APIs for steering and follow-up messages. The Agent wraps the raw
 // `run_loop` / `run_loop_continue` functions with lifecycle management.
+//
+// State is event-reduced: as the loop emits, each event is first applied to
+// `AgentState` (the transcript grows exclusively through `MessageEnd`) and
+// then dispatched to subscribed listeners, awaited in registration order.
+// A slow listener therefore backpressures the loop itself.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
@@ -67,28 +76,58 @@ impl PendingMessageQueue {
     }
 }
 
-/// A sink that collects events and forwards them to subscribers.
-struct SubscriberSink {
-    events: Arc<Mutex<Vec<AgentEvent>>>,
+/// A listener invoked for every run event.
+///
+/// Receives the event and the active run's cancellation token. Listeners are
+/// awaited in registration order before the loop advances past the event, so
+/// they are part of the run's settlement: `agent_end` does not make the agent
+/// idle until its listeners have completed.
+pub type AgentListener = Arc<
+    dyn Fn(AgentEvent, CancellationToken) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// A registered listener's removal handle; unsubscribes on drop.
+pub struct Subscription {
+    id: u64,
+    listeners: Arc<Mutex<Vec<(u64, AgentListener)>>>,
 }
 
-impl SubscriberSink {
-    fn new() -> Self {
-        SubscriberSink {
-            events: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn drain(&self) -> Vec<AgentEvent> {
-        let mut events = self.events.lock().unwrap();
-        std::mem::take(&mut *events)
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.listeners
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
     }
 }
 
-impl EventSink for SubscriberSink {
-    fn emit(&self, event: AgentEvent) {
-        self.events.lock().unwrap().push(event);
+/// The sink handed to the loop during a run.
+///
+/// Events travel a bounded channel to the reducing side of
+/// [`Agent::run_with_lifecycle`]. Capacity one lets the loop run a single
+/// event ahead of the reducer; beyond that, a send waits until the previous
+/// event has been reduced and its listeners awaited.
+struct ChannelSink {
+    tx: mpsc::Sender<AgentEvent>,
+}
+
+#[async_trait::async_trait]
+impl EventSink for ChannelSink {
+    async fn emit(&self, event: AgentEvent) {
+        // A closed channel means the reducer is gone, which only happens once
+        // the run has already settled — nothing left to deliver to.
+        let _ = self.tx.send(event).await;
     }
+}
+
+/// The registered state of a run in flight.
+///
+/// `finish_tx` flips to `true` after the run's final events (including their
+/// listeners) have settled and runtime-owned state has been cleared — the
+/// point at which [`Agent::wait_for_idle`] resolves.
+struct ActiveRun {
+    token: CancellationToken,
+    finish_tx: watch::Sender<bool>,
 }
 
 /// Per-run observation hooks cloned into each turn's `AgentLoopConfig`.
@@ -120,11 +159,15 @@ pub struct Agent {
     /// `get_follow_up_messages` callback to resume a run that would otherwise
     /// have ended.
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
-    /// The active run's cancel token, shared with [`RunHandle`] so `abort`
-    /// can cancel a run in flight without an `&mut self` borrow on the Agent.
-    active_run: Arc<Mutex<Option<CancellationToken>>>,
+    /// The active run's registration, shared with [`RunHandle`] so `abort` and
+    /// `wait_for_idle` work without an `&mut self` borrow on the Agent.
+    active_run: Arc<Mutex<Option<Arc<ActiveRun>>>>,
+    /// Subscribed event listeners, in registration order. Shared with
+    /// [`RunHandle`] so listeners can be added mid-run.
+    listeners: Arc<Mutex<Vec<(u64, AgentListener)>>>,
+    /// Next listener registration id.
+    next_listener_id: Arc<AtomicU64>,
     stream_fn: Arc<dyn StreamFn>,
-    sink: SubscriberSink,
     /// Tools mounted on the agent and forwarded into each turn's context.
     tools: Arc<[Box<dyn crate::tool::AgentTool>]>,
     /// Session-scoped execution context for tool calls. Backs the real
@@ -157,8 +200,9 @@ impl Agent {
             steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             active_run: Arc::new(Mutex::new(None)),
+            listeners: Arc::new(Mutex::new(Vec::new())),
+            next_listener_id: Arc::new(AtomicU64::new(1)),
             stream_fn,
-            sink: SubscriberSink::new(),
             tools: Arc::from(Vec::new()),
             tool_ctx,
             session_id: None,
@@ -200,9 +244,33 @@ impl Agent {
         &self.state
     }
 
-    /// Drain all events that have been emitted since the last drain.
-    pub fn drain_events(&self) -> Vec<AgentEvent> {
-        self.sink.drain()
+    /// Register a listener for run events.
+    ///
+    /// The listener is awaited for every event — including mid-run — until the
+    /// returned [`Subscription`] is dropped. Listeners run after the event has
+    /// been reduced into [`AgentState`], so a listener always observes the
+    /// post-event state.
+    pub fn subscribe(&self, listener: AgentListener) -> Subscription {
+        let id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
+        self.listeners.lock().unwrap().push((id, listener));
+        Subscription {
+            id,
+            listeners: Arc::clone(&self.listeners),
+        }
+    }
+
+    /// Resolve once the active run has fully settled: its final event's
+    /// listeners have completed and runtime-owned state has been cleared.
+    /// Returns immediately when no run is in flight.
+    pub async fn wait_for_idle(&self) {
+        let mut finished = match self.active_run.lock().unwrap().as_ref() {
+            Some(active) => active.finish_tx.subscribe(),
+            None => return,
+        };
+        if *finished.borrow_and_update() {
+            return;
+        }
+        let _ = finished.changed().await;
     }
 
     /// Queue a message to be injected after the current assistant turn finishes.
@@ -232,9 +300,14 @@ impl Agent {
     }
 
     /// Abort the current run, if one is active.
+    ///
+    /// Cancellation is cooperative: the loop notices the token and winds the
+    /// run down through its normal terminal events. The run's registration
+    /// stays until settlement, so `wait_for_idle` still tracks the aborting
+    /// run to its end.
     pub fn abort(&self) {
-        if let Some(token) = self.active_run.lock().unwrap().take() {
-            token.cancel();
+        if let Some(active) = self.active_run.lock().unwrap().as_ref() {
+            active.token.cancel();
         }
     }
 
@@ -247,13 +320,16 @@ impl Agent {
     ///
     /// `prompt`/`continue_` take `&mut self` for the whole run, so the Agent's
     /// own `steer`/`follow_up`/`abort` cannot be called while a run is in
-    /// flight. The handle shares the same `Arc`-backed queues and cancel slot,
-    /// exposing `&self` methods callable from another task during the run.
+    /// flight. The handle shares the same `Arc`-backed queues, listener
+    /// registry, and run slot, exposing `&self` methods callable from another
+    /// task during the run.
     pub fn run_handle(&self) -> RunHandle {
         RunHandle {
             steering_queue: Arc::clone(&self.steering_queue),
             follow_up_queue: Arc::clone(&self.follow_up_queue),
             active_run: Arc::clone(&self.active_run),
+            listeners: Arc::clone(&self.listeners),
+            next_listener_id: Arc::clone(&self.next_listener_id),
         }
     }
 
@@ -371,103 +447,153 @@ impl Agent {
         &mut self,
         messages: &[AgentMessage],
     ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        let owned_messages = messages.to_vec();
-        let (messages, context) = self
-            .run_with_lifecycle(|signal, agent| {
-                let mut context = agent.create_context_snapshot();
-                let config = agent.create_loop_config();
-                let stream_fn = Arc::clone(&agent.stream_fn);
-                let tool_ctx = Arc::clone(&agent.tool_ctx);
-                let sink = agent.sink.clone();
-                let msgs = owned_messages.clone();
+        let msgs = messages.to_vec();
+        let mut context = self.create_context_snapshot();
+        let config = self.create_loop_config();
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let tool_ctx = Arc::clone(&self.tool_ctx);
 
-                Box::pin(async move {
-                    let msgs = run_loop(
-                        &msgs,
-                        &mut context,
-                        &config,
-                        Some(signal),
-                        stream_fn,
-                        &*tool_ctx,
-                        &sink,
-                    )
-                    .await?;
-                    Ok((msgs, context))
-                })
-            })
-            .await?;
-        self.state.messages = context.messages;
-        Ok(messages)
+        self.run_with_lifecycle(|signal, sink| async move {
+            run_loop(
+                &msgs,
+                &mut context,
+                &config,
+                Some(signal),
+                stream_fn,
+                &*tool_ctx,
+                &sink,
+            )
+            .await
+        })
+        .await
     }
 
     async fn run_continuation(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        let (messages, context) = self
-            .run_with_lifecycle(|signal, agent| {
-                let mut context = agent.create_context_snapshot();
-                let config = agent.create_loop_config();
-                let stream_fn = Arc::clone(&agent.stream_fn);
-                let tool_ctx = Arc::clone(&agent.tool_ctx);
-                let sink = agent.sink.clone();
+        let mut context = self.create_context_snapshot();
+        let config = self.create_loop_config();
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let tool_ctx = Arc::clone(&self.tool_ctx);
 
-                Box::pin(async move {
-                    let msgs = run_loop_continue(
-                        &mut context,
-                        &config,
-                        Some(signal),
-                        stream_fn,
-                        &*tool_ctx,
-                        &sink,
-                    )
-                    .await?;
-                    Ok((msgs, context))
-                })
-            })
-            .await?;
-        self.state.messages = context.messages;
-        Ok(messages)
+        self.run_with_lifecycle(|signal, sink| async move {
+            run_loop_continue(
+                &mut context,
+                &config,
+                Some(signal),
+                stream_fn,
+                &*tool_ctx,
+                &sink,
+            )
+            .await
+        })
+        .await
     }
 
-    async fn run_with_lifecycle<F>(
+    /// Drive one run to settlement.
+    ///
+    /// The loop future emits into a bounded channel; this side reduces each
+    /// event into the agent state and awaits listeners before the loop
+    /// advances. Because the transcript accumulates through `MessageEnd`
+    /// reduction alone, `state.messages` is current throughout the run — not
+    /// only after it — and matches what the loop's own context built.
+    async fn run_with_lifecycle<F, Fut>(
         &mut self,
         executor: F,
-    ) -> Result<(Vec<AgentMessage>, AgentContext), anyhow::Error>
+    ) -> Result<Vec<AgentMessage>, anyhow::Error>
     where
-        F: for<'a> FnOnce(
-            CancellationToken,
-            &'a mut Agent,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<(Vec<AgentMessage>, AgentContext), anyhow::Error>,
-                    > + 'a,
-            >,
-        >,
+        F: FnOnce(CancellationToken, ChannelSink) -> Fut,
+        Fut: Future<Output = Result<Vec<AgentMessage>, anyhow::Error>>,
     {
         if self.is_running() {
             anyhow::bail!("Agent is already processing.");
         }
 
         let token = CancellationToken::new();
-        *self.active_run.lock().unwrap() = Some(token.clone());
+        let (finish_tx, _) = watch::channel(false);
+        *self.active_run.lock().unwrap() = Some(Arc::new(ActiveRun {
+            token: token.clone(),
+            finish_tx,
+        }));
         self.state.is_streaming = true;
         self.state.streaming_message = None;
         self.state.error_message = None;
 
-        let result = executor(token.clone(), self).await;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(1);
+        let mut run = Box::pin(executor(token.clone(), ChannelSink { tx }));
+        let result = loop {
+            tokio::select! {
+                biased;
+                ev = rx.recv() => match ev {
+                    Some(ev) => self.process_event(ev, &token).await,
+                    // The sender lives inside the run future, so the channel
+                    // can only close after the run completed — which the other
+                    // branch observes first. This arm never fires.
+                    None => unreachable!("event channel closed before the run completed"),
+                },
+                r = &mut run => break r,
+            }
+        };
+        drop(run);
+        // Settle events the loop emitted just before finishing, so `agent_end`
+        // and its listeners are part of the run.
+        while let Ok(ev) = rx.try_recv() {
+            self.process_event(ev, &token).await;
+        }
 
         self.state.is_streaming = false;
         self.state.streaming_message = None;
-        self.state.error_message = None;
-        *self.active_run.lock().unwrap() = None;
+        self.state.pending_tool_calls.clear();
+        if let Some(active) = self.active_run.lock().unwrap().take() {
+            let _ = active.finish_tx.send(true);
+        }
 
         result
     }
-}
 
-impl Clone for SubscriberSink {
-    fn clone(&self) -> Self {
-        SubscriberSink {
-            events: Arc::clone(&self.events),
+    /// Reduce one loop event into the agent state, then dispatch it to
+    /// subscribed listeners in registration order.
+    async fn process_event(&mut self, event: AgentEvent, token: &CancellationToken) {
+        match &event {
+            AgentEvent::MessageStart { message } | AgentEvent::MessageUpdate { message, .. } => {
+                self.state.streaming_message = Some((**message).clone());
+            }
+            AgentEvent::MessageEnd { message } => {
+                self.state.streaming_message = None;
+                self.state.messages.push((**message).clone());
+            }
+            AgentEvent::ToolExecutionStart { tool_call_id, .. }
+                if !self.state.pending_tool_calls.contains(tool_call_id) =>
+            {
+                self.state.pending_tool_calls.push(tool_call_id.clone());
+            }
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                self.state
+                    .pending_tool_calls
+                    .retain(|id| id != tool_call_id);
+            }
+            AgentEvent::TurnEnd { message, .. } => {
+                if let AgentMessage::Assistant {
+                    error_message: Some(error),
+                    ..
+                } = &**message
+                {
+                    self.state.error_message = Some(error.clone());
+                }
+            }
+            AgentEvent::AgentEnd { .. } => {
+                self.state.streaming_message = None;
+            }
+            _ => {}
+        }
+
+        let listeners: Vec<AgentListener> = self
+            .listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, listener)| Arc::clone(listener))
+            .collect();
+        for listener in listeners {
+            listener(event.clone(), token.clone()).await;
         }
     }
 }
@@ -481,7 +607,9 @@ impl Clone for SubscriberSink {
 pub struct RunHandle {
     steering_queue: Arc<Mutex<PendingMessageQueue>>,
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
-    active_run: Arc<Mutex<Option<CancellationToken>>>,
+    active_run: Arc<Mutex<Option<Arc<ActiveRun>>>>,
+    listeners: Arc<Mutex<Vec<(u64, AgentListener)>>>,
+    next_listener_id: Arc<AtomicU64>,
 }
 
 impl RunHandle {
@@ -497,8 +625,32 @@ impl RunHandle {
 
     /// Cancel the active run, if one is in flight.
     pub fn abort(&self) {
-        if let Some(token) = self.active_run.lock().unwrap().take() {
-            token.cancel();
+        if let Some(active) = self.active_run.lock().unwrap().as_ref() {
+            active.token.cancel();
+        }
+    }
+
+    /// Resolve once the active run has fully settled, like
+    /// [`Agent::wait_for_idle`]. Returns immediately when no run is in flight.
+    pub async fn wait_for_idle(&self) {
+        let mut finished = match self.active_run.lock().unwrap().as_ref() {
+            Some(active) => active.finish_tx.subscribe(),
+            None => return,
+        };
+        if *finished.borrow_and_update() {
+            return;
+        }
+        let _ = finished.changed().await;
+    }
+
+    /// Register a listener for run events, like [`Agent::subscribe`]; usable
+    /// while a run is in flight.
+    pub fn subscribe(&self, listener: AgentListener) -> Subscription {
+        let id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
+        self.listeners.lock().unwrap().push((id, listener));
+        Subscription {
+            id,
+            listeners: Arc::clone(&self.listeners),
         }
     }
 
@@ -524,7 +676,7 @@ mod tests {
     use super::*;
     use crate::env::ExecutionEnv;
     use crate::tool::ToolState;
-    use crate::types::{StopReason, ThinkingKind, Usage};
+    use crate::types::{AssistantMessageEvent, StopReason, ThinkingKind, Usage};
     use std::path::{Path, PathBuf};
 
     struct TestEnv;
@@ -828,6 +980,403 @@ mod tests {
             result.is_ok(),
             "aborted run must complete with Ok, got: {:?}",
             result.err()
+        );
+    }
+
+    // ── Reducer / subscription / lifecycle ──────────────────────────────────
+
+    /// Stream fn that forwards start + deltas through the channel before
+    /// returning the completed assistant message, like a real provider.
+    struct StreamingStreamFn;
+
+    fn streaming_partial(text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for StreamingStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(streaming_partial("")),
+                })
+                .await;
+            for chunk in ["Hello", " world"] {
+                let _ = event_tx
+                    .send(AgentEvent::MessageUpdate {
+                        message: Box::new(streaming_partial(chunk)),
+                        assistant_message_event: AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: chunk.into(),
+                        },
+                    })
+                    .await;
+            }
+            Ok(streaming_partial("Hello world"))
+        }
+    }
+
+    fn event_name(event: &AgentEvent) -> &'static str {
+        match event {
+            AgentEvent::AgentStart => "agent_start",
+            AgentEvent::TurnStart => "turn_start",
+            AgentEvent::MessageStart { .. } => "message_start",
+            AgentEvent::MessageUpdate { .. } => "message_update",
+            AgentEvent::MessageEnd { .. } => "message_end",
+            AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
+            AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update",
+            AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end",
+            AgentEvent::TurnEnd { .. } => "turn_end",
+            AgentEvent::Retry { .. } => "retry",
+            AgentEvent::AgentEnd { .. } => "agent_end",
+        }
+    }
+
+    fn recording_listener(log: Arc<Mutex<Vec<&'static str>>>) -> AgentListener {
+        Arc::new(move |event, _token| {
+            let log = Arc::clone(&log);
+            Box::pin(async move {
+                log.lock().unwrap().push(event_name(&event));
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn listeners_observe_events_in_wire_order() {
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(StreamingStreamFn),
+            test_tool_ctx(),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let _sub = agent.subscribe(recording_listener(Arc::clone(&log)));
+
+        agent.prompt("hi").await.unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "agent_start",
+                "turn_start",
+                "message_start",
+                "message_end",
+                "message_start",
+                "message_update",
+                "message_update",
+                "message_end",
+                "turn_end",
+                "agent_end",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_subscription_stops_delivery() {
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(StreamingStreamFn),
+            test_tool_ctx(),
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sub = agent.subscribe(recording_listener(Arc::clone(&log)));
+        drop(sub);
+
+        agent.prompt("hi").await.unwrap();
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a dropped subscription must receive nothing"
+        );
+
+        // A fresh subscription still receives the next run's events.
+        let _sub = agent.subscribe(recording_listener(Arc::clone(&log)));
+        agent.prompt("again").await.unwrap();
+        assert!(!log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcript_grows_via_message_end_and_matches_new_messages() {
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(StreamingStreamFn),
+            test_tool_ctx(),
+        );
+
+        let new_messages = agent.prompt("hi").await.unwrap();
+        assert_eq!(new_messages.len(), 2, "user prompt + assistant response");
+        assert_eq!(agent.state().messages.len(), new_messages.len());
+        assert!(
+            agent.state().streaming_message.is_none(),
+            "streaming message clears when the run settles"
+        );
+        assert!(!agent.state().is_streaming);
+        assert!(agent.state().pending_tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_resolves_after_agent_end_listeners() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        /// Streams like [`StreamingStreamFn`] and signals once the provider
+        /// call has begun — at which point the run's lifecycle registration
+        /// is already visible to `wait_for_idle`.
+        struct SignalingStreamFn {
+            started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StreamFn for SignalingStreamFn {
+            async fn stream(
+                &self,
+                _context: &AgentContext,
+                _signal: CancellationToken,
+                event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if let Some(tx) = self.started_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = event_tx
+                    .send(AgentEvent::MessageStart {
+                        message: Box::new(streaming_partial("")),
+                    })
+                    .await;
+                Ok(streaming_partial("Hello"))
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(SignalingStreamFn {
+                started_tx: Mutex::new(Some(started_tx)),
+            }),
+            test_tool_ctx(),
+        );
+        let agent_end_seen = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&agent_end_seen);
+        let _sub = agent.subscribe(Arc::new(move |event, _token| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::AgentEnd { .. }) {
+                    // Listeners are awaited: a slow agent_end listener holds
+                    // the run open past the loop's own completion.
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    seen.store(true, AtomicOrdering::SeqCst);
+                }
+            })
+        }));
+        let handle = agent.run_handle();
+
+        // No run in flight: resolves immediately.
+        handle.wait_for_idle().await;
+
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let join = tokio::task::spawn_local(async move { agent.prompt("hi").await });
+                // Registration precedes the loop's first provider call, so a
+                // started stream implies `wait_for_idle` sees the active run.
+                started_rx.await.expect("stream fn never started");
+                handle.wait_for_idle().await;
+                assert!(
+                    agent_end_seen.load(AtomicOrdering::SeqCst),
+                    "wait_for_idle must not resolve before agent_end listeners settle"
+                );
+                join.await.expect("prompt task panicked").unwrap();
+            })
+            .await;
+    }
+
+    /// Stream fn whose provider call fails outright; the loop materializes a
+    /// terminal `Error` assistant message.
+    struct FailingStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for FailingStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            Err(anyhow::anyhow!("provider exploded"))
+        }
+    }
+
+    #[tokio::test]
+    async fn error_message_survives_run_settlement() {
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(FailingStreamFn),
+            test_tool_ctx(),
+        );
+
+        agent.prompt("hi").await.unwrap();
+
+        let state = agent.state();
+        assert!(!state.is_streaming);
+        assert!(state.streaming_message.is_none());
+        let error = state
+            .error_message
+            .as_deref()
+            .expect("a failed turn leaves its error on the state");
+        assert!(
+            error.contains("provider exploded"),
+            "unexpected error message: {error}"
+        );
+        assert!(
+            state.messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                }
+            )),
+            "the terminal Error assistant message must be in the transcript"
+        );
+    }
+
+    /// Stream fn replaying a scripted sequence of assistant messages, one per
+    /// provider call.
+    struct ScriptedStreamFn {
+        scripts: Mutex<std::collections::VecDeque<AgentMessage>>,
+    }
+
+    impl ScriptedStreamFn {
+        fn new(messages: Vec<AgentMessage>) -> Self {
+            ScriptedStreamFn {
+                scripts: Mutex::new(messages.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ScriptedStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            self.scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("script exhausted"))
+        }
+    }
+
+    struct EchoTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes input"
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "message": { "type": "string" } },
+                "required": ["message"]
+            })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            params: JsonValue,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, crate::tool::ToolError> {
+            Ok(AgentToolResult::text(
+                params["message"].as_str().unwrap_or("no message"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_execution_events_bracket_execution_and_pending_settles() {
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let text_msg = streaming_partial("done");
+
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ScriptedStreamFn::new(vec![tool_call_msg, text_msg])),
+            test_tool_ctx(),
+        )
+        .with_tools(Arc::from(vec![
+            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+        ]));
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let _sub = agent.subscribe(recording_listener(Arc::clone(&log)));
+
+        agent.prompt("hi").await.unwrap();
+
+        let events = log.lock().unwrap();
+        let start = events
+            .iter()
+            .position(|e| *e == "tool_execution_start")
+            .expect("tool_execution_start missing");
+        let end = events
+            .iter()
+            .position(|e| *e == "tool_execution_end")
+            .expect("tool_execution_end missing");
+        assert!(start < end, "start must precede end: {events:?}");
+        assert!(
+            agent.state().pending_tool_calls.is_empty(),
+            "the pending set empties once every call settles"
+        );
+        assert!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::ToolResult { .. })),
+            "the tool result message must be in the transcript"
         );
     }
 }
