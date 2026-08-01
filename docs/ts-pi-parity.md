@@ -109,6 +109,13 @@
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
 | 第九轮（Phase 4A，2026-08-01） | `d100401` | `4488ad55c`（未变） | 运行配置闭环：Model 全字段判等、restore 三态同步、resolver 失败 terminal 化、无 resolver 跨 API 报错、harness_chat api 修正；新增 6 个回归 + `runtime_switch` example |
+| Phase 4B（2026-08-01） | `faa9690` | `4488ad55c` | EventSink Result 化、PrepareTurnFn async+TurnUpdate、Agent middleware、message_end 逐条持久化（Arc Session）、删除 turn 末批量写；`session_resume` example |
+| Phase 3A（2026-08-01） | `4b7605d` | `4488ad55c` | split-turn 双摘要（history+turn prefix）、pre-prompt aborted compaction；`split_turn_compact` example |
+| Phase 3B（2026-08-01） | `8cf26ef` | `4488ad55c` | SessionRepository（create/open/list/delete/fork/search）、Session move_to/label/name/stats/pagination/custom、navigate_tree；`navigate_tree` example |
+| Phase 4C（2026-08-01） | `e600989` | `4488ad55c` | PromptInput/images、skills/templates、next_turn、mid-run active-tools、session entry 入口 |
+| Phase 2B（2026-08-01） | `bf98d4c` | `4488ad55c` | Completions 交错块合并（单 text+单 thinking）、请求级 headers/timeout |
+| Phase 8（2026-08-01） | `562e3a0` | `4488ad55c` | coding-agent facade（AgentSession/Builder、ModelRuntime、ResourceLoader、create_agent_session）；`coding_agent_smoke` example |
+| Phase 7（2026-08-01） | 终局 | `4488ad55c` | fixtures/ts-pi 差分（serialize_conversation/system prompt/file ops）+ 刷新脚本；最终门禁全绿 |
 | 第八轮（2026-08-01） | `b2b3a10` | `4488ad55c`（未变） | 1 P1（StreamResolver：Model.api + 每请求 provider runtime 切换）+ 3 P2（flush 逐条成功才 pop / TurnRuntime 快照消除 continuation 晚一拍 / create-open header validator 统一+null 拒绝）+ 1 P3（PLAN 校准）均已修复，见各章节 |
 | 第七轮（2026-08-01） | `af7c195` | `4488ad55c`（未变） | 2 P2（prepare-next-turn 接线+运行中 mutation 排队+thinking setter 闭环 / JSONL wire 结构校验）+ 1 P3（partial 错误保留 timestamp/api）均已修复，无新 P0/P1 |
 | 第六轮（2026-08-01） | `9367432` | `4488ad55c`（未变） | 3 P2（partial 失败终态保留 / retry token 先于 Start 安装 / JSONL 重复 id 拒绝）+ 2 P3（尾部 SSE 解析错误传播 / 并发测试断言）均已修复，无新 P0/P1 |

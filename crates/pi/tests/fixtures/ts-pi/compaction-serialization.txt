@@ -1,0 +1,7 @@
+[User]: hello
+
+[Assistant]: hi
+
+[Assistant tool calls]: read(path="a.rs")
+
+[Tool result]: ok

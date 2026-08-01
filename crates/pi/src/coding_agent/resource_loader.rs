@@ -2,8 +2,6 @@
 // (CLAUDE.md), skills, and prompt templates are read from the working
 // directory and surfaced as harness resources.
 
-use std::path::Path;
-
 use crate::harness::{HarnessResources, PromptTemplate, Skill};
 
 /// Loads resources for a working directory.

@@ -90,7 +90,7 @@ impl JsonlSessionStorage {
     /// The path is the exact file location — the caller owns the naming scheme
     /// (the TS Pi repo writes `timestamp_sessionId.jsonl` under a per-cwd
     /// directory). A missing parent directory is created. This errors if the
-    /// file already exists; reopen an existing file with [`open`].
+    /// file already exists; reopen an existing file with [`Self::open`].
     pub async fn create(
         path: &Path,
         metadata: JsonlSessionMetadata,
@@ -130,7 +130,7 @@ impl JsonlSessionStorage {
     /// Open an existing session file at `path`.
     ///
     /// The file must exist and begin with a valid v3 session header; otherwise
-    /// this errors rather than guessing at a repair. Unlike [`create`], a
+    /// this errors rather than guessing at a repair. Unlike [`Self::create`], a
     /// missing or mis-typed path surfaces as an error so a recovery path can
     /// never silently materialize an empty session.
     pub async fn open(path: &Path) -> Result<Self, anyhow::Error> {

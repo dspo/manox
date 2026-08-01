@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::harness::{AgentHarness, HarnessResources};
 use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
+use crate::session::repository::SessionRepository;
 use crate::tool::AgentTool;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;

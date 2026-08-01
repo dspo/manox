@@ -4,7 +4,7 @@
 //! or a connect-phase transport failure is usually transient. This module
 //! wraps the send in an exponential-backoff retry loop so those recover
 //! silently, emitting [`AgentEvent::Retry`] between attempts; only after
-//! [`MAX_ATTEMPTS`] does the classified error reach the caller.
+//! `MAX_ATTEMPTS` does the classified error reach the caller.
 //!
 //! Safety boundary: retry happens only at the handshake stage, before any SSE
 //! event has been forwarded. A stream that fails mid-flight is never retried
