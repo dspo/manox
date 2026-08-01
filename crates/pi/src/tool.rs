@@ -278,7 +278,7 @@ pub async fn execute_tool_calls(
     config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
     sequential: bool,
-) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
+) -> Result<(Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>), anyhow::Error> {
     // A tool that declares itself Sequential forces the whole batch to run
     // one call at a time, so its per-call ordering holds.
     let any_tool_sequential = tool_calls.iter().any(|(_, name, _)| {
@@ -302,17 +302,18 @@ async fn execute_sequential(
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
-) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
+) -> Result<(Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>), anyhow::Error> {
     let mut executed = Vec::with_capacity(tool_calls.len());
     let mut messages = Vec::with_capacity(tool_calls.len());
 
     for (id, name, args) in tool_calls {
-        let outcome = execute_one((id, name, args), tools, signal.clone(), ctx, config, sink).await;
+        let outcome =
+            execute_one((id, name, args), tools, signal.clone(), ctx, config, sink).await?;
         messages.push(outcome.result_message.clone());
         executed.push(outcome);
     }
 
-    (executed, messages)
+    Ok((executed, messages))
 }
 
 async fn execute_parallel(
@@ -322,7 +323,7 @@ async fn execute_parallel(
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
-) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
+) -> Result<(Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>), anyhow::Error> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|(id, name, args)| {
@@ -330,7 +331,11 @@ async fn execute_parallel(
         })
         .collect();
 
-    let outcomes = futures::future::join_all(futures).await;
+    let outcomes: Vec<Result<ExecutedToolCall, anyhow::Error>> =
+        futures::future::join_all(futures).await;
+    // Propagate the first sink failure; a persistence error must stop the
+    // run before any later tool side effects.
+    let outcomes: Vec<ExecutedToolCall> = outcomes.into_iter().collect::<Result<_, _>>()?;
 
     let mut executed = Vec::with_capacity(outcomes.len());
     let mut messages = Vec::with_capacity(outcomes.len());
@@ -340,7 +345,7 @@ async fn execute_parallel(
         executed.push(outcome);
     }
 
-    (executed, messages)
+    Ok((executed, messages))
 }
 
 /// Forwards a tool's mid-execution progress reports to the loop's sink as
@@ -382,7 +387,7 @@ async fn execute_one(
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
-) -> ExecutedToolCall {
+) -> Result<ExecutedToolCall, anyhow::Error> {
     let (tool_call_id, tool_name, args) = call;
     let id = tool_call_id.to_string();
     let name = tool_name.to_string();
@@ -392,7 +397,7 @@ async fn execute_one(
         tool_name: name.clone(),
         arguments: args.clone(),
     })
-    .await;
+    .await?;
 
     // Find the tool by name.
     let tool = match tools.iter().find(|t| t.name() == tool_name) {
@@ -406,15 +411,15 @@ async fn execute_one(
                 result: result.clone(),
                 is_error: result.is_error,
             })
-            .await;
-            return ExecutedToolCall {
+            .await?;
+            return Ok(ExecutedToolCall {
                 tool_call_id: id,
                 tool_name: name,
                 result_message,
                 result,
                 blocked: false,
                 block_reason: None,
-            };
+            });
         }
     };
 
@@ -428,15 +433,15 @@ async fn execute_one(
             result: result.clone(),
             is_error: result.is_error,
         })
-        .await;
-        return ExecutedToolCall {
+        .await?;
+        return Ok(ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
             result_message,
             result,
             blocked: false,
             block_reason: None,
-        };
+        });
     }
 
     // before_tool_call hook: `Some(reason)` blocks before execution.
@@ -451,15 +456,15 @@ async fn execute_one(
             result: result.clone(),
             is_error: result.is_error,
         })
-        .await;
-        return ExecutedToolCall {
+        .await?;
+        return Ok(ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
             result_message,
             result,
             blocked: true,
             block_reason: Some(reason),
-        };
+        });
     }
 
     // Execute the tool.
@@ -472,15 +477,15 @@ async fn execute_one(
             result: result.clone(),
             is_error: result.is_error,
         })
-        .await;
-        return ExecutedToolCall {
+        .await?;
+        return Ok(ExecutedToolCall {
             tool_call_id: id,
             tool_name: name,
             result_message,
             result,
             blocked: false,
             block_reason: None,
-        };
+        });
     }
 
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -492,7 +497,9 @@ async fn execute_one(
     };
     let mut forward_progress = Box::pin(async {
         while let Some(update) = progress_rx.recv().await {
-            sink.emit(update).await;
+            // Real-time progress echoes are not persistence events; a dead
+            // sink must not kill the run for one.
+            let _ = sink.emit(update).await;
         }
     });
     let mut result = {
@@ -527,16 +534,16 @@ async fn execute_one(
         result: result.clone(),
         is_error: result.is_error,
     })
-    .await;
+    .await?;
 
-    ExecutedToolCall {
+    Ok(ExecutedToolCall {
         tool_call_id: id,
         tool_name: name,
         result_message,
         result,
         blocked: false,
         block_reason: None,
-    }
+    })
 }
 
 fn make_tool_result_message(
@@ -577,7 +584,9 @@ mod tests {
     struct NullSink;
     #[async_trait::async_trait]
     impl EventSink for NullSink {
-        async fn emit(&self, _event: AgentEvent) {}
+        async fn emit(&self, _event: AgentEvent) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
     }
     use crate::env::ExecutionEnv;
     use std::path::{Path, PathBuf};
@@ -713,7 +722,8 @@ mod tests {
             &NullSink,
             false,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(executed.len(), 1);
         assert_eq!(messages.len(), 1);
@@ -742,7 +752,8 @@ mod tests {
             &NullSink,
             false,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(executed[0].result.is_error);
     }
@@ -751,8 +762,9 @@ mod tests {
     struct RecordingSink(std::sync::Mutex<Vec<AgentEvent>>);
     #[async_trait::async_trait]
     impl EventSink for RecordingSink {
-        async fn emit(&self, event: AgentEvent) {
+        async fn emit(&self, event: AgentEvent) -> Result<(), anyhow::Error> {
             self.0.lock().unwrap().push(event);
+            Ok(())
         }
     }
 
@@ -810,7 +822,8 @@ mod tests {
             &sink,
             false,
         )
-        .await;
+        .await
+        .unwrap();
 
         let events = sink.0.lock().unwrap();
         let start = events
@@ -880,10 +893,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EventSink for UpdateWatchSink {
-        async fn emit(&self, event: AgentEvent) {
+        async fn emit(&self, event: AgentEvent) -> Result<(), anyhow::Error> {
             if matches!(event, AgentEvent::ToolExecutionUpdate { .. }) {
                 self.seen.notify_one();
             }
+            Ok(())
         }
     }
 
@@ -916,7 +930,7 @@ mod tests {
             _ = &mut execution => panic!("execution settled before its progress arrived"),
         }
         release.notify_one();
-        let (executed, _) = execution.await;
+        let (executed, _) = execution.await.unwrap();
         assert!(!executed[0].result.is_error);
     }
 
@@ -939,7 +953,8 @@ mod tests {
             &sink,
             false,
         )
-        .await;
+        .await
+        .unwrap();
 
         let events = sink.0.lock().unwrap();
         let start = events.iter().find_map(|e| match e {

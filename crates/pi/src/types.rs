@@ -467,7 +467,10 @@ pub enum AgentEvent {
 /// the run advances — the same ordering TS Pi's awaited `emit` provides.
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
-    async fn emit(&self, event: AgentEvent);
+    /// Emit an event. An `Err` aborts the run: a persistence or subscriber
+    /// failure must stop further provider/tool effects rather than letting
+    /// the conversation diverge from what was durably recorded.
+    async fn emit(&self, event: AgentEvent) -> Result<(), anyhow::Error>;
 }
 
 // ── Agent context and configuration ─────────────────────────────────────────
@@ -576,8 +579,23 @@ impl std::fmt::Debug for AgentContext {
 
 /// Supplies queued messages to inject into the run.
 pub type MessageQueueFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
+/// The refresh a `prepare_next_turn` returns for the next turn: the model
+/// and thinking level snapshot (TS `AgentLoopTurnUpdate`). The loop applies
+/// it to its in-flight context before the next provider request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnUpdate {
+    pub model: Model,
+    pub thinking_level: Option<String>,
+}
+
 /// Refreshes the context/model before a turn; `None` keeps the current turn.
-pub type PrepareTurnFn = Box<dyn Fn(&mut AgentContext) -> Option<AgentContext> + Send + Sync>;
+/// Async so the refresh can flush durable writes (TS `prepareNextTurn`);
+/// takes no context reference so the future is `'static`.
+pub type PrepareTurnFn = Box<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<TurnUpdate>> + Send>>
+        + Send
+        + Sync,
+>;
 /// Decides whether the run should stop after a turn.
 pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + Send + Sync>;
 /// Gates a tool call before execution; `Some(reason)` blocks it.

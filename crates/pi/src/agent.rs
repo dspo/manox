@@ -21,6 +21,7 @@ use crate::tool::{AgentToolResult, ToolContext};
 use crate::types::{
     AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState,
     BeforeProviderRequestFn, BeforeToolCallFn, CacheRetention, ContentBlock, Model, PrepareTurnFn,
+    TurnUpdate,
 };
 use serde_json::Value as JsonValue;
 
@@ -82,6 +83,21 @@ impl PendingMessageQueue {
 /// awaited in registration order before the loop advances past the event, so
 /// they are part of the run's settlement: `agent_end` does not make the agent
 /// idle until its listeners have completed.
+pub type EventMiddleware = Arc<
+    dyn Fn(
+            AgentEvent,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A listener invoked for every run event.
+///
+/// Receives the event and the active run's cancellation token. Listeners are
+/// awaited in registration order before the loop advances past the event, so
+/// they are part of the run's settlement: `agent_end` does not make the agent
+/// idle until its listeners have completed.
 pub type AgentListener = Arc<
     dyn Fn(AgentEvent, CancellationToken) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
@@ -115,13 +131,14 @@ struct ChannelSink {
 
 #[async_trait::async_trait]
 impl EventSink for ChannelSink {
-    async fn emit(&self, event: AgentEvent) {
+    async fn emit(&self, event: AgentEvent) -> Result<(), anyhow::Error> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         // A closed channel means the reducer is gone, which only happens once
         // the run has already settled — nothing left to deliver to.
         if self.tx.send((event, ack_tx)).await.is_ok() {
             let _ = ack_rx.await;
         }
+        Ok(())
     }
 }
 
@@ -143,7 +160,11 @@ struct ActiveRun {
 pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
-pub type PrepareTurnHook = Arc<dyn Fn(&mut AgentContext) -> Option<AgentContext> + Send + Sync>;
+pub type PrepareTurnHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<TurnUpdate>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Default)]
 pub struct LoopHooks {
@@ -175,6 +196,10 @@ pub struct Agent {
     /// Subscribed event listeners, in registration order. Shared with
     /// [`RunHandle`] so listeners can be added mid-run.
     listeners: Arc<Mutex<Vec<(u64, AgentListener)>>>,
+    /// Event middleware, run after reduction and before listeners, in
+    /// registration order. Shared with [`RunHandle`] so a harness can attach
+    /// its persistence middleware before a run starts.
+    middlewares: Arc<Mutex<Vec<EventMiddleware>>>,
     /// Next listener registration id.
     next_listener_id: Arc<AtomicU64>,
     stream_fn: Arc<dyn StreamFn>,
@@ -214,6 +239,7 @@ impl Agent {
             follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             active_run: Arc::new(Mutex::new(None)),
             listeners: Arc::new(Mutex::new(Vec::new())),
+            middlewares: Arc::new(Mutex::new(Vec::new())),
             next_listener_id: Arc::new(AtomicU64::new(1)),
             stream_fn,
             stream_resolver: None,
@@ -285,6 +311,12 @@ impl Agent {
     /// Current agent state.
     pub fn state(&self) -> &AgentState {
         &self.state
+    }
+
+    /// Register an event middleware, run after reduction and before
+    /// listeners. An `Err` aborts the run.
+    pub fn add_middleware(&self, middleware: EventMiddleware) {
+        self.middlewares.lock().unwrap().push(middleware);
     }
 
     /// Register a listener for run events.
@@ -495,7 +527,7 @@ impl Agent {
         });
         let prepare_next_turn = self.loop_hooks.prepare_next_turn.as_ref().map(|h| {
             let h = Arc::clone(h);
-            Box::new(move |ctx: &mut AgentContext| h(ctx)) as PrepareTurnFn
+            Box::new(move || h()) as PrepareTurnFn
         });
         AgentLoopConfig {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
@@ -592,7 +624,10 @@ impl Agent {
                 biased;
                 ev = rx.recv() => match ev {
                     Some((ev, ack)) => {
-                        self.process_event(ev, &token).await;
+                        if let Err(e) = self.process_event(ev, &token).await {
+                            let _ = ack.send(());
+                            break Err(e);
+                        }
                         // The loop's emit awaits this acknowledgement, so the
                         // next loop step sees the listener side effects.
                         let _ = ack.send(());
@@ -609,7 +644,10 @@ impl Agent {
         // Settle events the loop emitted just before finishing, so `agent_end`
         // and its listeners are part of the run.
         while let Ok((ev, ack)) = rx.try_recv() {
-            self.process_event(ev, &token).await;
+            if let Err(e) = self.process_event(ev, &token).await {
+                let _ = ack.send(());
+                return Err(e);
+            }
             let _ = ack.send(());
         }
 
@@ -623,9 +661,14 @@ impl Agent {
         result
     }
 
-    /// Reduce one loop event into the agent state, then dispatch it to
-    /// subscribed listeners in registration order.
-    async fn process_event(&mut self, event: AgentEvent, token: &CancellationToken) {
+    /// Reduce one loop event into the agent state, run middlewares, then
+    /// dispatch it to subscribed listeners in registration order. A middleware
+    /// error aborts the run.
+    async fn process_event(
+        &mut self,
+        event: AgentEvent,
+        token: &CancellationToken,
+    ) -> Result<(), anyhow::Error> {
         match &event {
             AgentEvent::MessageStart { message } | AgentEvent::MessageUpdate { message, .. } => {
                 self.state.streaming_message = Some((**message).clone());
@@ -659,6 +702,12 @@ impl Agent {
             _ => {}
         }
 
+        let middlewares: Vec<EventMiddleware> =
+            self.middlewares.lock().unwrap().iter().cloned().collect();
+        for middleware in middlewares {
+            middleware(event.clone()).await?;
+        }
+
         let listeners: Vec<AgentListener> = self
             .listeners
             .lock()
@@ -669,6 +718,7 @@ impl Agent {
         for listener in listeners {
             listener(event.clone(), token.clone()).await;
         }
+        Ok(())
     }
 }
 

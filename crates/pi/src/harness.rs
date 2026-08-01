@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks,
-    PrepareTurnHook, RunHandle,
+    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, EventMiddleware,
+    LoopHooks, PrepareTurnHook, RunHandle,
 };
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
@@ -20,7 +20,7 @@ use crate::provider::retry;
 use crate::session::{CompactionAuthorship, Session, SessionStorage, SessionTreeEntry};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
+    AgentContext, AgentEvent, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
 };
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -123,6 +123,10 @@ struct HarnessControl {
     /// Whether a per-model resolver is plugged in; when set, any api is
     /// resolvable.
     has_resolver: std::sync::atomic::AtomicBool,
+    /// Entry ids recorded by the persistence middleware for messages appended
+    /// since the last drain, aligned with the transcript's new tail. The
+    /// harness merges them into its own alignment after each run.
+    message_entry_ids: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 /// A runtime mutation queued mid-run; applied to the shared snapshot
@@ -414,7 +418,7 @@ pub type ModelResolver =
 /// The orchestration layer wrapping the agent loop.
 pub struct AgentHarness<S: SessionStorage> {
     agent: Agent,
-    session: Session<S>,
+    session: Arc<Session<S>>,
     model: Model,
     phase: AgentHarnessPhase,
     compaction_settings: CompactionSettings,
@@ -470,7 +474,7 @@ pub struct AgentHarness<S: SessionStorage> {
     model_resolver: Option<ModelResolver>,
 }
 
-impl<S: SessionStorage> AgentHarness<S> {
+impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Create a new harness with the given session, model, and stream function.
     pub fn new(
         session: Session<S>,
@@ -498,6 +502,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             pending_mutations: std::sync::Mutex::new(Vec::new()),
             fixed_api,
             has_resolver: std::sync::atomic::AtomicBool::new(false),
+            message_entry_ids: std::sync::Mutex::new(Vec::new()),
         });
         let mut agent = Agent::new(
             system_prompt,
@@ -505,7 +510,14 @@ impl<S: SessionStorage> AgentHarness<S> {
             Arc::clone(&stream_fn),
             tool_ctx,
         );
+        // The persistence middleware shares the session Arc so it can append
+        // each message at MessageEnd; the harness keeps the other handle.
+        let session = Arc::new(session);
         agent.set_loop_hooks(build_loop_hooks(Arc::clone(&hooks), Arc::clone(&control)));
+        agent.add_middleware(build_persistence_middleware(
+            Arc::clone(&control),
+            Arc::clone(&session),
+        ));
         AgentHarness {
             agent,
             session,
@@ -576,7 +588,7 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Access the underlying session storage.
     pub fn session(&self) -> &Session<S> {
-        &self.session
+        self.session.as_ref()
     }
 
     /// Access the agent.
@@ -868,20 +880,29 @@ impl<S: SessionStorage> AgentHarness<S> {
         match result {
             Ok(messages) => {
                 self.phase = AgentHarnessPhase::Idle;
-                self.persist_turn_messages(&messages).await?;
                 self.note_run_outcome(&messages);
 
                 let mut all_messages = messages;
                 all_messages.extend(self.settle_after_run().await?);
+                // The persistence middleware wrote every MessageEnd at emit
+                // time; only the entry-id bookkeeping lands here.
+                self.drain_turn_entry_ids();
                 self.flush_pending_mutations().await?;
                 Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
-                // Mutations queued mid-run are still persisted with the
-                // failed run; a flush failure must not mask the run error.
+                // A middleware append failure aborted the run: the transcript
+                // may hold messages the session never recorded, so revert to
+                // the persisted prefix before surfacing the error.
+                let revert = self.restore().await;
                 let _ = self.flush_pending_mutations().await;
-                Err(e)
+                Err(match revert {
+                    Ok(()) => e,
+                    Err(re) => anyhow::anyhow!(
+                        "{e:#}; reverting the transcript to the persisted session also failed: {re:#}"
+                    ),
+                })
             }
         }
     }
@@ -907,37 +928,35 @@ impl<S: SessionStorage> AgentHarness<S> {
         match result {
             Ok(messages) => {
                 self.phase = AgentHarnessPhase::Idle;
-                self.persist_turn_messages(&messages).await?;
                 self.note_run_outcome(&messages);
 
                 let mut all_messages = messages;
                 all_messages.extend(self.settle_after_run().await?);
+                self.drain_turn_entry_ids();
                 self.flush_pending_mutations().await?;
                 Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
+                let revert = self.restore().await;
                 let _ = self.flush_pending_mutations().await;
-                Err(e)
+                Err(match revert {
+                    Ok(()) => e,
+                    Err(re) => anyhow::anyhow!(
+                        "{e:#}; reverting the transcript to the persisted session also failed: {re:#}"
+                    ),
+                })
             }
         }
     }
 
-    /// Persist a finished run's messages to the session, tracking the entry
-    /// id of each so [`AgentHarness::compact`] can record the real first-kept
-    /// entry. A mid-batch persistence failure reverts the transcript to the
-    /// persisted session before the error surfaces.
-    async fn persist_turn_messages(
-        &mut self,
-        messages: &[AgentMessage],
-    ) -> Result<(), anyhow::Error> {
-        for msg in messages {
-            match self.session.append_message(msg.clone()).await {
-                Ok(id) => self.message_entry_ids.push(Some(id)),
-                Err(e) => return Err(self.revert_transcript_after_persist_failure(e).await),
-            }
-        }
-        Ok(())
+    /// Merge the entry ids the persistence middleware recorded for the
+    /// just-run messages into the harness's transcript alignment. The
+    /// middleware appended each `MessageEnd` to the session at emit time, so
+    /// the durable write is already done; only the id bookkeeping lands here.
+    fn drain_turn_entry_ids(&mut self) {
+        let ids = std::mem::take(&mut *self.control.message_entry_ids.lock().unwrap());
+        self.message_entry_ids.extend(ids);
     }
 
     /// Rearm the one-shot overflow recovery and close out an in-progress
@@ -975,8 +994,8 @@ impl<S: SessionStorage> AgentHarness<S> {
     async fn run_overflow_recovery(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let mut produced = Vec::new();
         while let Some(retry_messages) = self.recover_overflow_once().await? {
-            self.persist_turn_messages(&retry_messages).await?;
             self.note_run_outcome(&retry_messages);
+            self.drain_turn_entry_ids();
             produced.extend(retry_messages);
         }
         Ok(produced)
@@ -1138,8 +1157,8 @@ impl<S: SessionStorage> AgentHarness<S> {
         let result = self.agent.continue_().await;
         self.phase = AgentHarnessPhase::Idle;
         let messages = result?;
-        self.persist_turn_messages(&messages).await?;
         self.note_run_outcome(&messages);
+        self.drain_turn_entry_ids();
         Ok(messages)
     }
 
@@ -1300,28 +1319,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.control.turn_runtime.lock().unwrap().thinking_level =
             self.agent.state().thinking_level.clone();
         self.message_entry_ids = context.message_entry_ids;
+        // Any ids the middleware recorded before a failure point at messages
+        // the restore already projected from the session — drop them so the
+        // next run starts clean.
+        self.control.message_entry_ids.lock().unwrap().clear();
         self.recover_boundary().await?;
         Ok(())
-    }
-
-    /// Reconcile the agent with the session after a turn's persistence
-    /// failed partway. The session is the durable record, so the transcript
-    /// is rebuilt from it: both views then hold exactly the persisted prefix,
-    /// which is also what any later [`AgentHarness::restore`] produces.
-    async fn revert_transcript_after_persist_failure(
-        &mut self,
-        persist_error: anyhow::Error,
-    ) -> anyhow::Error {
-        match self.restore().await {
-            Ok(()) => anyhow::anyhow!(
-                "failed to persist messages: {persist_error:#}; \
-                 transcript reverted to the persisted session"
-            ),
-            Err(revert_error) => anyhow::anyhow!(
-                "failed to persist messages: {persist_error:#}; \
-                 reverting the transcript to the persisted session also failed: {revert_error:#}"
-            ),
-        }
     }
 
     /// Check whether compaction is needed based on current context size.
@@ -1708,6 +1711,27 @@ impl<S: SessionStorage> AgentHarness<S> {
 /// Build the loop-config observation closures that route the harness's
 /// registered hooks into the agent loop. Each closure clones the shared hook
 /// list so it sees handlers registered via `on()` after the harness is built.
+/// The harness's persistence middleware: appends every `MessageEnd` message
+/// to the session immediately — before any listener observes it — and
+/// records the entry id for the harness's transcript alignment. An append
+/// failure aborts the run, keeping the persisted prefix as the truth.
+fn build_persistence_middleware<S: SessionStorage + 'static>(
+    control: Arc<HarnessControl>,
+    session: Arc<Session<S>>,
+) -> EventMiddleware {
+    Arc::new(move |event: AgentEvent| {
+        let session = Arc::clone(&session);
+        let control = Arc::clone(&control);
+        Box::pin(async move {
+            if let AgentEvent::MessageEnd { message } = event {
+                let id = session.append_message((*message).clone()).await?;
+                control.message_entry_ids.lock().unwrap().push(Some(id));
+            }
+            Ok(())
+        })
+    })
+}
+
 fn build_loop_hooks(
     hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>,
     control: Arc<HarnessControl>,
@@ -1763,20 +1787,19 @@ fn build_loop_hooks(
     });
 
     let runtime = Arc::clone(&control);
-    let prepare_next_turn: PrepareTurnHook = Arc::new(move |context: &mut AgentContext| {
+    let prepare_next_turn: PrepareTurnHook = Arc::new(move || {
         // Refresh the next turn's context from the shared runtime snapshot.
         // The snapshot is the truth source — the durable write queue is only
-        // for persistence — so every turn (and every new run built after
-        // `apply_turn_runtime`) sees the same model/thinking.
-        let snapshot = runtime.turn_runtime.lock().unwrap();
-        let (model, thinking_level) = (snapshot.model.clone(), snapshot.thinking_level.clone());
-        drop(snapshot);
-        if model == context.model && thinking_level == context.thinking_level {
-            return None;
-        }
-        context.model = model;
-        context.thinking_level = thinking_level;
-        Some(context.clone())
+        // for persistence — so every turn sees the same model/thinking.
+        let runtime = Arc::clone(&runtime);
+        Box::pin(async move {
+            let snapshot = runtime.turn_runtime.lock().unwrap();
+            let update = crate::types::TurnUpdate {
+                model: snapshot.model.clone(),
+                thinking_level: snapshot.thinking_level.clone(),
+            };
+            Some(update)
+        })
     });
 
     LoopHooks {
@@ -5454,7 +5477,7 @@ mod tests {
 
         let err = harness.prompt("hi").await.unwrap_err();
         assert!(
-            err.to_string().contains("failed to persist messages"),
+            err.to_string().contains("injected append failure"),
             "{err:#}"
         );
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
@@ -5487,7 +5510,7 @@ mod tests {
         // The user message persists; the assistant reply does not.
         let err = harness.prompt("hi").await.unwrap_err();
         assert!(
-            err.to_string().contains("failed to persist messages"),
+            err.to_string().contains("injected append failure"),
             "{err:#}"
         );
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
@@ -5525,6 +5548,109 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A `MessageEnd` listener observes the message already persisted: the
+    /// harness middleware appends to the session before listeners run, so a
+    /// crash at any later point never loses the completed messages.
+    #[tokio::test]
+    async fn test_message_end_persists_before_listener() {
+        use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("session.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let meta = JsonlSessionMetadata {
+            id: uuid::Uuid::new_v4().to_string(),
+            cwd: "/test".into(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
+        };
+        let storage = JsonlSessionStorage::create(std::path::Path::new(&path), meta)
+            .await
+            .unwrap();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        let path_in_listener = path.clone();
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let path = path_in_listener.clone();
+            Box::pin(async move {
+                if matches!(event, AgentEvent::MessageEnd { .. }) {
+                    let content = tokio::fs::read_to_string(&path).await.unwrap();
+                    let entries = content.lines().filter(|l| !l.trim().is_empty()).count();
+                    // Header + every message emitted so far is already on disk.
+                    assert!(
+                        entries >= 2,
+                        "the MessageEnd listener must observe the message persisted"
+                    );
+                }
+            })
+        }));
+
+        let _ = harness.prompt("hi").await.unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let entries = content.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(entries, 3, "header + user + assistant");
+    }
+
+    /// A crash mid-tool-turn leaves every completed message recoverable: the
+    /// user prompt, the tool-use assistant message, and the tool result were
+    /// all persisted at their MessageEnd, and a reopen restores exactly them.
+    #[tokio::test]
+    async fn test_mid_tool_turn_messages_survive_restore() {
+        let storage = MemStorage::new();
+        // Fail on the second provider call's assistant append (call 4: user,
+        // tool-use assistant, tool result, then the final assistant fails).
+        *storage.fail_at_call.lock().unwrap() = 4;
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        assert!(harness.prompt("use the tool").await.is_err());
+
+        // The persisted prefix holds the completed part of the tool turn.
+        let entries = harness.session().build_context_entries().await.unwrap();
+        assert_eq!(entries.len(), 3, "{entries:?}");
+
+        // A fresh harness over the same session restores exactly the prefix.
+        let entries_snapshot = harness.session().storage().get_entries().await.unwrap();
+        let mut reopened = AgentHarness::new(
+            Session::new(MemStorage::from_entries(entries_snapshot)),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        reopened.restore().await.unwrap();
+        let transcript = reopened.agent().state().messages.clone();
+        assert_eq!(transcript.len(), 3, "{transcript:?}");
+        assert!(matches!(
+            &transcript[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            }
+        ));
+        assert!(matches!(&transcript[2], AgentMessage::ToolResult { .. }));
     }
 
     #[tokio::test]
