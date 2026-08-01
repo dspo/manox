@@ -93,6 +93,7 @@ impl StreamFn for CompletionsStreamFn {
         let mut acc = Accumulator::new(context);
         let mut parser = SseParser::new();
         let mut byte_stream = response.bytes_stream();
+        let mut saw_done = false;
 
         loop {
             let chunk = tokio::select! {
@@ -105,6 +106,7 @@ impl StreamFn for CompletionsStreamFn {
 
             for payload in parser.feed(&bytes) {
                 if payload == "[DONE]" {
+                    saw_done = true;
                     continue;
                 }
                 apply_payload(&mut acc, &payload, &event_tx).await?;
@@ -112,10 +114,23 @@ impl StreamFn for CompletionsStreamFn {
         }
 
         // Drain any trailing unterminated event.
-        if let Some(payload) = parser.finish()
-            && payload != "[DONE]"
-        {
-            apply_payload(&mut acc, &payload, &event_tx).await?;
+        if let Some(payload) = parser.finish() {
+            if payload == "[DONE]" {
+                saw_done = true;
+            } else {
+                apply_payload(&mut acc, &payload, &event_tx).await?;
+            }
+        }
+
+        // A stream that ended before the protocol's terminal marker — no
+        // `[DONE]` and no `finish_reason` — is a truncated response, not a
+        // completed one: surface it as a transport failure instead of
+        // persisting the partial message as if it were whole, mirroring the
+        // TS throw on a missing finish_reason.
+        if !saw_done && !acc.has_finish_reason() {
+            return Err(
+                ProviderError::Transport("stream ended without finish_reason".into()).into(),
+            );
         }
 
         acc.finish(&event_tx).await
@@ -200,6 +215,12 @@ impl Accumulator {
         }
     }
 
+    /// Whether a `finish_reason` was reported before the stream ended — the
+    /// protocol's terminal marker alongside `[DONE]`.
+    fn has_finish_reason(&self) -> bool {
+        self.raw_finish_reason.is_some()
+    }
+
     fn current(&self) -> AgentMessage {
         // A failure finish reason (content_filter/network_error) surfaces its
         // raw label as the message's `error_message`.
@@ -219,6 +240,7 @@ impl Accumulator {
             response_id: self.response_id.clone(),
             diagnostics: None,
             stop_reason: self.stop_reason,
+            raw_stop_reason: self.raw_finish_reason.clone(),
             usage: self.usage.clone(),
             error_message,
             timestamp: chrono::Utc::now(),
@@ -425,6 +447,22 @@ impl Accumulator {
         mut self,
         tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error> {
+        // A stream terminated by `[DONE]` alone carries no finish_reason;
+        // infer the completed stop reason the way TS does for endpoints
+        // without finish_reason support.
+        if self.stop_reason.is_none() {
+            self.stop_reason = Some(
+                if self
+                    .blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                {
+                    crate::types::StopReason::ToolUse
+                } else {
+                    crate::types::StopReason::Stop
+                },
+            );
+        }
         // Resolve every tool call's accumulated argument JSON now that the
         // stream is complete.
         for call in &self.tool_calls {
@@ -583,6 +621,40 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::MessageUpdate { .. }))
         );
         assert!(matches!(events.last(), Some(AgentEvent::MessageEnd { .. })));
+    }
+
+    #[tokio::test]
+    async fn finish_reason_is_kept_as_raw_stop_reason() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(chunk(text("hi"), Some("stop")), &tx)
+            .await
+            .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            raw_stop_reason,
+            ..
+        } = &msg
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
+        assert_eq!(raw_stop_reason.as_deref(), Some("stop"));
+    }
+
+    /// A stream terminated by `[DONE]` without `finish_reason` still infers
+    /// the completed stop reason.
+    #[tokio::test]
+    async fn done_only_stream_infers_stop_reason() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(chunk(text("hi"), None), &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant { stop_reason, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
     }
 
     #[tokio::test]
@@ -848,5 +920,98 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn fixture_stream_fn(addr: &str) -> CompletionsStreamFn {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        CompletionsStreamFn {
+            client,
+            api_key: "test-key".into(),
+            base_url: format!("http://{addr}"),
+            options: StreamOptions::default(),
+        }
+    }
+
+    /// Serve one SSE body then close the connection.
+    async fn serve_one(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    /// A stream that ends before the terminal marker — no `[DONE]` and no
+    /// `finish_reason` — surfaces a transport error instead of completing a
+    /// partial message.
+    #[tokio::test]
+    async fn truncated_stream_surfaces_transport_error() {
+        let addr = serve_one(
+            "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+        .await;
+        let stream_fn = fixture_stream_fn(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Transport(_))
+        ));
+    }
+
+    /// A stream terminated by `[DONE]` alone completes with the inferred
+    /// stop reason — endpoints that skip `finish_reason` are still whole
+    /// responses.
+    #[tokio::test]
+    async fn done_terminated_stream_completes_with_inferred_stop() {
+        let body = "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        let addr = serve_one(body).await;
+        let stream_fn = fixture_stream_fn(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let message = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            content,
+            ..
+        } = &message
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
+        assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "hi"));
+    }
+
+    /// A `finish_reason` in the final chunk terminates the stream even when
+    /// the server never sends `[DONE]`.
+    #[tokio::test]
+    async fn finish_reason_terminates_stream_without_done() {
+        let body = "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let addr = serve_one(body).await;
+        let stream_fn = fixture_stream_fn(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let message = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let AgentMessage::Assistant { stop_reason, .. } = &message else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
     }
 }

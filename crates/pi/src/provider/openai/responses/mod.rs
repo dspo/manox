@@ -242,6 +242,7 @@ impl Accumulator {
             response_model: self.response_model.clone(),
             response_id: self.response_id.clone(),
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
             error_message: None,

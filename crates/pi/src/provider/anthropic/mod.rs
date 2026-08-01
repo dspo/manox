@@ -139,6 +139,10 @@ struct Accumulator {
     /// Raw protocol stop-reason string retained so a failure stop reason can
     /// carry an `error_message` derived from it.
     raw_stop_reason: Option<String>,
+    /// The refusal explanation from `message_delta.stop_details`, surfaced as
+    /// the message's `error_message` so callers keep the provider's specific
+    /// rejection reason.
+    stop_details_explanation: Option<String>,
     blocks: Vec<ContentBlock>,
     /// Raw partial JSON for the tool_use block currently streaming, by index.
     open_json: std::collections::HashMap<usize, String>,
@@ -155,6 +159,7 @@ impl Accumulator {
             response_id: None,
             response_model: None,
             raw_stop_reason: None,
+            stop_details_explanation: None,
             blocks: Vec::new(),
             open_json: std::collections::HashMap::new(),
             stop_reason: None,
@@ -164,14 +169,25 @@ impl Accumulator {
     }
 
     fn current(&self) -> AgentMessage {
-        // A failure stop reason (refusal/sensitive/overflow) surfaces its raw
-        // protocol label as the message's `error_message` so callers can tell
-        // why the turn failed without parsing stop_reason alone.
+        // A refusal surfaces its provider explanation as the `error_message`;
+        // other failure stop reasons (sensitive/overflow) carry the raw
+        // protocol label so callers can tell why the turn failed without
+        // parsing stop_reason alone.
         let error_message = match self.stop_reason {
-            Some(crate::types::StopReason::Error) => Some(format!(
-                "provider stop reason: {}",
-                self.raw_stop_reason.as_deref().unwrap_or("error")
-            )),
+            Some(crate::types::StopReason::Error) => {
+                if self.raw_stop_reason.as_deref() == Some("refusal") {
+                    Some(
+                        self.stop_details_explanation
+                            .clone()
+                            .unwrap_or_else(|| "The model refused to complete the request".into()),
+                    )
+                } else {
+                    Some(format!(
+                        "provider stop reason: {}",
+                        self.raw_stop_reason.as_deref().unwrap_or("error")
+                    ))
+                }
+            }
             _ => None,
         };
         AgentMessage::Assistant {
@@ -183,6 +199,7 @@ impl Accumulator {
             response_id: self.response_id.clone(),
             diagnostics: None,
             stop_reason: self.stop_reason,
+            raw_stop_reason: self.raw_stop_reason.clone(),
             usage: self.usage.clone(),
             error_message,
             timestamp: chrono::Utc::now(),
@@ -245,7 +262,7 @@ impl Accumulator {
                     }
                     WireContentBlock::RedactedThinking { data } => {
                         self.blocks[index] = ContentBlock::Thinking {
-                            thinking: String::new(),
+                            thinking: "[Reasoning redacted]".into(),
                             signature: Some(data),
                             redacted: Some(true),
                         };
@@ -371,6 +388,11 @@ impl Accumulator {
                 if let Some(sr) = &delta.stop_reason {
                     self.raw_stop_reason = Some(sr.clone());
                     self.stop_reason = Some(parse_stop_reason(sr));
+                }
+                if let Some(details) = &delta.stop_details
+                    && details.kind == "refusal"
+                {
+                    self.stop_details_explanation = details.explanation.clone();
                 }
                 if let Some(u) = &usage {
                     // The delta usage carries cumulative counts, but any class
@@ -642,6 +664,7 @@ mod tests {
                 delta: wire::MessageDeltaBody {
                     stop_reason: Some("end_turn".into()),
                     stop_sequence: None,
+                    stop_details: None,
                 },
                 usage: Some(wire::WireUsage {
                     input_tokens: None,
@@ -755,6 +778,126 @@ mod tests {
         }
     }
 
+    /// A refusal `message_delta` carries its explanation into the message's
+    /// `error_message`, and the raw stop reason persists on the message.
+    #[tokio::test]
+    async fn refusal_keeps_stop_details_explanation_and_raw_reason() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(
+            RawStreamEvent::MessageDelta {
+                delta: wire::MessageDeltaBody {
+                    stop_reason: Some("refusal".into()),
+                    stop_sequence: None,
+                    stop_details: Some(wire::WireStopDetails {
+                        kind: "refusal".into(),
+                        explanation: Some("I cannot help with that.".into()),
+                    }),
+                },
+                usage: None,
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            raw_stop_reason,
+            error_message,
+            ..
+        } = &msg
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Error));
+        assert_eq!(raw_stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(error_message.as_deref(), Some("I cannot help with that."));
+    }
+
+    /// A refusal without a provider explanation falls back to the TS wording.
+    #[tokio::test]
+    async fn refusal_without_explanation_falls_back_to_default() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(message_delta("refusal"), &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            raw_stop_reason,
+            error_message,
+            ..
+        } = &msg
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Error));
+        assert_eq!(raw_stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(
+            error_message.as_deref(),
+            Some("The model refused to complete the request")
+        );
+    }
+
+    /// A normal end_turn carries its raw stop reason too — the field is not
+    /// reserved for failures.
+    #[tokio::test]
+    async fn normal_stop_keeps_raw_stop_reason() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(message_delta("end_turn"), &tx).await.unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            raw_stop_reason,
+            ..
+        } = &msg
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
+        assert_eq!(raw_stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    /// Redacted thinking carries the TS `[Reasoning redacted]` placeholder
+    /// text instead of an empty string.
+    #[tokio::test]
+    async fn redacted_thinking_uses_placeholder_text() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+        acc.apply(start_event(), &tx).await.unwrap();
+        acc.apply(
+            RawStreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: WireContentBlock::RedactedThinking {
+                    data: "encrypted-payload".into(),
+                },
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        match &content[0] {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                redacted,
+            } => {
+                assert_eq!(thinking, "[Reasoning redacted]");
+                assert_eq!(signature.as_deref(), Some("encrypted-payload"));
+                assert_eq!(*redacted, Some(true));
+            }
+            other => panic!("expected thinking, got {other:?}"),
+        }
+    }
+
     // ── fixtures ────────────────────────────────────────────────────────────
 
     fn start_event() -> RawStreamEvent {
@@ -806,6 +949,7 @@ mod tests {
             delta: wire::MessageDeltaBody {
                 stop_reason: Some(stop.into()),
                 stop_sequence: None,
+                stop_details: None,
             },
             usage: None,
         }

@@ -254,6 +254,103 @@ where
     }
 }
 
+/// Error substrings that never classify as retryable — subscription/account
+/// limits and quota/billing exhaustion are deterministic and would burn the
+/// retry budget. Mirrors the TS `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
+const NON_RETRYABLE_PATTERNS: &[&str] = &[
+    "gousagelimiterror",
+    "freeusagelimiterror",
+    "monthlyusagelimitreached",
+    "availablebalance",
+    "insufficient_quota",
+    "outofbudget",
+    "quotaexceeded",
+    "billing",
+];
+
+/// Error substrings that classify as retryable — provider load, transient
+/// HTTP statuses, transport failures, and premature stream endings. Mirrors
+/// the TS `RETRYABLE_PROVIDER_ERROR_PATTERN`; the regex `.?` separators fold
+/// into the comparison spelling, so e.g. "rate.?limit" matches both
+/// "rate limit" and "ratelimit".
+const RETRYABLE_PATTERNS: &[&str] = &[
+    "overloaded",
+    "ratelimit",
+    "toomanyrequests",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "524",
+    "serviceunavailable",
+    "servererror",
+    "internalerror",
+    "providerreturnederror",
+    "networkerror",
+    "connectionerror",
+    "connectionrefused",
+    "connectionlost",
+    "othersideclosed",
+    "fetchfailed",
+    "getaddrinfo",
+    "enotfound",
+    "eai_again",
+    "upstreamconnect",
+    "resetbeforeheaders",
+    "sockethangup",
+    "socketconnectionwasclosed",
+    "timedout",
+    "timeout",
+    "terminated",
+    "websocketclosed",
+    "websocketerror",
+    "endedwithout",
+    "streamendedbeforemessage_stop",
+    "streamendedbeforeaterminalresponseevent",
+    "http2requestdidnotgetaresponse",
+    "retrydelay",
+    "youcanretryyourrequest",
+    "tryyourrequestagain",
+    "pleaseretryyourrequest",
+    "resourceexhausted",
+];
+
+/// Fold text to the comparison spelling: lowercase with whitespace removed.
+fn comparison_spelling(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Classify whether a failed assistant message looks like a transient
+/// provider or transport error, mirroring the TS `isRetryableAssistantError`.
+/// Callers handle context overflow separately (compaction, not retry); this
+/// classifier itself does not know the context window. A non-retryable limit
+/// pattern wins over a retryable one, so deterministic errors fail fast.
+pub fn is_retryable_assistant_error(message: &crate::types::AgentMessage) -> bool {
+    let crate::types::AgentMessage::Assistant {
+        stop_reason,
+        error_message,
+        ..
+    } = message
+    else {
+        return false;
+    };
+    if *stop_reason != Some(crate::types::StopReason::Error) {
+        return false;
+    }
+    let Some(error_message) = error_message else {
+        return false;
+    };
+    let spelling = comparison_spelling(error_message);
+    if NON_RETRYABLE_PATTERNS.iter().any(|p| spelling.contains(p)) {
+        return false;
+    }
+    RETRYABLE_PATTERNS.iter().any(|p| spelling.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +516,97 @@ mod tests {
             rx.try_recv().is_err(),
             "no retry event for a terminal status"
         );
+    }
+
+    fn assistant(error_message: Option<&str>) -> crate::types::AgentMessage {
+        crate::types::AgentMessage::Assistant {
+            content: Vec::new(),
+            model: "m".into(),
+            provider: "p".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(crate::types::StopReason::Error),
+            raw_stop_reason: None,
+            usage: Box::default(),
+            error_message: error_message.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn retryable_assistant_error_classifies_transients() {
+        for message in [
+            "http 529: overloaded",
+            "429 Too Many Requests",
+            "The server is overloaded, please retry later",
+            "Provider returned error: connection refused",
+            "Error: socket hang up",
+            "Anthropic stream ended before message_stop",
+            "stream ended without finish_reason",
+            "upstream connect error or disconnect/reset before headers",
+            "request timed out after 60s",
+            "fetch failed: getaddrinfo ENOTFOUND api.example.com",
+            "http 500: internal error",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&assistant(Some(message))),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_assistant_error_excludes_limits_and_non_errors() {
+        for message in [
+            "insufficient_quota: you have exceeded your quota",
+            "Monthly usage limit reached, please enable available balance",
+            "billing error: out of budget",
+            "GoUsageLimitError: free-tier limit",
+            "invalid temperature: only 0.6 is allowed",
+            "prompt is too long: 213462 tokens > 200000 maximum",
+        ] {
+            assert!(
+                !is_retryable_assistant_error(&assistant(Some(message))),
+                "{message}"
+            );
+        }
+        // A successful stop or an error without a message is never retried.
+        let stop = crate::types::AgentMessage::Assistant {
+            content: Vec::new(),
+            model: "m".into(),
+            provider: "p".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(crate::types::StopReason::Stop),
+            raw_stop_reason: None,
+            usage: Box::default(),
+            error_message: Some("http 529: overloaded".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(!is_retryable_assistant_error(&stop));
+        assert!(!is_retryable_assistant_error(&assistant(None)));
+    }
+
+    #[test]
+    fn comparison_spelling_folds_spacing_and_case() {
+        // The TS regex `.?` separators collapse to one spelling: "rate limit"
+        // and "ratelimit" both match, as do service errors with odd spacing.
+        for message in [
+            "Rate Limit exceeded",
+            "ratelimit exceeded",
+            "Service  Unavailable",
+            "serviceunavailable",
+            "server  error",
+            "stream ended  without  finish_reason",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&assistant(Some(message))),
+                "{message}"
+            );
+        }
     }
 }

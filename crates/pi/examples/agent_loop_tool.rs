@@ -46,6 +46,7 @@ impl StreamFn for ToolLoopMock {
                 response_id: None,
                 diagnostics: None,
                 stop_reason,
+                raw_stop_reason: None,
                 usage: Box::new(Usage::default()),
                 error_message: None,
                 timestamp: chrono::Utc::now(),

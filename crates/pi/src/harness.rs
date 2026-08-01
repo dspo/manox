@@ -15,6 +15,7 @@ use crate::agent::{
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
+use crate::provider::retry;
 use crate::session::{CompactionAuthorship, Session, SessionStorage, SessionTreeEntry};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{
@@ -39,6 +40,51 @@ pub enum AgentHarnessPhase {
     BranchSummary,
     /// Retrying a failed operation.
     Retry,
+}
+
+/// Agent-level auto-retry policy for transient provider failures, mirroring
+/// the TS `settings.retry` (`enabled` / `maxRetries` / `baseDelayMs`). The
+/// initial call never counts as a retry; the per-attempt delay is
+/// `baseDelayMs * 2^(attempt-1)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrySettings {
+    pub enabled: bool,
+    /// Max retry attempts (0 = no retries).
+    pub max_retries: u32,
+    /// Base delay in ms for the first retry.
+    pub base_delay_ms: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        RetrySettings {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 2_000,
+        }
+    }
+}
+
+/// A retry lifecycle event, mirroring the TS `auto_retry_start` /
+/// `auto_retry_end` session events.
+#[derive(Debug, Clone)]
+pub enum RetryEvent {
+    /// A retry was scheduled: attempt `attempt` (1-indexed) retries the
+    /// failed turn after `delay`, up to `max_attempts`.
+    Start {
+        attempt: u32,
+        max_attempts: u32,
+        delay: std::time::Duration,
+        error_message: String,
+    },
+    /// The retry lifecycle ended: `success` when a retry turn completed,
+    /// otherwise the failure that exhausted the budget (or a cancellation)
+    /// as `final_error`.
+    End {
+        success: bool,
+        attempt: u32,
+        final_error: Option<String>,
+    },
 }
 
 /// Hook points that consumers can register handlers for.
@@ -256,6 +302,17 @@ pub struct AgentHarness<S: SessionStorage> {
     /// `_overflowRecoveryAttempted` flag — a context that stays oversized
     /// after one compact-and-retry surfaces its error instead of looping.
     overflow_recovery_attempted: bool,
+    /// Auto-retry policy for transient provider failures.
+    retry_settings: RetrySettings,
+    /// Attempts used by the current auto-retry lifecycle; reset by any
+    /// non-error assistant message. Mirrors TS `_retryAttempt`.
+    retry_attempt: u32,
+    /// Cancels the in-flight retry backoff sleep; [`AgentHarness::abort`]
+    /// fires it. A fresh token arms each retry.
+    retry_cancel: CancellationToken,
+    /// Observer for the auto-retry lifecycle, mirroring TS `_emit` of
+    /// `auto_retry_start` / `auto_retry_end`.
+    retry_observer: Option<Arc<dyn Fn(RetryEvent) + Send + Sync>>,
     /// Every mounted tool, including ones the active selection currently
     /// hides from the model. The agent receives only the active subset.
     all_tools: Arc<[Arc<dyn crate::tool::AgentTool>]>,
@@ -304,6 +361,10 @@ impl<S: SessionStorage> AgentHarness<S> {
             stream_fn,
             message_entry_ids: Vec::new(),
             overflow_recovery_attempted: false,
+            retry_settings: RetrySettings::default(),
+            retry_attempt: 0,
+            retry_cancel: CancellationToken::new(),
+            retry_observer: None,
             all_tools: Arc::from(Vec::new()),
             active_tool_names: None,
             model_resolver: None,
@@ -370,6 +431,26 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Update compaction settings.
     pub fn set_compaction_settings(&mut self, settings: CompactionSettings) {
         self.compaction_settings = settings;
+    }
+
+    /// Current auto-retry policy.
+    pub fn retry_settings(&self) -> &RetrySettings {
+        &self.retry_settings
+    }
+
+    /// Update the auto-retry policy.
+    pub fn set_retry_settings(&mut self, settings: RetrySettings) {
+        self.retry_settings = settings;
+    }
+
+    /// Attempts used by the current auto-retry lifecycle.
+    pub fn retry_attempt(&self) -> u32 {
+        self.retry_attempt
+    }
+
+    /// Observe the auto-retry lifecycle (`auto_retry_start`/`auto_retry_end`).
+    pub fn on_auto_retry(&mut self, observer: impl Fn(RetryEvent) + Send + Sync + 'static) {
+        self.retry_observer = Some(Arc::new(observer));
     }
 
     /// The active tool subset; `None` when the full mounted set is in play.
@@ -456,18 +537,17 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Returns the messages produced during this turn. The messages are
     /// also persisted to the session.
     ///
-    /// A turn that ends in a context-overflow error from the current model is
-    /// recovered in place: the failed turn's terminal message stays persisted
-    /// but leaves the transcript, the conversation is compacted, and the turn
-    /// is retried once from the compacted context. The recovery is one-shot
-    /// per error episode — a successful assistant message rearms it — so a
-    /// context that stays oversized after compaction surfaces its second
-    /// overflow error instead of looping. The returned messages include the
-    /// retry's output.
-    ///
-    /// A settled turn whose context crossed the compaction threshold is
-    /// compacted for the next turn without a retry; a failed maintenance
-    /// compaction never turns the settled turn into an error.
+    /// A turn ending in a transient provider failure is retried in place
+    /// after an exponential backoff (`RetrySettings`, default 3 attempts at
+    /// 2s doubling); a context-overflow error from the current model is
+    /// instead compacted and retried once (`run_overflow_recovery`). Both
+    /// drop the failed turn's terminal message from the transcript — it
+    /// stays persisted — so the retry runs against the same context that
+    /// preceded the failure. A settled turn whose context crossed the
+    /// compaction threshold is compacted for the next turn without a retry;
+    /// a failed maintenance compaction never turns the settled turn into an
+    /// error. Messages queued during the run or any maintenance step are
+    /// delivered before the call returns.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
@@ -530,10 +610,12 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Continue from the current transcript.
     ///
-    /// The same one-shot overflow recovery as [`AgentHarness::prompt`]
-    /// applies: an overflow terminal from the current model is compacted and
-    /// retried once per error episode. A settled turn over the compaction
-    /// threshold is compacted for the next turn without a retry.
+    /// The same post-run maintenance as [`AgentHarness::prompt`] applies:
+    /// transient provider errors are auto-retried after a backoff, an
+    /// overflow terminal from the current model is compacted and retried
+    /// once per error episode, a settled turn over the compaction threshold
+    /// is compacted for the next turn without a retry, and queued messages
+    /// are delivered before the call returns.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
@@ -576,9 +658,10 @@ impl<S: SessionStorage> AgentHarness<S> {
         Ok(())
     }
 
-    /// Rearm the one-shot overflow recovery when a run produced any
-    /// non-error assistant message — the recovery budget applies per error
-    /// episode, and a completed assistant reply ends the episode.
+    /// Rearm the one-shot overflow recovery and close out an in-progress
+    /// retry lifecycle when a run produced any non-error assistant message —
+    /// both budgets apply per error episode, and a completed assistant reply
+    /// ends the episode.
     fn note_run_outcome(&mut self, messages: &[AgentMessage]) {
         let succeeded = messages.iter().any(|m| {
             matches!(
@@ -588,6 +671,15 @@ impl<S: SessionStorage> AgentHarness<S> {
         });
         if succeeded {
             self.overflow_recovery_attempted = false;
+            if self.retry_attempt > 0 {
+                let attempt = self.retry_attempt;
+                self.retry_attempt = 0;
+                self.emit_retry(RetryEvent::End {
+                    success: true,
+                    attempt,
+                    final_error: None,
+                });
+            }
         }
     }
 
@@ -608,32 +700,57 @@ impl<S: SessionStorage> AgentHarness<S> {
         Ok(produced)
     }
 
-    /// Post-run maintenance shared by `prompt` and `continue_`: overflow
-    /// compact-and-retry first, then threshold compaction. A threshold
-    /// compaction that ran while messages were queued is followed by one
-    /// continuation delivering them, and that continuation's own outcome
-    /// settles through another iteration — the same shape as the TS
-    /// `while (handlePostAgentRun()) continue()` loop.
+    /// Post-run maintenance shared by `prompt` and `continue_`, mirroring the
+    /// TS `while (handlePostAgentRun()) continue()` loop: agent-level
+    /// auto-retry of retryable provider errors first, then overflow
+    /// compact-and-retry, then threshold compaction. Any messages still
+    /// queued — from `agent_end` listeners or while a maintenance step ran —
+    /// are delivered by one continuation, and that continuation's own
+    /// outcome settles through another iteration. A settled turn with no
+    /// pending work exits the loop.
     async fn settle_after_run(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let mut produced = Vec::new();
         loop {
+            if self.prepare_auto_retry().await? {
+                produced.extend(self.run_continuation_turn().await?);
+                continue;
+            }
+            // An in-progress retry lifecycle closes out when the latest
+            // failure is not retryable or the budget is spent — TS emits
+            // `auto_retry_end` here, before the compaction path.
+            if self.retry_attempt > 0
+                && let Some(AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    error_message,
+                    ..
+                }) = self.agent.state().messages.last()
+            {
+                let attempt = self.retry_attempt;
+                self.retry_attempt = 0;
+                self.emit_retry(RetryEvent::End {
+                    success: false,
+                    attempt,
+                    final_error: error_message.clone(),
+                });
+            }
             produced.extend(self.run_overflow_recovery().await?);
-            let drained = self.run_threshold_compaction().await?;
-            let ran_continuation = !drained.is_empty();
-            produced.extend(drained);
-            if !ran_continuation {
+            produced.extend(self.run_threshold_compaction().await?);
+            if !self.agent.has_queued_messages() {
                 return Ok(produced);
             }
+            // Deliver messages queued while the run or a maintenance step
+            // was in flight. One continuation drains them; its own outcome
+            // settles through the next iteration.
+            produced.extend(self.run_continuation_turn().await?);
         }
     }
 
     /// Threshold compaction after a settled run: the turn already completed,
     /// so the conversation is compacted for the next turn and never
-    /// retried. Returns the messages of the one continuation run to deliver
-    /// anything queued while compaction was in flight — empty when no
-    /// compaction ran or nothing was waiting. A failed maintenance
-    /// compaction only logs: the settled turn keeps its result, and the
-    /// next turn's settle re-attempts the compaction.
+    /// retried. A failed maintenance compaction only logs: the settled turn
+    /// keeps its result, and the next turn's settle re-attempts the
+    /// compaction. Queued-message delivery happens in the outer
+    /// [`AgentHarness::settle_after_run`] loop, not here.
     async fn run_threshold_compaction(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         // A user-aborted turn stays exactly where the user stopped it.
         if matches!(
@@ -653,12 +770,79 @@ impl<S: SessionStorage> AgentHarness<S> {
             Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => {}
             Err(e) => {
                 tracing::warn!("threshold compaction failed: {e:#}");
-                return Ok(Vec::new());
             }
         }
-        if !self.agent.has_queued_messages() {
-            return Ok(Vec::new());
+        Ok(Vec::new())
+    }
+
+    /// Start the auto-retry of a retryable provider error when the transcript
+    /// ends on one and the retry budget is open: increment the attempt
+    /// counter, emit `auto_retry_start`, drop the failed turn's terminal
+    /// message from the transcript (the session keeps it), and sleep the
+    /// exponential backoff. Returns whether the caller should run the retry
+    /// turn. An abort during the backoff closes the lifecycle with
+    /// `Retry cancelled` and returns false, mirroring TS `_prepareRetry`.
+    /// Context overflow is never retried here — the overflow path owns it.
+    async fn prepare_auto_retry(&mut self) -> Result<bool, anyhow::Error> {
+        let settings = self.retry_settings;
+        if !settings.enabled || self.retry_attempt >= settings.max_retries {
+            return Ok(false);
         }
+        let Some(message) = self.agent.state().messages.last() else {
+            return Ok(false);
+        };
+        if crate::provider::overflow::is_context_overflow(message, self.model.context_window as u64)
+            || !retry::is_retryable_assistant_error(message)
+        {
+            return Ok(false);
+        }
+        let AgentMessage::Assistant { error_message, .. } = message else {
+            return Ok(false);
+        };
+
+        self.retry_attempt += 1;
+        let delay = std::time::Duration::from_millis(
+            settings.base_delay_ms * 2u64.pow(self.retry_attempt - 1),
+        );
+        self.emit_retry(RetryEvent::Start {
+            attempt: self.retry_attempt,
+            max_attempts: settings.max_retries,
+            delay,
+            error_message: error_message
+                .clone()
+                .unwrap_or_else(|| "Unknown error".into()),
+        });
+
+        // The failed turn's terminal message must not reach the retry's
+        // context; the session keeps it for history.
+        let mut messages = self.agent.state().messages.clone();
+        messages.pop();
+        self.agent.replace_transcript(messages);
+        self.message_entry_ids.pop();
+
+        let cancel = CancellationToken::new();
+        self.retry_cancel = cancel.clone();
+        let slept = tokio::select! {
+            _ = cancel.cancelled() => false,
+            _ = tokio::time::sleep(delay) => true,
+        };
+        if !slept {
+            let attempt = self.retry_attempt;
+            self.retry_attempt = 0;
+            self.emit_retry(RetryEvent::End {
+                success: false,
+                attempt,
+                final_error: Some("Retry cancelled".into()),
+            });
+        }
+        Ok(slept)
+    }
+
+    /// One continuation turn over the current transcript — the retry turn
+    /// after a dropped error message, or a drain of messages queued by
+    /// `agent_end` listeners or a maintenance step. Messages persist and
+    /// settle like any other turn.
+    async fn run_continuation_turn(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         self.phase = AgentHarnessPhase::Turn;
         let result = self.agent.continue_().await;
         self.phase = AgentHarnessPhase::Idle;
@@ -666,6 +850,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.persist_turn_messages(&messages).await?;
         self.note_run_outcome(&messages);
         Ok(messages)
+    }
+
+    fn emit_retry(&self, event: RetryEvent) {
+        if let Some(observer) = &self.retry_observer {
+            observer(event);
+        }
     }
 
     /// One overflow recovery step over the finished run.
@@ -761,8 +951,9 @@ impl<S: SessionStorage> AgentHarness<S> {
         }
     }
 
-    /// Abort the current agent run.
+    /// Abort the current agent run and any in-flight retry backoff.
     pub fn abort(&mut self) {
+        self.retry_cancel.cancel();
         self.agent.abort();
         self.phase = AgentHarnessPhase::Idle;
     }
@@ -1328,6 +1519,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
+                raw_stop_reason: None,
                 stop_reason: Some(StopReason::Stop),
                 usage: Box::new(Usage::default()),
                 error_message: None,
@@ -1356,6 +1548,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
+                raw_stop_reason: None,
                 stop_reason: Some(StopReason::Aborted),
                 usage: Box::new(Usage::default()),
                 error_message: Some("summarization was cancelled".into()),
@@ -1399,6 +1592,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
+                raw_stop_reason: None,
                 stop_reason: Some(StopReason::Stop),
                 usage: Box::new(Usage::default()),
                 error_message: None,
@@ -1459,6 +1653,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: Some(StopReason::Stop),
             usage: Box::new(Usage {
                 total_tokens: 90_000,
@@ -1806,6 +2001,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -1914,6 +2110,11 @@ mod tests {
         AnswerWithUsage { total_tokens: u64 },
         /// A provider failure classified as context overflow.
         OverflowError,
+        /// A transient provider failure the agent-level auto-retry restarts.
+        RetryableError,
+        /// A completed reply whose reported input exceeded the window — the
+        /// silent overflow that compacts without retry.
+        SilentOverflow,
         /// An overflow terminal stamped with a different model's identity.
         ForeignModelOverflow,
     }
@@ -1955,6 +2156,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: Some(StopReason::Stop),
             usage: Box::new(Usage::default()),
             error_message: None,
@@ -1995,6 +2197,16 @@ mod tests {
                 Some(ScriptedTurn::OverflowError) => Err(anyhow::anyhow!(
                     "http 400: prompt is too long: 213462 tokens > 200000 maximum"
                 )),
+                Some(ScriptedTurn::RetryableError) => {
+                    Err(anyhow::anyhow!("http 529: overloaded, please retry later"))
+                }
+                Some(ScriptedTurn::SilentOverflow) => {
+                    let mut message = scripted_assistant("x".into(), "test", "test");
+                    if let AgentMessage::Assistant { usage, .. } = &mut message {
+                        usage.input_tokens = 150_000;
+                    }
+                    Ok(message)
+                }
                 Some(ScriptedTurn::ForeignModelOverflow) => Ok(AgentMessage::Assistant {
                     content: Vec::new(),
                     model: "other".into(),
@@ -2003,6 +2215,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Error),
                     usage: Box::new(Usage::default()),
                     error_message: Some(
@@ -2429,6 +2642,300 @@ mod tests {
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
 
+    /// A follow-up queued by an `agent_end` listener is delivered by one
+    /// continuation even when nothing needs compaction — the queued check is
+    /// the loop's own exit condition, not a side effect of the threshold
+    /// branch.
+    #[tokio::test]
+    async fn test_agent_end_listener_follow_up_is_delivered_without_compaction() {
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(None::<crate::agent::RunHandle>));
+        let handle_in_listener = std::sync::Arc::clone(&handle);
+        let (stream_fn, _summaries) =
+            ScriptedStreamFn::new(vec![ScriptedTurn::Answer(2048), ScriptedTurn::Answer(8)]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        let agent_handle = harness.agent().run_handle();
+        *handle.lock().unwrap() = Some(agent_handle.clone());
+        // Queue exactly once: the listener fires on every run's AgentEnd,
+        // including the drain continuation's, and an unconditional queue
+        // would keep the settle loop alive forever.
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued_in_listener = std::sync::Arc::clone(&queued);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = std::sync::Arc::clone(&handle_in_listener);
+            let queued = std::sync::Arc::clone(&queued_in_listener);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::AgentEnd { .. })
+                    && !queued.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    && let Some(handle) = handle.lock().unwrap().as_ref()
+                {
+                    handle.follow_up(AgentMessage::user("from agent_end"));
+                }
+            })
+        }));
+
+        let messages = harness.prompt("first").await.unwrap();
+        // Turn output plus the drain continuation's follow-up and reply.
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::User { content, .. }
+                    if matches!(&content[0], ContentBlock::Text { text, .. } if text == "from agent_end")
+            )),
+            "the agent_end follow-up was delivered: {messages:?}"
+        );
+        assert!(!harness.agent().has_queued_messages());
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    /// A follow-up queued while the overflow compact-no-retry path compacts
+    /// is delivered by one continuation after — the same delivery the
+    /// threshold branch gets, reached through the overflow path this time.
+    #[tokio::test]
+    async fn test_overflow_compact_no_retry_delivers_queued_follow_up() {
+        let handle_slot: Arc<std::sync::Mutex<Option<crate::agent::RunHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_in_summary = Arc::clone(&handle_slot);
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::SilentOverflow,
+            ScriptedTurn::Answer(8),
+        ]);
+        let stream_fn = stream_fn.on_summary(move || {
+            if let Some(handle) = slot_in_summary.lock().unwrap().as_ref() {
+                handle.follow_up(AgentMessage::user("while compacting"));
+            }
+        });
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        *handle_slot.lock().unwrap() = Some(harness.agent().run_handle());
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+
+        let messages = harness.prompt("second").await.unwrap();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::User { content, .. }
+                    if matches!(&content[0], ContentBlock::Text { text, .. } if text == "while compacting")
+            )),
+            "the queued follow-up was delivered: {messages:?}"
+        );
+        assert!(!harness.agent().has_queued_messages());
+    }
+
+    /// A transient provider failure is retried after the backoff and the
+    /// recovered reply is returned with the failed turn — the error message
+    /// leaves the transcript for the retry while the session keeps it.
+    #[tokio::test]
+    async fn test_retryable_error_is_retried_after_backoff() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 2,
+            ..Default::default()
+        });
+
+        harness.prompt("first").await.unwrap();
+        let messages = harness.prompt("second").await.unwrap();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(err),
+                ..
+            } if err.contains("overloaded")
+        ));
+        assert!(matches!(
+            &messages[2],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Stop),
+                ..
+            }
+        ));
+        // The transcript ends on the recovered reply with the failed turn
+        // removed (the session keeps it).
+        let transcript = &harness.agent().state().messages;
+        assert_eq!(transcript.len(), 4, "{transcript:?}");
+        assert!(
+            !transcript.iter().any(|m| matches!(
+                m,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                }
+            )),
+            "the failed turn left the transcript: {transcript:?}"
+        );
+        assert!(matches!(
+            transcript.last(),
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Stop),
+                ..
+            })
+        ));
+    }
+
+    /// The retry budget is per error episode: a failure that stays retryable
+    /// exhausts `maxRetries` attempts, and the terminal error then settles
+    /// without another retry.
+    #[tokio::test]
+    async fn test_retry_budget_exhaustion_keeps_terminal_error() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::RetryableError,
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 1,
+            max_retries: 3,
+            ..Default::default()
+        });
+
+        harness.prompt("first").await.unwrap();
+        let messages = harness.prompt("second").await.unwrap();
+        // The original failure plus three retried failures; the fourth
+        // retryable failure is terminal.
+        assert_eq!(messages.len(), 5, "{messages:?}");
+        assert!(messages[1..].iter().all(|m| matches!(
+            m,
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                ..
+            }
+        )));
+        assert_eq!(harness.retry_attempt(), 0);
+    }
+
+    /// The retry lifecycle emits `auto_retry_start` then `auto_retry_end` on
+    /// success, mirroring the TS session events.
+    #[tokio::test]
+    async fn test_auto_retry_emits_lifecycle_events() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 1,
+            ..Default::default()
+        });
+        let events: Arc<std::sync::Mutex<Vec<RetryEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = std::sync::Arc::clone(&events);
+        harness.on_auto_retry(move |event| capture.lock().unwrap().push(event));
+
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            RetryEvent::Start {
+                attempt: 1,
+                max_attempts: 3,
+                error_message,
+                ..
+            } if error_message.contains("overloaded")
+        ));
+        assert!(matches!(
+            &events[1],
+            RetryEvent::End {
+                success: true,
+                attempt: 1,
+                final_error: None,
+            }
+        ));
+    }
+
+    /// Context overflow never enters the agent-level auto-retry — it goes to
+    /// compaction, and no retry lifecycle events fire.
+    #[tokio::test]
+    async fn test_overflow_error_is_not_auto_retried() {
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::OverflowError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 1,
+            ..Default::default()
+        });
+        let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&retries);
+        harness.on_auto_retry(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        harness.prompt("first").await.unwrap();
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 10,
+            ..Default::default()
+        });
+        let messages = harness.prompt("second").await.unwrap();
+        // Overflow compact-and-retry, not agent-level retry.
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(retries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(harness.retry_attempt(), 0);
+    }
+
     /// A failed summarization (Error/Aborted terminal, or an empty summary)
     /// must not persist a compaction entry nor rewrite the transcript — the
     /// compacted prefix would otherwise be replaced with nothing and lost.
@@ -2559,6 +3066,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -2815,6 +3323,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -2894,6 +3403,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: Some(StopReason::Stop),
             usage: Box::new(Usage::default()),
             error_message: None,
@@ -2973,6 +3483,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -3191,6 +3702,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: Some(StopReason::Stop),
             usage: Box::new(Usage {
                 total_tokens: 90_000,
@@ -3916,6 +4428,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::ToolUse),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -3933,6 +4446,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -4052,6 +4566,7 @@ mod tests {
                     response_model: None,
                     response_id: None,
                     diagnostics: None,
+                    raw_stop_reason: None,
                     stop_reason: Some(StopReason::Stop),
                     usage: Box::new(Usage::default()),
                     error_message: None,
@@ -4183,6 +4698,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
+                raw_stop_reason: None,
                 stop_reason: Some(StopReason::Stop),
                 usage: Box::new(Usage::default()),
                 error_message: None,

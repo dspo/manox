@@ -718,6 +718,7 @@ mod tests {
                 response_model: None,
                 response_id: None,
                 diagnostics: None,
+                raw_stop_reason: None,
                 stop_reason: None,
                 usage: Box::default(),
                 error_message: None,

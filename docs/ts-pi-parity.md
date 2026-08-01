@@ -1,7 +1,7 @@
 # TS Pi → crate pi 对齐清单
 
 > 目的：逐项核验 `crates/pi` 对 TS Pi（pi-mono 的 `packages/ai` + `packages/coding-agent`）核心行为的对齐状态。
-> 对齐基线：TS Pi upstream **`ea781d68f296bea36db3a540d2c53746f1a90bdd`**（2026-07-31 第三轮对抗审查定为新基线；此前无可靠历史基线，此前结论以该轮重核为准）。
+> 对齐基线：TS Pi upstream **`bf4a90d81985bd45052eeeae59d84fe13e0bd2c8`**（2026-08-01 第四轮对抗审查推进基线；此前基因为 `ea781d68f296bea36db3a540d2c53746f1a90bdd`）。
 > 本文件只追踪 TS Pi → crate pi 的行为对齐。「pi crate 何时能替换 manox agent crate」的产品能力清单见 [manox-cutover.md](manox-cutover.md)。
 > 状态图例：✅ 已对齐 · 🟡 已对齐但有记录在案的偏差 · 🔲 未对齐 · 🚫 有意偏离（记录理由）
 
@@ -32,7 +32,8 @@
 | Phase 状态机 | ✅ | idle/turn/compaction/branch_summary/retry；结构化操作 idle 门控 |
 | overflow compact-retry | ✅ | 一次性预算 + 同模型/stale/aborted 守卫；摘除失败终端（session 保留）→ 压缩 → 重试一次；成功 assistant 重新武装 |
 | threshold compact-no-retry | ✅（2026-07-31） | settled 回合（成功/错误）后计量超阈值即为下一回合压缩，不重试；维护性压缩失败只记日志，已完结回合结果不受影响（对齐 TS `_runAutoCompaction` catch → return false） |
-| 压缩期队列处理 | ✅（2026-07-31） | 压缩只替换 transcript 不清队列；压缩后队列非空则续跑一次 drain continuation 投递（对齐 TS `return this.agent.hasQueuedMessages()`） |
+| 压缩期队列处理 | ✅（2026-07-31） | 压缩只替换 transcript 不清队列；settle 循环最外层检查 queued 消息，非空即续跑一次 continuation 投递（对齐 TS `_handlePostAgentRun` 末行 `hasQueuedMessages()`，2026-08-01 从 threshold 分支提升到最外层） |
+| session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`abort()` 可取消退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`） |
 | Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §8 |
 | 持久化粒度 | 🟡 | turn 末批量追加；TS 在 message_end 逐条持久化，turn 中途崩溃不丢。对齐项见「已知余项」 |
 | 运行配置 | ✅ | set_model/set_active_tools 持久化 entry 并校验；restore 回放 thinking tier/active tools/model（ModelResolver 插接，crate registry-free），不追加 entry |
@@ -60,8 +61,8 @@
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| Anthropic 形状 | ✅ | content_block_start 自带 text/thinking/signature 保留，signature_delta 追加（对齐 upstream 59ad3dead，2026-07-31） |
-| Completions 形状 | 🟡 | 已对齐；已知偏差：交错块模型（TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块），见「已知余项」 |
+| Anthropic 形状 | ✅ | content_block_start 自带 text/thinking/signature 保留，signature_delta 追加（对齐 upstream 59ad3dead，2026-07-31）；refusal 的 `stop_details.explanation` 进入 error_message、`rawStopReason` 持久化、redacted thinking 用 `[Reasoning redacted]` 占位（2026-08-01） |
+| Completions 形状 | 🟡 | 已对齐；已知偏差：交错块模型（TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块），见「已知余项」；截断流（无 `[DONE]` 且无 `finish_reason`）报 transport 错误而非当成功响应（2026-08-01） |
 | Responses 形状 | ✅ | reasoning encrypted_content 往返、tool call id 规则、孤儿 call 合成结果等逐项对齐 |
 | 握手重试 | ✅ | 形状无关装饰器：429/408/5xx + 连接期传输错误指数退避、Retry-After 遵从、6 次上限、仅握手阶段 |
 | 溢出分类 | ✅ | 20 种跨厂商子串 + 限流排除 + 413；terminal/mid_stream 两构造点统一 ProviderError::Overflow |
@@ -82,7 +83,7 @@
 - **grep/find 进程内化**（ignore + regex + globset），TS shell 出系统 grep/find
 - **manox 自创恢复项不移植**：空响应 nudge、拒绝熔断、取消级联清理（TS agent-loop 皆无）
 - **registry 不进 crate**：模型解析经 consumer 插接的 ModelResolver，crate 保持 registry-free
-- **Hook 推迟项**：`before_provider_payload`/`after_provider_response`（provider 层无接缝）、`session_before_tree`/`session_tree`（无 tree 操作）、`retry_*`（循环内无重试）、`model_update`/`tools_update`（fire 点已具备、变体未接线）、`thinking_level_update`/`resources_update`（无 setter 面）——激进纪律不留无 fire 点的死变体
+- **Hook 推迟项**：`before_provider_payload`/`after_provider_response`（provider 层无接缝）、`session_before_tree`/`session_tree`（无 tree 操作）、`summarization_retry_*`（summarization 调用无重试/取消）、`model_update`/`tools_update`（fire 点已具备、变体未接线）、`thinking_level_update`/`resources_update`（无 setter 面）——激进纪律不留无 fire 点的死变体；session auto-retry 已由 `RetryEvent` observer 承载（2026-08-01）
 
 ## 已知余项（对齐缺口，按严重度排序）
 
@@ -102,5 +103,6 @@
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| 第四轮（2026-08-01） | `fe4431d` | `bf4a90d8`（新对齐基线） | 3 P1（post-run 队列投递 / Completions 截断流 / session auto-retry）+ 1 P2（Anthropic refusal 细节）均已修复，见各章节 |
 | 第三轮（2026-07-31） | `36884be` | `ea781d68`（新对齐基线） | 3 P1（压缩清队列 / content_block_start 丢初始内容 / threshold 未接线）+ 1 P2（本文档拆分），均已修复 |
 | 第二轮（2026-07-31） | round-1 修复后 | 7df73a00c（本地 checkout） | 7 项修复合并为 `36884be`，remora 零缺陷 |

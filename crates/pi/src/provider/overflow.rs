@@ -202,6 +202,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
+            raw_stop_reason: None,
             stop_reason: Some(stop_reason),
             usage: Box::new(usage),
             error_message: error_message.map(str::to_string),

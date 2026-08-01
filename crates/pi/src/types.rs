@@ -118,6 +118,12 @@ pub enum AgentMessage {
         /// — `Error`/`Aborted` cover provider failures and local interrupts.
         #[serde(default)]
         stop_reason: Option<StopReason>,
+        /// The provider's raw stop-reason string, kept verbatim for
+        /// diagnostics and persistence (TS `rawStopReason`). Only providers
+        /// that report one set it — Anthropic's `stop_reason`, Completions'
+        /// `finish_reason`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_stop_reason: Option<String>,
         /// Boxed so the `Assistant` variant — by far the largest, carrying the
         /// provider's full response payload — stays off the enum's inline size.
         /// `Box<Usage>` derefs to `Usage`, so reads are transparent.

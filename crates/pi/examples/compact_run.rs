@@ -38,6 +38,7 @@ fn assistant_message(text: String, total_tokens: u64) -> AgentMessage {
         response_model: None,
         response_id: None,
         diagnostics: None,
+        raw_stop_reason: None,
         stop_reason: Some(StopReason::Stop),
         usage: Box::new(Usage {
             total_tokens,

@@ -298,6 +298,17 @@ pub enum WireDelta {
 pub struct MessageDeltaBody {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
+    #[serde(default)]
+    pub stop_details: Option<WireStopDetails>,
+}
+
+/// The refusal payload a `message_delta` carries when the model refused the
+/// request; the explanation is the provider's specific rejection reason.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireStopDetails {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub explanation: Option<String>,
 }
 
 /// Token usage as reported by the API.
