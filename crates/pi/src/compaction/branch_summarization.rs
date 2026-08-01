@@ -221,7 +221,7 @@ pub async fn summarize_branch(
 }
 
 /// System prompt for the summarizing model.
-const SYSTEM_PROMPT: &str =
+pub const SYSTEM_PROMPT: &str =
     "You summarize a coding agent's conversation branch into a concise, dense summary.";
 
 #[cfg(test)]

@@ -1316,6 +1316,68 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// layer. Restore never appends entries: the session already records
     /// these choices. The compaction boundary used by token estimation is
     /// recovered alongside.
+    /// Move the session cursor to an earlier entry, rebuild the transcript
+    /// from the new path, and append a branch summary for it — the TS
+    /// `navigateTree`. The branch summary is generated with the current
+    /// model's runtime and persisted as a `branch_summary` entry.
+    pub async fn navigate_tree(&mut self, target_id: &str) -> Result<(), anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!("Cannot navigate while harness is in {:?} phase", self.phase);
+        }
+        let _active = ActiveGuard::arm(&self.control);
+
+        self.session.move_to(Some(target_id)).await?;
+        self.restore().await?;
+
+        let entries = self.session.get_branch().await?;
+        let messages: Vec<AgentMessage> = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        let existing = entries.iter().rev().find_map(|e| match e {
+            SessionTreeEntry::BranchSummary {
+                summary, details, ..
+            } => Some(crate::compaction::branch_summarization::BranchSummary {
+                summary: summary.clone(),
+                files_changed: details
+                    .as_ref()
+                    .and_then(|d| d.get("filesChanged"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+            _ => None,
+        });
+        let stream_fn = match &self.stream_resolver {
+            Some(resolver) => resolver(&self.model)?,
+            None => Arc::clone(&self.stream_fn),
+        };
+        let summary = crate::compaction::branch_summarization::summarize_branch(
+            &messages,
+            &self.model,
+            stream_fn,
+            existing.as_ref(),
+        )
+        .await?;
+        self.session
+            .append_branch_summary(
+                target_id,
+                &summary.summary,
+                &summary.files_changed,
+                None,
+                false,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
         let context = self.session.build_session_context().await?;
         self.agent.clear_transcript_state();
@@ -5827,6 +5889,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// navigate_tree moves the cursor to an earlier entry, rebuilds the
+    /// transcript from the new path, and appends a branch summary.
+    #[tokio::test]
+    async fn test_navigate_tree_moves_and_summarizes_branch() {
+        // A stream whose summarization calls answer with a fixed summary and
+        // whose normal turns play simple answers.
+        struct NavigateStreamFn;
+        #[async_trait::async_trait]
+        impl StreamFn for NavigateStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if context.system_prompt == crate::compaction::branch_summarization::SYSTEM_PROMPT {
+                    return Ok(scripted_assistant("branch summary".into(), "test", "test"));
+                }
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(NavigateStreamFn),
+        );
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+        let full_len = harness.agent().state().messages.len();
+        assert_eq!(full_len, 4);
+
+        // The first turn's assistant reply: navigating back to it keeps the
+        // whole first turn on the active path.
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let first_reply_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        harness.navigate_tree(&first_reply_id).await.unwrap();
+        // The transcript now holds only the first turn (user + answer); the
+        // second turn's messages are on the other branch.
+        assert_eq!(harness.agent().state().messages.len(), 2);
+
+        // A branch summary entry was appended.
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+            "{entries:?}"
+        );
     }
 
     #[tokio::test]

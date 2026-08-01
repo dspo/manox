@@ -6,6 +6,7 @@
 // matching the TS Pi v3 on-disk schema exactly so real session files load.
 
 pub mod jsonl;
+pub mod repository;
 
 use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
@@ -460,6 +461,167 @@ impl<S: SessionStorage> Session<S> {
             active_tool_names,
         })
     }
+
+    /// Append a `branch_summary` entry and return the entry ID.
+    pub async fn append_branch_summary(
+        &self,
+        from_id: &str,
+        summary: &str,
+        files_changed: &[String],
+        usage: Option<Usage>,
+        from_hook: bool,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::BranchSummary {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            from_id: from_id.to_string(),
+            summary: summary.to_string(),
+            details: Some(serde_json::json!({"filesChanged": files_changed})),
+            usage,
+            from_hook: Some(from_hook),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Move the session cursor to an earlier entry, appending a `leaf` entry
+    /// that records the branch point — the TS `moveTo`. `None` resets the
+    /// cursor to the root.
+    pub async fn move_to(&self, target_id: Option<&str>) -> Result<(), anyhow::Error> {
+        self.storage.set_leaf_id(target_id).await
+    }
+
+    /// The current leaf (cursor) entry id.
+    pub async fn leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
+        self.storage.get_leaf_id().await
+    }
+
+    /// Append a `custom` entry whose payload the harness does not interpret.
+    pub async fn append_custom(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::Custom {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            custom_type: custom_type.to_string(),
+            data,
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Append a `custom_message` entry whose payload the harness does not
+    /// interpret; it joins the transcript like any message.
+    pub async fn append_custom_message(
+        &self,
+        custom_type: &str,
+        content: Vec<crate::types::ContentBlock>,
+        details: Option<JsonValue>,
+        display: bool,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::CustomMessage {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            custom_type: custom_type.to_string(),
+            content,
+            details,
+            display,
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Attach a short human-readable label to an entry in the tree.
+    pub async fn append_label(
+        &self,
+        target_id: &str,
+        label: Option<String>,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::Label {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            target_id: target_id.to_string(),
+            label,
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Set the session's display name via a `session_info` entry.
+    pub async fn set_session_name(&self, name: &str) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::SessionInfo {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            name: Some(name.to_string()),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Coarse session statistics over the whole entry list: entry count,
+    /// message count, branch count, and the latest activity timestamp.
+    pub async fn stats(&self) -> Result<SessionStats, anyhow::Error> {
+        let entries = self.storage.get_entries().await?;
+        let messages = entries
+            .iter()
+            .filter(|e| matches!(e, SessionTreeEntry::Message { .. }))
+            .count();
+        let branches = entries
+            .iter()
+            .filter(|e| matches!(e, SessionTreeEntry::Leaf { .. }))
+            .count();
+        let last_activity = entries.iter().map(|e| e.timestamp()).max();
+        Ok(SessionStats {
+            entries: entries.len(),
+            messages,
+            branches: branches + 1,
+            last_activity,
+        })
+    }
+
+    /// A page of entries from the full list, newest first, with a cursor flag
+    /// for callers that page onward.
+    pub async fn paginate(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<SessionTreeEntry>, bool), anyhow::Error> {
+        let entries = self.storage.get_entries().await?;
+        let total = entries.len();
+        let page = entries.into_iter().rev().skip(offset).take(limit).collect();
+        Ok((page, offset + limit < total))
+    }
+}
+
+/// Coarse session statistics, computed over the whole entry list.
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    pub entries: usize,
+    pub messages: usize,
+    pub branches: usize,
+    pub last_activity: Option<DateTime<Utc>>,
 }
 
 /// The projected session state an agent is restored from.
