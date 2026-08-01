@@ -477,6 +477,11 @@ pub trait EventSink: Send + Sync {
 pub struct Model {
     /// Provider identifier (e.g. "anthropic", "openai").
     pub provider: String,
+    /// The wire API shape this model speaks (e.g. "anthropic",
+    /// "openai_completions", "openai_responses") — the discriminator a
+    /// [`StreamResolver`](crate::agent_loop::StreamFn) uses to pick the
+    /// provider runtime, mirroring the TS `Model.api`.
+    pub api: String,
     /// Model identifier (e.g. "claude-sonnet-4-6").
     pub id: String,
     /// Maximum context window in tokens.
@@ -592,6 +597,10 @@ pub struct AgentLoopConfig {
     pub get_follow_up_messages: Option<MessageQueueFn>,
     /// Called before each turn to potentially refresh context/model.
     pub prepare_next_turn: Option<PrepareTurnFn>,
+    /// Resolves the provider runtime for the current model, per turn. When
+    /// set, each provider call uses the stream function for `context.model`;
+    /// when `None`, the run's fixed stream fn serves every turn.
+    pub stream_resolver: Option<crate::agent_loop::StreamResolver>,
     /// Called after each turn to decide whether to stop.
     pub should_stop_after_turn: Option<StopAfterTurnFn>,
     /// Called before a tool call executes. Return `Some(reason)` to block.

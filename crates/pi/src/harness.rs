@@ -88,6 +88,16 @@ pub enum RetryEvent {
     },
 }
 
+/// The shared runtime snapshot (model + thinking level) that new runs and
+/// next-turn refreshes build their context from. Both the idle setters and
+/// the mid-run handle setters update it immediately; the durable session
+/// writes are queued separately.
+#[derive(Clone)]
+struct TurnRuntime {
+    model: Model,
+    thinking_level: Option<String>,
+}
+
 /// Shared harness control state exposed as [`AgentHarness::handle`], so a
 /// caller can abort or await a harness that `prompt`/`continue_` own
 /// exclusively — the retry backoff runs while the harness is `&mut`-borrowed.
@@ -99,14 +109,19 @@ struct HarnessControl {
     /// Number of operations (prompt/continue_/compact, including their
     /// settle phases) in flight; zero means the harness is fully settled.
     active_tx: watch::Sender<usize>,
-    /// Runtime mutations queued while a run is in flight. The loop's
-    /// `prepare_next_turn` applies them to the next turn's context; the
-    /// harness persists them and syncs its own state once the run settles
-    /// (TS queues them during a run and flushes at the next turn boundary).
+    /// The runtime truth for following turns: model and thinking level as
+    /// mutated by idle setters and mid-run handle setters alike. Every new
+    /// run and every next-turn refresh reads it.
+    turn_runtime: std::sync::Mutex<TurnRuntime>,
+    /// Durable writes for mutations applied mid-run. Entries leave the queue
+    /// only after their session append succeeds, so a failed write keeps the
+    /// tail for the next flush.
     pending_mutations: std::sync::Mutex<Vec<PendingMutation>>,
 }
 
-/// A runtime mutation queued mid-run and applied at the next turn boundary.
+/// A runtime mutation queued mid-run; applied to the shared snapshot
+/// immediately and persisted by the harness once the run settles.
+#[derive(Clone)]
 enum PendingMutation {
     Model(Model),
     ThinkingLevel(Option<String>),
@@ -173,9 +188,11 @@ impl HarnessHandle {
     }
 
     /// Queue a model change for the next turn boundary of the in-flight run.
-    /// The change reaches the loop context before the next provider request
-    /// and is persisted once the run settles — the TS mid-run `setModel`.
+    /// The shared runtime snapshot updates immediately — the next provider
+    /// request and the next run both see it — and the change is persisted
+    /// once the run settles (the TS mid-run `setModel`).
     pub fn set_model(&self, model: Model) {
+        self.control.turn_runtime.lock().unwrap().model = model.clone();
         self.control
             .pending_mutations
             .lock()
@@ -186,6 +203,7 @@ impl HarnessHandle {
     /// Queue a thinking-level change for the next turn boundary of the
     /// in-flight run, same semantics as [`HarnessHandle::set_model`].
     pub fn set_thinking_level(&self, level: Option<String>) {
+        self.control.turn_runtime.lock().unwrap().thinking_level = level.clone();
         self.control
             .pending_mutations
             .lock()
@@ -397,6 +415,10 @@ pub struct AgentHarness<S: SessionStorage> {
     hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>,
     /// The streaming function used for the summarization call in `compact()`.
     stream_fn: Arc<dyn StreamFn>,
+    /// Per-model provider runtime resolution, when the consumer plugs one in;
+    /// forwards to the agent for per-turn resolution and serves the
+    /// summarization call in `compact()`.
+    stream_resolver: Option<crate::agent_loop::StreamResolver>,
     /// Entry ids aligned by index with the agent transcript. `None` marks a
     /// synthetic carrier (a compaction summary message, or a message folded
     /// into a compaction entry's retained tail on restore) that has no
@@ -453,6 +475,10 @@ impl<S: SessionStorage> AgentHarness<S> {
         let control: Arc<HarnessControl> = Arc::new(HarnessControl {
             retry_cancel: std::sync::Mutex::new(CancellationToken::new()),
             active_tx: watch::Sender::new(0),
+            turn_runtime: std::sync::Mutex::new(TurnRuntime {
+                model: model.clone(),
+                thinking_level: None,
+            }),
             pending_mutations: std::sync::Mutex::new(Vec::new()),
         });
         let mut agent = Agent::new(
@@ -471,6 +497,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             last_compaction_at: None,
             hooks,
             stream_fn,
+            stream_resolver: None,
             message_entry_ids: Vec::new(),
             overflow_recovery_attempted: false,
             retry_settings: RetrySettings::default(),
@@ -502,6 +529,17 @@ impl<S: SessionStorage> AgentHarness<S> {
         resolver: impl Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync + 'static,
     ) -> Self {
         self.model_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Plug in per-model provider runtime resolution (the consumer's registry
+    /// seam — the crate stays registry-free). Every provider call — normal
+    /// turns, overflow retries, continuations, and summarization — resolves
+    /// its stream function from the current model, so a mid-session model
+    /// change switches protocol/endpoint/credentials.
+    pub fn with_stream_resolver(mut self, resolver: crate::agent_loop::StreamResolver) -> Self {
+        self.stream_resolver = Some(Arc::clone(&resolver));
+        self.agent.set_stream_resolver(resolver);
         self
     }
 
@@ -593,6 +631,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.session
             .append_model_change(&model.provider, &model.id)
             .await?;
+        self.control.turn_runtime.lock().unwrap().model = model.clone();
         self.agent.set_model(model.clone());
         self.model = model;
         Ok(())
@@ -641,34 +680,60 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.session
             .append_thinking_level_change(thinking_level.as_deref().unwrap_or("off"))
             .await?;
+        self.control.turn_runtime.lock().unwrap().thinking_level = thinking_level.clone();
         self.agent.set_thinking_level(thinking_level);
         Ok(())
     }
 
-    /// Persist runtime mutations queued while a run was in flight and sync
-    /// the harness state to them. The loop's `prepare_next_turn` already
-    /// applied them to the in-flight context; this closes the durability loop
-    /// once the run settles.
+    /// Sync the harness's own state (agent model/thinking) from the shared
+    /// runtime snapshot. Called before every new run and before post-run
+    /// maintenance, so continuations and overflow recovery read the same
+    /// model the turns just used. The durable session writes are flushed
+    /// separately.
+    fn apply_turn_runtime(&mut self) {
+        let snapshot = self.control.turn_runtime.lock().unwrap().clone();
+        let current = self.agent.state().model.clone();
+        if snapshot.model.id != current.id || snapshot.model.api != current.api {
+            self.agent.set_model(snapshot.model.clone());
+            self.model = snapshot.model;
+        }
+        if snapshot.thinking_level != self.agent.state().thinking_level {
+            self.agent.set_thinking_level(snapshot.thinking_level);
+        }
+    }
+
+    /// Persist runtime mutations queued while a run was in flight, one at a
+    /// time: each entry leaves the queue only after its session append
+    /// succeeds, so a failed write keeps the tail (and the current entry)
+    /// for the next flush instead of dropping it. Runtime state is synced by
+    /// [`AgentHarness::apply_turn_runtime`], not here.
     async fn flush_pending_mutations(&mut self) -> Result<(), anyhow::Error> {
-        let pending = std::mem::take(&mut *self.control.pending_mutations.lock().unwrap());
-        for mutation in pending {
+        loop {
+            let next = self
+                .control
+                .pending_mutations
+                .lock()
+                .unwrap()
+                .first()
+                .cloned();
+            let Some(mutation) = next else {
+                return Ok(());
+            };
             match mutation {
                 PendingMutation::Model(model) => {
                     self.session
                         .append_model_change(&model.provider, &model.id)
                         .await?;
-                    self.agent.set_model(model.clone());
-                    self.model = model;
                 }
                 PendingMutation::ThinkingLevel(level) => {
                     self.session
                         .append_thinking_level_change(level.as_deref().unwrap_or("off"))
                         .await?;
-                    self.agent.set_thinking_level(level);
                 }
             }
+            // The append succeeded: drop the entry and continue.
+            self.control.pending_mutations.lock().unwrap().remove(0);
         }
-        Ok(())
     }
 
     /// Re-derive the agent's tool list from the mounted set and the active
@@ -723,6 +788,9 @@ impl<S: SessionStorage> AgentHarness<S> {
             anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
         }
         let _active = ActiveGuard::arm(&self.control);
+        // A handle mutation queued while idle applies to this run's first
+        // turn.
+        self.apply_turn_runtime();
 
         self.phase = AgentHarnessPhase::Turn;
         // A new user message rearms the one-shot overflow recovery.
@@ -796,6 +864,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
         }
         let _active = ActiveGuard::arm(&self.control);
+        self.apply_turn_runtime();
 
         self.phase = AgentHarnessPhase::Turn;
         let result = self.agent.continue_().await;
@@ -888,6 +957,10 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// pending work exits the loop.
     async fn settle_after_run(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let mut produced = Vec::new();
+        // Sync the harness model/agent from the runtime snapshot before
+        // overflow recovery and threshold compaction, so both read the
+        // context window of the model the turns just used.
+        self.apply_turn_runtime();
         loop {
             if self.prepare_auto_retry().await? {
                 produced.extend(self.run_continuation_turn().await?);
@@ -1497,8 +1570,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
         // Run the summarization stream concurrently with draining its events:
         // the producer would block on the 64-cap channel once it fills, so the
-        // receiver must drain while it runs, not after.
-        let stream_fn = Arc::clone(&self.stream_fn);
+        // receiver must drain while it runs, not after. With a resolver, the
+        // summarization call uses the current model's runtime too.
+        let stream_fn = match &self.stream_resolver {
+            Some(resolver) => resolver(&self.model)?,
+            None => Arc::clone(&self.stream_fn),
+        };
         let stream_handle =
             tokio::spawn(async move { stream_fn.stream(&summary_context, signal, event_tx).await });
         // The harness does not surface summarization events; just keep the
@@ -1645,22 +1722,20 @@ fn build_loop_hooks(
         hc.tool_result.unwrap_or_else(|| r.clone())
     });
 
-    let pending = Arc::clone(&control);
+    let runtime = Arc::clone(&control);
     let prepare_next_turn: PrepareTurnHook = Arc::new(move |context: &mut AgentContext| {
-        // Apply runtime mutations queued mid-run to the next turn's context.
-        // The queue is drained and persisted by the harness once the run
-        // settles; applying here (rather than draining) keeps the refresh
-        // idempotent across turns.
-        let mutations = pending.pending_mutations.lock().unwrap();
-        if mutations.is_empty() {
+        // Refresh the next turn's context from the shared runtime snapshot.
+        // The snapshot is the truth source — the durable write queue is only
+        // for persistence — so every turn (and every new run built after
+        // `apply_turn_runtime`) sees the same model/thinking.
+        let snapshot = runtime.turn_runtime.lock().unwrap();
+        let (model, thinking_level) = (snapshot.model.clone(), snapshot.thinking_level.clone());
+        drop(snapshot);
+        if model.id == context.model.id && thinking_level == context.thinking_level {
             return None;
         }
-        for mutation in mutations.iter() {
-            match mutation {
-                PendingMutation::Model(model) => context.model = model.clone(),
-                PendingMutation::ThinkingLevel(level) => context.thinking_level = level.clone(),
-            }
-        }
+        context.model = model;
+        context.thinking_level = thinking_level;
         Some(context.clone())
     });
 
@@ -1812,6 +1887,7 @@ mod tests {
         Model {
             provider: "test".into(),
             id: "test".into(),
+            api: "test".into(),
             context_window: 100_000,
             max_tokens: 8_192,
             thinking: ThinkingKind::None,
@@ -1825,6 +1901,7 @@ mod tests {
         Model {
             provider: "anthropic".into(),
             id: "claude-opus".into(),
+            api: "test".into(),
             context_window: 200_000,
             max_tokens: 16_384,
             thinking: ThinkingKind::None,
@@ -1894,6 +1971,9 @@ mod tests {
         append_calls: std::sync::Mutex<u64>,
         /// Call number at which `append_entry` fails; `u64::MAX` means never.
         fail_at_call: std::sync::Mutex<u64>,
+        /// When set, a `model_change` append for this model id fails — the
+        /// durability hook for flush tests.
+        fail_model_id: std::sync::Mutex<Option<String>>,
     }
 
     impl MemStorage {
@@ -1903,6 +1983,7 @@ mod tests {
                 leaf_id: std::sync::Mutex::new(None),
                 append_calls: std::sync::Mutex::new(0),
                 fail_at_call: std::sync::Mutex::new(u64::MAX),
+                fail_model_id: std::sync::Mutex::new(None),
             }
         }
 
@@ -1915,6 +1996,7 @@ mod tests {
                 leaf_id: std::sync::Mutex::new(leaf_id),
                 append_calls: std::sync::Mutex::new(0),
                 fail_at_call: std::sync::Mutex::new(u64::MAX),
+                fail_model_id: std::sync::Mutex::new(None),
             }
         }
     }
@@ -1925,6 +2007,12 @@ mod tests {
             Ok(uuid::Uuid::new_v4().to_string())
         }
         async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+            if let SessionTreeEntry::ModelChange { model_id, .. } = entry
+                && let Some(fail_id) = self.fail_model_id.lock().unwrap().as_ref()
+                && fail_id == model_id
+            {
+                anyhow::bail!("injected model change failure");
+            }
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
             if *calls == *self.fail_at_call.lock().unwrap() {
@@ -3340,6 +3428,232 @@ mod tests {
             )),
             "the queued model change was persisted: {entries:?}"
         );
+    }
+
+    /// A per-model stream resolver switches the provider runtime at the next
+    /// turn boundary: the first provider call hits the construction-time
+    /// stream, the second hits the stream for the queued model's api.
+    #[tokio::test]
+    async fn test_stream_resolver_switches_provider_mid_run() {
+        let served_first = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let served_second = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let first_calls = std::sync::Arc::clone(&served_first);
+        let second_calls = std::sync::Arc::clone(&served_second);
+
+        // Provider A (api "test"): a tool-use turn then a plain answer.
+        let provider_a = Arc::new(ToolUseStreamFn {
+            call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            seen: Some(first_calls),
+        }) as Arc<dyn crate::agent_loop::StreamFn>;
+        let harness_stream = Arc::clone(&provider_a);
+        // Provider B (api "openai_responses"): a plain answer, recording the
+        // model it served.
+        let provider_b: Arc<dyn crate::agent_loop::StreamFn> = Arc::new(TaggedAnswerStreamFn {
+            served: second_calls,
+        });
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.api == "openai_responses" {
+                Ok(Arc::clone(&provider_b))
+            } else {
+                Ok(Arc::clone(&provider_a))
+            }
+        });
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            harness_stream,
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]))
+        .with_stream_resolver(resolver);
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(Model {
+                        provider: "openai".into(),
+                        api: "openai_responses".into(),
+                        id: "gpt-responses".into(),
+                        context_window: 200_000,
+                        max_tokens: 16_384,
+                        thinking: ThinkingKind::None,
+                        metadata: Default::default(),
+                    });
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await.unwrap();
+
+        // Turn 1 went to provider A under the construction model; turn 2 went
+        // to provider B under the queued model — a real runtime switch, not
+        // just a context field change.
+        assert_eq!(
+            *served_first.lock().unwrap(),
+            vec!["test".to_string()],
+            "turn 1 must hit the construction-time provider"
+        );
+        assert_eq!(
+            *served_second.lock().unwrap(),
+            vec!["gpt-responses".to_string()],
+            "turn 2 must hit the queued model's provider"
+        );
+        assert_eq!(harness.model().id, "gpt-responses");
+    }
+
+    /// A failed durable write keeps the mutation in the queue (and the tail
+    /// after it) for the next flush — nothing is dropped, and a later flush
+    /// retries the suffix until it lands.
+    #[tokio::test]
+    async fn test_flush_keeps_unpersisted_mutation_on_failure() {
+        let storage = MemStorage::new();
+        *storage.fail_model_id.lock().unwrap() = Some("model-b".into());
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(Model {
+                        provider: "test".into(),
+                        api: "test".into(),
+                        id: "model-a".into(),
+                        context_window: 100_000,
+                        max_tokens: 8_192,
+                        thinking: ThinkingKind::None,
+                        metadata: Default::default(),
+                    });
+                    handle.set_model(Model {
+                        provider: "test".into(),
+                        api: "test".into(),
+                        id: "model-b".into(),
+                        context_window: 100_000,
+                        max_tokens: 8_192,
+                        thinking: ThinkingKind::None,
+                        metadata: Default::default(),
+                    });
+                }
+            })
+        }));
+
+        async fn model_changes(harness: &AgentHarness<MemStorage>) -> Vec<String> {
+            let entries = harness.session().storage().get_entries().await.unwrap();
+            entries
+                .iter()
+                .filter_map(|e| match e {
+                    SessionTreeEntry::ModelChange { model_id, .. } => Some(model_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // model_a persists; model_b's append fails and surfaces the error.
+        assert!(harness.prompt("use the tool").await.is_err());
+        assert_eq!(model_changes(&harness).await, vec!["model-a".to_string()]);
+        // The runtime snapshot applied regardless of the failed write.
+        assert_eq!(harness.model().id, "model-b");
+
+        // The failed write stayed queued: the next run's flush retries it and
+        // both changes land.
+        *harness.session().storage().fail_model_id.lock().unwrap() = None;
+        let _ = harness.prompt("again").await.unwrap();
+        assert_eq!(
+            model_changes(&harness).await,
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+    }
+
+    /// A follow-up queued by an `agent_end` listener together with a model
+    /// change is delivered on the first continuation turn under the new model
+    /// — the runtime snapshot applies before any new run starts.
+    #[tokio::test]
+    async fn test_continuation_first_turn_uses_queued_model() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in_stream = Arc::clone(&seen);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: Some(seen_in_stream),
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued_in_listener = std::sync::Arc::clone(&queued);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let queued = std::sync::Arc::clone(&queued_in_listener);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::AgentEnd { .. })
+                    && !queued.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    handle.set_model(resolved_model());
+                    handle.follow_up(AgentMessage::user("follow up"));
+                }
+            })
+        }));
+
+        let messages = harness.prompt("use the tool").await.unwrap();
+        // Turns 1-2 (tool use + reply) under the construction model; the
+        // follow-up continuation's first turn under the queued model.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "test".to_string(),
+                "test".to_string(),
+                "claude-opus".to_string()
+            ],
+            "the follow-up's first turn must already use the queued model"
+        );
+        assert!(messages.len() >= 4, "{messages:?}");
+        assert!(messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "follow up")
+        )));
     }
 
     /// The thinking-level setter persists a `thinking_level_change` entry
@@ -4895,6 +5209,41 @@ mod tests {
 
     // A stream fn that issues one tool call then stops, so a single prompt
     // drives a full tool-execution round through the harness.
+    /// A plain-answer stream that records the model id of every provider
+    /// call — the stand-in for a second provider runtime in resolver tests.
+    struct TaggedAnswerStreamFn {
+        served: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for TaggedAnswerStreamFn {
+        async fn stream(
+            &self,
+            context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            self.served.lock().unwrap().push(context.model.id.clone());
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "provider b".into(),
+                    signature: None,
+                }],
+                model: context.model.id.clone(),
+                provider: context.model.provider.clone(),
+                api: context.model.api.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(StopReason::Stop),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
     struct ToolUseStreamFn {
         call: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Records the model id of every provider call, when set.

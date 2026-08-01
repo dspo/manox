@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
+use crate::agent_loop::{EventSink, StreamFn, StreamResolver, run_loop, run_loop_continue};
 use crate::tool::{AgentToolResult, ToolContext};
 use crate::types::{
     AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState,
@@ -178,6 +178,9 @@ pub struct Agent {
     /// Next listener registration id.
     next_listener_id: Arc<AtomicU64>,
     stream_fn: Arc<dyn StreamFn>,
+    /// Per-model provider runtime resolution, when the consumer plugs one in;
+    /// without it every turn uses [`Self::stream_fn`].
+    stream_resolver: Option<StreamResolver>,
     /// Tools mounted on the agent and forwarded into each turn's context.
     tools: Arc<[Arc<dyn crate::tool::AgentTool>]>,
     /// Session-scoped execution context for tool calls. Backs the real
@@ -213,6 +216,7 @@ impl Agent {
             listeners: Arc::new(Mutex::new(Vec::new())),
             next_listener_id: Arc::new(AtomicU64::new(1)),
             stream_fn,
+            stream_resolver: None,
             tools: Arc::from(Vec::new()),
             tool_ctx,
             session_id: None,
@@ -252,6 +256,13 @@ impl Agent {
     /// Set the per-run observation hooks forwarded into the loop config.
     pub fn set_loop_hooks(&mut self, hooks: LoopHooks) {
         self.loop_hooks = hooks;
+    }
+
+    /// Plug in per-model provider runtime resolution. Every turn resolves its
+    /// stream function from the current model, so a mid-run model change
+    /// switches protocol/endpoint/credentials for the next provider call.
+    pub fn set_stream_resolver(&mut self, resolver: StreamResolver) {
+        self.stream_resolver = Some(resolver);
     }
 
     /// Set the reasoning tier forwarded into each turn's context. `None`
@@ -490,6 +501,7 @@ impl Agent {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
             prepare_next_turn,
+            stream_resolver: self.stream_resolver.clone(),
             should_stop_after_turn: None,
             before_tool_call: before_tool,
             after_tool_call: after_tool,
@@ -860,6 +872,7 @@ mod tests {
         Model {
             provider: "test".into(),
             id: "test".into(),
+            api: "test".into(),
             context_window: 100_000,
             max_tokens: 8_192,
             thinking: ThinkingKind::None,

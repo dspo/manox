@@ -354,6 +354,7 @@ mod tests {
         Model {
             provider: "anthropic".into(),
             id: "claude-test".into(),
+            api: "anthropic".into(),
             context_window: 200_000,
             max_tokens: 8_192,
             thinking,

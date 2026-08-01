@@ -16,6 +16,7 @@ fn real_model() -> Model {
     Model {
         provider: "anthropic".into(),
         id: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-haiku-4-5-20251001".into()),
+        api: "anthropic".into(),
         context_window: 200_000,
         max_tokens: 8_192,
         thinking: ThinkingKind::None,

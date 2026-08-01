@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tool::{AgentToolResult, ToolContext, execute_tool_calls};
 use crate::types::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, StopReason, Usage,
+    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, ContentBlock, Model, StopReason, Usage,
 };
 
 /// Sink for agent lifecycle events emitted during the loop.
@@ -58,6 +58,13 @@ pub trait StreamFn: Send + Sync {
         ""
     }
 }
+
+/// Resolves the provider runtime for a model — the consumer-pluggable seam
+/// that switches protocol, endpoint, and credentials when the session model
+/// changes (the TS `Model.api` discriminator picking a stream function).
+/// `None` on the config keeps the run's fixed stream fn.
+pub type StreamResolver =
+    Arc<dyn Fn(&Model) -> Result<Arc<dyn StreamFn>, anyhow::Error> + Send + Sync>;
 
 /// Run the agent loop with new prompt messages.
 ///
@@ -200,10 +207,15 @@ async fn run_loop_inner(
                 }
             }
 
-            // Stream assistant response.
+            // Stream assistant response. With a resolver, the provider
+            // runtime is picked per turn from the current model — a mid-run
+            // model change switches protocol/endpoint for the next request.
+            let resolved = match &config.stream_resolver {
+                Some(resolver) => resolver(&context.model)?,
+                None => Arc::clone(&stream_fn),
+            };
             let message =
-                stream_assistant_response(context, signal, Arc::clone(&stream_fn), config, sink)
-                    .await?;
+                stream_assistant_response(context, signal, resolved, config, sink).await?;
 
             new_messages.push(message.clone());
             context.messages.push(message.clone());
@@ -768,6 +780,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -815,6 +828,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -936,6 +950,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -1039,6 +1054,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -1132,6 +1148,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -1208,6 +1225,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,
@@ -1268,6 +1286,7 @@ mod tests {
             model: Model {
                 provider: "mock".into(),
                 id: "mock".into(),
+                api: "test".into(),
                 context_window: 100_000,
                 max_tokens: 8_192,
                 thinking: ThinkingKind::None,

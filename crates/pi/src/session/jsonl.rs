@@ -106,6 +106,9 @@ impl JsonlSessionStorage {
             parent_session: metadata.parent_session_path.clone(),
             metadata: metadata.metadata.clone(),
         };
+        // create must never write a header its own `open` would reject — the
+        // same wire validator guards both paths.
+        validate_header_wire(&serde_json::to_value(&header).expect("header serializes"))?;
         let line = serde_json::to_string(&header)? + "\n";
         tokio::fs::write(path, line).await?;
         Ok(JsonlSessionStorage {
@@ -138,35 +141,11 @@ impl JsonlSessionStorage {
         if header_line.trim().is_empty() {
             anyhow::bail!("session file header is blank");
         }
-        let header: SessionHeader = serde_json::from_str(&header_line)
+        let header: JsonValue = serde_json::from_str(&header_line)
             .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
-        if header.type_tag != "session" {
-            anyhow::bail!(
-                "session file first line is not a session header (type=\"{}\")",
-                header.type_tag
-            );
-        }
-        if header.version != FORMAT_VERSION {
-            anyhow::bail!(
-                "session file version {} is unsupported (expected {})",
-                header.version,
-                FORMAT_VERSION
-            );
-        }
-        // Wire-level header checks serde cannot express: an empty id/cwd is
-        // a String, not a missing field, and a non-object metadata passes
-        // `JsonValue` — TS rejects all three as corruption.
-        if header.id.is_empty() {
-            anyhow::bail!("session header is missing id");
-        }
-        if header.cwd.is_empty() {
-            anyhow::bail!("session header is missing cwd");
-        }
-        if let Some(metadata) = &header.metadata
-            && !metadata.is_object()
-        {
-            anyhow::bail!("session header metadata must be an object");
-        }
+        validate_header_wire(&header)?;
+        let header: SessionHeader = serde_json::from_value(header)
+            .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
 
         let metadata = JsonlSessionMetadata {
             id: header.id,
@@ -251,6 +230,44 @@ impl JsonlSessionStorage {
         *self.leaf_id.lock().await = entry.leaf_cursor_after();
         Ok(())
     }
+}
+
+/// Wire-level header checks on the raw JSON, mirroring the TS
+/// `parseHeaderLine`: type/version identity, non-empty id and cwd, and — the
+/// distinction serde's `Option` cannot make — a present-but-null
+/// `parentSession` or `metadata` is rejected while an absent one is fine.
+/// Shared by `load` (rejecting damaged files) and `create` (never writing a
+/// header its own `open` would reject).
+fn validate_header_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("session header is not an object"))?;
+    if obj.get("type").and_then(JsonValue::as_str) != Some("session") {
+        anyhow::bail!("session file first line is not a session header");
+    }
+    if obj.get("version").and_then(JsonValue::as_u64) != Some(FORMAT_VERSION as u64) {
+        anyhow::bail!("unsupported session version");
+    }
+    match obj.get("id") {
+        Some(JsonValue::String(id)) if !id.is_empty() => {}
+        _ => anyhow::bail!("session header is missing id"),
+    }
+    match obj.get("cwd") {
+        Some(JsonValue::String(cwd)) if !cwd.is_empty() => {}
+        _ => anyhow::bail!("session header is missing cwd"),
+    }
+    if !matches!(obj.get("timestamp"), Some(JsonValue::String(_))) {
+        anyhow::bail!("session header is missing timestamp");
+    }
+    if obj.contains_key("parentSession")
+        && !matches!(obj.get("parentSession"), Some(JsonValue::String(_)))
+    {
+        anyhow::bail!("session header parentSession must be a string");
+    }
+    if obj.contains_key("metadata") && !matches!(obj.get("metadata"), Some(JsonValue::Object(_))) {
+        anyhow::bail!("session header metadata must be an object");
+    }
+    Ok(())
 }
 
 /// Wire-level structural checks on a raw entry object before deserializing,
@@ -605,7 +622,7 @@ mod tests {
             .await
             .unwrap();
         let err = open_err(&path).await;
-        assert!(err.contains("version 2 is unsupported"), "{err}");
+        assert!(err.contains("unsupported session version"), "{err}");
     }
 
     #[tokio::test]
@@ -1528,5 +1545,52 @@ mod tests {
             .err()
             .expect("open must fail");
         assert!(err.to_string().contains("invalid targetId"), "{err}");
+    }
+
+    /// A present-but-null `metadata` or `parentSession` is corruption — the
+    /// distinction serde's `Option` cannot make, so the wire validator has to.
+    #[tokio::test]
+    async fn test_load_rejects_null_metadata_and_parent_session() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, header) in [
+            (
+                "metadata",
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","metadata":null}"#,
+            ),
+            (
+                "parentSession",
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj","parentSession":null}"#,
+            ),
+        ] {
+            let path = dir.path().join(format!("bad-{field}.jsonl"));
+            tokio::fs::write(&path, format!("{header}\n"))
+                .await
+                .unwrap();
+            let err = JsonlSessionStorage::open(&path)
+                .await
+                .err()
+                .expect("open must fail");
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+    }
+
+    /// `create` never writes a header its own `open` would reject: an empty
+    /// id or cwd surfaces at creation time, not on the next restart.
+    #[tokio::test]
+    async fn test_create_rejects_empty_id_or_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, value) in [("id", String::new()), ("cwd", String::new())] {
+            let mut m = meta();
+            if field == "id" {
+                m.id = value;
+            } else {
+                m.cwd = value;
+            }
+            let err = JsonlSessionStorage::create(&dir.path().join(format!("{field}.jsonl")), m)
+                .await
+                .err()
+                .expect("create must fail");
+            assert!(err.to_string().contains("missing"), "{field}: {err}");
+        }
     }
 }

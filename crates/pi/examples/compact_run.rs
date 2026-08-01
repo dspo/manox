@@ -73,6 +73,7 @@ fn test_model() -> Model {
     Model {
         provider: "mock".into(),
         id: "mock".into(),
+        api: "test".into(),
         context_window: 100_000,
         max_tokens: 8_192,
         thinking: ThinkingKind::None,

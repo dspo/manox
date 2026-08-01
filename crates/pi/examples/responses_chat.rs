@@ -103,6 +103,7 @@ async fn main() {
         model: Model {
             provider: "openai".into(),
             id: args.model.clone(),
+            api: "openai_responses".into(),
             context_window: 200_000,
             max_tokens: 16_384,
             thinking: args.thinking_kind,

@@ -535,6 +535,7 @@ mod tests {
             model: Model {
                 provider: "openai".into(),
                 id: "gpt-test".into(),
+                api: "openai_completions".into(),
                 context_window: 200_000,
                 max_tokens: 16_384,
                 thinking: ThinkingKind::None,

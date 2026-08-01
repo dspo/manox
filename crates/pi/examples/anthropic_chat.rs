@@ -97,6 +97,7 @@ async fn main() {
         model: Model {
             provider: "anthropic".into(),
             id: args.model.clone(),
+            api: "anthropic".into(),
             context_window: 200_000,
             max_tokens: 8_192,
             thinking: args.thinking_kind,

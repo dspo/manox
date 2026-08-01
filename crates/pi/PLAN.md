@@ -10,7 +10,7 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~27,900 行 Rust（src 26.6k + examples 1.3k），368 个测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~29,600 行 Rust（src 28.3k + examples 1.3k），405 个 unit 测试 + 5 个 integration 测试（另 3 个 live 测试 ignored），零警告。
 
 ## 架构设计
 
@@ -182,8 +182,11 @@ pub trait AgentTool: Send + Sync {
    - settled 回合（成功/错误）后计量超阈值即为下一回合压缩、不重试（对齐 TS `_checkCompaction` 第二路径）；维护性压缩失败只记日志，不拖垮已完结回合
    - 压缩只替换 transcript：`Agent::clear_transcript_state` 与全清队列的 `reset` 分离，压缩/restore 走前者——steering/follow-up 队列在压缩窗口不丢消息；压缩后队列非空则续跑一次 drain continuation 投递
 8. ✅ 运行配置 API 与 restore 回放
-   - `set_model` / `set_active_tools`：应用并持久化 `model_change` / `active_tools_change` entry（未知工具名拒绝）
+   - `set_model` / `set_active_tools` / `set_thinking_level`：应用并持久化 `model_change` / `active_tools_change` / `thinking_level_change` entry（未知工具名拒绝）
+   - 运行中 mutation：`HarnessHandle::set_model/set_thinking_level` 立即更新共享 TurnRuntime 快照，prepare-next-turn 在下一轮 provider 请求前刷新 context；持久化队列逐条成功才 pop，失败项留待下次 flush；`with_stream_resolver` 按 `Model.api` 每次请求解析 provider runtime（consumer 插拔，crate registry-free）
    - `restore()` 回放 path 携带的完整运行配置：thinking tier、active tools 子集（经全量挂载集过滤）、model（经 consumer 插接的 `ModelResolver`——crate 保持 registry-free，无 resolver 时保留构造期 model）；restore 不追加任何 entry
+
+> 能力校准：以上 Phase 只覆盖模块基线（文件存在、主路径可用）。TS Pi 行为逐项对齐状态以 `docs/ts-pi-parity.md` 为准——其中「运行配置」行标为 🟡（active_tools 运行中排队未接线）、Session store/reader/repository、split-turn、message_end 逐条持久化、coding-agent facade 等仍属未完成能力，Phase 的 ✅ 不等于完整迁移。
 
 ### Phase 5: 内置工具 ✅
 

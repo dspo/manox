@@ -24,7 +24,8 @@
 | 流中事件 | ✅ | MessageUpdate 携 9 变体 AssistantMessageEvent（text/thinking/toolcall × start/delta/end），三 provider 形状各自映射 |
 | 事件订阅 | ✅ | 监听器按注册序 await；agent_end 监听器结算后才算 idle |
 | 队列与 RunHandle | ✅ | steering/follow-up 队列 Arc 共享，运行中可经 RunHandle 写入 |
-| prepare-next-turn | ✅（2026-08-01） | `prepare_next_turn` 接入 `LoopHooks`/`create_loop_config`；`ChannelSink` 每事件 ack 在归约+listener 结算后返回，循环下一步必然观察到 listener 副作用（对齐 TS awaited emit）；Harness 经 `HarnessHandle::set_model/set_thinking_level` 排队运行中 mutation，下一轮 provider 请求前刷新 context，run 结束后持久化并同步 harness 状态 |
+| prepare-next-turn | ✅（2026-08-01） | `prepare_next_turn` 接入 `LoopHooks`/`create_loop_config`；`ChannelSink` 每事件 ack 在归约+listener 结算后返回，循环下一步必然观察到 listener 副作用（对齐 TS awaited emit）；Harness 经 `HarnessHandle::set_model/set_thinking_level` 更新共享 TurnRuntime 快照，下一轮 provider 请求前刷新 context，持久化队列逐条成功才 pop |
+| provider runtime 切换 | ✅（2026-08-01） | `Model.api` discriminator + consumer 插拔 `StreamResolver`：正常 turn、overflow retry、continuation、summarization 每次请求按当前 model 解析 StreamFn（协议/endpoint/credential 随之切换）；无 resolver 时回落构造期 StreamFn |
 | reset 语义分层 | ✅ | `clear_transcript_state`（清 transcript/流态，**保队列**）与 `reset`（全清）分离；压缩与 session restore 只走前者——queued 用户输入不会在压缩窗口丢失（2026-07-31） |
 
 ## 3. Harness 编排（`harness.rs` ↔ agent-session.ts）
@@ -38,7 +39,7 @@
 | session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`）；`HarnessHandle::abort`/`wait_for_idle` 统一覆盖 agent run、退避与 settle（对齐 TS `abort()` → `abortRetry()` + `waitForIdle()`）；cancel token 先于 Start 事件安装，listener 的 abort 必取消当前退避（2026-08-01） |
 | Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §8 |
 | 持久化粒度 | 🟡 | turn 末批量追加；TS 在 message_end 逐条持久化，turn 中途崩溃不丢。对齐项见「已知余项」 |
-| 运行配置 | 🟡 | set_model/set_active_tools/set_thinking_level idle 期持久化并应用；`set_thinking_level` 持久化闭环已补齐（2026-08-01）；运行中 model/thinking 经 HarnessHandle 排队下一轮生效，active_tools 运行中排队仍未接线（见「已知余项」） |
+| 运行配置 | 🟡 | set_model/set_active_tools/set_thinking_level idle 期持久化并应用；`set_thinking_level` 持久化闭环已补齐（2026-08-01）；运行中 model/thinking 经 HarnessHandle 立即更新共享快照、下一轮生效，独立 continuation 首轮亦生效（apply_turn_runtime 在新 run 前同步）；active_tools 运行中排队仍未接线（见「已知余项」） |
 
 ## 4. Compaction（`compaction/` ↔ compaction.ts）
 
@@ -56,7 +57,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | v3 schema | ✅ | 全部 entry 变体逐字段对齐（camelCase rename 全覆盖，parentId 不丢 ancestry） |
-| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id；wire 级校验：header id/cwd 非空、metadata 为对象、entry `parentId`（leaf 另含 `targetId`）必须为 null|string，缺失即 corruption（对齐 TS parseEntryLine，2026-08-01） |
+| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id；wire 级校验：header id/cwd 非空、metadata 为对象、entry `parentId`（leaf 另含 `targetId`）必须为 null|string，缺失即 corruption，`metadata:null`/`parentSession:null` 拒绝而缺失接受（对齐 TS parseHeaderLine/parseEntryLine，2026-08-01）；create 与 open 共用同一 header validator，不再写出自身拒绝的文件 |
 | 上下文重建 | ✅ | get_branch / build_context_entries / build_session_context 对齐 TS；设置类 entry（thinking_level/model_change/active_tools_change）经 SessionContext 上报不回 transcript |
 
 ## 6. Providers（`provider/` ↔ packages/ai）
@@ -107,6 +108,7 @@
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| 第八轮（2026-08-01） | `b2b3a10` | `4488ad55c`（未变） | 1 P1（StreamResolver：Model.api + 每请求 provider runtime 切换）+ 3 P2（flush 逐条成功才 pop / TurnRuntime 快照消除 continuation 晚一拍 / create-open header validator 统一+null 拒绝）+ 1 P3（PLAN 校准）均已修复，见各章节 |
 | 第七轮（2026-08-01） | `af7c195` | `4488ad55c`（未变） | 2 P2（prepare-next-turn 接线+运行中 mutation 排队+thinking setter 闭环 / JSONL wire 结构校验）+ 1 P3（partial 错误保留 timestamp/api）均已修复，无新 P0/P1 |
 | 第六轮（2026-08-01） | `9367432` | `4488ad55c`（未变） | 3 P2（partial 失败终态保留 / retry token 先于 Start 安装 / JSONL 重复 id 拒绝）+ 2 P3（尾部 SSE 解析错误传播 / 并发测试断言）均已修复，无新 P0/P1 |
 | 第五轮（2026-08-01） | `54873cd` | `4488ad55c`（新对齐基线） | 4 P1（HarnessHandle 取消/等待 / Anthropic terminal guard / Session append 线性化 / Completions 严格 finish_reason）+ 2 P2（retry classifier 正则保真 / ledger 校准）均已修复，见各章节 |
