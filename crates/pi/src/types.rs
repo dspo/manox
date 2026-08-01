@@ -586,6 +586,8 @@ pub type MessageQueueFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
 pub struct TurnUpdate {
     pub model: Model,
     pub thinking_level: Option<String>,
+    /// Active tool subset for the next turn; `None` keeps the current set.
+    pub active_tool_names: Option<Vec<String>>,
 }
 
 /// Refreshes the context/model before a turn; `None` keeps the current turn.

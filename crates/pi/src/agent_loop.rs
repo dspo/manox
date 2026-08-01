@@ -341,6 +341,14 @@ async fn run_loop_inner(
             {
                 context.model = update.model;
                 context.thinking_level = update.thinking_level;
+                if let Some(names) = update.active_tool_names {
+                    context.tools = context
+                        .tools
+                        .iter()
+                        .filter(|t| names.iter().any(|n| n == t.name()))
+                        .cloned()
+                        .collect();
+                }
             }
 
             // Check early stop.
