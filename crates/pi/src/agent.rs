@@ -20,7 +20,7 @@ use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
 use crate::tool::{AgentToolResult, ToolContext};
 use crate::types::{
     AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState,
-    BeforeProviderRequestFn, BeforeToolCallFn, CacheRetention, ContentBlock, Model,
+    BeforeProviderRequestFn, BeforeToolCallFn, CacheRetention, ContentBlock, Model, PrepareTurnFn,
 };
 use serde_json::Value as JsonValue;
 
@@ -105,18 +105,23 @@ impl Drop for Subscription {
 ///
 /// Events travel a bounded channel to the reducing side of
 /// [`Agent::run_with_lifecycle`]. Capacity one lets the loop run a single
-/// event ahead of the reducer; beyond that, a send waits until the previous
-/// event has been reduced and its listeners awaited.
+/// event ahead of the reducer; each emission awaits an acknowledgement fired
+/// only after the event has been reduced and its listeners awaited, so the
+/// loop's next step observes listener side effects — the same ordering TS
+/// Pi's awaited `emit` provides.
 struct ChannelSink {
-    tx: mpsc::Sender<AgentEvent>,
+    tx: mpsc::Sender<(AgentEvent, tokio::sync::oneshot::Sender<()>)>,
 }
 
 #[async_trait::async_trait]
 impl EventSink for ChannelSink {
     async fn emit(&self, event: AgentEvent) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         // A closed channel means the reducer is gone, which only happens once
         // the run has already settled — nothing left to deliver to.
-        let _ = self.tx.send(event).await;
+        if self.tx.send((event, ack_tx)).await.is_ok() {
+            let _ = ack_rx.await;
+        }
     }
 }
 
@@ -138,12 +143,17 @@ struct ActiveRun {
 pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext + Send + Sync>;
 pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+pub type PrepareTurnHook = Arc<dyn Fn(&mut AgentContext) -> Option<AgentContext> + Send + Sync>;
 
 #[derive(Default)]
 pub struct LoopHooks {
     pub before_provider_request: Option<BeforeProviderRequestHook>,
     pub before_tool_call: Option<BeforeToolCallHook>,
     pub after_tool_call: Option<AfterToolCallHook>,
+    /// Refreshes the loop context before the next turn of the same run — the
+    /// TS `prepareNextTurn` seam for applying runtime mutations (model,
+    /// thinking level) queued mid-run.
+    pub prepare_next_turn: Option<PrepareTurnHook>,
 }
 
 /// The Agent wraps the raw agent loop with state management, event
@@ -472,10 +482,14 @@ impl Agent {
             let h = Arc::clone(h);
             Box::new(move |r: &AgentToolResult| h(r)) as AfterToolCallFn
         });
+        let prepare_next_turn = self.loop_hooks.prepare_next_turn.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |ctx: &mut AgentContext| h(ctx)) as PrepareTurnFn
+        });
         AgentLoopConfig {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
-            prepare_next_turn: None,
+            prepare_next_turn,
             should_stop_after_turn: None,
             before_tool_call: before_tool,
             after_tool_call: after_tool,
@@ -559,13 +573,18 @@ impl Agent {
         self.state.streaming_message = None;
         self.state.error_message = None;
 
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(1);
+        let (tx, mut rx) = mpsc::channel::<(AgentEvent, tokio::sync::oneshot::Sender<()>)>(1);
         let mut run = Box::pin(executor(token.clone(), ChannelSink { tx }));
         let result = loop {
             tokio::select! {
                 biased;
                 ev = rx.recv() => match ev {
-                    Some(ev) => self.process_event(ev, &token).await,
+                    Some((ev, ack)) => {
+                        self.process_event(ev, &token).await;
+                        // The loop's emit awaits this acknowledgement, so the
+                        // next loop step sees the listener side effects.
+                        let _ = ack.send(());
+                    }
                     // The sender lives inside the run future, so the channel
                     // can only close after the run completed — which the other
                     // branch observes first. This arm never fires.
@@ -577,8 +596,9 @@ impl Agent {
         drop(run);
         // Settle events the loop emitted just before finishing, so `agent_end`
         // and its listeners are part of the run.
-        while let Ok(ev) = rx.try_recv() {
+        while let Ok((ev, ack)) = rx.try_recv() {
             self.process_event(ev, &token).await;
+            let _ = ack.send(());
         }
 
         self.state.is_streaming = false;

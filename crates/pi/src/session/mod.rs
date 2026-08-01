@@ -341,6 +341,26 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
+    /// Append a `thinking_level_change` entry and return the entry ID.
+    ///
+    /// The reasoning tier a path carries round-trips through these entries:
+    /// restore projects the latest one onto the agent (`None` on the session
+    /// reads as `"off"`).
+    pub async fn append_thinking_level_change(&self, level: &str) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::ThinkingLevelChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            thinking_level: level.to_string(),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
     /// Append a compaction entry and return the entry ID and timestamp.
     ///
     /// The leaf cursor moves to the entry, so later messages parent onto it.

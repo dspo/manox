@@ -10,7 +10,8 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks, RunHandle,
+    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks,
+    PrepareTurnHook, RunHandle,
 };
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
@@ -98,6 +99,17 @@ struct HarnessControl {
     /// Number of operations (prompt/continue_/compact, including their
     /// settle phases) in flight; zero means the harness is fully settled.
     active_tx: watch::Sender<usize>,
+    /// Runtime mutations queued while a run is in flight. The loop's
+    /// `prepare_next_turn` applies them to the next turn's context; the
+    /// harness persists them and syncs its own state once the run settles
+    /// (TS queues them during a run and flushes at the next turn boundary).
+    pending_mutations: std::sync::Mutex<Vec<PendingMutation>>,
+}
+
+/// A runtime mutation queued mid-run and applied at the next turn boundary.
+enum PendingMutation {
+    Model(Model),
+    ThinkingLevel(Option<String>),
 }
 
 /// Sets the harness's active count for the duration of an operation and
@@ -158,6 +170,27 @@ impl HarnessHandle {
                 break;
             }
         }
+    }
+
+    /// Queue a model change for the next turn boundary of the in-flight run.
+    /// The change reaches the loop context before the next provider request
+    /// and is persisted once the run settles — the TS mid-run `setModel`.
+    pub fn set_model(&self, model: Model) {
+        self.control
+            .pending_mutations
+            .lock()
+            .unwrap()
+            .push(PendingMutation::Model(model));
+    }
+
+    /// Queue a thinking-level change for the next turn boundary of the
+    /// in-flight run, same semantics as [`HarnessHandle::set_model`].
+    pub fn set_thinking_level(&self, level: Option<String>) {
+        self.control
+            .pending_mutations
+            .lock()
+            .unwrap()
+            .push(PendingMutation::ThinkingLevel(level));
     }
 }
 
@@ -417,13 +450,18 @@ impl<S: SessionStorage> AgentHarness<S> {
         let tool_ctx: Arc<dyn crate::tool::ToolContext> =
             Arc::new(LocalToolContext::new(env, cwd, tool_state));
         let hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>> = Arc::new(Mutex::new(Vec::new()));
+        let control: Arc<HarnessControl> = Arc::new(HarnessControl {
+            retry_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            active_tx: watch::Sender::new(0),
+            pending_mutations: std::sync::Mutex::new(Vec::new()),
+        });
         let mut agent = Agent::new(
             system_prompt,
             model.clone(),
             Arc::clone(&stream_fn),
             tool_ctx,
         );
-        agent.set_loop_hooks(build_loop_hooks(Arc::clone(&hooks)));
+        agent.set_loop_hooks(build_loop_hooks(Arc::clone(&hooks), Arc::clone(&control)));
         AgentHarness {
             agent,
             session,
@@ -437,10 +475,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             overflow_recovery_attempted: false,
             retry_settings: RetrySettings::default(),
             retry_attempt: 0,
-            control: Arc::new(HarnessControl {
-                retry_cancel: std::sync::Mutex::new(CancellationToken::new()),
-                active_tx: watch::Sender::new(0),
-            }),
+            control,
             retry_observer: None,
             all_tools: Arc::from(Vec::new()),
             active_tool_names: None,
@@ -589,6 +624,53 @@ impl<S: SessionStorage> AgentHarness<S> {
         Ok(())
     }
 
+    /// Set the reasoning tier for following turns, persisting a
+    /// `thinking_level_change` entry so a later restore projects it. `None`
+    /// reads as `"off"` on the session path. Mid-run changes go through
+    /// [`HarnessHandle::set_thinking_level`] instead.
+    pub async fn set_thinking_level(
+        &mut self,
+        thinking_level: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot set thinking level while harness is in {:?} phase",
+                self.phase
+            );
+        }
+        self.session
+            .append_thinking_level_change(thinking_level.as_deref().unwrap_or("off"))
+            .await?;
+        self.agent.set_thinking_level(thinking_level);
+        Ok(())
+    }
+
+    /// Persist runtime mutations queued while a run was in flight and sync
+    /// the harness state to them. The loop's `prepare_next_turn` already
+    /// applied them to the in-flight context; this closes the durability loop
+    /// once the run settles.
+    async fn flush_pending_mutations(&mut self) -> Result<(), anyhow::Error> {
+        let pending = std::mem::take(&mut *self.control.pending_mutations.lock().unwrap());
+        for mutation in pending {
+            match mutation {
+                PendingMutation::Model(model) => {
+                    self.session
+                        .append_model_change(&model.provider, &model.id)
+                        .await?;
+                    self.agent.set_model(model.clone());
+                    self.model = model;
+                }
+                PendingMutation::ThinkingLevel(level) => {
+                    self.session
+                        .append_thinking_level_change(level.as_deref().unwrap_or("off"))
+                        .await?;
+                    self.agent.set_thinking_level(level);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Re-derive the agent's tool list from the mounted set and the active
     /// selection. The full set mounts when no selection ever narrowed it.
     fn apply_active_tools(&mut self) {
@@ -688,10 +770,14 @@ impl<S: SessionStorage> AgentHarness<S> {
 
                 let mut all_messages = messages;
                 all_messages.extend(self.settle_after_run().await?);
+                self.flush_pending_mutations().await?;
                 Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
+                // Mutations queued mid-run are still persisted with the
+                // failed run; a flush failure must not mask the run error.
+                let _ = self.flush_pending_mutations().await;
                 Err(e)
             }
         }
@@ -722,10 +808,12 @@ impl<S: SessionStorage> AgentHarness<S> {
 
                 let mut all_messages = messages;
                 all_messages.extend(self.settle_after_run().await?);
+                self.flush_pending_mutations().await?;
                 Ok(all_messages)
             }
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
+                let _ = self.flush_pending_mutations().await;
                 Err(e)
             }
         }
@@ -1503,7 +1591,10 @@ impl<S: SessionStorage> AgentHarness<S> {
 /// Build the loop-config observation closures that route the harness's
 /// registered hooks into the agent loop. Each closure clones the shared hook
 /// list so it sees handlers registered via `on()` after the harness is built.
-fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHooks {
+fn build_loop_hooks(
+    hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>,
+    control: Arc<HarnessControl>,
+) -> LoopHooks {
     let provider = Arc::clone(&hooks);
     let before_provider_request: BeforeProviderRequestHook = Arc::new(move |ctx: &AgentContext| {
         let mut hc = HookContext::new(HookPoint::BeforeProviderRequest).with_context(ctx.clone());
@@ -1554,10 +1645,30 @@ fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHoo
         hc.tool_result.unwrap_or_else(|| r.clone())
     });
 
+    let pending = Arc::clone(&control);
+    let prepare_next_turn: PrepareTurnHook = Arc::new(move |context: &mut AgentContext| {
+        // Apply runtime mutations queued mid-run to the next turn's context.
+        // The queue is drained and persisted by the harness once the run
+        // settles; applying here (rather than draining) keeps the refresh
+        // idempotent across turns.
+        let mutations = pending.pending_mutations.lock().unwrap();
+        if mutations.is_empty() {
+            return None;
+        }
+        for mutation in mutations.iter() {
+            match mutation {
+                PendingMutation::Model(model) => context.model = model.clone(),
+                PendingMutation::ThinkingLevel(level) => context.thinking_level = level.clone(),
+            }
+        }
+        Some(context.clone())
+    });
+
     LoopHooks {
         before_provider_request: Some(before_provider_request),
         before_tool_call: Some(before_tool_call),
         after_tool_call: Some(after_tool_call),
+        prepare_next_turn: Some(prepare_next_turn),
     }
 }
 
@@ -1790,6 +1901,18 @@ mod tests {
             MemStorage {
                 entries: std::sync::Mutex::new(Vec::new()),
                 leaf_id: std::sync::Mutex::new(None),
+                append_calls: std::sync::Mutex::new(0),
+                fail_at_call: std::sync::Mutex::new(u64::MAX),
+            }
+        }
+
+        /// Rebuild a storage over persisted entries, cursor at the tail — the
+        /// same state a reopen of the JSONL file would produce.
+        fn from_entries(entries: Vec<SessionTreeEntry>) -> Self {
+            let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+            MemStorage {
+                entries: std::sync::Mutex::new(entries),
+                leaf_id: std::sync::Mutex::new(leaf_id),
                 append_calls: std::sync::Mutex::new(0),
                 fail_at_call: std::sync::Mutex::new(u64::MAX),
             }
@@ -3158,6 +3281,113 @@ mod tests {
             }
         ));
         assert_eq!(harness.retry_attempt(), 0);
+    }
+
+    /// A model queued mid-run reaches the next turn's provider request (the
+    /// loop's prepare-next-turn seam) and is persisted once the run settles.
+    #[tokio::test]
+    async fn test_handle_set_model_applies_next_turn_and_persists() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in_stream = Arc::clone(&seen);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: Some(seen_in_stream),
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(resolved_model());
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await.unwrap();
+
+        // Turn 1 streamed under the construction model; turn 2 saw the
+        // queued one.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["test".to_string(), "claude-opus".to_string()],
+            "prepare_next_turn must refresh the context before the next request"
+        );
+        // The mutation persisted and the harness state caught up.
+        assert_eq!(harness.model().id, "claude-opus");
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::ModelChange { model_id, .. } if model_id == "claude-opus"
+            )),
+            "the queued model change was persisted: {entries:?}"
+        );
+    }
+
+    /// The thinking-level setter persists a `thinking_level_change` entry
+    /// that a later restore projects back onto the agent.
+    #[tokio::test]
+    async fn test_set_thinking_level_persists_and_restores() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        harness
+            .set_thinking_level(Some("high".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            harness.agent().state().thinking_level.as_deref(),
+            Some("high")
+        );
+
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::ThinkingLevelChange {
+                    thinking_level: l,
+                    ..
+                } if l == "high"
+            )),
+            "the thinking level change was persisted: {entries:?}"
+        );
+
+        // A fresh harness over the same session restores the tier.
+        let mut restored = AgentHarness::new(
+            Session::new(MemStorage::from_entries(entries)),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        restored.restore().await.unwrap();
+        assert_eq!(
+            restored.agent().state().thinking_level.as_deref(),
+            Some("high")
+        );
     }
 
     /// Context overflow never enters the agent-level auto-retry — it goes to
@@ -4667,16 +4897,21 @@ mod tests {
     // drives a full tool-execution round through the harness.
     struct ToolUseStreamFn {
         call: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Records the model id of every provider call, when set.
+        seen: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     #[async_trait::async_trait]
     impl StreamFn for ToolUseStreamFn {
         async fn stream(
             &self,
-            _context: &AgentContext,
+            context: &AgentContext,
             _signal: CancellationToken,
             _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
+            if let Some(seen) = &self.seen {
+                seen.lock().unwrap().push(context.model.id.clone());
+            }
             let n = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
                 Ok(AgentMessage::Assistant {
@@ -4760,6 +4995,7 @@ mod tests {
             test_model(),
             Arc::new(ToolUseStreamFn {
                 call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
             }),
         )
         .with_tools(Arc::from(vec![
@@ -4880,6 +5116,7 @@ mod tests {
             test_model(),
             Arc::new(ToolUseStreamFn {
                 call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
             }),
         )
         .with_tools(Arc::from(vec![
@@ -4911,6 +5148,7 @@ mod tests {
             test_model(),
             Arc::new(ToolUseStreamFn {
                 call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
             }),
         )
         .with_tools(Arc::from(vec![

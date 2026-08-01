@@ -12,7 +12,7 @@
 | 双循环结构 | ✅ | 外层 follow-up 循环 + 内层 tool call/steering 循环 |
 | 队列排空时机 | ✅ | steering 在 tool call 边界注入，follow-up 在将停时注入；agent_end 前两队列排空 |
 | 截断安全 | ✅ | stop_reason == length 时 fail 全部 tool calls |
-| 失败终态保留 partial | ✅（2026-08-01） | provider 中途失败时基于已流出的最新 partial Assistant 构造终端 error（保留 content/usage/response id，只覆盖 stop reason 与 error message），对齐 TS catch 路径 |
+| 失败终态保留 partial | ✅（2026-08-01） | provider 中途失败时基于已流出的最新 partial Assistant 构造终端 error（保留 content/usage/response id/api/timestamp，只覆盖 stop reason 与 error message），对齐 TS catch 原位改写路径 |
 | 中止检查 | ✅ | 批次级 CancellationToken 检查；取消中断执行中的工具（进程组树杀，对齐 TS killProcessTree） |
 | 工具 progress | ✅ | 同步 emit 经 unbounded channel 实时转发，全部 update 先于 ToolExecutionEnd 结算（TS settled updateEvents 同序） |
 
@@ -24,6 +24,7 @@
 | 流中事件 | ✅ | MessageUpdate 携 9 变体 AssistantMessageEvent（text/thinking/toolcall × start/delta/end），三 provider 形状各自映射 |
 | 事件订阅 | ✅ | 监听器按注册序 await；agent_end 监听器结算后才算 idle |
 | 队列与 RunHandle | ✅ | steering/follow-up 队列 Arc 共享，运行中可经 RunHandle 写入 |
+| prepare-next-turn | ✅（2026-08-01） | `prepare_next_turn` 接入 `LoopHooks`/`create_loop_config`；`ChannelSink` 每事件 ack 在归约+listener 结算后返回，循环下一步必然观察到 listener 副作用（对齐 TS awaited emit）；Harness 经 `HarnessHandle::set_model/set_thinking_level` 排队运行中 mutation，下一轮 provider 请求前刷新 context，run 结束后持久化并同步 harness 状态 |
 | reset 语义分层 | ✅ | `clear_transcript_state`（清 transcript/流态，**保队列**）与 `reset`（全清）分离；压缩与 session restore 只走前者——queued 用户输入不会在压缩窗口丢失（2026-07-31） |
 
 ## 3. Harness 编排（`harness.rs` ↔ agent-session.ts）
@@ -37,7 +38,7 @@
 | session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`）；`HarnessHandle::abort`/`wait_for_idle` 统一覆盖 agent run、退避与 settle（对齐 TS `abort()` → `abortRetry()` + `waitForIdle()`）；cancel token 先于 Start 事件安装，listener 的 abort 必取消当前退避（2026-08-01） |
 | Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §8 |
 | 持久化粒度 | 🟡 | turn 末批量追加；TS 在 message_end 逐条持久化，turn 中途崩溃不丢。对齐项见「已知余项」 |
-| 运行配置 | ✅ | set_model/set_active_tools 持久化 entry 并校验；restore 回放 thinking tier/active tools/model（ModelResolver 插接，crate registry-free），不追加 entry |
+| 运行配置 | 🟡 | set_model/set_active_tools/set_thinking_level idle 期持久化并应用；`set_thinking_level` 持久化闭环已补齐（2026-08-01）；运行中 model/thinking 经 HarnessHandle 排队下一轮生效，active_tools 运行中排队仍未接线（见「已知余项」） |
 
 ## 4. Compaction（`compaction/` ↔ compaction.ts）
 
@@ -55,7 +56,7 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | v3 schema | ✅ | 全部 entry 变体逐字段对齐（camelCase rename 全覆盖，parentId 不丢 ancestry） |
-| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id（对齐 TS store，2026-08-01） |
+| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id；wire 级校验：header id/cwd 非空、metadata 为对象、entry `parentId`（leaf 另含 `targetId`）必须为 null|string，缺失即 corruption（对齐 TS parseEntryLine，2026-08-01） |
 | 上下文重建 | ✅ | get_branch / build_context_entries / build_session_context 对齐 TS；设置类 entry（thinking_level/model_change/active_tools_change）经 SessionContext 上报不回 transcript |
 
 ## 6. Providers（`provider/` ↔ packages/ai）
@@ -95,6 +96,7 @@
 5. **Completions 流交错块模型**：TS 每条流只合并一个 text/thinking 块（交错并入同块），crate pi 交错时关闭当前块另开新块，终态 content 形状不同
 6. **Hook 推迟项**：见 §8——model_update/tools_update 的 fire 点已具备，可补变体接线
 7. **Session store/reader/repository 重构（upstream 4488ad55c 及之后）**：TS `session/` 已拆分 repo/readers/search-backend/repo-utils 等抽象；crate pi 仍是单 `SessionStorage` trait + JSONL/Mem 两个实现，repository/readers/search/pagination/labels 未移植（applicable unported delta，2026-08-01 记录）
+8. **运行中 active_tools 排队**：`HarnessHandle` 已支持 model/thinking 排队下一轮生效；active_tools 运行中变更仍只走 idle 期 `set_active_tools`（2026-08-01 记录）
 
 ## 工程化余项（非行为对齐）
 
@@ -105,6 +107,7 @@
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| 第七轮（2026-08-01） | `af7c195` | `4488ad55c`（未变） | 2 P2（prepare-next-turn 接线+运行中 mutation 排队+thinking setter 闭环 / JSONL wire 结构校验）+ 1 P3（partial 错误保留 timestamp/api）均已修复，无新 P0/P1 |
 | 第六轮（2026-08-01） | `9367432` | `4488ad55c`（未变） | 3 P2（partial 失败终态保留 / retry token 先于 Start 安装 / JSONL 重复 id 拒绝）+ 2 P3（尾部 SSE 解析错误传播 / 并发测试断言）均已修复，无新 P0/P1 |
 | 第五轮（2026-08-01） | `54873cd` | `4488ad55c`（新对齐基线） | 4 P1（HarnessHandle 取消/等待 / Anthropic terminal guard / Session append 线性化 / Completions 严格 finish_reason）+ 2 P2（retry classifier 正则保真 / ledger 校准）均已修复，见各章节 |
 | 第四轮（2026-08-01） | `fe4431d` | `bf4a90d8`（新对齐基线） | 3 P1（post-run 队列投递 / Completions 截断流 / session auto-retry）+ 1 P2（Anthropic refusal 细节）均已修复，见各章节 |

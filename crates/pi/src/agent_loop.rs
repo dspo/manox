@@ -497,10 +497,11 @@ fn terminal_message(
 
 /// Terminal error for a provider failure that struck mid-stream: when a
 /// partial assistant already streamed, the failure is materialized from that
-/// snapshot — same content, usage, and response identity — with only the stop
-/// reason and error message overwritten, mirroring TS's catch which marks the
-/// in-flight output as `stopReason: error`. Falls back to an empty terminal
-/// message when the stream failed before emitting anything.
+/// snapshot — same content, usage, response identity, api, and timestamp —
+/// with only the stop reason and error message overwritten, mirroring TS's
+/// catch which marks the in-flight `output` in place as `stopReason: error`.
+/// Falls back to an empty terminal message when the stream failed before
+/// emitting anything.
 fn terminal_message_from_partial(
     partial: Option<AgentMessage>,
     context: &AgentContext,
@@ -518,17 +519,19 @@ fn terminal_message_from_partial(
             content,
             model,
             provider,
+            api,
             response_model,
             response_id,
             diagnostics,
             raw_stop_reason,
             usage,
+            timestamp,
             ..
         }) => AgentMessage::Assistant {
             content,
             model,
             provider,
-            api: api.to_string(),
+            api,
             response_model,
             response_id,
             diagnostics,
@@ -536,7 +539,7 @@ fn terminal_message_from_partial(
             stop_reason: Some(stop_reason),
             usage,
             error_message: Some(error_message),
-            timestamp: chrono::Utc::now(),
+            timestamp,
         },
         _ => terminal_message(context, signal, api, error_message),
     }
@@ -1726,7 +1729,11 @@ mod tests {
 
     /// A stream that emits a partial assistant then fails mid-flight, as a
     /// provider does when the connection drops after streaming some text.
-    struct PartialThenFailStreamFn;
+    struct PartialThenFailStreamFn {
+        /// The timestamp stamped on the partial; the terminal error must keep
+        /// it, like TS mutating the in-flight output in place.
+        partial_timestamp: chrono::DateTime<chrono::Utc>,
+    }
 
     #[async_trait::async_trait]
     impl StreamFn for PartialThenFailStreamFn {
@@ -1751,7 +1758,7 @@ mod tests {
                 stop_reason: None,
                 usage: Box::new(Usage::default()),
                 error_message: None,
-                timestamp: chrono::Utc::now(),
+                timestamp: self.partial_timestamp,
             };
             if let AgentMessage::Assistant { usage, .. } = &mut message {
                 usage.output_tokens = 7;
@@ -1775,21 +1782,25 @@ mod tests {
     }
 
     /// A mid-stream provider failure is materialized from the partial
-    /// assistant that already streamed — content, usage, and response id
-    /// survive the error, so the text the user saw does not vanish from the
-    /// persisted turn (TS marks the same in-flight output as an error).
+    /// assistant that already streamed — content, usage, response id, and
+    /// timestamp survive the error, so the text the user saw does not vanish
+    /// from the persisted turn (TS marks the same in-flight output as an
+    /// error).
     #[tokio::test]
     async fn provider_error_keeps_streamed_partial_content() {
         let sink = MockSink::new();
         let config = AgentLoopConfig::default();
         let mut context = minimal_context();
+        let partial_timestamp = chrono::DateTime::parse_from_rfc3339("2026-05-28T07:13:46.608Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
 
         let messages = run_loop(
             &[AgentMessage::user("hi")],
             &mut context,
             &config,
             None,
-            Arc::new(PartialThenFailStreamFn),
+            Arc::new(PartialThenFailStreamFn { partial_timestamp }),
             &TestToolContext::new(),
             &sink,
         )
@@ -1806,6 +1817,8 @@ mod tests {
             error_message,
             usage,
             response_id,
+            timestamp,
+            api,
             ..
         } = assistant
         else {
@@ -1824,5 +1837,10 @@ mod tests {
         );
         assert_eq!(usage.output_tokens, 7);
         assert_eq!(response_id.as_deref(), Some("resp_1"));
+        assert_eq!(
+            *timestamp, partial_timestamp,
+            "the error keeps the stream's timestamp"
+        );
+        assert_eq!(api, "mock");
     }
 }

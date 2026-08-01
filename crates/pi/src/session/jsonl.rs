@@ -153,6 +153,20 @@ impl JsonlSessionStorage {
                 FORMAT_VERSION
             );
         }
+        // Wire-level header checks serde cannot express: an empty id/cwd is
+        // a String, not a missing field, and a non-object metadata passes
+        // `JsonValue` — TS rejects all three as corruption.
+        if header.id.is_empty() {
+            anyhow::bail!("session header is missing id");
+        }
+        if header.cwd.is_empty() {
+            anyhow::bail!("session header is missing cwd");
+        }
+        if let Some(metadata) = &header.metadata
+            && !metadata.is_object()
+        {
+            anyhow::bail!("session header metadata must be an object");
+        }
 
         let metadata = JsonlSessionMetadata {
             id: header.id,
@@ -168,7 +182,13 @@ impl JsonlSessionStorage {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: SessionTreeEntry = serde_json::from_str(&line)?;
+            let value: JsonValue = serde_json::from_str(&line)?;
+            // Wire-level structural checks before deserializing: a missing
+            // required field must not be silently read as `null` (TS
+            // `parseEntryLine` treats a missing `parentId`/`targetId` as an
+            // invalid entry).
+            validate_entry_wire(&value)?;
+            let entry: SessionTreeEntry = serde_json::from_value(value)?;
             // A duplicate id would make the walk index silently overwrite one
             // entry with the other — reject the file instead of restoring a
             // wrong ancestry.
@@ -231,6 +251,33 @@ impl JsonlSessionStorage {
         *self.leaf_id.lock().await = entry.leaf_cursor_after();
         Ok(())
     }
+}
+
+/// Wire-level structural checks on a raw entry object before deserializing,
+/// mirroring the TS `parseEntryLine`: `parentId` (and `targetId` on `leaf`
+/// entries) must be present as `null|string` — a missing field is corruption,
+/// not a silent root or empty cursor.
+fn validate_entry_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("session entry is not an object"))?;
+    let kind = obj
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let field_ok = |name: &str| {
+        matches!(
+            obj.get(name),
+            Some(JsonValue::Null) | Some(JsonValue::String(_))
+        )
+    };
+    if !field_ok("parentId") {
+        anyhow::bail!("session entry of type {kind} has invalid parentId (must be null|string)");
+    }
+    if kind == "leaf" && !field_ok("targetId") {
+        anyhow::bail!("leaf entry has invalid targetId (must be null|string)");
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1411,5 +1458,75 @@ mod tests {
         let err = storage.append_entry(&entry).await.unwrap_err();
         assert!(err.to_string().contains("empty id"), "{err}");
         assert!(storage.get_entries().await.unwrap().is_empty());
+    }
+
+    /// A header line with an empty id or cwd is corruption, not a valid
+    /// session — serde would accept both as empty strings.
+    #[tokio::test]
+    async fn test_load_rejects_empty_header_id_or_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        for (field, header) in [
+            (
+                "id",
+                r#"{"type":"session","version":3,"id":"","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            ),
+            (
+                "cwd",
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":""}"#,
+            ),
+        ] {
+            let path = dir.path().join(format!("bad-{field}.jsonl"));
+            tokio::fs::write(&path, format!("{header}\n"))
+                .await
+                .unwrap();
+            let err = JsonlSessionStorage::open(&path)
+                .await
+                .err()
+                .expect("open must fail");
+            assert!(
+                err.to_string().contains("session header is missing"),
+                "{field}: {err}"
+            );
+        }
+    }
+
+    /// An entry without a `parentId` field must not be silently read as a
+    /// root node — the field has to be present as `null|string`.
+    #[tokio::test]
+    async fn test_load_rejects_entry_missing_parent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let err = JsonlSessionStorage::open(&path)
+            .await
+            .err()
+            .expect("open must fail");
+        assert!(err.to_string().contains("invalid parentId"), "{err}");
+    }
+
+    /// A `leaf` entry without a `targetId` must not silently clear the
+    /// cursor — the field has to be present as `null|string`.
+    #[tokio::test]
+    async fn test_load_rejects_leaf_missing_target_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"leaf","id":"leaf1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z"}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let err = JsonlSessionStorage::open(&path)
+            .await
+            .err()
+            .expect("open must fail");
+        assert!(err.to_string().contains("invalid targetId"), "{err}");
     }
 }
