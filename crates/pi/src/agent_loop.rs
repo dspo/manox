@@ -209,13 +209,37 @@ async fn run_loop_inner(
 
             // Stream assistant response. With a resolver, the provider
             // runtime is picked per turn from the current model — a mid-run
-            // model change switches protocol/endpoint for the next request.
-            let resolved = match &config.stream_resolver {
-                Some(resolver) => resolver(&context.model)?,
-                None => Arc::clone(&stream_fn),
+            // model change switches protocol/endpoint for the next request. A
+            // resolution failure materializes as a terminal error message
+            // with the normal lifecycle, not a run-level panic.
+            let message = match &config.stream_resolver {
+                Some(resolver) => match resolver(&context.model) {
+                    Ok(resolved) => {
+                        stream_assistant_response(context, signal, resolved, config, sink).await?
+                    }
+                    Err(e) => {
+                        let message = terminal_message(
+                            context,
+                            signal,
+                            &context.model.api,
+                            format!("failed to resolve provider runtime: {e}"),
+                        );
+                        sink.emit(AgentEvent::MessageStart {
+                            message: Box::new(message.clone()),
+                        })
+                        .await;
+                        sink.emit(AgentEvent::MessageEnd {
+                            message: Box::new(message.clone()),
+                        })
+                        .await;
+                        message
+                    }
+                },
+                None => {
+                    stream_assistant_response(context, signal, Arc::clone(&stream_fn), config, sink)
+                        .await?
+                }
             };
-            let message =
-                stream_assistant_response(context, signal, resolved, config, sink).await?;
 
             new_messages.push(message.clone());
             context.messages.push(message.clone());

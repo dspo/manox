@@ -127,7 +127,7 @@ async fn main() {
     let model = Model {
         provider: "anthropic".into(),
         id: args.model.clone(),
-        api: "test".into(),
+        api: "anthropic".into(),
         context_window: 200_000,
         max_tokens: 8_192,
         thinking: ThinkingKind::None,

@@ -117,6 +117,12 @@ struct HarnessControl {
     /// only after their session append succeeds, so a failed write keeps the
     /// tail for the next flush.
     pending_mutations: std::sync::Mutex<Vec<PendingMutation>>,
+    /// The construction-time stream's api. Without a resolver, a model whose
+    /// api differs is refused — the fixed stream cannot serve it.
+    fixed_api: String,
+    /// Whether a per-model resolver is plugged in; when set, any api is
+    /// resolvable.
+    has_resolver: std::sync::atomic::AtomicBool,
 }
 
 /// A runtime mutation queued mid-run; applied to the shared snapshot
@@ -192,6 +198,15 @@ impl HarnessHandle {
     /// request and the next run both see it — and the change is persisted
     /// once the run settles (the TS mid-run `setModel`).
     pub fn set_model(&self, model: Model) {
+        if !self
+            .control
+            .has_resolver
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !self.control.fixed_api.is_empty()
+            && model.api != self.control.fixed_api
+        {
+            return;
+        }
         self.control.turn_runtime.lock().unwrap().model = model.clone();
         self.control
             .pending_mutations
@@ -472,6 +487,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         let tool_ctx: Arc<dyn crate::tool::ToolContext> =
             Arc::new(LocalToolContext::new(env, cwd, tool_state));
         let hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>> = Arc::new(Mutex::new(Vec::new()));
+        let fixed_api = stream_fn.api().to_string();
         let control: Arc<HarnessControl> = Arc::new(HarnessControl {
             retry_cancel: std::sync::Mutex::new(CancellationToken::new()),
             active_tx: watch::Sender::new(0),
@@ -480,6 +496,8 @@ impl<S: SessionStorage> AgentHarness<S> {
                 thinking_level: None,
             }),
             pending_mutations: std::sync::Mutex::new(Vec::new()),
+            fixed_api,
+            has_resolver: std::sync::atomic::AtomicBool::new(false),
         });
         let mut agent = Agent::new(
             system_prompt,
@@ -539,6 +557,9 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// change switches protocol/endpoint/credentials.
     pub fn with_stream_resolver(mut self, resolver: crate::agent_loop::StreamResolver) -> Self {
         self.stream_resolver = Some(Arc::clone(&resolver));
+        self.control
+            .has_resolver
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.agent.set_stream_resolver(resolver);
         self
     }
@@ -628,6 +649,20 @@ impl<S: SessionStorage> AgentHarness<S> {
                 self.phase
             );
         }
+        // Without a resolver the fixed stream serves one api; a cross-api
+        // model change is refused instead of silently talking the wrong
+        // protocol.
+        if self.stream_resolver.is_none()
+            && !self.stream_fn.api().is_empty()
+            && model.api != self.stream_fn.api()
+        {
+            anyhow::bail!(
+                "model api \"{}\" is not served by the fixed stream ({}); \
+                 plug in a StreamResolver to switch providers",
+                model.api,
+                self.stream_fn.api()
+            );
+        }
         self.session
             .append_model_change(&model.provider, &model.id)
             .await?;
@@ -693,7 +728,7 @@ impl<S: SessionStorage> AgentHarness<S> {
     fn apply_turn_runtime(&mut self) {
         let snapshot = self.control.turn_runtime.lock().unwrap().clone();
         let current = self.agent.state().model.clone();
-        if snapshot.model.id != current.id || snapshot.model.api != current.api {
+        if snapshot.model != current {
             self.agent.set_model(snapshot.model.clone());
             self.model = snapshot.model;
         }
@@ -1259,6 +1294,11 @@ impl<S: SessionStorage> AgentHarness<S> {
             self.agent.set_model(model.clone());
             self.model = model;
         }
+        // The shared runtime snapshot follows the restored state, so a
+        // handle mutation or next-turn refresh never reverts it.
+        self.control.turn_runtime.lock().unwrap().model = self.model.clone();
+        self.control.turn_runtime.lock().unwrap().thinking_level =
+            self.agent.state().thinking_level.clone();
         self.message_entry_ids = context.message_entry_ids;
         self.recover_boundary().await?;
         Ok(())
@@ -1731,7 +1771,7 @@ fn build_loop_hooks(
         let snapshot = runtime.turn_runtime.lock().unwrap();
         let (model, thinking_level) = (snapshot.model.clone(), snapshot.thinking_level.clone());
         drop(snapshot);
-        if model.id == context.model.id && thinking_level == context.thinking_level {
+        if model == context.model && thinking_level == context.thinking_level {
             return None;
         }
         context.model = model;
@@ -3595,6 +3635,384 @@ mod tests {
             model_changes(&harness).await,
             vec!["model-a".to_string(), "model-b".to_string()]
         );
+    }
+
+    /// A model switch keyed on api with the same model id still swaps the
+    /// provider runtime — the resolver discriminates on api, not id.
+    #[tokio::test]
+    async fn test_same_id_different_api_switches_stream() {
+        let served_first = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let served_second = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let first_calls = std::sync::Arc::clone(&served_first);
+        let second_calls = std::sync::Arc::clone(&served_second);
+        let provider_a = Arc::new(ToolUseStreamFn {
+            call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            seen: Some(first_calls),
+        }) as Arc<dyn crate::agent_loop::StreamFn>;
+        let provider_b: Arc<dyn crate::agent_loop::StreamFn> = Arc::new(TaggedAnswerStreamFn {
+            served: second_calls,
+        });
+        let harness_stream = Arc::clone(&provider_a);
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.api == "openai_responses" {
+                Ok(Arc::clone(&provider_b))
+            } else {
+                Ok(Arc::clone(&provider_a))
+            }
+        });
+        let same_id = |api: &str| Model {
+            provider: "openai".into(),
+            api: api.into(),
+            id: "same-id".into(),
+            context_window: 200_000,
+            max_tokens: 16_384,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        };
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            same_id("openai_completions"),
+            harness_stream,
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]))
+        .with_stream_resolver(resolver);
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(same_id("openai_responses"));
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await.unwrap();
+        // The id stayed "same-id" across both calls; the stream changed with
+        // the api.
+        assert_eq!(*served_first.lock().unwrap(), vec!["same-id".to_string()]);
+        assert_eq!(*served_second.lock().unwrap(), vec!["same-id".to_string()]);
+    }
+
+    /// A model switch with the same id but a different provider updates the
+    /// loop context — the resolver keyed on provider routes the next turn
+    /// differently.
+    #[tokio::test]
+    async fn test_same_id_different_provider_updates_context() {
+        let served_first = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let served_second = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let first_calls = std::sync::Arc::clone(&served_first);
+        let second_calls = std::sync::Arc::clone(&served_second);
+        let provider_a = Arc::new(ToolUseStreamFn {
+            call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            seen: Some(first_calls),
+        }) as Arc<dyn crate::agent_loop::StreamFn>;
+        let provider_b: Arc<dyn crate::agent_loop::StreamFn> = Arc::new(TaggedAnswerStreamFn {
+            served: second_calls,
+        });
+        let harness_stream = Arc::clone(&provider_a);
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.provider == "other" {
+                Ok(Arc::clone(&provider_b))
+            } else {
+                Ok(Arc::clone(&provider_a))
+            }
+        });
+        let same_id = |provider: &str| Model {
+            provider: provider.into(),
+            api: "test".into(),
+            id: "same-id".into(),
+            context_window: 200_000,
+            max_tokens: 16_384,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        };
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            same_id("test"),
+            harness_stream,
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]))
+        .with_stream_resolver(resolver);
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(same_id("other"));
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await.unwrap();
+        // The provider change reached the loop context: the second turn was
+        // routed by provider.
+        assert_eq!(*served_first.lock().unwrap(), vec!["same-id".to_string()]);
+        assert_eq!(*served_second.lock().unwrap(), vec!["same-id".to_string()]);
+    }
+
+    /// A resolver failure on the first turn is a terminal error message with
+    /// the normal lifecycle — not a run-level panic.
+    #[tokio::test]
+    async fn test_resolver_failure_on_first_turn_is_terminal() {
+        let resolver: crate::agent_loop::StreamResolver =
+            Arc::new(|_: &Model| Err(anyhow::anyhow!("no provider runtime for this model")));
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_stream_resolver(resolver);
+
+        let messages = harness.prompt("hi").await.unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(e),
+                ..
+            } if e.contains("failed to resolve provider runtime")
+        ));
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    /// A resolver failure after a mid-run model switch terminates the next
+    /// turn cleanly.
+    #[tokio::test]
+    async fn test_resolver_failure_after_model_switch_is_terminal() {
+        let provider_a = Arc::new(ToolUseStreamFn {
+            call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            seen: None,
+        }) as Arc<dyn crate::agent_loop::StreamFn>;
+        let harness_stream = Arc::clone(&provider_a);
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.id == "broken" {
+                Err(anyhow::anyhow!("unsupported model"))
+            } else {
+                Ok(Arc::clone(&provider_a))
+            }
+        });
+        let broken = Model {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "broken".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        };
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            harness_stream,
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]))
+        .with_stream_resolver(resolver);
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            let broken = broken.clone();
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(broken);
+                }
+            })
+        }));
+
+        let messages = harness.prompt("use the tool").await.unwrap();
+        assert!(
+            messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    error_message: Some(e),
+                    ..
+                } if e.contains("failed to resolve provider runtime")
+            )),
+            "{messages:?}"
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                ..
+            })
+        ));
+    }
+
+    /// Restore pulls the model from the session into the shared runtime, so a
+    /// prompt after restore uses the restored provider — and a resolver
+    /// failure for it stays terminal across the restore.
+    #[tokio::test]
+    async fn test_restore_then_prompt_uses_restored_runtime() {
+        let served: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served_in_stream = Arc::clone(&served);
+        let responses = Model {
+            provider: "openai".into(),
+            api: "openai_responses".into(),
+            id: "gpt-responses".into(),
+            context_window: 200_000,
+            max_tokens: 16_384,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        };
+        let provider_a = Arc::new(ToolUseStreamFn {
+            call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            seen: None,
+        }) as Arc<dyn crate::agent_loop::StreamFn>;
+        let harness_stream = Arc::clone(&provider_a);
+        let provider_b: Arc<dyn crate::agent_loop::StreamFn> = Arc::new(TaggedAnswerStreamFn {
+            served: served_in_stream,
+        });
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.api == "openai_responses" {
+                Ok(Arc::clone(&provider_b))
+            } else {
+                Ok(Arc::clone(&provider_a))
+            }
+        });
+
+        // Harness 1 persists the model change.
+        let mut h1 = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        h1.set_model(responses.clone()).await.unwrap();
+        let entries = h1.session().storage().get_entries().await.unwrap();
+
+        // Harness 2 restores the session and prompts under the restored model.
+        let mut h2 = AgentHarness::new(
+            Session::new(MemStorage::from_entries(entries)),
+            "You are a test assistant.",
+            test_model(),
+            harness_stream,
+        )
+        .with_stream_resolver(resolver)
+        .with_model_resolver({
+            let responses = responses.clone();
+            move |mref: &crate::session::SessionModelRef| {
+                (mref.provider == "openai" && mref.model_id == "gpt-responses")
+                    .then(|| responses.clone())
+            }
+        });
+        h2.restore().await.unwrap();
+        assert_eq!(h2.model().id, "gpt-responses");
+
+        let _ = h2.prompt("hi").await.unwrap();
+        assert_eq!(
+            *served.lock().unwrap(),
+            vec!["gpt-responses".to_string()],
+            "the restored model's provider served the prompt"
+        );
+    }
+
+    /// A resolver failure survives restore: the restored model still fails
+    /// to resolve on the next prompt, terminal rather than silent.
+    #[tokio::test]
+    async fn test_resolver_failure_survives_restore() {
+        let broken = Model {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "broken".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        };
+        let failing =
+            |model: &Model| -> Result<Arc<dyn crate::agent_loop::StreamFn>, anyhow::Error> {
+                if model.id == "broken" {
+                    Err(anyhow::anyhow!("unsupported model"))
+                } else {
+                    Ok(Arc::new(TestStreamFn) as Arc<dyn crate::agent_loop::StreamFn>)
+                }
+            };
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(failing);
+
+        let mut h1 = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_stream_resolver(resolver);
+        h1.set_model(broken.clone()).await.unwrap();
+        let entries = h1.session().storage().get_entries().await.unwrap();
+
+        let mut h2 = AgentHarness::new(
+            Session::new(MemStorage::from_entries(entries)),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_stream_resolver(Arc::new(failing))
+        .with_model_resolver({
+            let broken = broken.clone();
+            move |mref: &crate::session::SessionModelRef| {
+                (mref.provider == "test" && mref.model_id == "broken").then(|| broken.clone())
+            }
+        });
+        h2.restore().await.unwrap();
+
+        let messages = h2.prompt("hi").await.unwrap();
+        let terminal = match messages.last() {
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(e),
+                ..
+            }) => e.contains("failed to resolve provider runtime"),
+            _ => false,
+        };
+        assert!(terminal, "{messages:?}");
+        assert_eq!(h2.phase(), AgentHarnessPhase::Idle);
     }
 
     /// A follow-up queued by an `agent_end` listener together with a model

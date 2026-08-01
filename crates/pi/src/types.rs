@@ -473,7 +473,7 @@ pub trait EventSink: Send + Sync {
 // ── Agent context and configuration ─────────────────────────────────────────
 
 /// A model descriptor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
     /// Provider identifier (e.g. "anthropic", "openai").
     pub provider: String,

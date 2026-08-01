@@ -188,6 +188,14 @@ pub trait AgentTool: Send + Sync {
 
 > 能力校准：以上 Phase 只覆盖模块基线（文件存在、主路径可用）。TS Pi 行为逐项对齐状态以 `docs/ts-pi-parity.md` 为准——其中「运行配置」行标为 🟡（active_tools 运行中排队未接线）、Session store/reader/repository、split-turn、message_end 逐条持久化、coding-agent facade 等仍属未完成能力，Phase 的 ✅ 不等于完整迁移。
 
+### Phase 4A：运行配置闭环 ✅（2026-08-01）
+
+- `Model` 全字段判等（provider/api/id/context_window/max_tokens/thinking/metadata）
+- `restore()` 同步 Agent、Harness、共享 TurnRuntime 快照三态（model/thinking）
+- `StreamResolver` 失败生成 terminal `Assistant(Error)`，正常发出 MessageEnd/TurnEnd/AgentEnd（loop 层不再 `?` 传播）
+- 无 resolver 时跨 API 切换显式报错（idle `set_model` 返回 Err；`HarnessHandle::set_model` 拒绝）；`harness_chat` api 修正为 `anthropic`
+- 回归：restore_then_prompt / same_id×api / same_id×provider / resolver_failure×3；example `runtime_switch`（A tool-use → 切 B → B 完成 → reopen → 仍 B）
+
 ### Phase 5: 内置工具 ✅
 
 **文件：** `tools/read.rs`, `write.rs`, `edit.rs`, `bash.rs`, `grep.rs`, `find.rs`, `ls.rs`
