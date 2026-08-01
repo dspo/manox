@@ -9,8 +9,8 @@
 // Usage:
 //   cargo run -p pi --example session_resume
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -99,14 +99,18 @@ async fn main() {
         parent_session_path: None,
         metadata: None,
     };
-    let storage = JsonlSessionStorage::create(&path, meta).await.expect("create");
+    let storage = JsonlSessionStorage::create(&path, meta)
+        .await
+        .expect("create");
     let session = Session::new(storage);
 
     let mut harness = AgentHarness::new(
         session,
         "You are a test assistant.",
         mock_model(),
-        Arc::new(ToolLoopMock { step: AtomicU32::new(0) }),
+        Arc::new(ToolLoopMock {
+            step: AtomicU32::new(0),
+        }),
     )
     .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]));
 
@@ -122,8 +126,14 @@ async fn main() {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count();
-    println!("persisted entries after \"crash\": {persisted} (header + {})", persisted - 1);
-    assert!(persisted >= turn_messages, "every completed message survived the crash");
+    println!(
+        "persisted entries after \"crash\": {persisted} (header + {})",
+        persisted - 1
+    );
+    assert!(
+        persisted >= turn_messages,
+        "every completed message survived the crash"
+    );
 
     // Reopen and restore: the transcript matches the persisted prefix.
     let reopened = JsonlSessionStorage::open(&path).await.expect("reopen");
@@ -131,13 +141,18 @@ async fn main() {
         Session::new(reopened),
         "You are a test assistant.",
         mock_model(),
-        Arc::new(ToolLoopMock { step: AtomicU32::new(10) }),
+        Arc::new(ToolLoopMock {
+            step: AtomicU32::new(10),
+        }),
     )
     .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]));
     restored.restore().await.expect("restore");
     let transcript_len = restored.agent().state().messages.len();
     println!("restored transcript: {transcript_len} messages");
-    assert_eq!(transcript_len, turn_messages, "restore reproduces the persisted prefix");
+    assert_eq!(
+        transcript_len, turn_messages,
+        "restore reproduces the persisted prefix"
+    );
 
     // Continue the session with a fresh prompt.
     let more = restored.prompt("say done").await.expect("continue");

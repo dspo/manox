@@ -56,6 +56,9 @@ pub struct CompactionResult {
     /// value only — the session reconstructs the kept segment by walking the
     /// tree from `first_kept_entry_id`.
     pub retained_tail: Vec<AgentMessage>,
+    /// Whether the cut split a turn: the history and the discarded turn
+    /// prefix were summarized separately.
+    pub is_split_turn: bool,
 }
 
 /// File paths touched by the compacted region, grouped by operation kind.
@@ -252,6 +255,50 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
             .sum(),
     };
     chars.div_ceil(4)
+}
+
+/// The cut point for a compaction, including whether it splits a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutPoint {
+    /// Index of the first message retained after compaction.
+    pub first_kept_index: usize,
+    /// Index of the user message that started the turn the cut lands in;
+    /// `None` when the cut is on a whole-turn boundary.
+    pub turn_start_index: Option<usize>,
+    pub is_split_turn: bool,
+}
+
+/// Find the cut point and detect split-turn: when the cut lands inside a
+/// turn (the first kept message is not a user message and a user message
+/// precedes it), the turn's prefix — from its user message up to the cut — is
+/// summarized separately while the suffix stays retained, mirroring TS
+/// `findCutPoint`'s `turnStartIndex` / `isSplitTurn`.
+pub fn find_cut_point_split(messages: &[AgentMessage], keep_recent_tokens: usize) -> CutPoint {
+    let cut = find_cut_point(messages, keep_recent_tokens);
+    if cut >= messages.len() || matches!(&messages[cut], AgentMessage::User { .. }) {
+        return CutPoint {
+            first_kept_index: cut,
+            turn_start_index: None,
+            is_split_turn: false,
+        };
+    }
+    match messages[..cut]
+        .iter()
+        .rposition(|m| matches!(m, AgentMessage::User { .. }))
+    {
+        // A single-message turn (nothing but the user prompt precedes the
+        // cut) has no prefix worth summarizing separately.
+        Some(start) if start + 1 < cut => CutPoint {
+            first_kept_index: cut,
+            turn_start_index: Some(start),
+            is_split_turn: true,
+        },
+        _ => CutPoint {
+            first_kept_index: cut,
+            turn_start_index: None,
+            is_split_turn: false,
+        },
+    }
 }
 
 /// Find the cut point in the message list for compaction.
@@ -568,6 +615,19 @@ pub fn build_compaction_prompt(
     prompt
 }
 
+/// The instruction block for summarizing a split turn's prefix — the part of
+/// a turn the cut discarded while its suffix stays retained. Mirrors the TS
+/// `TURN_PREFIX_SUMMARIZATION_PROMPT`.
+pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
+
+/// Build the summarization prompt for a split turn's prefix.
+pub fn build_turn_prefix_prompt(prefix_messages: &[AgentMessage]) -> String {
+    let conversation_text = serialize_conversation(prefix_messages);
+    format!(
+        "<conversation>\n{conversation_text}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+    )
+}
+
 /// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
 ///
 /// `branch` is the full session path to the root — the same entries TS
@@ -585,7 +645,7 @@ pub fn build_compaction_prompt(
 pub fn build_preparation(
     branch: &[SessionTreeEntry],
     messages: &[AgentMessage],
-    cut_point: usize,
+    cut_point: &CutPoint,
     first_kept_entry_id: Option<String>,
     tokens_before: u64,
     settings: &CompactionSettings,
@@ -602,24 +662,41 @@ pub fn build_preparation(
         _ => None,
     });
     let start = usize::from(previous_summary.is_some());
-    let end = cut_point.max(start);
+    let history_end = cut_point
+        .turn_start_index
+        .unwrap_or(cut_point.first_kept_index)
+        .max(start);
     let messages_to_summarize = messages
-        .get(start..end)
+        .get(start..history_end)
         .map(|s| s.to_vec())
         .unwrap_or_default();
-    if messages_to_summarize.is_empty() {
+    // A split turn summarizes its prefix (user message up to the cut)
+    // separately, so the retained suffix keeps the tool chain intact.
+    let turn_prefix_messages = match cut_point.turn_start_index {
+        Some(turn_start) => messages
+            .get(turn_start..cut_point.first_kept_index)
+            .map(|s| s.to_vec())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
         return None;
     }
-    let retained_tail = messages[cut_point..].to_vec();
+    let retained_tail = messages[cut_point.first_kept_index..].to_vec();
 
-    let file_ops = extract_file_operations(&messages_to_summarize, branch);
+    let mut file_ops = extract_file_operations(&messages_to_summarize, branch);
+    if cut_point.is_split_turn {
+        for message in &turn_prefix_messages {
+            extract_file_ops_from_message(message, &mut file_ops);
+        }
+    }
 
     Some(CompactionPreparation {
         first_kept_entry_id,
         messages_to_summarize,
-        turn_prefix_messages: Vec::new(),
+        turn_prefix_messages,
         retained_tail,
-        is_split_turn: false,
+        is_split_turn: cut_point.is_split_turn,
         tokens_before,
         previous_summary,
         file_ops,
@@ -754,6 +831,30 @@ pub fn format_file_operations(read_files: &[String], modified_files: &[String]) 
 mod tests {
     use super::*;
     use crate::types::StopReason;
+
+    /// A budget that keeps only the final assistant cuts inside the tool
+    /// turn: the split cut point reports the turn start and flags the split,
+    /// with the tool chain wholly in the prefix.
+    #[test]
+    fn find_cut_point_split_detects_mid_turn_cut() {
+        let msgs = vec![
+            make_user("do the work"),
+            make_tool_use_assistant("t1", "read", "a.rs"),
+            make_tool_result("t1", "read"),
+            make_assistant("done"),
+        ];
+        // keep=1 retains only the final assistant: the cut lands at index 3,
+        // inside the turn, with the user message at 0 as the turn start.
+        let cp = find_cut_point_split(&msgs, 1);
+        assert!(cp.is_split_turn, "{cp:?}");
+        assert_eq!(cp.first_kept_index, 3);
+        assert_eq!(cp.turn_start_index, Some(0));
+
+        // A whole-turn budget (keep the user prompt too) is not a split.
+        let cp = find_cut_point_split(&msgs, 30);
+        assert!(!cp.is_split_turn, "{cp:?}");
+        assert_eq!(cp.turn_start_index, None);
+    }
 
     fn make_user(text: &str) -> AgentMessage {
         AgentMessage::User {

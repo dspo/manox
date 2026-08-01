@@ -839,6 +839,22 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // turn.
         self.apply_turn_runtime();
 
+        // An aborted turn skips the post-run threshold check, so the oversized
+        // context would otherwise wait for a real overflow to compact. TS
+        // checks again before the next prompt (`skipAbortedCheck: false`); a
+        // failed maintenance compaction here never blocks the prompt.
+        if matches!(
+            self.agent.state().messages.last(),
+            Some(AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Aborted),
+                ..
+            })
+        ) && self.needs_compaction()
+            && let Err(e) = self.compact(None).await
+        {
+            tracing::warn!("pre-prompt compaction failed: {e:#}");
+        }
+
         self.phase = AgentHarnessPhase::Turn;
         // A new user message rearms the one-shot overflow recovery.
         self.overflow_recovery_attempted = false;
@@ -1400,10 +1416,16 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
 
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
-        let cut_point =
-            compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
-        let kept = &messages[cut_point..];
-        let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
+        let cut_point = compaction::find_cut_point_split(
+            &messages,
+            self.compaction_settings.keep_recent_tokens,
+        );
+        let kept = &messages[cut_point.first_kept_index..];
+        let first_kept_entry_id = self
+            .message_entry_ids
+            .get(cut_point.first_kept_index)
+            .cloned()
+            .flatten();
 
         // The preparation doubles as the emptiness guard: an empty
         // summarizable range is refused here — before the phase change, the
@@ -1412,7 +1434,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         let preparation = match compaction::build_preparation(
             &branch_entries,
             &messages,
-            cut_point,
+            &cut_point,
             first_kept_entry_id.clone(),
             tokens_before,
             &self.compaction_settings,
@@ -1547,7 +1569,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         } else {
             let mut known = self
                 .message_entry_ids
-                .get(cut_point..)
+                .get(cut_point.first_kept_index..)
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
             known.resize(tail_len, None);
@@ -1566,6 +1588,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             usage,
             details,
             retained_tail,
+            is_split_turn: preparation.is_split_turn,
         };
 
         // Run after-compact hooks.
@@ -1574,7 +1597,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             HookContext::new(HookPoint::SessionAfterCompact).with_data(serde_json::json!({
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
-                "cut_point": cut_point,
+                "cut_point": cut_point.first_kept_index,
+                "is_split_turn": cut_point.is_split_turn,
             })),
         );
 
@@ -1587,18 +1611,63 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Consumes the [`CompactionPreparation`]: `previous_summary` is folded
     /// into the summarization prompt, and the computed file lists are appended
     /// to the summary text and returned as `details` — mirroring TS `compact`.
-    /// A terminal `Error`/`Aborted` stop reason or an empty summary bails before
+    /// A split turn summarizes the history and the discarded turn prefix
+    /// separately and merges them (TS `isSplitTurn`). A terminal
+    /// `Error`/`Aborted` stop reason or an empty summary bails before
     /// anything is persisted so the transcript and session stay intact.
     async fn summarize_via_model(
         &mut self,
         preparation: &CompactionPreparation,
         custom_instructions: Option<&str>,
     ) -> Result<(String, Option<Usage>, Option<JsonValue>), anyhow::Error> {
-        let prompt = compaction::build_compaction_prompt(
-            &preparation.messages_to_summarize,
-            preparation.previous_summary.as_deref(),
-            custom_instructions,
-        );
+        let (summary_text, usage) = if preparation.is_split_turn {
+            let (history_text, history_usage) = if preparation.messages_to_summarize.is_empty() {
+                ("No prior history.".to_string(), None)
+            } else {
+                let prompt = compaction::build_compaction_prompt(
+                    &preparation.messages_to_summarize,
+                    preparation.previous_summary.as_deref(),
+                    custom_instructions,
+                );
+                self.summarize_prompt(prompt).await?
+            };
+            let (prefix_text, prefix_usage) = self
+                .summarize_prompt(compaction::build_turn_prefix_prompt(
+                    &preparation.turn_prefix_messages,
+                ))
+                .await?;
+            (
+                format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix_text}"),
+                match (history_usage, prefix_usage) {
+                    (Some(a), Some(b)) => Some(merge_usage(&a, &b)),
+                    (a, b) => a.or(b),
+                },
+            )
+        } else {
+            let prompt = compaction::build_compaction_prompt(
+                &preparation.messages_to_summarize,
+                preparation.previous_summary.as_deref(),
+                custom_instructions,
+            );
+            self.summarize_prompt(prompt).await?
+        };
+        let (read_files, modified_files) = compaction::compute_file_lists(&preparation.file_ops);
+        let block = compaction::format_file_operations(&read_files, &modified_files);
+        let summary_text = format!("{summary_text}{block}");
+        let details = serde_json::json!({
+            "readFiles": read_files,
+            "modifiedFiles": modified_files,
+        });
+        Ok((summary_text, usage, Some(details)))
+    }
+
+    /// One summarization model call: streams the prompt with the
+    /// summarization system prompt, no cache writes, and returns the summary
+    /// text plus reported usage. A terminal error or empty summary bails.
+    async fn summarize_prompt(
+        &mut self,
+        prompt: String,
+    ) -> Result<(String, Option<Usage>), anyhow::Error> {
         let summary_context = AgentContext {
             system_prompt: compaction::SUMMARIZATION_SYSTEM_PROMPT.into(),
             messages: vec![AgentMessage::user(prompt)],
@@ -1666,14 +1735,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             };
             return Err(anyhow::anyhow!("summarization failed ({label}){detail}"));
         }
-        let (read_files, modified_files) = compaction::compute_file_lists(&preparation.file_ops);
-        let block = compaction::format_file_operations(&read_files, &modified_files);
-        let summary_text = format!("{summary_text}{block}");
-        let details = serde_json::json!({
-            "readFiles": read_files,
-            "modifiedFiles": modified_files,
-        });
-        Ok((summary_text, usage, Some(details)))
+        Ok((summary_text, usage))
     }
 
     /// Build a compaction prompt for the current conversation.
@@ -1814,6 +1876,35 @@ fn build_loop_hooks(
 ///
 /// Only a completed assistant turn carries trustworthy usage; an unfinished
 /// or non-assistant response contributes no usage anchor.
+/// Merge two summarization usages (history + split-turn prefix) into one.
+fn merge_usage(a: &Usage, b: &Usage) -> Usage {
+    Usage {
+        input_tokens: a.input_tokens + b.input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        cache_read_input_tokens: a.cache_read_input_tokens + b.cache_read_input_tokens,
+        cache_creation_input_tokens: a.cache_creation_input_tokens + b.cache_creation_input_tokens,
+        cache_write_1h: match (a.cache_write_1h, b.cache_write_1h) {
+            (Some(x), Some(y)) => Some(x + y),
+            (x, y) => x.or(y),
+        },
+        reasoning_tokens: match (a.reasoning_tokens, b.reasoning_tokens) {
+            (Some(x), Some(y)) => Some(x + y),
+            (x, y) => x.or(y),
+        },
+        total_tokens: a.total_tokens + b.total_tokens,
+        cost: match (a.cost.as_ref(), b.cost.as_ref()) {
+            (Some(x), Some(y)) => Some(crate::types::Cost {
+                input: x.input + y.input,
+                output: x.output + y.output,
+                cache_read: x.cache_read + y.cache_read,
+                cache_write: x.cache_write + y.cache_write,
+                total: x.total + y.total,
+            }),
+            (x, y) => x.cloned().or_else(|| y.cloned()),
+        },
+    }
+}
+
 fn extract_summary(message: &AgentMessage) -> (String, Option<Usage>) {
     match message {
         AgentMessage::Assistant {
@@ -5651,6 +5742,91 @@ mod tests {
             }
         ));
         assert!(matches!(&transcript[2], AgentMessage::ToolResult { .. }));
+    }
+
+    /// Split-turn compaction: a cut inside an oversized tool turn summarizes
+    /// the history and the turn prefix separately (two summarization calls),
+    /// keeps the tool chain in the prefix, and merges the results into one
+    /// boundary summary.
+    #[tokio::test]
+    async fn test_split_turn_compacts_oversized_tool_turn() {
+        let tool_use = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "x".repeat(500) }),
+                thought_signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let tool_result = AgentMessage::ToolResult {
+            tool_call_id: "t1".into(),
+            tool_name: "read".into(),
+            content: vec![ContentBlock::Text {
+                text: "y".repeat(500),
+                signature: None,
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let transcript = vec![
+            AgentMessage::user("earlier work"),
+            AgentMessage::user("large tool turn"),
+            tool_use,
+            tool_result,
+            scripted_assistant("done".into(), "test", "test"),
+        ];
+
+        let (stream_fn, summaries) = ScriptedStreamFn::new(vec![ScriptedTurn::Answer(8)]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.agent_mut().replace_transcript(transcript);
+        harness.set_compaction_settings(CompactionSettings {
+            keep_recent_tokens: 20,
+            ..Default::default()
+        });
+        assert!(harness.needs_compaction());
+
+        let result = harness.compact(None).await.unwrap();
+        // History + turn prefix: two separate summarization calls.
+        assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            result.summary.contains("**Turn Context (split turn):**"),
+            "{}",
+            result.summary
+        );
+        assert!(result.tokens_after < result.tokens_before);
+        // The retained tail is the final answer only.
+        assert_eq!(result.retained_tail.len(), 1);
+        assert!(matches!(
+            &result.retained_tail[0],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Stop),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
