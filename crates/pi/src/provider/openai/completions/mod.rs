@@ -90,13 +90,31 @@ impl StreamFn for CompletionsStreamFn {
         let body = to_request(context, &self.options, &self.base_url);
         let url = format!("{}/chat/completions", self.base_url);
 
+        // Extra headers are merged into every request; invalid names or
+        // values are a configuration bug and surface at the first call.
+        let extra_headers: reqwest::header::HeaderMap = self
+            .options
+            .headers
+            .iter()
+            .filter_map(|(k, v)| {
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
+                let value = v.parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
         let response = retry::send_with_retry(
             || {
-                self.client
+                let mut builder = self
+                    .client
                     .post(&url)
                     .bearer_auth(&self.api_key)
                     .header("content-type", "application/json")
-                    .json(&body)
+                    .headers(extra_headers.clone())
+                    .json(&body);
+                if let Some(timeout) = self.options.timeout {
+                    builder = builder.timeout(timeout);
+                }
+                builder
             },
             &signal,
             &event_tx,
@@ -333,9 +351,8 @@ impl Accumulator {
     }
 
     fn push_text(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
-        // A text delta closes any open reasoning block: interleaved kinds
-        // become consecutive blocks.
-        self.open_thinking = None;
+        // One text block per stream, mirroring TS: interleaved reasoning does
+        // not close the open text block — deltas keep appending to it.
         let index = match self.open_text {
             Some(i) => i,
             None => {
@@ -363,7 +380,8 @@ impl Accumulator {
     }
 
     fn push_thinking(&mut self, thinking: &str, events: &mut Vec<AssistantMessageEvent>) {
-        self.open_text = None;
+        // One thinking block per stream, mirroring TS: interleaved text does
+        // not close the open thinking block.
         let index = match self.open_thinking {
             Some(i) => i,
             None => {
@@ -698,6 +716,54 @@ mod tests {
             if thinking == "let me think" && signature.is_none())
         );
         assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
+    }
+
+    /// Interleaved text and reasoning keep exactly two blocks for the whole
+    /// stream — each kind merges into its single block, mirroring TS.
+    #[tokio::test]
+    async fn interleaved_text_and_thinking_merge_into_two_blocks() {
+        let (tx, _rx) = chan();
+        let mut acc = Accumulator::new(&ctx());
+
+        let reasoning = |s: &str| WireDelta {
+            reasoning_content: Some(s.into()),
+            ..Default::default()
+        };
+        acc.apply(chunk(text("hello "), None), &tx).await.unwrap();
+        acc.apply(chunk(reasoning("think"), None), &tx)
+            .await
+            .unwrap();
+        acc.apply(chunk(text("world"), None), &tx).await.unwrap();
+        acc.apply(chunk(reasoning(" more"), None), &tx)
+            .await
+            .unwrap();
+        acc.apply(chunk(text("!"), Some("stop")), &tx)
+            .await
+            .unwrap();
+        let msg = acc.finish(&tx).await.unwrap();
+
+        let AgentMessage::Assistant { content, .. } = &msg else {
+            panic!("expected assistant")
+        };
+        assert_eq!(content.len(), 2, "{content:?}");
+        let text_joined = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let thinking_joined = content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text_joined, "hello world!");
+        assert_eq!(thinking_joined, "think more");
     }
 
     #[tokio::test]

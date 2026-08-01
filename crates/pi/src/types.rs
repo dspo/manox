@@ -686,6 +686,10 @@ pub struct StreamOptions {
     pub max_tokens: Option<usize>,
     /// Temperature override.
     pub temperature: Option<f32>,
+    /// Extra headers merged into every request, e.g. gateway auth.
+    pub headers: Vec<(String, String)>,
+    /// Per-request timeout; `None` uses the client's default.
+    pub timeout: Option<std::time::Duration>,
 }
 
 // ── Re-export from tool module ──────────────────────────────────────────────

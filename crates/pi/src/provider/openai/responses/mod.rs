@@ -87,13 +87,31 @@ impl StreamFn for ResponsesStreamFn {
         let body = to_request(context, &self.options);
         let url = format!("{}/responses", self.base_url);
 
+        // Extra headers are merged into every request; invalid names or
+        // values are a configuration bug and surface at the first call.
+        let extra_headers: reqwest::header::HeaderMap = self
+            .options
+            .headers
+            .iter()
+            .filter_map(|(k, v)| {
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
+                let value = v.parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
         let response = retry::send_with_retry(
             || {
-                self.client
+                let mut builder = self
+                    .client
                     .post(&url)
                     .bearer_auth(&self.api_key)
                     .header("content-type", "application/json")
-                    .json(&body)
+                    .headers(extra_headers.clone())
+                    .json(&body);
+                if let Some(timeout) = self.options.timeout {
+                    builder = builder.timeout(timeout);
+                }
+                builder
             },
             &signal,
             &event_tx,
