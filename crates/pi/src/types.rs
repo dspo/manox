@@ -594,8 +594,9 @@ pub struct TurnUpdate {
 /// Async so the refresh can flush durable writes (TS `prepareNextTurn`);
 /// takes no context reference so the future is `'static`.
 pub type PrepareTurnFn = Box<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<TurnUpdate>> + Send>>
-        + Send
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<TurnUpdate>, anyhow::Error>> + Send>,
+        > + Send
         + Sync,
 >;
 /// Decides whether the run should stop after a turn.

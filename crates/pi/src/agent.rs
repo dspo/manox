@@ -161,8 +161,9 @@ pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) -> AgentContext +
 pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
 pub type PrepareTurnHook = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<TurnUpdate>> + Send>>
-        + Send
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<TurnUpdate>, anyhow::Error>> + Send>,
+        > + Send
         + Sync,
 >;
 

@@ -489,6 +489,9 @@ pub struct AgentHarness<S: SessionStorage> {
     model_resolver: Option<ModelResolver>,
     /// Skills and prompt templates the harness can expand into prompts.
     resources: HarnessResources,
+    /// Messages queued by `next_turn`, prepended to the next prompt batch —
+    /// the TS `nextTurnQueue`.
+    next_turn_queue: Vec<AgentMessage>,
 }
 
 impl<S: SessionStorage + 'static> AgentHarness<S> {
@@ -531,7 +534,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // The persistence middleware shares the session Arc so it can append
         // each message at MessageEnd; the harness keeps the other handle.
         let session = Arc::new(session);
-        agent.set_loop_hooks(build_loop_hooks(Arc::clone(&hooks), Arc::clone(&control)));
+        agent.set_loop_hooks(build_loop_hooks(
+            Arc::clone(&hooks),
+            Arc::clone(&control),
+            Arc::clone(&session),
+        ));
         agent.add_middleware(build_persistence_middleware(
             Arc::clone(&control),
             Arc::clone(&session),
@@ -556,6 +563,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             active_tool_names: None,
             model_resolver: None,
             resources: HarnessResources::default(),
+            next_turn_queue: Vec::new(),
         }
     }
 
@@ -594,14 +602,13 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
 
     /// Run a skill by name: its content becomes the prompt for this turn.
     pub async fn skill(&mut self, name: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        let content = self
+        let skill = self
             .resources
             .skills
             .iter()
             .find(|s| s.name == name)
-            .map(|s| s.content.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown skill: {name}"))?;
-        self.prompt(&content).await
+        self.prompt(&format_skill_invocation(skill, None)).await
     }
 
     /// Expand a prompt template by name with `args` substituted for
@@ -609,7 +616,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     pub async fn prompt_from_template(
         &mut self,
         name: &str,
-        args: &[(String, String)],
+        args: &[String],
     ) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let template = self
             .resources
@@ -618,22 +625,29 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .find(|t| t.name == name)
             .map(|t| t.content.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown prompt template: {name}"))?;
-        let mut rendered = template;
-        for (key, value) in args {
-            rendered = rendered.replace(&format!("{{{key}}}"), value);
-        }
+        let rendered = substitute_args(&template, args);
         self.prompt(&rendered).await
     }
 
-    /// The next turn's runtime snapshot (model + thinking), as the loop's
-    /// prepare-next-turn would apply it — the TS `prepareNextTurn` surface.
-    pub fn next_turn(&self) -> crate::types::TurnUpdate {
-        let snapshot = self.control.turn_runtime.lock().unwrap().clone();
-        crate::types::TurnUpdate {
-            model: snapshot.model,
-            thinking_level: snapshot.thinking_level,
-            active_tool_names: snapshot.active_tool_names,
-        }
+    /// Queue a user message for the next turn — the TS `nextTurn`. It can be
+    /// called while idle or mid-run; the queued messages are prepended to the
+    /// next prompt batch, before the prompt's own message.
+    pub fn next_turn(&mut self, text: &str, images: Vec<ContentBlock>) {
+        let mut content = Vec::with_capacity(images.len() + 1);
+        content.push(ContentBlock::Text {
+            text: text.to_string(),
+            signature: None,
+        });
+        content.extend(images);
+        self.next_turn_queue.push(AgentMessage::User {
+            content,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    /// Whether next-turn messages are queued.
+    pub fn has_next_turn(&self) -> bool {
+        !self.next_turn_queue.is_empty()
     }
 
     /// Append a custom message to the session, joining the transcript.
@@ -1003,7 +1017,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             content,
             timestamp: chrono::Utc::now(),
         };
-        let mut batch = vec![user_message];
+        let mut batch = Vec::new();
+        // Queued next-turn messages run before the prompt's own message,
+        // mirroring TS.
+        batch.append(&mut self.next_turn_queue);
+        batch.push(user_message);
         batch.extend(hook_ctx.inject_messages);
 
         let prior_system_prompt = self.agent.state().system_prompt.clone();
@@ -1448,35 +1466,45 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         }
         let _active = ActiveGuard::arm(&self.control);
 
-        self.session.move_to(Some(target_id)).await?;
-        self.restore().await?;
+        let old_leaf = self.session.leaf_id().await?;
+        if old_leaf.as_deref() == Some(target_id) {
+            return Ok(());
+        }
+        let target_entry = self
+            .session
+            .storage()
+            .get_entry(target_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("entry {target_id} not found"))?;
 
-        let entries = self.session.get_branch().await?;
-        let messages: Vec<AgentMessage> = entries
+        // Summarize the branch that is being left behind: the old leaf up to
+        // the common ancestor with the target path. The target's own history
+        // stays untouched — TS `collectEntriesForBranchSummary`.
+        let old_path = self.session.storage().get_path(old_leaf.as_deref()).await?;
+        let target_path = self.session.storage().get_path(Some(target_id)).await?;
+        let old_ids: std::collections::HashSet<&str> = old_path.iter().map(|e| e.id()).collect();
+        let common_ancestor = target_path
+            .iter()
+            .rev()
+            .find(|e| old_ids.contains(e.id()))
+            .map(|e| e.id().to_string());
+        let abandoned: Vec<SessionTreeEntry> = old_path
+            .iter()
+            .rev()
+            .take_while(|e| common_ancestor.as_deref() != Some(e.id()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let messages: Vec<AgentMessage> = abandoned
             .iter()
             .filter_map(|e| match e {
                 SessionTreeEntry::Message { message, .. } => Some(message.clone()),
                 _ => None,
             })
             .collect();
-        let existing = entries.iter().rev().find_map(|e| match e {
-            SessionTreeEntry::BranchSummary {
-                summary, details, ..
-            } => Some(crate::compaction::branch_summarization::BranchSummary {
-                summary: summary.clone(),
-                files_changed: details
-                    .as_ref()
-                    .and_then(|d| d.get("filesChanged"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            }),
-            _ => None,
-        });
+
         let stream_fn = match &self.stream_resolver {
             Some(resolver) => resolver(&self.model)?,
             None => Arc::clone(&self.stream_fn),
@@ -1485,18 +1513,32 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             &messages,
             &self.model,
             stream_fn,
-            existing.as_ref(),
+            None,
         )
         .await?;
+
+        // Move the cursor (a user/custom target focuses its parent, mirroring
+        // TS), then hang the summary on the new branch.
+        let new_leaf = match &target_entry {
+            SessionTreeEntry::Message {
+                message: AgentMessage::User { .. },
+                parent_id,
+                ..
+            }
+            | SessionTreeEntry::CustomMessage { parent_id, .. } => parent_id.clone(),
+            _ => Some(target_id.to_string()),
+        };
+        self.session.move_to(new_leaf.as_deref()).await?;
         self.session
             .append_branch_summary(
-                target_id,
+                new_leaf.as_deref().unwrap_or("root"),
                 &summary.summary,
                 &summary.files_changed,
                 None,
                 false,
             )
             .await?;
+        self.restore().await?;
         Ok(())
     }
 
@@ -1990,7 +2032,62 @@ pub struct HarnessResources {
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// The skill file path, used in the invocation block so the model can
+    /// resolve relative references.
+    pub location: String,
     pub content: String,
+}
+
+/// The TS `formatSkillInvocation`: a `<skill name location>` block that tells
+/// the model where relative references resolve, optionally followed by
+/// additional instructions.
+pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&str>) -> String {
+    let dir = std::path::Path::new(&skill.location)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        skill.name, skill.location, dir, skill.content
+    );
+    match additional_instructions {
+        Some(extra) => format!("{block}\n\n{extra}"),
+        None => block,
+    }
+}
+
+/// The TS `substituteArgs`: positional `$1`..`$N`, slices `${@:N}` /
+/// `${@:N:L}`, and the whole-argument `$ARGUMENTS` / `$@`.
+pub fn substitute_args(content: &str, args: &[String]) -> String {
+    let mut result = content.to_string();
+    // $N
+    let re = regex::Regex::new(r"\$(\d+)").expect("static positional pattern");
+    result = re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let n: usize = caps[1].parse().unwrap_or(0);
+            args.get(n - 1).cloned().unwrap_or_default()
+        })
+        .into_owned();
+    // ${@:N} and ${@:N:L}
+    let slice = regex::Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("static slice pattern");
+    result = slice
+        .replace_all(&result, |caps: &regex::Captures| {
+            let start = caps[1].parse::<usize>().unwrap_or(1).saturating_sub(1);
+            let start = start.min(args.len());
+            match caps.get(2) {
+                Some(len) => args[start..]
+                    .iter()
+                    .take(len.as_str().parse::<usize>().unwrap_or(0))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                None => args[start..].join(" "),
+            }
+        })
+        .into_owned();
+    let all = args.join(" ");
+    result = result.replace("$ARGUMENTS", &all);
+    result.replace("$@", &all)
 }
 
 /// A named prompt template.
@@ -2021,9 +2118,10 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
     })
 }
 
-fn build_loop_hooks(
+fn build_loop_hooks<S: SessionStorage + 'static>(
     hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>,
     control: Arc<HarnessControl>,
+    session: Arc<Session<S>>,
 ) -> LoopHooks {
     let provider = Arc::clone(&hooks);
     let before_provider_request: BeforeProviderRequestHook = Arc::new(move |ctx: &AgentContext| {
@@ -2076,19 +2174,43 @@ fn build_loop_hooks(
     });
 
     let runtime = Arc::clone(&control);
+    let durable = Arc::clone(&session);
     let prepare_next_turn: PrepareTurnHook = Arc::new(move || {
-        // Refresh the next turn's context from the shared runtime snapshot.
-        // The snapshot is the truth source — the durable write queue is only
-        // for persistence — so every turn sees the same model/thinking.
+        // Before the next provider request, flush mutations listeners queued
+        // at TurnEnd to the session — each entry leaves the queue only after
+        // its append succeeds, and a failed write aborts the run so the next
+        // request never starts with the new model's messages ahead of its
+        // model_change entry (TS `flushPendingSessionWrites`).
         let runtime = Arc::clone(&runtime);
+        let durable = Arc::clone(&durable);
         Box::pin(async move {
+            loop {
+                let next = runtime.pending_mutations.lock().unwrap().first().cloned();
+                let Some(mutation) = next else { break };
+                match &mutation {
+                    PendingMutation::Model(model) => {
+                        durable
+                            .append_model_change(&model.provider, &model.id)
+                            .await?;
+                    }
+                    PendingMutation::ThinkingLevel(level) => {
+                        durable
+                            .append_thinking_level_change(level.as_deref().unwrap_or("off"))
+                            .await?;
+                    }
+                    PendingMutation::ActiveTools(names) => {
+                        durable.append_active_tools_change(names).await?;
+                    }
+                }
+                runtime.pending_mutations.lock().unwrap().remove(0);
+            }
             let snapshot = runtime.turn_runtime.lock().unwrap();
             let update = crate::types::TurnUpdate {
                 model: snapshot.model.clone(),
                 thinking_level: snapshot.thinking_level.clone(),
                 active_tool_names: snapshot.active_tool_names.clone(),
             };
-            Some(update)
+            Ok(Some(update))
         })
     });
 
@@ -3963,11 +4085,10 @@ mod tests {
                 .collect()
         }
 
-        // model_a persists; model_b's append fails and surfaces the error.
+        // model_a persists (flushed at the first turn boundary); model_b's
+        // append fails at the next turn boundary and surfaces the error.
         assert!(harness.prompt("use the tool").await.is_err());
         assert_eq!(model_changes(&harness).await, vec!["model-a".to_string()]);
-        // The runtime snapshot applied regardless of the failed write.
-        assert_eq!(harness.model().id, "model-b");
 
         // The failed write stayed queued: the next run's flush retries it and
         // both changes land.
@@ -6062,8 +6183,10 @@ mod tests {
     #[tokio::test]
     async fn test_navigate_tree_moves_and_summarizes_branch() {
         // A stream whose summarization calls answer with a fixed summary and
-        // whose normal turns play simple answers.
-        struct NavigateStreamFn;
+        // record the messages they were fed; normal turns play answers.
+        struct NavigateStreamFn {
+            summarized: Arc<std::sync::Mutex<Vec<String>>>,
+        }
         #[async_trait::async_trait]
         impl StreamFn for NavigateStreamFn {
             async fn stream(
@@ -6073,19 +6196,33 @@ mod tests {
                 _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
             ) -> Result<AgentMessage, anyhow::Error> {
                 if context.system_prompt == crate::compaction::branch_summarization::SYSTEM_PROMPT {
+                    let mut out = Vec::new();
+                    for m in &context.messages {
+                        if let AgentMessage::User { content, .. } = m {
+                            for b in content {
+                                if let ContentBlock::Text { text, .. } = b {
+                                    out.push(text.clone());
+                                }
+                            }
+                        }
+                    }
+                    self.summarized.lock().unwrap().extend(out);
                     return Ok(scripted_assistant("branch summary".into(), "test", "test"));
                 }
                 Ok(scripted_assistant("answer".into(), "test", "test"))
             }
         }
 
+        let summarized = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let storage = MemStorage::new();
         let session = Session::new(storage);
         let mut harness = AgentHarness::new(
             session,
             "You are a test assistant.",
             test_model(),
-            Arc::new(NavigateStreamFn),
+            Arc::new(NavigateStreamFn {
+                summarized: Arc::clone(&summarized),
+            }),
         );
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
@@ -6108,9 +6245,20 @@ mod tests {
             .unwrap();
 
         harness.navigate_tree(&first_reply_id).await.unwrap();
-        // The transcript now holds only the first turn (user + answer); the
-        // second turn's messages are on the other branch.
-        assert_eq!(harness.agent().state().messages.len(), 2);
+        // The transcript now holds only the first turn (user + answer) plus
+        // the branch summary carrier; the second turn's messages are on the
+        // abandoned branch.
+        assert_eq!(harness.agent().state().messages.len(), 3);
+
+        // The branch summary summarized the abandoned second turn, not the
+        // first turn the navigation kept.
+        let captured: Vec<String> = summarized.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "{captured:?}");
+        assert!(captured[0].contains("User: second"), "{captured:?}");
+        assert!(
+            !captured[0].contains("User: first"),
+            "the kept turn must not be re-summarized: {captured:?}"
+        );
 
         // A branch summary entry was appended.
         let entries = harness.session().storage().get_entries().await.unwrap();
@@ -6139,11 +6287,12 @@ mod tests {
             skills: vec![Skill {
                 name: "summarize".into(),
                 description: "summarize the work".into(),
+                location: "/proj/skills/summarize.md".into(),
                 content: "Summarize everything.".into(),
             }],
             prompt_templates: vec![PromptTemplate {
                 name: "review".into(),
-                content: "Review {file} for bugs.".into(),
+                content: "Review $1 for bugs.".into(),
             }],
         });
 
@@ -6168,7 +6317,7 @@ mod tests {
         // Skills and templates expand into a prompt turn.
         harness.skill("summarize").await.unwrap();
         harness
-            .prompt_from_template("review", &[("file".into(), "main.rs".into())])
+            .prompt_from_template("review", &["main.rs".into()])
             .await
             .unwrap();
         let transcript = &harness.agent().state().messages;
@@ -6177,11 +6326,31 @@ mod tests {
             AgentMessage::User { content, .. }
                 if matches!(&content[0], ContentBlock::Text { text, .. } if text == "Review main.rs for bugs.")
         )));
+        // The skill invocation carries the TS `<skill name location>` block.
+        harness.skill("summarize").await.unwrap();
+        let transcript = &harness.agent().state().messages;
+        assert!(transcript.iter().any(|m| matches!(
+            m,
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text.contains("<skill name=\"summarize\" location=\"/proj/skills/summarize.md\">"))
+        )));
 
-        // next_turn reflects a queued model change without a run.
-        harness.handle().set_model(resolved_model());
-        let next = harness.next_turn();
-        assert_eq!(next.model.id, "claude-opus");
+        // A queued next-turn message runs before the following prompt's own
+        // message.
+        harness.next_turn("queued next", Vec::new());
+        assert!(harness.has_next_turn());
+        let messages = harness.prompt("direct").await.unwrap();
+        assert!(!harness.has_next_turn());
+        assert!(matches!(
+            &messages[0],
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued next")
+        ));
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "direct")
+        ));
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
 
@@ -6234,6 +6403,122 @@ mod tests {
             SessionTreeEntry::ActiveToolsChange { active_tool_names, .. }
                 if active_tool_names == &["echo".to_string()]
         )));
+    }
+
+    /// A TurnEnd model switch is persisted before the next provider request:
+    /// the model_change entry lands ahead of the messages the new model
+    /// produces (TS flushPendingSessionWrites at the turn boundary).
+    #[tokio::test]
+    async fn test_model_change_precedes_next_turn_messages() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(resolved_model());
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await.unwrap();
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        // model_change sits before the new model's assistant reply.
+        let model_change_at = entries
+            .iter()
+            .position(|e| matches!(e, SessionTreeEntry::ModelChange { .. }))
+            .expect("model change persisted");
+        let last_assistant_at = entries
+            .iter()
+            .rposition(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Message {
+                        message: AgentMessage::Assistant { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("turn-two assistant");
+        assert!(
+            model_change_at < last_assistant_at,
+            "model change must precede the new model's messages: {entries:?}"
+        );
+    }
+
+    /// A failed mutation append aborts the run at the turn boundary: the next
+    /// provider request never starts.
+    #[tokio::test]
+    async fn test_mutation_append_failure_blocks_next_request() {
+        let storage = MemStorage::new();
+        *storage.fail_model_id.lock().unwrap() = Some("claude-opus".into());
+        let session = Session::new(storage);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in_stream = Arc::clone(&calls);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: calls_in_stream,
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_model(resolved_model());
+                }
+            })
+        }));
+
+        // The flush failure at the turn boundary aborts the run; the second
+        // provider call never happens.
+        let err = harness.prompt("use the tool").await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected model change failure"),
+            "{err:#}"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "only the first turn ran"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ impl ResourceLoader {
             resources.skills.push(Skill {
                 name: "project-instructions".into(),
                 description: "Project instructions from CLAUDE.md".into(),
+                location: instructions_path.to_string_lossy().into_owned(),
                 content,
             });
         }
@@ -45,6 +46,7 @@ impl ResourceLoader {
                     resources.skills.push(Skill {
                         name,
                         description: "A project skill".into(),
+                        location: path.to_string_lossy().into_owned(),
                         content,
                     });
                 }

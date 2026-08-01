@@ -172,8 +172,7 @@ pub trait AgentTool: Send + Sync {
    - 取消传播到执行层：`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时 SIGKILL 整个进程树（对齐 TS `killProcessTree`），bash 工具透传 signal
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
-5. ✅ 实现 session 持久化 —— turn 结束后批量追加该 turn 全部消息（持久化失败时 transcript 回滚到 session 已持久化前缀）
-   - 与 TS 的逐条 append 不同：进程在 turn 中途崩溃会丢失该 turn 未持久化的消息——对齐项见「待完成」
+5. ✅ 实现 session 持久化 —— harness persistence middleware 在每条 `MessageEnd` 立即 append（先于 listener），删除 turn 末批量写入；mutation 在下一 provider request 前 flush（prepare-next-turn）；append 失败时 run 终止并回滚 transcript 到 session 前缀（2026-08-01 Phase 4B）
 6. ✅ 实现 overflow → compact → retry 闭环
    - assistant 错误消息经 `is_context_overflow` 三判据分类（错误消息模式 / Stop 但 input+cacheRead 超窗 / Length 且 output=0 且 input ≥99% 窗）
    - 同模型守卫、stale 守卫（错误不晚于最近一次压缩）、aborted 不恢复
@@ -231,16 +230,26 @@ pub trait AgentTool: Send + Sync {
 5. ✅ edit_diff 单元测试（统一 diff 计算、空 diff、hunk 计数）
 6. ✅ 单元测试全通过，零警告（计数见文首「当前规模」，随实现滚动更新）
 
+### Phase 3A：split-turn compaction ✅（2026-08-01）
+
+- `find_cut_point_split`：cut 落在轮内时返回 turn start；turn prefix 单独摘要（`TURN_PREFIX_SUMMARIZATION_PROMPT`），history + prefix 双调用合并 text/usage
+- pre-prompt compaction：aborted 回合后 `prompt()` 前执行
+- example `split_turn_compact`：90k→179 tokens，reopen 一致
+
+### Phase 8：coding-agent facade ✅（2026-08-01）
+
+- `coding_agent` 模块：AgentSession/Builder、ModelRuntime（env credential）、ResourceLoader（CLAUDE.md/skills/templates）、`create_agent_session`
+- example `coding_agent_smoke`：资源加载→工具轮→model 切换→compact→close/reopen→continue
+
 ### 待完成
 
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
 
-- [ ] 压缩 split-turn（turn prefix 摘要）：cut 恒在整轮边界，单轮超 keep-recent 窗口时整轮保留而非切分——极端工具轮可能在压缩后仍然溢出
-- [ ] session 逐条 append：TS 在 `message_end` 时即持久化，crate pi 在 turn 末批量追加，turn 中途崩溃丢失该 turn 消息
-- [ ] pre-prompt 压缩检查：TS `prompt()` 发送前 `_checkCompaction(lastAssistant, skipAbortedCheck=false)` 兜住 aborted 回合；crate pi 只有回合后检查
 - [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳
-- [ ] Completions 流交错块模型：TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块（Phase 2 已知偏离）
+- [ ] summarization retry/cancel：summarization 与 branch summary 调用无 retry 策略与取消通道
 - [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §8）
+- [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐
+- [ ] pi-ai breadth：三协议之外的 chat API 与 image API（明确排除项）
 
 工程化余项：
 

@@ -88,3 +88,160 @@ fn file_operation_formatting_matches_ts() {
     assert!(formatted.contains("<modified-files>\nb.rs\n</modified-files>"));
     assert!(formatted.starts_with("\n\n"));
 }
+
+#[test]
+fn substitute_args_matches_ts_fixture() {
+    let fixture = include_str!("fixtures/ts-pi/substitute-args.txt");
+    // The fixture records input/args/expected on separate lines; args is a
+    // JSON string array.
+    let mut lines = fixture.lines();
+    let input = lines.next().unwrap().strip_prefix("input: ").unwrap();
+    let args: Vec<String> =
+        serde_json::from_str(lines.next().unwrap().strip_prefix("args: ").unwrap()).unwrap();
+    let expected = lines.next().unwrap().strip_prefix("expected: ").unwrap();
+    let rendered = pi::harness::substitute_args(input, &args);
+    assert_eq!(rendered, expected);
+}
+
+#[test]
+fn skill_invocation_matches_ts_fixture() {
+    let fixture = include_str!("fixtures/ts-pi/skill-invocation.txt");
+    let skill = pi::harness::Skill {
+        name: "review".into(),
+        description: String::new(),
+        location: "/proj/skills/review.md".into(),
+        content: "Check the diff carefully.".into(),
+    };
+    let rendered = pi::harness::format_skill_invocation(&skill, None);
+    assert_eq!(rendered, fixture.trim_end());
+}
+
+#[tokio::test]
+async fn single_turn_event_trace_matches_ts() {
+    // The TS agent loop emits this exact lifecycle for a plain single-turn
+    // run with no tools; the Rust loop must reproduce it.
+    let expected: Vec<&str> = include_str!("fixtures/ts-pi/agent-loop-events.txt")
+        .lines()
+        .collect();
+    let events = capture_single_turn_events().await;
+    let kinds: Vec<String> = events
+        .iter()
+        .map(|e| match e {
+            pi::AgentEvent::AgentStart => "AgentStart".into(),
+            pi::AgentEvent::TurnStart => "TurnStart".into(),
+            pi::AgentEvent::MessageStart { message } => {
+                if matches!(message.as_ref(), pi::AgentMessage::User { .. }) {
+                    "MessageStart(user)".into()
+                } else {
+                    "MessageStart(assistant)".into()
+                }
+            }
+            pi::AgentEvent::MessageEnd { message } => {
+                if matches!(message.as_ref(), pi::AgentMessage::User { .. }) {
+                    "MessageEnd(user)".into()
+                } else {
+                    "MessageEnd(assistant)".into()
+                }
+            }
+            pi::AgentEvent::TurnEnd { .. } => "TurnEnd".into(),
+            pi::AgentEvent::AgentEnd { .. } => "AgentEnd".into(),
+            other => format!("{other:?}"),
+        })
+        .filter(|k| !k.starts_with("Tool") && k != "AgentEnd-extra")
+        .collect();
+    assert_eq!(kinds, expected);
+}
+
+/// Run one plain turn through the loop and capture the emitted lifecycle.
+async fn capture_single_turn_events() -> Vec<pi::AgentEvent> {
+    use async_trait::async_trait;
+    use pi::agent_loop::{StreamFn, run_loop};
+    use pi::types::AgentLoopConfig;
+    use tokio_util::sync::CancellationToken;
+
+    struct LocalSink(std::sync::Arc<std::sync::Mutex<Vec<pi::AgentEvent>>>);
+    #[async_trait]
+    impl pi::EventSink for LocalSink {
+        async fn emit(&self, event: pi::AgentEvent) -> Result<(), anyhow::Error> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    struct ToolCtx;
+    #[async_trait]
+    impl pi::tool::ToolContext for ToolCtx {
+        fn env(&self) -> &dyn pi::env::ExecutionEnv {
+            panic!("no tools in this trace")
+        }
+        fn cwd(&self) -> &std::path::Path {
+            panic!("no tools in this trace")
+        }
+        fn tool_state(&self) -> &pi::tool::ToolState {
+            static STATE: std::sync::OnceLock<pi::tool::ToolState> = std::sync::OnceLock::new();
+            STATE.get_or_init(pi::tool::ToolState::new)
+        }
+    }
+
+    struct OneShot;
+    #[async_trait]
+    impl StreamFn for OneShot {
+        async fn stream(
+            &self,
+            _c: &pi::AgentContext,
+            _s: CancellationToken,
+            _tx: tokio::sync::mpsc::Sender<pi::AgentEvent>,
+        ) -> Result<pi::AgentMessage, anyhow::Error> {
+            Ok(pi::AgentMessage::Assistant {
+                content: vec![pi::types::ContentBlock::Text {
+                    text: "ok".into(),
+                    signature: None,
+                }],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(pi::types::StopReason::Stop),
+                usage: Box::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = LocalSink(std::sync::Arc::clone(&events));
+    let mut context = pi::AgentContext {
+        system_prompt: "sys".into(),
+        messages: Vec::new(),
+        tools: std::sync::Arc::from(Vec::<std::sync::Arc<dyn pi::tool::AgentTool>>::new()),
+        model: pi::types::Model {
+            provider: "p".into(),
+            api: "test".into(),
+            id: "m".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: Default::default(),
+        },
+        thinking_level: None,
+        cache_retention: Default::default(),
+        session_id: None,
+        metadata: Default::default(),
+    };
+    run_loop(
+        &[pi::AgentMessage::user("hi")],
+        &mut context,
+        &AgentLoopConfig::default(),
+        None,
+        std::sync::Arc::new(OneShot),
+        &ToolCtx,
+        &sink,
+    )
+    .await
+    .expect("run");
+    events.lock().unwrap().clone()
+}

@@ -134,7 +134,7 @@ async fn main() {
         "after navigate: {} messages, branch summary persisted",
         harness.agent().state().messages.len()
     );
-    assert_eq!(harness.agent().state().messages.len(), 2, "first turn only");
+    assert_eq!(harness.agent().state().messages.len(), 3, "first turn + summary carrier");
     drop(harness);
 
     // Reopen: the branch (leaf entry) and the branch summary survive.

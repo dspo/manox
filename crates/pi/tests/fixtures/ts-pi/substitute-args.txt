@@ -1,0 +1,3 @@
+input: "Run $1 then $2. All: $@. Slice: ${@:2}. Slice3: ${@:1:2}. Args: $ARGUMENTS."
+args: ["build", "test", "lint"]
+expected: "Run build then test. All: build test lint. Slice: test lint. Slice3: build test. Args: build test lint."

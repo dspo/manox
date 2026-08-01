@@ -337,7 +337,7 @@ async fn run_loop_inner(
 
             // Apply next-turn context update.
             if let Some(ref prepare_next_turn) = config.prepare_next_turn
-                && let Some(update) = prepare_next_turn().await
+                && let Some(update) = prepare_next_turn().await?
             {
                 context.model = update.model;
                 context.thinking_level = update.thinking_level;
