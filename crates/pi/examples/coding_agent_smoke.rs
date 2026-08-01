@@ -1,0 +1,188 @@
+// Coding-agent facade smoke test, offline.
+//
+// create_agent_session → load project instructions + skill/template →
+// tool call → model switch → compact → close/reopen → continue. A fake
+// provider runtime stands in for the real APIs; the session, tools,
+// resources, and compaction all run for real.
+//
+// Usage:
+//   cargo run -p pi --example coding_agent_smoke
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
+use pi::coding_agent::model_runtime::ModelRuntime;
+use pi::coding_agent::{ResourceLoader, create_agent_session};
+use pi::types::{AgentContext, AgentEvent, ContentBlock, Model, StopReason, ThinkingKind, Usage};
+use pi::{AgentMessage, StreamFn};
+
+/// A fake provider: tool-use turn first, then answers.
+struct FakeProvider {
+    step: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl StreamFn for FakeProvider {
+    async fn stream(
+        &self,
+        context: &AgentContext,
+        _signal: CancellationToken,
+        _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        let step = self.step.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let assistant = |content, stop| AgentMessage::Assistant {
+            content,
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(stop),
+            raw_stop_reason: None,
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        if step == 0 {
+            Ok(assistant(
+                vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({ "path": "README.md" }),
+                    thought_signature: None,
+                }],
+                StopReason::ToolUse,
+            ))
+        } else if step == 1 {
+            // The summarization call for compaction.
+            Ok(assistant(
+                vec![ContentBlock::Text {
+                    text: "compacted history".into(),
+                    signature: None,
+                }],
+                StopReason::Stop,
+            ))
+        } else {
+            Ok(assistant(
+                vec![ContentBlock::Text {
+                    text: format!("done under {}", context.model.id),
+                    signature: None,
+                }],
+                StopReason::Stop,
+            ))
+        }
+    }
+}
+
+fn fake_runtime() -> ModelRuntime {
+    let provider = Arc::new(FakeProvider {
+        step: std::sync::atomic::AtomicU32::new(0),
+    }) as Arc<dyn StreamFn>;
+    let resolver: pi::agent_loop::StreamResolver =
+        Arc::new(move |_model: &Model| Ok(Arc::clone(&provider)));
+    ModelRuntime::new(resolver)
+}
+
+#[tokio::main]
+async fn main() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // A CLAUDE.md and a template to load.
+    tokio::fs::write(cwd.join("CLAUDE.md"), "Keep changes minimal.")
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(cwd.join("templates"))
+        .await
+        .unwrap();
+    tokio::fs::write(cwd.join("templates/review.md"), "Review {target}.")
+        .await
+        .unwrap();
+
+    let mut session = create_agent_session()
+        .with_cwd(cwd.clone())
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(fake_runtime())
+        .with_model(Model {
+            provider: "mock".into(),
+            api: "mock".into(),
+            id: "alpha".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        })
+        .build()
+        .await
+        .expect("build");
+
+    // Loaded resources: project instructions became a skill, the template is
+    // available.
+    let resources = ResourceLoader::new(&cwd).snapshot().await.unwrap();
+    assert_eq!(resources.skills.len(), 1);
+    assert_eq!(resources.prompt_templates.len(), 1);
+    println!(
+        "resources: {} skills, {} templates",
+        resources.skills.len(),
+        resources.prompt_templates.len()
+    );
+
+    // Tool turn.
+    let messages = session.prompt("read README.md").await.expect("prompt");
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult { .. }))
+    );
+    println!("tool turn produced {} messages", messages.len());
+
+    // Model switch + compact. A tiny context window guarantees the
+    // conversation is over the threshold.
+    session
+        .set_model(Model {
+            provider: "mock".into(),
+            api: "mock".into(),
+            id: "beta".into(),
+            context_window: 200,
+            max_tokens: 8_192,
+            thinking: ThinkingKind::None,
+            metadata: Default::default(),
+        })
+        .await
+        .expect("set_model");
+    session.set_compaction_settings(pi::compaction::CompactionSettings {
+        keep_recent_tokens: 10,
+        ..Default::default()
+    });
+    session.compact().await.expect("compact");
+    session.prompt("continue the work").await.expect("prompt 2");
+
+    let stats = session.stats().await.expect("stats");
+    println!(
+        "session stats: entries={} messages={}",
+        stats.entries, stats.messages
+    );
+
+    // Close and reopen: the session resumes.
+    let _path = session.close();
+    let repo = pi::session::repository::SessionRepository::new(dir.path().join("sessions"));
+    let listed = repo.list().await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let mut resumed = create_agent_session()
+        .with_cwd(cwd)
+        .with_model_runtime(fake_runtime())
+        .open(listed[0].path.clone())
+        .await
+        .expect("reopen");
+    resumed.restore().await.expect("restore");
+    resumed.prompt("resume").await.expect("resume prompt");
+    println!(
+        "resumed transcript: {} messages",
+        resumed.harness_messages().len()
+    );
+    println!(
+        "OK: coding-agent facade — session, tools, resources, model switch, compact, reopen, continue"
+    );
+}

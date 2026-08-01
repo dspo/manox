@@ -11,6 +11,7 @@
 //   ExecutionEnv  — how the harness accesses filesystem and shell
 
 pub mod cache_stats;
+pub mod coding_agent;
 pub mod compaction;
 pub mod env;
 pub mod harness;

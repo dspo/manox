@@ -78,6 +78,13 @@ pub struct JsonlSessionStorage {
 }
 
 impl JsonlSessionStorage {
+    /// The session file path.
+    pub fn path(&self) -> &Path {
+        &self.jsonl_path
+    }
+}
+
+impl JsonlSessionStorage {
     /// Create a new session file at `path`, writing `metadata` as the header.
     ///
     /// The path is the exact file location — the caller owns the naming scheme
