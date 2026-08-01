@@ -12,6 +12,7 @@
 | 双循环结构 | ✅ | 外层 follow-up 循环 + 内层 tool call/steering 循环 |
 | 队列排空时机 | ✅ | steering 在 tool call 边界注入，follow-up 在将停时注入；agent_end 前两队列排空 |
 | 截断安全 | ✅ | stop_reason == length 时 fail 全部 tool calls |
+| 失败终态保留 partial | ✅（2026-08-01） | provider 中途失败时基于已流出的最新 partial Assistant 构造终端 error（保留 content/usage/response id，只覆盖 stop reason 与 error message），对齐 TS catch 路径 |
 | 中止检查 | ✅ | 批次级 CancellationToken 检查；取消中断执行中的工具（进程组树杀，对齐 TS killProcessTree） |
 | 工具 progress | ✅ | 同步 emit 经 unbounded channel 实时转发，全部 update 先于 ToolExecutionEnd 结算（TS settled updateEvents 同序） |
 
@@ -33,7 +34,7 @@
 | overflow compact-retry | ✅ | 一次性预算 + 同模型/stale/aborted 守卫；摘除失败终端（session 保留）→ 压缩 → 重试一次；成功 assistant 重新武装 |
 | threshold compact-no-retry | ✅（2026-07-31） | settled 回合（成功/错误）后计量超阈值即为下一回合压缩，不重试；维护性压缩失败只记日志，已完结回合结果不受影响（对齐 TS `_runAutoCompaction` catch → return false） |
 | 压缩期队列处理 | ✅（2026-07-31） | 压缩只替换 transcript 不清队列；settle 循环最外层检查 queued 消息，非空即续跑一次 continuation 投递（对齐 TS `_handlePostAgentRun` 末行 `hasQueuedMessages()`，2026-08-01 从 threshold 分支提升到最外层） |
-| session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`）；`HarnessHandle::abort`/`wait_for_idle` 统一覆盖 agent run、退避与 settle（对齐 TS `abort()` → `abortRetry()` + `waitForIdle()`，2026-08-01） |
+| session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`）；`HarnessHandle::abort`/`wait_for_idle` 统一覆盖 agent run、退避与 settle（对齐 TS `abort()` → `abortRetry()` + `waitForIdle()`）；cancel token 先于 Start 事件安装，listener 的 abort 必取消当前退避（2026-08-01） |
 | Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §8 |
 | 持久化粒度 | 🟡 | turn 末批量追加；TS 在 message_end 逐条持久化，turn 中途崩溃不丢。对齐项见「已知余项」 |
 | 运行配置 | ✅ | set_model/set_active_tools 持久化 entry 并校验；restore 回放 thinking tier/active tools/model（ModelResolver 插接，crate registry-free），不追加 entry |
@@ -54,14 +55,14 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | v3 schema | ✅ | 全部 entry 变体逐字段对齐（camelCase rename 全覆盖，parentId 不丢 ancestry） |
-| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01） |
+| JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id（对齐 TS store，2026-08-01） |
 | 上下文重建 | ✅ | get_branch / build_context_entries / build_session_context 对齐 TS；设置类 entry（thinking_level/model_change/active_tools_change）经 SessionContext 上报不回 transcript |
 
 ## 6. Providers（`provider/` ↔ packages/ai）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| Anthropic 形状 | ✅ | content_block_start 自带 text/thinking/signature 保留，signature_delta 追加（对齐 upstream 59ad3dead，2026-07-31）；refusal 的 `stop_details.explanation` 进入 error_message、`rawStopReason` 持久化、redacted thinking 用 `[Reasoning redacted]` 占位（2026-08-01）；terminal guard：缺 `message_stop` 或缺 stop reason 的流报 retryable mid-stream 错误，部分回复不再持久化为成功（对齐 TS 2026-08-01） |
+| Anthropic 形状 | ✅ | content_block_start 自带 text/thinking/signature 保留，signature_delta 追加（对齐 upstream 59ad3dead，2026-07-31）；refusal 的 `stop_details.explanation` 进入 error_message、`rawStopReason` 持久化、redacted thinking 用 `[Reasoning redacted]` 占位（2026-08-01）；terminal guard：缺 `message_stop` 或缺 stop reason 的流报 retryable mid-stream 错误，部分回复不再持久化为成功；尾部未闭合 SSE 解析失败照常传播（对齐 TS 2026-08-01） |
 | Completions 形状 | 🟡 | 已对齐；已知偏差：交错块模型（TS 每条流只合并一个 text/thinking 块，crate pi 交错时另开新块），见「已知余项」；缺 `finish_reason` 的流（含 `[DONE]`-only）默认报 transport 截断，仅显式 `with_supports_finish_reason(false)` 才推断 stop/toolUse（对齐 TS `supportsFinishReason` 默认 true，2026-08-01） |
 | Responses 形状 | ✅ | reasoning encrypted_content 往返、tool call id 规则、孤儿 call 合成结果等逐项对齐 |
 | 握手重试 | ✅ | 形状无关装饰器：429/408/5xx + 连接期传输错误指数退避、Retry-After 遵从、6 次上限、仅握手阶段 |
@@ -104,6 +105,7 @@
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| 第六轮（2026-08-01） | `9367432` | `4488ad55c`（未变） | 3 P2（partial 失败终态保留 / retry token 先于 Start 安装 / JSONL 重复 id 拒绝）+ 2 P3（尾部 SSE 解析错误传播 / 并发测试断言）均已修复，无新 P0/P1 |
 | 第五轮（2026-08-01） | `54873cd` | `4488ad55c`（新对齐基线） | 4 P1（HarnessHandle 取消/等待 / Anthropic terminal guard / Session append 线性化 / Completions 严格 finish_reason）+ 2 P2（retry classifier 正则保真 / ledger 校准）均已修复，见各章节 |
 | 第四轮（2026-08-01） | `fe4431d` | `bf4a90d8`（新对齐基线） | 3 P1（post-run 队列投递 / Completions 截断流 / session auto-retry）+ 1 P2（Anthropic refusal 细节）均已修复，见各章节 |
 | 第三轮（2026-07-31） | `36884be` | `ea781d68`（新对齐基线） | 3 P1（压缩清队列 / content_block_start 丢初始内容 / threshold 未接线）+ 1 P2（本文档拆分），均已修复 |

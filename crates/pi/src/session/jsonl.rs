@@ -163,11 +163,21 @@ impl JsonlSessionStorage {
         };
 
         let mut entries = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let entry: SessionTreeEntry = serde_json::from_str(&line)?;
+            // A duplicate id would make the walk index silently overwrite one
+            // entry with the other — reject the file instead of restoring a
+            // wrong ancestry.
+            if entry.id().is_empty() {
+                anyhow::bail!("session file contains an entry with an empty id");
+            }
+            if !seen_ids.insert(entry.id().to_string()) {
+                anyhow::bail!("duplicate entry id {} in session file", entry.id());
+            }
             entries.push(entry);
         }
         // The cursor follows the last entry: a trailing `leaf` entry
@@ -195,7 +205,21 @@ impl JsonlSessionStorage {
 
     /// The write → index → cursor sequence, atomic under
     /// [`Self::append_lock`]. Trait methods take the lock and delegate here.
+    /// A duplicate or empty id is refused before anything touches disk — the
+    /// walk index would otherwise silently overwrite one entry with another.
     async fn append_entry_locked(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+        if entry.id().is_empty() {
+            anyhow::bail!("refusing entry with empty id");
+        }
+        let exists = self
+            .entries
+            .lock()
+            .await
+            .iter()
+            .any(|e| e.id() == entry.id());
+        if exists {
+            anyhow::bail!("duplicate entry id {}", entry.id());
+        }
         let line = serde_json::to_string(entry)? + "\n";
         self.append_line(&line).await?;
         // Index the entry before moving the cursor, mirroring TS Pi's order:
@@ -1303,18 +1327,89 @@ mod tests {
         }
 
         // All eight entries sit on one path — each append parented onto the
-        // previous one rather than onto a stale leaf.
+        // previous one rather than onto a stale leaf. The chain is asserted
+        // structurally (whatever order the lock granted), and the branch is
+        // exactly the set the spawned appends returned.
         let branch = session.get_branch().await.unwrap();
         assert_eq!(branch.len(), 8, "{branch:?}");
-        for (index, entry) in branch.iter().enumerate() {
+        for pair in branch.windows(2) {
             assert_eq!(
-                entry.parent_id(),
-                index
-                    .checked_sub(1)
-                    .and_then(|i| ids.get(i))
-                    .map(|s| s.as_str()),
-                "entry {index} parents onto its predecessor: {branch:?}"
+                pair[1].parent_id(),
+                Some(pair[0].id()),
+                "each entry parents onto its predecessor: {branch:?}"
             );
         }
+        let mut branch_ids: Vec<&str> = branch.iter().map(|e| e.id()).collect();
+        branch_ids.sort_unstable();
+        let mut returned_ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        returned_ids.sort_unstable();
+        assert_eq!(branch_ids, returned_ids);
+    }
+
+    /// A file whose entries repeat an id is rejected on load — the walk index
+    /// would otherwise silently overwrite one entry with the other.
+    #[tokio::test]
+    async fn test_load_rejects_duplicate_entry_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let err = JsonlSessionStorage::open(&path)
+            .await
+            .err()
+            .expect("open must fail");
+        assert!(err.to_string().contains("duplicate entry id m1"), "{err}");
+    }
+
+    /// A direct append with a repeated id is refused before touching disk.
+    #[tokio::test]
+    async fn test_append_rejects_duplicate_entry_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
+        let entry = SessionTreeEntry::Message {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("first"),
+        };
+        storage.append_entry(&entry).await.unwrap();
+        let dup = SessionTreeEntry::Message {
+            id: "m1".into(),
+            parent_id: Some("m1".into()),
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("second"),
+        };
+        let err = storage.append_entry(&dup).await.unwrap_err();
+        assert!(err.to_string().contains("duplicate entry id m1"), "{err}");
+        // The rejected entry left no trace: the file and index hold one entry.
+        assert_eq!(storage.get_entries().await.unwrap().len(), 1);
+        assert_eq!(storage.get_leaf_id().await.unwrap().as_deref(), Some("m1"));
+    }
+
+    /// An entry with an empty id is refused on append.
+    #[tokio::test]
+    async fn test_append_rejects_empty_entry_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
+        let entry = SessionTreeEntry::Message {
+            id: String::new(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("bad"),
+        };
+        let err = storage.append_entry(&entry).await.unwrap_err();
+        assert!(err.to_string().contains("empty id"), "{err}");
+        assert!(storage.get_entries().await.unwrap().is_empty());
     }
 }

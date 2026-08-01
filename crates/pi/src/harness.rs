@@ -894,6 +894,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         let delay = std::time::Duration::from_millis(
             settings.base_delay_ms * 2u64.pow(self.retry_attempt - 1),
         );
+        // Arm the cancellation token and the Retry phase BEFORE the Start
+        // event goes out: a listener reacting to the event with an abort must
+        // cancel this backoff, not the previous (already spent) one.
+        let cancel = CancellationToken::new();
+        *self.control.retry_cancel.lock().unwrap() = cancel.clone();
+        self.phase = AgentHarnessPhase::Retry;
         self.emit_retry(RetryEvent::Start {
             attempt: self.retry_attempt,
             max_attempts: settings.max_retries,
@@ -910,9 +916,6 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.agent.replace_transcript(messages);
         self.message_entry_ids.pop();
 
-        let cancel = CancellationToken::new();
-        *self.control.retry_cancel.lock().unwrap() = cancel.clone();
-        self.phase = AgentHarnessPhase::Retry;
         let slept = tokio::select! {
             _ = cancel.cancelled() => false,
             _ = tokio::time::sleep(delay) => true,
@@ -3110,6 +3113,51 @@ mod tests {
         harness.prompt("second").await.unwrap();
         abort_task.await.unwrap();
         handle.wait_for_idle().await;
+    }
+
+    /// An abort issued from the `auto_retry_start` listener must cancel the
+    /// backoff it just announced — the token is armed before the event goes
+    /// out. Multi-threaded runtime so the listener could observe the old
+    /// token if the ordering were wrong.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_abort_from_retry_start_listener_cancels_the_new_backoff() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 60_000,
+            ..Default::default()
+        });
+        let abort_handle = harness.handle();
+        harness.on_auto_retry(move |event| {
+            if matches!(event, RetryEvent::Start { .. }) {
+                abort_handle.abort();
+            }
+        });
+
+        harness.prompt("first").await.unwrap();
+        let messages = harness.prompt("second").await.unwrap();
+        // The listener's abort landed on the armed token: the 60s backoff
+        // never ran and no retry turn followed.
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                ..
+            }
+        ));
+        assert_eq!(harness.retry_attempt(), 0);
     }
 
     /// Context overflow never enters the agent-level auto-retry — it goes to

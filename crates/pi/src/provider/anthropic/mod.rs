@@ -113,10 +113,14 @@ impl StreamFn for AnthropicStreamFn {
             }
         }
 
-        // Drain any trailing unterminated event.
+        // Drain any trailing unterminated event. A malformed final payload is
+        // a parse failure like any other — only `[DONE]` (which the feed loop
+        // skips too) is tolerated.
         if let Some(payload) = parser.finish()
-            && let Ok(event) = serde_json::from_str::<RawStreamEvent>(&payload)
+            && payload != "[DONE]"
         {
+            let event: RawStreamEvent =
+                serde_json::from_str(&payload).map_err(ProviderError::Json)?;
             acc.apply(event, &event_tx).await?;
         }
 
@@ -1043,6 +1047,26 @@ mod tests {
         };
         assert_eq!(*stop_reason, Some(StopReason::Stop));
         assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "hi there"));
+    }
+
+    /// A malformed trailing payload (an unterminated final event) is a parse
+    /// failure, not a silently skipped tail — the stream must surface it.
+    #[tokio::test]
+    async fn malformed_trailing_payload_is_a_parse_error() {
+        let body = format!(
+            "{MESSAGE_START}data: {{{{malformed\n" // no trailing blank line
+        );
+        let addr = serve_anthropic(body).await;
+        let stream_fn = anthropic_fixture(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Json(_))
+        ));
     }
 
     fn start_event() -> RawStreamEvent {

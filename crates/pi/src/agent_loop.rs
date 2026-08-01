@@ -396,16 +396,24 @@ async fn stream_assistant_response(
     // Accumulate streaming state on the receiver side. The stream may emit
     // its own MessageStart/MessageEnd; the loop only backstops the lifecycle
     // events the stream never sent, so exactly one of each reaches the sink
-    // per assistant message.
+    // per assistant message. The latest partial assistant snapshot is kept so
+    // a provider failure is materialized from the text that already streamed
+    // rather than an empty shell — TS marks the same partial message as an
+    // error, preserving content and usage.
     let mut first = true;
     let mut saw_end = false;
+    let mut last_assistant: Option<AgentMessage> = None;
 
     // Process events as they arrive from the channel.
     // The channel closes when the sender is dropped (stream completes or errors).
     while let Some(event) = event_rx.recv().await {
         match &event {
-            AgentEvent::MessageStart { .. } => {
+            AgentEvent::MessageStart { message } => {
                 first = false;
+                last_assistant = Some((**message).clone());
+            }
+            AgentEvent::MessageUpdate { message, .. } => {
+                last_assistant = Some((**message).clone());
             }
             AgentEvent::MessageEnd { .. } => {
                 saw_end = true;
@@ -421,8 +429,11 @@ async fn stream_assistant_response(
     // failure from the event stream and the run can close out cleanly.
     let message = match stream_handle.await {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => terminal_message(context, signal, &api, e.to_string()),
-        Err(join_err) => terminal_message(
+        Ok(Err(e)) => {
+            terminal_message_from_partial(last_assistant, context, signal, &api, e.to_string())
+        }
+        Err(join_err) => terminal_message_from_partial(
+            last_assistant,
             context,
             signal,
             &api,
@@ -481,6 +492,53 @@ fn terminal_message(
         usage: Box::new(Usage::default()),
         error_message: Some(error_message),
         timestamp: chrono::Utc::now(),
+    }
+}
+
+/// Terminal error for a provider failure that struck mid-stream: when a
+/// partial assistant already streamed, the failure is materialized from that
+/// snapshot — same content, usage, and response identity — with only the stop
+/// reason and error message overwritten, mirroring TS's catch which marks the
+/// in-flight output as `stopReason: error`. Falls back to an empty terminal
+/// message when the stream failed before emitting anything.
+fn terminal_message_from_partial(
+    partial: Option<AgentMessage>,
+    context: &AgentContext,
+    signal: &CancellationToken,
+    api: &str,
+    error_message: String,
+) -> AgentMessage {
+    let stop_reason = if signal.is_cancelled() {
+        StopReason::Aborted
+    } else {
+        StopReason::Error
+    };
+    match partial {
+        Some(AgentMessage::Assistant {
+            content,
+            model,
+            provider,
+            response_model,
+            response_id,
+            diagnostics,
+            raw_stop_reason,
+            usage,
+            ..
+        }) => AgentMessage::Assistant {
+            content,
+            model,
+            provider,
+            api: api.to_string(),
+            response_model,
+            response_id,
+            diagnostics,
+            raw_stop_reason,
+            stop_reason: Some(stop_reason),
+            usage,
+            error_message: Some(error_message),
+            timestamp: chrono::Utc::now(),
+        },
+        _ => terminal_message(context, signal, api, error_message),
     }
 }
 
@@ -1664,5 +1722,107 @@ mod tests {
             1,
             "the loop must not append a second message_end after the stream's own"
         );
+    }
+
+    /// A stream that emits a partial assistant then fails mid-flight, as a
+    /// provider does when the connection drops after streaming some text.
+    struct PartialThenFailStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for PartialThenFailStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let mut message = AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "partial".into(),
+                    signature: None,
+                }],
+                model: "mock".into(),
+                provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: Some("resp_1".into()),
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: None,
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            };
+            if let AgentMessage::Assistant { usage, .. } = &mut message {
+                usage.output_tokens = 7;
+            }
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentEvent::MessageUpdate {
+                    message: Box::new(message.clone()),
+                    assistant_message_event: crate::types::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "partial".into(),
+                    },
+                })
+                .await;
+            Err(anyhow::anyhow!("connection reset"))
+        }
+    }
+
+    /// A mid-stream provider failure is materialized from the partial
+    /// assistant that already streamed — content, usage, and response id
+    /// survive the error, so the text the user saw does not vanish from the
+    /// persisted turn (TS marks the same in-flight output as an error).
+    #[tokio::test]
+    async fn provider_error_keeps_streamed_partial_content() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(PartialThenFailStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let assistant = messages
+            .iter()
+            .find(|m| matches!(m, AgentMessage::Assistant { .. }))
+            .expect("terminal assistant");
+        let AgentMessage::Assistant {
+            content,
+            stop_reason,
+            error_message,
+            usage,
+            response_id,
+            ..
+        } = assistant
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Error));
+        assert!(
+            error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("connection reset")),
+            "{assistant:?}"
+        );
+        assert!(
+            matches!(&content[0], ContentBlock::Text { text, .. } if text == "partial"),
+            "the streamed partial text survives the error: {assistant:?}"
+        );
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(response_id.as_deref(), Some("resp_1"));
     }
 }
