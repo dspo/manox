@@ -120,6 +120,23 @@ impl StreamFn for AnthropicStreamFn {
             acc.apply(event, &event_tx).await?;
         }
 
+        // A stream that began but never reached `message_stop` was cut short,
+        // and a stream that never reported a stop reason is incomplete — both
+        // surface as failures rather than persisting a partial reply, mirroring
+        // the TS throws on a missing message_stop / a pending stop reason.
+        if acc.started() && !acc.message_stop_seen() {
+            return Err(ProviderError::MidStream(
+                "Anthropic stream ended before message_stop".into(),
+            )
+            .into());
+        }
+        if acc.stop_reason().is_none() {
+            return Err(ProviderError::MidStream(
+                "Anthropic stream ended without a stop reason".into(),
+            )
+            .into());
+        }
+
         acc.finish(&event_tx).await
     }
 }
@@ -149,6 +166,9 @@ struct Accumulator {
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
     started: bool,
+    /// Whether the protocol's terminal `message_stop` event arrived. A
+    /// stream that began but never reached it was cut short.
+    message_stop_seen: bool,
 }
 
 impl Accumulator {
@@ -165,7 +185,20 @@ impl Accumulator {
             stop_reason: None,
             usage: Box::new(Usage::default()),
             started: false,
+            message_stop_seen: false,
         }
+    }
+
+    fn started(&self) -> bool {
+        self.started
+    }
+
+    fn message_stop_seen(&self) -> bool {
+        self.message_stop_seen
+    }
+
+    fn stop_reason(&self) -> Option<crate::types::StopReason> {
+        self.stop_reason
     }
 
     fn current(&self) -> AgentMessage {
@@ -418,7 +451,10 @@ impl Accumulator {
                     self.usage = merged;
                 }
             }
-            RawStreamEvent::MessageStop | RawStreamEvent::Ping => {}
+            RawStreamEvent::MessageStop => {
+                self.message_stop_seen = true;
+            }
+            RawStreamEvent::Ping => {}
         }
         Ok(())
     }
@@ -899,6 +935,115 @@ mod tests {
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────
+
+    fn anthropic_fixture(addr: &str) -> AnthropicStreamFn {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        AnthropicStreamFn {
+            client,
+            api_key: "test-key".into(),
+            base_url: format!("http://{addr}"),
+            options: StreamOptions::default(),
+        }
+    }
+
+    /// Serve one SSE body then close the connection.
+    async fn serve_anthropic(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    const MESSAGE_START: &str = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-test\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"usage\":{}}}\n\n";
+    const MESSAGE_STOP: &str = "data: {\"type\":\"message_stop\"}\n\n";
+
+    /// A stream that began but never reached `message_stop` was cut short:
+    /// the partial reply must not be persisted as a completed response.
+    #[tokio::test]
+    async fn stream_without_message_stop_is_midstream_error() {
+        let addr = serve_anthropic(MESSAGE_START.to_string()).await;
+        let stream_fn = anthropic_fixture(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::MidStream(m)) if m.contains("before message_stop")
+        ));
+    }
+
+    /// A stream that reaches `message_stop` without ever reporting a stop
+    /// reason is incomplete — the finalized message must carry one.
+    #[tokio::test]
+    async fn stream_without_stop_reason_is_midstream_error() {
+        let body = format!("{MESSAGE_START}{MESSAGE_STOP}");
+        let addr = serve_anthropic(body).await;
+        let stream_fn = anthropic_fixture(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::MidStream(m)) if m.contains("without a stop reason")
+        ));
+    }
+
+    /// An empty 200 stream is neither a completed response nor a started one:
+    /// the missing stop reason surfaces the failure.
+    #[tokio::test]
+    async fn empty_stream_is_midstream_error() {
+        let addr = serve_anthropic(String::new()).await;
+        let stream_fn = anthropic_fixture(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::MidStream(m)) if m.contains("without a stop reason")
+        ));
+    }
+
+    /// A complete stream — start, delta with a stop reason, stop — still
+    /// finishes as a normal message.
+    #[tokio::test]
+    async fn complete_stream_finishes_normally() {
+        let body = format!(
+            "{MESSAGE_START}data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"hi\"}}}}\n\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\" there\"}}}}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{}}}}\n\n{MESSAGE_STOP}"
+        );
+        let addr = serve_anthropic(body).await;
+        let stream_fn = anthropic_fixture(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let message = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap();
+        let AgentMessage::Assistant {
+            stop_reason,
+            content,
+            ..
+        } = &message
+        else {
+            panic!("expected assistant")
+        };
+        assert_eq!(*stop_reason, Some(StopReason::Stop));
+        assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "hi there"));
+    }
 
     fn start_event() -> RawStreamEvent {
         RawStreamEvent::MessageStart {

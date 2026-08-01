@@ -258,77 +258,77 @@ where
 /// limits and quota/billing exhaustion are deterministic and would burn the
 /// retry budget. Mirrors the TS `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
 const NON_RETRYABLE_PATTERNS: &[&str] = &[
-    "gousagelimiterror",
-    "freeusagelimiterror",
-    "monthlyusagelimitreached",
-    "availablebalance",
+    "GoUsageLimitError",
+    "FreeUsageLimitError",
+    "Monthly usage limit reached",
+    "available balance",
     "insufficient_quota",
-    "outofbudget",
-    "quotaexceeded",
+    "out of budget",
+    "quota exceeded",
     "billing",
 ];
 
-/// Error substrings that classify as retryable — provider load, transient
-/// HTTP statuses, transport failures, and premature stream endings. Mirrors
-/// the TS `RETRYABLE_PROVIDER_ERROR_PATTERN`; the regex `.?` separators fold
-/// into the comparison spelling, so e.g. "rate.?limit" matches both
-/// "rate limit" and "ratelimit".
+/// Error patterns that classify as retryable — provider load, transient HTTP
+/// statuses, transport failures, and premature stream endings. Verbatim TS
+/// `RETRYABLE_PROVIDER_ERROR_PATTERN`: the `.?` separators match one optional
+/// character, so e.g. "rate.?limit" hits "rate limit", "ratelimit", and
+/// "rate-limit" alike.
 const RETRYABLE_PATTERNS: &[&str] = &[
     "overloaded",
-    "ratelimit",
-    "toomanyrequests",
+    "rate.?limit",
+    "too many requests",
     "429",
     "500",
     "502",
     "503",
     "504",
     "524",
-    "serviceunavailable",
-    "servererror",
-    "internalerror",
-    "providerreturnederror",
-    "networkerror",
-    "connectionerror",
-    "connectionrefused",
-    "connectionlost",
-    "othersideclosed",
-    "fetchfailed",
+    "service.?unavailable",
+    "server.?error",
+    "internal.?error",
+    "provider.?returned.?error",
+    "network.?error",
+    "connection.?error",
+    "connection.?refused",
+    "connection.?lost",
+    "other side closed",
+    "fetch failed",
     "getaddrinfo",
-    "enotfound",
-    "eai_again",
-    "upstreamconnect",
-    "resetbeforeheaders",
-    "sockethangup",
-    "socketconnectionwasclosed",
-    "timedout",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "upstream.?connect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed? out",
     "timeout",
     "terminated",
-    "websocketclosed",
-    "websocketerror",
-    "endedwithout",
-    "streamendedbeforemessage_stop",
-    "streamendedbeforeaterminalresponseevent",
-    "http2requestdidnotgetaresponse",
-    "retrydelay",
-    "youcanretryyourrequest",
-    "tryyourrequestagain",
-    "pleaseretryyourrequest",
-    "resourceexhausted",
+    "websocket.?closed",
+    "websocket.?error",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "ResourceExhausted",
 ];
 
-/// Fold text to the comparison spelling: lowercase with whitespace removed.
-fn comparison_spelling(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
+fn combined_regex(patterns: &[&str]) -> regex::Regex {
+    regex::RegexBuilder::new(&patterns.join("|"))
+        .case_insensitive(true)
+        .build()
+        .expect("static retry patterns are valid regex")
 }
 
 /// Classify whether a failed assistant message looks like a transient
-/// provider or transport error, mirroring the TS `isRetryableAssistantError`.
-/// Callers handle context overflow separately (compaction, not retry); this
-/// classifier itself does not know the context window. A non-retryable limit
-/// pattern wins over a retryable one, so deterministic errors fail fast.
+/// provider or transport error, mirroring the TS `isRetryableAssistantError`
+/// (a case-insensitive regex over the raw provider text). Callers handle
+/// context overflow separately (compaction, not retry); this classifier
+/// itself does not know the context window. A non-retryable limit pattern
+/// wins over a retryable one, so deterministic errors fail fast.
 pub fn is_retryable_assistant_error(message: &crate::types::AgentMessage) -> bool {
     let crate::types::AgentMessage::Assistant {
         stop_reason,
@@ -344,11 +344,17 @@ pub fn is_retryable_assistant_error(message: &crate::types::AgentMessage) -> boo
     let Some(error_message) = error_message else {
         return false;
     };
-    let spelling = comparison_spelling(error_message);
-    if NON_RETRYABLE_PATTERNS.iter().any(|p| spelling.contains(p)) {
+    static NON_RETRYABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RETRYABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if NON_RETRYABLE
+        .get_or_init(|| combined_regex(NON_RETRYABLE_PATTERNS))
+        .is_match(error_message)
+    {
         return false;
     }
-    RETRYABLE_PATTERNS.iter().any(|p| spelling.contains(p))
+    RETRYABLE
+        .get_or_init(|| combined_regex(RETRYABLE_PATTERNS))
+        .is_match(error_message)
 }
 
 #[cfg(test)]
@@ -592,16 +598,19 @@ mod tests {
     }
 
     #[test]
-    fn comparison_spelling_folds_spacing_and_case() {
-        // The TS regex `.?` separators collapse to one spelling: "rate limit"
-        // and "ratelimit" both match, as do service errors with odd spacing.
+    fn retryable_assistant_error_matches_ts_regex_separators() {
+        // The TS `.?` separator matches one optional character: a space, a
+        // dash, an underscore, or nothing at all.
         for message in [
             "Rate Limit exceeded",
+            "rate-limit exceeded",
+            "rate_limit exceeded",
             "ratelimit exceeded",
-            "Service  Unavailable",
-            "serviceunavailable",
-            "server  error",
-            "stream ended  without  finish_reason",
+            "connection_error",
+            "service-unavailable",
+            "Service Unavailable",
+            "server_error",
+            "stream ended before message_stop",
         ] {
             assert!(
                 is_retryable_assistant_error(&assistant(Some(message))),

@@ -32,6 +32,11 @@ pub struct CompletionsStreamFn {
     api_key: String,
     base_url: String,
     options: StreamOptions,
+    /// Whether the endpoint reports `finish_reason` (TS
+    /// `supportsFinishReason`, default true). A stream that ends without one
+    /// is truncated and surfaces an error; only endpoints that explicitly
+    /// opt out accept a missing `finish_reason` and infer `stop`/`toolUse`.
+    supports_finish_reason: bool,
 }
 
 impl CompletionsStreamFn {
@@ -41,6 +46,7 @@ impl CompletionsStreamFn {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             options: StreamOptions::default(),
+            supports_finish_reason: true,
         }
     }
 
@@ -57,6 +63,14 @@ impl CompletionsStreamFn {
     /// Override the HTTP client (e.g. to inject a test transport).
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Declare that the endpoint never reports `finish_reason`; a stream
+    /// without one then infers `stop`/`toolUse` instead of being treated as
+    /// truncated (TS `model.compat.supportsFinishReason: false`).
+    pub fn with_supports_finish_reason(mut self, supports: bool) -> Self {
+        self.supports_finish_reason = supports;
         self
     }
 }
@@ -93,7 +107,6 @@ impl StreamFn for CompletionsStreamFn {
         let mut acc = Accumulator::new(context);
         let mut parser = SseParser::new();
         let mut byte_stream = response.bytes_stream();
-        let mut saw_done = false;
 
         loop {
             let chunk = tokio::select! {
@@ -106,7 +119,6 @@ impl StreamFn for CompletionsStreamFn {
 
             for payload in parser.feed(&bytes) {
                 if payload == "[DONE]" {
-                    saw_done = true;
                     continue;
                 }
                 apply_payload(&mut acc, &payload, &event_tx).await?;
@@ -114,20 +126,19 @@ impl StreamFn for CompletionsStreamFn {
         }
 
         // Drain any trailing unterminated event.
-        if let Some(payload) = parser.finish() {
-            if payload == "[DONE]" {
-                saw_done = true;
-            } else {
-                apply_payload(&mut acc, &payload, &event_tx).await?;
-            }
+        if let Some(payload) = parser.finish()
+            && payload != "[DONE]"
+        {
+            apply_payload(&mut acc, &payload, &event_tx).await?;
         }
 
-        // A stream that ended before the protocol's terminal marker — no
-        // `[DONE]` and no `finish_reason` — is a truncated response, not a
-        // completed one: surface it as a transport failure instead of
-        // persisting the partial message as if it were whole, mirroring the
-        // TS throw on a missing finish_reason.
-        if !saw_done && !acc.has_finish_reason() {
+        // A stream that ended without a `finish_reason` is truncated — even
+        // one closed by `[DONE]` — and must not persist a partial message as
+        // if it were whole, mirroring the TS throw for a missing
+        // finish_reason under the default `supportsFinishReason: true`.
+        // Endpoints that never report it opt out via
+        // [`CompletionsStreamFn::with_supports_finish_reason`].
+        if !acc.has_finish_reason() && self.supports_finish_reason {
             return Err(
                 ProviderError::Transport("stream ended without finish_reason".into()).into(),
             );
@@ -929,6 +940,7 @@ mod tests {
             api_key: "test-key".into(),
             base_url: format!("http://{addr}"),
             options: StreamOptions::default(),
+            supports_finish_reason: true,
         }
     }
 
@@ -971,15 +983,35 @@ mod tests {
         ));
     }
 
-    /// A stream terminated by `[DONE]` alone completes with the inferred
-    /// stop reason — endpoints that skip `finish_reason` are still whole
-    /// responses.
+    /// A stream closed by `[DONE]` without a `finish_reason` is truncated
+    /// under the default strict mode (`supportsFinishReason: true`) — only
+    /// an endpoint that explicitly opts out accepts it.
     #[tokio::test]
-    async fn done_terminated_stream_completes_with_inferred_stop() {
+    async fn done_terminated_stream_without_finish_reason_is_truncated() {
         let body = "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
 data: [DONE]\n\n";
         let addr = serve_one(body).await;
         let stream_fn = fixture_stream_fn(&addr);
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_fn
+            .stream(&ctx(), CancellationToken::new(), tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Transport(_))
+        ));
+    }
+
+    /// An endpoint declared without `finish_reason` support completes a
+    /// `[DONE]`-closed stream with the inferred stop reason (TS
+    /// `supportsFinishReason: false`).
+    #[tokio::test]
+    async fn compat_endpoint_without_finish_reason_infers_stop() {
+        let body = "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+data: [DONE]\n\n";
+        let addr = serve_one(body).await;
+        let stream_fn = fixture_stream_fn(&addr).with_supports_finish_reason(false);
         let (tx, _rx) = mpsc::channel(64);
         let message = stream_fn
             .stream(&ctx(), CancellationToken::new(), tx)

@@ -69,6 +69,10 @@ pub struct JsonlSessionStorage {
     /// Current leaf cursor. For a `leaf` entry this is its `targetId`;
     /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
+    /// Serializes the write → index → cursor sequence so concurrent appends
+    /// never interleave the three steps and diverge disk order from the
+    /// in-memory index or the cursor.
+    append_lock: Mutex<()>,
     /// Metadata read from the header (file is authoritative on reopen).
     pub metadata: JsonlSessionMetadata,
 }
@@ -108,6 +112,7 @@ impl JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
             entries: Mutex::new(Vec::new()),
             leaf_id: Mutex::new(None),
+            append_lock: Mutex::new(()),
             metadata,
         })
     }
@@ -173,6 +178,7 @@ impl JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
             entries: Mutex::new(entries),
             leaf_id: Mutex::new(leaf_id),
+            append_lock: Mutex::new(()),
             metadata,
         })
     }
@@ -186,15 +192,10 @@ impl JsonlSessionStorage {
         file.write_all(line.as_bytes()).await?;
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl SessionStorage for JsonlSessionStorage {
-    async fn create_entry_id(&self) -> Result<String, anyhow::Error> {
-        Ok(uuid::Uuid::new_v4().to_string())
-    }
-
-    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+    /// The write → index → cursor sequence, atomic under
+    /// [`Self::append_lock`]. Trait methods take the lock and delegate here.
+    async fn append_entry_locked(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
         let line = serde_json::to_string(entry)? + "\n";
         self.append_line(&line).await?;
         // Index the entry before moving the cursor, mirroring TS Pi's order:
@@ -205,6 +206,18 @@ impl SessionStorage for JsonlSessionStorage {
         // `targetId`, otherwise the entry becomes the cursor itself.
         *self.leaf_id.lock().await = entry.leaf_cursor_after();
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStorage for JsonlSessionStorage {
+    async fn create_entry_id(&self) -> Result<String, anyhow::Error> {
+        Ok(uuid::Uuid::new_v4().to_string())
+    }
+
+    async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        self.append_entry_locked(entry).await
     }
 
     async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
@@ -226,6 +239,7 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
         // Validate the target exists before recording the move.
         if let Some(id) = leaf_id {
             let exists = self.entries.lock().await.iter().any(|e| e.id() == id);
@@ -244,7 +258,7 @@ impl SessionStorage for JsonlSessionStorage {
         // Reuse the shared append path so the leaf entry lands on disk, in the
         // in-memory index, and as the cursor through one code path — the
         // cursor becomes the leaf's `targetId` via `leaf_cursor_after`.
-        self.append_entry(&entry).await
+        self.append_entry_locked(&entry).await
     }
 
     async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
@@ -1259,5 +1273,48 @@ mod tests {
         // A well-formed chain still walks.
         let path = storage.get_path(Some("m1")).await.unwrap();
         assert_eq!(path.len(), 1);
+    }
+
+    /// Concurrent appends must chain onto each other, never fork sibling
+    /// branches: the session serializes parent-selection + append, so the
+    /// second append's parent is the first's id (upstream 4488ad55c).
+    #[tokio::test]
+    async fn test_concurrent_appends_form_a_chain_not_siblings() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
+            .await
+            .unwrap();
+        let session = std::sync::Arc::new(Session::new(storage));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let session = std::sync::Arc::clone(&session);
+            handles.push(tokio::spawn(async move {
+                session
+                    .append_message(AgentMessage::user("concurrent"))
+                    .await
+            }));
+        }
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.unwrap().unwrap());
+        }
+
+        // All eight entries sit on one path — each append parented onto the
+        // previous one rather than onto a stale leaf.
+        let branch = session.get_branch().await.unwrap();
+        assert_eq!(branch.len(), 8, "{branch:?}");
+        for (index, entry) in branch.iter().enumerate() {
+            assert_eq!(
+                entry.parent_id(),
+                index
+                    .checked_sub(1)
+                    .and_then(|i| ids.get(i))
+                    .map(|s| s.as_str()),
+                "entry {index} parents onto its predecessor: {branch:?}"
+            );
+        }
     }
 }

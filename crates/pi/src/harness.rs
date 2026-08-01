@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
@@ -85,6 +85,80 @@ pub enum RetryEvent {
         attempt: u32,
         final_error: Option<String>,
     },
+}
+
+/// Shared harness control state exposed as [`AgentHarness::handle`], so a
+/// caller can abort or await a harness that `prompt`/`continue_` own
+/// exclusively — the retry backoff runs while the harness is `&mut`-borrowed.
+struct HarnessControl {
+    /// The current retry backoff token, or a cancelled one when no retry is
+    /// in flight. Each retry arms a fresh token; [`HarnessHandle::abort`]
+    /// and [`AgentHarness::abort`] fire the live one.
+    retry_cancel: std::sync::Mutex<CancellationToken>,
+    /// Number of operations (prompt/continue_/compact, including their
+    /// settle phases) in flight; zero means the harness is fully settled.
+    active_tx: watch::Sender<usize>,
+}
+
+/// Sets the harness's active count for the duration of an operation and
+/// decrements it on drop, so a shared handle's `wait_for_idle` observes the
+/// whole operation — agent run plus settle — rather than just the agent turn.
+struct ActiveGuard {
+    tx: watch::Sender<usize>,
+}
+
+impl ActiveGuard {
+    fn arm(control: &HarnessControl) -> Self {
+        let tx = control.active_tx.clone();
+        tx.send_modify(|n| *n += 1);
+        ActiveGuard { tx }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.tx.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+/// A decoupled handle for mid-run control of a harness, mirroring the TS
+/// session's abort/waitForIdle surface: it reaches the agent run, the retry
+/// backoff, and the full settle signal without holding `&mut self`, so a
+/// caller can cancel or await a harness while `prompt`/`continue_` are in
+/// flight.
+#[derive(Clone)]
+pub struct HarnessHandle {
+    run: crate::agent::RunHandle,
+    control: Arc<HarnessControl>,
+}
+
+impl HarnessHandle {
+    /// Queue a steering message injected into the current or next turn.
+    pub fn steer(&self, message: AgentMessage) {
+        self.run.steer(message);
+    }
+
+    /// Queue a follow-up message that resumes a run that would otherwise stop.
+    pub fn follow_up(&self, message: AgentMessage) {
+        self.run.follow_up(message);
+    }
+
+    /// Abort the agent run and cancel any in-flight retry backoff.
+    pub fn abort(&self) {
+        self.run.abort();
+        self.control.retry_cancel.lock().unwrap().cancel();
+    }
+
+    /// Resolve once the harness is fully settled: no agent run, no retry
+    /// backoff, no settle loop in flight.
+    pub async fn wait_for_idle(&self) {
+        let mut rx = self.control.active_tx.subscribe();
+        while *rx.borrow_and_update() != 0 {
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 /// Hook points that consumers can register handlers for.
@@ -307,9 +381,9 @@ pub struct AgentHarness<S: SessionStorage> {
     /// Attempts used by the current auto-retry lifecycle; reset by any
     /// non-error assistant message. Mirrors TS `_retryAttempt`.
     retry_attempt: u32,
-    /// Cancels the in-flight retry backoff sleep; [`AgentHarness::abort`]
-    /// fires it. A fresh token arms each retry.
-    retry_cancel: CancellationToken,
+    /// Shared mid-run control: the live retry backoff token and the active
+    /// operation count behind [`AgentHarness::handle`].
+    control: Arc<HarnessControl>,
     /// Observer for the auto-retry lifecycle, mirroring TS `_emit` of
     /// `auto_retry_start` / `auto_retry_end`.
     retry_observer: Option<Arc<dyn Fn(RetryEvent) + Send + Sync>>,
@@ -363,7 +437,10 @@ impl<S: SessionStorage> AgentHarness<S> {
             overflow_recovery_attempted: false,
             retry_settings: RetrySettings::default(),
             retry_attempt: 0,
-            retry_cancel: CancellationToken::new(),
+            control: Arc::new(HarnessControl {
+                retry_cancel: std::sync::Mutex::new(CancellationToken::new()),
+                active_tx: watch::Sender::new(0),
+            }),
             retry_observer: None,
             all_tools: Arc::from(Vec::new()),
             active_tool_names: None,
@@ -421,6 +498,17 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Decoupled handle for mid-run control (steer/follow_up/abort).
     pub fn run_handle(&self) -> RunHandle {
         self.agent.run_handle()
+    }
+
+    /// Decoupled harness-level handle: queues, the agent run, the retry
+    /// backoff, and the full settle signal. Unlike [`AgentHarness::run_handle`],
+    /// its `abort` cancels the retry backoff and its `wait_for_idle` resolves
+    /// only after the whole operation (run + settle) settles.
+    pub fn handle(&self) -> HarnessHandle {
+        HarnessHandle {
+            run: self.agent.run_handle(),
+            control: Arc::clone(&self.control),
+        }
     }
 
     /// Current compaction settings.
@@ -552,6 +640,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot prompt while harness is in {:?} phase", self.phase);
         }
+        let _active = ActiveGuard::arm(&self.control);
 
         self.phase = AgentHarnessPhase::Turn;
         // A new user message rearms the one-shot overflow recovery.
@@ -620,6 +709,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot continue while harness is in {:?} phase", self.phase);
         }
+        let _active = ActiveGuard::arm(&self.control);
 
         self.phase = AgentHarnessPhase::Turn;
         let result = self.agent.continue_().await;
@@ -821,11 +911,13 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.message_entry_ids.pop();
 
         let cancel = CancellationToken::new();
-        self.retry_cancel = cancel.clone();
+        *self.control.retry_cancel.lock().unwrap() = cancel.clone();
+        self.phase = AgentHarnessPhase::Retry;
         let slept = tokio::select! {
             _ = cancel.cancelled() => false,
             _ = tokio::time::sleep(delay) => true,
         };
+        self.phase = AgentHarnessPhase::Idle;
         if !slept {
             let attempt = self.retry_attempt;
             self.retry_attempt = 0;
@@ -953,7 +1045,7 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Abort the current agent run and any in-flight retry backoff.
     pub fn abort(&mut self) {
-        self.retry_cancel.cancel();
+        self.control.retry_cancel.lock().unwrap().cancel();
         self.agent.abort();
         self.phase = AgentHarnessPhase::Idle;
     }
@@ -1089,6 +1181,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot compact while harness is in {:?} phase", self.phase);
         }
+        let _active = ActiveGuard::arm(&self.control);
         if self.agent.state().messages.is_empty() {
             anyhow::bail!("Cannot compact an empty transcript");
         }
@@ -2894,6 +2987,129 @@ mod tests {
                 final_error: None,
             }
         ));
+    }
+
+    /// `HarnessHandle::abort` cancels an in-flight retry backoff and
+    /// `HarnessHandle::wait_for_idle` stays pending across the whole
+    /// operation (run + settle), not just the agent turn — the shared control
+    /// surface a caller needs while `prompt` owns the harness exclusively.
+    #[tokio::test]
+    async fn test_handle_abort_cancels_backoff_and_wait_covers_settle() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 60_000,
+            ..Default::default()
+        });
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let start_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(start_tx)));
+        let signal = std::sync::Arc::clone(&start_tx);
+        harness.on_auto_retry(move |event| {
+            if matches!(event, RetryEvent::Start { .. })
+                && let Some(tx) = signal.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        });
+        let handle = harness.handle();
+        let abort_handle = handle.clone();
+
+        let abort_task = tokio::spawn(async move {
+            start_rx.await.unwrap();
+            // The harness is now in the 60s backoff; the shared handle
+            // reaches it even though `prompt` owns the `&mut` borrow.
+            abort_handle.abort();
+        });
+
+        harness.prompt("first").await.unwrap();
+        let messages = harness.prompt("second").await.unwrap();
+        abort_task.await.unwrap();
+
+        // The cancelled backoff never ran the retry: the turn's messages are
+        // the user prompt plus the terminal error, and the lifecycle closed
+        // with the cancellation reason.
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error),
+                error_message: Some(err),
+                ..
+            } if err.contains("overloaded")
+        ));
+        assert_eq!(harness.retry_attempt(), 0);
+
+        // Fully settled: the harness-level wait resolves after the abort
+        // wind-down completes.
+        handle.wait_for_idle().await;
+    }
+
+    /// `HarnessHandle::wait_for_idle` stays pending while the settle loop
+    /// runs after the agent turn — it must not resolve just because the
+    /// agent's own run finished.
+    #[tokio::test]
+    async fn test_handle_wait_for_idle_stays_pending_during_backoff() {
+        let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
+            ScriptedTurn::Answer(2048),
+            ScriptedTurn::RetryableError,
+            ScriptedTurn::Answer(16),
+        ]);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(stream_fn),
+        );
+        harness.set_retry_settings(RetrySettings {
+            base_delay_ms: 60_000,
+            ..Default::default()
+        });
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let start_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(start_tx)));
+        let signal = std::sync::Arc::clone(&start_tx);
+        harness.on_auto_retry(move |event| {
+            if matches!(event, RetryEvent::Start { .. })
+                && let Some(tx) = signal.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+        });
+        let handle = harness.handle();
+        let wait_handle = handle.clone();
+        let abort_handle = handle.clone();
+
+        let abort_task = tokio::spawn(async move {
+            start_rx.await.unwrap();
+            // While the backoff is in flight, the harness is not idle.
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    wait_handle.wait_for_idle(),
+                )
+                .await
+                .is_err(),
+                "wait_for_idle must stay pending during the retry backoff"
+            );
+            abort_handle.abort();
+        });
+
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+        abort_task.await.unwrap();
+        handle.wait_for_idle().await;
     }
 
     /// Context overflow never enters the agent-level auto-retry — it goes to

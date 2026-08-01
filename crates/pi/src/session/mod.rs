@@ -257,6 +257,10 @@ pub trait SessionStorage: Send + Sync {
 /// A session wraps a SessionStorage with context-building logic.
 pub struct Session<S: SessionStorage> {
     storage: S,
+    /// Serializes parent-selection + append so concurrent appends never read
+    /// the same leaf and fork sibling branches — the linearized per-session
+    /// append queue of the TS storage (upstream 4488ad55c).
+    append_lock: tokio::sync::Mutex<()>,
 }
 
 /// Authorship of a persisted compaction: whether a before-compact hook
@@ -271,7 +275,10 @@ pub struct CompactionAuthorship {
 
 impl<S: SessionStorage> Session<S> {
     pub fn new(storage: S) -> Self {
-        Session { storage }
+        Session {
+            storage,
+            append_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub fn storage(&self) -> &S {
@@ -280,6 +287,7 @@ impl<S: SessionStorage> Session<S> {
 
     /// Append a message entry and return the entry ID.
     pub async fn append_message(&self, message: AgentMessage) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
 
@@ -299,6 +307,7 @@ impl<S: SessionStorage> Session<S> {
         provider: &str,
         model_id: &str,
     ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
 
@@ -318,6 +327,7 @@ impl<S: SessionStorage> Session<S> {
         &self,
         active_tool_names: &[String],
     ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
 
@@ -349,6 +359,7 @@ impl<S: SessionStorage> Session<S> {
         authorship: CompactionAuthorship,
         retained_tail: Option<Vec<AgentMessage>>,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
         let timestamp = Utc::now();
