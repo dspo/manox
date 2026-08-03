@@ -213,15 +213,15 @@ pub trait AgentTool: Send + Sync {
 - ✅ `truncate.rs` —— 共享输出截断，保留 head+tail
 - ✅ `path_utils.rs` —— 路径解析、安全边界检查
 
-### Phase 6: 辅助模块 🟡（类型就绪，接线见 S5）
+### Phase 6: 辅助模块 ✅（接线于 S5/S10/S14）
 
 **文件：** `settings.rs`, `trust.rs`, `cache_stats.rs`, `system_prompt.rs`, `output_guard.rs`
 
-1. 🟡 `settings.rs` —— Settings struct + field-wise 合并（serde 序列化助手）；文件加载/保存/reload/递归覆盖未接线（接线方待 S5）
-2. 🟡 `trust.rs` —— 项目信任决策管理（内存态，无持久化、未接入资源/工具启用策略）
-3. 🟡 `cache_stats.rs` —— 逐 turn 扫描 usage 字段检测 cache miss（token 维度：missed_tokens + miss 计数，带 noise floor）；金额与 idle 未实现（`missed_cost` 恒 0、`idle_ms` 占位、`ModelPriceSource` 未接线——见 S5）
-4. ✅ `system_prompt.rs` —— 系统提示词构建（项目上下文 + CLAUDE.md 加载）
-5. 🚫 `output_guard.rs` —— 默认关闭：未接入任何工具输出路径，无可观察行为；维持默认关闭，除非差分证明不改变 TS 模型可见行为
+1. ✅ `settings.rs` —— camelCase 线形 + 文件 load/save/reload + 递归合并；thinking/compaction/retry/queue modes/shell prefix 应用（S5/S8/S11）
+2. ✅ `trust.rs` —— 全局 agentDir/trust.json + 祖先匹配 + untrusted 门控项目 settings/资源（S8/S11）
+3. ✅ `cache_stats.rs` —— token miss 检测 + `StaticModelPrices` 真实计价 + idle（S5）
+4. ✅ `system_prompt.rs` —— 唯一 builder（`build_harness_prompt`：identity/guidelines/tool snippets/context files/skills/cwd，动态 rebuild；S10–S14）
+5. 🚫 `output_guard.rs` —— 默认关闭：未接入任何工具输出路径，无可观察行为；维持默认关闭
 
 ### Phase 7: 真实执行环境 + 测试 ✅
 
@@ -238,10 +238,10 @@ pub trait AgentTool: Send + Sync {
 - pre-prompt compaction：aborted 回合后 `prompt()` 前执行
 - example `split_turn_compact`：90k→179 tokens，reopen 一致
 
-### Phase 8：coding-agent facade 🟡（类型骨架，纵向闭环见 S6）
+### Phase 8：coding-agent facade ✅（纵向闭环 S6–S14）
 
-- `coding_agent` 模块：AgentSession/Builder、ModelRuntime（env credential，缺凭证生成 `missing-*_API_KEY` 假值——S3 改 typed missing-credential 错误）、ResourceLoader（CLAUDE.md/skills/templates 有类型未全接线）、`create_agent_session`
-- `open()` 不自动 restore（调用者需手动恢复，S6 改为返回前 restore）；无 `fork`/事件订阅面/shutdown（S6/S4）；`from_env` 缺凭证已返回 typed `MissingCredential`（S3，2026-08-01）
+- `coding_agent` 模块：AgentSession/Builder、ModelRuntime（惰性 per-model typed credential）、ResourceLoader（AGENTS/CLAUDE ancestor + .pi/skills|prompts + settings paths）、`create_agent_session`
+- build/open 共用 assemble：settings/trust/resources/prompt/tools/runtime；open 自动 restore；`options.model > restored > initial`；fork(entry, ForkPosition)；HarnessEvent 订阅；shutdown；prompt 默认 `/skill:`/`/template` 展开；thinking clamp 统一
 - example `coding_agent_smoke`：资源加载→工具轮→model 切换→compact→close/reopen→continue
 
 ### 迭代切片（2026-08-01 已执行）
