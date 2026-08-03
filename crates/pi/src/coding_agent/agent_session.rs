@@ -633,12 +633,29 @@ impl AgentSessionBuilder {
         };
 
         let session_path = session.storage().path().to_path_buf();
+        let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
+            vec![
+                Arc::new(ReadTool) as Arc<dyn AgentTool>,
+                Arc::new(WriteTool) as Arc<dyn AgentTool>,
+                Arc::new(EditTool) as Arc<dyn AgentTool>,
+                Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
+                    as Arc<dyn AgentTool>,
+                Arc::new(GrepTool) as Arc<dyn AgentTool>,
+                Arc::new(FindTool) as Arc<dyn AgentTool>,
+                Arc::new(LsTool) as Arc<dyn AgentTool>,
+            ]
+        } else {
+            self.tools.clone()
+        };
         let base_prompt = self
             .system_prompt
             .clone()
             .unwrap_or_else(|| "You are a helpful coding agent.".into());
+        let active_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         let system_prompt = crate::system_prompt::build_harness_prompt(
             &base_prompt,
+            &cwd,
+            &active_tools,
             &resources.context_files,
             &resources.skills,
         );
@@ -686,21 +703,6 @@ impl AgentSessionBuilder {
             },
         };
 
-        let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
-            vec![
-                Arc::new(ReadTool) as Arc<dyn AgentTool>,
-                Arc::new(WriteTool) as Arc<dyn AgentTool>,
-                Arc::new(EditTool) as Arc<dyn AgentTool>,
-                Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
-                    as Arc<dyn AgentTool>,
-                Arc::new(GrepTool) as Arc<dyn AgentTool>,
-                Arc::new(FindTool) as Arc<dyn AgentTool>,
-                Arc::new(LsTool) as Arc<dyn AgentTool>,
-            ]
-        } else {
-            self.tools.clone()
-        };
-
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
         let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
@@ -713,10 +715,14 @@ impl AgentSessionBuilder {
         // after-response hooks fire on the real provider requests.
         let observer = harness.request_observer();
         harness.rebind_stream_resolver(runtime.resolver_with_observer(observer));
-        // Apply the loaded non-UI settings: thinking tier, compaction,
-        // retry, and queue modes.
-        if let Some(level) = settings.default_thinking_level.clone() {
-            let _ = harness.set_thinking_level(Some(level)).await;
+        // Apply the loaded non-UI settings: compaction, retry, and queue
+        // modes are in-memory-only setters, safe for a reopen. The default
+        // thinking tier applies only to a NEW session and only as initial
+        // in-memory state — never through the persisting setter, which would
+        // append a `thinking_level_change` entry and overwrite the session's
+        // persisted tier on every reopen.
+        if !restore && let Some(level) = settings.default_thinking_level.clone() {
+            harness.agent_mut().set_thinking_level(Some(level));
         }
         harness.set_compaction_settings(settings.resolved_compaction());
         harness.set_retry_settings(settings.resolved_retry());
@@ -1058,16 +1064,11 @@ mod tests {
         );
     }
 
-    /// build → close → move the process cwd → open → fork: the reopened and
-    /// forked sessions keep the project cwd, resources, and tool environment
-    /// without drift.
+    /// build → close → open with a WRONG cwd → fork: the session metadata
+    /// cwd wins over the caller-provided one, so tools/resources stay in the
+    /// session project.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn reopen_and_fork_survive_a_process_cwd_change() {
-        // The std Mutex serializes the process-wide cwd change against other
-        // tests; it is intentionally held for the whole test body.
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let guard = CWD_LOCK.lock().unwrap();
+    async fn reopen_and_fork_use_the_session_cwd_over_a_wrong_one() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         tokio::fs::create_dir_all(&project).await.unwrap();
@@ -1089,22 +1090,17 @@ mod tests {
         session.prompt("first").await.unwrap();
         let path = session.close().await.unwrap();
 
-        // Move the process cwd somewhere else entirely.
+        // Reopen with a wrong cwd: the session metadata cwd wins.
         let elsewhere = dir.path().join("elsewhere");
         tokio::fs::create_dir_all(&elsewhere).await.unwrap();
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&elsewhere).unwrap();
-
-        // Reopen: the session's own cwd wins over the moved process cwd.
         let resumed = create_agent_session()
+            .with_cwd(&elsewhere)
             .with_model_runtime(fake_runtime())
             .open(path.clone())
             .await
             .unwrap();
         assert_eq!(resumed.harness_messages().len(), 2, "transcript restored");
-        // Resources (context files) reloaded from the session cwd.
         assert_eq!(resumed.resources().context_files.len(), 1);
-        // The read tool resolves relative to the session project.
         let read = resumed
             .harness
             .agent()
@@ -1128,7 +1124,6 @@ mod tests {
             "tools run in the session cwd after reopen"
         );
 
-        // Fork: the new session stays in the project cwd too.
         let entries = resumed
             .harness
             .session()
@@ -1163,8 +1158,74 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.is_error, "forked session keeps the project cwd");
-        std::env::set_current_dir(&original).unwrap();
-        drop(guard);
+    }
+
+    /// A model id can be served by either protocol; an injected catalog
+    /// pins it, and a session switched to it reopens on the same protocol.
+    #[tokio::test]
+    async fn reopen_keeps_model_on_its_original_api_via_catalog() {
+        use crate::coding_agent::model_runtime::ModelCatalog;
+
+        struct PinApi(&'static str);
+        impl ModelCatalog for PinApi {
+            fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
+                (provider == "openai" && model_id == "gpt-5-mini").then(|| Model {
+                    provider: "openai".into(),
+                    api: self.0.into(),
+                    id: "gpt-5-mini".into(),
+                    context_window: 200_000,
+                    max_tokens: 16_384,
+                    thinking: crate::types::ThinkingKind::None,
+                    metadata: Default::default(),
+                })
+            }
+        }
+
+        fn runtime(api: &'static str) -> ModelRuntime {
+            let stream: Arc<dyn StreamFn> =
+                Arc::new(Scripted(Arc::new(std::sync::Mutex::new(Vec::new()))));
+            let resolver: crate::agent_loop::StreamResolver =
+                Arc::new(move |_m: &Model| Ok(Arc::clone(&stream)));
+            ModelRuntime::new(resolver).with_catalog(Arc::new(PinApi(api)))
+        }
+
+        for api in ["openai_completions", "openai_responses"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("proj");
+            tokio::fs::create_dir_all(&cwd).await.unwrap();
+            let model = Model {
+                provider: "openai".into(),
+                api: api.into(),
+                id: "gpt-5-mini".into(),
+                context_window: 200_000,
+                max_tokens: 16_384,
+                thinking: crate::types::ThinkingKind::None,
+                metadata: Default::default(),
+            };
+            let mut session = create_agent_session()
+                .with_cwd(&cwd)
+                .with_session_dir(dir.path().join("sessions"))
+                .with_model_runtime(runtime(api))
+                .with_model(model.clone())
+                .build()
+                .await
+                .unwrap();
+            // Prompt first, then switch: the model_change entry is the last
+            // model-bearing entry on the path, so the reopen projects it.
+            session.prompt("hi").await.unwrap();
+            session.set_model(model.clone()).await.unwrap();
+            let path = session.close().await.unwrap();
+
+            // Reopen with the same catalog: the session model restores on
+            // the exact api, not a heuristic.
+            let resumed = create_agent_session()
+                .with_model_runtime(runtime(api))
+                .open(path)
+                .await
+                .unwrap();
+            assert_eq!(resumed.model().api, api, "api preserved for {api}");
+            assert_eq!(resumed.model().id, "gpt-5-mini");
+        }
     }
 
     #[tokio::test]
@@ -1208,8 +1269,10 @@ mod tests {
     /// A build without any model runtime fails with the typed
     /// missing-credential error when the environment has no keys; the custom
     /// runtime path (covered above) never consults the environment.
-    #[test]
-    fn build_fails_early_without_credentials() {
+    /// A build without credentials fails with the typed missing-credential
+    /// error for the default model's provider.
+    #[tokio::test]
+    async fn build_fails_early_without_credentials() {
         let restore: Vec<(String, Option<String>)> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
             .iter()
             .map(|v| {
@@ -1219,9 +1282,23 @@ mod tests {
                 (v.to_string(), prev)
             })
             .collect();
-        let result = std::env::var("ANTHROPIC_API_KEY");
-        // The env is clear in this process regardless of the parent shell.
-        assert!(result.is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        // Default model is Anthropic: without ANTHROPIC_API_KEY the build
+        // fails with a typed missing-credential error.
+        let err = match create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .build()
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected a missing-credential error"),
+        };
+        assert!(err.to_string().contains("missing credential"), "{err}");
+
         for (v, prev) in restore {
             match prev {
                 Some(value) => unsafe { std::env::set_var(v, value) },

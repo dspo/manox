@@ -190,6 +190,7 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 pub async fn send_with_retry<F>(
     build: F,
     observer: Option<&dyn RequestObserver>,
+    model: &crate::types::Model,
     payload: &serde_json::Value,
     signal: &CancellationToken,
     event_tx: &mpsc::Sender<AgentEvent>,
@@ -205,7 +206,7 @@ where
         // provider-side prefix caching is unaffected.
         let current = match observer {
             Some(observer) => observer
-                .before_payload(attempt, payload)
+                .before_payload(attempt, model, payload)
                 .unwrap_or_else(|| payload.clone()),
             None => payload.clone(),
         };
@@ -384,6 +385,18 @@ pub fn is_retryable_assistant_error(message: &crate::types::AgentMessage) -> boo
 mod tests {
     use super::*;
 
+    fn test_model() -> crate::types::Model {
+        crate::types::Model {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "m".into(),
+            context_window: 1000,
+            max_tokens: 10,
+            thinking: crate::types::ThinkingKind::None,
+            metadata: Default::default(),
+        }
+    }
+
     #[test]
     fn retryable_statuses() {
         for s in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
@@ -487,6 +500,7 @@ mod tests {
             send_with_retry(
                 |_| client.post("http://127.0.0.1:1/").body("x".to_string()),
                 None,
+                &test_model(),
                 &serde_json::json!({"x": 1}),
                 &signal,
                 &tx,
@@ -534,6 +548,7 @@ mod tests {
         let err = send_with_retry(
             |_| client.post(&url).body("x".to_string()),
             None,
+            &test_model(),
             &serde_json::json!({"x": 1}),
             &CancellationToken::new(),
             &tx,

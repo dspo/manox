@@ -91,17 +91,37 @@ pub enum RetryEvent {
 /// Whether a summarization error is transient and worth retrying (TS
 /// `isRetryableAssistantError`): retryable HTTP statuses and transport
 /// failures; auth, quota/billing, and invalid requests are not.
+/// Whether a summarization error is transient and worth retrying (TS
+/// `isRetryableAssistantError`): retryable HTTP statuses and transport
+/// failures; auth, quota/billing, and invalid requests are not. A retryable
+/// status whose body names quota/billing/credit is terminal — retrying a
+/// billing failure only burns attempts.
 fn is_transient_error(err: &anyhow::Error) -> bool {
     if let Some(pe) = err.downcast_ref::<crate::provider::ProviderError>() {
         return match pe {
-            crate::provider::ProviderError::Http { status, .. } => {
-                crate::provider::retry::is_retryable_status(*status)
+            crate::provider::ProviderError::Http { status, body } => {
+                crate::provider::retry::is_retryable_status(*status) && !is_quota_or_billing(body)
             }
             crate::provider::ProviderError::Transport(_) => true,
             _ => false,
         };
     }
     false
+}
+
+/// Whether an error body names quota or billing — terminal, never retried.
+fn is_quota_or_billing(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    [
+        "quota",
+        "billing",
+        "credit",
+        "insufficient",
+        "payment",
+        "plan limit",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 /// The shared runtime snapshot (model + thinking level) that new runs and
@@ -483,6 +503,16 @@ pub struct SessionBeforeCompactEvent<'a> {
     pub custom_instructions: Option<&'a str>,
 }
 
+/// A branch summary supplied by the `session_before_tree` hook, mirroring
+/// the TS `summary` override. Persisted verbatim with `fromHook`.
+#[derive(Debug, Clone)]
+pub struct BranchSummaryHookOverride {
+    pub summary: String,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    pub usage: Option<crate::types::Usage>,
+}
+
 /// The typed `session_before_tree` hook event, mirroring the TS
 /// `SessionBeforeTreeEvent`: the navigation preparation a handler can cancel
 /// or use to override the summarization instructions and label. The TS
@@ -565,9 +595,14 @@ pub struct HookContext {
     /// cursor move or entry append.
     pub cancel_tree: bool,
     /// At the `SessionBeforeTree` point, overrides the summarization custom
-    /// instructions and label when present.
+    /// instructions, label, and replace-instructions flag when present.
     pub tree_custom_instructions: Option<String>,
     pub tree_label: Option<String>,
+    pub tree_replace_instructions: Option<bool>,
+    /// At the `SessionBeforeTree` point, supplies the branch summary
+    /// directly so the harness skips the summarization model call (TS
+    /// `summary` with `fromHook`).
+    pub tree_summary: Option<BranchSummaryHookOverride>,
 }
 
 impl HookContext {
@@ -585,6 +620,8 @@ impl HookContext {
             cancel_tree: false,
             tree_custom_instructions: None,
             tree_label: None,
+            tree_replace_instructions: None,
+            tree_summary: None,
         }
     }
 
@@ -636,6 +673,20 @@ impl HookContext {
     /// At `SessionBeforeTree`, override the label written to the tree.
     pub fn with_tree_label(mut self, label: String) -> Self {
         self.tree_label = Some(label);
+        self
+    }
+
+    /// At `SessionBeforeTree`, override the replace-instructions flag.
+    pub fn with_tree_replace_instructions(mut self, replace: bool) -> Self {
+        self.tree_replace_instructions = Some(replace);
+        self
+    }
+
+    /// At `SessionBeforeTree`, supply the branch summary directly; the
+    /// harness skips the model call and persists it as a hook-authored
+    /// entry (`fromHook`).
+    pub fn with_tree_summary(mut self, summary: BranchSummaryHookOverride) -> Self {
+        self.tree_summary = Some(summary);
         self
     }
 
@@ -1038,6 +1089,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             fn before_payload(
                 &self,
                 attempt: u32,
+                model: &crate::types::Model,
                 payload: &serde_json::Value,
             ) -> Option<serde_json::Value> {
                 // Handlers chain: each receives the previous handler's
@@ -1052,6 +1104,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                         let effective = current.clone().unwrap_or_else(|| payload.clone());
                         let ctx = ctx_base.clone().with_data(serde_json::json!({
                             "attempt": attempt,
+                            "model": { "provider": model.provider, "id": model.id, "api": model.api },
                             "payload": effective,
                         }));
                         let next = handler(ctx);
@@ -1068,12 +1121,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 status: u16,
                 headers: &reqwest::header::HeaderMap,
             ) {
-                let headers_json: Vec<serde_json::Value> = headers
+                // TS `Record<string,string>`: header name -> value.
+                let headers_json: serde_json::Map<String, serde_json::Value> = headers
                     .iter()
                     .filter_map(|(name, value)| {
-                        let name = name.as_str().to_string();
                         let value = value.to_str().ok()?.to_string();
-                        Some(serde_json::json!({ "name": name, "value": value }))
+                        Some((name.as_str().to_string(), serde_json::Value::String(value)))
                     })
                     .collect();
                 let ctx = HookContext::new(HookPoint::AfterProviderResponse).with_data(
@@ -2151,6 +2204,18 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         if let Some(overridden) = hook_ctx.tree_label {
             label = Some(overridden);
         }
+        let replace_instructions = hook_ctx
+            .tree_replace_instructions
+            .unwrap_or(options.replace_instructions);
+        let hook_summary = hook_ctx.tree_summary.map(|s| {
+            crate::compaction::branch_summarization::BranchSummaryResult {
+                summary: Some(s.summary),
+                usage: s.usage,
+                read_files: s.read_files,
+                modified_files: s.modified_files,
+                aborted: false,
+            }
+        });
 
         // A summary is generated only when asked for and there is an
         // abandoned branch to summarize (TS `options.summarize &&
@@ -2159,7 +2224,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // request carries the harness's per-request stream options; transient
         // failures retry under the harness retry policy; the operation token
         // lets abort/shutdown end the run.
-        let summary = if options.summarize && !abandoned.is_empty() {
+        let summary = if let Some(hook) = hook_summary {
+            // The hook supplied the summary: no model call, persisted with
+            // fromHook below.
+            Some(hook)
+        } else if options.summarize && !abandoned.is_empty() {
             let stream_fn = match &self.stream_resolver {
                 Some(resolver) => resolver(&self.model)?,
                 None => Arc::clone(&self.stream_fn),
@@ -2174,11 +2243,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 .unwrap()
                 .stream_options
                 .clone();
-            // The branch summary caps its output at 2048 tokens (TS).
-            stream_options.max_tokens = stream_options.max_tokens.or(Some(2048));
+            // The branch summary caps its output at 2048 tokens (TS, fixed).
+            stream_options.max_tokens = Some(2048);
             let retry = self.retry_settings;
             let mut attempt = 0u32;
-            let mut last_error: Option<String> = None;
+            let mut started = false;
             let result = loop {
                 attempt += 1;
                 match crate::compaction::branch_summarization::summarize_branch(
@@ -2187,19 +2256,29 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                     Arc::clone(&stream_fn),
                     token_budget,
                     custom_instructions.as_deref(),
-                    options.replace_instructions,
+                    replace_instructions,
                     signal.clone(),
                     &stream_options,
                 )
                 .await
                 {
-                    Ok(result) => break Ok(result),
+                    Ok(result) => {
+                        // A retried attempt that finally succeeded closes the
+                        // lifecycle as a success.
+                        if started {
+                            self.emit_retry(RetryEvent::End {
+                                success: true,
+                                attempt,
+                                final_error: None,
+                            });
+                        }
+                        break Ok(result);
+                    }
                     Err(e) => {
                         // Only transient failures retry (TS
                         // `isRetryableAssistantError`): auth, quota/billing,
                         // and invalid requests are deterministic and surface
-                        // immediately.
-                        last_error = Some(e.to_string());
+                        // immediately, with no lifecycle events.
                         let transient = is_transient_error(&e);
                         let delay = std::time::Duration::from_millis(
                             retry.base_delay_ms.saturating_mul(
@@ -2216,10 +2295,31 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                             delay,
                             error_message: e.to_string(),
                         });
-                        tokio::select! {
-                            _ = tokio::time::sleep(delay) => {}
-                            _ = signal.cancelled() => break
-                                Err(anyhow::anyhow!("branch summary cancelled during retry backoff")),
+                        started = true;
+                        let cancelled = tokio::select! {
+                            _ = tokio::time::sleep(delay) => false,
+                            _ = signal.cancelled() => true,
+                        };
+                        if cancelled {
+                            // TS: an aborted summarization cancels the
+                            // navigation — a result, not an error, and no
+                            // cursor move or entry append.
+                            if started {
+                                self.emit_retry(RetryEvent::End {
+                                    success: false,
+                                    attempt,
+                                    final_error: Some("branch summary cancelled".into()),
+                                });
+                            }
+                            break Ok(
+                                crate::compaction::branch_summarization::BranchSummaryResult {
+                                    summary: None,
+                                    usage: None,
+                                    read_files: Vec::new(),
+                                    modified_files: Vec::new(),
+                                    aborted: true,
+                                },
+                            );
                         }
                     }
                 }
@@ -2227,11 +2327,13 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             let result = match result {
                 Ok(result) => result,
                 Err(e) => {
-                    self.emit_retry(RetryEvent::End {
-                        success: false,
-                        attempt,
-                        final_error: last_error.or_else(|| Some(e.to_string())),
-                    });
+                    if started {
+                        self.emit_retry(RetryEvent::End {
+                            success: false,
+                            attempt,
+                            final_error: Some(e.to_string()),
+                        });
+                    }
                     return Err(e);
                 }
             };
@@ -4916,7 +5018,8 @@ pub(crate) mod tests {
         );
 
         let observer = harness.request_observer();
-        let replaced = observer.before_payload(2, &serde_json::json!({ "model": "m" }));
+        let replaced =
+            observer.before_payload(2, &test_model(), &serde_json::json!({ "model": "m" }));
         // The registered handler echoed the payload unchanged; the provider
         // sends it verbatim.
         assert_eq!(replaced, Some(serde_json::json!({ "model": "m" })));
@@ -4975,7 +5078,7 @@ pub(crate) mod tests {
 
         let observer = harness.request_observer();
         let replaced = observer
-            .before_payload(1, &serde_json::json!({ "model": "m" }))
+            .before_payload(1, &test_model(), &serde_json::json!({ "model": "m" }))
             .unwrap();
         assert_eq!(
             replaced,
@@ -5030,10 +5133,94 @@ pub(crate) mod tests {
         assert!(!is_transient_error(&auth));
         let quota = anyhow::anyhow!(crate::provider::ProviderError::Http {
             status: 429,
-            body: "billing limit".into(),
+            body: "billing limit exceeded".into(),
         });
-        // 429 is transient per status; the error body decides at the caller.
-        assert!(is_transient_error(&quota));
+        // A retryable status whose body names billing is terminal.
+        assert!(!is_transient_error(&quota), "quota/billing is not retried");
+        let rate_limit = anyhow::anyhow!(crate::provider::ProviderError::Http {
+            status: 429,
+            body: "rate limit reached".into(),
+        });
+        assert!(is_transient_error(&rate_limit), "plain rate limit retries");
+    }
+
+    /// A `session_before_tree` hook can supply the branch summary directly,
+    /// skipping the model call, and override replaceInstructions.
+    #[tokio::test]
+    async fn test_tree_hook_supplies_summary_and_replace_override() {
+        struct CountingStream(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl StreamFn for CountingStream {
+            async fn stream(
+                &self,
+                _context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CountingStream(Arc::clone(&calls))),
+        );
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let first_reply = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        harness.on(
+            HookPoint::SessionBeforeTree,
+            Arc::new(|ctx: HookContext| {
+                ctx.with_tree_summary(BranchSummaryHookOverride {
+                    summary: "hook-provided summary".into(),
+                    read_files: vec!["a.rs".into()],
+                    modified_files: Vec::new(),
+                    usage: None,
+                })
+                .with_tree_replace_instructions(true)
+            }),
+        );
+        let result = harness
+            .navigate_tree_with_options(
+                &first_reply,
+                NavigateTreeOptions {
+                    summarize: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.summary_entry_id.is_some());
+        // The hook summary replaced the model call: only the two prompts'
+        // turns streamed, no summarization request.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let summary = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::BranchSummary { summary, .. } => Some(summary.clone()),
+                _ => None,
+            })
+            .expect("hook summary persisted");
+        assert!(summary.contains("hook-provided summary"), "{summary}");
     }
 
     /// A per-model stream resolver switches the provider runtime at the next

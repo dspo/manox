@@ -10,9 +10,9 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~31,000 行 Rust（src 28.5k + examples 2.5k），462 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~31,000 行 Rust（src 28.5k + examples 2.5k），464 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
 
-**基线（S0 冻结，S8/S9 复核轮确认）：** Rust HEAD `d86a6fe`（S8/S9 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `f0deb8dd`，delta 见 parity ledger 已知余项 #7）。
+**基线（S0 冻结，S8–S10 复核轮确认）：** Rust HEAD `（S10 待提交）`（S8–S10 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `c6eb6281`：post-login model catalog refresh 15s 超时——env-only scope 下 deferred，见 parity ledger 已知余项 #7）。
 
 ## 架构设计
 

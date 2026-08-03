@@ -26,12 +26,24 @@ pub struct MissingCredential {
 /// three selected protocols, taking credentials from env vars
 /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); consumers can build their own
 /// registry over the same `StreamResolver` seam.
+/// Resolves a `provider + modelId` reference into a full [`Model`] for
+/// session restore. The env-backed default catalog covers the wired
+/// providers; custom runtimes inject their own catalog so a reopen resolves
+/// the exact protocol/parameters the session used (a model id alone cannot
+/// disambiguate e.g. Completions vs Responses).
+pub trait ModelCatalog: Send + Sync {
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<Model>;
+}
+
 #[derive(Clone)]
 pub struct ModelRuntime {
     resolver: StreamResolver,
     /// Whether this runtime is the env-backed default registry; only it can
     /// rebuild provider streams with a request observer attached.
     env_backed: bool,
+    /// The catalog resolving session model references back to full models.
+    /// Injected catalogs win over the default one.
+    catalog: Option<Arc<dyn ModelCatalog>>,
 }
 
 impl ModelRuntime {
@@ -39,7 +51,16 @@ impl ModelRuntime {
         ModelRuntime {
             resolver,
             env_backed: false,
+            catalog: None,
         }
+    }
+
+    /// Inject a catalog that resolves `provider + modelId` to full models —
+    /// the custom-runtime restore path. Without one, `resolve_model` falls
+    /// back to the default catalog.
+    pub fn with_catalog(mut self, catalog: Arc<dyn ModelCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// The default registry: credentials from the environment. Fails with a
@@ -103,6 +124,7 @@ impl ModelRuntime {
         ModelRuntime {
             resolver,
             env_backed: true,
+            catalog: Some(Arc::new(DefaultModelCatalog)),
         }
     }
 
@@ -118,9 +140,24 @@ impl ModelRuntime {
     /// and the caller keeps its construction-time model rather than
     /// guessing a protocol.
     pub fn resolve_model(&self, provider: &str, model_id: &str) -> Option<Model> {
+        if let Some(catalog) = &self.catalog {
+            return catalog.resolve(provider, model_id);
+        }
         if !self.env_backed {
             return None;
         }
+        DefaultModelCatalog.resolve(provider, model_id)
+    }
+}
+
+/// The default catalog: Anthropic always maps to the Messages protocol;
+/// OpenAI models split by generation (reasoning families to Responses, the
+/// rest to Completions). A custom runtime injects its own catalog when the
+/// session's protocol must be exact.
+struct DefaultModelCatalog;
+
+impl ModelCatalog for DefaultModelCatalog {
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
         let api = match provider {
             "anthropic" => "anthropic".to_string(),
             "openai" => {
@@ -142,6 +179,18 @@ impl ModelRuntime {
             metadata: Default::default(),
         })
     }
+}
+
+/// Whether an OpenAI model id maps to the Responses API (the modern default
+/// for reasoning-capable models).
+fn is_responses_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
+        .iter()
+        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
+}
+
+impl ModelRuntime {
     /// A resolver whose provider streams carry a request observer (the TS
     /// before-payload / after-response hooks). Only the env-backed registry
     /// rebuilds its streams with the observer attached; custom runtimes
@@ -197,15 +246,6 @@ impl ModelRuntime {
             Ok(stream)
         })
     }
-}
-
-/// Whether an OpenAI model id maps to the Responses API (the modern default
-/// for reasoning-capable models).
-fn is_responses_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
-        .iter()
-        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
 }
 
 #[cfg(test)]

@@ -102,10 +102,17 @@ impl ResourceLoader {
             load_instruction_file(agent_dir, &mut resources, &mut diagnostics, &mut seen_files)
                 .await;
         }
+        // The ancestor chain loads root -> cwd (TS order), so the nearest
+        // directory's instructions come last in the prompt.
+        let mut ancestors = Vec::new();
         let mut dir = Some(self.cwd.as_path());
         while let Some(current) = dir {
-            load_instruction_file(current, &mut resources, &mut diagnostics, &mut seen_files).await;
+            ancestors.push(current.to_path_buf());
             dir = current.parent();
+        }
+        for current in ancestors.into_iter().rev() {
+            load_instruction_file(&current, &mut resources, &mut diagnostics, &mut seen_files)
+                .await;
         }
 
         // Skills and prompts: user (agentDir) resources always load;
@@ -120,10 +127,10 @@ impl ResourceLoader {
             load_templates(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
         }
         for path in &self.extra_skill_paths {
-            load_skills(path, &mut resources, &mut diagnostics).await;
+            load_explicit_path(path, false, &mut resources, &mut diagnostics).await;
         }
         for path in &self.extra_prompt_paths {
-            load_templates(path, &mut resources, &mut diagnostics).await;
+            load_explicit_path(path, true, &mut resources, &mut diagnostics).await;
         }
 
         Ok(ResourceSnapshot {
@@ -176,16 +183,18 @@ async fn load_instruction_file(
 
 /// Discover skills under `root`: `SKILL.md` files anywhere (recursively,
 /// named after their parent directory) plus direct root `.md` files.
-async fn load_skills(
-    root: &Path,
+/// Discover skills in a skills directory: `SKILL.md` files anywhere
+/// (recursively, named after their parent directory) plus direct root
+/// `.md` files.
+async fn load_skills_from_dir(
+    skills_dir: &Path,
     resources: &mut HarnessResources,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let skills_dir = root.join("skills");
     if !skills_dir.is_dir() {
         return;
     }
-    let mut stack = vec![skills_dir.clone()];
+    let mut stack = vec![skills_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
             continue;
@@ -220,6 +229,62 @@ async fn load_skills(
                 .to_string();
             load_skill_file(&path, name, resources, diagnostics).await;
         }
+    }
+}
+
+/// The default skill dirs (`<root>/skills`) — TS agentDir/skills and
+/// `.pi/skills`.
+async fn load_skills(
+    root: &Path,
+    resources: &mut HarnessResources,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) {
+    load_skills_from_dir(&root.join("skills"), resources, diagnostics).await;
+}
+
+/// Load an explicit settings path (`settings.skills` / `settings.prompts`):
+/// a directory is scanned directly, a single Markdown file loads as one
+/// skill/template — never re-joined under a `skills`/`prompts` subdir.
+async fn load_explicit_path(
+    path: &Path,
+    is_prompt: bool,
+    resources: &mut HarnessResources,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) {
+    if path.is_dir() {
+        if is_prompt {
+            load_templates_from_dir(path, resources, diagnostics).await;
+        } else {
+            load_skills_from_dir(path, resources, diagnostics).await;
+        }
+    } else if path.is_file() && path.extension().is_some_and(|e| e == "md") {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("resource")
+            .to_string();
+        if is_prompt {
+            let Ok(content) = tokio::fs::read_to_string(path).await else {
+                return;
+            };
+            if resources.prompt_templates.iter().any(|t| t.name == name) {
+                diagnostics.push(ResourceDiagnostic {
+                    message: format!("prompt template name conflict: {name:?}"),
+                    path: path.to_string_lossy().into_owned(),
+                });
+                resources.prompt_templates.retain(|t| t.name != name);
+            }
+            resources
+                .prompt_templates
+                .push(PromptTemplate { name, content });
+        } else {
+            load_skill_file(path, name, resources, diagnostics).await;
+        }
+    } else {
+        diagnostics.push(ResourceDiagnostic {
+            message: "skill/prompt path is not a directory or markdown file".into(),
+            path: path.to_string_lossy().into_owned(),
+        });
     }
 }
 
@@ -288,11 +353,19 @@ async fn load_templates(
     resources: &mut HarnessResources,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let templates_dir = root.join("prompts");
+    load_templates_from_dir(&root.join("prompts"), resources, diagnostics).await;
+}
+
+/// Load direct `*.md` files of a prompts directory as prompt templates.
+async fn load_templates_from_dir(
+    templates_dir: &Path,
+    resources: &mut HarnessResources,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) {
     if !templates_dir.is_dir() {
         return;
     }
-    let Ok(mut entries) = tokio::fs::read_dir(&templates_dir).await else {
+    let Ok(mut entries) = tokio::fs::read_dir(templates_dir).await else {
         return;
     };
     let mut paths = Vec::new();

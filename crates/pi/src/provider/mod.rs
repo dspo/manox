@@ -21,12 +21,13 @@ pub mod transform;
 /// outside the provider; the harness maps it onto its
 /// `BeforeProviderPayload` / `AfterProviderResponse` hook points.
 pub trait RequestObserver: Send + Sync {
-    /// The payload about to be sent, `attempt` 1-indexed. Returning
-    /// `Some(replacement)` substitutes the payload for this attempt (the TS
-    /// before-payload mutation); `None` sends the original.
+    /// The payload about to be sent for `model`, `attempt` 1-indexed.
+    /// Returning `Some(replacement)` substitutes the payload for this
+    /// attempt (the TS before-payload mutation); `None` sends the original.
     fn before_payload(
         &self,
         attempt: u32,
+        model: &crate::types::Model,
         payload: &serde_json::Value,
     ) -> Option<serde_json::Value>;
 

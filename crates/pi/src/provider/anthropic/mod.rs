@@ -118,6 +118,7 @@ impl StreamFn for AnthropicStreamFn {
                 builder
             },
             self.request_observer.as_deref(),
+            &context.model,
             &body,
             &signal,
             &event_tx,
