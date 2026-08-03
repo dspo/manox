@@ -72,6 +72,14 @@ impl PendingMessageQueue {
         }
     }
 
+    fn set_mode(&mut self, mode: QueueMode) {
+        self.mode = mode;
+    }
+
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
     fn clear(&mut self) {
         self.messages.clear();
     }
@@ -382,6 +390,42 @@ impl Agent {
     /// Remove all queued follow-up messages.
     pub fn clear_follow_up_queue(&mut self) {
         self.follow_up_queue.lock().unwrap().clear();
+    }
+
+    /// Remove every queued steering and follow-up message.
+    pub fn clear_all_queues(&self) {
+        self.steering_queue.lock().unwrap().clear();
+        self.follow_up_queue.lock().unwrap().clear();
+    }
+
+    /// The steering queue drain mode.
+    pub fn steering_mode(&self) -> QueueMode {
+        self.steering_queue.lock().unwrap().mode
+    }
+
+    /// Change the steering queue drain mode.
+    pub fn set_steering_mode(&self, mode: QueueMode) {
+        self.steering_queue.lock().unwrap().set_mode(mode);
+    }
+
+    /// The follow-up queue drain mode.
+    pub fn follow_up_mode(&self) -> QueueMode {
+        self.follow_up_queue.lock().unwrap().mode
+    }
+
+    /// Change the follow-up queue drain mode.
+    pub fn set_follow_up_mode(&self, mode: QueueMode) {
+        self.follow_up_queue.lock().unwrap().set_mode(mode);
+    }
+
+    /// Number of queued steering messages.
+    pub fn queued_steering_count(&self) -> usize {
+        self.steering_queue.lock().unwrap().len()
+    }
+
+    /// Number of queued follow-up messages.
+    pub fn queued_follow_up_count(&self) -> usize {
+        self.follow_up_queue.lock().unwrap().len()
     }
 
     /// Whether either queue has pending messages.
@@ -769,6 +813,22 @@ impl RunHandle {
         if let Some(active) = self.active_run.lock().unwrap().as_ref() {
             active.token.cancel();
         }
+    }
+
+    /// Drop every queued steering and follow-up message.
+    pub fn clear_queues(&self) {
+        self.steering_queue.lock().unwrap().clear();
+        self.follow_up_queue.lock().unwrap().clear();
+    }
+
+    /// Number of queued steering messages.
+    pub fn queued_steering_count(&self) -> usize {
+        self.steering_queue.lock().unwrap().len()
+    }
+
+    /// Number of queued follow-up messages.
+    pub fn queued_follow_up_count(&self) -> usize {
+        self.follow_up_queue.lock().unwrap().len()
     }
 
     /// Resolve once the active run has fully settled, like
