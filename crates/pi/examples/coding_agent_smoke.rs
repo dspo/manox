@@ -166,7 +166,7 @@ async fn main() {
     );
 
     // Close and reopen: the session resumes.
-    let _path = session.close();
+    let _path = session.close().await.expect("close");
     let repo = pi::session::repository::SessionRepository::new(dir.path().join("sessions"));
     let listed = repo.list().await.unwrap();
     assert_eq!(listed.len(), 1, "{listed:?}");
@@ -176,7 +176,7 @@ async fn main() {
         .open(listed[0].path.clone())
         .await
         .expect("reopen");
-    resumed.restore().await.expect("restore");
+    // open() restores the session; no manual restore.
     resumed.prompt("resume").await.expect("resume prompt");
     println!(
         "resumed transcript: {} messages",
