@@ -24,6 +24,10 @@ pub struct ResourceLoader {
     /// the TS trust gate on project config resources. User (agentDir)
     /// resources and the instruction ancestor chain always load.
     trusted: bool,
+    /// Extra skill directories from settings (`settings.skills`).
+    extra_skill_paths: Vec<PathBuf>,
+    /// Extra prompt template directories from settings (`settings.prompts`).
+    extra_prompt_paths: Vec<PathBuf>,
 }
 
 /// A non-fatal discovery problem: name conflicts, unreadable files, or
@@ -51,6 +55,8 @@ impl ResourceLoader {
             cwd: cwd.into(),
             agent_dir: None,
             trusted: true,
+            extra_skill_paths: Vec::new(),
+            extra_prompt_paths: Vec::new(),
         }
     }
 
@@ -58,6 +64,18 @@ impl ResourceLoader {
     /// project-scoped resources.
     pub fn with_trust(mut self, trusted: bool) -> Self {
         self.trusted = trusted;
+        self
+    }
+
+    /// Additional skill directories (TS `settings.skills`).
+    pub fn with_extra_skill_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.extra_skill_paths = paths;
+        self
+    }
+
+    /// Additional prompt template directories (TS `settings.prompts`).
+    pub fn with_extra_prompt_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.extra_prompt_paths = paths;
         self
     }
 
@@ -100,6 +118,12 @@ impl ResourceLoader {
         if self.trusted {
             load_skills(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
             load_templates(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
+        }
+        for path in &self.extra_skill_paths {
+            load_skills(path, &mut resources, &mut diagnostics).await;
+        }
+        for path in &self.extra_prompt_paths {
+            load_templates(path, &mut resources, &mut diagnostics).await;
         }
 
         Ok(ResourceSnapshot {

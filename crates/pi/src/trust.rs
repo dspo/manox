@@ -22,7 +22,7 @@ pub enum TrustStatus {
 
 /// Manages trust decisions for project directories, persisted as a map of
 /// canonical path → decision (TS `agentDir/trust.json`).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TrustManager {
     decisions: HashMap<PathBuf, bool>,
 }

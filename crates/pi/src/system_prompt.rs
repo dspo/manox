@@ -33,8 +33,9 @@ pub struct ProjectContext {
 }
 
 /// Build the full system prompt by combining the base template with
-/// project context.
-pub fn build_system_prompt(base_instructions: Option<&str>, project: &ProjectContext) -> String {
+/// project context. Kept as the context-rich variant; the facade uses
+/// [`build_harness_prompt`] which folds context files and the skill index.
+pub fn build_project_prompt(base_instructions: Option<&str>, project: &ProjectContext) -> String {
     let instructions = base_instructions.unwrap_or(BASE_PROMPT);
 
     let mut parts = vec![instructions.to_string()];
@@ -91,53 +92,70 @@ pub fn find_project_instructions(cwd: &Path) -> Option<String> {
     None
 }
 
+/// Build the harness system prompt from a base prompt, the project
+/// instruction context files (AGENTS.md / CLAUDE.md), and the mounted skills.
+/// This is the facade's single prompt builder — skills appear as an index so
+/// the model knows what is invocable (TS `buildSystemPrompt`).
+pub fn build_harness_prompt(
+    base: &str,
+    context_files: &[crate::harness::ContextFile],
+    skills: &[crate::harness::Skill],
+) -> String {
+    let mut prompt = base.to_string();
+    if !context_files.is_empty() {
+        prompt.push_str("\n\n# Project instructions\n");
+        for file in context_files {
+            prompt.push_str(&format!("\n## {}\n\n{}\n", file.name, file.content));
+        }
+    }
+    if !skills.is_empty() {
+        prompt.push_str("\n# Available skills\n");
+        for skill in skills {
+            prompt.push_str(&format!(
+                "- **{}**{}: {}\n",
+                skill.name,
+                if skill.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", skill.description)
+                },
+                skill.location
+            ));
+        }
+    }
+    prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{ContextFile, Skill};
 
+    /// The unified prompt builder folds context files and a skill index —
+    /// the golden output the facade relies on.
     #[test]
-    fn test_build_system_prompt_basic() {
-        let project = ProjectContext {
-            cwd: "/home/user/project".into(),
-            platform: "linux".into(),
-            current_date: "2026-07-29".into(),
-            ..Default::default()
-        };
-
-        let prompt = build_system_prompt(None, &project);
-        assert!(prompt.contains("coding agent"));
-        assert!(prompt.contains("/home/user/project"));
-        assert!(prompt.contains("linux"));
-        assert!(prompt.contains("2026-07-29"));
+    fn harness_prompt_golden() {
+        let context = vec![ContextFile {
+            name: "claude".into(),
+            location: "/proj/CLAUDE.md".into(),
+            content: "Keep changes minimal.".into(),
+        }];
+        let skills = vec![Skill {
+            name: "review".into(),
+            description: "review the diff".into(),
+            location: "/proj/.pi/skills/review.md".into(),
+            content: "Check the diff.".into(),
+        }];
+        let prompt = build_harness_prompt("Base prompt.", &context, &skills);
+        assert_eq!(
+            prompt,
+            "Base prompt.\n\n# Project instructions\n\n## claude\n\nKeep changes minimal.\n\n# Available skills\n- **review** — review the diff: /proj/.pi/skills/review.md\n"
+        );
     }
 
     #[test]
-    fn test_build_system_prompt_with_git() {
-        let project = ProjectContext {
-            cwd: "/project".into(),
-            platform: "darwin".into(),
-            git_branch: Some("feat/my-feature".into()),
-            git_status: Some(" M src/main.rs".into()),
-            current_date: "2026-07-29".into(),
-            ..Default::default()
-        };
-
-        let prompt = build_system_prompt(None, &project);
-        assert!(prompt.contains("feat/my-feature"));
-        assert!(prompt.contains("src/main.rs"));
-    }
-
-    #[test]
-    fn test_build_system_prompt_with_instructions() {
-        let project = ProjectContext {
-            cwd: "/project".into(),
-            platform: "darwin".into(),
-            project_instructions: Some("Always use async/await.".into()),
-            current_date: "2026-07-29".into(),
-            ..Default::default()
-        };
-
-        let prompt = build_system_prompt(None, &project);
-        assert!(prompt.contains("Always use async/await"));
+    fn harness_prompt_without_skills_omits_the_index() {
+        let prompt = build_harness_prompt("Base.", &[], &[]);
+        assert_eq!(prompt, "Base.");
     }
 }

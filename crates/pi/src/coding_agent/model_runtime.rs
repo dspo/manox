@@ -26,6 +26,7 @@ pub struct MissingCredential {
 /// three selected protocols, taking credentials from env vars
 /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`); consumers can build their own
 /// registry over the same `StreamResolver` seam.
+#[derive(Clone)]
 pub struct ModelRuntime {
     resolver: StreamResolver,
     /// Whether this runtime is the env-backed default registry; only it can
@@ -110,6 +111,37 @@ impl ModelRuntime {
         Arc::clone(&self.resolver)
     }
 
+    /// Restore a full model from a session-carried `provider + modelId`
+    /// reference. The env-backed registry maps the known providers onto
+    /// their protocol (OpenAI models split by generation: reasoning families
+    /// to Responses, the rest to Completions); custom runtimes return `None`
+    /// and the caller keeps its construction-time model rather than
+    /// guessing a protocol.
+    pub fn resolve_model(&self, provider: &str, model_id: &str) -> Option<Model> {
+        if !self.env_backed {
+            return None;
+        }
+        let api = match provider {
+            "anthropic" => "anthropic".to_string(),
+            "openai" => {
+                if is_responses_model(model_id) {
+                    "openai_responses".to_string()
+                } else {
+                    "openai_completions".to_string()
+                }
+            }
+            _ => return None,
+        };
+        Some(Model {
+            provider: provider.to_string(),
+            api,
+            id: model_id.to_string(),
+            context_window: 200_000,
+            max_tokens: 8_192,
+            thinking: crate::types::ThinkingKind::None,
+            metadata: Default::default(),
+        })
+    }
     /// A resolver whose provider streams carry a request observer (the TS
     /// before-payload / after-response hooks). Only the env-backed registry
     /// rebuilds its streams with the observer attached; custom runtimes
@@ -165,6 +197,15 @@ impl ModelRuntime {
             Ok(stream)
         })
     }
+}
+
+/// Whether an OpenAI model id maps to the Responses API (the modern default
+/// for reasoning-capable models).
+fn is_responses_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
+        .iter()
+        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
 }
 
 #[cfg(test)]

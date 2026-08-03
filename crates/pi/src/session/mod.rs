@@ -1226,73 +1226,153 @@ impl EntryType {
     }
 }
 
+/// Where a branch query starts traversing.
+#[derive(Debug, Clone, Default)]
+pub enum BranchStart {
+    /// The active leaf (TS `start` unset).
+    #[default]
+    Leaf,
+    /// Explicit `null`: no traversal, empty result.
+    None,
+    /// Start at this entry id.
+    At(String),
+}
+
 /// The TS `SessionBranchQuery`: a bounded traversal of the active branch.
 #[derive(Debug, Clone, Default)]
 pub struct SessionBranchQuery {
-    /// Entry where traversal starts; defaults to the active leaf.
-    pub start: Option<String>,
+    /// Entry where traversal starts; defaults to the active leaf. `None`
+    /// (TS `null`) yields an empty result.
+    pub start: BranchStart,
     /// Stop after the first entry of this type (inclusive).
     pub stop_at_type: Option<EntryType>,
     /// Stop after the entry with this id (inclusive).
     pub stop_at_id: Option<String>,
     /// Only return entries of this type.
     pub entry_type: Option<EntryType>,
-    /// Only return custom entries with this custom type.
+    /// Only return `custom` entries with this custom type.
     pub custom_type: Option<String>,
-    /// Traversal order; defaults to newest first (toward the root).
+    /// Traversal order; defaults to newest first (start toward root).
     pub oldest_first: bool,
-    /// Maximum number of filtered entries to return.
+    /// Maximum number of filtered entries to return (must be positive).
     pub limit: Option<usize>,
 }
 
+/// A branch-query failure carrying the TS error code.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum BranchQueryError {
+    /// The traversal start entry does not exist.
+    #[error("Entry {0} not found")]
+    NotFound(String),
+    /// A broken parent chain or a cycle corrupts the branch.
+    #[error("{0}")]
+    InvalidSession(String),
+}
+
 impl<S: SessionStorage> Session<S> {
-    /// Find entries on the active branch under the given bounds — the TS
-    /// `findEntriesOnBranch`. Walks from `start` (default: the leaf) toward
-    /// the root, stops after `stopAtType`/`stopAtId` (inclusive), filters by
-    /// type / custom type, and caps at `limit`.
+    /// Find entries on the active branch under the given bounds — the
+    /// upstream `findEntriesOnBranch`. Mirrors the TS semantics exactly:
+    /// walk from `start` toward the root (newest first) or from the root
+    /// toward `start` (oldest first), stop after `stopAtType` / `stopAtId`
+    /// (inclusive, computed after the traversal), filter by type / custom
+    /// type, then apply `limit`. A missing start is `not_found`; a broken
+    /// parent chain or a cycle is `invalid_session`; `limit: 0` is refused;
+    /// `start: null` yields an empty result.
     pub async fn find_entries_on_branch(
         &self,
         query: SessionBranchQuery,
-    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-        let start = query.start.clone().or(self.storage.get_leaf_id().await?);
-        let mut out = Vec::new();
-        let mut current = start;
-        while let Some(id) = current {
-            let entry = self
+    ) -> Result<Vec<SessionTreeEntry>, BranchQueryError> {
+        if query.limit == Some(0) {
+            return Err(BranchQueryError::InvalidSession(
+                "limit must be a positive integer".into(),
+            ));
+        }
+        let start_id = match query.start {
+            BranchStart::None => return Ok(Vec::new()),
+            BranchStart::Leaf => self
                 .storage
-                .get_entry(&id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("entry {id} not found"))?;
-            let kind = entry_kind(&entry);
-            let stop =
-                query.stop_at_id.as_deref() == Some(entry.id()) || query.stop_at_type == Some(kind);
-            if query.entry_type.is_none_or(|t| t == kind)
-                && query
-                    .custom_type
-                    .as_deref()
-                    .is_none_or(|t| matches!(&entry, SessionTreeEntry::CustomMessage { custom_type, .. } if custom_type == t))
-            {
-                out.push(entry.clone());
-                if query.limit.is_some_and(|l| out.len() >= l) {
-                    break;
-                }
+                .get_leaf_id()
+                .await
+                .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?,
+            BranchStart::At(id) => Some(id),
+        };
+        let Some(start_id) = start_id else {
+            return Ok(Vec::new());
+        };
+
+        let mut path: Vec<SessionTreeEntry> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut current = self
+            .storage
+            .get_entry(&start_id)
+            .await
+            .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?
+            .ok_or_else(|| BranchQueryError::NotFound(start_id.clone()))?;
+        loop {
+            let id = current.id().to_string();
+            if !visited.insert(id.clone()) {
+                return Err(BranchQueryError::InvalidSession(format!(
+                    "Session branch contains a cycle at {id}"
+                )));
             }
-            if stop {
+            path.push(current.clone());
+            if !query.oldest_first
+                && (query.stop_at_id.as_deref() == Some(current.id())
+                    || query.stop_at_type == Some(entry_kind(&current)))
+            {
                 break;
             }
-            current = entry.parent_id().map(|p| p.to_string());
+            let Some(parent_id) = current.parent_id() else {
+                break;
+            };
+            current = self
+                .storage
+                .get_entry(parent_id)
+                .await
+                .map_err(|e| BranchQueryError::InvalidSession(e.to_string()))?
+                .ok_or_else(|| {
+                    BranchQueryError::InvalidSession(format!("Entry {parent_id} not found"))
+                })?;
         }
-        if query.oldest_first {
-            out.reverse();
-        }
-        Ok(out)
+
+        let traversal = if query.oldest_first {
+            path.reverse();
+            path
+        } else {
+            path
+        };
+        let stop_index = if query.oldest_first {
+            traversal.iter().position(|e| {
+                query.stop_at_id.as_deref() == Some(e.id())
+                    || query.stop_at_type == Some(entry_kind(e))
+            })
+        } else {
+            None
+        };
+        let bounded = match stop_index {
+            Some(i) => traversal[..=i].to_vec(),
+            None => traversal,
+        };
+        let entries: Vec<SessionTreeEntry> = bounded
+            .into_iter()
+            .filter(|e| {
+                query.entry_type.is_none_or(|t| t == entry_kind(e))
+                    && query.custom_type.as_deref().is_none_or(|ct| {
+                        matches!(e, SessionTreeEntry::Custom { custom_type, .. } if custom_type == ct)
+                    })
+            })
+            .collect();
+        Ok(match query.limit {
+            Some(l) => entries.into_iter().take(l).collect(),
+            None => entries,
+        })
     }
 
-    /// The first entry matching the query — the TS `findEntryOnBranch`.
+    /// The first entry matching the query — the upstream `findEntryOnBranch`.
     pub async fn find_entry_on_branch(
         &self,
         query: SessionBranchQuery,
-    ) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
+    ) -> Result<Option<SessionTreeEntry>, BranchQueryError> {
         let query = SessionBranchQuery {
             limit: Some(1),
             ..query
@@ -1315,5 +1395,321 @@ fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::Label { .. } => EntryType::Label,
         SessionTreeEntry::SessionInfo { .. } => EntryType::SessionInfo,
         SessionTreeEntry::Leaf { .. } => EntryType::Leaf,
+    }
+}
+
+#[cfg(test)]
+mod branch_query_tests {
+    use super::*;
+    use crate::types::ContentBlock;
+
+    /// The upstream bounded branch-query semantics, ported from
+    /// `branch-query.test.ts`: traversal bounds, order, filtering, limits,
+    /// and error codes.
+    #[tokio::test]
+    async fn find_entries_on_branch_matches_upstream_semantics() {
+        use crate::types::AgentMessage as M;
+        fn assistant(text: &str) -> M {
+            M::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: text.into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(crate::types::StopReason::Stop),
+                usage: Default::default(),
+                error_message: None,
+                timestamp: Utc::now(),
+            }
+        }
+        let storage = crate::harness::tests::MemStorage::new();
+        let session = Session::new(storage);
+        let root = session.append_message(M::user("root")).await.unwrap();
+        let custom = session
+            .append_custom("note", Some(serde_json::json!({"value": 1})))
+            .await
+            .unwrap();
+        let child = session.append_message(assistant("child")).await.unwrap();
+        let (compaction, _) = session
+            .append_compaction(
+                "summary",
+                Some(child.clone()),
+                100,
+                None,
+                CompactionAuthorship {
+                    details: None,
+                    from_hook: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let recent_custom = session
+            .append_custom("note", Some(serde_json::json!({"value": 2})))
+            .await
+            .unwrap();
+        let tail = session.append_message(M::user("tail")).await.unwrap();
+        session.move_to(Some(&root)).await.unwrap();
+        let sibling = session.append_message(M::user("sibling")).await.unwrap();
+
+        let ids = |entries: Vec<SessionTreeEntry>| {
+            entries
+                .into_iter()
+                .map(|e| e.id().to_string())
+                .collect::<Vec<_>>()
+        };
+        let q = |start, oldest_first: bool| SessionBranchQuery {
+            start,
+            oldest_first,
+            ..Default::default()
+        };
+
+        // Default (newest first) from the active leaf.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery::default())
+                .await
+                .unwrap()),
+            vec![sibling.clone(), root.clone()]
+        );
+        // Explicit null start: empty.
+        assert!(
+            session
+                .find_entries_on_branch(q(BranchStart::None, false))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Oldest first walks root -> start.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(q(BranchStart::At(tail.clone()), true))
+                .await
+                .unwrap()),
+            vec![
+                root.clone(),
+                custom.clone(),
+                child.clone(),
+                compaction.clone(),
+                recent_custom.clone(),
+                tail.clone()
+            ]
+        );
+        // stopAtType inclusive on the newest-first walk.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    stop_at_type: Some(EntryType::Compaction),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![tail.clone(), recent_custom.clone(), compaction.clone()]
+        );
+        // stopAtType with a type filter drops the stop entry itself.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    stop_at_type: Some(EntryType::Compaction),
+                    entry_type: Some(EntryType::Message),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![tail.clone()]
+        );
+        // stopAtId on the oldest-first walk bounds from the root.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    stop_at_id: Some(child.clone()),
+                    oldest_first: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![root.clone(), custom.clone(), child.clone()]
+        );
+        // stopAtType "custom" stops at the custom entry (newest first).
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    stop_at_type: Some(EntryType::Custom),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![tail.clone(), recent_custom.clone()]
+        );
+        // stopAtType "custom" oldest first stops at the earliest custom.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    stop_at_type: Some(EntryType::Custom),
+                    oldest_first: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![root.clone(), custom.clone()]
+        );
+        // Type filter over the whole walk, oldest first.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    entry_type: Some(EntryType::Message),
+                    oldest_first: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![root.clone(), child.clone(), tail.clone()]
+        );
+        // customType filters the custom entries.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    custom_type: Some("note".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![recent_custom.clone(), custom.clone()]
+        );
+        // limit applies after ordering: newest first keeps the start.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![tail.clone()]
+        );
+        // limit on the oldest-first walk keeps the root.
+        assert_eq!(
+            ids(session
+                .find_entries_on_branch(SessionBranchQuery {
+                    start: BranchStart::At(tail.clone()),
+                    entry_type: Some(EntryType::Message),
+                    oldest_first: true,
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()),
+            vec![root.clone()]
+        );
+        // findEntryOnBranch returns the first match.
+        let found = session
+            .find_entry_on_branch(SessionBranchQuery {
+                start: BranchStart::At(tail.clone()),
+                entry_type: Some(EntryType::Compaction),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id(), compaction);
+        // Missing start: not_found.
+        let err = session
+            .find_entries_on_branch(q(BranchStart::At("missing".into()), false))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BranchQueryError::NotFound(_)), "{err}");
+        // limit 0 is refused.
+        let err = session
+            .find_entries_on_branch(SessionBranchQuery {
+                start: BranchStart::At(tail.clone()),
+                limit: Some(0),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
+    /// A broken parent chain and a cycle surface as invalid_session.
+    #[tokio::test]
+    async fn find_entries_on_branch_detects_cycles_and_broken_parents() {
+        let storage = crate::harness::tests::MemStorage::new();
+        let session = Session::new(storage);
+        session
+            .storage()
+            .append_entry(&SessionTreeEntry::Message {
+                id: "orphan".into(),
+                parent_id: Some("missing-parent".into()),
+                timestamp: Utc::now(),
+                message: AgentMessage::user("orphan"),
+            })
+            .await
+            .unwrap();
+        // stopAtId on the start itself still resolves (no parent walk).
+        let entries = session
+            .find_entries_on_branch(SessionBranchQuery {
+                start: BranchStart::At("orphan".into()),
+                stop_at_id: Some("orphan".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        // Without a stop, the broken parent errors as invalid_session.
+        let err = session
+            .find_entries_on_branch(q_orphan())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BranchQueryError::InvalidSession(_)), "{err}");
+
+        session
+            .storage()
+            .append_entry(&SessionTreeEntry::Message {
+                id: "cycle-a".into(),
+                parent_id: Some("cycle-b".into()),
+                timestamp: Utc::now(),
+                message: AgentMessage::user("a"),
+            })
+            .await
+            .unwrap();
+        session
+            .storage()
+            .append_entry(&SessionTreeEntry::Message {
+                id: "cycle-b".into(),
+                parent_id: Some("cycle-a".into()),
+                timestamp: Utc::now(),
+                message: AgentMessage::user("b"),
+            })
+            .await
+            .unwrap();
+        let err = session
+            .find_entries_on_branch(SessionBranchQuery {
+                start: BranchStart::At("cycle-b".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cycle"), "{err}");
+    }
+
+    fn q_orphan() -> SessionBranchQuery {
+        SessionBranchQuery {
+            start: BranchStart::At("orphan".into()),
+            ..Default::default()
+        }
     }
 }

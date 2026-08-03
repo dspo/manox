@@ -88,6 +88,22 @@ pub enum RetryEvent {
     },
 }
 
+/// Whether a summarization error is transient and worth retrying (TS
+/// `isRetryableAssistantError`): retryable HTTP statuses and transport
+/// failures; auth, quota/billing, and invalid requests are not.
+fn is_transient_error(err: &anyhow::Error) -> bool {
+    if let Some(pe) = err.downcast_ref::<crate::provider::ProviderError>() {
+        return match pe {
+            crate::provider::ProviderError::Http { status, .. } => {
+                crate::provider::retry::is_retryable_status(*status)
+            }
+            crate::provider::ProviderError::Transport(_) => true,
+            _ => false,
+        };
+    }
+    false
+}
+
 /// The shared runtime snapshot (model + thinking level) that new runs and
 /// next-turn refreshes build their context from. Both the idle setters and
 /// the mid-run handle setters update it immediately; the durable session
@@ -702,6 +718,12 @@ pub struct AgentHarness<S: SessionStorage> {
     /// crate stays registry-free, so the consumer plugs in its registry;
     /// without one a restore keeps the construction-time model.
     model_resolver: Option<ModelResolver>,
+    /// Whether cache-miss notices are shown in the transcript (TS
+    /// `showCacheMissNotices`; the harness records it for UI consumers).
+    show_cache_miss_notices: bool,
+    /// Tokens reserved for a branch summary's prompt + response (TS
+    /// `branchSummary.reserveTokens`).
+    branch_summary_reserve: usize,
     /// Skills and prompt templates the harness can expand into prompts.
     resources: HarnessResources,
 }
@@ -815,6 +837,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             active_tool_names: None,
             model_resolver: None,
             resources: HarnessResources::default(),
+            show_cache_miss_notices: false,
+            branch_summary_reserve: crate::compaction::branch_summarization::RESERVE_TOKENS,
         }
     }
 
@@ -1016,30 +1040,45 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 attempt: u32,
                 payload: &serde_json::Value,
             ) -> Option<serde_json::Value> {
-                let mut replacement = None;
-                let ctx = HookContext::new(HookPoint::BeforeProviderPayload)
-                    .with_data(serde_json::json!({ "attempt": attempt, "payload": payload }));
+                // Handlers chain: each receives the previous handler's
+                // payload (the original when none has run yet), and its
+                // returned `payload` becomes the next input — TS
+                // before-payload composition.
+                let mut current: Option<serde_json::Value> = None;
+                let ctx_base = HookContext::new(HookPoint::BeforeProviderPayload);
                 let list = self.0.lock().unwrap();
                 for (point, handler) in list.iter() {
                     if *point == HookPoint::BeforeProviderPayload {
-                        let next = handler(ctx.clone());
-                        // A handler that replaced the `payload` field wins
-                        // for this attempt (TS before-payload mutation).
+                        let effective = current.clone().unwrap_or_else(|| payload.clone());
+                        let ctx = ctx_base.clone().with_data(serde_json::json!({
+                            "attempt": attempt,
+                            "payload": effective,
+                        }));
+                        let next = handler(ctx);
                         if let Some(data) = next.data.get("payload") {
-                            replacement = Some(data.clone());
+                            current = Some(data.clone());
                         }
                     }
                 }
-                replacement
+                current
             }
             fn after_response(
                 &self,
                 attempt: u32,
                 status: u16,
-                _headers: &reqwest::header::HeaderMap,
+                headers: &reqwest::header::HeaderMap,
             ) {
-                let ctx = HookContext::new(HookPoint::AfterProviderResponse)
-                    .with_data(serde_json::json!({ "attempt": attempt, "status": status }));
+                let headers_json: Vec<serde_json::Value> = headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let name = name.as_str().to_string();
+                        let value = value.to_str().ok()?.to_string();
+                        Some(serde_json::json!({ "name": name, "value": value }))
+                    })
+                    .collect();
+                let ctx = HookContext::new(HookPoint::AfterProviderResponse).with_data(
+                    serde_json::json!({ "attempt": attempt, "status": status, "headers": headers_json }),
+                );
                 let list = self.0.lock().unwrap();
                 for (point, handler) in list.iter() {
                     if *point == HookPoint::AfterProviderResponse {
@@ -1080,6 +1119,26 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Update the auto-retry policy.
     pub fn set_retry_settings(&mut self, settings: RetrySettings) {
         self.retry_settings = settings;
+    }
+
+    /// Whether cache-miss notices are shown.
+    pub fn show_cache_miss_notices(&self) -> bool {
+        self.show_cache_miss_notices
+    }
+
+    /// Set whether cache-miss notices are shown.
+    pub fn set_show_cache_miss_notices(&mut self, enabled: bool) {
+        self.show_cache_miss_notices = enabled;
+    }
+
+    /// Tokens reserved for a branch summary's prompt + response.
+    pub fn branch_summary_reserve(&self) -> usize {
+        self.branch_summary_reserve
+    }
+
+    /// Set the branch-summary reserve tokens (TS `branchSummary.reserveTokens`).
+    pub fn set_branch_summary_reserve(&mut self, reserve: usize) {
+        self.branch_summary_reserve = reserve;
     }
 
     /// Set the per-request provider options (headers, timeout, output
@@ -2106,17 +2165,20 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 None => Arc::clone(&self.stream_fn),
             };
             let token_budget = (self.model.context_window as u64)
-                .saturating_sub(crate::compaction::branch_summarization::RESERVE_TOKENS as u64);
+                .saturating_sub(self.branch_summary_reserve as u64);
             let signal = self.control.operation_cancel.lock().unwrap().clone();
-            let stream_options = self
+            let mut stream_options = self
                 .control
                 .turn_runtime
                 .lock()
                 .unwrap()
                 .stream_options
                 .clone();
+            // The branch summary caps its output at 2048 tokens (TS).
+            stream_options.max_tokens = stream_options.max_tokens.or(Some(2048));
             let retry = self.retry_settings;
             let mut attempt = 0u32;
+            let mut last_error: Option<String> = None;
             let result = loop {
                 attempt += 1;
                 match crate::compaction::branch_summarization::summarize_branch(
@@ -2131,28 +2193,46 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 )
                 .await
                 {
-                    Ok(result) => break result,
-                    Err(_e)
-                        if retry.enabled
-                            && attempt <= retry.max_retries
-                            && !signal.is_cancelled() =>
-                    {
+                    Ok(result) => break Ok(result),
+                    Err(e) => {
+                        // Only transient failures retry (TS
+                        // `isRetryableAssistantError`): auth, quota/billing,
+                        // and invalid requests are deterministic and surface
+                        // immediately.
+                        last_error = Some(e.to_string());
+                        let transient = is_transient_error(&e);
                         let delay = std::time::Duration::from_millis(
-                            retry.base_delay_ms * (1u64 << (attempt - 1)),
+                            retry.base_delay_ms.saturating_mul(
+                                1u64.checked_shl(attempt.saturating_sub(1))
+                                    .unwrap_or(u64::MAX),
+                            ),
                         );
+                        if !retry.enabled || !transient || attempt > retry.max_retries {
+                            break Err(e);
+                        }
+                        self.emit_retry(RetryEvent::Start {
+                            attempt,
+                            max_attempts: retry.max_retries,
+                            delay,
+                            error_message: e.to_string(),
+                        });
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
                             _ = signal.cancelled() => break
-                                crate::compaction::branch_summarization::BranchSummaryResult {
-                                    summary: None,
-                                    usage: None,
-                                    read_files: Vec::new(),
-                                    modified_files: Vec::new(),
-                                    aborted: true,
-                                },
+                                Err(anyhow::anyhow!("branch summary cancelled during retry backoff")),
                         }
                     }
-                    Err(e) => return Err(e),
+                }
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(e) => {
+                    self.emit_retry(RetryEvent::End {
+                        success: false,
+                        attempt,
+                        final_error: last_error.or_else(|| Some(e.to_string())),
+                    });
+                    return Err(e);
                 }
             };
             if result.aborted {
@@ -3057,7 +3137,7 @@ fn extract_summary(message: &AgentMessage) -> (String, Option<Usage>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session::SessionStorage;
     use crate::session::SessionTreeEntry;
@@ -3248,7 +3328,7 @@ mod tests {
     }
 
     // In-memory session storage for testing.
-    struct MemStorage {
+    pub(crate) struct MemStorage {
         entries: std::sync::Mutex<Vec<SessionTreeEntry>>,
         leaf_id: std::sync::Mutex<Option<String>>,
         /// Number of `append_entry` calls so far.
@@ -3261,7 +3341,7 @@ mod tests {
     }
 
     impl MemStorage {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             MemStorage {
                 entries: std::sync::Mutex::new(Vec::new()),
                 leaf_id: std::sync::Mutex::new(None),
@@ -4852,6 +4932,108 @@ mod tests {
             })]
         );
         assert_eq!(seen_status.lock().unwrap().clone(), vec![429, 200]);
+    }
+
+    /// before-payload handlers chain: each sees the previous handler's
+    /// payload and its replacement becomes the next handler's input (TS
+    /// composition); after-response carries the response headers.
+    #[tokio::test]
+    async fn test_payload_handlers_chain_and_headers_flow() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.on(
+            HookPoint::BeforeProviderPayload,
+            Arc::new(|ctx: HookContext| {
+                let mut payload = ctx
+                    .data
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                payload["first"] = serde_json::json!(true);
+                let attempt = ctx.data.get("attempt").cloned().unwrap_or_default();
+                ctx.with_data(serde_json::json!({ "attempt": attempt, "payload": payload }))
+            }),
+        );
+        harness.on(
+            HookPoint::BeforeProviderPayload,
+            Arc::new(|ctx: HookContext| {
+                let payload = ctx.data.get("payload").cloned().unwrap_or_default();
+                // The second handler sees the first handler's mutation.
+                assert_eq!(payload.get("first"), Some(&serde_json::json!(true)));
+                let mut payload = payload;
+                payload["second"] = serde_json::json!(true);
+                let attempt = ctx.data.get("attempt").cloned().unwrap_or_default();
+                ctx.with_data(serde_json::json!({ "attempt": attempt, "payload": payload }))
+            }),
+        );
+
+        let observer = harness.request_observer();
+        let replaced = observer
+            .before_payload(1, &serde_json::json!({ "model": "m" }))
+            .unwrap();
+        assert_eq!(
+            replaced,
+            serde_json::json!({ "model": "m", "first": true, "second": true }),
+            "mutations chain through the handlers"
+        );
+
+        // Headers flow into the after-response hook data.
+        let seen_headers: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_slot = Arc::clone(&seen_headers);
+        harness.on(
+            HookPoint::AfterProviderResponse,
+            Arc::new(move |ctx: HookContext| {
+                if let Some(headers) = ctx.data.get("headers") {
+                    seen_slot.lock().unwrap().push(headers.clone());
+                }
+                ctx
+            }),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "42".parse().unwrap());
+        observer.after_response(1, 429, &headers);
+        assert!(
+            seen_headers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|h| h.to_string().contains("x-ratelimit-remaining")),
+            "headers reach the hook data: {:?}",
+            seen_headers.lock().unwrap()
+        );
+    }
+
+    /// Branch-summarization retry only retries transient provider errors —
+    /// auth and invalid-request failures surface immediately.
+    #[test]
+    fn summarization_retry_classifies_errors() {
+        let transient = anyhow::anyhow!(crate::provider::ProviderError::Http {
+            status: 503,
+            body: "unavailable".into(),
+        });
+        assert!(is_transient_error(&transient));
+        let transport = anyhow::anyhow!(crate::provider::ProviderError::Transport(
+            "connection reset".into()
+        ));
+        assert!(is_transient_error(&transport));
+        let auth = anyhow::anyhow!(crate::provider::ProviderError::Http {
+            status: 401,
+            body: "unauthorized".into(),
+        });
+        assert!(!is_transient_error(&auth));
+        let quota = anyhow::anyhow!(crate::provider::ProviderError::Http {
+            status: 429,
+            body: "billing limit".into(),
+        });
+        // 429 is transient per status; the error body decides at the caller.
+        assert!(is_transient_error(&quota));
     }
 
     /// A per-model stream resolver switches the provider runtime at the next

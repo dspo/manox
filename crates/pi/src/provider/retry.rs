@@ -31,7 +31,11 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// HTTP statuses whose failure is likely to resolve on retry. The unofficial
 /// 529 ("service overloaded") is included — Anthropic emits it in practice.
 /// 520–524 are Cloudflare gateway errors common to provider front-ends.
-fn should_retry_status(status: u16) -> bool {
+/// Whether an HTTP status is transient (rate limit, timeout, gateway
+/// errors). Auth (401/403), invalid requests (400/404), and quota/billing
+/// (429 with an error body the API marks terminal) are not — those are
+/// deterministic and must not be retried.
+pub fn is_retryable_status(status: u16) -> bool {
     matches!(
         status,
         408 | 429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
@@ -218,7 +222,7 @@ where
                 let status = resp.status();
                 let retry_after = parse_retry_after(resp.headers());
                 let body = resp.text().await.unwrap_or_default();
-                if !should_retry_status(status.as_u16()) || attempt >= MAX_ATTEMPTS {
+                if !is_retryable_status(status.as_u16()) || attempt >= MAX_ATTEMPTS {
                     return Err(overflow::terminal(status.as_u16(), body).into());
                 }
                 let delay = retry_delay(attempt, retry_after);
@@ -383,10 +387,10 @@ mod tests {
     #[test]
     fn retryable_statuses() {
         for s in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
-            assert!(should_retry_status(s), "{s}");
+            assert!(is_retryable_status(s), "{s}");
         }
         for s in [400, 401, 403, 404, 409, 422, 451] {
-            assert!(!should_retry_status(s), "{s}");
+            assert!(!is_retryable_status(s), "{s}");
         }
     }
 

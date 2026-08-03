@@ -431,13 +431,23 @@ impl AgentSession {
             .with_stream_resolver(resolver.clone())
             .with_tool_cwd(self.cwd.clone());
         // Restore projects the session's own model onto the harness.
-        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
+        harness = harness.with_model_resolver(model_resolver(&self.runtime));
         let observer = harness.request_observer();
         harness.rebind_stream_resolver(self.runtime.resolver_with_observer(observer));
         // Re-apply the captured assembly state so a fork is identical to the
         // session it came from.
         config.apply(&mut harness).await;
         Ok(harness)
+    }
+}
+
+/// Resolve a settings path against the project cwd (TS `resolvePath`).
+fn resolve_path(cwd: &std::path::Path, path: &str) -> PathBuf {
+    let expanded = expand_tilde(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
     }
 }
 
@@ -466,20 +476,6 @@ fn api_for_provider(provider: &str) -> String {
     }
 }
 
-/// Compose the system prompt: the base prompt followed by the project
-/// instruction context files (AGENTS.md / CLAUDE.md), so the instructions
-/// are automatic context rather than manually invocable skills.
-fn compose_system_prompt(base: &str, resources: &HarnessResources) -> String {
-    if resources.context_files.is_empty() {
-        return base.to_string();
-    }
-    let mut prompt = format!("{base}\n\n# Project instructions\n");
-    for file in &resources.context_files {
-        prompt.push_str(&format!("\n## {}\n\n{}\n", file.name, file.content));
-    }
-    prompt
-}
-
 /// The default model when none is configured: anthropic, from `ANTHROPIC_MODEL`
 /// or a sensible default.
 pub fn default_model() -> Model {
@@ -494,46 +490,16 @@ pub fn default_model() -> Model {
     }
 }
 
-/// A model resolver that maps a session-carried model reference onto a
-/// concrete model served by the runtime's resolver.
+/// A model resolver that restores a session-carried model reference through
+/// the runtime's catalog. An unknown provider resolves to `None`, so the
+/// harness keeps its construction-time model instead of guessing a protocol.
 fn model_resolver(
-    _runtime: crate::agent_loop::StreamResolver,
+    runtime: &ModelRuntime,
 ) -> impl Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync + 'static {
-    |mref: &crate::session::SessionModelRef| {
-        // Restore the full model from the session's provider + model id via
-        // the default catalog. An unknown provider resolves to `None`, so
-        // the harness keeps its construction-time model instead of silently
-        // switching protocol.
-        let api = match mref.provider.as_str() {
-            "anthropic" => "anthropic".to_string(),
-            "openai" => {
-                if is_responses_model(&mref.model_id) {
-                    "openai_responses".to_string()
-                } else {
-                    "openai_completions".to_string()
-                }
-            }
-            _ => return None,
-        };
-        Some(Model {
-            provider: mref.provider.clone(),
-            api,
-            id: mref.model_id.clone(),
-            context_window: 200_000,
-            max_tokens: 8_192,
-            thinking: crate::types::ThinkingKind::None,
-            metadata: Default::default(),
-        })
+    let runtime = runtime.clone();
+    move |mref: &crate::session::SessionModelRef| {
+        runtime.resolve_model(&mref.provider, &mref.model_id)
     }
-}
-
-/// Whether an OpenAI model id maps to the Responses API (the modern default
-/// for reasoning-capable models).
-fn is_responses_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
-        .iter()
-        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
 }
 
 /// Builds an [`AgentSession`]: cwd, session folder, model runtime, resources,
@@ -608,98 +574,132 @@ impl AgentSessionBuilder {
         self
     }
 
-    /// Open (or create) the session and assemble the harness.
-    pub async fn build(self) -> Result<AgentSession, anyhow::Error> {
-        let cwd = self
-            .cwd
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let session_dir = self.session_dir.unwrap_or_else(|| cwd.join(".pi-sessions"));
-        tokio::fs::create_dir_all(&session_dir).await?;
-        let repo = SessionRepository::new(&session_dir);
-
+    /// The shared build/open assembly: settings, trust, resources, system
+    /// prompt, model, tools, and runtime are resolved identically for a new
+    /// session and a reopened one, so a reopen does not drift. `restore`
+    /// rebuilds the transcript and runtime configuration for open.
+    async fn assemble_common(
+        &self,
+        session: crate::session::Session<crate::session::jsonl::JsonlSessionStorage>,
+        cwd: PathBuf,
+        session_dir: PathBuf,
+        restore: bool,
+    ) -> Result<AgentSession, anyhow::Error> {
         // Agent config dir: explicit override, `PI_AGENT_DIR`, or `~/.pi/agent`
         // (with `~` expanded).
         let agent_dir = self.agent_dir.clone().unwrap_or_else(default_agent_dir);
 
         // Settings: loaded and merged unless the caller supplied an override.
-        let settings = match self.settings {
-            Some(settings) => settings,
+        let settings = match &self.settings {
+            Some(settings) => settings.clone(),
             None => crate::settings::Settings::load_at(&cwd, &agent_dir).await?,
         };
 
         // Trust: the global `agentDir/trust.json`, nearest-ancestor match.
         // Undecided projects are treated as untrusted (no UI to ask): their
         // project-scoped resources are skipped.
-        let trust = match self.trust {
-            Some(trust) => trust,
+        let trust = match &self.trust {
+            Some(trust) => trust.clone(),
             None => TrustManager::load(&agent_dir.join("trust.json")).unwrap_or_default(),
         };
         let trusted = matches!(trust.check(&cwd), TrustStatus::Trusted);
 
         // Resources: discovered unless the caller supplied them. Trust gates
         // project-scoped resources; the user/agentDir ones always load.
-        let resources = match self.resources {
-            Some(resources) => resources,
+        let resources = match &self.resources {
+            Some(resources) => resources.clone(),
             None => {
+                let extra_skills = settings
+                    .skills
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| resolve_path(&cwd, &p))
+                    .collect();
+                let extra_prompts = settings
+                    .prompts
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| resolve_path(&cwd, &p))
+                    .collect();
                 let loader = ResourceLoader::new(&cwd)
                     .with_agent_dir(&agent_dir)
-                    .with_trust(trusted);
+                    .with_trust(trusted)
+                    .with_extra_skill_paths(extra_skills)
+                    .with_extra_prompt_paths(extra_prompts);
                 loader.snapshot().await?
             }
         };
 
-        let model = self.model.or_else(|| {
-            settings.default_model.clone().map(|id| {
-                let provider = settings
-                    .default_provider
+        let session_path = session.storage().path().to_path_buf();
+        let base_prompt = self
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| "You are a helpful coding agent.".into());
+        let system_prompt = crate::system_prompt::build_harness_prompt(
+            &base_prompt,
+            &resources.context_files,
+            &resources.skills,
+        );
+
+        // The session's own model when reopening (restore), the builder
+        // override or settings default otherwise.
+        let session_model = if restore {
+            session
+                .build_session_context()
+                .await
+                .ok()
+                .and_then(|c| c.model)
+        } else {
+            None
+        };
+        let runtime = match &self.model_runtime {
+            Some(runtime) => runtime.clone(),
+            None => ModelRuntime::from_env(),
+        };
+        let model = match &self.model {
+            Some(model) => model.clone(),
+            None => match &session_model {
+                Some(mref) => runtime
+                    .resolve_model(&mref.provider, &mref.model_id)
+                    .unwrap_or_else(default_model),
+                None => settings
+                    .default_model
                     .clone()
-                    .unwrap_or_else(|| "anthropic".into());
-                Model {
-                    api: api_for_provider(&provider),
-                    provider,
-                    id,
-                    context_window: 200_000,
-                    max_tokens: 8_192,
-                    thinking: crate::types::ThinkingKind::None,
-                    metadata: Default::default(),
-                }
-            })
-        });
-        let model = model.unwrap_or_else(default_model);
+                    .map(|id| {
+                        let provider = settings
+                            .default_provider
+                            .clone()
+                            .unwrap_or_else(|| "anthropic".into());
+                        Model {
+                            api: api_for_provider(&provider),
+                            provider,
+                            id,
+                            context_window: 200_000,
+                            max_tokens: 8_192,
+                            thinking: crate::types::ThinkingKind::None,
+                            metadata: Default::default(),
+                        }
+                    })
+                    .unwrap_or_else(default_model),
+            },
+        };
 
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
             vec![
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(EditTool) as Arc<dyn AgentTool>,
-                Arc::new(BashTool::new(None)) as Arc<dyn AgentTool>,
+                Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
+                    as Arc<dyn AgentTool>,
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
                 Arc::new(FindTool) as Arc<dyn AgentTool>,
                 Arc::new(LsTool) as Arc<dyn AgentTool>,
             ]
         } else {
-            self.tools
+            self.tools.clone()
         };
-
-        let runtime = match self.model_runtime {
-            Some(runtime) => runtime,
-            None => ModelRuntime::from_env(),
-        };
-
-        let session = repo
-            .create(JsonlSessionMetadata {
-                id: uuid::Uuid::new_v4().to_string(),
-                cwd: cwd.to_string_lossy().into_owned(),
-                created_at: chrono::Utc::now(),
-                parent_session_path: None,
-                metadata: None,
-            })
-            .await?;
-        let session_path = session.storage().path().to_path_buf();
-        let base_prompt = self
-            .system_prompt
-            .unwrap_or_else(|| "You are a helpful coding agent.".into());
-        let system_prompt = compose_system_prompt(&base_prompt, &resources);
 
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
@@ -708,7 +708,7 @@ impl AgentSessionBuilder {
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
             .with_resources(resources);
-        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
+        harness = harness.with_model_resolver(model_resolver(&runtime));
         // Attach the request observer so the harness's before-payload /
         // after-response hooks fire on the real provider requests.
         let observer = harness.request_observer();
@@ -726,6 +726,15 @@ impl AgentSessionBuilder {
         if let Some(mode) = settings.resolved_follow_up_mode() {
             harness.set_follow_up_mode(mode);
         }
+        if let Some(enabled) = settings.show_cache_miss_notices {
+            harness.set_show_cache_miss_notices(enabled);
+        }
+        if let Some(reserve) = settings.resolved_branch_summary_reserve() {
+            harness.set_branch_summary_reserve(reserve);
+        }
+        if restore {
+            harness.restore().await?;
+        }
 
         Ok(AgentSession {
             harness,
@@ -738,72 +747,44 @@ impl AgentSessionBuilder {
         })
     }
 
-    /// Open an existing session file, restoring its model / thinking / active
-    /// tools before returning — callers must not restore manually.
+    /// Open (or create) the session and assemble the harness.
+    pub async fn build(self) -> Result<AgentSession, anyhow::Error> {
+        let cwd = self
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let session_dir = self
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| cwd.join(".pi-sessions"));
+        tokio::fs::create_dir_all(&session_dir).await?;
+        let repo = SessionRepository::new(&session_dir);
+        let session = repo
+            .create(JsonlSessionMetadata {
+                id: uuid::Uuid::new_v4().to_string(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                metadata: None,
+            })
+            .await?;
+        self.assemble_common(session, cwd, session_dir, false).await
+    }
+
+    /// Open an existing session file, restoring its model / thinking /
+    /// active tools and its full assembly (settings, trust, resources,
+    /// system prompt, tools, runtime) before returning — callers must not
+    /// restore manually. Tools and the returned session cwd follow the
+    /// session's own project directory.
     pub async fn open(self, path: PathBuf) -> Result<AgentSession, anyhow::Error> {
         let session_dir = path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
-        let cwd = self
-            .cwd
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let repo = SessionRepository::new(&session_dir);
         let session = repo.open(&path).await?;
-        let session_path = session.storage().path().to_path_buf();
-        // Tools run against the session's own cwd, not the process cwd.
-        let session_cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
-
-        let model = self.model.unwrap_or_else(default_model);
-        let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
-            vec![
-                Arc::new(ReadTool) as Arc<dyn AgentTool>,
-                Arc::new(WriteTool) as Arc<dyn AgentTool>,
-                Arc::new(EditTool) as Arc<dyn AgentTool>,
-                Arc::new(BashTool::new(None)) as Arc<dyn AgentTool>,
-                Arc::new(GrepTool) as Arc<dyn AgentTool>,
-                Arc::new(FindTool) as Arc<dyn AgentTool>,
-                Arc::new(LsTool) as Arc<dyn AgentTool>,
-            ]
-        } else {
-            self.tools
-        };
-        let runtime = match self.model_runtime {
-            Some(runtime) => runtime,
-            None => ModelRuntime::from_env(),
-        };
-        let base_prompt = self
-            .system_prompt
-            .unwrap_or_else(|| "You are a helpful coding agent.".into());
-        let system_prompt = match &self.resources {
-            Some(resources) => compose_system_prompt(&base_prompt, resources),
-            None => base_prompt,
-        };
-
-        let stream_fn = runtime.resolver()(&model)?;
-        let resolver = runtime.resolver();
-        let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
-            .with_stream_resolver(resolver.clone())
-            .with_tools(Arc::from(tools.clone()))
-            .with_tool_cwd(session_cwd);
-        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
-        let observer = harness.request_observer();
-        harness.rebind_stream_resolver(runtime.resolver_with_observer(observer));
-        if let Some(resources) = self.resources {
-            harness = harness.with_resources(resources);
-        }
-        // Restore the session's transcript and runtime configuration now.
-        harness.restore().await?;
-
-        Ok(AgentSession {
-            harness,
-            session_path,
-            session_dir,
-            cwd,
-            runtime,
-            system_prompt,
-            tools,
-        })
+        let cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
+        self.assemble_common(session, cwd, session_dir, true).await
     }
 }
 
@@ -1075,6 +1056,115 @@ mod tests {
             "read must resolve relative to the session cwd: {:?}",
             result.details
         );
+    }
+
+    /// build → close → move the process cwd → open → fork: the reopened and
+    /// forked sessions keep the project cwd, resources, and tool environment
+    /// without drift.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn reopen_and_fork_survive_a_process_cwd_change() {
+        // The std Mutex serializes the process-wide cwd change against other
+        // tests; it is intentionally held for the whole test body.
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = CWD_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::write(project.join("CLAUDE.md"), "project rules")
+            .await
+            .unwrap();
+        tokio::fs::write(project.join("only-in-project.txt"), "file")
+            .await
+            .unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&project)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let path = session.close().await.unwrap();
+
+        // Move the process cwd somewhere else entirely.
+        let elsewhere = dir.path().join("elsewhere");
+        tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&elsewhere).unwrap();
+
+        // Reopen: the session's own cwd wins over the moved process cwd.
+        let resumed = create_agent_session()
+            .with_model_runtime(fake_runtime())
+            .open(path.clone())
+            .await
+            .unwrap();
+        assert_eq!(resumed.harness_messages().len(), 2, "transcript restored");
+        // Resources (context files) reloaded from the session cwd.
+        assert_eq!(resumed.resources().context_files.len(), 1);
+        // The read tool resolves relative to the session project.
+        let read = resumed
+            .harness
+            .agent()
+            .tools()
+            .iter()
+            .find(|t| t.name() == "read")
+            .unwrap()
+            .clone();
+        let ctx = Arc::clone(resumed.harness.agent().tool_context());
+        let result = read
+            .execute(
+                "t1",
+                serde_json::json!({ "path": "only-in-project.txt" }),
+                tokio_util::sync::CancellationToken::new(),
+                &*ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "tools run in the session cwd after reopen"
+        );
+
+        // Fork: the new session stays in the project cwd too.
+        let entries = resumed
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap();
+        let first_user = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .next()
+            .unwrap();
+        let ForkResult { session: fork, .. } = resumed
+            .fork(&first_user, ForkPosition::AtEntry)
+            .await
+            .unwrap();
+        let ctx = Arc::clone(fork.harness.agent().tool_context());
+        let result = read
+            .execute(
+                "t1",
+                serde_json::json!({ "path": "only-in-project.txt" }),
+                tokio_util::sync::CancellationToken::new(),
+                &*ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "forked session keeps the project cwd");
+        std::env::set_current_dir(&original).unwrap();
+        drop(guard);
     }
 
     #[tokio::test]
