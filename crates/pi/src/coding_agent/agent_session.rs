@@ -322,9 +322,12 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // TS persists the default model/provider on every switch; the
-        // settings file is patched first so a later failure cannot leave a
-        // half-applied switch.
+        // TS writes the declared default (provider/model) before the
+        // switch: settings.json carries the user's intent for future
+        // sessions, and the harness switch follows. A failed switch leaves
+        // the active session on its prior model (the session JSONL is
+        // authoritative on reopen) while the declared default persists —
+        // matching TS `setModel`.
         let provider = model.provider.clone();
         let model_id = model.id.clone();
         self.patch_global_settings(|obj| {
@@ -343,15 +346,21 @@ impl AgentSession {
                 .append_thinking_level_change(&wire)
                 .await?;
             // TS updates the settings default only when the new model
-            // supports thinking or the level is not `off`.
+            // supports thinking or the level is not `off`. The switch and
+            // thinking entry have already landed; the default is a best-effort
+            // preference for future sessions, so a write failure is logged
+            // rather than failing an otherwise-successful switch.
             if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
                 self.settings_thinking_default = Some(wire.clone());
                 let default = wire.clone();
-                let _ = self
+                if let Err(e) = self
                     .patch_global_settings(|obj| {
                         obj.insert("defaultThinkingLevel".into(), default.into());
                     })
-                    .await;
+                    .await
+                {
+                    tracing::warn!("failed to persist default thinking level: {e:#}");
+                }
             }
         }
         self.harness.set_initial_thinking_level(effective);
@@ -382,11 +391,16 @@ impl AgentSession {
             if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
                 self.settings_thinking_default = Some(wire.clone());
                 let default = wire.clone();
-                let _ = self
+                // Best-effort preference for future sessions; the entry has
+                // already landed, so a write failure is logged, not fatal.
+                if let Err(e) = self
                     .patch_global_settings(|obj| {
                         obj.insert("defaultThinkingLevel".into(), default.into());
                     })
-                    .await;
+                    .await
+                {
+                    tracing::warn!("failed to persist default thinking level: {e:#}");
+                }
             }
         }
         self.harness.set_initial_thinking_level(effective);
@@ -397,8 +411,10 @@ impl AgentSession {
     /// read, the closure mutates specific top-level keys, and the whole
     /// object is written back atomically (temp file + rename). Fields the
     /// typed `Settings` does not model (theme, packages, extensions,
-    /// transport, images, enabledModels, future keys) survive untouched (TS
-    /// settings manager locks and merges only the modified fields).
+    /// transport, images, enabledModels, future keys) survive untouched, as
+    /// TS merges only the modified fields. manox ships single-process, so no
+    /// cross-process file lock is taken; concurrent writes from other
+    /// processes racing on the same agent dir are not guarded.
     async fn patch_global_settings(
         &self,
         patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
@@ -420,6 +436,11 @@ impl AgentSession {
         };
         patch(&mut root);
         let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+        // The agent dir may not yet exist for a first-time user; create it so
+        // the temp file write does not fail on a missing parent.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let tmp = path.with_extension("json.tmp");
         tokio::fs::write(&tmp, serialized).await?;
         tokio::fs::rename(&tmp, &path).await?;
@@ -2492,6 +2513,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(raw, corrupt, "corrupt settings must not be wiped");
+    }
+
+    /// A first-time user whose agent dir does not yet exist can still switch
+    /// models: `patch_global_settings` creates the parent dir before the
+    /// temp-file write.
+    #[tokio::test]
+    async fn patch_global_settings_creates_missing_agent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        // Deliberately do NOT create the agent dir; settings has no file.
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        session
+            .set_model(Model {
+                provider: "openai".into(),
+                api: "openai".into(),
+                id: "gpt-5".into(),
+                thinking: crate::types::ThinkingKind::Enabled,
+                context_window: 200_000,
+                max_tokens: 16_384,
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(agent_dir.join("settings.json").exists());
     }
 
     /// An explicit `off` preference on a thinking model survives a round
