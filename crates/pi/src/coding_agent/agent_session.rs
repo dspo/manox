@@ -10,6 +10,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::harness::{AgentHarness, HarnessResources, NavigateTreeOptions};
 use crate::session::jsonl::JsonlSessionMetadata;
 use crate::session::repository::SessionRepository;
@@ -403,18 +405,18 @@ impl AgentSession {
     ) -> Result<(), anyhow::Error> {
         let path = crate::settings::Settings::global_path(&self.agent_dir);
         let root = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-                .unwrap_or_else(|_| serde_json::json!({})),
+            // A missing file is a fresh start: patch runs against `{}`.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
             Err(e) => return Err(e.into()),
+            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+                .context("parse global settings.json")?,
         };
         let mut root = match root {
             serde_json::Value::Object(map) => map,
-            other => {
-                let mut map = serde_json::Map::new();
-                map.insert("__legacy_root__".into(), other);
-                map
-            }
+            // A non-object root is corrupt; do not silently rewrite it under
+            // a synthetic key (that key would itself become an unmodeled
+            // field polluting the file).
+            other => anyhow::bail!("global settings.json root is not an object: {other}"),
         };
         patch(&mut root);
         let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
@@ -2445,6 +2447,51 @@ mod tests {
         assert_eq!(obj["packages"][1], "python");
         assert_eq!(obj["extensions"]["foo"]["enabled"], true);
         assert_eq!(obj["enabledModels"][0], "sonnet");
+    }
+
+    /// A corrupt global settings file is not silently wiped to `{}`: the
+    /// parse error propagates and the on-disk content is left intact for the
+    /// user to repair.
+    #[tokio::test]
+    async fn patch_global_settings_propagates_parse_error_without_wiping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        // Build with no settings file so construction succeeds, then corrupt
+        // the file mid-session (the realistic path to a bad file at patch
+        // time).
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        let corrupt = "{ not valid json";
+        tokio::fs::write(agent_dir.join("settings.json"), corrupt)
+            .await
+            .unwrap();
+        let result = session
+            .set_model(Model {
+                id: "x".into(),
+                ..test_model()
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "corrupt settings must error, got {result:?}"
+        );
+        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
+            .await
+            .unwrap();
+        assert_eq!(raw, corrupt, "corrupt settings must not be wiped");
     }
 
     /// An explicit `off` preference on a thinking model survives a round
