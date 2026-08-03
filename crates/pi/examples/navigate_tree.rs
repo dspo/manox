@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use pi::compaction::branch_summarization::SYSTEM_PROMPT;
+use pi::compaction::SUMMARIZATION_SYSTEM_PROMPT;
 use pi::session::Session;
 use pi::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use pi::session::{SessionStorage, SessionTreeEntry};
@@ -31,7 +31,7 @@ impl StreamFn for MockStream {
         _signal: CancellationToken,
         _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error> {
-        let text = if context.system_prompt == SYSTEM_PROMPT {
+        let text = if context.system_prompt == SUMMARIZATION_SYSTEM_PROMPT {
             "branch summary: the early exploration turn".to_string()
         } else {
             format!("answer to: {}", message_text(&context.messages))

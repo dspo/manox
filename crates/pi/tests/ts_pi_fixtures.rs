@@ -173,6 +173,193 @@ async fn single_turn_event_trace_matches_ts() {
     assert_eq!(kinds, expected);
 }
 
+/// The fixed abandoned branch the TS fixture captures: user/assistant
+/// messages (including tool calls and an excluded tool result), a custom
+/// message, a harness-authored branch summary seeding file lists, and a
+/// compaction carrier.
+fn fixture_branch_entries() -> Vec<pi::session::SessionTreeEntry> {
+    use pi::session::SessionTreeEntry;
+    use pi::types::ContentBlock;
+    fn user(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            timestamp: chrono::Utc::now(),
+            message: pi::AgentMessage::user(text),
+        }
+    }
+    fn assistant_tool(id: &str, parent: &str, name: &str, path: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            timestamp: chrono::Utc::now(),
+            message: pi::AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t".into(),
+                    name: name.into(),
+                    input: serde_json::json!({ "path": path }),
+                    thought_signature: None,
+                }],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(pi::types::StopReason::ToolUse),
+                usage: Box::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            },
+        }
+    }
+    let tool_result = SessionTreeEntry::Message {
+        id: "tr".into(),
+        parent_id: Some("a3".into()),
+        timestamp: chrono::Utc::now(),
+        message: pi::AgentMessage::ToolResult {
+            tool_call_id: "t1".into(),
+            tool_name: "write".into(),
+            content: vec![ContentBlock::Text {
+                text: "ok".into(),
+                signature: None,
+            }],
+            is_error: false,
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            timestamp: chrono::Utc::now(),
+        },
+    };
+    let custom = SessionTreeEntry::CustomMessage {
+        id: "c1".into(),
+        parent_id: Some("tr".into()),
+        timestamp: chrono::Utc::now(),
+        custom_type: "note".into(),
+        content: vec![ContentBlock::Text {
+            text: "custom note".into(),
+            signature: None,
+        }],
+        details: None,
+        display: true,
+    };
+    let branch_summary = SessionTreeEntry::BranchSummary {
+        id: "bs1".into(),
+        parent_id: Some("c1".into()),
+        timestamp: chrono::Utc::now(),
+        from_id: "u1".into(),
+        summary: "prior branch".into(),
+        details: Some(serde_json::json!({
+            "readFiles": ["old.rs"],
+            "modifiedFiles": ["old.rs"],
+        })),
+        usage: None,
+        from_hook: Some(false),
+    };
+    let compaction = SessionTreeEntry::Compaction {
+        id: "cp1".into(),
+        parent_id: Some("bs1".into()),
+        timestamp: chrono::Utc::now(),
+        summary: "prior compaction".into(),
+        first_kept_entry_id: None,
+        tokens_before: 100,
+        retained_tail: None,
+        usage: None,
+        details: None,
+        from_hook: Some(false),
+    };
+    vec![
+        user("u1", None, "first"),
+        SessionTreeEntry::Message {
+            id: "a1".into(),
+            parent_id: Some("u1".into()),
+            timestamp: chrono::Utc::now(),
+            message: pi::AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "hi".into(),
+                    signature: None,
+                }],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(pi::types::StopReason::Stop),
+                usage: Box::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            },
+        },
+        assistant_tool("a2", "a1", "write", "a.rs"),
+        assistant_tool("a3", "a2", "read", "b.rs"),
+        tool_result,
+        custom,
+        branch_summary,
+        compaction,
+    ]
+}
+
+#[test]
+fn branch_summary_preparation_matches_ts_fixture() {
+    let fixture = include_str!("fixtures/ts-pi/branch-summary-preparation.txt");
+    let mut lines = fixture.lines();
+    let roles: Vec<String> =
+        serde_json::from_str(lines.next().unwrap().strip_prefix("roles: ").unwrap()).unwrap();
+    let read_files: Vec<String> =
+        serde_json::from_str(lines.next().unwrap().strip_prefix("readFiles: ").unwrap()).unwrap();
+    let modified_files: Vec<String> = serde_json::from_str(
+        lines
+            .next()
+            .unwrap()
+            .strip_prefix("modifiedFiles: ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lines.next().unwrap(), "conversation:");
+    let expected_conversation = lines.collect::<Vec<_>>().join("\n");
+
+    let entries = fixture_branch_entries();
+    let prep = pi::compaction::branch_summarization::prepare_branch_entries(&entries, 0);
+    let actual_roles: Vec<String> = prep.messages.iter().map(role_name).collect();
+    assert_eq!(actual_roles, roles, "prepared message roles");
+    assert_eq!(prep.read_files, read_files);
+    assert_eq!(prep.modified_files, modified_files);
+    let conversation = pi::compaction::serialize_conversation(&prep.messages);
+    assert_eq!(
+        conversation, expected_conversation,
+        "serialized conversation"
+    );
+}
+
+/// The fixture role label of a prepared message: the tagged carriers identify
+/// branch/compaction summaries by their prefix.
+fn role_name(message: &pi::AgentMessage) -> String {
+    match message {
+        pi::AgentMessage::User { content, .. } => {
+            let text = content
+                .iter()
+                .find_map(|b| match b {
+                    pi::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            if text.starts_with(pi::session::BRANCH_SUMMARY_PREFIX) {
+                "branchSummary".into()
+            } else if text.starts_with(pi::session::COMPACTION_SUMMARY_PREFIX) {
+                "compactionSummary".into()
+            } else {
+                "user".into()
+            }
+        }
+        pi::AgentMessage::Assistant { .. } => "assistant".into(),
+        pi::AgentMessage::Custom { .. } => "custom".into(),
+        pi::AgentMessage::ToolResult { .. } => "toolResult".into(),
+    }
+}
+
 /// Run one plain turn through the loop and capture the emitted lifecycle.
 async fn capture_single_turn_events() -> Vec<pi::AgentEvent> {
     use async_trait::async_trait;

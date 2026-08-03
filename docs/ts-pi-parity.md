@@ -64,8 +64,8 @@
 | SessionRepository fork | 🟡 | `fork()` 跨项目复制全 entries 并写 `parentSession`，但写源 session id 而非源文件路径、timestamp 复用源值；TS 语义：新 id + 新 timestamp + 目标 cwd + `parentSession` 为源文件路径；path fork（`ForkPosition::BeforeUser`/`AtEntry`、branch labels 重链）未实现——见 S2 |
 | SessionRepository search | 🚫 删除 | `search()` 为 Rust-only 扩展，TS 核心无此 API；仓内无真实调用方，公开入口在 S2 删除 |
 | Session move_to/label/name/stats/pagination/custom | ✅ | `Session::move_to/append_label/set_session_name/stats/page/custom`（`session/mod.rs`）；对应单测与 examples 覆盖 |
-| branch_summary append | 🟡 | `append_branch_summary` 类型与 entry 形状在，但摘要输入/提示词/结果为自创（`render_messages`/300 字 prompt/单一 `files_changed`），未按 TS `getMessageFromEntry`/`prepareBranchEntries` 抽取（tool result 排除、custom/branch/compaction carrier、token budget、90% 规则、read/modified file ops）、不含 usage——见 S1 |
-| navigate_tree | 🟡 | 默认 summarize=false、`summarize/custom_instructions/replace_instructions/label` 选项面、`NavigateTreeResult`、BranchSummary phase 已对齐（2026-08-01）；但 `label` 未落盘（TS 写 summary/target entry）、summary 未接 retry/cancel、`session_before_tree`/`session_tree` hook 未接线——见 S1 |
+| branch_summary append | ✅ | 摘要输入/提示词/结果按 TS 对齐（S1，2026-08-01）：`getMessageFromEntry`（tool result 排除、custom/branch/compaction carrier）、`prepareBranchEntries`（token budget + carrier 90% 规则 + read/modified file ops 累积）、`BRANCH_SUMMARY_PROMPT`/preamble、`serialize_conversation` 会话、usage/readFiles/modifiedFiles 随 entry 持久化；差分 fixture `branch-summary-preparation.txt` |
+| navigate_tree | 🟡 | 默认 summarize=false、选项面、`NavigateTreeResult`（cancelled/aborted/editor_text/summary_entry_id）、BranchSummary phase、label 落盘（summary/target entry）、abort 取消（不动游标不追加 entry）、`session_before_tree`（cancel/override）/`session_tree` typed hook 已对齐（S1，2026-08-01）；余项：summarization 无 retry 策略（见「已知余项」） |
 
 ## 6. Providers（`provider/` ↔ packages/ai）
 
@@ -113,7 +113,7 @@
 
 1. **cache_stats 金额与 idle**：missed_cost 恒 0、idle_ms 占位，需接线 ModelPriceSource 与消息时间戳（S5）
 2. **summarization retry/cancel**：summarization 与 branch summary 调用无 retry 策略与取消通道（S1）
-3. **branch summarization 输入/提示词/结果**：摘要输入为自创（未按 TS `getMessageFromEntry`/`prepareBranchEntries`），提示词与结果格式非 TS structured branch prompt；`label` 未落盘（S1）
+3. **summarization retry**：branch summary 与 compaction 的 summarization 调用无 retry 策略（S1 已接 abort/取消，retry 仍缺）
 4. **Session store/reader/repository 深度（upstream 4488ad55c 之后）**：crate pi 已有 SessionRepository + Session 树操作；TS 的 readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 标删除（S2）
 5. **coding-agent facade 纵向**：open 不自劢 restore、缺凭证假 key、无 fork/事件/shutdown（S6/S4）
 6. **pi-ai breadth**：已选三协议之外的 7 个 chat API + image API 未实现（明确排除项，不阻塞 agreed scope）

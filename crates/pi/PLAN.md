@@ -249,8 +249,8 @@ pub trait AgentTool: Send + Sync {
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
 
 - [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳（S5）
-- [ ] summarization retry/cancel：summarization 与 branch summary 调用无 retry 策略与取消通道（S1）
-- [ ] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写，删除自创 `render_messages`/300 字 prompt（S1）
+- [ ] summarization retry：branch summary 与 compaction 的 summarization 调用无 retry 策略（abort/取消通道已由 S1 接入）
+- [x] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写，删除自创 `render_messages`/300 字 prompt（S1，2026-08-01）；navigate label/abort/hook 同步对齐
 - [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §9「有意偏离」）
 - [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 删除（S2）
 - [ ] coding-agent facade 纵向：open 自动 restore、缺凭证 typed 错误、fork/事件/shutdown（S6/S4）

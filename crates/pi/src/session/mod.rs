@@ -467,7 +467,8 @@ impl<S: SessionStorage> Session<S> {
         &self,
         from_id: &str,
         summary: &str,
-        files_changed: &[String],
+        read_files: &[String],
+        modified_files: &[String],
         usage: Option<Usage>,
         from_hook: bool,
     ) -> Result<String, anyhow::Error> {
@@ -480,7 +481,10 @@ impl<S: SessionStorage> Session<S> {
             timestamp: Utc::now(),
             from_id: from_id.to_string(),
             summary: summary.to_string(),
-            details: Some(serde_json::json!({"filesChanged": files_changed})),
+            details: Some(serde_json::json!({
+                "readFiles": read_files,
+                "modifiedFiles": modified_files,
+            })),
             usage,
             from_hook: Some(from_hook),
         };

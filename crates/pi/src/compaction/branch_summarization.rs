@@ -1,239 +1,228 @@
 // Branch summarization — summarize a conversation/session-tree branch.
 //
 // A branch summary captures what was done across a stretch of the session
-// tree: the assistant's intent, the files touched, and the open work. It is
-// produced by feeding the branch's messages (leaf upward, chronologically
-// reversed into prompt order) to an LLM via the same StreamFn the agent loop
-// uses, and persisted as a `branch_summary` session entry.
+// tree: the assistant's intent, the files touched, and the open work. The
+// abandoned branch's entries are prepared under a token budget (tool results
+// skipped, prior branch/compaction summaries folded to their tagged user
+// carriers, harness-authored branch summaries seeding the file lists),
+// serialized to plain text, and fed to an LLM via the same StreamFn the agent
+// loop uses. The result — preamble, model prose, and a file-operation tail —
+// is persisted as a `branch_summary` session entry carrying usage and the
+// read/modified file lists.
 
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::StreamFn;
-use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, Model};
+use crate::compaction::{
+    FileOperations, SUMMARIZATION_SYSTEM_PROMPT, compute_file_lists, estimate_tokens,
+    extract_file_ops_from_message, format_file_operations, serialize_conversation,
+};
+use crate::session::SessionTreeEntry;
+use crate::types::{
+    AgentContext, AgentEvent, AgentMessage, ContentBlock, Model, StopReason, Usage,
+};
 
-/// A summary of the work done on a conversation branch.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BranchSummary {
-    /// Prose summary of the work, produced by the summarizing model.
-    pub summary: String,
-    /// File paths created, modified, or deleted along the branch.
-    pub files_changed: Vec<String>,
+/// Tokens reserved for the summarization prompt and the model's response —
+/// the TS `GenerateBranchSummaryOptions.reserveTokens` default.
+pub const RESERVE_TOKENS: usize = 16_384;
+
+/// Result of a branch summarization run, mirroring the TS
+/// `generateBranchSummary` result.
+#[derive(Debug, Clone)]
+pub struct BranchSummaryResult {
+    /// The full summary text — preamble, model prose, file-operation tail.
+    /// `None` when the run was aborted.
+    pub summary: Option<String>,
+    /// Usage reported by the summarization call, when recorded.
+    pub usage: Option<Usage>,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    /// The run was aborted before producing a summary.
+    pub aborted: bool,
 }
 
-/// Tool-call field names that carry a filesystem path, in lookup priority.
-const PATH_FIELDS: &[&str] = &["path", "file_path", "filePath", "filepath"];
-
-/// Tool names whose `path` argument denotes a file touched by the agent.
-fn is_file_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "write"
-            | "edit"
-            | "str_replace_editor"
-            | "create_file"
-            | "delete_file"
-            | "move_file"
-            | "patch"
-            | "apply_patch"
-            | "multiedit"
-    )
+/// The prepared summarization input: messages selected under the token
+/// budget plus the file lists accumulated along the way.
+#[derive(Debug, Clone)]
+pub struct BranchPreparation {
+    /// Messages selected for summarization, in chronological order.
+    pub messages: Vec<AgentMessage>,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    /// Estimated tokens of the selected messages.
+    pub total_tokens: u64,
 }
 
-/// Extract the set of file paths a tool call touched, if any.
-fn file_path_of(name: &str, input: &serde_json::Value) -> Option<String> {
-    if !is_file_tool(name) {
-        return None;
+/// Extract a message from a session entry — the TS `getMessageFromEntry`:
+/// tool results are skipped (the assistant tool call carries their context),
+/// custom messages fold to their custom form, and branch/compaction summaries
+/// become their tagged user carriers.
+pub fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> {
+    match entry {
+        SessionTreeEntry::Message {
+            message: AgentMessage::ToolResult { .. },
+            ..
+        } => None,
+        SessionTreeEntry::Message { message, .. } => Some(message.clone()),
+        SessionTreeEntry::CustomMessage {
+            custom_type,
+            content,
+            details,
+            display,
+            timestamp,
+            ..
+        } => Some(AgentMessage::Custom {
+            custom_type: custom_type.clone(),
+            content: content.clone(),
+            display: *display,
+            details: details.clone(),
+            timestamp: *timestamp,
+        }),
+        SessionTreeEntry::BranchSummary {
+            summary, timestamp, ..
+        } => Some(crate::session::branch_summary_message(summary, *timestamp)),
+        SessionTreeEntry::Compaction {
+            summary, timestamp, ..
+        } => Some(crate::session::compaction_summary_message(
+            summary, *timestamp,
+        )),
+        _ => None,
     }
-    for field in PATH_FIELDS {
-        if let Some(s) = input.get(field).and_then(|v| v.as_str()) {
-            return Some(s.to_string());
-        }
-    }
-    None
 }
 
-/// File paths touched by tool calls anywhere in the branch, in first-seen order.
-pub fn extract_files_changed(messages: &[AgentMessage]) -> Vec<String> {
-    let mut files: Vec<String> = Vec::new();
-    for msg in messages {
-        let blocks = match msg {
-            AgentMessage::Assistant { content, .. } => content,
-            _ => continue,
-        };
-        for block in blocks {
-            if let ContentBlock::ToolUse { name, input, .. } = block
-                && let Some(path) = file_path_of(name, input)
-                && !files.contains(&path)
-            {
-                files.push(path);
+/// Prepare branch entries for summarization under a token budget — the TS
+/// `prepareBranchEntries`. Walks newest to oldest, keeping messages until the
+/// budget is exhausted; a compaction/branch-summary carrier past the budget
+/// still fits while the accumulated total stays under 90% of it. Harness-
+/// authored branch summaries seed the read/modified file lists first so
+/// cumulative tracking survives nested navigation.
+pub fn prepare_branch_entries(
+    entries: &[SessionTreeEntry],
+    token_budget: u64,
+) -> BranchPreparation {
+    let mut ops = FileOperations::default();
+    for entry in entries {
+        if let SessionTreeEntry::BranchSummary {
+            details: Some(details),
+            from_hook,
+            ..
+        } = entry
+            && *from_hook != Some(true)
+        {
+            if let Some(arr) = details.get("readFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.read.insert(f.to_string());
+                }
+            }
+            if let Some(arr) = details.get("modifiedFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.edited.insert(f.to_string());
+                }
             }
         }
     }
-    files
+
+    let mut messages: Vec<AgentMessage> = Vec::new();
+    let mut total_tokens: u64 = 0;
+    for entry in entries.iter().rev() {
+        let Some(message) = get_message_from_entry(entry) else {
+            continue;
+        };
+        extract_file_ops_from_message(&message, &mut ops);
+        let tokens = estimate_tokens(&message);
+        if token_budget > 0 && total_tokens + tokens > token_budget {
+            if matches!(
+                entry,
+                SessionTreeEntry::Compaction { .. } | SessionTreeEntry::BranchSummary { .. }
+            ) && (total_tokens as u128) < (token_budget as u128) * 9 / 10
+            {
+                messages.insert(0, message);
+                total_tokens += tokens;
+            }
+            break;
+        }
+        messages.insert(0, message);
+        total_tokens += tokens;
+    }
+    let (read_files, modified_files) = compute_file_lists(&ops);
+    BranchPreparation {
+        messages,
+        read_files,
+        modified_files,
+        total_tokens,
+    }
 }
 
-/// Render a message list as the prompt body: user/assistant text and tool
-/// calls (name plus arguments), omitting tool results and images.
-fn render_messages(messages: &[AgentMessage]) -> String {
-    messages
-        .iter()
-        .map(|m| {
-            let role = match m {
-                AgentMessage::User { .. } => "User",
-                AgentMessage::Assistant { .. } => "Assistant",
-                AgentMessage::ToolResult { tool_name, .. } => {
-                    return format!("Tool result ({tool_name}): (omitted)");
-                }
-                AgentMessage::Custom { custom_type, .. } => {
-                    return format!("Custom ({custom_type}): (omitted)");
-                }
-            };
-            let body = match m {
-                AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => {
-                    content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text, .. } => Some(text.clone()),
-                            ContentBlock::ToolUse { name, input, .. } => {
-                                Some(format!("tool: {name} {input}"))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-                _ => String::new(),
-            };
-            format!("{role}: {body}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
+/// The instruction block asking the model for a structured branch summary —
+/// the TS `BRANCH_SUMMARY_PROMPT`.
+pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
-/// Build the prompt asking the model to summarize the branch.
+/// The preamble prepended to every model-produced branch summary.
+pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
+
+/// Build the summarization prompt for a prepared branch — the TS
+/// `generateBranchSummary` prompt: the serialized conversation wrapped in
+/// `<conversation>` tags followed by the instruction block.
 pub fn build_branch_summary_prompt(
     messages: &[AgentMessage],
-    files_changed: &[String],
-    existing: Option<&BranchSummary>,
-) -> String {
-    build_branch_summary_prompt_with_instructions(messages, files_changed, existing, None, false)
-}
-
-/// [`build_branch_summary_prompt`] with the TS `generateBranchSummary`
-/// instruction overrides: custom instructions append to the default prompt
-/// unless `replace_instructions` swaps it in wholesale.
-pub fn build_branch_summary_prompt_with_instructions(
-    messages: &[AgentMessage],
-    files_changed: &[String],
-    existing: Option<&BranchSummary>,
     custom_instructions: Option<&str>,
     replace_instructions: bool,
 ) -> String {
-    let files_list = files_changed.join("\n");
-    let conversation = render_messages(messages);
-
-    let existing_context = match existing {
-        Some(e) => format!(
-            "An existing summary of this branch is below; update and extend it with the new work.\n\
-             <existing_summary>\n{}\n</existing_summary>\n\n",
-            e.summary
-        ),
-        None => String::new(),
-    };
-
-    let default_instructions = "\
-        Summarize the work done in the conversation branch below. The summary should be \
-        concise (<=300 words) and cover:\n\
-        1. The user's main goal or feature being implemented\n\
-        2. Key architectural decisions and trade-offs\n\
-        3. Notable files created, modified, or deleted (with paths)\n\
-        4. Unfinished work or known issues\n\n\
-        Do NOT repeat the full conversation. Focus on information essential for continuing \
-        the work without losing context.";
+    let conversation = serialize_conversation(messages);
     let instructions = match custom_instructions {
         Some(extra) if replace_instructions => extra.to_string(),
-        Some(extra) => format!("{default_instructions}\n\nAdditional focus: {extra}"),
-        None => default_instructions.to_string(),
+        Some(extra) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {extra}"),
+        None => BRANCH_SUMMARY_PROMPT.to_string(),
     };
-
-    format!(
-        "{existing_context}{instructions}\n\n\
-        <files_changed>\n{files_list}\n</files_changed>\n\n\
-        <conversation>\n{conversation}\n</conversation>"
-    )
+    format!("<conversation>\n{conversation}\n</conversation>\n\n{instructions}")
 }
 
-/// First text block of an assistant message, if it carries any.
-fn assistant_text(message: &AgentMessage) -> Option<String> {
-    let content = match message {
-        AgentMessage::Assistant { content, .. } => content,
-        _ => return None,
-    };
-    let text: String = content
-        .iter()
-        .filter_map(|b| {
-            if let ContentBlock::Text { text, .. } = b {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-/// Summarize a branch by feeding its messages to the LLM via `stream_fn`.
-///
-/// `messages` is taken in chronological order (oldest first); the function
-/// reverses leafward input into prompt order internally. The returned
-/// `BranchSummary` carries the model's prose plus the files extracted from
-/// tool calls along the branch.
+/// Summarize an abandoned branch — the TS `generateBranchSummary`. An empty
+/// preparation yields the TS "No content to summarize" marker without a model
+/// call; a cancelled run reports `aborted`; a failed run propagates the
+/// provider error.
 pub async fn summarize_branch(
-    messages: &[AgentMessage],
+    entries: &[SessionTreeEntry],
     model: &Model,
     stream_fn: Arc<dyn StreamFn>,
-    existing: Option<&BranchSummary>,
+    token_budget: u64,
     custom_instructions: Option<&str>,
     replace_instructions: bool,
-) -> Result<BranchSummary, anyhow::Error> {
-    let files_changed = extract_files_changed(messages);
-    let prompt = build_branch_summary_prompt_with_instructions(
-        messages,
-        &files_changed,
-        existing,
+    signal: CancellationToken,
+) -> Result<BranchSummaryResult, anyhow::Error> {
+    let preparation = prepare_branch_entries(entries, token_budget);
+    if preparation.messages.is_empty() {
+        return Ok(BranchSummaryResult {
+            summary: Some("No content to summarize".to_string()),
+            usage: None,
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
+            aborted: false,
+        });
+    }
+    let prompt = build_branch_summary_prompt(
+        &preparation.messages,
         custom_instructions,
         replace_instructions,
     );
-
     let context = AgentContext {
-        system_prompt: SYSTEM_PROMPT.to_string(),
+        system_prompt: SUMMARIZATION_SYSTEM_PROMPT.to_string(),
         messages: vec![AgentMessage::user(prompt)],
         tools: Arc::from(Vec::new()),
         model: model.clone(),
         thinking_level: None,
-        cache_retention: Default::default(),
+        cache_retention: crate::types::CacheRetention::None,
         session_id: None,
         metadata: Default::default(),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
-    // Spawn the producer and drain concurrently: the channel caps at 64, so a
+    // Drain events concurrently with the stream: the channel caps at 64, so a
     // longer stream would deadlock if the receiver only ran after it returned.
     let stream_fn_for_task = Arc::clone(&stream_fn);
-    let handle = tokio::spawn(async move {
-        stream_fn_for_task
-            .stream(&context, CancellationToken::new(), tx)
-            .await
-    });
-    // The summary text rides on the final assistant message; events are discarded.
+    let handle = tokio::spawn(async move { stream_fn_for_task.stream(&context, signal, tx).await });
     while rx.recv().await.is_some() {}
     let response = match handle.await {
         Ok(Ok(r)) => r,
@@ -241,16 +230,58 @@ pub async fn summarize_branch(
         Err(join_err) => return Err(anyhow::Error::new(join_err)),
     };
 
-    let summary = assistant_text(&response).unwrap_or_default();
-    Ok(BranchSummary {
-        summary,
-        files_changed,
+    match &response {
+        AgentMessage::Assistant {
+            stop_reason: Some(StopReason::Aborted),
+            ..
+        } => {
+            return Ok(BranchSummaryResult {
+                summary: None,
+                usage: None,
+                read_files: Vec::new(),
+                modified_files: Vec::new(),
+                aborted: true,
+            });
+        }
+        AgentMessage::Assistant {
+            stop_reason: Some(StopReason::Error),
+            error_message,
+            ..
+        } => {
+            anyhow::bail!(
+                "branch summary failed: {}",
+                error_message.as_deref().unwrap_or("unknown error")
+            );
+        }
+        _ => {}
+    }
+
+    let (text, usage) = match &response {
+        AgentMessage::Assistant { content, usage, .. } => (
+            content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (**usage).clone(),
+        ),
+        _ => (String::new(), Usage::default()),
+    };
+    let summary = format!(
+        "{BRANCH_SUMMARY_PREAMBLE}{text}{}",
+        format_file_operations(&preparation.read_files, &preparation.modified_files)
+    );
+    Ok(BranchSummaryResult {
+        summary: Some(summary),
+        usage: Some(usage),
+        read_files: preparation.read_files,
+        modified_files: preparation.modified_files,
+        aborted: false,
     })
 }
-
-/// System prompt for the summarizing model.
-pub const SYSTEM_PROMPT: &str =
-    "You summarize a coding agent's conversation branch into a concise, dense summary.";
 
 #[cfg(test)]
 mod tests {
@@ -309,47 +340,211 @@ mod tests {
         }
     }
 
+    fn message_entry(id: &str, parent: Option<&str>, message: AgentMessage) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            timestamp: chrono::Utc::now(),
+            message,
+        }
+    }
+
+    /// Tool results are excluded; custom messages fold to their custom form;
+    /// branch summaries become their tagged user carriers.
     #[test]
-    fn extract_files_changed_dedups_in_first_seen_order() {
-        let messages = vec![
-            assistant_with_tool_use("write", serde_json::json!({"path": "a.rs"})),
-            assistant_with_tool_use("read", serde_json::json!({"path": "b.rs"})),
-            // Non-file tool ignored.
-            assistant_with_tool_use("grep", serde_json::json!({"pattern": "x"})),
-            // Duplicate of a.rs dropped.
-            assistant_with_tool_use("edit", serde_json::json!({"path": "a.rs"})),
-            // file_path field recognized.
-            assistant_with_tool_use("create_file", serde_json::json!({"file_path": "c.rs"})),
+    fn get_message_from_entry_skips_tool_results_and_folds_carriers() {
+        let tool_result = message_entry(
+            "tr",
+            Some("a"),
+            AgentMessage::ToolResult {
+                tool_call_id: "t1".into(),
+                tool_name: "read".into(),
+                content: vec![ContentBlock::Text {
+                    text: "ok".into(),
+                    signature: None,
+                }],
+                is_error: false,
+                details: None,
+                usage: None,
+                added_tool_names: None,
+                timestamp: chrono::Utc::now(),
+            },
+        );
+        assert!(get_message_from_entry(&tool_result).is_none());
+
+        let user = message_entry("u", None, make_user("hello"));
+        assert!(matches!(
+            get_message_from_entry(&user),
+            Some(AgentMessage::User { .. })
+        ));
+
+        let custom = SessionTreeEntry::CustomMessage {
+            id: "c".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "hi".into(),
+                signature: None,
+            }],
+            details: None,
+            display: true,
+        };
+        assert!(matches!(
+            get_message_from_entry(&custom),
+            Some(AgentMessage::Custom { custom_type, .. }) if custom_type == "note"
+        ));
+
+        let branch = SessionTreeEntry::BranchSummary {
+            id: "bs".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            from_id: "root".into(),
+            summary: "prior branch".into(),
+            details: None,
+            usage: None,
+            from_hook: Some(false),
+        };
+        let carrier = get_message_from_entry(&branch).expect("branch summary carrier");
+        let AgentMessage::User { content, .. } = &carrier else {
+            panic!("carrier is a user message");
+        };
+        let ContentBlock::Text { text, .. } = &content[0] else {
+            panic!("carrier is text");
+        };
+        assert!(text.contains("prior branch"));
+        assert!(text.starts_with(crate::session::BRANCH_SUMMARY_PREFIX));
+
+        let setting = SessionTreeEntry::ModelChange {
+            id: "m".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            provider: "p".into(),
+            model_id: "m1".into(),
+        };
+        assert!(get_message_from_entry(&setting).is_none());
+    }
+
+    /// The token budget keeps the newest messages; a branch-summary carrier
+    /// past the budget still fits under the 90% rule; prior branch-summary
+    /// details seed the file lists.
+    #[test]
+    fn prepare_branch_entries_applies_budget_and_carrier_rule() {
+        let entries = vec![
+            message_entry("u1", None, make_user("first")),
+            message_entry(
+                "a1",
+                Some("u1"),
+                assistant_with_tool_use("write", serde_json::json!({"path": "a.rs"})),
+            ),
+            message_entry("u2", Some("a1"), make_user("second")),
+            message_entry(
+                "a2",
+                Some("u2"),
+                assistant_with_tool_use("read", serde_json::json!({"path": "b.rs"})),
+            ),
         ];
-        assert_eq!(
-            extract_files_changed(&messages),
-            vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()]
+        // A budget that admits the newest message but not the pair keeps only
+        // the newest (a2: ~5 tokens; u2 adds ~2 more).
+        let prep = prepare_branch_entries(&entries, 6);
+        assert_eq!(prep.messages.len(), 1);
+        assert!(matches!(&prep.messages[0], AgentMessage::Assistant { .. }));
+        assert_eq!(prep.total_tokens, estimate_tokens(&prep.messages[0]));
+
+        // Zero budget admits everything, newest first; tool results excluded.
+        let with_tool_result = vec![
+            entries[0].clone(),
+            entries[1].clone(),
+            message_entry(
+                "tr",
+                Some("a1"),
+                AgentMessage::ToolResult {
+                    tool_call_id: "t1".into(),
+                    tool_name: "write".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "ok".into(),
+                        signature: None,
+                    }],
+                    is_error: false,
+                    details: None,
+                    usage: None,
+                    added_tool_names: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            ),
+        ];
+        let prep = prepare_branch_entries(&with_tool_result, 0);
+        assert_eq!(prep.messages.len(), 2, "tool result excluded");
+        // read-only list: b.rs read but not modified; a.rs written => modified.
+        let with_second = vec![
+            entries[0].clone(),
+            entries[1].clone(),
+            entries[2].clone(),
+            entries[3].clone(),
+        ];
+        let prep = prepare_branch_entries(&with_second, 0);
+        assert_eq!(prep.read_files, vec!["b.rs".to_string()]);
+        assert_eq!(prep.modified_files, vec!["a.rs".to_string()]);
+
+        // A prior branch summary seeds the file lists and folds into the
+        // carrier under the 90% rule.
+        let branch_summary = SessionTreeEntry::BranchSummary {
+            id: "bs".into(),
+            parent_id: Some("u2".into()),
+            timestamp: chrono::Utc::now(),
+            from_id: "u2".into(),
+            summary: "prior exploration".into(),
+            details: Some(serde_json::json!({
+                "readFiles": ["old.rs"],
+                "modifiedFiles": ["old.rs"],
+            })),
+            usage: None,
+            from_hook: Some(false),
+        };
+        let entries = vec![entries[0].clone(), branch_summary];
+        let prep = prepare_branch_entries(&entries, 0);
+        assert_eq!(prep.read_files, Vec::<String>::new());
+        assert_eq!(prep.modified_files, vec!["old.rs".to_string()]);
+        let has_carrier = prep.messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::User { content, .. }
+                    if content.iter().any(|b| matches!(
+                        b,
+                        ContentBlock::Text { text, .. } if text.contains("prior exploration")
+                    ))
+            )
+        });
+        assert!(
+            has_carrier,
+            "the branch summary carrier folds into the messages"
         );
     }
 
+    /// The prompt is the TS shape: serialized conversation in `<conversation>`
+    /// tags followed by the structured instruction block.
     #[test]
-    fn build_prompt_includes_files_and_conversation() {
+    fn build_prompt_matches_ts_shape() {
         let messages = vec![
             make_user("add a hello world"),
             make_assistant("I will create main.rs"),
         ];
-        let files = vec!["src/main.rs".to_string()];
-        let prompt = build_branch_summary_prompt(&messages, &files, None);
-        assert!(prompt.contains("src/main.rs"));
-        assert!(prompt.contains("add a hello world"));
-        assert!(prompt.contains("I will create main.rs"));
-        assert!(!prompt.contains("existing_summary"));
-    }
+        let prompt = build_branch_summary_prompt(&messages, None, false);
+        assert!(prompt.starts_with("<conversation>\n[User]: add a hello world"));
+        assert!(prompt.contains("\n</conversation>\n\n"));
+        assert!(prompt.ends_with(BRANCH_SUMMARY_PROMPT));
 
-    #[test]
-    fn build_prompt_extends_existing_summary() {
-        let existing = BranchSummary {
-            summary: "Prior work".into(),
-            files_changed: vec!["a.rs".into()],
-        };
-        let prompt =
-            build_branch_summary_prompt(&[make_user("more")], &["b.rs".into()], Some(&existing));
-        assert!(prompt.contains("existing_summary"));
-        assert!(prompt.contains("Prior work"));
+        let replaced = build_branch_summary_prompt(&messages, Some("Focus only on errors."), true);
+        assert_eq!(
+            replaced,
+            format!(
+                "<conversation>\n{}\n</conversation>\n\nFocus only on errors.",
+                serialize_conversation(&messages)
+            )
+        );
+
+        let appended = build_branch_summary_prompt(&messages, Some("Focus on errors."), false);
+        assert!(appended.ends_with("\n\nAdditional focus: Focus on errors."));
+        assert!(appended.contains(BRANCH_SUMMARY_PROMPT));
     }
 }

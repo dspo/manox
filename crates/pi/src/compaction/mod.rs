@@ -763,7 +763,7 @@ fn extract_file_operations(
 
 /// Classify a message's assistant tool calls into the file-operation sets.
 /// Only `read`, `write`, and `edit` calls carrying a `path` argument count.
-fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut FileOperations) {
+pub(crate) fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut FileOperations) {
     let AgentMessage::Assistant { content, .. } = message else {
         return;
     };

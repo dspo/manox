@@ -286,6 +286,10 @@ pub enum HookPoint {
     SessionBeforeCompact,
     /// After the session is compacted.
     SessionAfterCompact,
+    /// Before the session tree cursor moves (tree navigation).
+    SessionBeforeTree,
+    /// After the session tree cursor moved.
+    SessionTree,
 }
 
 /// A hook handler receives context about the event and can mutate it.
@@ -348,14 +352,57 @@ pub struct SessionBeforeCompactEvent<'a> {
     pub custom_instructions: Option<&'a str>,
 }
 
+/// The typed `session_before_tree` hook event, mirroring the TS
+/// `SessionBeforeTreeEvent`: the navigation preparation a handler can cancel
+/// or use to override the summarization instructions and label. The TS
+/// `signal: AbortSignal` has no Rust sync-hook equivalent — cancellation is
+/// expressed via the result's `cancel` field
+/// ([`HookContext::with_cancel_tree`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeTreeEvent<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub target_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_leaf_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub common_ancestor_id: Option<&'a str>,
+    pub entries_to_summarize: &'a [SessionTreeEntry],
+    pub user_wants_summary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<&'a str>,
+    pub replace_instructions: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<&'a str>,
+}
+
+/// The typed `session_tree` hook event fired after the cursor moved,
+/// mirroring the TS `SessionTreeEvent`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTreeEvent<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_leaf_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_leaf_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_entry_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_hook: Option<bool>,
+}
+
 /// Context passed to hook handlers.
 ///
 /// Handlers return a (possibly mutated) copy; the harness threads selected
 /// fields back into the loop. `agent_context` feeds the provider request,
 /// `block_reason` gates a tool call, `tool_result` patches a tool result,
-/// `cancel_compaction`/`compact_override` steer the compaction flow, and
-/// `inject_messages`/`system_prompt_override` carry the `before_agent_start`
-/// effects.
+/// `cancel_compaction`/`compact_override` steer the compaction flow,
+/// `cancel_tree`/`tree_custom_instructions`/`tree_label` steer tree
+/// navigation, and `inject_messages`/`system_prompt_override` carry the
+/// `before_agent_start` effects.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// The hook point being triggered.
@@ -383,6 +430,13 @@ pub struct HookContext {
     /// context carries. Only that first context sees the override — steering
     /// and follow-up turns snapshot the agent's configured prompt again.
     pub system_prompt_override: Option<String>,
+    /// At the `SessionBeforeTree` point, aborts the navigation before any
+    /// cursor move or entry append.
+    pub cancel_tree: bool,
+    /// At the `SessionBeforeTree` point, overrides the summarization custom
+    /// instructions and label when present.
+    pub tree_custom_instructions: Option<String>,
+    pub tree_label: Option<String>,
 }
 
 impl HookContext {
@@ -397,6 +451,9 @@ impl HookContext {
             compact_override: None,
             inject_messages: Vec::new(),
             system_prompt_override: None,
+            cancel_tree: false,
+            tree_custom_instructions: None,
+            tree_label: None,
         }
     }
 
@@ -430,6 +487,24 @@ impl HookContext {
     /// summarization model call. The persisted entry carries `fromHook`.
     pub fn with_compact_override(mut self, override_: BeforeCompactOverride) -> Self {
         self.compact_override = Some(override_);
+        self
+    }
+
+    /// At `SessionBeforeTree`, cancel the navigation before any cursor move.
+    pub fn with_cancel_tree(mut self) -> Self {
+        self.cancel_tree = true;
+        self
+    }
+
+    /// At `SessionBeforeTree`, override the summarization custom instructions.
+    pub fn with_tree_instructions(mut self, instructions: String) -> Self {
+        self.tree_custom_instructions = Some(instructions);
+        self
+    }
+
+    /// At `SessionBeforeTree`, override the label written to the tree.
+    pub fn with_tree_label(mut self, label: String) -> Self {
+        self.tree_label = Some(label);
         self
     }
 
@@ -519,8 +594,9 @@ pub struct AgentHarness<S: SessionStorage> {
 /// Options for [`AgentHarness::navigate_tree_with_options`], mirroring the
 /// TS `navigateTree` options. `summarize` gates branch summarization
 /// (off by default, like TS); `custom_instructions` / `replace_instructions`
-/// shape the summarization prompt; `label` is carried for the deferred
-/// `session_before_tree` hook (see docs/ts-pi-parity.md §9).
+/// shape the summarization prompt; `label` is written to the summary entry
+/// when one is generated, otherwise to the target entry, and is also
+/// surfaced on the `session_before_tree` hook (see docs/ts-pi-parity.md §9).
 #[derive(Debug, Clone, Default)]
 pub struct NavigateTreeOptions {
     /// Generate a summary of the abandoned branch (requires a provider).
@@ -537,9 +613,12 @@ pub struct NavigateTreeOptions {
 /// Result of a tree navigation, mirroring the TS `NavigateTreeResult`.
 #[derive(Debug, Clone)]
 pub struct NavigateTreeResult {
-    /// True when the deferred `session_before_tree` hook cancels the
-    /// navigation; the hook is not wired yet, so this stays false.
+    /// True when the navigation was cancelled before moving the cursor: a
+    /// `session_before_tree` hook cancellation or an aborted summarization.
     pub cancelled: bool,
+    /// True when the summarization was aborted mid-flight; implies
+    /// `cancelled`.
+    pub aborted: bool,
     /// The target message's text when it is a user or custom message;
     /// `None` for assistant or structural targets.
     pub editor_text: Option<String>,
@@ -1542,6 +1621,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         if old_leaf.as_deref() == Some(target_id) {
             return Ok(NavigateTreeResult {
                 cancelled: false,
+                aborted: false,
                 editor_text: None,
                 summary_entry_id: None,
             });
@@ -1594,32 +1674,74 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             _ => None,
         };
 
+        // The before-tree hook sees the full TS-shaped preparation and may
+        // cancel the navigation or override the summarization instructions
+        // and label. The typed event rides in the context data.
+        let mut custom_instructions = options.custom_instructions.clone();
+        let mut label = options.label.clone();
+        let before_event = SessionBeforeTreeEvent {
+            kind: "session_before_tree",
+            target_id,
+            old_leaf_id: old_leaf.as_deref(),
+            common_ancestor_id: common_ancestor.as_deref(),
+            entries_to_summarize: &abandoned,
+            user_wants_summary: options.summarize,
+            custom_instructions: custom_instructions.as_deref(),
+            replace_instructions: options.replace_instructions,
+            label: label.as_deref(),
+        };
+        let hook_ctx = self.run_hooks(
+            HookPoint::SessionBeforeTree,
+            HookContext::new(HookPoint::SessionBeforeTree)
+                .with_data(serde_json::to_value(&before_event).unwrap_or(serde_json::Value::Null)),
+        );
+        if hook_ctx.cancel_tree {
+            return Ok(NavigateTreeResult {
+                cancelled: true,
+                aborted: false,
+                editor_text: None,
+                summary_entry_id: None,
+            });
+        }
+        if let Some(instructions) = hook_ctx.tree_custom_instructions {
+            custom_instructions = Some(instructions);
+        }
+        if let Some(overridden) = hook_ctx.tree_label {
+            label = Some(overridden);
+        }
+
         // A summary is generated only when asked for and there is an
         // abandoned branch to summarize (TS `options.summarize &&
-        // entries.length > 0`).
+        // entriesToSummarize.length > 0`). The token budget is the model's
+        // context window minus the reserved prompt/response space.
         let summary = if options.summarize && !abandoned.is_empty() {
-            let messages: Vec<AgentMessage> = abandoned
-                .iter()
-                .filter_map(|e| match e {
-                    SessionTreeEntry::Message { message, .. } => Some(message.clone()),
-                    _ => None,
-                })
-                .collect();
             let stream_fn = match &self.stream_resolver {
                 Some(resolver) => resolver(&self.model)?,
                 None => Arc::clone(&self.stream_fn),
             };
-            Some(
-                crate::compaction::branch_summarization::summarize_branch(
-                    &messages,
-                    &self.model,
-                    stream_fn,
-                    None,
-                    options.custom_instructions.as_deref(),
-                    options.replace_instructions,
-                )
-                .await?,
+            let token_budget = (self.model.context_window as u64)
+                .saturating_sub(crate::compaction::branch_summarization::RESERVE_TOKENS as u64);
+            let result = crate::compaction::branch_summarization::summarize_branch(
+                &abandoned,
+                &self.model,
+                stream_fn,
+                token_budget,
+                custom_instructions.as_deref(),
+                options.replace_instructions,
+                CancellationToken::new(),
             )
+            .await?;
+            if result.aborted {
+                // TS: an aborted summarization cancels the navigation before
+                // any cursor move or entry append.
+                return Ok(NavigateTreeResult {
+                    cancelled: true,
+                    aborted: true,
+                    editor_text: None,
+                    summary_entry_id: None,
+                });
+            }
+            Some(result)
         } else {
             None
         };
@@ -1641,18 +1763,51 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 self.session
                     .append_branch_summary(
                         new_leaf.as_deref().unwrap_or("root"),
-                        &summary.summary,
-                        &summary.files_changed,
-                        None,
+                        summary.summary.as_deref().unwrap_or(""),
+                        &summary.read_files,
+                        &summary.modified_files,
+                        summary.usage.clone(),
                         false,
                     )
                     .await?,
             ),
             None => None,
         };
+        // A label attaches to the summary entry when one exists, otherwise to
+        // the target entry — TS `appendLabelChange` on either node.
+        if let Some(label) = &label {
+            match &summary_entry_id {
+                Some(summary_id) => {
+                    self.session
+                        .append_label(summary_id, Some(label.clone()))
+                        .await?;
+                }
+                None => {
+                    self.session
+                        .append_label(target_id, Some(label.clone()))
+                        .await?;
+                }
+            }
+        }
         self.restore().await?;
+
+        let new_leaf_id = self.session.leaf_id().await?;
+        let tree_event = SessionTreeEvent {
+            kind: "session_tree",
+            new_leaf_id: new_leaf_id.as_deref(),
+            old_leaf_id: old_leaf.as_deref(),
+            summary_entry_id: summary_entry_id.as_deref(),
+            from_hook: None,
+        };
+        let _ = self.run_hooks(
+            HookPoint::SessionTree,
+            HookContext::new(HookPoint::SessionTree)
+                .with_data(serde_json::to_value(&tree_event).unwrap_or(serde_json::Value::Null)),
+        );
+
         Ok(NavigateTreeResult {
             cancelled: false,
+            aborted: false,
             editor_text,
             summary_entry_id,
         })
@@ -6386,7 +6541,7 @@ mod tests {
                 _signal: CancellationToken,
                 _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
             ) -> Result<AgentMessage, anyhow::Error> {
-                if context.system_prompt == crate::compaction::branch_summarization::SYSTEM_PROMPT {
+                if context.system_prompt == crate::compaction::SUMMARIZATION_SYSTEM_PROMPT {
                     let mut out = Vec::new();
                     for m in &context.messages {
                         if let AgentMessage::User { content, .. } = m {
@@ -6454,9 +6609,9 @@ mod tests {
         // first turn the navigation kept.
         let captured: Vec<String> = summarized.lock().unwrap().clone();
         assert_eq!(captured.len(), 1, "{captured:?}");
-        assert!(captured[0].contains("User: second"), "{captured:?}");
+        assert!(captured[0].contains("[User]: second"), "{captured:?}");
         assert!(
-            !captured[0].contains("User: first"),
+            !captured[0].contains("[User]: first"),
             "the kept turn must not be re-summarized: {captured:?}"
         );
 
@@ -6485,7 +6640,7 @@ mod tests {
                 _signal: CancellationToken,
                 _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
             ) -> Result<AgentMessage, anyhow::Error> {
-                if context.system_prompt == crate::compaction::branch_summarization::SYSTEM_PROMPT {
+                if context.system_prompt == crate::compaction::SUMMARIZATION_SYSTEM_PROMPT {
                     *self.0.lock().unwrap() += 1;
                 }
                 Ok(scripted_assistant("answer".into(), "test", "test"))
@@ -6547,6 +6702,203 @@ mod tests {
         let result = harness.navigate_tree(&first_user_id).await.unwrap();
         assert_eq!(result.editor_text.as_deref(), Some("first"));
         assert!(harness.session().leaf_id().await.unwrap().is_none());
+    }
+
+    /// A navigation label attaches to the summary entry when one is generated
+    /// and to the target entry otherwise — TS `appendLabelChange` on either
+    /// node.
+    #[tokio::test]
+    async fn test_navigate_tree_label_attaches_to_summary_or_target() {
+        struct SummarizeStreamFn;
+        #[async_trait::async_trait]
+        impl StreamFn for SummarizeStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if context.system_prompt == crate::compaction::SUMMARIZATION_SYSTEM_PROMPT {
+                    return Ok(scripted_assistant("branch summary".into(), "test", "test"));
+                }
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(SummarizeStreamFn),
+        );
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let first_reply_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        // With a summary, the label lands on the branch summary entry.
+        let result = harness
+            .navigate_tree_with_options(
+                &first_reply_id,
+                NavigateTreeOptions {
+                    summarize: true,
+                    label: Some("nav-summary".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let summary_id = result.summary_entry_id.expect("summary entry");
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::Label { target_id, label, .. }
+                    if target_id == &summary_id && label.as_deref() == Some("nav-summary")
+            )),
+            "label must attach to the summary entry: {entries:?}"
+        );
+
+        // Without a summary, the label lands on the target entry.
+        let first_user_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        harness
+            .navigate_tree_with_options(
+                &first_user_id,
+                NavigateTreeOptions {
+                    summarize: false,
+                    label: Some("nav-target".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                SessionTreeEntry::Label { target_id, label, .. }
+                    if target_id == &first_user_id && label.as_deref() == Some("nav-target")
+            )),
+            "label must attach to the target entry without a summary: {entries:?}"
+        );
+    }
+
+    /// An aborted summarization cancels the navigation before any cursor
+    /// move or entry append (TS `{ cancelled: true, aborted: true }`); a
+    /// `session_before_tree` hook cancellation behaves the same way.
+    #[tokio::test]
+    async fn test_navigate_tree_abort_and_hook_cancel_leave_tree_untouched() {
+        struct AbortSummaryStreamFn;
+        #[async_trait::async_trait]
+        impl StreamFn for AbortSummaryStreamFn {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if context.system_prompt == crate::compaction::SUMMARIZATION_SYSTEM_PROMPT {
+                    let mut m = scripted_assistant("".into(), "test", "test");
+                    if let AgentMessage::Assistant { stop_reason, .. } = &mut m {
+                        *stop_reason = Some(StopReason::Aborted);
+                    }
+                    return Ok(m);
+                }
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(AbortSummaryStreamFn),
+        );
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+        let leaf_before = harness.session().leaf_id().await.unwrap();
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let first_reply_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let result = harness
+            .navigate_tree_with_options(
+                &first_reply_id,
+                NavigateTreeOptions {
+                    summarize: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.cancelled && result.aborted);
+        assert_eq!(harness.session().leaf_id().await.unwrap(), leaf_before);
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+            "aborted navigation must not append a summary: {entries:?}"
+        );
+
+        // A hook cancellation returns `cancelled` without moving the cursor.
+        harness.on(
+            HookPoint::SessionBeforeTree,
+            Arc::new(|ctx: HookContext| ctx.with_cancel_tree()),
+        );
+        let result = harness
+            .navigate_tree_with_options(
+                &first_reply_id,
+                NavigateTreeOptions {
+                    summarize: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.cancelled && !result.aborted);
+        assert_eq!(harness.session().leaf_id().await.unwrap(), leaf_before);
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::Label { .. })),
+            "cancelled navigation must not append anything: {entries:?}"
+        );
     }
 
     /// A prompt batch with image content produces a user message carrying

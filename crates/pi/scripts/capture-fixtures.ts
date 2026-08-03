@@ -24,6 +24,10 @@ const codingAgent = join(repo, "packages/coding-agent/src");
 const { substituteArgs } = await import(join(codingAgent, "core/prompt-templates.ts"));
 const { formatSkillInvocation } = await import(join(agent, "harness/skills.ts"));
 const { serializeConversation } = await import(join(agent, "harness/compaction/utils.ts"));
+const { prepareBranchEntries } = await import(
+	join(agent, "harness/compaction/branch-summarization.ts"),
+);
+const { convertToLlm } = await import(join(agent, "harness/messages.ts"));
 const { runAgentLoop } = await import(join(agent, "agent-loop.ts"));
 
 // --- substitute-args.txt ---------------------------------------------------
@@ -97,6 +101,139 @@ const conversation = [
 writeFileSync(
 	join(outDir, "compaction-serialization.txt"),
 	serializeConversation(conversation) + "\n",
+);
+
+// --- branch-summary-preparation.txt -----------------------------------------
+// The fixed abandoned branch the Rust differential test mirrors: messages
+// (user/assistant/toolResult), a custom message, a harness-authored branch
+// summary (seeding file lists), and a compaction carrier. `prepareBranchEntries`
+// runs under the real TS implementation; the fixture records the selected
+// roles, the accumulated file lists, and the serialized conversation.
+const branchEntries = [
+	{
+		type: "message",
+		id: "u1",
+		parentId: null,
+		timestamp: 1,
+		message: { role: "user", content: [{ type: "text", text: "first" }], timestamp: 1 },
+	},
+	{
+		type: "message",
+		id: "a1",
+		parentId: "u1",
+		timestamp: 2,
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "hi" }],
+			model: "m",
+			provider: "p",
+			api: "test",
+			stopReason: "stop",
+			usage: {},
+			timestamp: 2,
+		},
+	},
+	{
+		type: "message",
+		id: "a2",
+		parentId: "a1",
+		timestamp: 3,
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", name: "write", arguments: { path: "a.rs" }, id: "t1" }],
+			model: "m",
+			provider: "p",
+			api: "test",
+			stopReason: "toolUse",
+			usage: {},
+			timestamp: 3,
+		},
+	},
+	{
+		type: "message",
+		id: "a3",
+		parentId: "a2",
+		timestamp: 4,
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", name: "read", arguments: { path: "b.rs" }, id: "t2" }],
+			model: "m",
+			provider: "p",
+			api: "test",
+			stopReason: "toolUse",
+			usage: {},
+			timestamp: 4,
+		},
+	},
+	{
+		type: "message",
+		id: "tr",
+		parentId: "a3",
+		timestamp: 5,
+		message: {
+			role: "toolResult",
+			toolCallId: "t1",
+			toolName: "write",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 5,
+		},
+	},
+	{
+		type: "custom_message",
+		id: "c1",
+		parentId: "tr",
+		timestamp: 6,
+		customType: "note",
+		content: [{ type: "text", text: "custom note" }],
+		display: true,
+		details: undefined,
+	},
+	{
+		type: "branch_summary",
+		id: "bs1",
+		parentId: "c1",
+		timestamp: 7,
+		fromId: "u1",
+		summary: "prior branch",
+		details: { readFiles: ["old.rs"], modifiedFiles: ["old.rs"] },
+		usage: undefined,
+		fromHook: false,
+	},
+	{
+		type: "compaction",
+		id: "cp1",
+		parentId: "bs1",
+		timestamp: 8,
+		summary: "prior compaction",
+		tokensBefore: 100,
+		details: undefined,
+		usage: undefined,
+		fromHook: false,
+		firstKeptEntryId: null,
+		retainedTail: undefined,
+	},
+];
+const branchPrep = prepareBranchEntries(branchEntries, 0);
+const llmMessages = convertToLlm(branchPrep.messages);
+const branchConversation = serializeConversation(llmMessages);
+const modified = new Set([...branchPrep.fileOps.edited, ...branchPrep.fileOps.written]);
+const branchReadFiles = [...branchPrep.fileOps.read].filter((f) => !modified.has(f)).sort();
+const branchModifiedFiles = [...modified].sort();
+const branchRole = (m) => {
+	if (m.role === "user") return "user";
+	if (m.role === "assistant") return "assistant";
+	if (m.role === "custom") return "custom";
+	if (m.role === "branchSummary") return "branchSummary";
+	if (m.role === "compactionSummary") return "compactionSummary";
+	return m.role;
+};
+writeFileSync(
+	join(outDir, "branch-summary-preparation.txt"),
+	`roles: ${JSON.stringify(branchPrep.messages.map(branchRole))}\n` +
+		`readFiles: ${JSON.stringify(branchReadFiles)}\n` +
+		`modifiedFiles: ${JSON.stringify(branchModifiedFiles)}\n` +
+		`conversation:\n${branchConversation}\n`,
 );
 
 // --- agent-loop-events.txt --------------------------------------------------
