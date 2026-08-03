@@ -127,6 +127,67 @@ impl Settings {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+
+    /// The global settings file under `global_dir` (TS `~/.pi/agent/`).
+    pub fn global_path(global_dir: &std::path::Path) -> std::path::PathBuf {
+        global_dir.join("settings.json")
+    }
+
+    /// The project settings file under a project root (TS `.pi/settings.json`).
+    pub fn project_path(project_root: &std::path::Path) -> std::path::PathBuf {
+        project_root.join(".pi").join("settings.json")
+    }
+
+    /// Load the global settings file; a missing file reads as defaults.
+    pub async fn load_global_at(global_dir: &std::path::Path) -> Result<Self, anyhow::Error> {
+        load_file(&Self::global_path(global_dir)).await
+    }
+
+    /// Load the project settings file; a missing file reads as defaults.
+    pub async fn load_project_at(project_root: &std::path::Path) -> Result<Self, anyhow::Error> {
+        load_file(&Self::project_path(project_root)).await
+    }
+
+    /// Load global then project settings, merging project overrides on top.
+    pub async fn load_at(
+        project_root: &std::path::Path,
+        global_dir: &std::path::Path,
+    ) -> Result<Self, anyhow::Error> {
+        let mut settings = Self::load_global_at(global_dir).await?;
+        let project = Self::load_project_at(project_root).await?;
+        settings.merge(&project);
+        Ok(settings)
+    }
+
+    /// Reload from disk, re-merging the project overrides.
+    pub async fn reload_at(
+        &mut self,
+        project_root: &std::path::Path,
+        global_dir: &std::path::Path,
+    ) -> Result<(), anyhow::Error> {
+        *self = Self::load_at(project_root, global_dir).await?;
+        Ok(())
+    }
+
+    /// Save to a JSON file, creating the parent directory.
+    pub async fn save(&self, path: &std::path::Path) -> Result<(), anyhow::Error> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(path, self.to_json()?).await?;
+        Ok(())
+    }
+}
+
+/// Read and parse a settings file; `NotFound` reads as defaults, any other
+/// failure surfaces (a corrupt settings file must not silently reset config).
+async fn load_file(path: &std::path::Path) -> Result<Settings, anyhow::Error> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(json) => Settings::from_json(&json)
+            .map_err(|e| anyhow::anyhow!("invalid settings file {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +259,55 @@ mod tests {
         assert!(!resolved.enabled);
         assert_eq!(resolved.reserve_tokens, 1000);
         assert_eq!(resolved.keep_recent_tokens, 8000);
+    }
+
+    #[tokio::test]
+    async fn test_save_and_reload_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_dir = dir.path().join("agent");
+        let project = dir.path().join("proj");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+
+        let settings = Settings {
+            default_model: Some("claude-sonnet-4-6".into()),
+            compaction: Some(CompactionOverrides {
+                keep_recent_tokens: Some(5000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        settings
+            .save(&Settings::global_path(&global_dir))
+            .await
+            .unwrap();
+
+        let loaded = Settings::load_global_at(&global_dir).await.unwrap();
+        assert_eq!(loaded.default_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(loaded.compaction.unwrap().keep_recent_tokens, Some(5000));
+
+        // Project override merges on load; reload reflects a changed file.
+        tokio::fs::create_dir_all(project.join(".pi"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            Settings::project_path(&project),
+            r#"{"default_model": "gpt-5"}"#,
+        )
+        .await
+        .unwrap();
+        let merged = Settings::load_at(&project, &global_dir).await.unwrap();
+        assert_eq!(merged.default_model.as_deref(), Some("gpt-5"));
+        assert_eq!(merged.compaction.unwrap().keep_recent_tokens, Some(5000));
+
+        tokio::fs::write(
+            Settings::project_path(&project),
+            r#"{"default_model": "claude-opus-4-8"}"#,
+        )
+        .await
+        .unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.reload_at(&project, &global_dir).await.unwrap();
+        assert_eq!(reloaded.default_model.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
