@@ -36,6 +36,7 @@ pub use agent_loop::run_loop;
 pub use agent_loop::{EventSink, StreamFn};
 pub use env::ExecutionEnv;
 pub use harness::AgentHarness;
+pub use harness::{NavigateTreeOptions, NavigateTreeResult};
 pub use provider::ProviderError;
 pub use provider::anthropic::AnthropicStreamFn;
 pub use provider::openai::completions::CompletionsStreamFn;

@@ -92,15 +92,23 @@ fn file_operation_formatting_matches_ts() {
 #[test]
 fn substitute_args_matches_ts_fixture() {
     let fixture = include_str!("fixtures/ts-pi/substitute-args.txt");
-    // The fixture records input/args/expected on separate lines; args is a
-    // JSON string array.
-    let mut lines = fixture.lines();
-    let input = lines.next().unwrap().strip_prefix("input: ").unwrap();
-    let args: Vec<String> =
-        serde_json::from_str(lines.next().unwrap().strip_prefix("args: ").unwrap()).unwrap();
-    let expected = lines.next().unwrap().strip_prefix("expected: ").unwrap();
-    let rendered = pi::harness::substitute_args(input, &args);
-    assert_eq!(rendered, expected);
+    // Each case block records input/args/expected on separate lines; args is
+    // a JSON string array. The Rust port must reproduce every case the TS
+    // implementation produced.
+    for block in fixture.trim().split("\n\n") {
+        let mut lines = block.lines();
+        // input/expected are JSON strings so values that end in whitespace
+        // survive `git diff --check`; args is a JSON string array.
+        let input: String =
+            serde_json::from_str(lines.next().unwrap().strip_prefix("input: ").unwrap()).unwrap();
+        let args: Vec<String> =
+            serde_json::from_str(lines.next().unwrap().strip_prefix("args: ").unwrap()).unwrap();
+        let expected: String =
+            serde_json::from_str(lines.next().unwrap().strip_prefix("expected: ").unwrap())
+                .unwrap();
+        let rendered = pi::harness::substitute_args(&input, &args);
+        assert_eq!(rendered, expected, "input: {input:?}, args: {args:?}");
+    }
 }
 
 #[test]
@@ -113,6 +121,19 @@ fn skill_invocation_matches_ts_fixture() {
         content: "Check the diff carefully.".into(),
     };
     let rendered = pi::harness::format_skill_invocation(&skill, None);
+    assert_eq!(rendered, fixture.trim_end());
+}
+
+#[test]
+fn skill_invocation_with_instructions_matches_ts_fixture() {
+    let fixture = include_str!("fixtures/ts-pi/skill-invocation-with-instructions.txt");
+    let skill = pi::harness::Skill {
+        name: "review".into(),
+        description: String::new(),
+        location: "/proj/skills/review.md".into(),
+        content: "Check the diff carefully.".into(),
+    };
+    let rendered = pi::harness::format_skill_invocation(&skill, Some("Focus on the diff."));
     assert_eq!(rendered, fixture.trim_end());
 }
 

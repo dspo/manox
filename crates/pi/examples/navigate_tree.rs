@@ -18,7 +18,7 @@ use pi::session::Session;
 use pi::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use pi::session::{SessionStorage, SessionTreeEntry};
 use pi::types::{AgentContext, AgentEvent, Model, StopReason, ThinkingKind, Usage};
-use pi::{AgentHarness, AgentMessage, StreamFn};
+use pi::{AgentHarness, AgentMessage, NavigateTreeOptions, StreamFn};
 
 /// A mock model that answers plain turns and summarizes branches.
 struct MockStream;
@@ -129,12 +129,25 @@ async fn main() {
             _ => None,
         })
         .expect("first reply");
-    harness.navigate_tree(&first_reply).await.expect("navigate");
+    harness
+        .navigate_tree_with_options(
+            &first_reply,
+            NavigateTreeOptions {
+                summarize: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("navigate");
     println!(
         "after navigate: {} messages, branch summary persisted",
         harness.agent().state().messages.len()
     );
-    assert_eq!(harness.agent().state().messages.len(), 3, "first turn + summary carrier");
+    assert_eq!(
+        harness.agent().state().messages.len(),
+        3,
+        "first turn + summary carrier"
+    );
     drop(harness);
 
     // Reopen: the branch (leaf entry) and the branch summary survive.

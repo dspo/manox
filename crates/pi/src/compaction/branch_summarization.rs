@@ -119,6 +119,19 @@ pub fn build_branch_summary_prompt(
     files_changed: &[String],
     existing: Option<&BranchSummary>,
 ) -> String {
+    build_branch_summary_prompt_with_instructions(messages, files_changed, existing, None, false)
+}
+
+/// [`build_branch_summary_prompt`] with the TS `generateBranchSummary`
+/// instruction overrides: custom instructions append to the default prompt
+/// unless `replace_instructions` swaps it in wholesale.
+pub fn build_branch_summary_prompt_with_instructions(
+    messages: &[AgentMessage],
+    files_changed: &[String],
+    existing: Option<&BranchSummary>,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
+) -> String {
     let files_list = files_changed.join("\n");
     let conversation = render_messages(messages);
 
@@ -131,8 +144,7 @@ pub fn build_branch_summary_prompt(
         None => String::new(),
     };
 
-    format!(
-        "{existing_context}\
+    let default_instructions = "\
         Summarize the work done in the conversation branch below. The summary should be \
         concise (<=300 words) and cover:\n\
         1. The user's main goal or feature being implemented\n\
@@ -140,7 +152,15 @@ pub fn build_branch_summary_prompt(
         3. Notable files created, modified, or deleted (with paths)\n\
         4. Unfinished work or known issues\n\n\
         Do NOT repeat the full conversation. Focus on information essential for continuing \
-        the work without losing context.\n\n\
+        the work without losing context.";
+    let instructions = match custom_instructions {
+        Some(extra) if replace_instructions => extra.to_string(),
+        Some(extra) => format!("{default_instructions}\n\nAdditional focus: {extra}"),
+        None => default_instructions.to_string(),
+    };
+
+    format!(
+        "{existing_context}{instructions}\n\n\
         <files_changed>\n{files_list}\n</files_changed>\n\n\
         <conversation>\n{conversation}\n</conversation>"
     )
@@ -181,9 +201,17 @@ pub async fn summarize_branch(
     model: &Model,
     stream_fn: Arc<dyn StreamFn>,
     existing: Option<&BranchSummary>,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
 ) -> Result<BranchSummary, anyhow::Error> {
     let files_changed = extract_files_changed(messages);
-    let prompt = build_branch_summary_prompt(messages, &files_changed, existing);
+    let prompt = build_branch_summary_prompt_with_instructions(
+        messages,
+        &files_changed,
+        existing,
+        custom_instructions,
+        replace_instructions,
+    );
 
     let context = AgentContext {
         system_prompt: SYSTEM_PROMPT.to_string(),

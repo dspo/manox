@@ -118,6 +118,10 @@ struct HarnessControl {
     /// only after their session append succeeds, so a failed write keeps the
     /// tail for the next flush.
     pending_mutations: std::sync::Mutex<Vec<PendingMutation>>,
+    /// Messages queued by `next_turn`, prepended to the next prompt batch —
+    /// the TS `nextTurnQueue`. Shared so the decoupled handle can enqueue
+    /// mid-run without holding `&mut self`.
+    next_turn_queue: std::sync::Mutex<Vec<AgentMessage>>,
     /// The construction-time stream's api. Without a resolver, a model whose
     /// api differs is refused — the fixed stream cannot serve it.
     fixed_api: String,
@@ -243,6 +247,27 @@ impl HarnessHandle {
             .lock()
             .unwrap()
             .push(PendingMutation::ActiveTools(active_tool_names));
+    }
+
+    /// Queue a user message for the next prompt batch — the TS mid-run
+    /// `nextTurn`. Unlike [`AgentHarness::next_turn`], this works while a
+    /// run is in flight: the message lands in the shared queue and the next
+    /// prompt prepends it before its own message.
+    pub fn next_turn(&self, text: &str, images: Vec<ContentBlock>) {
+        let mut content = Vec::with_capacity(images.len() + 1);
+        content.push(ContentBlock::Text {
+            text: text.to_string(),
+            signature: None,
+        });
+        content.extend(images);
+        self.control
+            .next_turn_queue
+            .lock()
+            .unwrap()
+            .push(AgentMessage::User {
+                content,
+                timestamp: chrono::Utc::now(),
+            });
     }
 }
 
@@ -489,9 +514,37 @@ pub struct AgentHarness<S: SessionStorage> {
     model_resolver: Option<ModelResolver>,
     /// Skills and prompt templates the harness can expand into prompts.
     resources: HarnessResources,
-    /// Messages queued by `next_turn`, prepended to the next prompt batch —
-    /// the TS `nextTurnQueue`.
-    next_turn_queue: Vec<AgentMessage>,
+}
+
+/// Options for [`AgentHarness::navigate_tree_with_options`], mirroring the
+/// TS `navigateTree` options. `summarize` gates branch summarization
+/// (off by default, like TS); `custom_instructions` / `replace_instructions`
+/// shape the summarization prompt; `label` is carried for the deferred
+/// `session_before_tree` hook (see docs/ts-pi-parity.md §9).
+#[derive(Debug, Clone, Default)]
+pub struct NavigateTreeOptions {
+    /// Generate a summary of the abandoned branch (requires a provider).
+    pub summarize: bool,
+    /// Instructions appended to the summarization prompt.
+    pub custom_instructions: Option<String>,
+    /// Replace the default summarization instructions with
+    /// `custom_instructions` instead of appending.
+    pub replace_instructions: bool,
+    /// Label carried for the deferred `session_before_tree` hook.
+    pub label: Option<String>,
+}
+
+/// Result of a tree navigation, mirroring the TS `NavigateTreeResult`.
+#[derive(Debug, Clone)]
+pub struct NavigateTreeResult {
+    /// True when the deferred `session_before_tree` hook cancels the
+    /// navigation; the hook is not wired yet, so this stays false.
+    pub cancelled: bool,
+    /// The target message's text when it is a user or custom message;
+    /// `None` for assistant or structural targets.
+    pub editor_text: Option<String>,
+    /// Entry id of the appended branch summary, when one was generated.
+    pub summary_entry_id: Option<String>,
 }
 
 impl<S: SessionStorage + 'static> AgentHarness<S> {
@@ -521,6 +574,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 active_tool_names: None,
             }),
             pending_mutations: std::sync::Mutex::new(Vec::new()),
+            next_turn_queue: std::sync::Mutex::new(Vec::new()),
             fixed_api,
             has_resolver: std::sync::atomic::AtomicBool::new(false),
             message_entry_ids: std::sync::Mutex::new(Vec::new()),
@@ -563,7 +617,6 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             active_tool_names: None,
             model_resolver: None,
             resources: HarnessResources::default(),
-            next_turn_queue: Vec::new(),
         }
     }
 
@@ -611,8 +664,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.prompt(&format_skill_invocation(skill, None)).await
     }
 
-    /// Expand a prompt template by name with `args` substituted for
-    /// `{name}` placeholders, then run it.
+    /// Expand a prompt template by name with `args` substituted for its
+    /// `$1`/`$@`/`$ARGUMENTS` placeholders (see [`substitute_args`]), then
+    /// run it.
     pub async fn prompt_from_template(
         &mut self,
         name: &str,
@@ -630,24 +684,29 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// Queue a user message for the next turn — the TS `nextTurn`. It can be
-    /// called while idle or mid-run; the queued messages are prepended to the
-    /// next prompt batch, before the prompt's own message.
-    pub fn next_turn(&mut self, text: &str, images: Vec<ContentBlock>) {
+    /// called while idle or mid-run (via [`HarnessHandle::next_turn`]); the
+    /// queued messages are prepended to the next prompt batch, before the
+    /// prompt's own message.
+    pub fn next_turn(&self, text: &str, images: Vec<ContentBlock>) {
         let mut content = Vec::with_capacity(images.len() + 1);
         content.push(ContentBlock::Text {
             text: text.to_string(),
             signature: None,
         });
         content.extend(images);
-        self.next_turn_queue.push(AgentMessage::User {
-            content,
-            timestamp: chrono::Utc::now(),
-        });
+        self.control
+            .next_turn_queue
+            .lock()
+            .unwrap()
+            .push(AgentMessage::User {
+                content,
+                timestamp: chrono::Utc::now(),
+            });
     }
 
     /// Whether next-turn messages are queued.
     pub fn has_next_turn(&self) -> bool {
-        !self.next_turn_queue.is_empty()
+        !self.control.next_turn_queue.lock().unwrap().is_empty()
     }
 
     /// Append a custom message to the session, joining the transcript.
@@ -1020,7 +1079,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         let mut batch = Vec::new();
         // Queued next-turn messages run before the prompt's own message,
         // mirroring TS.
-        batch.append(&mut self.next_turn_queue);
+        batch.append(&mut self.control.next_turn_queue.lock().unwrap());
         batch.push(user_message);
         batch.extend(hook_ctx.inject_messages);
 
@@ -1442,33 +1501,50 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         Ok(())
     }
 
-    /// Rebuild the agent transcript from the persisted session.
-    ///
-    /// Every message-producing entry variant on the active path projects into
-    /// the transcript: messages verbatim, custom messages as `Custom`,
-    /// branch/compaction summaries as their tagged user-text carriers. The
-    /// kept segment behind a compaction boundary is reconstructed by walking
-    /// the tree from its `first_kept_entry_id`, never from the boundary
-    /// itself. The reasoning tier the path carries is applied to the agent,
-    /// the active tool selection narrows the mounted set, and the model the
-    /// path carries is applied when a model resolver is plugged in —
-    /// resolving it needs the provider registry, which lives at the facade
-    /// layer. Restore never appends entries: the session already records
-    /// these choices. The compaction boundary used by token estimation is
-    /// recovered alongside.
     /// Move the session cursor to an earlier entry, rebuild the transcript
     /// from the new path, and append a branch summary for it — the TS
-    /// `navigateTree`. The branch summary is generated with the current
-    /// model's runtime and persisted as a `branch_summary` entry.
-    pub async fn navigate_tree(&mut self, target_id: &str) -> Result<(), anyhow::Error> {
+    /// `navigateTree` with default options (summarization off).
+    pub async fn navigate_tree(
+        &mut self,
+        target_id: &str,
+    ) -> Result<NavigateTreeResult, anyhow::Error> {
+        self.navigate_tree_with_options(target_id, NavigateTreeOptions::default())
+            .await
+    }
+
+    /// [`AgentHarness::navigate_tree`] with the TS option surface. The branch
+    /// summary is generated with the current model's runtime only when
+    /// `summarize` is set and the abandoned branch is non-empty; a plain
+    /// navigation moves the cursor and restores the transcript without a
+    /// provider call. The harness is in the `BranchSummary` phase for the
+    /// operation's duration, mirroring TS.
+    pub async fn navigate_tree_with_options(
+        &mut self,
+        target_id: &str,
+        options: NavigateTreeOptions,
+    ) -> Result<NavigateTreeResult, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot navigate while harness is in {:?} phase", self.phase);
         }
         let _active = ActiveGuard::arm(&self.control);
+        self.phase = AgentHarnessPhase::BranchSummary;
+        let result = self.navigate_tree_inner(target_id, &options).await;
+        self.phase = AgentHarnessPhase::Idle;
+        result
+    }
 
+    async fn navigate_tree_inner(
+        &mut self,
+        target_id: &str,
+        options: &NavigateTreeOptions,
+    ) -> Result<NavigateTreeResult, anyhow::Error> {
         let old_leaf = self.session.leaf_id().await?;
         if old_leaf.as_deref() == Some(target_id) {
-            return Ok(());
+            return Ok(NavigateTreeResult {
+                cancelled: false,
+                editor_text: None,
+                summary_entry_id: None,
+            });
         }
         let target_entry = self
             .session
@@ -1477,9 +1553,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("entry {target_id} not found"))?;
 
-        // Summarize the branch that is being left behind: the old leaf up to
-        // the common ancestor with the target path. The target's own history
-        // stays untouched — TS `collectEntriesForBranchSummary`.
+        // Collect the branch being left behind: the old leaf up to the common
+        // ancestor with the target path. The target's own history stays
+        // untouched — TS `collectEntriesForBranchSummary`.
         let old_path = self.session.storage().get_path(old_leaf.as_deref()).await?;
         let target_path = self.session.storage().get_path(Some(target_id)).await?;
         let old_ids: std::collections::HashSet<&str> = old_path.iter().map(|e| e.id()).collect();
@@ -1497,28 +1573,59 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .into_iter()
             .rev()
             .collect();
-        let messages: Vec<AgentMessage> = abandoned
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Message { message, .. } => Some(message.clone()),
-                _ => None,
-            })
-            .collect();
 
-        let stream_fn = match &self.stream_resolver {
-            Some(resolver) => resolver(&self.model)?,
-            None => Arc::clone(&self.stream_fn),
+        // The target's message text rides on the result for user/custom
+        // targets — TS `contentText(content, "")`.
+        let editor_text = match &target_entry {
+            SessionTreeEntry::Message {
+                message: AgentMessage::User { content, .. },
+                ..
+            }
+            | SessionTreeEntry::CustomMessage { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
         };
-        let summary = crate::compaction::branch_summarization::summarize_branch(
-            &messages,
-            &self.model,
-            stream_fn,
-            None,
-        )
-        .await?;
+
+        // A summary is generated only when asked for and there is an
+        // abandoned branch to summarize (TS `options.summarize &&
+        // entries.length > 0`).
+        let summary = if options.summarize && !abandoned.is_empty() {
+            let messages: Vec<AgentMessage> = abandoned
+                .iter()
+                .filter_map(|e| match e {
+                    SessionTreeEntry::Message { message, .. } => Some(message.clone()),
+                    _ => None,
+                })
+                .collect();
+            let stream_fn = match &self.stream_resolver {
+                Some(resolver) => resolver(&self.model)?,
+                None => Arc::clone(&self.stream_fn),
+            };
+            Some(
+                crate::compaction::branch_summarization::summarize_branch(
+                    &messages,
+                    &self.model,
+                    stream_fn,
+                    None,
+                    options.custom_instructions.as_deref(),
+                    options.replace_instructions,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         // Move the cursor (a user/custom target focuses its parent, mirroring
-        // TS), then hang the summary on the new branch.
+        // TS), then hang the summary on the new branch when one was produced.
         let new_leaf = match &target_entry {
             SessionTreeEntry::Message {
                 message: AgentMessage::User { .. },
@@ -1529,19 +1636,42 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             _ => Some(target_id.to_string()),
         };
         self.session.move_to(new_leaf.as_deref()).await?;
-        self.session
-            .append_branch_summary(
-                new_leaf.as_deref().unwrap_or("root"),
-                &summary.summary,
-                &summary.files_changed,
-                None,
-                false,
-            )
-            .await?;
+        let summary_entry_id = match &summary {
+            Some(summary) => Some(
+                self.session
+                    .append_branch_summary(
+                        new_leaf.as_deref().unwrap_or("root"),
+                        &summary.summary,
+                        &summary.files_changed,
+                        None,
+                        false,
+                    )
+                    .await?,
+            ),
+            None => None,
+        };
         self.restore().await?;
-        Ok(())
+        Ok(NavigateTreeResult {
+            cancelled: false,
+            editor_text,
+            summary_entry_id,
+        })
     }
 
+    /// Rebuild the agent transcript from the persisted session.
+    ///
+    /// Every message-producing entry variant on the active path projects into
+    /// the transcript: messages verbatim, custom messages as `Custom`,
+    /// branch/compaction summaries as their tagged user-text carriers. The
+    /// kept segment behind a compaction boundary is reconstructed by walking
+    /// the tree from its `first_kept_entry_id`, never from the boundary
+    /// itself. The reasoning tier the path carries is applied to the agent,
+    /// the active tool selection narrows the mounted set, and the model the
+    /// path carries is applied when a model resolver is plugged in —
+    /// resolving it needs the provider registry, which lives at the facade
+    /// layer. Restore never appends entries: the session already records
+    /// these choices. The compaction boundary used by token estimation is
+    /// recovered alongside.
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
         let context = self.session.build_session_context().await?;
         self.agent.clear_transcript_state();
@@ -1562,6 +1692,25 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             self.agent.state().thinking_level.clone();
         self.control.turn_runtime.lock().unwrap().active_tool_names =
             self.active_tool_names.clone();
+        // Mutations whose durable write failed are still the caller's latest
+        // intent: replay them onto the snapshot so the next provider request
+        // runs under them instead of reverting to the persisted model while
+        // the entry stays queued (TS keeps `this.model` at the new value
+        // until the pending write lands).
+        {
+            let mut snapshot = self.control.turn_runtime.lock().unwrap();
+            for mutation in self.control.pending_mutations.lock().unwrap().iter() {
+                match mutation {
+                    PendingMutation::Model(model) => snapshot.model = model.clone(),
+                    PendingMutation::ThinkingLevel(level) => {
+                        snapshot.thinking_level = level.clone()
+                    }
+                    PendingMutation::ActiveTools(names) => {
+                        snapshot.active_tool_names = Some(names.clone())
+                    }
+                }
+            }
+        }
         self.message_entry_ids = context.message_entry_ids;
         // Any ids the middleware recorded before a failure point at messages
         // the restore already projected from the session — drop them so the
@@ -2056,38 +2205,68 @@ pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&s
     }
 }
 
-/// The TS `substituteArgs`: positional `$1`..`$N`, slices `${@:N}` /
-/// `${@:N:L}`, and the whole-argument `$ARGUMENTS` / `$@`.
+/// The TS coding-agent `substituteArgs`: one regex pass over the template
+/// string only, so argument and default values containing placeholder
+/// patterns are never re-substituted. Supports `$N`, `$@` / `$ARGUMENTS`,
+/// `${@:N}` / `${@:N:L}` slices, and `${N:-default}` / `${@:-default}` /
+/// `${ARGUMENTS:-default}` defaults. A bare `$0` yields nothing — TS indexes
+/// at -1, which reads as undefined.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let mut result = content.to_string();
-    // $N
-    let re = regex::Regex::new(r"\$(\d+)").expect("static positional pattern");
-    result = re
-        .replace_all(&result, |caps: &regex::Captures| {
-            let n: usize = caps[1].parse().unwrap_or(0);
-            args.get(n - 1).cloned().unwrap_or_default()
-        })
-        .into_owned();
-    // ${@:N} and ${@:N:L}
-    let slice = regex::Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("static slice pattern");
-    result = slice
-        .replace_all(&result, |caps: &regex::Captures| {
-            let start = caps[1].parse::<usize>().unwrap_or(1).saturating_sub(1);
-            let start = start.min(args.len());
-            match caps.get(2) {
-                Some(len) => args[start..]
+    let all = args.join(" ");
+    let re = regex::Regex::new(
+        r"\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)",
+    )
+    .expect("static placeholder pattern");
+    re.replace_all(content, |caps: &regex::Captures| {
+        // ${N:-default} / ${@:-default} / ${ARGUMENTS:-default}
+        if let Some(target) = caps.get(1) {
+            let n: i64 = target.as_str().parse().unwrap_or(1);
+            let value = if n < 1 {
+                String::new()
+            } else if target.as_str() == "@" || target.as_str() == "ARGUMENTS" {
+                all.clone()
+            } else {
+                args.get((n as usize) - 1).cloned().unwrap_or_default()
+            };
+            return if value.is_empty() {
+                caps[2].to_string()
+            } else {
+                value
+            };
+        }
+        // ${@:N} / ${@:N:L}
+        if let Some(start_m) = caps.get(3) {
+            let start = start_m
+                .as_str()
+                .parse::<usize>()
+                .unwrap_or(1)
+                .saturating_sub(1)
+                .min(args.len());
+            return match caps.get(4) {
+                Some(len_m) => args[start..]
                     .iter()
-                    .take(len.as_str().parse::<usize>().unwrap_or(0))
+                    .take(len_m.as_str().parse::<usize>().unwrap_or(0))
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(" "),
                 None => args[start..].join(" "),
+            };
+        }
+        // $ARGUMENTS / $@ / $N
+        let simple = caps.get(5).expect("one alternative matched");
+        match simple.as_str() {
+            "ARGUMENTS" | "@" => all.clone(),
+            n => {
+                let n: i64 = n.parse().unwrap_or(1);
+                if n < 1 {
+                    String::new()
+                } else {
+                    args.get((n as usize) - 1).cloned().unwrap_or_default()
+                }
             }
-        })
-        .into_owned();
-    let all = args.join(" ");
-    result = result.replace("$ARGUMENTS", &all);
-    result.replace("$@", &all)
+        }
+    })
+    .into_owned()
 }
 
 /// A named prompt template.
@@ -4021,19 +4200,24 @@ mod tests {
 
     /// A failed durable write keeps the mutation in the queue (and the tail
     /// after it) for the next flush — nothing is dropped, and a later flush
-    /// retries the suffix until it lands.
+    /// retries the suffix until it lands. The recovered run must also be
+    /// served by the queued model: the failed write must not revert the next
+    /// provider request to the persisted model.
     #[tokio::test]
     async fn test_flush_keeps_unpersisted_mutation_on_failure() {
         let storage = MemStorage::new();
         *storage.fail_model_id.lock().unwrap() = Some("model-b".into());
         let session = Session::new(storage);
+        let served: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served_in_stream = Arc::clone(&served);
         let mut harness = AgentHarness::new(
             session,
             "You are a test assistant.",
             test_model(),
             Arc::new(ToolUseStreamFn {
                 call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                seen: None,
+                seen: Some(served_in_stream),
             }),
         )
         .with_tools(Arc::from(vec![
@@ -4091,12 +4275,19 @@ mod tests {
         assert_eq!(model_changes(&harness).await, vec!["model-a".to_string()]);
 
         // The failed write stayed queued: the next run's flush retries it and
-        // both changes land.
+        // both changes land — and the run itself is served by the queued
+        // model, not the persisted one.
         *harness.session().storage().fail_model_id.lock().unwrap() = None;
         let _ = harness.prompt("again").await.unwrap();
         assert_eq!(
             model_changes(&harness).await,
             vec!["model-a".to_string(), "model-b".to_string()]
+        );
+        assert_eq!(
+            *served.lock().unwrap(),
+            vec!["test".to_string(), "model-b".to_string()],
+            "the recovered run must be served by the queued model, not the \
+             persisted one"
         );
     }
 
@@ -6244,7 +6435,16 @@ mod tests {
             })
             .unwrap();
 
-        harness.navigate_tree(&first_reply_id).await.unwrap();
+        harness
+            .navigate_tree_with_options(
+                &first_reply_id,
+                NavigateTreeOptions {
+                    summarize: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         // The transcript now holds only the first turn (user + answer) plus
         // the branch summary carrier; the second turn's messages are on the
         // abandoned branch.
@@ -6268,6 +6468,85 @@ mod tests {
                 .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
             "{entries:?}"
         );
+    }
+
+    /// Plain navigation (the TS default, `summarize: false`) never calls the
+    /// model and appends no branch summary — the cursor moves, the transcript
+    /// rebuilds, and the result carries the target's editor text for user
+    /// targets.
+    #[tokio::test]
+    async fn test_navigate_tree_default_skips_summarization() {
+        struct NoSummaryStream(Arc<std::sync::Mutex<usize>>);
+        #[async_trait::async_trait]
+        impl StreamFn for NoSummaryStream {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                if context.system_prompt == crate::compaction::branch_summarization::SYSTEM_PROMPT {
+                    *self.0.lock().unwrap() += 1;
+                }
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let summarization_calls = Arc::new(std::sync::Mutex::new(0usize));
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(NoSummaryStream(Arc::clone(&summarization_calls))),
+        );
+        harness.prompt("first").await.unwrap();
+        harness.prompt("second").await.unwrap();
+
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        let first_reply_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let result = harness.navigate_tree(&first_reply_id).await.unwrap();
+        // No model call, no summary entry, no summary carrier message.
+        assert_eq!(*summarization_calls.lock().unwrap(), 0);
+        assert_eq!(harness.agent().state().messages.len(), 2);
+        assert!(result.summary_entry_id.is_none());
+        assert!(!result.cancelled);
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::BranchSummary { .. })),
+            "no summary entry without summarize: {entries:?}"
+        );
+
+        // Navigating to the first user message reports its text and resets
+        // the cursor to the root (its parent).
+        let first_user_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let result = harness.navigate_tree(&first_user_id).await.unwrap();
+        assert_eq!(result.editor_text.as_deref(), Some("first"));
+        assert!(harness.session().leaf_id().await.unwrap().is_none());
     }
 
     /// A prompt batch with image content produces a user message carrying
@@ -6403,6 +6682,60 @@ mod tests {
             SessionTreeEntry::ActiveToolsChange { active_tool_names, .. }
                 if active_tool_names == &["echo".to_string()]
         )));
+    }
+
+    /// A TurnEnd listener queues a next-turn message mid-run; the next prompt
+    /// consumes it before its own message (TS `nextTurn` from a settled
+    /// event, delivered at the next `prompt`).
+    #[tokio::test]
+    async fn test_next_turn_queued_mid_run_consumed_next_prompt() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.next_turn("queued mid-run", Vec::new());
+                }
+            })
+        }));
+
+        let _ = harness.prompt("first").await.unwrap();
+        assert!(harness.has_next_turn());
+
+        let messages = harness.prompt("second").await.unwrap();
+        assert!(!harness.has_next_turn());
+        assert!(matches!(
+            &messages[0],
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued mid-run")
+        ));
+        assert!(matches!(
+            &messages[1],
+            AgentMessage::User { content, .. }
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "second")
+        ));
     }
 
     /// A TurnEnd model switch is persisted before the next provider request:

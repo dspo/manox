@@ -10,7 +10,9 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~29,600 行 Rust（src 28.3k + examples 1.3k），405 个 unit 测试 + 5 个 integration 测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~27,500 行 Rust（src 25.2k + examples 2.3k），427 个 unit 测试 + 12 个 integration 测试（另 3 个 live 测试 ignored），零警告。
+
+**基线（S0 冻结）：** Rust HEAD `b9b6869`（工作区含未提交 S0 校准：10 改 2 增）；TS Pi `4488ad55c18f07ae89a489096c90de8667b3adfb`（与 `origin/main` 一致）。S0 完成后冻结共享基线，其余 agent 在此基线上开始。
 
 ## 架构设计
 
@@ -156,7 +158,7 @@ pub trait AgentTool: Send + Sync {
 7. ✅ 实现 `prepare_compaction()` + `compact()` —— 调用 stream_fn 生成摘要
    - 摘要请求逐字对齐 TS `generateSummaryWithUsage`：`serialize_conversation`（user/custom 文本、assistant thinking/文本/tool calls（name+k=JSON 参数）、tool result 截 2000 字符）、`SUMMARIZATION_SYSTEM_PROMPT` 常量、`SUMMARIZATION_PROMPT`/`UPDATE_SUMMARIZATION_PROMPT` 双模板经 `<previous-summary>` 切换
    - 无可摘要范围时拒绝（`NothingToCompact`，对齐 TS `prepareCompaction` 返回 `undefined`）：tiny transcript 在默认 keep-recent 下切点恒为 0，不再产出空摘要
-   - 已知余项：split-turn（turn prefix 摘要，cut 恒在整轮边界）
+   - split-turn（turn prefix 摘要，cut 恒在整轮边界）已由 Phase 3A 闭环
 
 ### Phase 4: AgentHarness 编排层 ✅
 
@@ -168,7 +170,7 @@ pub trait AgentTool: Send + Sync {
 2. ✅ 实现 hook 系统
    - `on()` 注册 hook handler
    - hook 点：before_agent_start（结果生效：messages 注入进 prompt 批次、systemPrompt 覆盖只达本 run 初始 context）, before_provider_request（逐 provider 调用变换整个 context，覆盖 TS `context` transform 接缝）, tool_call（block）, tool_result（全字段 patch 含 terminate）, session_before_compact（cancel/全量 override）, session_after_compact
-   - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/ts-pi-parity.md §8「有意偏离」
+   - 有意推迟（无 fire 点/接缝）：payload/response、tree、retry、update 通知类变体——见 docs/ts-pi-parity.md §9「有意偏离」
    - 取消传播到执行层：`ExecutionEnv::exec` 带 CancellationToken，Tokio 实现独占进程组（`process_group(0)`），取消/超时 SIGKILL 整个进程树（对齐 TS `killProcessTree`），bash 工具透传 signal
 3. ✅ 实现 compaction 集成 —— `compact()` 方法编排完整流程
 4. ✅ 实现 turn state 快照 —— 每次 turn 开始前快照 context
@@ -185,7 +187,7 @@ pub trait AgentTool: Send + Sync {
    - 运行中 mutation：`HarnessHandle::set_model/set_thinking_level` 立即更新共享 TurnRuntime 快照，prepare-next-turn 在下一轮 provider 请求前刷新 context；持久化队列逐条成功才 pop，失败项留待下次 flush；`with_stream_resolver` 按 `Model.api` 每次请求解析 provider runtime（consumer 插拔，crate registry-free）
    - `restore()` 回放 path 携带的完整运行配置：thinking tier、active tools 子集（经全量挂载集过滤）、model（经 consumer 插接的 `ModelResolver`——crate 保持 registry-free，无 resolver 时保留构造期 model）；restore 不追加任何 entry
 
-> 能力校准：以上 Phase 只覆盖模块基线（文件存在、主路径可用）。TS Pi 行为逐项对齐状态以 `docs/ts-pi-parity.md` 为准——其中「运行配置」行标为 🟡（active_tools 运行中排队未接线）、Session store/reader/repository、split-turn、message_end 逐条持久化、coding-agent facade 等仍属未完成能力，Phase 的 ✅ 不等于完整迁移。
+> 能力校准：以上 Phase 只覆盖模块基线（文件存在、主路径可用）。TS Pi 行为逐项对齐状态以 `docs/ts-pi-parity.md` 为准——split-turn、message_end 逐条持久化、运行中 active_tools 排队均已闭环（2026-08-01）；Session store/reader/repository 深度（upstream 4488ad55c 之后）、coding-agent facade、hook 通知类变体（见 ts-pi-parity §9）等仍属未完成能力，Phase 的 ✅ 不等于完整迁移。
 
 ### Phase 4A：运行配置闭环 ✅（2026-08-01）
 
@@ -211,15 +213,15 @@ pub trait AgentTool: Send + Sync {
 - ✅ `truncate.rs` —— 共享输出截断，保留 head+tail
 - ✅ `path_utils.rs` —— 路径解析、安全边界检查
 
-### Phase 6: 辅助模块 ✅
+### Phase 6: 辅助模块 🟡（类型就绪，接线见 S5）
 
 **文件：** `settings.rs`, `trust.rs`, `cache_stats.rs`, `system_prompt.rs`, `output_guard.rs`
 
-1. ✅ `settings.rs` —— Settings struct + global/project 合并（serde 序列化助手，文件加载/保存由接线方负责）
-2. ✅ `trust.rs` —— 项目信任决策管理（内存态，无持久化）
-3. ✅ `cache_stats.rs` —— 逐 turn 扫描 usage 字段检测 cache miss（token 维度：missed_tokens + miss 计数，带 noise floor）；金额与 idle 未实现（`missed_cost` 恒 0、`idle_ms` 占位、`ModelPriceSource` 未接线——见「待完成」）
+1. 🟡 `settings.rs` —— Settings struct + field-wise 合并（serde 序列化助手）；文件加载/保存/reload/递归覆盖未接线（接线方待 S5）
+2. 🟡 `trust.rs` —— 项目信任决策管理（内存态，无持久化、未接入资源/工具启用策略）
+3. 🟡 `cache_stats.rs` —— 逐 turn 扫描 usage 字段检测 cache miss（token 维度：missed_tokens + miss 计数，带 noise floor）；金额与 idle 未实现（`missed_cost` 恒 0、`idle_ms` 占位、`ModelPriceSource` 未接线——见 S5）
 4. ✅ `system_prompt.rs` —— 系统提示词构建（项目上下文 + CLAUDE.md 加载）
-5. ✅ `output_guard.rs` —— 工具输出标记（防注入攻击）
+5. 🚫 `output_guard.rs` —— 默认关闭：未接入任何工具输出路径，无可观察行为；维持默认关闭，除非差分证明不改变 TS 模型可见行为
 
 ### Phase 7: 真实执行环境 + 测试 ✅
 
@@ -236,25 +238,34 @@ pub trait AgentTool: Send + Sync {
 - pre-prompt compaction：aborted 回合后 `prompt()` 前执行
 - example `split_turn_compact`：90k→179 tokens，reopen 一致
 
-### Phase 8：coding-agent facade ✅（2026-08-01）
+### Phase 8：coding-agent facade 🟡（类型骨架，纵向闭环见 S6）
 
-- `coding_agent` 模块：AgentSession/Builder、ModelRuntime（env credential）、ResourceLoader（CLAUDE.md/skills/templates）、`create_agent_session`
+- `coding_agent` 模块：AgentSession/Builder、ModelRuntime（env credential，缺凭证生成 `missing-*_API_KEY` 假值——S3 改 typed missing-credential 错误）、ResourceLoader（CLAUDE.md/skills/templates 有类型未全接线）、`create_agent_session`
+- `open()` 不自动 restore（调用者需手动恢复，S6 改为返回前 restore）；无 `fork`/事件订阅面/shutdown（S6/S4）
 - example `coding_agent_smoke`：资源加载→工具轮→model 切换→compact→close/reopen→continue
 
 ### 待完成
 
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
 
-- [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳
-- [ ] summarization retry/cancel：summarization 与 branch summary 调用无 retry 策略与取消通道
-- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §8）
-- [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐
+- [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳（S5）
+- [ ] summarization retry/cancel：summarization 与 branch summary 调用无 retry 策略与取消通道（S1）
+- [ ] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写，删除自创 `render_messages`/300 字 prompt（S1）
+- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §9「有意偏离」）
+- [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 删除（S2）
+- [ ] coding-agent facade 纵向：open 自动 restore、缺凭证 typed 错误、fork/事件/shutdown（S6/S4）
 - [ ] pi-ai breadth：三协议之外的 chat API 与 image API（明确排除项）
+
+Rust-only 处置（S0 拍板）：
+
+- [ ] `SessionRepository::search()` 删除（TS 核心无此 API，仓内无真实调用方）——S2
+- [ ] `output_guard` 维持默认关闭（未接入任何工具输出路径）——冻结
+- [ ] hashline / 进程内 grep/find / file mutation queue 保留并冻结，不继续扩展
 
 工程化余项：
 
 - [ ] 与 Pi TS 的差分测试（相同输入 → 相同输出）
-- [ ] `schemars` 生成工具 JSON Schema（从 Rust struct 派生，替代手写 serde_json::json!）
+- tool schema 对齐与 `schemars` 已从待办/验收项删除（S0 拍板：以手写 serde_json::json! 为准）
 
 ## 与 manox 现有 `agent` crate 的关系
 

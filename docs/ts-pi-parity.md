@@ -4,6 +4,7 @@
 > 对齐基线：TS Pi upstream **`4488ad55c18f07ae89a489096c90de8667b3adfb`**（2026-08-01 第五轮对抗审查推进基线；此前基因为 `bf4a90d8`，再前为 `ea781d68`）。
 > 本文件只追踪 TS Pi → crate pi 的行为对齐。「pi crate 何时能替换 manox agent crate」的产品能力清单见 [manox-cutover.md](manox-cutover.md)。
 > 状态图例：✅ 已对齐 · 🟡 已对齐但有记录在案的偏差 · 🔲 未对齐 · 🚫 有意偏离（记录理由）
+> 基线冻结（S0，2026-08-01）：Rust HEAD `b9b6869` + 未提交 S0 校准（10 改 2 增）；TS `4488ad55c` 不变。冻结后其余 agent 以此共享基线开始。
 
 ## 1. Agent loop（`agent_loop.rs` ↔ agent-loop.ts）
 
@@ -37,9 +38,9 @@
 | threshold compact-no-retry | ✅（2026-07-31） | settled 回合（成功/错误）后计量超阈值即为下一回合压缩，不重试；维护性压缩失败只记日志，已完结回合结果不受影响（对齐 TS `_runAutoCompaction` catch → return false） |
 | 压缩期队列处理 | ✅（2026-07-31） | 压缩只替换 transcript 不清队列；settle 循环最外层检查 queued 消息，非空即续跑一次 continuation 投递（对齐 TS `_handlePostAgentRun` 末行 `hasQueuedMessages()`，2026-08-01 从 threshold 分支提升到最外层） |
 | session auto-retry | ✅（2026-08-01） | retryable 错误（overload/429/5xx/传输中断，排除 overflow 与 quota/billing）进入退避重试：错误留在 session 但离开重试上下文、默认 3 次 / 2s 指数退避、`RetryEvent` observer 承载 auto_retry_start/end 生命周期（对齐 TS `_prepareRetry` + `_retryAttempt`）；`HarnessHandle::abort`/`wait_for_idle` 统一覆盖 agent run、退避与 settle（对齐 TS `abort()` → `abortRetry()` + `waitForIdle()`）；cancel token 先于 Start 事件安装，listener 的 abort 必取消当前退避（2026-08-01） |
-| Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §8 |
+| Hook 系统 | 🟡 | 结果承载 hook 全对齐（before_agent_start 注入/systemPrompt 覆盖、tool_call block、tool_result 全字段 patch、session_before_compact cancel/override、session_after_compact）；推迟项见 §9 |
 | 持久化粒度 | ✅（2026-08-01） | message_end 逐条 append（harness persistence middleware 先于 listener）；turn 中途崩溃只丢未完成消息，已提交消息全部可恢复；mutation 在下一 provider request 前 flush（prepare-next-turn），model_change 先于新模型消息 |
-| 运行配置 | 🟡 | set_model/set_active_tools/set_thinking_level idle 期持久化并应用；`set_thinking_level` 持久化闭环已补齐（2026-08-01）；运行中 model/thinking 经 HarnessHandle 立即更新共享快照、下一轮生效，独立 continuation 首轮亦生效（apply_turn_runtime 在新 run 前同步）；`restore()` 同步 Agent/Harness/共享快照三者（2026-08-01）；active_tools 运行中排队仍未接线（见「已知余项」） |
+| 运行配置 | ✅ | set_model/set_active_tools/set_thinking_level idle 期持久化并应用；运行中 model/thinking/active_tools 经 HarnessHandle 立即更新共享快照、下一轮生效（prepare-next-turn 在下一 provider 请求前刷新 context；active_tools 运行中排队 2026-08-01 闭环），独立 continuation 首轮亦生效（apply_turn_runtime 在新 run 前同步）；持久化队列逐条成功才 pop，flush 失败后 restore 重放队列到共享快照，恢复后的下一 provider 请求仍由被排队 model 服务；`restore()` 同步 Agent/Harness/共享快照三者 |
 
 ## 4. Compaction（`compaction/` ↔ compaction.ts）
 
@@ -59,7 +60,12 @@
 | v3 schema | ✅ | 全部 entry 变体逐字段对齐（camelCase rename 全覆盖，parentId 不丢 ancestry） |
 | JSONL 存储 | ✅ | 追加写入 + leaf 游标；get_path 全路径 walk，未知 leaf/断链显式报错；append 事务线性化：Session 层串行化 parent-selection + append（并发 append 成链不 fork 兄弟分支），存储层 write→index→cursor 原子（对齐 TS 4488ad55c 的 linear-time 修复，2026-08-01）；load/append 拒绝重复或空 entry id；wire 级校验：header id/cwd 非空、metadata 为对象、entry `parentId`（leaf 另含 `targetId`）必须为 null|string，缺失即 corruption，`metadata:null`/`parentSession:null` 拒绝而缺失接受（对齐 TS parseHeaderLine/parseEntryLine，2026-08-01）；create 与 open 共用同一 header validator，不再写出自身拒绝的文件 |
 | 上下文重建 | ✅ | get_branch / build_context_entries / build_session_context 对齐 TS；设置类 entry（thinking_level/model_change/active_tools_change）经 SessionContext 上报不回 transcript |
-| repository 与导航 | ✅（2026-08-01） | SessionRepository（create/open/list/delete/fork/search）；Session move_to/label/name/stats/pagination/custom/branch_summary；navigate_tree 摘要被放弃分支（old leaf→common ancestor）并挂到新分支 |
+| SessionRepository create/open/list/delete | ✅ | `SessionRepository::new/create/open/list/delete`（`session/repository.rs`）；list 按 created_at 倒序、坏文件跳过，`SessionSummary` 只含 path/id/name/created_at/entry_count——非 UI 核心 `SessionInfo` 全字段（modified/first message/message text）与 deferred-first-assistant 持久化见 S2 |
+| SessionRepository fork | 🟡 | `fork()` 跨项目复制全 entries 并写 `parentSession`，但写源 session id 而非源文件路径、timestamp 复用源值；TS 语义：新 id + 新 timestamp + 目标 cwd + `parentSession` 为源文件路径；path fork（`ForkPosition::BeforeUser`/`AtEntry`、branch labels 重链）未实现——见 S2 |
+| SessionRepository search | 🚫 删除 | `search()` 为 Rust-only 扩展，TS 核心无此 API；仓内无真实调用方，公开入口在 S2 删除 |
+| Session move_to/label/name/stats/pagination/custom | ✅ | `Session::move_to/append_label/set_session_name/stats/page/custom`（`session/mod.rs`）；对应单测与 examples 覆盖 |
+| branch_summary append | 🟡 | `append_branch_summary` 类型与 entry 形状在，但摘要输入/提示词/结果为自创（`render_messages`/300 字 prompt/单一 `files_changed`），未按 TS `getMessageFromEntry`/`prepareBranchEntries` 抽取（tool result 排除、custom/branch/compaction carrier、token budget、90% 规则、read/modified file ops）、不含 usage——见 S1 |
+| navigate_tree | 🟡 | 默认 summarize=false、`summarize/custom_instructions/replace_instructions/label` 选项面、`NavigateTreeResult`、BranchSummary phase 已对齐（2026-08-01）；但 `label` 未落盘（TS 写 summary/target entry）、summary 未接 retry/cancel、`session_before_tree`/`session_tree` hook 未接线——见 S1 |
 
 ## 6. Providers（`provider/` ↔ packages/ai）
 
@@ -78,10 +84,24 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | 7 内建工具 | ✅ | read/write/edit/bash/grep/find/ls + truncate/path_utils/file_mutation_queue 基础设施 |
-| Settings 合并 | ✅ | 只合并显式字段（field-wise CompactionOverrides，对齐 TS deepMergeSettings 递归语义） |
-| cache_stats | 🟡 | token 维度 miss 检测已对齐；金额/idle 未接线，见「已知余项」 |
+| Settings 合并 | 🟡 | `settings.rs` 只做结构合并（field-wise CompactionOverrides，对齐 TS deepMergeSettings 递归语义）；文件加载/保存/reload/递归覆盖由接线方负责——见 S5 |
+| Trust | 🟡 | `trust.rs` 内存态决策管理，无持久化、未接入资源/工具启用策略——见 S5 |
+| cache_stats | 🟡 | token 维度 miss 检测已对齐（missed_tokens + miss 计数，noise floor）；金额与 idle 未接线（`missed_cost` 恒 0、`idle_ms` 占位）——见 S5 |
+| output_guard | 🚫 默认关闭 | `output_guard.rs` 未接入任何工具输出路径（无可观察行为）；维持默认关闭，除非差分测试证明不改变 TS 模型可见行为 |
+| hashline edit | 🚫 接受并冻结 | hashline 锚定补丁 + 3-way 快照恢复（manox 增强，2026-07-29 拍板），保留但冻结不扩展 |
 
-## 8. 有意偏离（🚫，不视为对齐缺口）
+## 8. coding-agent facade（`coding_agent/` ↔ packages/coding-agent/src/core）
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| AgentSession build | 🟡 | `AgentSession::build`（`coding_agent/agent_session.rs`）默认 model 回退 env `ANTHROPIC_MODEL`、session 目录 `.pi-sessions`；settings/trust/resources/system prompt/tools 完整组装见 S6 |
+| AgentSession open | 🟡 | `open()` 不自劢 `restore()`——调用者需手动恢复；S6 改为返回前 restore 并使用 session 恢复的 model/thinking/active tools |
+| ModelRuntime from_env | 🟡 | `from_env()` 缺凭证时生成 `missing-*_API_KEY` 假值；S3 改为 typed missing-credential 错误 |
+| ResourceLoader | 🟡 | `ResourceLoader`（`coding_agent/resources.rs`）有类型与 CLAUDE.md 加载；global context/ancestor chain/skills/templates/去重/诊断未真实接线——见 S5 |
+| settings/trust/cache | 🟡 | 有类型无持久化/无接线（trust 内存态、settings 由接线方加载、cache 金额与 idle 恒零）——见 S5 |
+| fork / events / shutdown | 🔲 | `AgentSession` 无 `fork(entry_id, ForkPosition)`、无统一事件订阅面、无 shutdown——见 S6/S4 |
+
+## 9. 有意偏离（🚫，不视为对齐缺口）
 
 - **Edit 工具**：hashline 锚定补丁 + 3-way 快照恢复，替代 TS 的 string-replace（manox 增强，2026-07-29 拍板）
 - **grep/find 进程内化**（ignore + regex + globset），TS shell 出系统 grep/find
@@ -91,21 +111,24 @@
 
 ## 已知余项（对齐缺口，按严重度排序）
 
-1. **cache_stats 金额与 idle**：missed_cost 恒 0、idle_ms 占位，需接线 ModelPriceSource 与消息时间戳
-2. **summarization retry/cancel**：summarization 与 branch summary 调用无 retry 策略与取消通道
-3. **Hook 推迟项**：见 §8——model_update/tools_update 的 fire 点已具备，可补变体接线
-4. **Session store/reader/repository 深度（upstream 4488ad55c 之后）**：crate pi 已有 SessionRepository + Session 树操作；TS 的 readers/search-backend/repo-utils 抽象与扫描 search 仍未逐层对齐（applicable unported delta）
-5. **pi-ai breadth**：已选三协议之外的 7 个 chat API + image API 未实现（明确排除项，不阻塞 agreed scope）
+1. **cache_stats 金额与 idle**：missed_cost 恒 0、idle_ms 占位，需接线 ModelPriceSource 与消息时间戳（S5）
+2. **summarization retry/cancel**：summarization 与 branch summary 调用无 retry 策略与取消通道（S1）
+3. **branch summarization 输入/提示词/结果**：摘要输入为自创（未按 TS `getMessageFromEntry`/`prepareBranchEntries`），提示词与结果格式非 TS structured branch prompt；`label` 未落盘（S1）
+4. **Session store/reader/repository 深度（upstream 4488ad55c 之后）**：crate pi 已有 SessionRepository + Session 树操作；TS 的 readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 标删除（S2）
+5. **coding-agent facade 纵向**：open 不自劢 restore、缺凭证假 key、无 fork/事件/shutdown（S6/S4）
+6. **pi-ai breadth**：已选三协议之外的 7 个 chat API + image API 未实现（明确排除项，不阻塞 agreed scope）
 
 ## 工程化余项（非行为对齐）
 
 - 与 TS Pi 的差分测试（相同输入 → 相同输出）
-- `schemars` 从 Rust struct 派生工具 JSON Schema（替代手写 serde_json::json!）
+- tool schema 对齐与 `schemars` 已从待办/验收项删除（S0 拍板：以手写 serde_json::json! 为准）
 
 ## 审查历史
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| S0（收口校准，2026-08-01） | `b9b6869` + dirty（10 改 2 增，未提交） | `4488ad55c`（未变） | 修 fixture 尾随空格（`git diff --check` 通过）；repository/navigation、coding-agent facade、settings/trust/cache 逐条状态化（🟡/🚫 不再用模块级 ✅ 掩盖）；`search` 标删除、`output_guard` 标默认关闭、hashline 标接受并冻结；schemars 从待办删除；**S0 完成后冻结共享基线，其余 agent 在此基线上开始** |
+| 第十轮（2026-08-01） | `b9b6869` | `4488ad55c`（未变） | navigate_tree 默认 summarize=false + 选项面（custom/replace/label）+ BranchSummary phase；next_turn 运行中排队（HarnessHandle）；flush 失败 restore 重放队列（恢复后由被排队 model 服务）；substitute_args 单趟全语法（defaults/$0/不递归）；fixture 刷新链路可用（bun 捕获真实 TS 源码）；PLAN/parity 校准 |
 | 第九轮（Phase 4A，2026-08-01） | `d100401` | `4488ad55c`（未变） | 运行配置闭环：Model 全字段判等、restore 三态同步、resolver 失败 terminal 化、无 resolver 跨 API 报错、harness_chat api 修正；新增 6 个回归 + `runtime_switch` example |
 | Phase 4B（2026-08-01） | `faa9690` | `4488ad55c` | EventSink Result 化、PrepareTurnFn async+TurnUpdate、Agent middleware、message_end 逐条持久化（Arc Session）、删除 turn 末批量写；`session_resume` example |
 | Phase 3A（2026-08-01） | `4b7605d` | `4488ad55c` | split-turn 双摘要（history+turn prefix）、pre-prompt aborted compaction；`split_turn_compact` example |

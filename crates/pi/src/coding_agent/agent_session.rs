@@ -53,9 +53,16 @@ impl AgentSession {
         self.harness.set_model(model).await
     }
 
-    /// Move the session cursor to an earlier entry and summarize the branch.
-    pub async fn navigate(&mut self, target_id: &str) -> Result<(), anyhow::Error> {
-        self.harness.navigate_tree(target_id).await
+    /// Move the session cursor to an earlier entry, optionally summarizing
+    /// the abandoned branch (TS `navigateTree`).
+    pub async fn navigate(
+        &mut self,
+        target_id: &str,
+        options: crate::harness::NavigateTreeOptions,
+    ) -> Result<crate::harness::NavigateTreeResult, anyhow::Error> {
+        self.harness
+            .navigate_tree_with_options(target_id, options)
+            .await
     }
 
     /// Coarse session statistics.
