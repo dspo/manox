@@ -241,7 +241,7 @@ pub trait AgentTool: Send + Sync {
 ### Phase 8：coding-agent facade 🟡（类型骨架，纵向闭环见 S6）
 
 - `coding_agent` 模块：AgentSession/Builder、ModelRuntime（env credential，缺凭证生成 `missing-*_API_KEY` 假值——S3 改 typed missing-credential 错误）、ResourceLoader（CLAUDE.md/skills/templates 有类型未全接线）、`create_agent_session`
-- `open()` 不自动 restore（调用者需手动恢复，S6 改为返回前 restore）；无 `fork`/事件订阅面/shutdown（S6/S4）
+- `open()` 不自动 restore（调用者需手动恢复，S6 改为返回前 restore）；无 `fork`/事件订阅面/shutdown（S6/S4）；`from_env` 缺凭证已返回 typed `MissingCredential`（S3，2026-08-01）
 - example `coding_agent_smoke`：资源加载→工具轮→model 切换→compact→close/reopen→continue
 
 ### 待完成
@@ -253,7 +253,7 @@ TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该
 - [x] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写，删除自创 `render_messages`/300 字 prompt（S1，2026-08-01）；navigate label/abort/hook 同步对齐
 - [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §9「有意偏离」）
 - [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐（S2 已补 SessionInfo/forkFrom/createBranchedSession/deferred 物化）
-- [ ] coding-agent facade 纵向：open 自动 restore、缺凭证 typed 错误、fork/事件/shutdown（S6/S4）
+- [ ] coding-agent facade 纵向：open 自动 restore、fork/事件/shutdown（S6/S4）；缺凭证 typed 错误已闭环（S3，2026-08-01）
 - [ ] pi-ai breadth：三协议之外的 chat API 与 image API（明确排除项）
 
 Rust-only 处置（S0 拍板）：

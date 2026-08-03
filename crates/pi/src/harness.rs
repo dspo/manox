@@ -97,6 +97,8 @@ struct TurnRuntime {
     model: Model,
     thinking_level: Option<String>,
     active_tool_names: Option<Vec<String>>,
+    /// Per-request provider options applied to every provider call.
+    stream_options: crate::types::StreamOptions,
 }
 
 /// Shared harness control state exposed as [`AgentHarness::handle`], so a
@@ -249,6 +251,14 @@ impl HarnessHandle {
             .push(PendingMutation::ActiveTools(active_tool_names));
     }
 
+    /// Queue per-request provider options for the next turn boundary of the
+    /// in-flight run. Unlike the durable mutations, stream options are
+    /// ephemeral: the snapshot updates immediately and the next
+    /// `apply_turn_runtime` forwards them into every provider request.
+    pub fn set_stream_options(&self, options: crate::types::StreamOptions) {
+        self.control.turn_runtime.lock().unwrap().stream_options = options;
+    }
+
     /// Queue a user message for the next prompt batch — the TS mid-run
     /// `nextTurn`. Unlike [`AgentHarness::next_turn`], this works while a
     /// run is in flight: the message lands in the shared queue and the next
@@ -290,6 +300,10 @@ pub enum HookPoint {
     SessionBeforeTree,
     /// After the session tree cursor moved.
     SessionTree,
+    /// The provider request payload is about to be sent (fires per attempt).
+    BeforeProviderPayload,
+    /// The provider responded with a status (fires per attempt).
+    AfterProviderResponse,
 }
 
 /// A hook handler receives context about the event and can mutate it.
@@ -651,6 +665,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 model: model.clone(),
                 thinking_level: None,
                 active_tool_names: None,
+                stream_options: crate::types::StreamOptions::default(),
             }),
             pending_mutations: std::sync::Mutex::new(Vec::new()),
             next_turn_queue: std::sync::Mutex::new(Vec::new()),
@@ -858,6 +873,38 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.run_handle()
     }
 
+    /// Build a provider request observer that maps the per-attempt payload
+    /// and status onto the [`HookPoint::BeforeProviderPayload`] /
+    /// [`HookPoint::AfterProviderResponse`] hooks. Attach it to a provider
+    /// stream builder (`with_request_observer`) so the harness's registered
+    /// handlers see the wire traffic of every attempt.
+    pub fn request_observer(&self) -> Arc<dyn crate::provider::RequestObserver> {
+        struct Observer(Arc<Mutex<Vec<(HookPoint, HookHandler)>>>);
+        impl crate::provider::RequestObserver for Observer {
+            fn before_payload(&self, attempt: u32, payload: &serde_json::Value) {
+                let ctx = HookContext::new(HookPoint::BeforeProviderPayload)
+                    .with_data(serde_json::json!({ "attempt": attempt, "payload": payload }));
+                let list = self.0.lock().unwrap();
+                for (point, handler) in list.iter() {
+                    if *point == HookPoint::BeforeProviderPayload {
+                        let _ = handler(ctx.clone());
+                    }
+                }
+            }
+            fn after_response(&self, attempt: u32, status: u16) {
+                let ctx = HookContext::new(HookPoint::AfterProviderResponse)
+                    .with_data(serde_json::json!({ "attempt": attempt, "status": status }));
+                let list = self.0.lock().unwrap();
+                for (point, handler) in list.iter() {
+                    if *point == HookPoint::AfterProviderResponse {
+                        let _ = handler(ctx.clone());
+                    }
+                }
+            }
+        }
+        Arc::new(Observer(Arc::clone(&self.hooks)))
+    }
+
     /// Decoupled harness-level handle: queues, the agent run, the retry
     /// backoff, and the full settle signal. Unlike [`AgentHarness::run_handle`],
     /// its `abort` cancels the retry backoff and its `wait_for_idle` resolves
@@ -887,6 +934,25 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Update the auto-retry policy.
     pub fn set_retry_settings(&mut self, settings: RetrySettings) {
         self.retry_settings = settings;
+    }
+
+    /// Set the per-request provider options (headers, timeout, output
+    /// budget) applied to every provider call from the next turn onward.
+    /// Ephemeral runtime config: never persisted to the session, so a
+    /// reopen restores the construction-time defaults.
+    pub fn set_stream_options(&mut self, options: crate::types::StreamOptions) {
+        self.control.turn_runtime.lock().unwrap().stream_options = options.clone();
+        self.agent.set_stream_options(options);
+    }
+
+    /// The per-request provider options the next turn applies.
+    pub fn stream_options(&self) -> crate::types::StreamOptions {
+        self.control
+            .turn_runtime
+            .lock()
+            .unwrap()
+            .stream_options
+            .clone()
     }
 
     /// Attempts used by the current auto-retry lifecycle.
@@ -1004,6 +1070,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         {
             self.active_tool_names = Some(names);
             self.apply_active_tools();
+        }
+        if snapshot.stream_options != *self.agent.stream_options() {
+            self.agent
+                .set_stream_options(snapshot.stream_options.clone());
         }
     }
 
@@ -2209,6 +2279,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             cache_retention: CacheRetention::None,
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
         let signal = CancellationToken::new();
         let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
@@ -4266,6 +4337,142 @@ mod tests {
             )),
             "the queued model change was persisted: {entries:?}"
         );
+    }
+
+    /// Per-request stream options flow from the harness turn snapshot into
+    /// every provider request: idle setters apply immediately, mid-run handle
+    /// setters from the next turn boundary.
+    #[tokio::test]
+    async fn test_stream_options_flow_from_turn_snapshot_to_requests() {
+        struct OptionsStream(Arc<std::sync::Mutex<Vec<crate::types::StreamOptions>>>);
+        #[async_trait::async_trait]
+        impl StreamFn for OptionsStream {
+            async fn stream(
+                &self,
+                context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                self.0.lock().unwrap().push(context.stream_options.clone());
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let seen: Arc<std::sync::Mutex<Vec<crate::types::StreamOptions>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_in_stream = Arc::clone(&seen);
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(OptionsStream(seen_in_stream)),
+        );
+
+        harness.set_stream_options(crate::types::StreamOptions {
+            headers: vec![("x-gateway".into(), "a".into())],
+            ..Default::default()
+        });
+
+        // Mid-run: a TurnEnd listener queues new options; the next turn's
+        // requests carry them.
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    handle.set_stream_options(crate::types::StreamOptions {
+                        timeout: Some(std::time::Duration::from_secs(9)),
+                        ..Default::default()
+                    });
+                }
+            })
+        }));
+
+        let _ = harness.prompt("first").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap()[0].headers,
+            vec![("x-gateway".to_string(), "a".to_string())]
+        );
+        // The first turn's TurnEnd queued the new options on the snapshot.
+        assert_eq!(
+            harness.stream_options().timeout,
+            Some(std::time::Duration::from_secs(9)),
+            "mid-run setter updated the shared snapshot"
+        );
+
+        let _ = harness.prompt("second").await.unwrap();
+        let all = seen.lock().unwrap().clone();
+        assert_eq!(
+            all.last().unwrap().timeout,
+            Some(std::time::Duration::from_secs(9)),
+            "mid-run options apply to the next turn's requests"
+        );
+        assert_eq!(all.last().unwrap().headers, Vec::<(String, String)>::new());
+    }
+
+    /// The provider request observer maps per-attempt payloads and statuses
+    /// onto the before-payload / after-response hook points.
+    #[tokio::test]
+    async fn test_request_observer_fires_payload_and_response_hooks() {
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_payload = Arc::clone(&seen);
+        let seen_status: Arc<std::sync::Mutex<Vec<u16>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_status_slot = Arc::clone(&seen_status);
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.on(
+            HookPoint::BeforeProviderPayload,
+            Arc::new(move |ctx: HookContext| {
+                if let Some(attempt) = ctx.data.get("attempt").and_then(|v| v.as_u64()) {
+                    seen_payload
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::json!({ "attempt": attempt, "payload": ctx.data.get("payload").cloned() }));
+                }
+                ctx
+            }),
+        );
+        harness.on(
+            HookPoint::AfterProviderResponse,
+            Arc::new(move |ctx: HookContext| {
+                if let Some(status) = ctx.data.get("status").and_then(|v| v.as_u64()) {
+                    seen_status_slot.lock().unwrap().push(status as u16);
+                }
+                ctx
+            }),
+        );
+
+        let observer = harness.request_observer();
+        observer.before_payload(2, &serde_json::json!({ "model": "m" }));
+        observer.after_response(1, 429);
+        observer.after_response(2, 200);
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![serde_json::json!({
+                "attempt": 2,
+                "payload": serde_json::json!({ "model": "m" }),
+            })]
+        );
+        assert_eq!(seen_status.lock().unwrap().clone(), vec![429, 200]);
     }
 
     /// A per-model stream resolver switches the provider runtime at the next

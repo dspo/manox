@@ -200,7 +200,10 @@ impl AgentSessionBuilder {
             self.tools
         };
 
-        let runtime = self.model_runtime.unwrap_or_else(ModelRuntime::from_env);
+        let runtime = match self.model_runtime {
+            Some(runtime) => runtime,
+            None => ModelRuntime::from_env()?,
+        };
         let stream_fn = runtime.resolver()(&model)?;
         let mut harness = AgentHarness::new(
             session,
@@ -257,7 +260,10 @@ impl AgentSessionBuilder {
             self.tools
         };
 
-        let runtime = self.model_runtime.unwrap_or_else(ModelRuntime::from_env);
+        let runtime = match self.model_runtime {
+            Some(runtime) => runtime,
+            None => ModelRuntime::from_env()?,
+        };
         let stream_fn = runtime.resolver()(&model)?;
         let mut harness = AgentHarness::new(
             session,

@@ -218,6 +218,9 @@ pub struct Agent {
     session_id: Option<String>,
     /// Prompt cache retention preference forwarded to providers.
     cache_retention: CacheRetention,
+    /// Per-request provider options from the harness turn snapshot,
+    /// forwarded into each turn's context.
+    stream_options: crate::types::StreamOptions,
     /// Observation hooks forwarded into each turn's loop config. The harness
     /// fills these so its registered `HookPoint`s fire inside the loop.
     loop_hooks: LoopHooks,
@@ -248,6 +251,7 @@ impl Agent {
             tool_ctx,
             session_id: None,
             cache_retention: CacheRetention::default(),
+            stream_options: crate::types::StreamOptions::default(),
             loop_hooks: LoopHooks::default(),
         }
     }
@@ -278,6 +282,17 @@ impl Agent {
     /// Set the prompt cache retention preference forwarded to providers.
     pub fn set_cache_retention(&mut self, retention: CacheRetention) {
         self.cache_retention = retention;
+    }
+
+    /// Set the per-request provider options forwarded into every turn's
+    /// context.
+    pub fn set_stream_options(&mut self, options: crate::types::StreamOptions) {
+        self.stream_options = options;
+    }
+
+    /// The per-request provider options.
+    pub fn stream_options(&self) -> &crate::types::StreamOptions {
+        &self.stream_options
     }
 
     /// Set the per-run observation hooks forwarded into the loop config.
@@ -500,6 +515,7 @@ impl Agent {
             thinking_level: self.state.thinking_level.clone(),
             cache_retention: self.cache_retention,
             session_id: self.session_id.clone(),
+            stream_options: self.stream_options.clone(),
             metadata: Default::default(),
         }
     }

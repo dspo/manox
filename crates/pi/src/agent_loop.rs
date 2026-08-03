@@ -824,6 +824,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
 
         let result = run_loop(
@@ -872,6 +873,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
         let cloned = ctx.clone();
         assert_eq!(cloned.tools.len(), 1, "clone must preserve mounted tools");
@@ -994,6 +996,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
 
         // First response: a tool call.
@@ -1098,6 +1101,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
 
         // Assistant message with stop_reason == Length and a tool call.
@@ -1192,6 +1196,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
 
         // Cancel before any stream — the loop should exit immediately.
@@ -1269,6 +1274,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         };
 
         let stream_fn = Arc::new(MockStreamFn);
@@ -1330,6 +1336,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         }
     }
 

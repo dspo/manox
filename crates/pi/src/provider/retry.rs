@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::provider::{ProviderError, overflow};
+use crate::provider::{ProviderError, RequestObserver, overflow};
 use crate::types::AgentEvent;
 
 /// Total request budget per stream call, including the original attempt.
@@ -178,8 +178,15 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 /// [`ProviderError::Overflow`], other statuses as [`ProviderError::Http`],
 /// transport failures as [`ProviderError::Transport`]. Cancellation at any
 /// point returns [`ProviderError::Aborted`].
+/// Send the streaming POST with exponential-backoff retry, firing the
+/// request observer around every attempt: `before_payload` once the payload
+/// is known (before the HTTP send) and `after_response` with the status of
+/// each response, success and retryable alike — the TS before-payload /
+/// after-response hooks.
 pub async fn send_with_retry<F>(
     build: F,
+    observer: Option<&dyn RequestObserver>,
+    payload: Option<&serde_json::Value>,
     signal: &CancellationToken,
     event_tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<reqwest::Response, anyhow::Error>
@@ -189,10 +196,16 @@ where
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
+        if let (Some(observer), Some(payload)) = (observer, payload) {
+            observer.before_payload(attempt, payload);
+        }
         let result = tokio::select! {
             _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
             res = build().send() => res,
         };
+        if let (Some(observer), Ok(resp)) = (observer, &result) {
+            observer.after_response(attempt, resp.status().as_u16());
+        }
         match result {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
@@ -463,6 +476,8 @@ mod tests {
         let handle = tokio::spawn(async move {
             send_with_retry(
                 || client.post("http://127.0.0.1:1/").body("x".to_string()),
+                None,
+                None,
                 &signal,
                 &tx,
             )
@@ -508,6 +523,8 @@ mod tests {
         let url = format!("http://{addr}/");
         let err = send_with_retry(
             || client.post(&url).body("x".to_string()),
+            None,
+            None,
             &CancellationToken::new(),
             &tx,
         )

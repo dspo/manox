@@ -8,6 +8,7 @@ pub mod translate;
 pub mod wire;
 
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +32,7 @@ pub struct AnthropicStreamFn {
     api_key: String,
     base_url: String,
     options: StreamOptions,
+    request_observer: Option<Arc<dyn crate::provider::RequestObserver>>,
 }
 
 impl AnthropicStreamFn {
@@ -40,6 +42,7 @@ impl AnthropicStreamFn {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             options: StreamOptions::default(),
+            request_observer: None,
         }
     }
 
@@ -50,6 +53,15 @@ impl AnthropicStreamFn {
 
     pub fn with_options(mut self, options: StreamOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Attach a request observer that fires around every HTTP attempt.
+    pub fn with_request_observer(
+        mut self,
+        observer: Arc<dyn crate::provider::RequestObserver>,
+    ) -> Self {
+        self.request_observer = Some(observer);
         self
     }
 
@@ -72,13 +84,15 @@ impl StreamFn for AnthropicStreamFn {
         signal: CancellationToken,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error> {
-        let body = to_request(context, &self.options);
+        // Per-request options from the harness turn snapshot overlay the
+        // builder's own; request-set fields win.
+        let options = self.options.overlay(&context.stream_options);
+        let body = to_request(context, &options);
         let url = format!("{}/v1/messages", self.base_url);
 
         // Extra headers are merged into every request; invalid names or
         // values are a configuration bug and surface at the first call.
-        let extra_headers: reqwest::header::HeaderMap = self
-            .options
+        let extra_headers: reqwest::header::HeaderMap = options
             .headers
             .iter()
             .filter_map(|(k, v)| {
@@ -87,6 +101,8 @@ impl StreamFn for AnthropicStreamFn {
                 Some((name, value))
             })
             .collect();
+        let payload = serde_json::to_value(&body)
+            .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let response = retry::send_with_retry(
             || {
                 let mut builder = self
@@ -97,11 +113,13 @@ impl StreamFn for AnthropicStreamFn {
                     .header("content-type", "application/json")
                     .headers(extra_headers.clone())
                     .json(&body);
-                if let Some(timeout) = self.options.timeout {
+                if let Some(timeout) = options.timeout {
                     builder = builder.timeout(timeout);
                 }
                 builder
             },
+            self.request_observer.as_deref(),
+            Some(&payload),
             &signal,
             &event_tx,
         )
@@ -525,6 +543,7 @@ mod tests {
             cache_retention: Default::default(),
             session_id: None,
             metadata: Default::default(),
+            stream_options: Default::default(),
         }
     }
 
@@ -966,6 +985,7 @@ mod tests {
             api_key: "test-key".into(),
             base_url: format!("http://{addr}"),
             options: StreamOptions::default(),
+            request_observer: None,
         }
     }
 

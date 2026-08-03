@@ -439,6 +439,7 @@ async fn capture_single_turn_events() -> Vec<pi::AgentEvent> {
         cache_retention: Default::default(),
         session_id: None,
         metadata: Default::default(),
+        stream_options: Default::default(),
     };
     run_loop(
         &[pi::AgentMessage::user("hi")],

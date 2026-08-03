@@ -113,6 +113,7 @@ async fn main() {
         cache_retention: Default::default(),
         session_id: None,
         metadata: Default::default(),
+        stream_options: Default::default(),
     };
 
     println!(

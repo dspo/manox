@@ -15,6 +15,21 @@ pub mod retry;
 pub mod sse;
 pub mod transform;
 
+/// Observes each HTTP request attempt of a provider stream — the TS
+/// before-payload / after-response hooks. A consumer attaches one via the
+/// provider builder (`with_request_observer`) to surface payload and status
+/// outside the provider; the harness maps it onto its
+/// `BeforeProviderPayload` / `AfterProviderResponse` hook points.
+pub trait RequestObserver: Send + Sync {
+    /// The final request payload (built once, byte-identical across retries)
+    /// about to be sent. `attempt` is 1-indexed.
+    fn before_payload(&self, attempt: u32, payload: &serde_json::Value);
+
+    /// The HTTP status of an attempt's response — success and retryable
+    /// statuses both fire.
+    fn after_response(&self, attempt: u32, status: u16);
+}
+
 use thiserror::Error;
 
 /// Errors a provider can surface while streaming.

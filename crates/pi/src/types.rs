@@ -558,6 +558,10 @@ pub struct AgentContext {
     /// Session identifier forwarded to providers that support session-based
     /// caching (`prompt_cache_key`). Ignored by providers that don't.
     pub session_id: Option<String>,
+    /// Per-request provider options taken from the harness turn snapshot —
+    /// headers, timeout, and output budget. They overlay the stream
+    /// builder's own options for this request only.
+    pub stream_options: StreamOptions,
     /// Additional context metadata.
     pub metadata: HashMap<String, JsonValue>,
 }
@@ -572,6 +576,7 @@ impl std::fmt::Debug for AgentContext {
             .field("thinking_level", &self.thinking_level)
             .field("cache_retention", &self.cache_retention)
             .field("session_id", &self.session_id)
+            .field("stream_options", &self.stream_options)
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -681,7 +686,7 @@ impl AgentState {
 ///
 /// Cache preferences are NOT carried here: they are per-conversation state
 /// owned by [`AgentContext::cache_retention`] / [`AgentContext::session_id`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamOptions {
     /// Maximum output tokens.
     pub max_tokens: Option<usize>,
@@ -691,6 +696,23 @@ pub struct StreamOptions {
     pub headers: Vec<(String, String)>,
     /// Per-request timeout; `None` uses the client's default.
     pub timeout: Option<std::time::Duration>,
+}
+
+impl StreamOptions {
+    /// Overlay per-request options on top of the stream builder's: a field
+    /// set on the request wins, unset fields fall back to the builder's, and
+    /// request headers append after (and therefore override same-name)
+    /// builder headers.
+    pub fn overlay(&self, request: &StreamOptions) -> StreamOptions {
+        let mut headers = self.headers.clone();
+        headers.extend(request.headers.iter().cloned());
+        StreamOptions {
+            max_tokens: request.max_tokens.or(self.max_tokens),
+            temperature: request.temperature.or(self.temperature),
+            headers,
+            timeout: request.timeout.or(self.timeout),
+        }
+    }
 }
 
 // ── Re-export from tool module ──────────────────────────────────────────────

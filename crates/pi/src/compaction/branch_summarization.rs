@@ -216,6 +216,7 @@ pub async fn summarize_branch(
         cache_retention: crate::types::CacheRetention::None,
         session_id: None,
         metadata: Default::default(),
+        stream_options: Default::default(),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);

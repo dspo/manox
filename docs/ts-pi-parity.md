@@ -78,6 +78,8 @@
 | 溢出分类 | ✅ | 20 种跨厂商子串 + 限流排除 + 413；terminal/mid_stream 两构造点统一 ProviderError::Overflow |
 | Prompt caching | ✅ | 按 TS Pi 对齐：CacheRetention 三态挂 AgentContext；Anthropic 三断点、Completions prompt_cache_key 门控、Responses 无 URL 门控 |
 | 悬空 tool call 修复 | ✅ | 请求线边界共享 repair_tool_flow（对齐 TS transformMessages 第二趟）+ error/aborted 剥离 |
+| 请求级 options | ✅（S3，2026-08-01） | `StreamOptions`（headers/timeout/max_tokens）从 harness turn snapshot 流入每次请求（`AgentContext.stream_options` overlay 于 builder options；idle setter + `HarnessHandle::set_stream_options` 运行中生效） |
+| 请求 hooks | ✅（S3，2026-08-01） | `RequestObserver`（before_payload / after_response）在每次 attempt 触发（含重试）；provider builder 挂接，harness `request_observer()` 映射到 `BeforeProviderPayload`/`AfterProviderResponse` hook 点 |
 
 ## 7. 工具与设置
 
@@ -96,7 +98,7 @@
 |---|---|---|
 | AgentSession build | 🟡 | `AgentSession::build`（`coding_agent/agent_session.rs`）默认 model 回退 env `ANTHROPIC_MODEL`、session 目录 `.pi-sessions`；settings/trust/resources/system prompt/tools 完整组装见 S6 |
 | AgentSession open | 🟡 | `open()` 不自劢 `restore()`——调用者需手动恢复；S6 改为返回前 restore 并使用 session 恢复的 model/thinking/active tools |
-| ModelRuntime from_env | 🟡 | `from_env()` 缺凭证时生成 `missing-*_API_KEY` 假值；S3 改为 typed missing-credential 错误 |
+| ModelRuntime from_env | ✅（S3，2026-08-01） | `from_env()` 缺凭证返回 typed `MissingCredential`（命名缺失 env var），不再生成 `missing-*_API_KEY` 假值；自定义 registry 不受 env 限制 |
 | ResourceLoader | 🟡 | `ResourceLoader`（`coding_agent/resources.rs`）有类型与 CLAUDE.md 加载；global context/ancestor chain/skills/templates/去重/诊断未真实接线——见 S5 |
 | settings/trust/cache | 🟡 | 有类型无持久化/无接线（trust 内存态、settings 由接线方加载、cache 金额与 idle 恒零）——见 S5 |
 | fork / events / shutdown | 🔲 | `AgentSession` 无 `fork(entry_id, ForkPosition)`、无统一事件订阅面、无 shutdown——见 S6/S4 |
