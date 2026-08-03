@@ -205,6 +205,46 @@ impl SessionTreeEntry {
         }
     }
 
+    /// Rewrite the entry's parent for path forks that strip label entries —
+    /// the re-chained ancestry keeps the retained path linear.
+    pub(crate) fn set_parent_id(&mut self, parent_id: Option<String>) {
+        match self {
+            SessionTreeEntry::Message {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::Compaction {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::ModelChange {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::ThinkingLevelChange {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::ActiveToolsChange {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::BranchSummary {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::CustomMessage {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::Custom {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::Label {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::SessionInfo {
+                parent_id: slot, ..
+            }
+            | SessionTreeEntry::Leaf {
+                parent_id: slot, ..
+            } => *slot = parent_id,
+        }
+    }
+
     /// The leaf cursor after appending this entry: a `leaf` entry redirects to
     /// its `targetId`; every other entry's cursor is its own id.
     pub(crate) fn leaf_cursor_after(&self) -> Option<String> {

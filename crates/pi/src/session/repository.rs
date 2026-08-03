@@ -1,27 +1,35 @@
 // Session repository: directory-scoped create / open / list / delete / fork /
-// search over JSONL session files — the TS `SessionRepository` surface for a
-// per-cwd session folder.
+// branch over JSONL session files — the TS `SessionRepository` surface for a
+// per-cwd session folder. New and branched sessions defer their file to the
+// first assistant message (TS `_persist`), so an empty session never appears
+// in `list`; `fork_from` materializes immediately with the source as parent.
 
 use std::path::{Path, PathBuf};
 
 use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use crate::session::{Session, SessionStorage, SessionTreeEntry};
+use crate::types::AgentMessage;
 
-/// A summary of a session found by [`SessionRepository::list`].
+/// A session summary as `list` reports it — the TS non-UI core `SessionInfo`.
 #[derive(Debug, Clone)]
-pub struct SessionSummary {
+pub struct SessionInfo {
     pub path: PathBuf,
     pub id: String,
+    /// Working directory where the session was started.
+    pub cwd: String,
+    /// The latest `session_info` display name, when one was set.
     pub name: Option<String>,
+    /// Path of the session this one forked from, when it has one.
+    pub parent_session_path: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub entry_count: usize,
-}
-
-/// A search hit: the session file and the entry that matched.
-#[derive(Debug, Clone)]
-pub struct SearchHit {
-    pub path: PathBuf,
-    pub entry_id: String,
+    /// Last message activity; falls back to the header timestamp.
+    pub modified_at: chrono::DateTime<chrono::Utc>,
+    /// Number of `message` entries (user, assistant, and tool results).
+    pub message_count: usize,
+    /// Text of the first user message, or `"(no messages)"`.
+    pub first_message: String,
+    /// All user and assistant text contents joined by spaces.
+    pub all_messages_text: String,
 }
 
 /// A repository over the JSONL session files in one directory.
@@ -38,13 +46,15 @@ impl SessionRepository {
         &self.dir
     }
 
-    /// Create a new session file in the repository directory.
+    /// Create a new session in the repository directory. The file is deferred
+    /// until the first assistant message, so an empty session is invisible to
+    /// [`Self::list`] and never touches disk — TS `newSession` + `_persist`.
     pub async fn create(
         &self,
         metadata: JsonlSessionMetadata,
     ) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
         let path = self.dir.join(session_file_name(&metadata.id));
-        let storage = JsonlSessionStorage::create(&path, metadata).await?;
+        let storage = JsonlSessionStorage::create_deferred(&path, metadata).await?;
         Ok(Session::new(storage))
     }
 
@@ -54,28 +64,17 @@ impl SessionRepository {
         Ok(Session::new(storage))
     }
 
-    /// List every session file in the repository directory.
-    pub async fn list(&self) -> Result<Vec<SessionSummary>, anyhow::Error> {
+    /// List every session file in the repository directory, newest activity
+    /// first. A corrupt file surfaces as missing — callers that need it can
+    /// `open` and see the error.
+    pub async fn list(&self) -> Result<Vec<SessionInfo>, anyhow::Error> {
         let mut out = Vec::new();
         for path in session_files(&self.dir).await? {
-            // A corrupt file surfaces in `list` as missing; callers that need
-            // it can `open` and see the error.
-            if let Ok(storage) = JsonlSessionStorage::open(&path).await {
-                let entries = storage.get_entries().await.unwrap_or_default();
-                let name = entries.iter().rev().find_map(|e| match e {
-                    SessionTreeEntry::SessionInfo { name, .. } => name.clone(),
-                    _ => None,
-                });
-                out.push(SessionSummary {
-                    path,
-                    id: storage.metadata.id.clone(),
-                    name,
-                    created_at: storage.metadata.created_at,
-                    entry_count: entries.len(),
-                });
+            if let Ok(info) = build_session_info(&path).await {
+                out.push(info);
             }
         }
-        out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        out.sort_by_key(|s| std::cmp::Reverse(s.modified_at));
         Ok(out)
     }
 
@@ -86,58 +85,114 @@ impl SessionRepository {
             .map_err(|e| anyhow::anyhow!("failed to delete session {}: {e}", path.display()))
     }
 
-    /// Fork a session: copy the file under a fresh id, recording the source
-    /// as `parentSession`, and open the fork.
-    pub async fn fork(&self, source: &Path) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
+    /// Fork a session from another project into this repository — the TS
+    /// `forkFrom`: a fresh id and timestamp, the target cwd, the source file
+    /// path as `parentSession`, and every non-header entry copied verbatim.
+    /// Unlike a new session the fork materializes immediately (TS writes the
+    /// header and entries eagerly).
+    pub async fn fork_from(
+        &self,
+        source: &Path,
+        target_cwd: &str,
+    ) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
         let source_storage = JsonlSessionStorage::open(source).await?;
         let new_id = uuid::Uuid::new_v4().to_string();
         let path = self.dir.join(session_file_name(&new_id));
-
-        let header = serde_json::json!({
-            "type": "session",
-            "version": 3,
-            "id": new_id,
-            "timestamp": source_storage.metadata.created_at,
-            "cwd": source_storage.metadata.cwd,
-            "parentSession": source_storage.metadata.id,
-        });
-        let mut body = serde_json::to_string(&header)?;
-        let lines = tokio::fs::read_to_string(source).await?;
-        // Drop the source header line; append every entry line verbatim.
-        body.push('\n');
-        for line in lines.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-            body.push_str(line);
-            body.push('\n');
+        let storage = JsonlSessionStorage::create(
+            &path,
+            JsonlSessionMetadata {
+                id: new_id,
+                cwd: target_cwd.to_string(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: Some(source.to_string_lossy().into_owned()),
+                metadata: None,
+            },
+        )
+        .await?;
+        for entry in source_storage.get_entries().await? {
+            storage.append_entry(&entry).await?;
         }
-        tokio::fs::write(&path, body).await?;
-        let storage = JsonlSessionStorage::open(&path).await?;
         Ok(Session::new(storage))
     }
 
-    /// Case-insensitive text search over every session's serialized entries.
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, anyhow::Error> {
-        let needle = query.to_lowercase();
-        let mut hits = Vec::new();
-        for path in session_files(&self.dir).await? {
-            let Ok(storage) = JsonlSessionStorage::open(&path).await else {
-                continue;
-            };
-            let Ok(entries) = storage.get_entries().await else {
-                continue;
-            };
-            for entry in entries {
-                let haystack = serde_json::to_string(&entry)
-                    .unwrap_or_default()
-                    .to_lowercase();
-                if haystack.contains(&needle) {
-                    hits.push(SearchHit {
-                        path: path.clone(),
-                        entry_id: entry.id().to_string(),
-                    });
-                }
-            }
+    /// Fork a single root→leaf path into a new session — the TS
+    /// `createBranchedSession`. Label entries are stripped and the retained
+    /// path re-chained (a label is a real tree node whose removal would orphan
+    /// its subtree), then label entries are rebuilt for the retained targets,
+    /// chained after the tail. The new session defers its file like any new
+    /// session: it materializes on the first assistant message.
+    pub async fn create_branched_session(
+        &self,
+        source: &Path,
+        leaf_id: &str,
+    ) -> Result<Session<JsonlSessionStorage>, anyhow::Error> {
+        let source_storage = JsonlSessionStorage::open(source).await?;
+        let branch = source_storage.get_path(Some(leaf_id)).await?;
+        if branch.is_empty() {
+            anyhow::bail!("entry {leaf_id} not found");
         }
-        Ok(hits)
+
+        // Strip labels, re-chaining parents so the retained path stays linear.
+        let mut retained: Vec<SessionTreeEntry> = Vec::new();
+        let mut parent: Option<String> = None;
+        for mut entry in branch {
+            if matches!(entry, SessionTreeEntry::Label { .. }) {
+                continue;
+            }
+            entry.set_parent_id(parent.take());
+            parent = Some(entry.id().to_string());
+            retained.push(entry);
+        }
+
+        // Rebuild label entries for retained targets, preserving each label's
+        // original timestamp and chaining after the retained tail.
+        let retained_ids: std::collections::HashSet<String> =
+            retained.iter().map(|e| e.id().to_string()).collect();
+        let labels: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = source_storage
+            .get_entries()
+            .await?
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Label {
+                    target_id,
+                    label: Some(label),
+                    timestamp,
+                    ..
+                } if retained_ids.contains(target_id) => {
+                    Some((target_id.clone(), label.clone(), *timestamp))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut tail_parent = retained.last().map(|e| e.id().to_string());
+        for (target_id, label, timestamp) in labels {
+            retained.push(SessionTreeEntry::Label {
+                id: uuid::Uuid::new_v4().to_string(),
+                parent_id: tail_parent,
+                timestamp,
+                target_id,
+                label: Some(label),
+            });
+            tail_parent = retained.last().map(|e| e.id().to_string());
+        }
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let path = self.dir.join(session_file_name(&new_id));
+        let storage = JsonlSessionStorage::create_deferred(
+            &path,
+            JsonlSessionMetadata {
+                id: new_id,
+                cwd: source_storage.metadata.cwd.clone(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: Some(source.to_string_lossy().into_owned()),
+                metadata: None,
+            },
+        )
+        .await?;
+        for entry in retained {
+            storage.append_entry(&entry).await?;
+        }
+        Ok(Session::new(storage))
     }
 }
 
@@ -157,10 +212,87 @@ async fn session_files(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
     Ok(out)
 }
 
+/// Build the [`SessionInfo`] for one file, mirroring the TS `buildSessionInfo`:
+/// the latest session name, message count, first user text, all text, and the
+/// last activity time (falling back to the header timestamp). A corrupt file
+/// yields `None` and is skipped by `list`.
+async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
+    let storage = JsonlSessionStorage::open(path).await?;
+    let entries = storage.get_entries().await?;
+    let mut name: Option<String> = None;
+    let mut message_count = 0usize;
+    let mut first_message = String::new();
+    let mut all_texts: Vec<String> = Vec::new();
+    let mut last_activity: Option<chrono::DateTime<chrono::Utc>> = None;
+    for entry in &entries {
+        match entry {
+            SessionTreeEntry::SessionInfo { name: n, .. } => {
+                let trimmed = n.as_deref().unwrap_or("").trim();
+                name = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            SessionTreeEntry::Message {
+                message, timestamp, ..
+            } => {
+                message_count += 1;
+                last_activity = Some(last_activity.map_or(*timestamp, |t| t.max(*timestamp)));
+                let text = message_text(message);
+                if text.is_empty() {
+                    continue;
+                }
+                if first_message.is_empty() && matches!(message, AgentMessage::User { .. }) {
+                    first_message = text.clone();
+                }
+                all_texts.push(text);
+            }
+            _ => {}
+        }
+    }
+    let modified_at = last_activity.unwrap_or(storage.metadata.created_at);
+    Ok(SessionInfo {
+        path: path.to_path_buf(),
+        id: storage.metadata.id.clone(),
+        cwd: storage.metadata.cwd.clone(),
+        name,
+        parent_session_path: storage.metadata.parent_session_path.clone(),
+        created_at: storage.metadata.created_at,
+        modified_at,
+        message_count,
+        first_message: if first_message.is_empty() {
+            "(no messages)".to_string()
+        } else {
+            first_message
+        },
+        all_messages_text: all_texts.join(" "),
+    })
+}
+
+/// All text blocks of a user or assistant message, joined by newlines; empty
+/// for other roles.
+fn message_text(message: &AgentMessage) -> String {
+    let content = match message {
+        AgentMessage::User { content, .. }
+        | AgentMessage::Assistant { content, .. }
+        | AgentMessage::ToolResult { content, .. }
+        | AgentMessage::Custom { content, .. } => content,
+    };
+    content
+        .iter()
+        .filter_map(|b| match b {
+            crate::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AgentMessage;
+    use crate::types::ContentBlock;
 
     fn meta() -> JsonlSessionMetadata {
         JsonlSessionMetadata {
@@ -172,29 +304,81 @@ mod tests {
         }
     }
 
+    fn assistant(text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(crate::types::StopReason::Stop),
+            usage: Default::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     #[tokio::test]
-    async fn test_repository_create_list_open() {
+    async fn test_repository_create_defers_file_until_first_assistant() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SessionRepository::new(dir.path());
 
         let session = repo.create(meta()).await.unwrap();
+        // An empty session (no assistant message yet) never appears in list.
         session
             .append_message(AgentMessage::user("first"))
             .await
             .unwrap();
         session.set_session_name("my session").await.unwrap();
+        assert!(repo.list().await.unwrap().is_empty(), "file deferred");
 
+        // The first assistant message materializes the file.
+        session.append_message(assistant("hello")).await.unwrap();
         let listed = repo.list().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].entry_count, 2, "message + session_info");
+        assert_eq!(listed[0].message_count, 2, "user + assistant");
         assert_eq!(listed[0].name.as_deref(), Some("my session"));
+        assert_eq!(listed[0].first_message, "first");
+        assert_eq!(listed[0].all_messages_text, "first hello");
 
+        // The materialized file reopens with the same content.
         let reopened = repo.open(&listed[0].path).await.unwrap();
-        assert_eq!(reopened.build_context_entries().await.unwrap().len(), 2);
+        assert_eq!(reopened.build_context_entries().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
-    async fn test_repository_fork_copies_entries_with_new_identity() {
+    async fn test_repository_list_sorts_by_modified_desc() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepository::new(dir.path());
+
+        let older = repo.create(meta()).await.unwrap();
+        older
+            .append_message(AgentMessage::user("older"))
+            .await
+            .unwrap();
+        older.append_message(assistant("old reply")).await.unwrap();
+
+        let newer = repo.create(meta()).await.unwrap();
+        newer
+            .append_message(AgentMessage::user("newer"))
+            .await
+            .unwrap();
+        newer.append_message(assistant("new reply")).await.unwrap();
+
+        let listed = repo.list().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].first_message, "newer");
+        assert_eq!(listed[1].first_message, "older");
+    }
+
+    #[tokio::test]
+    async fn test_repository_fork_from_uses_source_path_as_parent() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SessionRepository::new(dir.path());
 
@@ -203,54 +387,158 @@ mod tests {
             .append_message(AgentMessage::user("shared history"))
             .await
             .unwrap();
+        session
+            .append_message(assistant("shared reply"))
+            .await
+            .unwrap();
         let listed = repo.list().await.unwrap();
         let source_path = listed[0].path.clone();
         let source_id = listed[0].id.clone();
 
-        let fork = repo.fork(&source_path).await.unwrap();
-        let entries = fork.build_context_entries().await.unwrap();
-        assert_eq!(entries.len(), 1, "fork carries the message");
-        assert!(
-            fork.leaf_id().await.unwrap().is_some(),
-            "the fork's cursor follows the copied message"
+        // Cross-project fork: target cwd differs, parentSession is the source
+        // file path, and the fork carries the full history.
+        let target_cwd = "/other/project";
+        let fork = repo.fork_from(&source_path, target_cwd).await.unwrap();
+        assert_eq!(fork.storage().metadata.cwd, target_cwd);
+        assert_eq!(
+            fork.storage().metadata.parent_session_path.as_deref(),
+            Some(source_path.to_str().unwrap()),
+            "parentSession must be the source file path, not its id"
         );
+        assert_ne!(fork.storage().metadata.id, source_id);
+        assert_eq!(fork.build_context_entries().await.unwrap().len(), 2);
 
-        // The fork is a separate file with its own id; the source keeps its
-        // own entry count.
+        // The fork materialized immediately and appears in list.
         let listed = repo.list().await.unwrap();
         assert_eq!(listed.len(), 2);
         let fork_summary = listed.iter().find(|s| s.id != source_id).unwrap();
-        assert!(fork_summary.path != source_path);
-        let fork_storage = JsonlSessionStorage::open(&fork_summary.path).await.unwrap();
         assert_eq!(
-            fork_storage.metadata.parent_session_path.as_deref(),
-            Some(source_id.as_str()),
-            "fork records its parent"
+            fork_summary.parent_session_path.as_deref(),
+            Some(source_path.to_str().unwrap())
         );
     }
 
     #[tokio::test]
-    async fn test_repository_search_finds_entry_text() {
+    async fn test_repository_create_branched_session_keeps_path_and_labels() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SessionRepository::new(dir.path());
 
         let session = repo.create(meta()).await.unwrap();
         session
-            .append_message(AgentMessage::user("refactor the payment gateway"))
+            .append_message(AgentMessage::user("u1"))
+            .await
+            .unwrap();
+        session.append_message(assistant("a1")).await.unwrap();
+        session
+            .append_message(AgentMessage::user("u2"))
+            .await
+            .unwrap();
+        session.append_message(assistant("a2")).await.unwrap();
+        // A label on the first reply and a second branch exploring elsewhere.
+        let entries = session.storage().get_entries().await.unwrap();
+        let a1_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        session
+            .append_label(&a1_id, Some("checkpoint".into()))
             .await
             .unwrap();
 
-        let hits = repo.search("PAYMENT").await.unwrap();
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        let misses = repo.search("nothing-matches-this").await.unwrap();
-        assert!(misses.is_empty());
+        // Fork the path up to a1: u1 + a1, labels re-chained.
+        let fork = repo
+            .create_branched_session(&repo.list().await.unwrap()[0].path, &a1_id)
+            .await
+            .unwrap();
+        let fork_entries = fork.storage().get_entries().await.unwrap();
+        let fork_ids: Vec<&str> = fork_entries.iter().map(|e| e.id()).collect();
+        assert_eq!(fork_ids.len(), 3, "u1 + a1 + rebuilt label");
+        // The retained path is linear: a1's parent is u1, not the stripped
+        // label.
+        let fork_a1 = fork_entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Message {
+                        message: AgentMessage::Assistant { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let fork_u1 = fork_entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Message {
+                        message: AgentMessage::User { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(fork_a1.parent_id(), Some(fork_u1.id()));
+        // The rebuilt label points at the retained a1 and chains after it.
+        let fork_label = fork_entries
+            .iter()
+            .find(|e| matches!(e, SessionTreeEntry::Label { .. }))
+            .expect("label rebuilt");
+        let SessionTreeEntry::Label {
+            target_id, label, ..
+        } = fork_label
+        else {
+            unreachable!()
+        };
+        assert_eq!(target_id, fork_a1.id());
+        assert_eq!(label.as_deref(), Some("checkpoint"));
+        assert_eq!(fork_label.parent_id(), Some(fork_a1.id()));
+    }
+
+    #[tokio::test]
+    async fn test_repository_list_skips_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("corrupt.jsonl"), "not a session file\n")
+            .await
+            .unwrap();
+        let repo = SessionRepository::new(dir.path());
+        assert!(
+            repo.list().await.unwrap().is_empty(),
+            "corrupt file skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repository_branch_unknown_leaf_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepository::new(dir.path());
+        let session = repo.create(meta()).await.unwrap();
+        session.append_message(assistant("hi")).await.unwrap();
+        let listed = repo.list().await.unwrap();
+        let err = match repo
+            .create_branched_session(&listed[0].path, "no-such-entry")
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for unknown leaf"),
+        };
+        assert!(err.to_string().contains("not found"), "{err}");
     }
 
     #[tokio::test]
     async fn test_repository_delete_removes_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SessionRepository::new(dir.path());
-        repo.create(meta()).await.unwrap();
+        let session = repo.create(meta()).await.unwrap();
+        session.append_message(assistant("hi")).await.unwrap();
         let listed = repo.list().await.unwrap();
         assert_eq!(listed.len(), 1);
 

@@ -75,6 +75,11 @@ pub struct JsonlSessionStorage {
     append_lock: Mutex<()>,
     /// Metadata read from the header (file is authoritative on reopen).
     pub metadata: JsonlSessionMetadata,
+    /// The file has not been written yet: the header and buffered entries
+    /// live in memory and the file materializes on the first assistant
+    /// message, matching the TS deferred-first-assistant contract. Until
+    /// then the session is invisible to `list` and `open`.
+    deferred: Mutex<bool>,
 }
 
 impl JsonlSessionStorage {
@@ -124,6 +129,47 @@ impl JsonlSessionStorage {
             leaf_id: Mutex::new(None),
             append_lock: Mutex::new(()),
             metadata,
+            deferred: Mutex::new(false),
+        })
+    }
+
+    /// Create a session whose file materializes on the first assistant
+    /// message — the TS deferred-first-assistant contract for new and
+    /// branched sessions. The header is validated (so a later materialization
+    /// never writes a file its own `open` would reject) but not written;
+    /// appends buffer in memory until an assistant message arrives, at which
+    /// point the header and every buffered entry are written in order. An
+    /// empty session never touches disk and therefore never appears in
+    /// [`crate::session::repository::SessionRepository::list`].
+    pub async fn create_deferred(
+        path: &Path,
+        metadata: JsonlSessionMetadata,
+    ) -> Result<Self, anyhow::Error> {
+        if path.exists() {
+            anyhow::bail!("session file already exists: {}", path.display());
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let header = SessionHeader {
+            type_tag: "session".into(),
+            version: FORMAT_VERSION,
+            id: metadata.id.clone(),
+            timestamp: metadata.created_at,
+            cwd: metadata.cwd.clone(),
+            parent_session: metadata.parent_session_path.clone(),
+            metadata: metadata.metadata.clone(),
+        };
+        validate_header_wire(&serde_json::to_value(&header).expect("header serializes"))?;
+        Ok(JsonlSessionStorage {
+            jsonl_path: path.to_path_buf(),
+            entries: Mutex::new(Vec::new()),
+            leaf_id: Mutex::new(None),
+            append_lock: Mutex::new(()),
+            metadata,
+            deferred: Mutex::new(true),
         })
     }
 
@@ -196,6 +242,7 @@ impl JsonlSessionStorage {
             leaf_id: Mutex::new(leaf_id),
             append_lock: Mutex::new(()),
             metadata,
+            deferred: Mutex::new(false),
         })
     }
 
@@ -227,7 +274,39 @@ impl JsonlSessionStorage {
             anyhow::bail!("duplicate entry id {}", entry.id());
         }
         let line = serde_json::to_string(entry)? + "\n";
-        self.append_line(&line).await?;
+        // A deferred session materializes on the first assistant message: the
+        // header plus every buffered entry are written in one shot, so the
+        // on-disk order matches the in-memory index (TS `_persist`).
+        let is_assistant = matches!(
+            entry,
+            SessionTreeEntry::Message {
+                message: crate::types::AgentMessage::Assistant { .. },
+                ..
+            }
+        );
+        if *self.deferred.lock().await {
+            if is_assistant {
+                let header = SessionHeader {
+                    type_tag: "session".into(),
+                    version: FORMAT_VERSION,
+                    id: self.metadata.id.clone(),
+                    timestamp: self.metadata.created_at,
+                    cwd: self.metadata.cwd.clone(),
+                    parent_session: self.metadata.parent_session_path.clone(),
+                    metadata: self.metadata.metadata.clone(),
+                };
+                let mut content = serde_json::to_string(&header)? + "\n";
+                for buffered in self.entries.lock().await.iter() {
+                    content.push_str(&serde_json::to_string(buffered)?);
+                    content.push('\n');
+                }
+                content.push_str(&line);
+                tokio::fs::write(&self.jsonl_path, content).await?;
+                *self.deferred.lock().await = false;
+            }
+        } else {
+            self.append_line(&line).await?;
+        }
         // Index the entry before moving the cursor, mirroring TS Pi's order:
         // a concurrent `get_leaf_id` must never see a cursor whose target is
         // absent from the index, which would read as session corruption.
