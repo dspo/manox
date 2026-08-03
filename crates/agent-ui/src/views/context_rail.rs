@@ -83,9 +83,6 @@ pub(crate) struct ContextRail {
     pub(crate) cockpit_auto_compact_threshold: f64,
     weak_workspace: WeakEntity<Workspace>,
     agents: Vec<SubagentInfo>,
-    /// Last request's model-facing projection breakdown and optimization
-    /// savings, including estimates collected by shadow-mode features.
-    pub(crate) optimization: Option<agent::ContextOptimizationMetrics>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
@@ -114,7 +111,6 @@ impl ContextRail {
             cockpit_auto_compact_threshold: auto_compact_threshold,
             weak_workspace,
             agents: Vec::new(),
-            optimization: None,
             side_calls: Vec::new(),
             main_call: None,
             git_change_stats: None,
@@ -139,7 +135,6 @@ impl ContextRail {
     /// reset. Also clears the cached git stats so the incoming thread shows
     /// placeholders until its own refresh lands.
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
-        self.optimization = None;
         self.side_calls.clear();
         self.main_call = None;
         self.agents.clear();
@@ -292,7 +287,7 @@ impl ContextRail {
     }
 
     /// Cumulative token total row with a hover tooltip consolidating main
-    /// calls, side calls, and context optimization distribution data.
+    /// and side calls.
     /// Usage section: a header row (icon + "消费" + total tokens), followed by
     /// a per-model token breakdown tree when per-model data is available. Each
     /// model node now carries a tree prefix (├─ / └─), shows its context-window
@@ -306,9 +301,8 @@ impl ContextRail {
         );
         let main_call = self.main_call.clone();
         let side_calls = self.side_calls.clone();
-        let optimization = self.optimization.clone();
         let theme_clone = theme.clone();
-        let has_tooltip = main_call.is_some() || !side_calls.is_empty() || optimization.is_some();
+        let has_tooltip = main_call.is_some() || !side_calls.is_empty();
         let header = h_flex()
             .items_center()
             .gap_2()
@@ -334,14 +328,8 @@ impl ContextRail {
                     let theme = theme_clone.clone();
                     let main_call = main_call.clone();
                     let side_calls = side_calls.clone();
-                    let optimization = optimization.clone();
                     Tooltip::element(move |_w, _c| {
-                        build_usage_tooltip(
-                            main_call.as_ref(),
-                            &side_calls,
-                            optimization.as_ref(),
-                            &theme,
-                        )
+                        build_usage_tooltip(main_call.as_ref(), &side_calls, &theme)
                     })
                     .build(window, cx)
                 })
@@ -931,12 +919,11 @@ impl Render for ContextRail {
 
 // ── Free helpers ───────────────────────────────────────────────────────────
 
-/// Build the hover tooltip for the usage row, consolidating main calls,
-/// side calls, and context optimization distribution into one tree view.
+/// Build the hover tooltip for the usage row, consolidating main and side
+/// calls into one tree view.
 fn build_usage_tooltip(
     main_call: Option<&agent::SideCallMetric>,
     side_calls: &[agent::SideCallMetric],
-    optimization: Option<&agent::ContextOptimizationMetrics>,
     theme: &Theme,
 ) -> AnyElement {
     let muted = theme.muted_foreground;
@@ -945,7 +932,7 @@ fn build_usage_tooltip(
     v_flex()
         .gap_1()
         .when_some(main_call, |el, metric| {
-            let is_last = side_calls.is_empty() && optimization.is_none();
+            let is_last = side_calls.is_empty();
             el.child(section_heading(
                 &i18n::t("context-tooltip-main-calls"),
                 muted,
@@ -953,7 +940,6 @@ fn build_usage_tooltip(
             .child(call_tree_row(metric, None, is_last, muted, &tokens))
         })
         .when(!side_calls.is_empty(), |el| {
-            let has_opt = optimization.is_some();
             let section = el.child(section_heading(
                 &i18n::t("context-tooltip-side-calls"),
                 muted,
@@ -963,7 +949,7 @@ fn build_usage_tooltip(
                 .iter()
                 .enumerate()
                 .fold(section, |el, (i, metric)| {
-                    let is_last_in_section = !has_opt && i == total - 1;
+                    let is_last_in_section = i == total - 1;
                     el.child(call_tree_row(
                         metric,
                         Some(&metric.purpose),
@@ -973,57 +959,10 @@ fn build_usage_tooltip(
                     ))
                 })
         })
-        .when_some(optimization, |el, m| {
-            el.child(section_heading(
-                &i18n::t("context-tooltip-distribution"),
-                muted,
-            ))
-            .child(opt_tree_row(
-                "Projection",
-                &format!(
-                    "Sent {} Baseline {} Saved -{}",
-                    tokens(m.projected_tokens),
-                    tokens(m.estimated_baseline_tokens),
-                    tokens(m.saved_tokens)
-                ),
-                false,
-                muted,
-            ))
-            .child(opt_tree_row(
-                "Breakdown",
-                &format!(
-                    "System {} Mode {} Project {} Schemas {} History {} Results {}",
-                    tokens(m.system_tokens),
-                    tokens(m.mode_tokens),
-                    tokens(m.project_context_tokens),
-                    tokens(m.tool_schema_tokens),
-                    tokens(m.history_tokens),
-                    tokens(m.tool_result_tokens)
-                ),
-                false,
-                muted,
-            ))
-            .child({
-                let mut parts = vec![format!(
-                    "Schemas {}/{}",
-                    m.active_tool_schemas, m.total_tool_schemas
-                )];
-                if m.discovery_saved_tokens > 0 {
-                    parts.push(format!("Discovery -{}", tokens(m.discovery_saved_tokens)));
-                }
-                opt_tree_row("Tools", &parts.join(" "), false, muted)
-            })
-            .child(opt_tree_row(
-                "Runtime",
-                &format!("Prefix {}%", m.prefix_stability_pct),
-                true,
-                muted,
-            ))
-        })
         .into_any_element()
 }
 
-/// Section heading in the usage tooltip (e.g. "主调用", "辅助调用", "Tokens 分布").
+/// Section heading in the usage tooltip (e.g. "主调用", "辅助调用").
 fn section_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
     gpui::div()
         .text_xs()
@@ -1079,20 +1018,6 @@ fn call_tree_row(
         .text_xs()
         .text_color(muted)
         .child(SharedString::from(text))
-        .into_any_element()
-}
-
-/// A tree row for an optimization distribution category.
-fn opt_tree_row(category: &str, detail: &str, is_last: bool, muted: gpui::Hsla) -> AnyElement {
-    let prefix = if is_last { "╰─ " } else { "├─ " };
-    gpui::div()
-        .pl(px(8.))
-        .text_xs()
-        .text_color(muted)
-        .child(SharedString::from(format!(
-            "{}{} | {}",
-            prefix, category, detail
-        )))
         .into_any_element()
 }
 

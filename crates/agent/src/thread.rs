@@ -62,39 +62,6 @@ pub enum ToolCallStatus {
     Cancelled,
 }
 
-/// Per-request model-facing projection metrics. Token counts use the same
-/// deterministic bytes/4 estimator as local overflow/compaction decisions;
-/// provider-reported usage remains authoritative once the request completes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextOptimizationMetrics {
-    pub projected_tokens: u64,
-    pub estimated_baseline_tokens: u64,
-    pub saved_tokens: u64,
-    pub shadow_saved_tokens: u64,
-    pub system_tokens: u64,
-    pub mode_tokens: u64,
-    pub project_context_tokens: u64,
-    pub tool_schema_tokens: u64,
-    pub history_tokens: u64,
-    pub tool_result_tokens: u64,
-    pub rewrite_saved_tokens: u64,
-    pub pruning_saved_tokens: u64,
-    pub discovery_saved_tokens: u64,
-    pub image_saved_tokens: u64,
-    pub active_tool_schemas: usize,
-    pub total_tool_schemas: usize,
-    pub activated_tools: Vec<String>,
-    pub tool_search_queries: u64,
-    pub tool_search_hits: u64,
-    pub tool_search_last_hits: Vec<String>,
-    pub code_nested_calls: u64,
-    pub code_model_round_trips_avoided: u64,
-    pub code_raw_tokens: u64,
-    pub code_projected_tokens: u64,
-    pub compactions_avoided: u64,
-    pub prefix_stability_pct: u16,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SideCallMetric {
     pub purpose: String,
@@ -293,10 +260,6 @@ pub enum ThreadEvent {
     CacheInvalidation {
         reprocessed_tokens: u64,
     },
-    /// Actual and shadow savings for the just-built model request. This is a
-    /// projection-only diagnostic; canonical thread history is never sampled
-    /// through a destructive transform.
-    ContextOptimizationUpdated(ContextOptimizationMetrics),
     /// Cumulative side-call breakdown, sorted by purpose for stable rendering.
     SideCallMetricsUpdated(Vec<SideCallMetric>),
     MainCallMetricsUpdated(SideCallMetric),
@@ -886,7 +849,6 @@ pub struct Thread {
     side_call_metrics: HashMap<String, SideCallMetric>,
     main_call_metric: SideCallMetric,
     current_model_call_started: Option<std::time::Instant>,
-    avoided_compactions: AtomicU64,
     /// Monotonic counter stamped into every `snapshot()` so the db `upsert`
     /// can reject out-of-order writes. `save_thread` is fire-and-forget: an
     /// older snapshot (e.g. taken at submit, before the turn produced assistant
@@ -1113,7 +1075,6 @@ impl Thread {
                     ..Default::default()
                 },
                 current_model_call_started: None,
-                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
@@ -1258,7 +1219,6 @@ impl Thread {
                     ..Default::default()
                 },
                 current_model_call_started: None,
-                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(rec.revision),
                 background_tasks,
                 ui_notes: Vec::new(),
@@ -1359,7 +1319,6 @@ impl Thread {
                     ..Default::default()
                 },
                 current_model_call_started: None,
-                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
@@ -3397,10 +3356,7 @@ impl Thread {
             });
         match outcome {
             crate::turn_ext::CompactionOutcome::Compact { insertion_ix } => Some(insertion_ix),
-            crate::turn_ext::CompactionOutcome::Avoided => {
-                self.avoided_compactions.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+            crate::turn_ext::CompactionOutcome::Avoided => None,
             crate::turn_ext::CompactionOutcome::Skip => None,
         }
     }
@@ -3830,9 +3786,6 @@ impl Thread {
                     system_changed: change.is_some_and(|c| c.system_changed),
                     tools_changed: change.is_some_and(|c| c.tools_changed),
                 });
-                cx.emit(ThreadEvent::ContextOptimizationUpdated(
-                    this.context_optimization_metrics(&request),
-                ));
                 request
             })?;
 
@@ -5980,287 +5933,6 @@ impl Thread {
             ..Default::default()
         }
     }
-
-    fn context_optimization_metrics(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> ContextOptimizationMetrics {
-        use crate::settings::Toggle;
-
-        let settings = crate::settings::context_optimization();
-        let message_bytes: usize = request.messages.iter().map(request_message_bytes).sum();
-        let system_bytes = request
-            .messages
-            .iter()
-            .filter(|message| message.role == Role::System)
-            .map(request_message_bytes)
-            .sum::<usize>();
-        let mode_bytes = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                MessageContent::Text(text) if text.contains("<collaboration_mode>") => {
-                    Some(text.len())
-                }
-                _ => None,
-            })
-            .sum::<usize>();
-        let project_context_bytes = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                MessageContent::Text(text) if text.contains("<instructions scope=") => {
-                    Some(text.len())
-                }
-                _ => None,
-            })
-            .sum::<usize>();
-        let tool_result_bytes = request
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                MessageContent::ToolResult(result) => Some(result.content.len()),
-                _ => None,
-            })
-            .sum::<usize>();
-        let schema_bytes = serde_json::to_vec(&request.tools)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-        let all_tools = self.tools.to_request_tools(self.agent_language);
-        let all_schema_bytes = serde_json::to_vec(&all_tools)
-            .map(|bytes| bytes.len())
-            .unwrap_or_default();
-
-        let rewrite_mode = settings.effective_history_rewrite();
-        let rewrite_bytes = if rewrite_mode == Toggle::Off {
-            0
-        } else {
-            self.messages
-                .iter()
-                .flat_map(|message| &message.content)
-                .filter_map(|content| match content {
-                    MessageContent::ToolResult(result)
-                        if !matches!(
-                            result.tool_name.as_ref(),
-                            crate::tools::AGENT | crate::tools::CODE
-                        ) =>
-                    {
-                        let compact = crate::optimizer::compact_tool_output(
-                            &result.tool_name,
-                            &result.content,
-                            crate::optimizer::tool_budget(&result.tool_name),
-                        );
-                        Some(result.content.len().saturating_sub(compact.len()))
-                    }
-                    _ => None,
-                })
-                .sum()
-        };
-        let pruning_bytes = if settings.history_pruning == Toggle::Off {
-            0
-        } else {
-            crate::retention::preview(&self.messages, self.cwd.as_ref())
-                .map(|pruned| {
-                    let retained: HashSet<&str> = pruned
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .filter_map(|content| match content {
-                            MessageContent::ToolUse(tool_use) => Some(tool_use.id.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    let dropped: HashSet<&str> = self
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .filter_map(|content| match content {
-                            MessageContent::ToolUse(tool_use)
-                                if !retained.contains(tool_use.id.as_str()) =>
-                            {
-                                Some(tool_use.id.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    let projected: HashSet<&str> = request
-                        .messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .filter_map(|content| match content {
-                            MessageContent::ToolUse(tool_use) => Some(tool_use.id.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    self.messages
-                        .iter()
-                        .flat_map(|message| &message.content)
-                        .filter(|content| match content {
-                            MessageContent::ToolUse(tool_use) => {
-                                dropped.contains(tool_use.id.as_str())
-                                    && (settings.history_pruning == Toggle::Shadow
-                                        || !projected.contains(tool_use.id.as_str()))
-                            }
-                            MessageContent::ToolResult(result) => {
-                                dropped.contains(result.tool_use_id.as_str())
-                                    && (settings.history_pruning == Toggle::Shadow
-                                        || !projected.contains(result.tool_use_id.as_str()))
-                            }
-                            _ => false,
-                        })
-                        .map(content_bytes)
-                        .sum()
-                })
-                .unwrap_or_default()
-        };
-        let discovery_bytes = match settings.tool_discovery {
-            Toggle::Off => 0,
-            Toggle::On => all_schema_bytes.saturating_sub(schema_bytes),
-            Toggle::Shadow => {
-                let allowed = crate::tools::tool_search::schema_order(&self.id.0);
-                let candidate =
-                    self.tools
-                        .to_request_tools_in_order(&allowed, self.agent_language, false);
-                let candidate_bytes = serde_json::to_vec(&candidate)
-                    .map(|bytes| bytes.len())
-                    .unwrap_or_default();
-                all_schema_bytes.saturating_sub(candidate_bytes)
-            }
-        };
-        let image_bytes = if self
-            .active_model()
-            .as_ref()
-            .is_some_and(|model| model.supports_images())
-        {
-            0
-        } else {
-            self.messages
-                .iter()
-                .flat_map(|message| &message.content)
-                .filter_map(|content| match content {
-                    MessageContent::Image { data, mime_type } => {
-                        let placeholder = format!(
-                            "[image omitted: active model has no vision support; mime={mime_type}, encoded_bytes={}]",
-                            data.len()
-                        );
-                        Some(
-                            data.len()
-                                .saturating_add(mime_type.len())
-                                .saturating_sub(placeholder.len()),
-                        )
-                    }
-                    _ => None,
-                })
-                .sum()
-        };
-        let mut code_nested_calls = 0u64;
-        let mut code_calls = 0u64;
-        let mut code_raw_bytes = 0usize;
-        let mut code_projected_bytes = 0usize;
-        for result in self
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                MessageContent::ToolResult(result)
-                    if result.tool_name.as_ref() == crate::tools::CODE =>
-                {
-                    Some(result)
-                }
-                _ => None,
-            })
-        {
-            code_raw_bytes = code_raw_bytes.saturating_add(result.content.len());
-            code_projected_bytes = code_projected_bytes
-                .saturating_add(crate::tools::code::model_text(&result.content).len());
-            if let Ok(envelope) =
-                serde_json::from_str::<crate::tools::code::CodeEnvelope>(&result.content)
-            {
-                code_calls = code_calls.saturating_add(1);
-                code_nested_calls = code_nested_calls.saturating_add(envelope.calls as u64);
-            }
-        }
-        let search_stats = crate::tools::tool_search::search_stats_for(&self.id.0);
-
-        let (actual_bytes, shadow_bytes) = [
-            (rewrite_mode, rewrite_bytes),
-            (settings.history_pruning, pruning_bytes),
-            (settings.tool_discovery, discovery_bytes),
-        ]
-        .into_iter()
-        .fold(
-            (image_bytes, 0usize),
-            |(actual, shadow), (toggle, bytes)| match toggle {
-                Toggle::On => (actual.saturating_add(bytes), shadow),
-                Toggle::Shadow => (actual, shadow.saturating_add(bytes)),
-                Toggle::Off => (actual, shadow),
-            },
-        );
-        let projected_bytes = message_bytes.saturating_add(schema_bytes);
-        ContextOptimizationMetrics {
-            projected_tokens: approx_tokens(projected_bytes),
-            estimated_baseline_tokens: approx_tokens(
-                projected_bytes
-                    .saturating_add(actual_bytes)
-                    .saturating_add(shadow_bytes),
-            ),
-            saved_tokens: approx_tokens(actual_bytes),
-            shadow_saved_tokens: approx_tokens(shadow_bytes),
-            system_tokens: approx_tokens(system_bytes),
-            mode_tokens: approx_tokens(mode_bytes),
-            project_context_tokens: approx_tokens(project_context_bytes),
-            tool_schema_tokens: approx_tokens(schema_bytes),
-            history_tokens: approx_tokens(
-                message_bytes
-                    .saturating_sub(system_bytes)
-                    .saturating_sub(mode_bytes)
-                    .saturating_sub(project_context_bytes),
-            ),
-            tool_result_tokens: approx_tokens(tool_result_bytes),
-            rewrite_saved_tokens: approx_tokens(rewrite_bytes),
-            pruning_saved_tokens: approx_tokens(pruning_bytes),
-            discovery_saved_tokens: approx_tokens(discovery_bytes),
-            image_saved_tokens: approx_tokens(image_bytes),
-            active_tool_schemas: request.tools.len(),
-            total_tool_schemas: all_tools.len(),
-            activated_tools: crate::tools::tool_search::activated_for(&self.id.0),
-            tool_search_queries: search_stats.queries,
-            tool_search_hits: search_stats.hits,
-            tool_search_last_hits: search_stats.last_hits,
-            code_nested_calls,
-            code_model_round_trips_avoided: code_nested_calls.saturating_sub(code_calls),
-            code_raw_tokens: approx_tokens(code_raw_bytes),
-            code_projected_tokens: approx_tokens(code_projected_bytes),
-            compactions_avoided: self.avoided_compactions.load(Ordering::Relaxed),
-            prefix_stability_pct: self.prefix.stability_pct(),
-        }
-    }
-}
-
-fn approx_tokens(bytes: usize) -> u64 {
-    bytes.div_ceil(4) as u64
-}
-
-fn content_bytes(content: &MessageContent) -> usize {
-    match content {
-        MessageContent::Text(text) | MessageContent::Compaction(text) => text.len(),
-        MessageContent::Thinking { text, signature } => {
-            text.len() + signature.as_ref().map_or(0, String::len)
-        }
-        MessageContent::Image { data, mime_type } => data.len() + mime_type.len(),
-        MessageContent::ToolUse(tool_use) => {
-            tool_use.raw_input.len()
-                + serde_json::to_string(&tool_use.input).map_or(0, |value| value.len())
-                + tool_use.name.len()
-        }
-        MessageContent::ToolResult(result) => result.content.len() + result.tool_name.len(),
-    }
-}
-
-fn request_message_bytes(message: &LanguageModelRequestMessage) -> usize {
-    message.content.iter().map(content_bytes).sum()
 }
 
 /// Strip the `agent` tool's JSON envelope from a ToolResult so only its `final`

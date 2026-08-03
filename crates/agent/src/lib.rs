@@ -61,10 +61,7 @@ pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::{Message, MessageProvenance, MessageUiMetadata};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
-pub use thread::{
-    ContextOptimizationMetrics, PendingAuthMeta, SideCallMetric, Thread, ThreadEvent, ThreadId,
-    ToolCallStatus,
-};
+pub use thread::{PendingAuthMeta, SideCallMetric, Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
