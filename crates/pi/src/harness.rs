@@ -1193,8 +1193,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// the settings default; `set_thinking_level` persists, this one does
     /// not.
     pub fn set_initial_thinking_level(&mut self, level: Option<String>) {
-        self.agent.set_thinking_level(level.clone());
-        self.control.turn_runtime.lock().unwrap().thinking_level = level;
+        // The in-memory tier is `None` for off (agent semantics); the wire
+        // value "off" normalizes here so a first turn equals a reopen.
+        let normalized = level.filter(|l| l != "off");
+        self.agent.set_thinking_level(normalized.clone());
+        self.control.turn_runtime.lock().unwrap().thinking_level = normalized;
     }
 
     /// Install the system-prompt builder; the harness re-invokes it whenever

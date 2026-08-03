@@ -158,14 +158,44 @@ struct DefaultModelCatalog;
 
 impl ModelCatalog for DefaultModelCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        let (api, context_window, max_tokens): (&str, usize, usize) = match (provider, model_id) {
-            ("anthropic", "claude-sonnet-4-6") => ("anthropic", 200_000, 8_192),
-            ("anthropic", "claude-opus-4-8") => ("anthropic", 200_000, 16_384),
-            ("anthropic", "claude-haiku-4-5") => ("anthropic", 200_000, 8_192),
-            ("openai", "gpt-5") | ("openai", "gpt-5-mini") => ("openai_responses", 200_000, 16_384),
-            ("openai", "gpt-4o") | ("openai", "gpt-4o-mini") => {
-                ("openai_completions", 128_000, 8_192)
-            }
+        // Thinking capability mirrors the frozen TS baseline: Sonnet 4.6,
+        // Opus 4.8, and GPT-5 support reasoning; Haiku 4.5 and GPT-4o do not.
+        let (api, context_window, max_tokens, thinking): (
+            &str,
+            usize,
+            usize,
+            crate::types::ThinkingKind,
+        ) = match (provider, model_id) {
+            ("anthropic", "claude-sonnet-4-6") => (
+                "anthropic",
+                200_000,
+                8_192,
+                crate::types::ThinkingKind::Enabled,
+            ),
+            ("anthropic", "claude-opus-4-8") => (
+                "anthropic",
+                200_000,
+                16_384,
+                crate::types::ThinkingKind::Enabled,
+            ),
+            ("anthropic", "claude-haiku-4-5") => (
+                "anthropic",
+                200_000,
+                8_192,
+                crate::types::ThinkingKind::None,
+            ),
+            ("openai", "gpt-5") | ("openai", "gpt-5-mini") => (
+                "openai_responses",
+                200_000,
+                16_384,
+                crate::types::ThinkingKind::Enabled,
+            ),
+            ("openai", "gpt-4o") | ("openai", "gpt-4o-mini") => (
+                "openai_completions",
+                128_000,
+                8_192,
+                crate::types::ThinkingKind::None,
+            ),
             _ => return None,
         };
         Some(Model {
@@ -174,7 +204,7 @@ impl ModelCatalog for DefaultModelCatalog {
             id: model_id.to_string(),
             context_window,
             max_tokens,
-            thinking: crate::types::ThinkingKind::None,
+            thinking,
             metadata: Default::default(),
         })
     }

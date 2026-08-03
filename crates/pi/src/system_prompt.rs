@@ -37,19 +37,36 @@ pub fn build_harness_prompt(
     active_tools: &[String],
     context_files: &[crate::harness::ContextFile],
     skills: &[crate::harness::Skill],
+    custom: bool,
 ) -> String {
     let mut prompt = base.to_string();
-    prompt.push_str("\n\nAvailable tools:\n");
-    if active_tools.is_empty() {
-        prompt.push_str("(none)\n");
-    } else {
-        for name in active_tools {
-            let snippet = TOOL_SNIPPETS
+    // TS `customPrompt` replaces the default prompt: no tools list or
+    // guidelines are appended, only context files, skills, and the cwd.
+    if !custom {
+        prompt.push_str("\n\nAvailable tools:\n");
+        let visible: Vec<&String> = active_tools
+            .iter()
+            .filter(|name| TOOL_SNIPPETS.iter().any(|(n, _)| n == *name))
+            .collect();
+        if visible.is_empty() {
+            prompt.push_str("(none)\n");
+        } else {
+            for name in visible {
+                let snippet = TOOL_SNIPPETS
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, s)| *s)
+                    .expect("visible tools have snippets");
+                prompt.push_str(&format!("- {name}: {snippet}\n"));
+            }
+        }
+        // TS dynamic guideline: with bash but no grep/find/ls.
+        if active_tools.contains(&"bash".to_string())
+            && !["grep", "find", "ls"]
                 .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, s)| *s)
-                .unwrap_or("Available");
-            prompt.push_str(&format!("- {name}: {snippet}\n"));
+                .any(|t| active_tools.contains(&t.to_string()))
+        {
+            prompt.push_str("\nUse bash for file operations like ls, rg, find\n");
         }
     }
     if !context_files.is_empty() {
@@ -118,6 +135,7 @@ mod tests {
             &tools,
             &context,
             &skills,
+            false,
         );
         assert!(prompt.contains("Current working directory: /proj"));
         assert!(prompt.contains("- read: Read a file from the filesystem"));
@@ -140,8 +158,14 @@ mod tests {
             content: "x".into(),
         }];
         // No read tool: skills are hidden — they cannot be referenced.
-        let prompt =
-            build_harness_prompt("Base.", std::path::Path::new("/proj"), &[], &[], &skills);
+        let prompt = build_harness_prompt(
+            "Base.",
+            std::path::Path::new("/proj"),
+            &[],
+            &[],
+            &skills,
+            false,
+        );
         assert!(!prompt.contains("<skill"), "{prompt}");
     }
 }

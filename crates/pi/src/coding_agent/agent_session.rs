@@ -525,6 +525,7 @@ impl AgentSession {
                     active_tools,
                     &resources.context_files,
                     &resources.skills,
+                    false,
                 )
             },
         );
@@ -565,6 +566,22 @@ fn default_agent_dir() -> PathBuf {
     std::env::var("PI_AGENT_DIR")
         .map(|v| expand_tilde(&v))
         .unwrap_or_else(|_| expand_tilde("~/.pi/agent"))
+}
+
+/// Clamp a desired thinking level against a model's capability (TS
+/// `clampThinkingLevel`): a non-thinking model forces `off`; with no desire,
+/// a thinking-capable model defaults to `medium`.
+fn clamp_thinking(
+    model_thinking: crate::types::ThinkingKind,
+    desired: Option<String>,
+) -> Option<String> {
+    match desired {
+        Some(level) if level != "off" && model_thinking == crate::types::ThinkingKind::None => {
+            Some("off".to_string())
+        }
+        Some(level) => Some(level),
+        None => (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string()),
+    }
 }
 
 /// The default model when none is configured: anthropic, from `ANTHROPIC_MODEL`
@@ -778,6 +795,7 @@ impl AgentSessionBuilder {
             &active_tools,
             &resources.context_files,
             &resources.skills,
+            self.system_prompt.is_some(),
         );
 
         // The session's own model when reopening (restore), the builder
@@ -826,23 +844,7 @@ impl AgentSessionBuilder {
             },
         };
 
-        // The final clamped thinking level: the settings default clamped to
-        // `off` for non-thinking models, else the TS default `medium` (also
-        // clamped). One value drives BOTH the persisted initial entry and
-        // the in-memory state, so the first turn equals a reopen.
         let model_thinking = model.thinking;
-        let clamped_thinking = match settings.default_thinking_level.clone() {
-            Some(level) => {
-                if model_thinking == crate::types::ThinkingKind::None && level != "off" {
-                    Some("off".to_string())
-                } else {
-                    Some(level)
-                }
-            }
-            None => {
-                (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string())
-            }
-        };
 
         // A new session persists its initial model and thinking entries (TS
         // writes them on session creation); they buffer in the deferred
@@ -857,8 +859,7 @@ impl AgentSessionBuilder {
                 .await?;
             let _ = session
                 .append_thinking_level_change(
-                    clamped_thinking
-                        .clone()
+                    clamp_thinking(model_thinking, settings.default_thinking_level.clone())
                         .unwrap_or_else(|| "off".into())
                         .as_str(),
                 )
@@ -880,7 +881,13 @@ impl AgentSessionBuilder {
             harness.set_initial_active_tools(names.clone());
             harness.set_restore_active_tool_default(names);
         }
-        harness = harness.with_model_resolver(model_resolver(&runtime));
+        if self.model.is_none() {
+            // Only install the model resolver when the caller did NOT
+            // explicitly set a model: `builder.with_model(B).open()` must
+            // keep B (TS `options.model > restored model`), and restore
+            // would otherwise overwrite it with the session's model.
+            harness = harness.with_model_resolver(model_resolver(&runtime));
+        }
         // Install the prompt builder: the harness rebuilds the system prompt
         // whenever the effective tool selection or resources change, so the
         // model never sees tools/skills that are not actually available.
@@ -894,6 +901,7 @@ impl AgentSessionBuilder {
                     active_tools,
                     &resources.context_files,
                     &resources.skills,
+                    false,
                 )
             },
         );
@@ -929,12 +937,17 @@ impl AgentSessionBuilder {
         // turn matches the persisted entry and a reopen) and for a reopened
         // session with no persisted entry. An explicit persisted `"off"` is
         // a real decision and is never overridden.
-        if !restore || !has_thinking_entry {
-            // The in-memory tier is `None` for off (agent semantics); the
-            // persisted wire value stays "off".
-            let level = clamped_thinking.filter(|l| l != "off");
-            harness.set_initial_thinking_level(level);
-        }
+        // The final thinking level: the session's persisted level (a reopen
+        // with an entry), else the settings default, else the TS default
+        // `medium` — clamped against the FINAL model's capability in every
+        // case (TS clamps again after a model fallback). One value lands in
+        // memory, so the first turn equals a reopen.
+        let desired = if restore && has_thinking_entry {
+            harness.agent().state().thinking_level.clone()
+        } else {
+            settings.default_thinking_level.clone()
+        };
+        harness.set_initial_thinking_level(clamp_thinking(model_thinking, desired));
 
         Ok(AgentSession {
             harness,
@@ -1779,6 +1792,83 @@ mod tests {
         assert!(
             !session.has_next_turn(),
             "shutdown refuses further enqueues"
+        );
+    }
+
+    /// `builder.with_model(B).open(path)` keeps B even when the session
+    /// recorded model A (TS `options.model > restored model`); the first
+    /// provider request is served by B.
+    #[tokio::test]
+    async fn open_keeps_an_explicit_model_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        // Session A (default test model).
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("hi").await.unwrap();
+        let path = session.close().await.unwrap();
+
+        // Reopen with an explicit model B.
+        let model_b = Model {
+            id: "model-b".into(),
+            ..test_model()
+        };
+        let resumed = create_agent_session()
+            .with_model_runtime(fake_runtime())
+            .with_model(model_b.clone())
+            .open(path)
+            .await
+            .unwrap();
+        assert_eq!(resumed.model().id, "model-b", "explicit model wins");
+        assert_eq!(resumed.harness.model().id, "model-b");
+    }
+
+    /// A thinking-capable default model (Sonnet, per the frozen TS baseline)
+    /// keeps the `medium` default instead of being clamped to off.
+    #[tokio::test]
+    async fn thinking_capable_model_keeps_medium_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        use crate::coding_agent::model_runtime::ModelCatalog;
+        struct SonnetCatalog;
+        impl ModelCatalog for SonnetCatalog {
+            fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
+                (provider == "anthropic" && model_id == "claude-sonnet-4-6").then(|| Model {
+                    provider: "anthropic".into(),
+                    api: "anthropic".into(),
+                    id: "claude-sonnet-4-6".into(),
+                    context_window: 200_000,
+                    max_tokens: 8_192,
+                    thinking: crate::types::ThinkingKind::Enabled,
+                    metadata: Default::default(),
+                })
+            }
+        }
+        let sonnet = SonnetCatalog
+            .resolve("anthropic", "claude-sonnet-4-6")
+            .unwrap();
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(fake_runtime().with_catalog(Arc::new(SonnetCatalog)))
+            .with_model(sonnet)
+            .build()
+            .await
+            .unwrap();
+        // Medium default is kept for a thinking-capable model.
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("medium"),
+            "thinking-capable model keeps medium"
         );
     }
 
