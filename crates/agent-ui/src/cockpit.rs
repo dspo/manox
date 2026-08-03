@@ -87,13 +87,15 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Pi Agent style token rendering: uppercase `M` suffix (1.0M) with the same
-/// one-decimal `k`/`M` shape as `format_tokens`. Used only by the usage
-/// section's compact symbol lines (`↑`/`↓`/`R`/`CH`); the global
-/// `format_tokens` keeps its lowercase `m` for the `[k]`/`[m]` window-label
-/// convention.
+/// Pi Agent style token rendering: uppercase `M` suffix, one-decimal under
+/// 10M (`1.0M`) and integral above it (`451M`); `k` keeps the one-decimal
+/// shape of `format_tokens` (`104.2k`). Used only by the usage section's
+/// compact symbol lines (`↑`/`↓`/`R`/`CH`); the global `format_tokens` keeps
+/// its lowercase `m` for the `[k]`/`[m]` window-label convention.
 pub fn format_tokens_pi(n: u64) -> String {
-    if n >= 1_000_000 {
+    if n >= 10_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}k", n as f64 / 1_000.0)
@@ -176,13 +178,16 @@ mod tests {
 
     #[test]
     fn format_tokens_pi_cases() {
-        // Uppercase M (Pi style), same one-decimal shape as `format_tokens`.
+        // Uppercase M (Pi style): one-decimal under 10M, integral above;
+        // `k` keeps the one-decimal shape of `format_tokens`.
         assert_eq!(format_tokens_pi(0), "0");
         assert_eq!(format_tokens_pi(512), "512");
         assert_eq!(format_tokens_pi(8_100), "8.1k");
         assert_eq!(format_tokens_pi(104_200), "104.2k");
         assert_eq!(format_tokens_pi(1_000_000), "1.0M");
-        assert_eq!(format_tokens_pi(451_000_000), "451.0M");
+        assert_eq!(format_tokens_pi(9_999_999), "10.0M");
+        assert_eq!(format_tokens_pi(10_000_000), "10M");
+        assert_eq!(format_tokens_pi(451_000_000), "451M");
     }
 
     #[test]
