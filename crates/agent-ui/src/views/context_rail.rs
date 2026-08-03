@@ -353,7 +353,7 @@ impl ContextRail {
                 per_model.iter().collect();
             models.sort_by_key(|(_, u)| -(u.total_tokens() as i64));
             let total_models = models.len();
-            for (i, (model_id, usage)) in models.iter().enumerate() {
+            for (i, (model_name, usage)) in models.iter().enumerate() {
                 let is_last_model = i == total_models - 1;
                 // Tree glyphs: model node gets the root branch glyph; children
                 // share a vertical-line or empty-line indent prefix plus their
@@ -362,8 +362,9 @@ impl ContextRail {
                 let indent = if is_last_model { "   " } else { "│  " };
 
                 let cache_pct = crate::cockpit::cache_read_ratio(**usage);
-                let window_label = registry::global()
-                    .get_model(model_id)
+                let model = registry::global().get_model_by_name(model_name);
+                let window_label = model
+                    .as_ref()
                     .map(|m| {
                         let cap = crate::cockpit::format_tokens(m.max_token_count());
                         format!("[{cap}]")
@@ -373,7 +374,7 @@ impl ContextRail {
                     format!(
                         "{} {}{}  {}",
                         branch,
-                        model_id,
+                        model_name,
                         window_label,
                         i18n::t_str(
                             "workspace-env-cache-hit-rate",
@@ -381,7 +382,7 @@ impl ContextRail {
                         )
                     )
                 } else {
-                    format!("{} {}{}", branch, model_id, window_label)
+                    format!("{} {}{}", branch, model_name, window_label)
                 };
 
                 section = section.child(
@@ -393,7 +394,7 @@ impl ContextRail {
                 );
 
                 // Context budget row — first tree child.
-                if let Some(m) = registry::global().get_model(model_id) {
+                if let Some(m) = model.as_ref() {
                     let max_input = m.max_token_count();
                     if let Some(budget) = context_budget_pct(max_input, effective_tokens) {
                         let pct = (budget.used_pct.round() as i64).clamp(0, 100);

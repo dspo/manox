@@ -56,6 +56,13 @@ impl ProviderRegistry {
     pub fn get_model(&self, id: &str) -> Option<AnyLanguageModel> {
         self.models.iter().find(|m| m.id() == id).cloned()
     }
+
+    /// Look up a model by its display name (the config `id`, e.g.
+    /// `kimi/kimi-k3[1m]`). Per-model usage is keyed by this name, so the
+    /// context rail resolves window/cap metadata through it.
+    pub fn get_model_by_name(&self, name: &str) -> Option<AnyLanguageModel> {
+        self.models.iter().find(|m| m.name() == name).cloned()
+    }
 }
 
 /// Build a concrete `LanguageModel` from a `ResolvedModel` by `wire_api`. Requires resolving the api_key.
@@ -471,5 +478,83 @@ mod tests {
             resolve_auto_compact_window(WireApi::Anthropic, &env, 200_000),
             Some(200_000)
         );
+    }
+
+    struct MockModel {
+        id: String,
+        name: String,
+    }
+
+    impl crate::language_model::LanguageModel for MockModel {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> WireApi {
+            WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            1_000_000
+        }
+        fn stream_completion(
+            &self,
+            _request: crate::language_model::LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    anyhow::Result<crate::language_model::LanguageModelCompletionEvent>,
+                >,
+            >,
+        > {
+            Box::pin(async {
+                use futures::StreamExt as _;
+                Ok(futures::stream::empty::<
+                    anyhow::Result<crate::language_model::LanguageModelCompletionEvent>,
+                >()
+                .boxed())
+            })
+        }
+    }
+
+    #[test]
+    fn lookup_keys_are_id_and_display_name() {
+        let registry = ProviderRegistry {
+            models: vec![
+                Arc::new(MockModel {
+                    id: "moonshot/kimi-k3/anthropic".into(),
+                    name: "kimi/kimi-k3[1m]".into(),
+                }),
+                Arc::new(MockModel {
+                    id: "bailian/glm-5.2/anthropic".into(),
+                    name: "glm-5.2[1m]".into(),
+                }),
+            ],
+        };
+        assert_eq!(
+            registry
+                .get_model("moonshot/kimi-k3/anthropic")
+                .map(|m| m.name()),
+            Some("kimi/kimi-k3[1m]".to_string())
+        );
+        assert_eq!(
+            registry
+                .get_model_by_name("kimi/kimi-k3[1m]")
+                .map(|m| m.id()),
+            Some("moonshot/kimi-k3/anthropic".to_string())
+        );
+        // The display name must not resolve through the stable-id lookup.
+        assert!(registry.get_model("kimi/kimi-k3[1m]").is_none());
+        assert!(registry.get_model_by_name("missing").is_none());
     }
 }
