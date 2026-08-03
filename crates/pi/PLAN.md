@@ -12,7 +12,7 @@
 
 **当前规模：** ~31,000 行 Rust（src 28.5k + examples 2.5k），466 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
 
-**基线（S0 冻结，S8–S10 复核轮确认）：** Rust HEAD `（S13 待提交）`（S8–S13 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `c6eb6281`：post-login model catalog refresh 15s 超时——env-only scope 下 deferred，见 parity ledger 已知余项 #7）。
+**基线（S0 冻结，S8–S10 复核轮确认）：** Rust HEAD `957533d`（S8–S13 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `c6eb6281`：post-login model catalog refresh 15s 超时——env-only scope 下 deferred，见 parity ledger 已知余项 #7）。
 
 ## 架构设计
 
