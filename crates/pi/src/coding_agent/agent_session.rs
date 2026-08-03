@@ -112,6 +112,13 @@ pub struct AgentSession {
     /// Set when a reopened session's model could not be resolved exactly and
     /// the initial model was used instead (TS `modelFallbackMessage`).
     model_fallback_notice: Option<String>,
+    /// The settings default thinking level applied at assembly; used when a
+    /// model switch moves from a non-thinking model to a thinking one (TS
+    /// restores the settings default).
+    settings_thinking_default: Option<String>,
+    /// Whether the system prompt is a caller-provided custom prompt (TS
+    /// `customPrompt` replacement semantics), preserved across forks.
+    custom_prompt: bool,
 }
 
 impl AgentSession {
@@ -283,8 +290,30 @@ impl AgentSession {
     }
 
     /// Switch the model (persisted; the resolver serves the new api).
+    /// Re-clamps the thinking level against the new model's capability and
+    /// persists the actual level (TS `setModel` → `_getThinkingLevelForModelSwitch`
+    /// → `setThinkingLevel`): a switch from a non-thinking model restores the
+    /// settings default (else `medium`), otherwise the user preference is kept
+    /// and clamped.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
-        self.harness.set_model(model).await
+        let current_level = self.harness.agent().state().thinking_level.clone();
+        let current_supports = self.harness.model().thinking != crate::types::ThinkingKind::None;
+        let desired = if current_supports {
+            Some(current_level.unwrap_or_else(|| "off".into()))
+        } else {
+            self.settings_thinking_default
+                .clone()
+                .or_else(|| Some("medium".into()))
+        };
+        self.harness.set_model(model.clone()).await?;
+        let clamped = clamp_thinking(&model, &self.runtime.thinking_levels(&model), desired);
+        self.harness.set_initial_thinking_level(clamped.clone());
+        let _ = self
+            .harness
+            .session()
+            .append_thinking_level_change(clamped.clone().unwrap_or_else(|| "off".into()).as_str())
+            .await?;
+        Ok(())
     }
 
     /// The current reasoning tier.
@@ -294,7 +323,18 @@ impl AgentSession {
 
     /// Set the reasoning tier (persisted).
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
-        self.harness.set_thinking_level(level).await
+        // TS `setThinkingLevel`: clamp against the current model's supported
+        // levels, persist, and apply in memory.
+        let model = self.harness.model().clone();
+        let levels = self.runtime.thinking_levels(&model);
+        let clamped = clamp_thinking(&model, &levels, level);
+        let _ = self
+            .harness
+            .session()
+            .append_thinking_level_change(clamped.clone().unwrap_or_else(|| "off".into()).as_str())
+            .await?;
+        self.harness.set_initial_thinking_level(clamped);
+        Ok(())
     }
 
     /// The full mounted tool set.
@@ -486,6 +526,8 @@ impl AgentSession {
                 tools: self.tools,
                 pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
                 model_fallback_notice: None,
+                settings_thinking_default: None,
+                custom_prompt: self.custom_prompt,
             },
             selected_text,
         })
@@ -517,7 +559,7 @@ impl AgentSession {
         // changes.
         let base_prompt = self.base_prompt.clone();
         let cwd = self.cwd.clone();
-        let custom_for_builder = self.base_prompt != crate::system_prompt::DEFAULT_BASE_PROMPT;
+        let custom_for_builder = self.custom_prompt;
         harness.set_system_prompt_builder(
             move |active_tools: &[String], resources: &HarnessResources| {
                 crate::system_prompt::build_harness_prompt(
@@ -572,14 +614,11 @@ fn default_agent_dir() -> PathBuf {
 /// Clamp a desired thinking level against a model's capability (TS
 /// `clampThinkingLevel`): a non-thinking model forces `off`; with no desire,
 /// a thinking-capable model defaults to `medium`.
-fn clamp_thinking(model: &Model, desired: Option<String>) -> Option<String> {
-    // The model's own reasoning flag is authoritative: a non-reasoning model
-    // supports only `off`, whatever the catalog says; otherwise the
-    // catalog's supported level set applies.
-    let levels: &[&str] = if model.thinking == crate::types::ThinkingKind::None {
-        &["off"]
+fn clamp_thinking(model: &Model, levels: &[String], desired: Option<String>) -> Option<String> {
+    let levels: Vec<&str> = if model.thinking == crate::types::ThinkingKind::None {
+        vec!["off"]
     } else {
-        crate::coding_agent::model_runtime::supported_thinking_levels(&model.provider, &model.id)
+        levels.iter().map(|l| l.as_str()).collect()
     };
     match desired {
         None => {
@@ -618,16 +657,14 @@ fn clamp_thinking(model: &Model, desired: Option<String>) -> Option<String> {
 /// Sonnet).
 pub fn default_model() -> Model {
     let id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
+    // Resolve through the default catalog; an unknown override falls back to
+    // Sonnet entirely (id and capability), never a hand-built guess.
     crate::coding_agent::model_runtime::DefaultModelCatalog
         .resolve("anthropic", &id)
-        .unwrap_or_else(|| Model {
-            provider: "anthropic".into(),
-            api: "anthropic".into(),
-            id,
-            context_window: 200_000,
-            max_tokens: 8_192,
-            thinking: crate::types::ThinkingKind::Enabled,
-            metadata: Default::default(),
+        .unwrap_or_else(|| {
+            crate::coding_agent::model_runtime::DefaultModelCatalog
+                .resolve("anthropic", "claude-sonnet-4-6")
+                .expect("sonnet is in the default catalog")
         })
 }
 
@@ -822,6 +859,7 @@ impl AgentSessionBuilder {
             .system_prompt
             .clone()
             .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
+        let custom_prompt = self.system_prompt.is_some();
         let system_prompt = crate::system_prompt::build_harness_prompt(
             &base_prompt,
             &cwd,
@@ -846,6 +884,8 @@ impl AgentSessionBuilder {
             Some(runtime) => runtime.clone(),
             None => ModelRuntime::from_env(),
         };
+        let settings_thinking_default = settings.default_thinking_level.clone();
+
         // The settings/catalog initial model — resolved through the runtime
         // catalog (never a hand-built guess of protocol or parameters).
         let settings_initial_model = settings.default_model.as_ref().and_then(|id| {
@@ -894,9 +934,13 @@ impl AgentSessionBuilder {
                 .await?;
             let _ = session
                 .append_thinking_level_change(
-                    clamp_thinking(&model, settings.default_thinking_level.clone())
-                        .unwrap_or_else(|| "off".into())
-                        .as_str(),
+                    clamp_thinking(
+                        &model,
+                        &runtime.thinking_levels(&model),
+                        settings.default_thinking_level.clone(),
+                    )
+                    .unwrap_or_else(|| "off".into())
+                    .as_str(),
                 )
                 .await?;
             true
@@ -928,7 +972,7 @@ impl AgentSessionBuilder {
         // model never sees tools/skills that are not actually available.
         let base_prompt_for_builder = base_prompt.clone();
         let cwd_for_builder = cwd.clone();
-        let custom_for_builder = self.system_prompt.is_some();
+        let custom_for_builder = custom_prompt;
         harness.set_system_prompt_builder(
             move |active_tools: &[String], resources: &HarnessResources| {
                 crate::system_prompt::build_harness_prompt(
@@ -1001,7 +1045,8 @@ impl AgentSessionBuilder {
             thinking: model_key.2,
             metadata: Default::default(),
         };
-        harness.set_initial_thinking_level(clamp_thinking(&clamp_model, desired));
+        let levels = runtime.thinking_levels(&clamp_model);
+        harness.set_initial_thinking_level(clamp_thinking(&clamp_model, &levels, desired));
 
         Ok(AgentSession {
             harness,
@@ -1014,6 +1059,8 @@ impl AgentSessionBuilder {
             tools,
             pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
             model_fallback_notice: fallback_notice,
+            settings_thinking_default,
+            custom_prompt,
         })
     }
 
@@ -1973,6 +2020,146 @@ mod tests {
             session.harness.agent().state().thinking_level.as_deref(),
             Some("medium"),
             "thinking-capable model keeps medium"
+        );
+    }
+
+    /// set_model re-clamps thinking: thinking high -> non-thinking becomes
+    /// off (in-memory AND persisted); non-thinking -> thinking restores the
+    /// settings default.
+    #[tokio::test]
+    async fn set_model_reclamps_thinking_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultThinkingLevel": "high"}"#,
+        )
+        .await
+        .unwrap();
+        // A thinking model.
+        let thinking = Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            ..test_model()
+        };
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(thinking)
+            .build()
+            .await
+            .unwrap();
+        // high (settings default, thinking-capable).
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("high")
+        );
+
+        // Switch to a non-thinking model: clamped to off in-memory.
+        let non_thinking = Model {
+            thinking: crate::types::ThinkingKind::None,
+            id: "non-thinking".into(),
+            ..test_model()
+        };
+        session.set_model(non_thinking).await.unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level,
+            None,
+            "high clamps to off for a non-thinking model"
+        );
+
+        // Switch back to a thinking model: restores the settings default.
+        let thinking2 = Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            id: "thinking-2".into(),
+            ..test_model()
+        };
+        session.set_model(thinking2).await.unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("high"),
+            "non-thinking -> thinking restores the settings default"
+        );
+        // The persisted entries reflect the clamps.
+        let entries = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap();
+        let levels: Vec<String> = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+                    Some(thinking_level.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(levels.iter().any(|l| l == "off"), "{levels:?}");
+        assert_eq!(
+            levels.last().map(String::as_str),
+            Some("high"),
+            "{levels:?}"
+        );
+    }
+
+    /// A custom catalog can restrict a model's supported thinking levels
+    /// (TS `thinkingLevelMap`), and xhigh clamps to the supported max.
+    #[tokio::test]
+    async fn custom_catalog_restricts_thinking_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        use crate::coding_agent::model_runtime::ModelCatalog;
+        struct CappedCatalog;
+        impl ModelCatalog for CappedCatalog {
+            fn resolve(&self, provider: &str, _model_id: &str) -> Option<Model> {
+                (provider == "test").then(test_model)
+            }
+            fn supported_thinking_levels(&self, _model: &Model) -> Option<Vec<String>> {
+                Some(
+                    ["off", "medium", "high", "max"]
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect(),
+                )
+            }
+        }
+        let runtime = fake_runtime().with_catalog(Arc::new(CappedCatalog));
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(runtime)
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // Desired xhigh: not supported -> clamps to max (TS up-search).
+        session
+            .set_thinking_level(Some("xhigh".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("max")
+        );
+        // minimal is also unsupported -> clamps to the nearest supported.
+        session
+            .set_thinking_level(Some("minimal".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("medium")
         );
     }
 

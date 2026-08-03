@@ -33,6 +33,14 @@ pub struct MissingCredential {
 /// disambiguate e.g. Completions vs Responses).
 pub trait ModelCatalog: Send + Sync {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model>;
+
+    /// The thinking levels a model supports, when the catalog knows them
+    /// exactly (TS `thinkingLevelMap`). `None` falls back to the default
+    /// derivation by provider/model id — custom catalogs should return
+    /// `Some` for models whose level set differs from the defaults.
+    fn supported_thinking_levels(&self, _model: &Model) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -131,6 +139,20 @@ impl ModelRuntime {
     /// The resolver behind this runtime.
     pub fn resolver(&self) -> StreamResolver {
         Arc::clone(&self.resolver)
+    }
+
+    /// The thinking levels `model` supports: the injected catalog's exact
+    /// set when it provides one, else the default derivation.
+    pub fn thinking_levels(&self, model: &Model) -> Vec<String> {
+        if let Some(catalog) = &self.catalog
+            && let Some(levels) = catalog.supported_thinking_levels(model)
+        {
+            return levels;
+        }
+        supported_thinking_levels(&model.provider, &model.id)
+            .iter()
+            .map(|l| l.to_string())
+            .collect()
     }
 
     /// Restore a full model from a session-carried `provider + modelId`

@@ -10,9 +10,9 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~31,000 行 Rust（src 28.5k + examples 2.5k），474 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~31,000 行 Rust（src 28.5k + examples 2.5k），476 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
 
-**基线（S0 冻结，S8–S10 复核轮确认）：** Rust HEAD `4a73759`（S8–S15 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `b9d360a2c`，新增仅 Google adapters transient retry（未选 provider breadth））。
+**基线（S0 冻结，S8–S10 复核轮确认）：** Rust HEAD `（S16 待提交）`（S8–S16 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `b9d360a2c`，新增仅 Google adapters transient retry（未选 provider breadth））。
 
 ## 架构设计
 
@@ -264,7 +264,7 @@ TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该
 - [x] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写（S1）；navigate label/abort/hook/retry/options 对齐（S8 复核轮）
 - [ ] Hook 推迟项：model_update/tools_update 等通知类变体已由 HarnessEvent 承载（S4）；before-provider-payload/after-response 已接 RequestObserver（S3+S8）；其余见 ts-pi-parity §9「有意偏离」
 - [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐（S2 已补 SessionInfo/forkFrom/createBranchedSession/deferred 物化）
-- [ ] coding-agent facade 纵向：open 自动 restore、fork/事件/shutdown（S6/S4）；缺凭证 typed 错误已闭环（S3，2026-08-01）
+- [x] coding-agent facade 纵向：open 自动 restore、fork/事件/shutdown、typed credential、thinking clamp、custom prompt（S6–S16）
 - [ ] pi-ai breadth：三协议之外的 chat API 与 image API（明确排除项）
 
 Rust-only 处置（S0 拍板）：

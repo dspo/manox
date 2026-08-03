@@ -1348,7 +1348,8 @@ mod tests {
         assert!(text.contains("[User]: custom payload"));
         assert!(text.contains("[Assistant thinking]: weighing options"));
         assert!(text.contains("[Assistant]: answer"));
-        assert!(text.contains("[Assistant tool calls]: read(offset=3, path=\"a.rs\")"));
+        // json! literal order (TS Object.entries insertion order):
+        assert!(text.contains("[Assistant tool calls]: read(path=\"a.rs\", offset=3)"));
         // Tool results survive, truncated to the budget with a drop marker.
         assert!(text.contains(&format!("[Tool result]: {}", "r".repeat(2000))));
         assert!(text.contains("[... 100 more characters truncated]"));
