@@ -313,40 +313,41 @@ impl AgentSession {
                 .clone()
                 .or_else(|| Some("medium".into()))
         };
-        // The in-memory tier normalizes `off` to `None` (agent semantics);
-        // comparisons and the settings default use that form.
+        // The runtime tier normalizes `off` to `None` (agent semantics); the
+        // persisted preference keeps the wire form (`Some("off")`) so an
+        // explicit off survives a round trip through a non-thinking model.
         let effective = clamp_thinking(&model, &self.runtime.thinking_levels(&model), desired)
             .filter(|l| l != "off");
+        let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // TS persists the default model/provider on every switch; failures
-        // surface as errors. The settings file is written first so a
-        // later failure cannot leave a half-applied switch.
-        self.persist_global_settings(|settings| {
-            settings.default_provider = Some(model.provider.clone());
-            settings.default_model = Some(model.id.clone());
+        // TS persists the default model/provider on every switch; the
+        // settings file is patched first so a later failure cannot leave a
+        // half-applied switch.
+        let provider = model.provider.clone();
+        let model_id = model.id.clone();
+        self.patch_global_settings(|obj| {
+            obj.insert("defaultProvider".into(), provider.into());
+            obj.insert("defaultModel".into(), model_id.into());
         })
         .await?;
 
         self.harness.set_model(model.clone()).await?;
         // TS `setThinkingLevel`: persist only when the effective level
-        // actually changes (append errors are not surfaced — TS does not
-        // await the entry write either).
+        // actually changes; the entry write is synchronous and throws on
+        // failure — propagate it so the caller knows the state did not land.
         if effective != current_level {
-            let _ = self
-                .harness
+            self.harness
                 .session()
-                .append_thinking_level_change(
-                    effective.clone().unwrap_or_else(|| "off".into()).as_str(),
-                )
-                .await;
+                .append_thinking_level_change(&wire)
+                .await?;
             // TS updates the settings default only when the new model
             // supports thinking or the level is not `off`.
-            if model.thinking != crate::types::ThinkingKind::None || effective.is_some() {
-                self.settings_thinking_default = effective.clone();
-                let default = effective.clone();
+            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+                self.settings_thinking_default = Some(wire.clone());
+                let default = wire.clone();
                 let _ = self
-                    .persist_global_settings(move |settings| {
-                        settings.default_thinking_level = default;
+                    .patch_global_settings(|obj| {
+                        obj.insert("defaultThinkingLevel".into(), default.into());
                     })
                     .await;
             }
@@ -369,21 +370,19 @@ impl AgentSession {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
         let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
+        let wire = effective.clone().unwrap_or_else(|| "off".into());
         let previous = self.harness.agent().state().thinking_level.clone();
         if effective != previous {
-            let _ = self
-                .harness
+            self.harness
                 .session()
-                .append_thinking_level_change(
-                    effective.clone().unwrap_or_else(|| "off".into()).as_str(),
-                )
-                .await;
-            if model.thinking != crate::types::ThinkingKind::None || effective.is_some() {
-                self.settings_thinking_default = effective.clone();
-                let default = effective.clone();
+                .append_thinking_level_change(&wire)
+                .await?;
+            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+                self.settings_thinking_default = Some(wire.clone());
+                let default = wire.clone();
                 let _ = self
-                    .persist_global_settings(move |settings| {
-                        settings.default_thinking_level = default;
+                    .patch_global_settings(|obj| {
+                        obj.insert("defaultThinkingLevel".into(), default.into());
                     })
                     .await;
             }
@@ -392,18 +391,37 @@ impl AgentSession {
         Ok(())
     }
 
-    /// Persist a mutation to the global settings file (agent dir); the file
-    /// is reloaded first so other keys survive (TS settings manager writes
-    /// the whole user settings object).
-    async fn persist_global_settings(
+    /// Patch the global settings file at the field level: the raw JSON is
+    /// read, the closure mutates specific top-level keys, and the whole
+    /// object is written back atomically (temp file + rename). Fields the
+    /// typed `Settings` does not model (theme, packages, extensions,
+    /// transport, images, enabledModels, future keys) survive untouched (TS
+    /// settings manager locks and merges only the modified fields).
+    async fn patch_global_settings(
         &self,
-        mutate: impl FnOnce(&mut crate::settings::Settings),
+        patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     ) -> Result<(), anyhow::Error> {
-        let mut settings = crate::settings::Settings::load_global_at(&self.agent_dir).await?;
-        mutate(&mut settings);
-        settings
-            .save(&crate::settings::Settings::global_path(&self.agent_dir))
-            .await
+        let path = crate::settings::Settings::global_path(&self.agent_dir);
+        let root = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e.into()),
+        };
+        let mut root = match root {
+            serde_json::Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("__legacy_root__".into(), other);
+                map
+            }
+        };
+        patch(&mut root);
+        let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, serialized).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(())
     }
 
     /// The full mounted tool set.
@@ -1593,9 +1611,12 @@ mod tests {
                 thinking: crate::types::ThinkingKind::None,
                 metadata: Default::default(),
             };
+            let agent_dir = dir.path().join("agent");
+            tokio::fs::create_dir_all(&agent_dir).await.unwrap();
             let mut session = create_agent_session()
                 .with_cwd(&cwd)
                 .with_session_dir(dir.path().join("sessions"))
+                .with_agent_dir(&agent_dir)
                 .with_model_runtime(runtime(api))
                 .with_model(model.clone())
                 .build()
@@ -2357,6 +2378,227 @@ mod tests {
             fork.harness.agent().state().thinking_level.as_deref(),
             Some("high"),
             "fork inherits the preference"
+        );
+    }
+
+    /// `patch_global_settings` preserves fields the typed `Settings` does not
+    /// model (theme, packages, nested objects): only the patched keys change.
+    #[tokio::test]
+    async fn settings_patch_preserves_unknown_and_nested_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        // A settings file with known + unknown + nested fields.
+        tokio::fs::write(
+            agent_dir.join("settings.json"),
+            r##"{
+                "defaultModel": "claude-sonnet-4-6",
+                "defaultProvider": "anthropic",
+                "theme": {"base": "dark", "accent": "#f0a"},
+                "packages": ["rust", "python"],
+                "extensions": {"foo": {"enabled": true}},
+                "enabledModels": ["sonnet", "opus"]
+            }"##,
+        )
+        .await
+        .unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // A model switch patches defaultModel/defaultProvider only.
+        session
+            .set_model(Model {
+                provider: "openai".into(),
+                api: "openai".into(),
+                id: "gpt-5".into(),
+                thinking: crate::types::ThinkingKind::Enabled,
+                context_window: 200_000,
+                max_tokens: 16_384,
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
+            .await
+            .unwrap();
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = root.as_object().unwrap();
+        // Patched keys updated.
+        assert_eq!(obj["defaultModel"], "gpt-5");
+        assert_eq!(obj["defaultProvider"], "openai");
+        // Unknown scalar, nested object, array, and nested-boolean fields
+        // all survive the patch.
+        assert_eq!(obj["theme"]["base"], "dark");
+        assert_eq!(obj["theme"]["accent"], "#f0a");
+        assert_eq!(obj["packages"][0], "rust");
+        assert_eq!(obj["packages"][1], "python");
+        assert_eq!(obj["extensions"]["foo"]["enabled"], true);
+        assert_eq!(obj["enabledModels"][0], "sonnet");
+    }
+
+    /// An explicit `off` preference on a thinking model survives a round
+    /// trip through a non-thinking model (and a fork): the preference is
+    /// stored as `Some("off")`, never folded to `None`, so switching back to
+    /// a thinking model restores `off` (not `medium`).
+    #[tokio::test]
+    async fn explicit_off_preference_survives_non_thinking_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        let session_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&session_dir)
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // Explicit off on a thinking model.
+        session.set_thinking_level(None).await.unwrap();
+        assert_eq!(session.harness.agent().state().thinking_level, None);
+
+        // Round trip through a non-thinking model: the off preference must
+        // not be overwritten (a non-thinking model clamps to off and TS does
+        // not store off for non-thinking models).
+        session
+            .set_model(Model {
+                thinking: crate::types::ThinkingKind::None,
+                id: "flat".into(),
+                ..test_model()
+            })
+            .await
+            .unwrap();
+        // Switch back to a thinking model: off, not medium.
+        session
+            .set_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                id: "thinking-back".into(),
+                ..test_model()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level,
+            None,
+            "explicit off survives the round trip"
+        );
+        // The persisted settings preference keeps the wire off.
+        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
+            .await
+            .unwrap();
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(root["defaultThinkingLevel"], "off");
+
+        // A fork inherits the off preference.
+        let _ = session.prompt("branch").await.unwrap();
+        let entries = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap();
+        let leaf = entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e, SessionTreeEntry::Message { .. }))
+            .map(|e| e.id().to_string())
+            .unwrap();
+        let mut fork = session
+            .fork(&leaf, ForkPosition::AtEntry)
+            .await
+            .unwrap()
+            .session;
+        fork.set_model(Model {
+            thinking: crate::types::ThinkingKind::None,
+            id: "fork-flat".into(),
+            ..test_model()
+        })
+        .await
+        .unwrap();
+        fork.set_model(Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            id: "fork-thinking".into(),
+            ..test_model()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fork.harness.agent().state().thinking_level,
+            None,
+            "fork inherits the off preference"
+        );
+    }
+
+    /// A session-append failure propagates: the caller sees an error and the
+    /// in-memory tier is not updated (no divergence between runtime and
+    /// persisted state).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn thinking_append_failure_propagates_and_leaves_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        let session_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&session_dir)
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // Materialize the session file so append writes to it directly.
+        let _ = session.prompt("seed").await.unwrap();
+        let before = session.harness.agent().state().thinking_level.clone();
+        // Make the session file read-only so the append write fails.
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = session.harness.session().storage().path().to_path_buf();
+        let original_mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+        let result = session.set_thinking_level(Some("high".into())).await;
+        // Restore writability for teardown.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "append failure must propagate, got {result:?}"
+        );
+        assert_eq!(
+            session.harness.agent().state().thinking_level,
+            before,
+            "in-memory tier unchanged on append failure"
         );
     }
 
