@@ -98,11 +98,11 @@
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | AgentSession build | 🟡 | `AgentSession::build`（`coding_agent/agent_session.rs`）默认 model 回退 env `ANTHROPIC_MODEL`、session 目录 `.pi-sessions`；settings/trust/resources/system prompt/tools 完整组装见 S6 |
-| AgentSession open | 🟡 | `open()` 不自劢 `restore()`——调用者需手动恢复；S6 改为返回前 restore 并使用 session 恢复的 model/thinking/active tools |
+| AgentSession open | ✅ | `open()` 返回前自动 `restore()` 并复用完整装配（settings/trust/resources/prompt/tools/runtime）；model 经 catalog 精确恢复（未知显式报错，不静默回退） |
 | ModelRuntime from_env | ✅（S3，2026-08-01） | `from_env()` 缺凭证返回 typed `MissingCredential`（命名缺失 env var），不再生成 `missing-*_API_KEY` 假值；自定义 registry 不受 env 限制 |
 | ResourceLoader | 🟡 | `ResourceLoader`（`coding_agent/resources.rs`）有类型与 CLAUDE.md 加载；global context/ancestor chain/skills/templates/去重/诊断未真实接线——见 S5 |
-| settings/trust/cache | 🟡 | 有类型无持久化/无接线（trust 内存态、settings 由接线方加载、cache 金额与 idle 恒零）——见 S5 |
-| fork / events / shutdown | 🔲 | `AgentSession` 无 `fork(entry_id, ForkPosition)`、无统一事件订阅面、无 shutdown——见 S6/S4 |
+| settings/trust/cache | ✅（S5/S8/S11） | settings 文件 load/save/reload + camelCase；trust 全局 agentDir/trust.json + 祖先匹配 + untrusted 门控项目 settings/资源；cache 真实计价（StaticModelPrices）+ idle |
+| fork / events / shutdown | ✅（S4/S6） | `fork(entry_id, ForkPosition)`（BeforeUser 返回选中文本）、HarnessEvent 订阅、shutdown（幂等/清队列/清 mutation/拒绝新操作） |
 
 ## 9. 有意偏离（🚫，不视为对齐缺口）
 
@@ -110,7 +110,7 @@
 - **grep/find 进程内化**（ignore + regex + globset），TS shell 出系统 grep/find
 - **manox 自创恢复项不移植**：空响应 nudge、拒绝熔断、取消级联清理（TS agent-loop 皆无）
 - **registry 不进 crate**：模型解析经 consumer 插接的 ModelResolver，crate 保持 registry-free
-- **Hook 推迟项**：`before_provider_payload`/`after_provider_response`（provider 层无接缝）、`session_before_tree`/`session_tree`（无 tree 操作）、`summarization_retry_*`（summarization 调用无重试/取消）、`model_update`/`tools_update`（fire 点已具备、变体未接线）、`thinking_level_update`/`resources_update`（无 setter 面）——激进纪律不留无 fire 点的死变体；session auto-retry 已由 `RetryEvent` observer 承载（2026-08-01）
+- **Hook 推迟项（已收窄）**：`before_provider_payload`/`after_provider_response` 已接 RequestObserver（S3/S8/S10，带 model + headers map）；`session_before_tree`/`session_tree` 已接 typed hooks（S1/S10，含 summary override + fromHook）；`summarization_retry_*` 已由 RetryEvent observer 承载（S10）；`model_update`/`tools_update`/`resources_update` 已由 HarnessEvent 承载（S4）；`thinking_level_update` 未单独发事件（随 thinking setter 的 HarnessEvent 覆盖）。剩余：extension loader 相关变体（动态 extension 明确不移植）
 
 ## 已知余项（对齐缺口，按严重度排序）
 
@@ -141,6 +141,7 @@
 | S7（2026-08-01） | `76e787c` | `4488ad55c` | check_examples.sh 离线 example gate（8 个实际运行）；fixture README 记录生成命令；upstream delta audit 拆为独立 ledger 项 |
 | S8（复核轮，2026-08-01） | `7f9e077` | `4488ad55c` | 按 remora 复核修复公共组装路径：session cwd 注入工具环境；AGENTS/CLAUDE 指令进 system prompt（不再作 skill）、`.pi/skills|prompts` 目录对齐；settings camelCase + `~` 展开 + thinking/compaction/retry/queue modes 应用；trust 对齐 TS（agentDir/trust.json + 祖先匹配 + undecided 门控项目资源，移除删工具行为）；惰性 per-model 凭证 + provider+modelId 恢复完整 API；fork 保留 assembly 状态；observer 接入公共路径（payload 可变 + headers）；navigate 取消/重试/请求选项闭环；shutdown 清 pending mutation；fork label 最终态；bounded branch queries（find_entries_on_branch/find_entry_on_branch） |
 | S9（复核轮，2026-08-01） | `d86a6fe` | `4488ad55c` | build/open 共用 assemble（open 按 session model 经 catalog 解析，不再默认 Anthropic 阻塞；AgentSession.cwd 跟 session）；branch query 重写为 upstream 语义 + 移植 branch-query.test.ts；唯一 system-prompt builder 雏形；settings.skills/prompts 初接线；before-payload 链式传递 + after-response headers；branch-summary retry 收窄 + 溢出安全退避 |
+| S11（复核轮，2026-08-01） | `（待提交）` | `4488ad55c` | trust 先于 settings（untrusted 项目 settings 视为空配置，含回归）；default thinking 双状态（agent + turn_runtime）且 reopen 无 thinking entry 时回落 settings default；默认工具集改 TS 四件（read/bash/edit/write）；system prompt 随 active tools/resources 重建（builder 闭包，关闭 read 后隐藏 skills）+ skill XML 转义；reopen 模型 catalog 未命中显式报错（不再静默回退）；next_turn 顺序改 user 在前（TS coding-agent）；`prompt()` 默认展开 `/skill:` 与 `/template`；tree hook summary 仅在 summarize 时接受 + fromHook 贯穿持久化与事件；skill/template collision 保留先加载（TS winner=first）；env 测试共享锁消除并行污染 |
 | S10（复核轮，2026-08-01） | `f154f9c` | `4488ad55c` | open 不再经持久化 setter 应用 settings default thinking（新 session 内存初始态，reopen 投影持久化 tier）；`ModelRuntime` 引入可注入 `ModelCatalog`（默认 catalog + 自定义 runtime 注入，同 ID 双协议 reopen 测试）；branch-summary retry：backoff 取消返回 cancelled/aborted 结果（非错误）、成功/失败 End 生命周期配对、maxTokens 强制 2048、quota/billing body 排除重试；settings extra path 支持 file-or-directory（不再多拼 skills/prompts 子目录）、ancestor context 顺序 root→cwd；system prompt 补 working dir/active tools/context 真实路径/skill XML + 无 read 工具隐藏 skills，删除未调用第二套 builder；tree hook 支持 summary override + replaceInstructions override；before-provider-payload 带 model、after-response headers 为 Record<string,string>；P3 测试改进（reopen 不再改进程 cwd、build_fails_early 真调 build） |
 | 第十轮（2026-08-01） | `b9b6869` | `4488ad55c`（未变） | navigate_tree 默认 summarize=false + 选项面（custom/replace/label）+ BranchSummary phase；next_turn 运行中排队（HarnessHandle）；flush 失败 restore 重放队列（恢复后由被排队 model 服务）；substitute_args 单趟全语法（defaults/$0/不递归）；fixture 刷新链路可用（bun 捕获真实 TS 源码）；PLAN/parity 校准 |
 | 第九轮（Phase 4A，2026-08-01） | `d100401` | `4488ad55c`（未变） | 运行配置闭环：Model 全字段判等、restore 三态同步、resolver 失败 terminal 化、无 resolver 跨 API 报错、harness_chat api 修正；新增 6 个回归 + `runtime_switch` example |

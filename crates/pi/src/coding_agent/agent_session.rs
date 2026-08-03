@@ -17,9 +17,6 @@ use crate::session::{SessionStorage, SessionTreeEntry};
 use crate::tool::AgentTool;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
-use crate::tools::find::FindTool;
-use crate::tools::grep::GrepTool;
-use crate::tools::ls::LsTool;
 use crate::tools::read::ReadTool;
 use crate::tools::write::WriteTool;
 use crate::trust::{TrustManager, TrustStatus};
@@ -101,9 +98,48 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Prompt the agent and return the produced messages.
+    /// Prompt the agent and return the produced messages. Expands the TS
+    /// default prompt forms: `/skill:name args` becomes the skill invocation
+    /// block (with `args` appended), and `/name args` expands a prompt
+    /// template by name with `substituteArgs`.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        self.harness.prompt(text).await
+        let expanded = self.expand_prompt(text);
+        self.harness.prompt(&expanded).await
+    }
+
+    /// The TS `_expandSkillCommand` + `expandPromptTemplate` expansion.
+    fn expand_prompt(&self, text: &str) -> String {
+        if let Some(rest) = text.strip_prefix("/skill:") {
+            let (name, args) = match rest.find(' ') {
+                Some(i) => (&rest[..i], rest[i + 1..].trim().to_string()),
+                None => (rest, String::new()),
+            };
+            if let Some(skill) = self.resources().skills.iter().find(|s| s.name == name) {
+                let block = crate::harness::format_skill_invocation(skill, None);
+                return if args.is_empty() {
+                    block
+                } else {
+                    format!("{block}\n\n{args}")
+                };
+            }
+            return text.to_string(); // Unknown skill, pass through.
+        }
+        if let Some(rest) = text.strip_prefix('/') {
+            let (name, args_string) = match rest.find(' ') {
+                Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+                None => (rest, String::new()),
+            };
+            if let Some(template) = self
+                .resources()
+                .prompt_templates
+                .iter()
+                .find(|t| t.name == name)
+            {
+                let args = crate::harness::parse_command_args(&args_string);
+                return crate::harness::substitute_args(&template.content, &args);
+            }
+        }
+        text.to_string()
     }
 
     /// Continue from the current transcript.
@@ -589,20 +625,29 @@ impl AgentSessionBuilder {
         // (with `~` expanded).
         let agent_dir = self.agent_dir.clone().unwrap_or_else(default_agent_dir);
 
-        // Settings: loaded and merged unless the caller supplied an override.
-        let settings = match &self.settings {
-            Some(settings) => settings.clone(),
-            None => crate::settings::Settings::load_at(&cwd, &agent_dir).await?,
-        };
-
-        // Trust: the global `agentDir/trust.json`, nearest-ancestor match.
-        // Undecided projects are treated as untrusted (no UI to ask): their
-        // project-scoped resources are skipped.
+        // Trust first: the global `agentDir/trust.json`, nearest-ancestor
+        // match. Undecided projects are treated as untrusted (no UI to ask).
         let trust = match &self.trust {
             Some(trust) => trust.clone(),
             None => TrustManager::load(&agent_dir.join("trust.json")).unwrap_or_default(),
         };
         let trusted = matches!(trust.check(&cwd), TrustStatus::Trusted);
+
+        // Settings: loaded and merged unless the caller supplied an override.
+        // An untrusted project's settings are treated as an empty config —
+        // `.pi/settings.json` cannot steer shell prefix, model, retry, or
+        // resource paths until the project is trusted (TS).
+        let settings = match &self.settings {
+            Some(settings) => settings.clone(),
+            None => {
+                let mut global = crate::settings::Settings::load_global_at(&agent_dir).await?;
+                if trusted {
+                    let project = crate::settings::Settings::load_project_at(&cwd).await?;
+                    global.merge(&project);
+                }
+                global
+            }
+        };
 
         // Resources: discovered unless the caller supplied them. Trust gates
         // project-scoped resources; the user/agentDir ones always load.
@@ -633,16 +678,14 @@ impl AgentSessionBuilder {
         };
 
         let session_path = session.storage().path().to_path_buf();
+        // TS default tool set: read/bash/edit/write only.
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
             vec![
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
-                Arc::new(WriteTool) as Arc<dyn AgentTool>,
-                Arc::new(EditTool) as Arc<dyn AgentTool>,
                 Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
                     as Arc<dyn AgentTool>,
-                Arc::new(GrepTool) as Arc<dyn AgentTool>,
-                Arc::new(FindTool) as Arc<dyn AgentTool>,
-                Arc::new(LsTool) as Arc<dyn AgentTool>,
+                Arc::new(EditTool) as Arc<dyn AgentTool>,
+                Arc::new(WriteTool) as Arc<dyn AgentTool>,
             ]
         } else {
             self.tools.clone()
@@ -678,9 +721,20 @@ impl AgentSessionBuilder {
         let model = match &self.model {
             Some(model) => model.clone(),
             None => match &session_model {
-                Some(mref) => runtime
-                    .resolve_model(&mref.provider, &mref.model_id)
-                    .unwrap_or_else(default_model),
+                Some(mref) => {
+                    // A reopened session's model must resolve exactly: a
+                    // catalog miss is an explicit error, never a silent
+                    // fallback to a different provider/protocol.
+                    runtime
+                        .resolve_model(&mref.provider, &mref.model_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "session model {}/{} cannot be restored: no catalog entry",
+                                mref.provider,
+                                mref.model_id
+                            )
+                        })?
+                }
                 None => settings
                     .default_model
                     .clone()
@@ -711,6 +765,22 @@ impl AgentSessionBuilder {
             .with_tool_cwd(cwd.clone())
             .with_resources(resources);
         harness = harness.with_model_resolver(model_resolver(&runtime));
+        // Install the prompt builder: the harness rebuilds the system prompt
+        // whenever the effective tool selection or resources change, so the
+        // model never sees tools/skills that are not actually available.
+        let base_prompt_for_builder = base_prompt.clone();
+        let cwd_for_builder = cwd.clone();
+        harness.set_system_prompt_builder(
+            move |active_tools: &[String], resources: &HarnessResources| {
+                crate::system_prompt::build_harness_prompt(
+                    &base_prompt_for_builder,
+                    &cwd_for_builder,
+                    active_tools,
+                    &resources.context_files,
+                    &resources.skills,
+                )
+            },
+        );
         // Attach the request observer so the harness's before-payload /
         // after-response hooks fire on the real provider requests.
         let observer = harness.request_observer();
@@ -721,9 +791,6 @@ impl AgentSessionBuilder {
         // in-memory state — never through the persisting setter, which would
         // append a `thinking_level_change` entry and overwrite the session's
         // persisted tier on every reopen.
-        if !restore && let Some(level) = settings.default_thinking_level.clone() {
-            harness.agent_mut().set_thinking_level(Some(level));
-        }
         harness.set_compaction_settings(settings.resolved_compaction());
         harness.set_retry_settings(settings.resolved_retry());
         if let Some(mode) = settings.resolved_steering_mode() {
@@ -740,6 +807,16 @@ impl AgentSessionBuilder {
         }
         if restore {
             harness.restore().await?;
+        }
+        // Default thinking tier: applied in-memory to BOTH the agent state
+        // and the shared runtime snapshot (so the first turn does not wipe
+        // it), for a new session and for a reopened session that carries no
+        // persisted thinking entry (TS falls back to the settings default).
+        // Never through the persisting setter; a persisted entry wins.
+        if let Some(level) = settings.default_thinking_level.clone()
+            && harness.agent().state().thinking_level.is_none()
+        {
+            harness.set_initial_thinking_level(Some(level));
         }
 
         Ok(AgentSession {
@@ -832,11 +909,20 @@ mod tests {
     }
 
     fn fake_runtime() -> ModelRuntime {
+        use crate::coding_agent::model_runtime::ModelCatalog;
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stream: Arc<dyn StreamFn> = Arc::new(Scripted(Arc::clone(&calls)));
         let resolver: crate::agent_loop::StreamResolver =
             Arc::new(move |_model: &Model| Ok(Arc::clone(&stream)));
-        ModelRuntime::new(resolver)
+        // A catalog that restores the test model, so reopen resolves it
+        // exactly instead of erroring.
+        struct TestCatalog;
+        impl ModelCatalog for TestCatalog {
+            fn resolve(&self, provider: &str, _model_id: &str) -> Option<Model> {
+                (provider == "test").then(test_model)
+            }
+        }
+        ModelRuntime::new(resolver).with_catalog(Arc::new(TestCatalog))
     }
 
     fn test_model() -> Model {
@@ -1228,6 +1314,101 @@ mod tests {
         }
     }
 
+    /// An untrusted project's settings are treated as an empty config:
+    /// `.pi/settings.json` cannot steer the shell prefix or resource paths.
+    #[tokio::test]
+    async fn untrusted_project_settings_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
+            .await
+            .unwrap();
+        // Project settings attempt to set a shell prefix and an external
+        // skill path — untrusted, so neither applies.
+        tokio::fs::create_dir_all(cwd.join(".pi")).await.unwrap();
+        tokio::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"shellCommandPrefix": "sudo", "skills": ["/ext/skills"]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("ext/skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("ext/skills/ext.md"), "external skill")
+            .await
+            .unwrap();
+        // No trust decision: project treated as untrusted.
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        let skill_names: Vec<&str> = session
+            .resources()
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !skill_names.contains(&"ext"),
+            "external skill path must not load from untrusted project settings: {skill_names:?}"
+        );
+        assert!(
+            !skill_names.contains(&"proj"),
+            "project skills skipped when untrusted: {skill_names:?}"
+        );
+    }
+
+    /// The system prompt is rebuilt when the active tools change, so skills
+    /// disappear once the read tool is disabled.
+    #[tokio::test]
+    async fn prompt_rebuilds_after_active_tool_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            cwd.join(".pi/skills/review.md"),
+            "---\nname: review\n---\nCheck the diff.",
+        )
+        .await
+        .unwrap();
+        let mut trust = crate::trust::TrustManager::new();
+        trust.trust(&cwd);
+        trust.save(&agent_dir.join("trust.json")).unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        let system_prompt = session.harness.agent().state().system_prompt.clone();
+        assert!(
+            system_prompt.contains(r#"<skill name="review">"#),
+            "{system_prompt}"
+        );
+
+        // Disable read: the skill index must disappear from the prompt.
+        session.set_active_tools(vec!["bash".into()]).await.unwrap();
+        let system_prompt = session.harness.agent().state().system_prompt.clone();
+        assert!(!system_prompt.contains("<skill"), "{system_prompt}");
+    }
+
     #[tokio::test]
     async fn undecided_trust_skips_project_scoped_resources() {
         let dir = tempfile::tempdir().unwrap();
@@ -1270,9 +1451,14 @@ mod tests {
     /// missing-credential error when the environment has no keys; the custom
     /// runtime path (covered above) never consults the environment.
     /// A build without credentials fails with the typed missing-credential
-    /// error for the default model's provider.
+    /// error for the default model's provider. Serializes the process-wide
+    /// env mutation against other tests.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn build_fails_early_without_credentials() {
+        let _guard = crate::coding_agent::model_runtime::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap();
         let restore: Vec<(String, Option<String>)> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
             .iter()
             .map(|v| {

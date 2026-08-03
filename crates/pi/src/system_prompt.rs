@@ -45,11 +45,22 @@ pub fn build_harness_prompt(
         for skill in skills {
             prompt.push_str(&format!(
                 "<skill name=\"{}\">\n<description>{}</description>\n<path>{}</path>\n</skill>\n",
-                skill.name, skill.description, skill.location
+                xml_escape(&skill.name),
+                xml_escape(&skill.description),
+                xml_escape(&skill.location)
             ));
         }
     }
     prompt
+}
+
+/// Escape XML-special characters in prompt-embedded strings.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]

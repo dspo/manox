@@ -513,6 +513,10 @@ pub struct BranchSummaryHookOverride {
     pub usage: Option<crate::types::Usage>,
 }
 
+/// Rebuilds the harness system prompt from the effective tool selection and
+/// resources.
+pub type SystemPromptBuilder = Arc<dyn Fn(&[String], &HarnessResources) -> String + Send + Sync>;
+
 /// The typed `session_before_tree` hook event, mirroring the TS
 /// `SessionBeforeTreeEvent`: the navigation preparation a handler can cancel
 /// or use to override the summarization instructions and label. The TS
@@ -775,6 +779,10 @@ pub struct AgentHarness<S: SessionStorage> {
     /// Tokens reserved for a branch summary's prompt + response (TS
     /// `branchSummary.reserveTokens`).
     branch_summary_reserve: usize,
+    /// Consumer-provided system-prompt builder invoked whenever the
+    /// effective active-tool selection or resources change, so the prompt
+    /// never advertises tools/skills that are not actually available.
+    system_prompt_builder: Option<SystemPromptBuilder>,
     /// Skills and prompt templates the harness can expand into prompts.
     resources: HarnessResources,
 }
@@ -890,6 +898,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             resources: HarnessResources::default(),
             show_cache_miss_notices: false,
             branch_summary_reserve: crate::compaction::branch_summarization::RESERVE_TOKENS,
+            system_prompt_builder: None,
         }
     }
 
@@ -1174,6 +1183,43 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.retry_settings = settings;
     }
 
+    /// Apply an initial thinking tier in memory — both the agent state and
+    /// the shared runtime snapshot — without persisting an entry. Used for
+    /// the settings default; `set_thinking_level` persists, this one does
+    /// not.
+    pub fn set_initial_thinking_level(&mut self, level: Option<String>) {
+        self.agent.set_thinking_level(level.clone());
+        self.control.turn_runtime.lock().unwrap().thinking_level = level;
+    }
+
+    /// Install the system-prompt builder; the harness re-invokes it whenever
+    /// the effective tool selection or resources change.
+    pub fn set_system_prompt_builder(
+        &mut self,
+        builder: impl Fn(&[String], &HarnessResources) -> String + Send + Sync + 'static,
+    ) {
+        self.system_prompt_builder = Some(Arc::new(builder));
+    }
+
+    /// Rebuild the system prompt from the builder over the EFFECTIVE tool
+    /// selection and resources. A no-op without a builder (the harness keeps
+    /// its construction-time prompt).
+    fn rebuild_system_prompt(&mut self) {
+        let Some(builder) = &self.system_prompt_builder else {
+            return;
+        };
+        let names: Vec<String> = match &self.active_tool_names {
+            Some(names) => names.clone(),
+            None => self
+                .all_tools
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect(),
+        };
+        let prompt = builder(&names, &self.resources);
+        self.agent.set_system_prompt(prompt);
+    }
+
     /// Whether cache-miss notices are shown.
     pub fn show_cache_miss_notices(&self) -> bool {
         self.show_cache_miss_notices
@@ -1354,6 +1400,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Replace the mounted resources, emitting a `ResourcesUpdate`.
     pub fn set_resources(&mut self, resources: HarnessResources) {
         self.resources = resources;
+        self.rebuild_system_prompt();
         self.emit_harness(HarnessEvent::ResourcesUpdate);
     }
 
@@ -1542,6 +1589,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             None => self.all_tools.to_vec(),
         };
         self.agent.set_tools(tools.into());
+        self.rebuild_system_prompt();
     }
 
     /// Register a hook handler.
@@ -1642,11 +1690,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             timestamp: chrono::Utc::now(),
         };
         let mut batch = Vec::new();
-        // Queued next-turn messages run before the prompt's own message,
-        // mirroring TS.
+        // The prompt's own user message runs first; queued next-turn
+        // messages follow as asides (TS coding-agent `prompt()`), then
+        // hook-injected messages.
+        batch.push(user_message);
         batch.append(&mut self.control.next_turn_queue.lock().unwrap());
         self.emit_queue_update();
-        batch.push(user_message);
         batch.extend(hook_ctx.inject_messages);
 
         let prior_system_prompt = self.agent.state().system_prompt.clone();
@@ -2224,10 +2273,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // request carries the harness's per-request stream options; transient
         // failures retry under the harness retry policy; the operation token
         // lets abort/shutdown end the run.
-        let summary = if let Some(hook) = hook_summary {
-            // The hook supplied the summary: no model call, persisted with
-            // fromHook below.
-            Some(hook)
+        // A hook summary is honored only when the caller requested one
+        // (TS), and carries fromHook provenance through persistence.
+        let summary = if options.summarize
+            && let Some(hook) = hook_summary
+        {
+            Some((hook, true))
         } else if options.summarize && !abandoned.is_empty() {
             let stream_fn = match &self.stream_resolver {
                 Some(resolver) => resolver(&self.model)?,
@@ -2347,7 +2398,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                     summary_entry_id: None,
                 });
             }
-            Some(result)
+            Some((result, false))
         } else {
             None
         };
@@ -2365,7 +2416,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         };
         self.session.move_to(new_leaf.as_deref()).await?;
         let summary_entry_id = match &summary {
-            Some(summary) => Some(
+            Some((summary, from_hook)) => Some(
                 self.session
                     .append_branch_summary(
                         new_leaf.as_deref().unwrap_or("root"),
@@ -2373,7 +2424,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                         &summary.read_files,
                         &summary.modified_files,
                         summary.usage.clone(),
-                        false,
+                        *from_hook,
                     )
                     .await?,
             ),
@@ -2398,12 +2449,13 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.restore().await?;
 
         let new_leaf_id = self.session.leaf_id().await?;
+        let from_hook = summary.as_ref().map(|(_, from_hook)| *from_hook);
         let tree_event = SessionTreeEvent {
             kind: "session_tree",
             new_leaf_id: new_leaf_id.as_deref(),
             old_leaf_id: old_leaf.as_deref(),
             summary_entry_id: summary_entry_id.as_deref(),
-            from_hook: None,
+            from_hook,
         };
         let _ = self.run_hooks(
             HookPoint::SessionTree,
@@ -2440,6 +2492,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.set_thinking_level(context.thinking_level);
         self.active_tool_names = context.active_tool_names;
         self.apply_active_tools();
+        self.rebuild_system_prompt();
         if let (Some(resolver), Some(model_ref)) = (&self.model_resolver, &context.model)
             && let Some(model) = resolver(model_ref)
         {
@@ -2983,6 +3036,39 @@ pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&s
         Some(extra) => format!("{block}\n\n{extra}"),
         None => block,
     }
+}
+
+/// Parse an argument string with shell-style single/double quotes — the TS
+/// `parseCommandArgs`. Whitespace splits unquoted tokens; quoted sections
+/// keep their inner content.
+pub fn parse_command_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in args.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// The TS coding-agent `substituteArgs`: one regex pass over the template
@@ -8191,8 +8277,8 @@ pub(crate) mod tests {
                 if matches!(&content[0], ContentBlock::Text { text, .. } if text.contains("<skill name=\"summarize\" location=\"/proj/skills/summarize.md\">"))
         )));
 
-        // A queued next-turn message runs before the following prompt's own
-        // message.
+        // A queued next-turn message follows the prompt's own message (TS
+        // coding-agent `prompt()`).
         harness.next_turn("queued next", Vec::new());
         assert!(harness.has_next_turn());
         let messages = harness.prompt("direct").await.unwrap();
@@ -8200,12 +8286,12 @@ pub(crate) mod tests {
         assert!(matches!(
             &messages[0],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued next")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "direct")
         ));
         assert!(matches!(
             &messages[1],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "direct")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued next")
         ));
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
@@ -8306,12 +8392,12 @@ pub(crate) mod tests {
         assert!(matches!(
             &messages[0],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued mid-run")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "second")
         ));
         assert!(matches!(
             &messages[1],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "second")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued mid-run")
         ));
     }
 

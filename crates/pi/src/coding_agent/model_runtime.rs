@@ -249,13 +249,17 @@ impl ModelRuntime {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Serializes process-wide env mutations across parallel tests.
+    pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A missing key for the requested model's api surfaces as a typed
     /// error at resolve time — never a placeholder key shipped to the API.
     #[test]
     fn from_env_resolves_credentials_lazily_per_model() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _guard = ScopedEnvGuard::clear(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
         let runtime = ModelRuntime::from_env();
         // Only the anthropic model is served by this resolver's own closure;
@@ -281,6 +285,7 @@ mod tests {
     /// credentials.
     #[test]
     fn custom_runtime_does_not_need_env_credentials() {
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _guard = ScopedEnvGuard::clear(&["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
         let resolver: StreamResolver = Arc::new(|_| Err(anyhow::anyhow!("no stream in this test")));
         let runtime = ModelRuntime::new(resolver);

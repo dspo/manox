@@ -78,12 +78,27 @@ impl StreamFn for FakeProvider {
 }
 
 fn fake_runtime() -> ModelRuntime {
+    use pi::coding_agent::model_runtime::ModelCatalog;
+    struct MockCatalog;
+    impl ModelCatalog for MockCatalog {
+        fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
+            (provider == "mock").then(|| Model {
+                provider: "mock".into(),
+                api: "mock".into(),
+                id: model_id.into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            })
+        }
+    }
     let provider = Arc::new(FakeProvider {
         step: std::sync::atomic::AtomicU32::new(0),
     }) as Arc<dyn StreamFn>;
     let resolver: pi::agent_loop::StreamResolver =
         Arc::new(move |_model: &Model| Ok(Arc::clone(&provider)));
-    ModelRuntime::new(resolver)
+    ModelRuntime::new(resolver).with_catalog(Arc::new(MockCatalog))
 }
 
 #[tokio::main]

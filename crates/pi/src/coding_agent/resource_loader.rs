@@ -272,7 +272,7 @@ async fn load_explicit_path(
                     message: format!("prompt template name conflict: {name:?}"),
                     path: path.to_string_lossy().into_owned(),
                 });
-                resources.prompt_templates.retain(|t| t.name != name);
+                return;
             }
             resources
                 .prompt_templates
@@ -333,15 +333,17 @@ fn push_skill(
     diagnostics: &mut Vec<ResourceDiagnostic>,
     skill: Skill,
 ) {
-    if resources.skills.iter().any(|s| s.name == skill.name) {
+    if let Some(winner) = resources.skills.iter().find(|s| s.name == skill.name) {
+        // The first loaded skill wins (TS keeps the first; later resources
+        // are losers). User/global skills therefore take precedence.
         diagnostics.push(ResourceDiagnostic {
             message: format!(
-                "skill name conflict: {:?} (project overrides global)",
-                skill.name
+                "skill name conflict: {:?} (kept {} as winner, dropped {})",
+                skill.name, winner.location, skill.location
             ),
             path: skill.location.clone(),
         });
-        resources.skills.retain(|s| s.name != skill.name);
+        return;
     }
     resources.skills.push(skill);
 }
@@ -387,12 +389,10 @@ async fn load_templates_from_dir(
             .to_string();
         if resources.prompt_templates.iter().any(|t| t.name == name) {
             diagnostics.push(ResourceDiagnostic {
-                message: format!(
-                    "prompt template name conflict: {name:?} (project overrides global)"
-                ),
+                message: format!("prompt template name conflict: {name:?} (first wins)"),
                 path: path.to_string_lossy().into_owned(),
             });
-            resources.prompt_templates.retain(|t| t.name != name);
+            continue;
         }
         resources
             .prompt_templates
@@ -617,7 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn templates_load_with_project_winning_conflicts() {
+    async fn templates_collision_keeps_the_first_winner() {
         let dir = tmp();
         let cwd = dir.path().join("proj");
         let agent_dir = dir.path().join("agent");
@@ -642,7 +642,9 @@ mod tests {
             .iter()
             .find(|t| t.name == "fix")
             .unwrap();
-        assert_eq!(fix.content, "project fix", "project wins the conflict");
+        // The first loaded (global) template wins; the project one is the
+        // loser (TS collision semantics).
+        assert_eq!(fix.content, "global fix");
         assert!(
             snapshot
                 .diagnostics
