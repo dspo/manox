@@ -105,6 +105,10 @@ fn fake_runtime() -> ModelRuntime {
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
+    // An isolated agent dir keeps set_model from writing the real
+    // ~/.pi/agent/settings.json; the smoke run must not touch the host.
+    let agent_dir = dir.path().join("agent");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
     // A CLAUDE.md (automatic context), a project skill, and a prompt
     // template in the TS `.pi` layout.
     tokio::fs::write(cwd.join("CLAUDE.md"), "Keep changes minimal.")
@@ -129,6 +133,7 @@ async fn main() {
     let mut session = create_agent_session()
         .with_cwd(cwd.clone())
         .with_session_dir(dir.path().join("sessions"))
+        .with_agent_dir(agent_dir.clone())
         .with_model_runtime(fake_runtime())
         .with_model(Model {
             provider: "mock".into(),
@@ -199,6 +204,7 @@ async fn main() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     let mut resumed = create_agent_session()
         .with_cwd(cwd)
+        .with_agent_dir(agent_dir)
         .with_model_runtime(fake_runtime())
         .open(listed[0].path.clone())
         .await

@@ -7,8 +7,10 @@
 // is forwarded straight through. `fork` replaces the session with a
 // root→leaf path fork; `close` settles the harness before returning the path.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 
@@ -29,6 +31,29 @@ use crate::types::{AgentMessage, Model, StopReason};
 
 use super::model_runtime::{ModelCatalog, ModelRuntime};
 use super::resource_loader::ResourceLoader;
+
+/// Per-agent-dir mutex registry so concurrent `patch_global_settings` calls
+/// on the same agent dir serialize their read-modify-write. The registry
+/// itself is a brief `std::sync::Mutex` over a path map; the per-path lock
+/// is a `tokio::sync::Mutex` held across the await points of the patch.
+static SETTINGS_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// Per-process counter for unique temp-file names (paired with the pid).
+static SETTINGS_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Acquire (get-or-create) the per-path settings mutex. Returns the
+/// `Arc`; the caller awaits `arc.lock()`.
+fn settings_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = SETTINGS_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("settings lock registry poisoned");
+    if let Some(m) = guard.get(path).cloned() {
+        return m;
+    }
+    let m = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(path.to_path_buf(), Arc::clone(&m));
+    m
+}
 
 /// Where a fork attaches the new session: at the selected entry, or before
 /// the selected user message (which focuses its parent and reports its text).
@@ -302,6 +327,13 @@ impl AgentSession {
     /// settings default (else `medium`), otherwise the user preference is kept
     /// and clamped.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
+        // TS checkAuth: preflight the target model's credentials before any
+        // mutation. The harness resolves streams through the same resolver at
+        // prompt time, so a `MissingCredential` surfaced here is exactly the
+        // error the next prompt would hit; failing now leaves the model, the
+        // session JSONL, and settings all unchanged.
+        (self.runtime.resolver())(&model).context("preflight model credentials")?;
+
         // Compute the effective thinking level up front: TS
         // `_getThinkingLevelForModelSwitch` keeps the user preference when
         // the current model supports thinking, else restores the settings
@@ -322,20 +354,10 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // TS writes the declared default (provider/model) before the
-        // switch: settings.json carries the user's intent for future
-        // sessions, and the harness switch follows. A failed switch leaves
-        // the active session on its prior model (the session JSONL is
-        // authoritative on reopen) while the declared default persists —
-        // matching TS `setModel`.
-        let provider = model.provider.clone();
-        let model_id = model.id.clone();
-        self.patch_global_settings(|obj| {
-            obj.insert("defaultProvider".into(), provider.into());
-            obj.insert("defaultModel".into(), model_id.into());
-        })
-        .await?;
-
+        // TS order: update agent (append model_change + in-memory), then
+        // append the thinking entry, THEN persist settings LAST. A switch or
+        // entry failure cannot leave settings ahead of the session JSONL,
+        // which is authoritative on reopen.
         self.harness.set_model(model.clone()).await?;
         // TS `setThinkingLevel`: persist only when the effective level
         // actually changes; the entry write is synchronous and throws on
@@ -345,25 +367,37 @@ impl AgentSession {
                 .session()
                 .append_thinking_level_change(&wire)
                 .await?;
-            // TS updates the settings default only when the new model
-            // supports thinking or the level is not `off`. The switch and
-            // thinking entry have already landed; the default is a best-effort
-            // preference for future sessions, so a write failure is logged
-            // rather than failing an otherwise-successful switch.
             if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
                 self.settings_thinking_default = Some(wire.clone());
-                let default = wire.clone();
-                if let Err(e) = self
-                    .patch_global_settings(|obj| {
-                        obj.insert("defaultThinkingLevel".into(), default.into());
-                    })
-                    .await
-                {
-                    tracing::warn!("failed to persist default thinking level: {e:#}");
-                }
             }
         }
         self.harness.set_initial_thinking_level(effective);
+
+        // Settings last: the declared default (provider/model, and the
+        // thinking level when the new model supports it or the level is not
+        // off) for future sessions. The switch and thinking entry have
+        // already landed, so a write failure is logged rather than failing an
+        // otherwise-successful switch.
+        let provider = model.provider.clone();
+        let model_id = model.id.clone();
+        let thinking_default =
+            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+                Some(wire.clone())
+            } else {
+                None
+            };
+        if let Err(e) = self
+            .patch_global_settings(|obj| {
+                obj.insert("defaultProvider".into(), provider.into());
+                obj.insert("defaultModel".into(), model_id.into());
+                if let Some(d) = thinking_default {
+                    obj.insert("defaultThinkingLevel".into(), d.into());
+                }
+            })
+            .await
+        {
+            tracing::warn!("failed to persist model switch default: {e:#}");
+        }
         Ok(())
     }
 
@@ -412,14 +446,23 @@ impl AgentSession {
     /// object is written back atomically (temp file + rename). Fields the
     /// typed `Settings` does not model (theme, packages, extensions,
     /// transport, images, enabledModels, future keys) survive untouched, as
-    /// TS merges only the modified fields. manox ships single-process, so no
-    /// cross-process file lock is taken; concurrent writes from other
-    /// processes racing on the same agent dir are not guarded.
+    /// TS merges only the modified fields.
+    ///
+    /// The whole read-modify-write is serialized per agent dir by a
+    /// process-local mutex so two `AgentSession` instances sharing one agent
+    /// dir (e.g. two windows) cannot lose updates or race on the temp file.
+    /// manox ships single-process, so no cross-process file lock is taken;
+    /// concurrent writes from OTHER processes are not guarded.
     async fn patch_global_settings(
         &self,
         patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
     ) -> Result<(), anyhow::Error> {
         let path = crate::settings::Settings::global_path(&self.agent_dir);
+        // Serialize per-path: hold the lock across read, patch, write, rename
+        // so a concurrent patch on the same agent dir sees this write's
+        // result, not a stale snapshot.
+        let lock = settings_lock(&path);
+        let _guard = lock.lock().await;
         let root = match tokio::fs::read_to_string(&path).await {
             // A missing file is a fresh start: patch runs against `{}`.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
@@ -441,7 +484,14 @@ impl AgentSession {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = path.with_extension("json.tmp");
+        // Unique temp name per call: concurrent patches (even within this
+        // process) cannot clobber each other's temp file before the rename.
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "settings.json".into());
+        let n = SETTINGS_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{file_name}.tmp.{}.{}", std::process::id(), n));
         tokio::fs::write(&tmp, serialized).await?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok(())
@@ -2470,11 +2520,13 @@ mod tests {
         assert_eq!(obj["enabledModels"][0], "sonnet");
     }
 
-    /// A corrupt global settings file is not silently wiped to `{}`: the
-    /// parse error propagates and the on-disk content is left intact for the
-    /// user to repair.
+    /// A corrupt global settings file neither blocks a model switch nor gets
+    /// silently wiped: `patch_global_settings` reads it, the parse error
+    /// aborts the patch before any write, and the switch (which writes the
+    /// session JSONL, not settings) proceeds. The on-disk content is left
+    /// intact for the user to repair.
     #[tokio::test]
-    async fn patch_global_settings_propagates_parse_error_without_wiping() {
+    async fn corrupt_settings_survive_a_model_switch() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         let agent_dir = dir.path().join("agent");
@@ -2506,8 +2558,8 @@ mod tests {
             })
             .await;
         assert!(
-            result.is_err(),
-            "corrupt settings must error, got {result:?}"
+            result.is_ok(),
+            "switch proceeds despite corrupt settings: {result:?}"
         );
         let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
             .await
@@ -2550,6 +2602,154 @@ mod tests {
             .await
             .unwrap();
         assert!(agent_dir.join("settings.json").exists());
+    }
+
+    /// A model whose credentials cannot be resolved is rejected by the
+    /// preflight BEFORE any mutation: the harness model, the session JSONL,
+    /// and settings.json are all left unchanged.
+    #[tokio::test]
+    async fn set_model_rejected_by_credential_preflight_leaves_state_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        // A runtime whose resolver errors for the "unauthed" model and serves
+        // the rest with the scripted stream.
+        use crate::agent_loop::StreamFn;
+        let stream: Arc<dyn StreamFn> =
+            Arc::new(Scripted(Arc::new(std::sync::Mutex::new(Vec::new()))));
+        let ok_stream = Arc::clone(&stream);
+        let resolver: crate::agent_loop::StreamResolver = Arc::new(move |model: &Model| {
+            if model.id == "unauthed" {
+                return Err(anyhow::anyhow!("missing credential for {}", model.id));
+            }
+            Ok(Arc::clone(&ok_stream))
+        });
+        struct AuthCatalog;
+        impl crate::coding_agent::model_runtime::ModelCatalog for AuthCatalog {
+            fn resolve(&self, provider: &str, _id: &str) -> Option<Model> {
+                (provider == "test").then(test_model)
+            }
+        }
+        let runtime = ModelRuntime::new(resolver).with_catalog(Arc::new(AuthCatalog));
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(runtime)
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        // Seed a settings file with a sentinel unknown field; it must survive
+        // a rejected switch untouched.
+        let sentinel = r#"{"defaultModel":"test-1","theme":"dark"}"#;
+        tokio::fs::write(agent_dir.join("settings.json"), sentinel)
+            .await
+            .unwrap();
+        let model_before = session.harness.model().id.clone();
+        let entries_before = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        let result = session
+            .set_model(Model {
+                id: "unauthed".into(),
+                ..test_model()
+            })
+            .await;
+        assert!(result.is_err(), "preflight must reject, got {result:?}");
+        assert_eq!(
+            session.harness.model().id,
+            model_before,
+            "harness model unchanged on rejected switch"
+        );
+        let entries_after = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            entries_before, entries_after,
+            "session JSONL unchanged on rejected switch"
+        );
+        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
+            .await
+            .unwrap();
+        assert_eq!(raw, sentinel, "settings unchanged on rejected switch");
+    }
+
+    /// Two `AgentSession` instances sharing one agent dir can patch different
+    /// settings fields concurrently without losing updates: the per-path
+    /// mutex serializes the read-modify-write, so both keys land.
+    #[tokio::test]
+    async fn concurrent_settings_patches_on_shared_agent_dir_do_not_lose_updates() {
+        // Run several rounds; the race window is real I/O, so a missing
+        // lock would flakily drop a key on at least one round.
+        for round in 0..20usize {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().join("proj");
+            let agent_dir = dir.path().join("agent");
+            tokio::fs::create_dir_all(&cwd).await.unwrap();
+            tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+            let mut a = create_agent_session()
+                .with_cwd(&cwd)
+                .with_session_dir(dir.path().join("sessions-a"))
+                .with_agent_dir(&agent_dir)
+                .with_model_runtime(fake_runtime())
+                .with_model(Model {
+                    thinking: crate::types::ThinkingKind::Enabled,
+                    ..test_model()
+                })
+                .build()
+                .await
+                .unwrap();
+            let mut b = create_agent_session()
+                .with_cwd(&cwd)
+                .with_session_dir(dir.path().join("sessions-b"))
+                .with_agent_dir(&agent_dir)
+                .with_model_runtime(fake_runtime())
+                .with_model(Model {
+                    thinking: crate::types::ThinkingKind::Enabled,
+                    ..test_model()
+                })
+                .build()
+                .await
+                .unwrap();
+            // A switches the model; B changes the thinking level. Both patch
+            // the shared settings file on different keys.
+            let (ra, rb) = tokio::join!(
+                a.set_model(Model {
+                    id: format!("beta-{round}"),
+                    thinking: crate::types::ThinkingKind::Enabled,
+                    ..test_model()
+                }),
+                b.set_thinking_level(Some("high".into()))
+            );
+            ra.unwrap();
+            rb.unwrap();
+            let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
+                .await
+                .unwrap();
+            let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                root["defaultModel"],
+                format!("beta-{round}"),
+                "round {round}: model patch lost"
+            );
+            assert_eq!(
+                root["defaultThinkingLevel"], "high",
+                "round {round}: thinking patch lost"
+            );
+        }
     }
 
     /// An explicit `off` preference on a thinking model survives a round

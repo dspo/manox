@@ -64,3 +64,6 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      - name: Offline example gate
+        run: ./crates/pi/scripts/check_examples.sh
