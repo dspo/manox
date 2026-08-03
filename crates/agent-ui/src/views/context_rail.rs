@@ -41,9 +41,8 @@ use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_disp
 // ── Geometry ─────────────────────────────────────────────────────────────
 
 /// Floating card width. Wide enough for the per-model usage block: model id
-/// (plus trailing cache-hit badge) on the top line, `├── 穿透` (input /
-/// (input / output) and `└── 缓存` (cache read) tree rows underneath,
-/// each with `↑↓` animated counters.
+/// on the top line, then `├─ pct% used/cap` and `└─ ↑input ↓output Rcache
+/// CHhit%` tree rows underneath.
 pub(crate) const ENV_CARD_WIDTH: f32 = 260.;
 /// Right inset the conversation body reserves for the floating card: the
 /// card width plus a gutter so the message list clears the card's shadow.
@@ -356,94 +355,59 @@ impl ContextRail {
             for (i, (model_name, usage)) in models.iter().enumerate() {
                 let is_last_model = i == total_models - 1;
                 // Tree glyphs: model node gets the root branch glyph; children
-                // share a vertical-line or empty-line indent prefix plus their
-                // own branch glyph.
+                // share a 4-column indent prefix (vertical line or blank) plus
+                // their own branch glyph.
                 let branch = if is_last_model { "└─" } else { "├─" };
-                let indent = if is_last_model { "   " } else { "│  " };
+                let indent = if is_last_model { "    " } else { "│   " };
 
-                let cache_pct = crate::cockpit::cache_read_ratio(**usage);
-                let model = registry::global().get_model_by_name(model_name);
-                let window_label = model
-                    .as_ref()
-                    .map(|m| {
-                        let cap = crate::cockpit::format_tokens(m.max_token_count());
-                        format!("[{cap}]")
-                    })
-                    .unwrap_or_default();
-                let model_label = if let Some(pct) = cache_pct {
-                    format!(
-                        "{} {}{}  {}",
-                        branch,
-                        model_name,
-                        window_label,
-                        i18n::t_str(
-                            "workspace-env-cache-hit-rate",
-                            &[("pct", &format!("{:.0}", pct * 100.0))]
-                        )
-                    )
-                } else {
-                    format!("{} {}{}", branch, model_name, window_label)
-                };
-
+                // Model row shows only the display name (which already carries
+                // the `[1m]` window suffix); the cache rate and window label
+                // are deliberately omitted — the rate moves to the CH field.
                 section = section.child(
                     gpui::div()
                         .text_xs()
                         .text_color(theme.foreground)
                         .truncate()
-                        .child(SharedString::from(model_label)),
+                        .child(SharedString::from(format!("{branch} {model_name}"))),
                 );
 
-                // Context budget row — first tree child.
-                if let Some(m) = model.as_ref() {
-                    let max_input = m.max_token_count();
-                    if let Some(budget) = context_budget_pct(max_input, effective_tokens) {
-                        let pct = (budget.used_pct.round() as i64).clamp(0, 100);
-                        let used = crate::cockpit::format_tokens(budget.active_tokens);
-                        let cap = crate::cockpit::format_tokens(budget.cap_tokens);
-                        let near_full = budget.used_pct >= 90.0;
-                        let ctx_color = if near_full { warn_color } else { muted };
-                        let ctx_line = i18n::t_str(
-                            "workspace-env-context-budget",
-                            &[("pct", &pct.to_string()), ("used", &used), ("cap", &cap)],
-                        );
-                        section = section.child(
-                            gpui::div()
-                                .pl(px(16.))
-                                .text_xs()
-                                .text_color(ctx_color)
-                                .child(SharedString::from(format!("{indent}├─ {ctx_line}"))),
-                        );
-                    }
+                // Context budget row — first tree child, only when the model is
+                // registered (so its window size is resolvable).
+                let model = registry::global().get_model_by_name(model_name);
+                let budget = model
+                    .as_ref()
+                    .and_then(|m| context_budget_pct(m.max_token_count(), effective_tokens));
+                if let Some(budget) = budget {
+                    let used = crate::cockpit::format_tokens_pi(budget.active_tokens);
+                    let cap = crate::cockpit::format_tokens_pi(budget.cap_tokens);
+                    let near_full = budget.used_pct >= 90.0;
+                    let ctx_color = if near_full { warn_color } else { muted };
+                    section = section.child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(ctx_color)
+                            .truncate()
+                            .child(SharedString::from(format!(
+                                "{indent}├─ {:.1}% {used}/{cap}",
+                                budget.used_pct
+                            ))),
+                    );
                 }
 
-                let throughput = format!(
-                    "{indent}├─ {} ↑{}  {} ↑{}",
-                    i18n::t("workspace-env-throughput"),
-                    crate::cockpit::format_tokens(usage.input_tokens),
-                    i18n::t("workspace-env-cache"),
-                    crate::cockpit::format_tokens(usage.cache_read_input_tokens),
-                );
-                let output_line = format!(
-                    "{indent}└─ {} ↓{}",
-                    i18n::t("workspace-env-output"),
-                    crate::cockpit::format_tokens(usage.output_tokens),
-                );
-
-                section = section
-                    .child(
-                        gpui::div()
-                            .pl(px(16.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(SharedString::from(throughput)),
-                    )
-                    .child(
-                        gpui::div()
-                            .pl(px(16.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(SharedString::from(output_line)),
-                    );
+                // Token line: ↑input ↓output Rcache_read CHcache_hit_rate. `--`
+                // (the tooltip convention) when there is no input to measure.
+                let cache_hit = crate::cockpit::cache_read_ratio(**usage)
+                    .map(|r| format!("{:.1}", r * 100.0))
+                    .unwrap_or_else(|| "--".into());
+                section = section.child(gpui::div().text_xs().text_color(muted).truncate().child(
+                    SharedString::from(format!(
+                        "{indent}└─ ↑{} ↓{} R{} CH{}",
+                        crate::cockpit::format_tokens_pi(usage.input_tokens),
+                        crate::cockpit::format_tokens_pi(usage.output_tokens),
+                        crate::cockpit::format_tokens_pi(usage.cache_read_input_tokens),
+                        cache_hit,
+                    )),
+                ));
             }
         }
         section.into_any_element()
