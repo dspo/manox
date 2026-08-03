@@ -10,9 +10,9 @@
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
 - ❌ 不移植：UI（TUI）、LLM Provider SDK（37 个）、Extension 系统（jiti 动态加载）
 
-**当前规模：** ~27,500 行 Rust（src 25.2k + examples 2.3k），427 个 unit 测试 + 12 个 integration 测试（另 3 个 live 测试 ignored），零警告。
+**当前规模：** ~30,000 行 Rust（src 28k + examples 2.5k），457 个 unit 测试 + 13 个 integration 测试（另 3 个 live 测试 ignored），零警告。
 
-**基线（S0 冻结）：** Rust HEAD `b9b6869`（工作区含未提交 S0 校准：10 改 2 增）；TS Pi `4488ad55c18f07ae89a489096c90de8667b3adfb`（与 `origin/main` 一致）。S0 完成后冻结共享基线，其余 agent 在此基线上开始。
+**基线（S0 冻结，S8 复核轮确认）：** Rust HEAD `76e787c`（S8 复核轮修复已提交）；TS Pi 冻结 `4488ad55c18f07ae89a489096c90de8667b3adfb`（upstream 已推进至 `f0deb8dd`，delta 见 parity ledger 已知余项 #7）。
 
 ## 架构设计
 
@@ -259,10 +259,10 @@ pub trait AgentTool: Send + Sync {
 
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
 
-- [ ] cache_stats 金额与 idle：`missed_cost` 恒 0、`idle_ms` 占位，需接线 `ModelPriceSource` 与消息时间戳（S5）
-- [ ] summarization retry：branch summary 与 compaction 的 summarization 调用无 retry 策略（abort/取消通道已由 S1 接入）
-- [x] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写，删除自创 `render_messages`/300 字 prompt（S1，2026-08-01）；navigate label/abort/hook 同步对齐
-- [ ] Hook 推迟项：payload/response、tree、retry、update 通知类变体（见 ts-pi-parity §9「有意偏离」）
+- [x] cache_stats 金额与 idle：`ModelPriceSource`（StaticModelPrices）+ `missed_cost` + idle 已接线（S5）；其余（session stats 消费侧）未接线
+- [x] summarization retry：branch summary 已接入 harness retry 策略与操作取消 token（S8 复核轮，2026-08-01）；compaction summarization retry 仍未接（与 run 级 auto-retry 语义待定）
+- [x] branch summarization 输入/提示词/结果：按 TS `getMessageFromEntry`/`prepareBranchEntries` 重写（S1）；navigate label/abort/hook/retry/options 对齐（S8 复核轮）
+- [ ] Hook 推迟项：model_update/tools_update 等通知类变体已由 HarnessEvent 承载（S4）；before-provider-payload/after-response 已接 RequestObserver（S3+S8）；其余见 ts-pi-parity §9「有意偏离」
 - [ ] Session store/reader/repository 深度（upstream 4488ad55c 之后）：readers/search-backend/repo-utils 抽象未逐层对齐（S2 已补 SessionInfo/forkFrom/createBranchedSession/deferred 物化）
 - [ ] coding-agent facade 纵向：open 自动 restore、fork/事件/shutdown（S6/S4）；缺凭证 typed 错误已闭环（S3，2026-08-01）
 - [ ] pi-ai breadth：三协议之外的 chat API 与 image API（明确排除项）

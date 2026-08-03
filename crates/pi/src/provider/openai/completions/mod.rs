@@ -100,7 +100,8 @@ impl StreamFn for CompletionsStreamFn {
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error> {
         let options = self.options.overlay(&context.stream_options);
-        let body = to_request(context, &options, &self.base_url);
+        let body = serde_json::to_value(to_request(context, &options, &self.base_url))
+            .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let url = format!("{}/chat/completions", self.base_url);
 
         // Extra headers are merged into every request; invalid names or
@@ -114,24 +115,22 @@ impl StreamFn for CompletionsStreamFn {
                 Some((name, value))
             })
             .collect();
-        let payload = serde_json::to_value(&body)
-            .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let response = retry::send_with_retry(
-            || {
+            |payload| {
                 let mut builder = self
                     .client
                     .post(&url)
                     .bearer_auth(&self.api_key)
                     .header("content-type", "application/json")
                     .headers(extra_headers.clone())
-                    .json(&body);
+                    .json(payload);
                 if let Some(timeout) = options.timeout {
                     builder = builder.timeout(timeout);
                 }
                 builder
             },
             self.request_observer.as_deref(),
-            Some(&payload),
+            &body,
             &signal,
             &event_tx,
         )

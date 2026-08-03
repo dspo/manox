@@ -144,25 +144,40 @@ impl SessionRepository {
             retained.push(entry);
         }
 
-        // Rebuild label entries for retained targets, preserving each label's
-        // original timestamp and chaining after the retained tail.
+        // Rebuild the FINAL label state per target (TS `labelsById`): labels
+        // apply in entry order, later labels replace earlier ones, and a
+        // `label: null` clears the target's label. Only retained targets keep
+        // their labels; the rebuilt entries chain after the retained tail.
         let retained_ids: std::collections::HashSet<String> =
             retained.iter().map(|e| e.id().to_string()).collect();
-        let labels: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = source_storage
-            .get_entries()
-            .await?
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Label {
-                    target_id,
-                    label: Some(label),
-                    timestamp,
-                    ..
-                } if retained_ids.contains(target_id) => {
-                    Some((target_id.clone(), label.clone(), *timestamp))
+        let mut final_labels: std::collections::HashMap<
+            String,
+            (String, chrono::DateTime<chrono::Utc>),
+        > = std::collections::HashMap::new();
+        for e in source_storage.get_entries().await?.iter() {
+            if let SessionTreeEntry::Label {
+                target_id,
+                label,
+                timestamp,
+                ..
+            } = e
+            {
+                if !retained_ids.contains(target_id) {
+                    continue;
                 }
-                _ => None,
-            })
+                match label {
+                    Some(label) => {
+                        final_labels.insert(target_id.clone(), (label.clone(), *timestamp));
+                    }
+                    None => {
+                        final_labels.remove(target_id);
+                    }
+                }
+            }
+        }
+        let labels: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = final_labels
+            .into_iter()
+            .map(|(target, (label, timestamp))| (target, label, timestamp))
             .collect();
         let mut tail_parent = retained.last().map(|e| e.id().to_string());
         for (target_id, label, timestamp) in labels {
@@ -501,6 +516,95 @@ mod tests {
         assert_eq!(target_id, fork_a1.id());
         assert_eq!(label.as_deref(), Some("checkpoint"));
         assert_eq!(fork_label.parent_id(), Some(fork_a1.id()));
+    }
+
+    /// A fork keeps only the FINAL label per target: a rename replaces the
+    /// old label, and a `label: null` clear removes it entirely.
+    #[tokio::test]
+    async fn test_fork_keeps_final_label_state_per_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepository::new(dir.path());
+        let session = repo.create(meta()).await.unwrap();
+        session
+            .append_message(AgentMessage::user("u1"))
+            .await
+            .unwrap();
+        session.append_message(assistant("a1")).await.unwrap();
+        let entries = session.storage().get_entries().await.unwrap();
+        let a1_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // Label, rename, then clear: only the clear survives on the target.
+        session
+            .append_label(&a1_id, Some("old".into()))
+            .await
+            .unwrap();
+        session
+            .append_label(&a1_id, Some("new".into()))
+            .await
+            .unwrap();
+        session.append_label(&a1_id, None).await.unwrap();
+
+        let fork = repo
+            .create_branched_session(&repo.list().await.unwrap()[0].path, &a1_id)
+            .await
+            .unwrap();
+        let fork_entries = fork.storage().get_entries().await.unwrap();
+        assert!(
+            !fork_entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::Label { .. })),
+            "cleared labels must not survive the fork: {fork_entries:?}"
+        );
+
+        // Rename only: the fork keeps just the latest value.
+        let session2 = repo.create(meta()).await.unwrap();
+        session2
+            .append_message(AgentMessage::user("u1"))
+            .await
+            .unwrap();
+        session2.append_message(assistant("a1")).await.unwrap();
+        let entries = session2.storage().get_entries().await.unwrap();
+        let a1_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::Assistant { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        session2
+            .append_label(&a1_id, Some("old".into()))
+            .await
+            .unwrap();
+        session2
+            .append_label(&a1_id, Some("new".into()))
+            .await
+            .unwrap();
+        let fork = repo
+            .create_branched_session(session2.storage().path(), &a1_id)
+            .await
+            .unwrap();
+        let fork_entries = fork.storage().get_entries().await.unwrap();
+        let labels: Vec<&str> = fork_entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Label { label: Some(l), .. } => Some(l.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["new"], "{fork_entries:?}");
     }
 
     #[tokio::test]

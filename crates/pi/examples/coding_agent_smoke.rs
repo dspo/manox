@@ -90,14 +90,24 @@ fn fake_runtime() -> ModelRuntime {
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    // A CLAUDE.md and a template to load.
+    // A CLAUDE.md (automatic context), a project skill, and a prompt
+    // template in the TS `.pi` layout.
     tokio::fs::write(cwd.join("CLAUDE.md"), "Keep changes minimal.")
         .await
         .unwrap();
-    tokio::fs::create_dir_all(cwd.join("templates"))
+    tokio::fs::create_dir_all(cwd.join(".pi/skills"))
         .await
         .unwrap();
-    tokio::fs::write(cwd.join("templates/review.md"), "Review {target}.")
+    tokio::fs::write(
+        cwd.join(".pi/skills/review.md"),
+        "---\nname: review\ndescription: review the work\n---\nCheck the diff.",
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(cwd.join(".pi/prompts"))
+        .await
+        .unwrap();
+    tokio::fs::write(cwd.join(".pi/prompts/review.md"), "Review {target}.")
         .await
         .unwrap();
 
@@ -121,10 +131,12 @@ async fn main() {
     // Loaded resources: project instructions became a skill, the template is
     // available.
     let resources = ResourceLoader::new(&cwd).snapshot().await.unwrap();
-    assert_eq!(resources.skills.len(), 1);
-    assert_eq!(resources.prompt_templates.len(), 1);
+    assert_eq!(resources.context_files.len(), 1, "CLAUDE.md is context");
+    assert_eq!(resources.skills.len(), 1, ".pi/skills loads");
+    assert_eq!(resources.prompt_templates.len(), 1, ".pi/prompts loads");
     println!(
-        "resources: {} skills, {} templates",
+        "resources: {} context files, {} skills, {} templates",
+        resources.context_files.len(),
         resources.skills.len(),
         resources.prompt_templates.len()
     );

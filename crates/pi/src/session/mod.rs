@@ -1190,3 +1190,130 @@ mod tests {
         assert_eq!(ids(&entries), ["c1", "m3"]);
     }
 }
+
+/// The TS `SessionTreeEntry["type"]` discriminator used by branch queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryType {
+    Message,
+    Compaction,
+    ModelChange,
+    ThinkingLevelChange,
+    ActiveToolsChange,
+    BranchSummary,
+    Custom,
+    CustomMessage,
+    Label,
+    SessionInfo,
+    Leaf,
+}
+
+impl EntryType {
+    /// The wire type tag.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EntryType::Message => "message",
+            EntryType::Compaction => "compaction",
+            EntryType::ModelChange => "model_change",
+            EntryType::ThinkingLevelChange => "thinking_level_change",
+            EntryType::ActiveToolsChange => "active_tools_change",
+            EntryType::BranchSummary => "branch_summary",
+            EntryType::Custom => "custom",
+            EntryType::CustomMessage => "custom_message",
+            EntryType::Label => "label",
+            EntryType::SessionInfo => "session_info",
+            EntryType::Leaf => "leaf",
+        }
+    }
+}
+
+/// The TS `SessionBranchQuery`: a bounded traversal of the active branch.
+#[derive(Debug, Clone, Default)]
+pub struct SessionBranchQuery {
+    /// Entry where traversal starts; defaults to the active leaf.
+    pub start: Option<String>,
+    /// Stop after the first entry of this type (inclusive).
+    pub stop_at_type: Option<EntryType>,
+    /// Stop after the entry with this id (inclusive).
+    pub stop_at_id: Option<String>,
+    /// Only return entries of this type.
+    pub entry_type: Option<EntryType>,
+    /// Only return custom entries with this custom type.
+    pub custom_type: Option<String>,
+    /// Traversal order; defaults to newest first (toward the root).
+    pub oldest_first: bool,
+    /// Maximum number of filtered entries to return.
+    pub limit: Option<usize>,
+}
+
+impl<S: SessionStorage> Session<S> {
+    /// Find entries on the active branch under the given bounds — the TS
+    /// `findEntriesOnBranch`. Walks from `start` (default: the leaf) toward
+    /// the root, stops after `stopAtType`/`stopAtId` (inclusive), filters by
+    /// type / custom type, and caps at `limit`.
+    pub async fn find_entries_on_branch(
+        &self,
+        query: SessionBranchQuery,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        let start = query.start.clone().or(self.storage.get_leaf_id().await?);
+        let mut out = Vec::new();
+        let mut current = start;
+        while let Some(id) = current {
+            let entry = self
+                .storage
+                .get_entry(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("entry {id} not found"))?;
+            let kind = entry_kind(&entry);
+            let stop =
+                query.stop_at_id.as_deref() == Some(entry.id()) || query.stop_at_type == Some(kind);
+            if query.entry_type.is_none_or(|t| t == kind)
+                && query
+                    .custom_type
+                    .as_deref()
+                    .is_none_or(|t| matches!(&entry, SessionTreeEntry::CustomMessage { custom_type, .. } if custom_type == t))
+            {
+                out.push(entry.clone());
+                if query.limit.is_some_and(|l| out.len() >= l) {
+                    break;
+                }
+            }
+            if stop {
+                break;
+            }
+            current = entry.parent_id().map(|p| p.to_string());
+        }
+        if query.oldest_first {
+            out.reverse();
+        }
+        Ok(out)
+    }
+
+    /// The first entry matching the query — the TS `findEntryOnBranch`.
+    pub async fn find_entry_on_branch(
+        &self,
+        query: SessionBranchQuery,
+    ) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
+        let query = SessionBranchQuery {
+            limit: Some(1),
+            ..query
+        };
+        Ok(self.find_entries_on_branch(query).await?.into_iter().next())
+    }
+}
+
+/// The entry-type tag of an entry.
+fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
+    match entry {
+        SessionTreeEntry::Message { .. } => EntryType::Message,
+        SessionTreeEntry::Compaction { .. } => EntryType::Compaction,
+        SessionTreeEntry::ModelChange { .. } => EntryType::ModelChange,
+        SessionTreeEntry::ThinkingLevelChange { .. } => EntryType::ThinkingLevelChange,
+        SessionTreeEntry::ActiveToolsChange { .. } => EntryType::ActiveToolsChange,
+        SessionTreeEntry::BranchSummary { .. } => EntryType::BranchSummary,
+        SessionTreeEntry::Custom { .. } => EntryType::Custom,
+        SessionTreeEntry::CustomMessage { .. } => EntryType::CustomMessage,
+        SessionTreeEntry::Label { .. } => EntryType::Label,
+        SessionTreeEntry::SessionInfo { .. } => EntryType::SessionInfo,
+        SessionTreeEntry::Leaf { .. } => EntryType::Leaf,
+    }
+}

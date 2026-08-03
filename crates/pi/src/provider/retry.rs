@@ -186,25 +186,31 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 pub async fn send_with_retry<F>(
     build: F,
     observer: Option<&dyn RequestObserver>,
-    payload: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
     signal: &CancellationToken,
     event_tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<reqwest::Response, anyhow::Error>
 where
-    F: Fn() -> reqwest::RequestBuilder,
+    F: Fn(&serde_json::Value) -> reqwest::RequestBuilder,
 {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        if let (Some(observer), Some(payload)) = (observer, payload) {
-            observer.before_payload(attempt, payload);
-        }
+        // The observer may substitute a mutated payload for this attempt;
+        // the default keeps the request byte-identical across retries so
+        // provider-side prefix caching is unaffected.
+        let current = match observer {
+            Some(observer) => observer
+                .before_payload(attempt, payload)
+                .unwrap_or_else(|| payload.clone()),
+            None => payload.clone(),
+        };
         let result = tokio::select! {
             _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
-            res = build().send() => res,
+            res = build(&current).send() => res,
         };
         if let (Some(observer), Ok(resp)) = (observer, &result) {
-            observer.after_response(attempt, resp.status().as_u16());
+            observer.after_response(attempt, resp.status().as_u16(), resp.headers());
         }
         match result {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
@@ -475,9 +481,9 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let handle = tokio::spawn(async move {
             send_with_retry(
-                || client.post("http://127.0.0.1:1/").body("x".to_string()),
+                |_| client.post("http://127.0.0.1:1/").body("x".to_string()),
                 None,
-                None,
+                &serde_json::json!({"x": 1}),
                 &signal,
                 &tx,
             )
@@ -522,9 +528,9 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://{addr}/");
         let err = send_with_retry(
-            || client.post(&url).body("x".to_string()),
+            |_| client.post(&url).body("x".to_string()),
             None,
-            None,
+            &serde_json::json!({"x": 1}),
             &CancellationToken::new(),
             &tx,
         )

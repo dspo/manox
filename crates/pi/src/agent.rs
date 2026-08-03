@@ -264,6 +264,11 @@ impl Agent {
         }
     }
 
+    /// The session-scoped tool execution context.
+    pub fn tool_context(&self) -> &Arc<dyn ToolContext> {
+        &self.tool_ctx
+    }
+
     /// Mount tools on the agent. They are forwarded into each turn's context
     /// so the provider sees them and `execute_tool_calls` can dispatch.
     pub fn with_tools(mut self, tools: Arc<[Arc<dyn crate::tool::AgentTool>]>) -> Self {
@@ -308,11 +313,23 @@ impl Agent {
         self.loop_hooks = hooks;
     }
 
+    /// Replace the session-scoped tool execution context (env + cwd + tool
+    /// state), so tools run against the session's project directory rather
+    /// than the process cwd.
+    pub fn set_tool_ctx(&mut self, tool_ctx: Arc<dyn ToolContext>) {
+        self.tool_ctx = tool_ctx;
+    }
+
     /// Plug in per-model provider runtime resolution. Every turn resolves its
     /// stream function from the current model, so a mid-run model change
     /// switches protocol/endpoint/credentials for the next provider call.
     pub fn set_stream_resolver(&mut self, resolver: StreamResolver) {
         self.stream_resolver = Some(resolver);
+    }
+
+    /// Replace the stream function used for provider calls.
+    pub fn set_stream_fn(&mut self, stream_fn: Arc<dyn StreamFn>) {
+        self.stream_fn = stream_fn;
     }
 
     /// Set the reasoning tier forwarded into each turn's context. `None`

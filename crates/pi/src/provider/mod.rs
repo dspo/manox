@@ -21,13 +21,18 @@ pub mod transform;
 /// outside the provider; the harness maps it onto its
 /// `BeforeProviderPayload` / `AfterProviderResponse` hook points.
 pub trait RequestObserver: Send + Sync {
-    /// The final request payload (built once, byte-identical across retries)
-    /// about to be sent. `attempt` is 1-indexed.
-    fn before_payload(&self, attempt: u32, payload: &serde_json::Value);
+    /// The payload about to be sent, `attempt` 1-indexed. Returning
+    /// `Some(replacement)` substitutes the payload for this attempt (the TS
+    /// before-payload mutation); `None` sends the original.
+    fn before_payload(
+        &self,
+        attempt: u32,
+        payload: &serde_json::Value,
+    ) -> Option<serde_json::Value>;
 
-    /// The HTTP status of an attempt's response — success and retryable
-    /// statuses both fire.
-    fn after_response(&self, attempt: u32, status: u16);
+    /// The HTTP status and headers of an attempt's response — success and
+    /// retryable statuses both fire.
+    fn after_response(&self, attempt: u32, status: u16, headers: &reqwest::header::HeaderMap);
 }
 
 use thiserror::Error;

@@ -46,6 +46,49 @@ pub struct ForkResult {
     pub selected_text: Option<String>,
 }
 
+/// The runtime assembly state of a session, captured from the harness so a
+/// fork rebuilds an identical environment: tool set + active selection,
+/// resources, stream options, queue modes, and policies.
+#[derive(Clone)]
+struct AssemblyConfig {
+    tools: Vec<Arc<dyn AgentTool>>,
+    active_tool_names: Option<Vec<String>>,
+    resources: HarnessResources,
+    stream_options: crate::types::StreamOptions,
+    steering_mode: crate::agent::QueueMode,
+    follow_up_mode: crate::agent::QueueMode,
+    compaction: crate::compaction::CompactionSettings,
+    retry: crate::harness::RetrySettings,
+}
+
+impl AssemblyConfig {
+    fn capture(harness: &AgentHarness<crate::session::jsonl::JsonlSessionStorage>) -> Self {
+        AssemblyConfig {
+            tools: harness.tools().to_vec(),
+            active_tool_names: harness.active_tool_names().map(|n| n.to_vec()),
+            resources: harness.resources().clone(),
+            stream_options: harness.stream_options(),
+            steering_mode: harness.steering_mode(),
+            follow_up_mode: harness.follow_up_mode(),
+            compaction: harness.compaction_settings().clone(),
+            retry: *harness.retry_settings(),
+        }
+    }
+
+    async fn apply(self, harness: &mut AgentHarness<crate::session::jsonl::JsonlSessionStorage>) {
+        let _ = harness.set_tools(Arc::from(self.tools));
+        if let Some(names) = self.active_tool_names {
+            let _ = harness.set_active_tools(names).await;
+        }
+        harness.set_resources(self.resources);
+        harness.set_stream_options(self.stream_options);
+        harness.set_steering_mode(self.steering_mode);
+        harness.set_follow_up_mode(self.follow_up_mode);
+        harness.set_compaction_settings(self.compaction);
+        harness.set_retry_settings(self.retry);
+    }
+}
+
 /// A live coding session: an open JSONL session plus a harness bound to it.
 pub struct AgentSession {
     harness: AgentHarness<crate::session::jsonl::JsonlSessionStorage>,
@@ -348,7 +391,8 @@ impl AgentSession {
             }
         };
         let session_path = session.storage().path().to_path_buf();
-        let mut harness = self.build_harness(session, None)?;
+        let config = AssemblyConfig::capture(&self.harness);
+        let mut harness = self.build_harness(session, None, config).await?;
         // The fork's transcript comes from the new session's path.
         harness.restore().await?;
         Ok(ForkResult {
@@ -374,22 +418,66 @@ impl AgentSession {
     }
 
     /// Assemble a harness over `session` with this facade's runtime and tools.
-    fn build_harness(
+    async fn build_harness(
         &self,
         session: crate::session::Session<crate::session::jsonl::JsonlSessionStorage>,
         model: Option<Model>,
+        config: AssemblyConfig,
     ) -> Result<AgentHarness<crate::session::jsonl::JsonlSessionStorage>, anyhow::Error> {
         let model = model.unwrap_or_else(default_model);
         let stream_fn = self.runtime.resolver()(&model)?;
         let resolver = self.runtime.resolver();
-        let tools = Arc::from(self.tools.clone());
         let mut harness = AgentHarness::new(session, self.system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
-            .with_tools(tools);
+            .with_tool_cwd(self.cwd.clone());
         // Restore projects the session's own model onto the harness.
-        harness = harness.with_model_resolver(model_resolver(resolver));
+        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
+        let observer = harness.request_observer();
+        harness.rebind_stream_resolver(self.runtime.resolver_with_observer(observer));
+        // Re-apply the captured assembly state so a fork is identical to the
+        // session it came from.
+        config.apply(&mut harness).await;
         Ok(harness)
     }
+}
+
+/// Expand a leading `~` to the home directory, the TS `expandTildePath`.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// The default agent config directory: `~/.pi/agent` (TS `getAgentDir`).
+fn default_agent_dir() -> PathBuf {
+    std::env::var("PI_AGENT_DIR")
+        .map(|v| expand_tilde(&v))
+        .unwrap_or_else(|_| expand_tilde("~/.pi/agent"))
+}
+
+/// The wire-API shape for a provider's default protocol.
+fn api_for_provider(provider: &str) -> String {
+    match provider {
+        "openai" => "openai_responses".into(),
+        _ => "anthropic".into(),
+    }
+}
+
+/// Compose the system prompt: the base prompt followed by the project
+/// instruction context files (AGENTS.md / CLAUDE.md), so the instructions
+/// are automatic context rather than manually invocable skills.
+fn compose_system_prompt(base: &str, resources: &HarnessResources) -> String {
+    if resources.context_files.is_empty() {
+        return base.to_string();
+    }
+    let mut prompt = format!("{base}\n\n# Project instructions\n");
+    for file in &resources.context_files {
+        prompt.push_str(&format!("\n## {}\n\n{}\n", file.name, file.content));
+    }
+    prompt
 }
 
 /// The default model when none is configured: anthropic, from `ANTHROPIC_MODEL`
@@ -412,13 +500,24 @@ fn model_resolver(
     _runtime: crate::agent_loop::StreamResolver,
 ) -> impl Fn(&crate::session::SessionModelRef) -> Option<Model> + Send + Sync + 'static {
     |mref: &crate::session::SessionModelRef| {
+        // Restore the full model from the session's provider + model id via
+        // the default catalog. An unknown provider resolves to `None`, so
+        // the harness keeps its construction-time model instead of silently
+        // switching protocol.
         let api = match mref.provider.as_str() {
-            "openai" => "openai_responses",
-            _ => "anthropic",
+            "anthropic" => "anthropic".to_string(),
+            "openai" => {
+                if is_responses_model(&mref.model_id) {
+                    "openai_responses".to_string()
+                } else {
+                    "openai_completions".to_string()
+                }
+            }
+            _ => return None,
         };
         Some(Model {
             provider: mref.provider.clone(),
-            api: api.into(),
+            api,
             id: mref.model_id.clone(),
             context_window: 200_000,
             max_tokens: 8_192,
@@ -426,6 +525,15 @@ fn model_resolver(
             metadata: Default::default(),
         })
     }
+}
+
+/// Whether an OpenAI model id maps to the Responses API (the modern default
+/// for reasoning-capable models).
+fn is_responses_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
+        .iter()
+        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
 }
 
 /// Builds an [`AgentSession`]: cwd, session folder, model runtime, resources,
@@ -509,57 +617,58 @@ impl AgentSessionBuilder {
         tokio::fs::create_dir_all(&session_dir).await?;
         let repo = SessionRepository::new(&session_dir);
 
+        // Agent config dir: explicit override, `PI_AGENT_DIR`, or `~/.pi/agent`
+        // (with `~` expanded).
+        let agent_dir = self.agent_dir.clone().unwrap_or_else(default_agent_dir);
+
         // Settings: loaded and merged unless the caller supplied an override.
         let settings = match self.settings {
             Some(settings) => settings,
-            None => {
-                crate::settings::Settings::load_at(
-                    &cwd,
-                    self.agent_dir
-                        .as_deref()
-                        .unwrap_or_else(|| std::path::Path::new("~/.pi/agent")),
-                )
-                .await?
-            }
+            None => crate::settings::Settings::load_at(&cwd, &agent_dir).await?,
         };
 
-        // Trust: side-effect tools are dropped for untrusted projects.
+        // Trust: the global `agentDir/trust.json`, nearest-ancestor match.
+        // Undecided projects are treated as untrusted (no UI to ask): their
+        // project-scoped resources are skipped.
         let trust = match self.trust {
             Some(trust) => trust,
-            None => TrustManager::load(&trust_path(&cwd)).unwrap_or_default(),
+            None => TrustManager::load(&agent_dir.join("trust.json")).unwrap_or_default(),
         };
-        let untrusted = matches!(trust.check(&cwd), TrustStatus::Untrusted);
+        let trusted = matches!(trust.check(&cwd), TrustStatus::Trusted);
 
-        // Resources: discovered unless the caller supplied them.
+        // Resources: discovered unless the caller supplied them. Trust gates
+        // project-scoped resources; the user/agentDir ones always load.
         let resources = match self.resources {
             Some(resources) => resources,
             None => {
-                let mut loader = ResourceLoader::new(&cwd);
-                if let Some(agent_dir) = &self.agent_dir {
-                    loader = loader.with_agent_dir(agent_dir);
-                }
+                let loader = ResourceLoader::new(&cwd)
+                    .with_agent_dir(&agent_dir)
+                    .with_trust(trusted);
                 loader.snapshot().await?
             }
         };
 
         let model = self.model.or_else(|| {
-            settings.default_model.clone().map(|id| Model {
-                provider: settings
+            settings.default_model.clone().map(|id| {
+                let provider = settings
                     .default_provider
                     .clone()
-                    .unwrap_or_else(|| "anthropic".into()),
-                api: "anthropic".into(),
-                id,
-                context_window: 200_000,
-                max_tokens: 8_192,
-                thinking: crate::types::ThinkingKind::None,
-                metadata: Default::default(),
+                    .unwrap_or_else(|| "anthropic".into());
+                Model {
+                    api: api_for_provider(&provider),
+                    provider,
+                    id,
+                    context_window: 200_000,
+                    max_tokens: 8_192,
+                    thinking: crate::types::ThinkingKind::None,
+                    metadata: Default::default(),
+                }
             })
         });
         let model = model.unwrap_or_else(default_model);
 
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
-            let mut builtins = vec![
+            vec![
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(EditTool) as Arc<dyn AgentTool>,
@@ -567,19 +676,14 @@ impl AgentSessionBuilder {
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
                 Arc::new(FindTool) as Arc<dyn AgentTool>,
                 Arc::new(LsTool) as Arc<dyn AgentTool>,
-            ];
-            if untrusted {
-                // Untrusted projects lose the side-effect tools (TS gating).
-                builtins.retain(|t| !matches!(t.name(), "write" | "edit" | "bash"));
-            }
-            builtins
+            ]
         } else {
             self.tools
         };
 
         let runtime = match self.model_runtime {
             Some(runtime) => runtime,
-            None => ModelRuntime::from_env()?,
+            None => ModelRuntime::from_env(),
         };
 
         let session = repo
@@ -592,17 +696,36 @@ impl AgentSessionBuilder {
             })
             .await?;
         let session_path = session.storage().path().to_path_buf();
-        let system_prompt = self
+        let base_prompt = self
             .system_prompt
             .unwrap_or_else(|| "You are a helpful coding agent.".into());
+        let system_prompt = compose_system_prompt(&base_prompt, &resources);
 
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
         let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
             .with_tools(Arc::from(tools.clone()))
+            .with_tool_cwd(cwd.clone())
             .with_resources(resources);
-        harness = harness.with_model_resolver(model_resolver(resolver));
+        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
+        // Attach the request observer so the harness's before-payload /
+        // after-response hooks fire on the real provider requests.
+        let observer = harness.request_observer();
+        harness.rebind_stream_resolver(runtime.resolver_with_observer(observer));
+        // Apply the loaded non-UI settings: thinking tier, compaction,
+        // retry, and queue modes.
+        if let Some(level) = settings.default_thinking_level.clone() {
+            let _ = harness.set_thinking_level(Some(level)).await;
+        }
+        harness.set_compaction_settings(settings.resolved_compaction());
+        harness.set_retry_settings(settings.resolved_retry());
+        if let Some(mode) = settings.resolved_steering_mode() {
+            harness.set_steering_mode(mode);
+        }
+        if let Some(mode) = settings.resolved_follow_up_mode() {
+            harness.set_follow_up_mode(mode);
+        }
 
         Ok(AgentSession {
             harness,
@@ -628,6 +751,8 @@ impl AgentSessionBuilder {
         let repo = SessionRepository::new(&session_dir);
         let session = repo.open(&path).await?;
         let session_path = session.storage().path().to_path_buf();
+        // Tools run against the session's own cwd, not the process cwd.
+        let session_cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
 
         let model = self.model.unwrap_or_else(default_model);
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
@@ -645,18 +770,25 @@ impl AgentSessionBuilder {
         };
         let runtime = match self.model_runtime {
             Some(runtime) => runtime,
-            None => ModelRuntime::from_env()?,
+            None => ModelRuntime::from_env(),
         };
-        let system_prompt = self
+        let base_prompt = self
             .system_prompt
             .unwrap_or_else(|| "You are a helpful coding agent.".into());
+        let system_prompt = match &self.resources {
+            Some(resources) => compose_system_prompt(&base_prompt, resources),
+            None => base_prompt,
+        };
 
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
         let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
-            .with_tools(Arc::from(tools.clone()));
-        harness = harness.with_model_resolver(model_resolver(resolver));
+            .with_tools(Arc::from(tools.clone()))
+            .with_tool_cwd(session_cwd);
+        harness = harness.with_model_resolver(model_resolver(resolver.clone()));
+        let observer = harness.request_observer();
+        harness.rebind_stream_resolver(runtime.resolver_with_observer(observer));
         if let Some(resources) = self.resources {
             harness = harness.with_resources(resources);
         }
@@ -673,11 +805,6 @@ impl AgentSessionBuilder {
             tools,
         })
     }
-}
-
-/// The trust decisions file for a project.
-fn trust_path(cwd: &std::path::Path) -> PathBuf {
-    cwd.join(".pi").join("trust.json")
 }
 
 #[cfg(test)]
@@ -902,15 +1029,16 @@ mod tests {
         assert!(err.to_string().contains("user message"), "{err}");
     }
 
+    /// Tools execute against the session cwd, not the process cwd: a file
+    /// that exists only in the session project is reachable by read/ls.
     #[tokio::test]
-    async fn untrusted_projects_lose_side_effect_tools() {
+    async fn tools_run_against_the_session_cwd() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
+        let cwd = dir.path().join("project");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut trust = TrustManager::new();
-        trust.untrust(cwd.clone());
-        tokio::fs::create_dir_all(cwd.join(".pi")).await.unwrap();
-        trust.save(&trust_path(&cwd)).unwrap();
+        tokio::fs::write(cwd.join("only-in-project.txt"), "project file")
+            .await
+            .unwrap();
 
         let session = create_agent_session()
             .with_cwd(&cwd)
@@ -920,10 +1048,71 @@ mod tests {
             .build()
             .await
             .unwrap();
+
+        // The read tool resolves relative to the session cwd, not the
+        // process cwd (the crate's root has no such file).
+        let tool = session
+            .harness
+            .agent()
+            .tools()
+            .iter()
+            .find(|t| t.name() == "read")
+            .expect("read mounted")
+            .clone();
+        let ctx = Arc::clone(session.harness.agent().tool_context());
+        let signal = tokio_util::sync::CancellationToken::new();
+        let result = tool
+            .execute(
+                "t1",
+                serde_json::json!({ "path": "only-in-project.txt" }),
+                signal,
+                &*ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "read must resolve relative to the session cwd: {:?}",
+            result.details
+        );
+    }
+
+    #[tokio::test]
+    async fn undecided_trust_skips_project_scoped_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(agent_dir.join("skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("skills/user.md"), "user skill")
+            .await
+            .unwrap();
+        // No trust decision: the project is treated as untrusted.
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
         let names = session.tools();
-        assert!(!names.iter().any(|n| n == "bash"), "{names:?}");
-        assert!(!names.iter().any(|n| n == "write"), "{names:?}");
-        assert!(names.iter().any(|n| n == "read"), "{names:?}");
+        assert!(names.iter().any(|n| n == "bash"), "{names:?}");
+        let skill_names: Vec<&str> = session
+            .resources()
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(skill_names, vec!["user"], "{skill_names:?}");
     }
 
     /// A build without any model runtime fails with the typed

@@ -183,6 +183,10 @@ pub fn build_branch_summary_prompt(
 /// preparation yields the TS "No content to summarize" marker without a model
 /// call; a cancelled run reports `aborted`; a failed run propagates the
 /// provider error.
+// All inputs are distinct semantic surfaces (entries, model, runtime,
+// budget, instructions, cancellation, request options); grouping them would
+// hide a caller's missing argument behind a struct literal.
+#[allow(clippy::too_many_arguments)]
 pub async fn summarize_branch(
     entries: &[SessionTreeEntry],
     model: &Model,
@@ -191,6 +195,7 @@ pub async fn summarize_branch(
     custom_instructions: Option<&str>,
     replace_instructions: bool,
     signal: CancellationToken,
+    stream_options: &crate::types::StreamOptions,
 ) -> Result<BranchSummaryResult, anyhow::Error> {
     let preparation = prepare_branch_entries(entries, token_budget);
     if preparation.messages.is_empty() {
@@ -216,7 +221,7 @@ pub async fn summarize_branch(
         cache_retention: crate::types::CacheRetention::None,
         session_id: None,
         metadata: Default::default(),
-        stream_options: Default::default(),
+        stream_options: stream_options.clone(),
     };
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);

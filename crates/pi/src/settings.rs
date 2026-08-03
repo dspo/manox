@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// mirroring the recursive merge of TS `deepMergeSettings` instead of
 /// replacing the whole section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionOverrides {
     /// Whether compaction is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,7 +54,31 @@ impl CompactionOverrides {
 }
 
 /// Application settings with global and project-level overrides.
+/// Auto-retry overrides — the TS `retry` settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_delay_ms: Option<u64>,
+}
+
+/// Branch-summary overrides — the TS `branchSummary` settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchSummaryOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<usize>,
+}
+
+/// The TS wire shape: camelCase field names (`defaultProvider`,
+/// `reserveTokens`, ...), so a real TS settings file parses instead of
+/// silently becoming an empty config.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// Default provider to use.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +103,24 @@ pub struct Settings {
     /// External editor path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_editor: Option<String>,
+    /// Steering queue drain mode (`"all"` / `"one-at-a-time"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steering_mode: Option<String>,
+    /// Follow-up queue drain mode (`"all"` / `"one-at-a-time"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_mode: Option<String>,
+    /// Auto-retry overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryOverrides>,
+    /// Branch-summary overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_summary: Option<BranchSummaryOverrides>,
+    /// Additional skill paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// Additional prompt template paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -107,6 +150,74 @@ impl Settings {
         if project.show_cache_miss_notices.is_some() {
             self.show_cache_miss_notices = project.show_cache_miss_notices;
         }
+        if project.steering_mode.is_some() {
+            self.steering_mode = project.steering_mode.clone();
+        }
+        if project.follow_up_mode.is_some() {
+            self.follow_up_mode = project.follow_up_mode.clone();
+        }
+        if let Some(retry) = &project.retry {
+            self.retry
+                .get_or_insert_with(Default::default)
+                .merge_from(retry);
+        }
+        if let Some(branch) = &project.branch_summary {
+            self.branch_summary = Some(branch.clone());
+        }
+        if project.skills.is_some() {
+            self.skills = project.skills.clone();
+        }
+        if project.prompts.is_some() {
+            self.prompts = project.prompts.clone();
+        }
+    }
+}
+
+impl RetryOverrides {
+    fn merge_from(&mut self, other: &RetryOverrides) {
+        if other.enabled.is_some() {
+            self.enabled = other.enabled;
+        }
+        if other.max_retries.is_some() {
+            self.max_retries = other.max_retries;
+        }
+        if other.base_delay_ms.is_some() {
+            self.base_delay_ms = other.base_delay_ms;
+        }
+    }
+}
+
+impl Settings {
+    /// The resolved retry policy under the explicit overrides.
+    pub fn resolved_retry(&self) -> crate::harness::RetrySettings {
+        let mut resolved = crate::harness::RetrySettings::default();
+        if let Some(retry) = &self.retry {
+            if let Some(enabled) = retry.enabled {
+                resolved.enabled = enabled;
+            }
+            if let Some(max_retries) = retry.max_retries {
+                resolved.max_retries = max_retries;
+            }
+            if let Some(base_delay_ms) = retry.base_delay_ms {
+                resolved.base_delay_ms = base_delay_ms;
+            }
+        }
+        resolved
+    }
+
+    /// The steering queue mode, if set.
+    pub fn resolved_steering_mode(&self) -> Option<crate::agent::QueueMode> {
+        queue_mode(&self.steering_mode)
+    }
+
+    /// The follow-up queue mode, if set.
+    pub fn resolved_follow_up_mode(&self) -> Option<crate::agent::QueueMode> {
+        queue_mode(&self.follow_up_mode)
+    }
+
+    /// The branch-summary reserve tokens, if set.
+    pub fn resolved_branch_summary_reserve(&self) -> Option<usize> {
+        self.branch_summary.as_ref().and_then(|b| b.reserve_tokens)
     }
 
     /// The compaction settings with defaults under the explicit overrides.
@@ -179,6 +290,15 @@ impl Settings {
     }
 }
 
+/// Map a TS queue-mode string to the drain mode.
+fn queue_mode(value: &Option<String>) -> Option<crate::agent::QueueMode> {
+    match value.as_deref() {
+        Some("all") => Some(crate::agent::QueueMode::All),
+        Some("one-at-a-time") => Some(crate::agent::QueueMode::OneAtATime),
+        _ => None,
+    }
+}
+
 /// Read and parse a settings file; `NotFound` reads as defaults, any other
 /// failure surfaces (a corrupt settings file must not silently reset config).
 async fn load_file(path: &std::path::Path) -> Result<Settings, anyhow::Error> {
@@ -231,7 +351,7 @@ mod tests {
             ..Default::default()
         };
         // A project file that never mentions compaction or notices.
-        let project = Settings::from_json(r#"{"default_model": "gpt-5"}"#).unwrap();
+        let project = Settings::from_json(r#"{"defaultModel": "gpt-5"}"#).unwrap();
 
         global.merge(&project);
         let compaction = global.compaction.unwrap();
@@ -250,8 +370,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let project =
-            Settings::from_json(r#"{"compaction": {"keep_recent_tokens": 8000}}"#).unwrap();
+        let project = Settings::from_json(r#"{"compaction": {"keepRecentTokens": 8000}}"#).unwrap();
 
         global.merge(&project);
         // The explicit field overrides; the untouched ones survive.
@@ -291,7 +410,7 @@ mod tests {
             .unwrap();
         tokio::fs::write(
             Settings::project_path(&project),
-            r#"{"default_model": "gpt-5"}"#,
+            r#"{"defaultModel": "gpt-5"}"#,
         )
         .await
         .unwrap();
@@ -301,7 +420,7 @@ mod tests {
 
         tokio::fs::write(
             Settings::project_path(&project),
-            r#"{"default_model": "claude-opus-4-8"}"#,
+            r#"{"defaultModel": "claude-opus-4-8"}"#,
         )
         .await
         .unwrap();
@@ -314,7 +433,7 @@ mod tests {
     fn test_merge_project_compaction_lands_when_global_is_silent() {
         let mut global = Settings::default();
         let project = Settings::from_json(
-            r#"{"compaction": {"enabled": false}, "show_cache_miss_notices": true}"#,
+            r#"{"compaction": {"enabled": false}, "showCacheMissNotices": true}"#,
         )
         .unwrap();
 

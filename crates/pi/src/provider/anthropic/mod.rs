@@ -87,7 +87,8 @@ impl StreamFn for AnthropicStreamFn {
         // Per-request options from the harness turn snapshot overlay the
         // builder's own; request-set fields win.
         let options = self.options.overlay(&context.stream_options);
-        let body = to_request(context, &options);
+        let body = serde_json::to_value(to_request(context, &options))
+            .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let url = format!("{}/v1/messages", self.base_url);
 
         // Extra headers are merged into every request; invalid names or
@@ -101,10 +102,8 @@ impl StreamFn for AnthropicStreamFn {
                 Some((name, value))
             })
             .collect();
-        let payload = serde_json::to_value(&body)
-            .map_err(|e| anyhow::anyhow!("request payload serialization failed: {e}"))?;
         let response = retry::send_with_retry(
-            || {
+            |payload| {
                 let mut builder = self
                     .client
                     .post(&url)
@@ -112,14 +111,14 @@ impl StreamFn for AnthropicStreamFn {
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header("content-type", "application/json")
                     .headers(extra_headers.clone())
-                    .json(&body);
+                    .json(payload);
                 if let Some(timeout) = options.timeout {
                     builder = builder.timeout(timeout);
                 }
                 builder
             },
             self.request_observer.as_deref(),
-            Some(&payload),
+            &body,
             &signal,
             &event_tx,
         )

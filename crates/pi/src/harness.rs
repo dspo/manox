@@ -124,6 +124,10 @@ struct HarnessControl {
     /// the TS `nextTurnQueue`. Shared so the decoupled handle can enqueue
     /// mid-run without holding `&mut self`.
     next_turn_queue: std::sync::Mutex<Vec<AgentMessage>>,
+    /// The cancellation token of the active structured operation
+    /// (navigation), armed per operation. `abort` / `request_shutdown`
+    /// cancel it so long-running branch summarization ends promptly.
+    operation_cancel: std::sync::Mutex<CancellationToken>,
     /// The construction-time stream's api. Without a resolver, a model whose
     /// api differs is refused — the fixed stream cannot serve it.
     fixed_api: String,
@@ -256,6 +260,7 @@ impl HarnessHandle {
     pub fn abort(&self) -> bool {
         self.run.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
+        self.control.operation_cancel.lock().unwrap().cancel();
         self.run.clear_queues();
         self.control.next_turn_queue.lock().unwrap().clear();
         true
@@ -334,6 +339,25 @@ impl HarnessHandle {
     /// `apply_turn_runtime` forwards them into every provider request.
     pub fn set_stream_options(&self, options: crate::types::StreamOptions) {
         self.control.turn_runtime.lock().unwrap().stream_options = options;
+    }
+
+    /// Begin shutdown from mid-run: stop accepting new operations, cancel
+    /// the active run and any retry backoff, clear every queue and the
+    /// unpersisted mutation queue. Idempotent.
+    pub fn request_shutdown(&self) {
+        if self
+            .control
+            .shutdown
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.run.abort();
+        self.control.retry_cancel.lock().unwrap().cancel();
+        self.control.operation_cancel.lock().unwrap().cancel();
+        self.run.clear_queues();
+        self.control.next_turn_queue.lock().unwrap().clear();
+        self.control.pending_mutations.lock().unwrap().clear();
     }
 
     /// Queue a user message for the next prompt batch — the TS mid-run
@@ -748,6 +772,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             next_turn_queue: std::sync::Mutex::new(Vec::new()),
             harness_listeners: std::sync::Mutex::new(Vec::new()),
             shutdown: std::sync::atomic::AtomicBool::new(false),
+            operation_cancel: std::sync::Mutex::new(CancellationToken::new()),
             fixed_api,
             has_resolver: std::sync::atomic::AtomicBool::new(false),
             message_entry_ids: std::sync::Mutex::new(Vec::new()),
@@ -791,6 +816,19 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             model_resolver: None,
             resources: HarnessResources::default(),
         }
+    }
+
+    /// Run tools against `cwd` instead of the process working directory —
+    /// the session's project directory. Rebuilds the execution environment
+    /// and tool context so read/bash/grep/find/ls resolve relative paths
+    /// there.
+    pub fn with_tool_cwd(mut self, cwd: std::path::PathBuf) -> Self {
+        let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
+        let tool_state = Arc::new(ToolState::new());
+        let tool_ctx: Arc<dyn crate::tool::ToolContext> =
+            Arc::new(LocalToolContext::new(env, cwd, tool_state));
+        self.agent.set_tool_ctx(tool_ctx);
+        self
     }
 
     /// Mount tools on the underlying agent.
@@ -909,6 +947,18 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.session.set_session_name(name).await
     }
 
+    /// Re-resolve the current model's stream under a new resolver and swap it
+    /// in — used to attach the request observer after the harness exists
+    /// (the observer needs the harness's hook registry).
+    pub fn rebind_stream_resolver(&mut self, resolver: crate::agent_loop::StreamResolver) {
+        if let Ok(stream) = resolver(&self.model) {
+            self.stream_fn = Arc::clone(&stream);
+            self.stream_resolver = Some(resolver.clone());
+            self.agent.set_stream_resolver(resolver);
+            self.agent.set_stream_fn(stream);
+        }
+    }
+
     /// Plug in per-model provider runtime resolution (the consumer's registry
     /// seam — the crate stays registry-free). Every provider call — normal
     /// turns, overflow retries, continuations, and summarization — resolves
@@ -961,17 +1011,33 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     pub fn request_observer(&self) -> Arc<dyn crate::provider::RequestObserver> {
         struct Observer(Arc<Mutex<Vec<(HookPoint, HookHandler)>>>);
         impl crate::provider::RequestObserver for Observer {
-            fn before_payload(&self, attempt: u32, payload: &serde_json::Value) {
+            fn before_payload(
+                &self,
+                attempt: u32,
+                payload: &serde_json::Value,
+            ) -> Option<serde_json::Value> {
+                let mut replacement = None;
                 let ctx = HookContext::new(HookPoint::BeforeProviderPayload)
                     .with_data(serde_json::json!({ "attempt": attempt, "payload": payload }));
                 let list = self.0.lock().unwrap();
                 for (point, handler) in list.iter() {
                     if *point == HookPoint::BeforeProviderPayload {
-                        let _ = handler(ctx.clone());
+                        let next = handler(ctx.clone());
+                        // A handler that replaced the `payload` field wins
+                        // for this attempt (TS before-payload mutation).
+                        if let Some(data) = next.data.get("payload") {
+                            replacement = Some(data.clone());
+                        }
                     }
                 }
+                replacement
             }
-            fn after_response(&self, attempt: u32, status: u16) {
+            fn after_response(
+                &self,
+                attempt: u32,
+                status: u16,
+                _headers: &reqwest::header::HeaderMap,
+            ) {
                 let ctx = HookContext::new(HookPoint::AfterProviderResponse)
                     .with_data(serde_json::json!({ "attempt": attempt, "status": status }));
                 let list = self.0.lock().unwrap();
@@ -1091,8 +1157,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         }
         self.agent.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
+        self.control.operation_cancel.lock().unwrap().cancel();
         self.agent.clear_all_queues();
         self.control.next_turn_queue.lock().unwrap().clear();
+        // Drop unpersisted mutations: after shutdown nothing flushes them, so
+        // they must not linger and surface on a later run.
+        self.control.pending_mutations.lock().unwrap().clear();
         self.emit_queue_update();
     }
 
@@ -1916,6 +1986,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             anyhow::bail!("Cannot navigate while harness is in {:?} phase", self.phase);
         }
         let _active = ActiveGuard::arm(&self.control);
+        // Arm the operation token so `abort` / `request_shutdown` can end a
+        // long-running branch summarization; a fresh token per operation.
+        *self.control.operation_cancel.lock().unwrap() = CancellationToken::new();
         self.phase = AgentHarnessPhase::BranchSummary;
         let result = self.navigate_tree_inner(target_id, &options).await;
         self.phase = AgentHarnessPhase::Idle;
@@ -2023,7 +2096,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // A summary is generated only when asked for and there is an
         // abandoned branch to summarize (TS `options.summarize &&
         // entriesToSummarize.length > 0`). The token budget is the model's
-        // context window minus the reserved prompt/response space.
+        // context window minus the reserved prompt/response space; the
+        // request carries the harness's per-request stream options; transient
+        // failures retry under the harness retry policy; the operation token
+        // lets abort/shutdown end the run.
         let summary = if options.summarize && !abandoned.is_empty() {
             let stream_fn = match &self.stream_resolver {
                 Some(resolver) => resolver(&self.model)?,
@@ -2031,16 +2107,54 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             };
             let token_budget = (self.model.context_window as u64)
                 .saturating_sub(crate::compaction::branch_summarization::RESERVE_TOKENS as u64);
-            let result = crate::compaction::branch_summarization::summarize_branch(
-                &abandoned,
-                &self.model,
-                stream_fn,
-                token_budget,
-                custom_instructions.as_deref(),
-                options.replace_instructions,
-                CancellationToken::new(),
-            )
-            .await?;
+            let signal = self.control.operation_cancel.lock().unwrap().clone();
+            let stream_options = self
+                .control
+                .turn_runtime
+                .lock()
+                .unwrap()
+                .stream_options
+                .clone();
+            let retry = self.retry_settings;
+            let mut attempt = 0u32;
+            let result = loop {
+                attempt += 1;
+                match crate::compaction::branch_summarization::summarize_branch(
+                    &abandoned,
+                    &self.model,
+                    Arc::clone(&stream_fn),
+                    token_budget,
+                    custom_instructions.as_deref(),
+                    options.replace_instructions,
+                    signal.clone(),
+                    &stream_options,
+                )
+                .await
+                {
+                    Ok(result) => break result,
+                    Err(_e)
+                        if retry.enabled
+                            && attempt <= retry.max_retries
+                            && !signal.is_cancelled() =>
+                    {
+                        let delay = std::time::Duration::from_millis(
+                            retry.base_delay_ms * (1u64 << (attempt - 1)),
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = signal.cancelled() => break
+                                crate::compaction::branch_summarization::BranchSummaryResult {
+                                    summary: None,
+                                    usage: None,
+                                    read_files: Vec::new(),
+                                    modified_files: Vec::new(),
+                                    aborted: true,
+                                },
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             if result.aborted {
                 // TS: an aborted summarization cancels the navigation before
                 // any cursor move or entry append.
@@ -2644,6 +2758,20 @@ impl PromptInput {
 pub struct HarnessResources {
     pub skills: Vec<Skill>,
     pub prompt_templates: Vec<PromptTemplate>,
+    /// AGENTS.md / CLAUDE.md instruction files discovered by the resource
+    /// loader. They are not skills: the facade folds them into the system
+    /// prompt automatically (TS project instructions), so every turn sees
+    /// them without an explicit invocation.
+    pub context_files: Vec<ContextFile>,
+}
+
+/// A project-instruction file (AGENTS.md / CLAUDE.md) from the agentDir or
+/// an ancestor directory.
+#[derive(Debug, Clone)]
+pub struct ContextFile {
+    pub name: String,
+    pub location: String,
+    pub content: String,
 }
 
 /// A skill the agent can invoke.
@@ -4708,9 +4836,13 @@ mod tests {
         );
 
         let observer = harness.request_observer();
-        observer.before_payload(2, &serde_json::json!({ "model": "m" }));
-        observer.after_response(1, 429);
-        observer.after_response(2, 200);
+        let replaced = observer.before_payload(2, &serde_json::json!({ "model": "m" }));
+        // The registered handler echoed the payload unchanged; the provider
+        // sends it verbatim.
+        assert_eq!(replaced, Some(serde_json::json!({ "model": "m" })));
+        let headers = reqwest::header::HeaderMap::new();
+        observer.after_response(1, 429, &headers);
+        observer.after_response(2, 200, &headers);
 
         assert_eq!(
             seen.lock().unwrap().clone(),
@@ -7574,6 +7706,56 @@ mod tests {
         assert!(err.to_string().contains("shut down"), "{err}");
     }
 
+    /// Shutdown drops queued (unpersisted) mutations: a mid-run model
+    /// change queued on the mutation queue must not be flushed after
+    /// shutdown.
+    #[tokio::test]
+    async fn test_shutdown_drops_pending_mutations() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                seen: None,
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Arc::new(EchoTool) as Arc<dyn crate::tool::AgentTool>
+        ]));
+
+        let handle = harness.handle();
+        let handle_in_listener = handle.clone();
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let turn_ends = Arc::new(AtomicUsize::new(0));
+        let turns = Arc::clone(&turn_ends);
+        let _sub = harness.agent().subscribe(Arc::new(move |event, _token| {
+            let handle = handle_in_listener.clone();
+            let turns = Arc::clone(&turns);
+            Box::pin(async move {
+                if matches!(event, AgentEvent::TurnEnd { .. })
+                    && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
+                {
+                    // Queue a model change mid-run; shutdown must drop it.
+                    handle.set_model(resolved_model());
+                    handle.request_shutdown();
+                }
+            })
+        }));
+
+        let _ = harness.prompt("use the tool").await;
+        // Shutdown cleared the mutation queue: no model_change was persisted.
+        let entries = harness.session().storage().get_entries().await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, SessionTreeEntry::ModelChange { .. })),
+            "shutdown must not flush queued mutations: {entries:?}"
+        );
+    }
+
     /// A prompt batch with image content produces a user message carrying
     /// both blocks; skills and templates expand into prompts; next_turn
     /// reflects queued runtime mutations.
@@ -7598,6 +7780,7 @@ mod tests {
                 name: "review".into(),
                 content: "Review $1 for bugs.".into(),
             }],
+            ..Default::default()
         });
 
         // Image content joins the user message.

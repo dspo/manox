@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::harness::{HarnessResources, PromptTemplate, Skill};
+use crate::harness::{ContextFile, HarnessResources, PromptTemplate, Skill};
 
 /// Loads resources for a working directory.
 pub struct ResourceLoader {
@@ -19,6 +19,11 @@ pub struct ResourceLoader {
     /// Global config directory whose instructions / skills / templates apply
     /// to every project.
     agent_dir: Option<PathBuf>,
+    /// Whether the project is trusted. Untrusted (or undecided) projects
+    /// lose their project-scoped resources (`.pi/skills`, `.pi/prompts`) —
+    /// the TS trust gate on project config resources. User (agentDir)
+    /// resources and the instruction ancestor chain always load.
+    trusted: bool,
 }
 
 /// A non-fatal discovery problem: name conflicts, unreadable files, or
@@ -45,7 +50,15 @@ impl ResourceLoader {
         ResourceLoader {
             cwd: cwd.into(),
             agent_dir: None,
+            trusted: true,
         }
+    }
+
+    /// Mark the project trusted or not; untrusted projects skip
+    /// project-scoped resources.
+    pub fn with_trust(mut self, trusted: bool) -> Self {
+        self.trusted = trusted;
+        self
     }
 
     /// Load the global (agentDir) instructions / skills / templates too.
@@ -77,17 +90,17 @@ impl ResourceLoader {
             dir = current.parent();
         }
 
-        // Skills: global first, then project — project wins name conflicts.
+        // Skills and prompts: user (agentDir) resources always load;
+        // project-scoped `.pi/skills` / `.pi/prompts` load only for trusted
+        // projects (TS gates project config resources on trust).
         if let Some(agent_dir) = &self.agent_dir {
             load_skills(agent_dir, &mut resources, &mut diagnostics).await;
-        }
-        load_skills(&self.cwd, &mut resources, &mut diagnostics).await;
-
-        // Templates: global first, then project — project wins name conflicts.
-        if let Some(agent_dir) = &self.agent_dir {
             load_templates(agent_dir, &mut resources, &mut diagnostics).await;
         }
-        load_templates(&self.cwd, &mut resources, &mut diagnostics).await;
+        if self.trusted {
+            load_skills(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
+            load_templates(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
+        }
 
         Ok(ResourceSnapshot {
             resources,
@@ -124,9 +137,8 @@ async fn load_instruction_file(
                 .to_lowercase();
             // Each ancestor level's instructions are distinct context; they
             // coexist even when they share a stem (multiple CLAUDE.md files).
-            resources.skills.push(Skill {
+            resources.context_files.push(ContextFile {
                 name: stem,
-                description: format!("Instructions from {}", path.display()),
                 location: path.to_string_lossy().into_owned(),
                 content,
             });
@@ -252,7 +264,7 @@ async fn load_templates(
     resources: &mut HarnessResources,
     diagnostics: &mut Vec<ResourceDiagnostic>,
 ) {
-    let templates_dir = root.join("templates");
+    let templates_dir = root.join("prompts");
     if !templates_dir.is_dir() {
         return;
     }
@@ -328,7 +340,6 @@ mod tests {
         let dir = tmp();
         let root = dir.path().join("proj");
         tokio::fs::create_dir_all(&root).await.unwrap();
-        // Both candidates exist; AGENTS.md wins per the preference order.
         tokio::fs::write(root.join("AGENTS.md"), "agents instructions")
             .await
             .unwrap();
@@ -338,14 +349,19 @@ mod tests {
 
         let loader = ResourceLoader::new(&root);
         let snapshot = loader.snapshot_with_diagnostics().await.unwrap();
+        // Instructions land in context files, not skills.
         let names: Vec<&str> = snapshot
             .resources
-            .skills
+            .context_files
             .iter()
-            .map(|s| s.name.as_str())
+            .map(|c| c.name.as_str())
             .collect();
         assert!(names.contains(&"agents"), "{names:?}");
         assert!(!names.contains(&"claude"), "{names:?}");
+        assert!(
+            snapshot.resources.skills.is_empty(),
+            "instructions are not skills"
+        );
     }
 
     #[tokio::test]
@@ -365,15 +381,15 @@ mod tests {
 
         let loader = ResourceLoader::new(&root);
         let snapshot = loader.snapshot_with_diagnostics().await.unwrap();
-        let claude_skills: Vec<&Skill> = snapshot
+        let claude_files: Vec<&ContextFile> = snapshot
             .resources
-            .skills
+            .context_files
             .iter()
-            .filter(|s| s.name == "claude")
+            .filter(|c| c.name == "claude")
             .collect();
-        assert_eq!(claude_skills.len(), 3, "one per ancestor level");
+        assert_eq!(claude_files.len(), 3, "one per ancestor level");
         assert!(
-            claude_skills.iter().any(|s| s.content.contains("level c")),
+            claude_files.iter().any(|c| c.content.contains("level c")),
             "closest wins by position"
         );
     }
@@ -382,23 +398,22 @@ mod tests {
     async fn recursive_skill_discovery_with_frontmatter_and_conflicts() {
         let dir = tmp();
         let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(cwd.join("skills").join("deep"))
+        tokio::fs::create_dir_all(cwd.join(".pi/skills/deep"))
             .await
             .unwrap();
         tokio::fs::write(
-            cwd.join("skills/review.md"),
+            cwd.join(".pi/skills/review.md"),
             "---\nname: review\ndescription: review the diff\n---\nCheck the diff.",
         )
         .await
         .unwrap();
         tokio::fs::write(
-            cwd.join("skills/deep/SKILL.md"),
+            cwd.join(".pi/skills/deep/SKILL.md"),
             "---\nname: deep-skill\n---\nDeep skill body.",
         )
         .await
         .unwrap();
-        // A nested non-SKILL .md is ignored.
-        tokio::fs::write(cwd.join("skills/deep/notes.md"), "ignored")
+        tokio::fs::write(cwd.join(".pi/skills/deep/notes.md"), "ignored")
             .await
             .unwrap();
 
@@ -429,9 +444,28 @@ mod tests {
             "nested non-SKILL md ignored"
         );
 
-        // Same name twice -> conflict diagnostic, later load wins.
-        let loader = ResourceLoader::new(&cwd);
-        let snapshot = loader.snapshot_with_diagnostics().await.unwrap();
+        // A user (agentDir) skill with the same name -> conflict diagnostic,
+        // the later (project) load wins the slot.
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(agent_dir.join("skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("skills/review.md"), "user review")
+            .await
+            .unwrap();
+        let snapshot = ResourceLoader::new(&cwd)
+            .with_agent_dir(&agent_dir)
+            .snapshot_with_diagnostics()
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("conflict")),
+            "conflict recorded: {:?}",
+            snapshot.diagnostics
+        );
         assert_eq!(
             snapshot
                 .resources
@@ -444,20 +478,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untrusted_projects_lose_project_scoped_resources() {
+        let dir = tmp();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(agent_dir.join("skills"))
+            .await
+            .unwrap();
+        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
+            .await
+            .unwrap();
+        tokio::fs::write(agent_dir.join("skills/user.md"), "user skill")
+            .await
+            .unwrap();
+
+        // Trusted: both load.
+        let snapshot = ResourceLoader::new(&cwd)
+            .with_agent_dir(&agent_dir)
+            .snapshot_with_diagnostics()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.resources.skills.len(), 2);
+
+        // Untrusted: project-scoped resources are dropped, user ones remain.
+        let snapshot = ResourceLoader::new(&cwd)
+            .with_agent_dir(&agent_dir)
+            .with_trust(false)
+            .snapshot_with_diagnostics()
+            .await
+            .unwrap();
+        let names: Vec<&str> = snapshot
+            .resources
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["user"], "{names:?}");
+    }
+
+    #[tokio::test]
     async fn templates_load_with_project_winning_conflicts() {
         let dir = tmp();
         let cwd = dir.path().join("proj");
         let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(cwd.join("templates"))
+        tokio::fs::create_dir_all(cwd.join(".pi/prompts"))
             .await
             .unwrap();
-        tokio::fs::create_dir_all(agent_dir.join("templates"))
+        tokio::fs::create_dir_all(agent_dir.join("prompts"))
             .await
             .unwrap();
-        tokio::fs::write(agent_dir.join("templates/fix.md"), "global fix")
+        tokio::fs::write(agent_dir.join("prompts/fix.md"), "global fix")
             .await
             .unwrap();
-        tokio::fs::write(cwd.join("templates/fix.md"), "project fix")
+        tokio::fs::write(cwd.join(".pi/prompts/fix.md"), "project fix")
             .await
             .unwrap();
 
