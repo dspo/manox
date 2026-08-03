@@ -25,7 +25,7 @@ use crate::tools::write::WriteTool;
 use crate::trust::{TrustManager, TrustStatus};
 use crate::types::{AgentMessage, Model, StopReason};
 
-use super::model_runtime::ModelRuntime;
+use super::model_runtime::{ModelCatalog, ModelRuntime};
 use super::resource_loader::ResourceLoader;
 
 /// Where a fork attaches the new session: at the selected entry, or before
@@ -517,6 +517,7 @@ impl AgentSession {
         // changes.
         let base_prompt = self.base_prompt.clone();
         let cwd = self.cwd.clone();
+        let custom_for_builder = self.base_prompt != crate::system_prompt::DEFAULT_BASE_PROMPT;
         harness.set_system_prompt_builder(
             move |active_tools: &[String], resources: &HarnessResources| {
                 crate::system_prompt::build_harness_prompt(
@@ -525,7 +526,7 @@ impl AgentSession {
                     active_tools,
                     &resources.context_files,
                     &resources.skills,
-                    false,
+                    custom_for_builder,
                 )
             },
         );
@@ -571,31 +572,63 @@ fn default_agent_dir() -> PathBuf {
 /// Clamp a desired thinking level against a model's capability (TS
 /// `clampThinkingLevel`): a non-thinking model forces `off`; with no desire,
 /// a thinking-capable model defaults to `medium`.
-fn clamp_thinking(
-    model_thinking: crate::types::ThinkingKind,
-    desired: Option<String>,
-) -> Option<String> {
+fn clamp_thinking(model: &Model, desired: Option<String>) -> Option<String> {
+    // The model's own reasoning flag is authoritative: a non-reasoning model
+    // supports only `off`, whatever the catalog says; otherwise the
+    // catalog's supported level set applies.
+    let levels: &[&str] = if model.thinking == crate::types::ThinkingKind::None {
+        &["off"]
+    } else {
+        crate::coding_agent::model_runtime::supported_thinking_levels(&model.provider, &model.id)
+    };
     match desired {
-        Some(level) if level != "off" && model_thinking == crate::types::ThinkingKind::None => {
-            Some("off".to_string())
+        None => {
+            if model.thinking == crate::types::ThinkingKind::None {
+                None
+            } else {
+                Some("medium".to_string())
+            }
         }
-        Some(level) => Some(level),
-        None => (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string()),
+        Some(level) => {
+            if levels.contains(&level.as_str()) {
+                return Some(level);
+            }
+            let order = crate::coding_agent::model_runtime::THINKING_LEVELS;
+            let Some(requested) = order.iter().position(|l| *l == level) else {
+                return levels.first().map(|l| l.to_string());
+            };
+            for candidate in &order[requested..] {
+                if levels.contains(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+            for candidate in order[..requested].iter().rev() {
+                if levels.contains(candidate) {
+                    return Some(candidate.to_string());
+                }
+            }
+            levels.first().map(|l| l.to_string())
+        }
     }
 }
 
-/// The default model when none is configured: anthropic, from `ANTHROPIC_MODEL`
-/// or a sensible default.
+/// The default model when none is configured: Sonnet 4.6 resolved through
+/// the default catalog, so its thinking capability and parameters are exact
+/// (`ANTHROPIC_MODEL` overrides the id; an unknown override falls back to
+/// Sonnet).
 pub fn default_model() -> Model {
-    Model {
-        provider: "anthropic".into(),
-        api: "anthropic".into(),
-        id: std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into()),
-        context_window: 200_000,
-        max_tokens: 8_192,
-        thinking: crate::types::ThinkingKind::None,
-        metadata: Default::default(),
-    }
+    let id = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into());
+    crate::coding_agent::model_runtime::DefaultModelCatalog
+        .resolve("anthropic", &id)
+        .unwrap_or_else(|| Model {
+            provider: "anthropic".into(),
+            api: "anthropic".into(),
+            id,
+            context_window: 200_000,
+            max_tokens: 8_192,
+            thinking: crate::types::ThinkingKind::Enabled,
+            metadata: Default::default(),
+        })
 }
 
 /// A model resolver that restores a session-carried model reference through
@@ -844,7 +877,9 @@ impl AgentSessionBuilder {
             },
         };
 
-        let model_thinking = model.thinking;
+        // Capture the model identity before it moves into the harness; the
+        // thinking clamp needs it after restore.
+        let model_key = (model.provider.clone(), model.id.clone(), model.thinking);
 
         // A new session persists its initial model and thinking entries (TS
         // writes them on session creation); they buffer in the deferred
@@ -859,7 +894,7 @@ impl AgentSessionBuilder {
                 .await?;
             let _ = session
                 .append_thinking_level_change(
-                    clamp_thinking(model_thinking, settings.default_thinking_level.clone())
+                    clamp_thinking(&model, settings.default_thinking_level.clone())
                         .unwrap_or_else(|| "off".into())
                         .as_str(),
                 )
@@ -893,6 +928,7 @@ impl AgentSessionBuilder {
         // model never sees tools/skills that are not actually available.
         let base_prompt_for_builder = base_prompt.clone();
         let cwd_for_builder = cwd.clone();
+        let custom_for_builder = self.system_prompt.is_some();
         harness.set_system_prompt_builder(
             move |active_tools: &[String], resources: &HarnessResources| {
                 crate::system_prompt::build_harness_prompt(
@@ -901,7 +937,7 @@ impl AgentSessionBuilder {
                     active_tools,
                     &resources.context_files,
                     &resources.skills,
-                    false,
+                    custom_for_builder,
                 )
             },
         );
@@ -943,11 +979,29 @@ impl AgentSessionBuilder {
         // case (TS clamps again after a model fallback). One value lands in
         // memory, so the first turn equals a reopen.
         let desired = if restore && has_thinking_entry {
-            harness.agent().state().thinking_level.clone()
+            // A persisted entry is a real preference — an explicit `"off"`
+            // must survive the reopen (the projection folds it to `None`).
+            Some(
+                harness
+                    .agent()
+                    .state()
+                    .thinking_level
+                    .clone()
+                    .unwrap_or_else(|| "off".into()),
+            )
         } else {
             settings.default_thinking_level.clone()
         };
-        harness.set_initial_thinking_level(clamp_thinking(model_thinking, desired));
+        let clamp_model = Model {
+            provider: model_key.0.clone(),
+            api: String::new(),
+            id: model_key.1.clone(),
+            context_window: 0,
+            max_tokens: 0,
+            thinking: model_key.2,
+            metadata: Default::default(),
+        };
+        harness.set_initial_thinking_level(clamp_thinking(&clamp_model, desired));
 
         Ok(AgentSession {
             harness,
@@ -1797,17 +1851,61 @@ mod tests {
 
     /// `builder.with_model(B).open(path)` keeps B even when the session
     /// recorded model A (TS `options.model > restored model`); the first
-    /// provider request is served by B.
+    /// provider request is actually served by B.
     #[tokio::test]
     async fn open_keeps_an_explicit_model_override() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        // Session A (default test model).
+
+        // A recording runtime: the stream notes the model id it served.
+        fn recording_runtime(seen: Arc<std::sync::Mutex<Vec<String>>>) -> ModelRuntime {
+            struct Recording(Arc<std::sync::Mutex<Vec<String>>>);
+            #[async_trait::async_trait]
+            impl StreamFn for Recording {
+                async fn stream(
+                    &self,
+                    context: &AgentContext,
+                    _signal: tokio_util::sync::CancellationToken,
+                    _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+                ) -> Result<AgentMessage, anyhow::Error> {
+                    self.0.lock().unwrap().push(context.model.id.clone());
+                    Ok(AgentMessage::Assistant {
+                        content: vec![ContentBlock::Text {
+                            text: "answer".into(),
+                            signature: None,
+                        }],
+                        model: "test".into(),
+                        provider: "test".into(),
+                        api: "test".into(),
+                        response_model: None,
+                        response_id: None,
+                        diagnostics: None,
+                        raw_stop_reason: None,
+                        stop_reason: Some(StopReason::Stop),
+                        usage: Default::default(),
+                        error_message: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                }
+            }
+            struct TestCatalog;
+            impl crate::coding_agent::model_runtime::ModelCatalog for TestCatalog {
+                fn resolve(&self, _provider: &str, _model_id: &str) -> Option<Model> {
+                    Some(test_model())
+                }
+            }
+            let stream: Arc<dyn StreamFn> = Arc::new(Recording(seen));
+            let resolver: crate::agent_loop::StreamResolver =
+                Arc::new(move |_m: &Model| Ok(Arc::clone(&stream)));
+            ModelRuntime::new(resolver).with_catalog(Arc::new(TestCatalog))
+        }
+
+        let seen_first = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
+            .with_model_runtime(recording_runtime(Arc::clone(&seen_first)))
             .with_model(test_model())
             .build()
             .await
@@ -1815,19 +1913,25 @@ mod tests {
         session.prompt("hi").await.unwrap();
         let path = session.close().await.unwrap();
 
-        // Reopen with an explicit model B.
+        // Reopen with an explicit model B and actually prompt.
         let model_b = Model {
             id: "model-b".into(),
             ..test_model()
         };
-        let resumed = create_agent_session()
-            .with_model_runtime(fake_runtime())
+        let seen_second = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut resumed = create_agent_session()
+            .with_model_runtime(recording_runtime(Arc::clone(&seen_second)))
             .with_model(model_b.clone())
             .open(path)
             .await
             .unwrap();
         assert_eq!(resumed.model().id, "model-b", "explicit model wins");
-        assert_eq!(resumed.harness.model().id, "model-b");
+        resumed.prompt("go").await.unwrap();
+        assert_eq!(
+            *seen_second.lock().unwrap(),
+            vec!["model-b".to_string()],
+            "the first provider request must be served by B"
+        );
     }
 
     /// A thinking-capable default model (Sonnet, per the frozen TS baseline)

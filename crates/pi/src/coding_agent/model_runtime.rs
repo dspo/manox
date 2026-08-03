@@ -154,7 +154,7 @@ impl ModelRuntime {
 /// and parameters. An unknown model id resolves to `None` — the crate never
 /// guesses a protocol or parameters for an arbitrary id; consumers inject
 /// their own catalog (registry) for full coverage.
-struct DefaultModelCatalog;
+pub struct DefaultModelCatalog;
 
 impl ModelCatalog for DefaultModelCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
@@ -176,7 +176,7 @@ impl ModelCatalog for DefaultModelCatalog {
                 "anthropic",
                 200_000,
                 16_384,
-                crate::types::ThinkingKind::Enabled,
+                crate::types::ThinkingKind::Adaptive,
             ),
             ("anthropic", "claude-haiku-4-5") => (
                 "anthropic",
@@ -265,6 +265,25 @@ impl ModelRuntime {
             };
             Ok(stream)
         })
+    }
+}
+
+/// The TS thinking-level order.
+pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The levels a model supports, mirroring TS `getSupportedThinkingLevels`
+/// for the default catalog: reasoning models support all levels except where
+/// the level map excludes one (Sonnet 4.6 excludes `xhigh`); non-reasoning
+/// models support only `off`.
+pub fn supported_thinking_levels(provider: &str, model_id: &str) -> &'static [&'static str] {
+    match (provider, model_id) {
+        ("anthropic", "claude-sonnet-4-6") => &["off", "minimal", "low", "medium", "high", "max"],
+        ("anthropic", "claude-opus-4-8") => THINKING_LEVELS,
+        ("openai", "gpt-5") | ("openai", "gpt-5-mini") => THINKING_LEVELS,
+        ("anthropic", "claude-haiku-4-5") | ("openai", "gpt-4o") | ("openai", "gpt-4o-mini") => {
+            &["off"]
+        }
+        _ => THINKING_LEVELS,
     }
 }
 
