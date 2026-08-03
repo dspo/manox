@@ -244,6 +244,17 @@ pub trait AgentTool: Send + Sync {
 - `open()` 不自动 restore（调用者需手动恢复，S6 改为返回前 restore）；无 `fork`/事件订阅面/shutdown（S6/S4）；`from_env` 缺凭证已返回 typed `MissingCredential`（S3，2026-08-01）
 - example `coding_agent_smoke`：资源加载→工具轮→model 切换→compact→close/reopen→continue
 
+### 迭代切片（2026-08-01 已执行）
+
+- [x] S0 收口校准 + 基线冻结（`b9b6869` + dirty / TS `4488ad55c`）
+- [x] S1 branch summarization 与 tree navigation（TS 对齐）
+- [x] S2 session repository 与 fork（SessionInfo / forkFrom / createBranchedSession / deferred 物化）
+- [x] S3 选定 pi-ai 请求链路（per-request options / typed credential / payload-response hooks）
+- [x] S4 harness 控制与事件语义（shutdown / queue modes / HarnessEvent）
+- [x] S5 资源、settings、trust、cache 真实接线
+- [x] S6 coding-agent facade 纵向闭环（build/open/fork/close）
+- [x] S7 差分覆盖与最终收口（check_examples.sh / upstream delta audit）
+
 ### 待完成
 
 TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该文件为准）：
@@ -259,6 +270,10 @@ TS Pi 对齐的已知余项（逐项对齐核验见 `docs/ts-pi-parity.md`，该
 Rust-only 处置（S0 拍板）：
 
 - [x] `SessionRepository::search()` 删除（S2，2026-08-01）
+- [x] S3 per-request StreamOptions / typed MissingCredential / RequestObserver
+- [x] S4 shutdown / queue modes / HarnessEvent 订阅
+- [x] S5 ResourceLoader / settings 文件 / trust 持久化 / cache 计价
+- [x] S6 AgentSession build 全组装 / open 自动 restore / fork / async close
 - [ ] `output_guard` 维持默认关闭（未接入任何工具输出路径）——冻结
 - [ ] hashline / 进程内 grep/find / file mutation queue 保留并冻结，不继续扩展
 

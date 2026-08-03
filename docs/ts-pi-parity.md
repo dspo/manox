@@ -119,6 +119,7 @@
 4. **Session store/reader/repository 深度（upstream 4488ad55c 之后）**：crate pi 已有 SessionRepository + Session 树操作；TS 的 readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 标删除（S2）
 5. **coding-agent facade 纵向**：open 不自劢 restore、缺凭证假 key、无 fork/事件/shutdown（S6/S4）
 6. **pi-ai breadth**：已选三协议之外的 7 个 chat API + image API 未实现（明确排除项，不阻塞 agreed scope）
+7. **upstream delta `4488ad55c..origin/main`（15 commits，审计于 S7）**：① session storage repository 重构（jsonl-store→jsonl-repo、memory-repo、search.ts，applicable unported delta）；② bounded branch queries + SQLite branch caching（性能/规模向）；③ harness v2 文档（设计，未实现）；④ coding-agent 修复（connection timeout、availability refresh、model-runtime）。基线冻结在 `4488ad55c`，以上拆为独立 ledger 项，不夹带已验收切片
 
 ## 工程化余项（非行为对齐）
 
@@ -130,6 +131,13 @@
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
 | S0（收口校准，2026-08-01） | `b9b6869` + dirty（10 改 2 增，未提交） | `4488ad55c`（未变） | 修 fixture 尾随空格（`git diff --check` 通过）；repository/navigation、coding-agent facade、settings/trust/cache 逐条状态化（🟡/🚫 不再用模块级 ✅ 掩盖）；`search` 标删除、`output_guard` 标默认关闭、hashline 标接受并冻结；schemars 从待办删除；**S0 完成后冻结共享基线，其余 agent 在此基线上开始** |
+| S1（2026-08-01） | `4033883` | `4488ad55c` | branch summarization 按 TS 重写（getMessageFromEntry/prepareBranchEntries/BRANCH_SUMMARY_PROMPT/preamble/usage/read+modified files）；navigate label/abort/hook（session_before_tree/session_tree）；append_branch_summary details 对齐 TS wire shape；差分 fixture branch-summary-preparation |
+| S2（2026-08-01） | `beb2f3d` | `4488ad55c` | SessionInfo 全字段 + modified 倒序 + 坏文件跳过；fork_from（parentSession=源路径/新 timestamp/目标 cwd）；create_branched_session（label 重链 + deferred 物化）；deferred-first-assistant 持久化；search 删除 |
+| S3（2026-08-01） | `b0d593a` | `4488ad55c` | per-request StreamOptions（turn snapshot → 每次请求，overlay builder）；ModelRuntime::from_env typed MissingCredential；RequestObserver（before_payload/after_response 每次 attempt）+ harness hook 映射 |
+| S4（2026-08-01） | `4671f7e` | `4488ad55c` | Agent 队列模式 getter/setter/clear；HarnessEvent 订阅（QueueUpdate/Settled/Model/Thinking/Tools/ResourcesUpdate）；shutdown（幂等、清队列、取消、拒绝新操作）；skill_with_instructions、append_message（idle 立即/运行中 mutation 队列）、set_tools 校验 |
+| S5（2026-08-01） | `f569503` | `4488ad55c` | ResourceLoader（agentDir + AGENTS/CLAUDE ancestor chain、候选顺序、canonical 去重、递归 SKILL.md + frontmatter + 冲突诊断）；settings 文件 load/save/reload 递归合并；trust JSON 持久化 + untrusted；cache_stats 真实计价（StaticModelPrices）与 idle |
+| S6（2026-08-01） | `bd936bc` | `4488ad55c` | AgentSession 纵向：build 全组装（settings/trust/resources/model/runtime，override 优先）；open 自动 restore；S4 面转发；fork(entry, ForkPosition)（BeforeUser 返回选中文本）；async close settle；缺凭证早失败；untrusted 禁用副作用工具 |
+| S7（2026-08-01） | `（待提交）` | `4488ad55c` | check_examples.sh 离线 example gate（8 个实际运行）；fixture README 记录生成命令；upstream delta audit 拆为独立 ledger 项 |
 | 第十轮（2026-08-01） | `b9b6869` | `4488ad55c`（未变） | navigate_tree 默认 summarize=false + 选项面（custom/replace/label）+ BranchSummary phase；next_turn 运行中排队（HarnessHandle）；flush 失败 restore 重放队列（恢复后由被排队 model 服务）；substitute_args 单趟全语法（defaults/$0/不递归）；fixture 刷新链路可用（bun 捕获真实 TS 源码）；PLAN/parity 校准 |
 | 第九轮（Phase 4A，2026-08-01） | `d100401` | `4488ad55c`（未变） | 运行配置闭环：Model 全字段判等、restore 三态同步、resolver 失败 terminal 化、无 resolver 跨 API 报错、harness_chat api 修正；新增 6 个回归 + `runtime_switch` example |
 | Phase 4B（2026-08-01） | `faa9690` | `4488ad55c` | EventSink Result 化、PrepareTurnFn async+TurnUpdate、Agent middleware、message_end 逐条持久化（Arc Session）、删除 turn 末批量写；`session_resume` example |
