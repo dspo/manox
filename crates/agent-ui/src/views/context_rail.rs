@@ -41,9 +41,8 @@ use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_disp
 // ── Geometry ─────────────────────────────────────────────────────────────
 
 /// Floating card width. Wide enough for the per-model usage block: model id
-/// (plus trailing cache-hit badge) on the top line, `├── 穿透` (input /
-/// (input / output) and `└── 缓存` (cache read) tree rows underneath,
-/// each with `↑↓` animated counters.
+/// on the top line, then `├─ pct% used/cap` and `└─ ↑input ↓output Rcache
+/// CHhit%` tree rows underneath.
 pub(crate) const ENV_CARD_WIDTH: f32 = 260.;
 /// Right inset the conversation body reserves for the floating card: the
 /// card width plus a gutter so the message list clears the card's shadow.
@@ -383,21 +382,26 @@ impl ContextRail {
                     let cap = crate::cockpit::format_tokens_pi(budget.cap_tokens);
                     let near_full = budget.used_pct >= 90.0;
                     let ctx_color = if near_full { warn_color } else { muted };
-                    section = section.child(gpui::div().text_xs().text_color(ctx_color).child(
-                        SharedString::from(format!(
-                            "{indent}├─ {:.1}% {used}/{cap}",
-                            budget.used_pct
-                        )),
-                    ));
+                    section = section.child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(ctx_color)
+                            .truncate()
+                            .child(SharedString::from(format!(
+                                "{indent}├─ {:.1}% {used}/{cap}",
+                                budget.used_pct
+                            ))),
+                    );
                 }
 
-                // Token line: ↑input ↓output Rcache_read CHcache_hit_rate.
+                // Token line: ↑input ↓output Rcache_read CHcache_hit_rate. `--`
+                // (the tooltip convention) when there is no input to measure.
                 let cache_hit = crate::cockpit::cache_read_ratio(**usage)
-                    .map(|r| r * 100.0)
-                    .unwrap_or(0.0);
-                section = section.child(gpui::div().text_xs().text_color(muted).child(
+                    .map(|r| format!("{:.1}", r * 100.0))
+                    .unwrap_or_else(|| "--".into());
+                section = section.child(gpui::div().text_xs().text_color(muted).truncate().child(
                     SharedString::from(format!(
-                        "{indent}└─ ↑{} ↓{} R{} CH{:.1}%",
+                        "{indent}└─ ↑{} ↓{} R{} CH{}",
                         crate::cockpit::format_tokens_pi(usage.input_tokens),
                         crate::cockpit::format_tokens_pi(usage.output_tokens),
                         crate::cockpit::format_tokens_pi(usage.cache_read_input_tokens),
