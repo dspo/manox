@@ -1220,6 +1220,13 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.set_system_prompt(prompt);
     }
 
+    /// Set the initial active tool subset in memory (no `active_tools_change`
+    /// entry) — used for the facade's TS default four tools.
+    pub fn set_initial_active_tools(&mut self, names: Vec<String>) {
+        self.active_tool_names = Some(names);
+        self.apply_active_tools();
+    }
+
     /// Whether cache-miss notices are shown.
     pub fn show_cache_miss_notices(&self) -> bool {
         self.show_cache_miss_notices
@@ -1690,12 +1697,14 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             timestamp: chrono::Utc::now(),
         };
         let mut batch = Vec::new();
-        // The prompt's own user message runs first; queued next-turn
-        // messages follow as asides (TS coding-agent `prompt()`), then
-        // hook-injected messages.
-        batch.push(user_message);
+        // pi-agent-core semantics: the harness's own next-turn queue runs
+        // BEFORE the prompt's user message (TS agent-harness executeTurn).
+        // The coding facade's asides (its pending next-turn messages) follow
+        // the user message, then hook-injected messages.
         batch.append(&mut self.control.next_turn_queue.lock().unwrap());
         self.emit_queue_update();
+        batch.push(user_message);
+        batch.extend(input.asides);
         batch.extend(hook_ctx.inject_messages);
 
         let prior_system_prompt = self.agent.state().system_prompt.clone();
@@ -2975,6 +2984,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
 pub struct PromptInput {
     pub text: String,
     pub images: Vec<ContentBlock>,
+    /// Extra user messages appended after the prompt's own message (the
+    /// coding facade's pending next-turn asides). The harness's own
+    /// next-turn queue still runs before the prompt message.
+    pub asides: Vec<AgentMessage>,
 }
 
 impl PromptInput {
@@ -2982,6 +2995,7 @@ impl PromptInput {
         PromptInput {
             text: text.into(),
             images: Vec::new(),
+            asides: Vec::new(),
         }
     }
 }
@@ -8246,6 +8260,7 @@ pub(crate) mod tests {
                     data: "aW1hZ2U=".into(),
                     mime_type: "image/png".into(),
                 }],
+                asides: Vec::new(),
             })
             .await
             .unwrap();
@@ -8277,8 +8292,8 @@ pub(crate) mod tests {
                 if matches!(&content[0], ContentBlock::Text { text, .. } if text.contains("<skill name=\"summarize\" location=\"/proj/skills/summarize.md\">"))
         )));
 
-        // A queued next-turn message follows the prompt's own message (TS
-        // coding-agent `prompt()`).
+        // The harness's next-turn queue runs BEFORE the prompt's own
+        // message (pi-agent-core semantics, TS agent-harness executeTurn).
         harness.next_turn("queued next", Vec::new());
         assert!(harness.has_next_turn());
         let messages = harness.prompt("direct").await.unwrap();
@@ -8286,12 +8301,12 @@ pub(crate) mod tests {
         assert!(matches!(
             &messages[0],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "direct")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued next")
         ));
         assert!(matches!(
             &messages[1],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued next")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "direct")
         ));
         assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
     }
@@ -8392,12 +8407,12 @@ pub(crate) mod tests {
         assert!(matches!(
             &messages[0],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "second")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued mid-run")
         ));
         assert!(matches!(
             &messages[1],
             AgentMessage::User { content, .. }
-                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "queued mid-run")
+                if matches!(&content[0], ContentBlock::Text { text, .. } if text == "second")
         ));
     }
 

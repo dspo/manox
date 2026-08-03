@@ -479,7 +479,8 @@ impl<S: SessionStorage> Session<S> {
     /// with, plus the settings the active path carries.
     pub async fn build_session_context(&self) -> Result<SessionContext, anyhow::Error> {
         let path = self.get_branch().await?;
-        let (thinking_level, model, active_tool_names) = context_settings(&path);
+        let (has_thinking_entry, thinking_level, model, active_tool_names) =
+            context_settings(&path);
         let entries = build_context_entries(path);
         let mut messages = Vec::new();
         let mut message_entry_ids = Vec::new();
@@ -498,6 +499,7 @@ impl<S: SessionStorage> Session<S> {
             message_entry_ids,
             thinking_level,
             model,
+            has_thinking_entry,
             active_tool_names,
         })
     }
@@ -682,6 +684,11 @@ pub struct SessionContext {
     /// The model the session was last driven with — from the latest
     /// `model_change` entry, or the latest assistant message's own identity.
     pub model: Option<SessionModelRef>,
+    /// Whether the path carries an explicit thinking-level entry. Distinct
+    /// from `thinking_level`'s `None` (which also means "off"): a persisted
+    /// `"off"` is a real decision and must not be overridden by settings
+    /// defaults on reopen.
+    pub has_thinking_entry: bool,
     /// The active tool subset from the latest `active_tools_change` entry;
     /// `None` when the path never narrowed the mounted set.
     pub active_tool_names: Option<Vec<String>>,
@@ -740,7 +747,13 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 /// from the latest `active_tools_change`.
 fn context_settings(
     path: &[SessionTreeEntry],
-) -> (Option<String>, Option<SessionModelRef>, Option<Vec<String>>) {
+) -> (
+    bool,
+    Option<String>,
+    Option<SessionModelRef>,
+    Option<Vec<String>>,
+) {
+    let mut has_thinking_entry = false;
     let mut thinking_level = None;
     let mut model = None;
     let mut active_tool_names = None;
@@ -749,6 +762,7 @@ fn context_settings(
             SessionTreeEntry::ThinkingLevelChange {
                 thinking_level: l, ..
             } => {
+                has_thinking_entry = true;
                 thinking_level = (l != "off").then(|| l.clone());
             }
             SessionTreeEntry::ModelChange {
@@ -780,7 +794,7 @@ fn context_settings(
             _ => {}
         }
     }
-    (thinking_level, model, active_tool_names)
+    (has_thinking_entry, thinking_level, model, active_tool_names)
 }
 
 /// Project one session entry into context messages. Display/state entries
@@ -990,7 +1004,12 @@ mod tests {
                 thinking_level: "off".into(),
             },
         ];
-        let (thinking_level, model, active_tool_names) = context_settings(&path);
+        let (has_thinking_entry, thinking_level, model, active_tool_names) =
+            context_settings(&path);
+        assert!(
+            has_thinking_entry,
+            "an explicit thinking entry is witnessed"
+        );
         // The trailing "off" change resets the tier to the provider default.
         assert_eq!(thinking_level, None);
         // An assistant message is a fresher model witness than an older

@@ -89,7 +89,7 @@
 | 7 内建工具 | ✅ | read/write/edit/bash/grep/find/ls + truncate/path_utils/file_mutation_queue 基础设施 |
 | Settings 合并 | 🟡 | `settings.rs` 只做结构合并（field-wise CompactionOverrides，对齐 TS deepMergeSettings 递归语义）；文件加载/保存/reload/递归覆盖由接线方负责——见 S5 |
 | Trust | 🟡 | `trust.rs` 内存态决策管理，无持久化、未接入资源/工具启用策略——见 S5 |
-| cache_stats | 🟡 | token 维度 miss 检测已对齐（missed_tokens + miss 计数，noise floor）；金额与 idle 未接线（`missed_cost` 恒 0、`idle_ms` 占位）——见 S5 |
+| cache_stats | ✅（S5） | token 维度 miss 检测 + `StaticModelPrices` 真实计价（missed_cost）+ idle；`CacheWasteTotals` 消费侧由 UI 负责 |
 | output_guard | 🚫 默认关闭 | `output_guard.rs` 未接入任何工具输出路径（无可观察行为）；维持默认关闭，除非差分测试证明不改变 TS 模型可见行为 |
 | hashline edit | 🚫 接受并冻结 | hashline 锚定补丁 + 3-way 快照恢复（manox 增强，2026-07-29 拍板），保留但冻结不扩展 |
 
@@ -114,11 +114,11 @@
 
 ## 已知余项（对齐缺口，按严重度排序）
 
-1. **cache_stats 金额与 idle**：missed_cost 恒 0、idle_ms 占位，需接线 ModelPriceSource 与消息时间戳（S5）
+1. ~~cache_stats 金额与 idle~~：`StaticModelPrices` + missed_cost + idle 已接线（S5）；session stats 消费侧未做（UI 职责）
 2. **summarization retry/cancel**：summarization 与 branch summary 调用无 retry 策略与取消通道（S1）
 3. **summarization retry**：branch summary 与 compaction 的 summarization 调用无 retry 策略（S1 已接 abort/取消，retry 仍缺）
 4. **Session store/reader/repository 深度（upstream 4488ad55c 之后）**：crate pi 已有 SessionRepository + Session 树操作；TS 的 readers/search-backend/repo-utils 抽象未逐层对齐；Rust-only `search()` 标删除（S2）
-5. **coding-agent facade 纵向**：open 不自劢 restore、缺凭证假 key、无 fork/事件/shutdown（S6/S4）
+5. ~~coding-agent facade 纵向~~：open 自动 restore、typed credential、fork/事件/shutdown 已闭环（S6/S10）；model catalog 需 consumer 注入精确表（S12）
 6. **pi-ai breadth**：已选三协议之外的 7 个 chat API + image API 未实现（明确排除项，不阻塞 agreed scope）
 7. **upstream delta `4488ad55c..origin/main`（已推进至 `c6eb6281`，审计于 S7/S10）**：① session storage repository 重构（jsonl-store→jsonl-repo、memory-repo、search.ts，applicable unported delta）；② bounded branch queries + SQLite branch caching（Rust 已移植查询语义，SQLite 缓存未做）；③ harness v2 文档（设计，未实现）；④ coding-agent 修复（connection timeout、availability refresh、model-runtime）；⑤ post-login model catalog refresh 15s 超时与取消信号（env-only scope 下 deferred）。基线冻结在 `4488ad55c`，以上拆为独立 ledger 项，不夹带已验收切片
 
@@ -141,6 +141,7 @@
 | S7（2026-08-01） | `76e787c` | `4488ad55c` | check_examples.sh 离线 example gate（8 个实际运行）；fixture README 记录生成命令；upstream delta audit 拆为独立 ledger 项 |
 | S8（复核轮，2026-08-01） | `7f9e077` | `4488ad55c` | 按 remora 复核修复公共组装路径：session cwd 注入工具环境；AGENTS/CLAUDE 指令进 system prompt（不再作 skill）、`.pi/skills|prompts` 目录对齐；settings camelCase + `~` 展开 + thinking/compaction/retry/queue modes 应用；trust 对齐 TS（agentDir/trust.json + 祖先匹配 + undecided 门控项目资源，移除删工具行为）；惰性 per-model 凭证 + provider+modelId 恢复完整 API；fork 保留 assembly 状态；observer 接入公共路径（payload 可变 + headers）；navigate 取消/重试/请求选项闭环；shutdown 清 pending mutation；fork label 最终态；bounded branch queries（find_entries_on_branch/find_entry_on_branch） |
 | S9（复核轮，2026-08-01） | `d86a6fe` | `4488ad55c` | build/open 共用 assemble（open 按 session model 经 catalog 解析，不再默认 Anthropic 阻塞；AgentSession.cwd 跟 session）；branch query 重写为 upstream 语义 + 移植 branch-query.test.ts；唯一 system-prompt builder 雏形；settings.skills/prompts 初接线；before-payload 链式传递 + after-response headers；branch-summary retry 收窄 + 溢出安全退避 |
+| S12（复核轮，2026-08-01） | `（待提交）` | `4488ad55c` | 分层 next-turn（harness queued-first 恢复 + facade user-first asides，`PromptInput.asides`）；七工具 registry + 初始四工具 active subset（`set_initial_active_tools` 内存）；thinking presence witness（`has_thinking_entry`，显式 off 不被 settings 覆盖）+ 默认 medium clamp + 新 session 初始 model/thinking entry 持久化；默认 system prompt 内容（身份/guidelines，`DEFAULT_BASE_PROMPT`）；默认 catalog 精确表（不猜任意 ID）+ reopen miss 回退初始模型 + `modelFallbackNotice`；fork 继承 prompt builder + `AssemblyConfig::apply` 传播错误 |
 | S11（复核轮，2026-08-01） | `0443948` | `4488ad55c` | trust 先于 settings（untrusted 项目 settings 视为空配置，含回归）；default thinking 双状态（agent + turn_runtime）且 reopen 无 thinking entry 时回落 settings default；默认工具集改 TS 四件（read/bash/edit/write）；system prompt 随 active tools/resources 重建（builder 闭包，关闭 read 后隐藏 skills）+ skill XML 转义；reopen 模型 catalog 未命中显式报错（不再静默回退）；next_turn 顺序改 user 在前（TS coding-agent）；`prompt()` 默认展开 `/skill:` 与 `/template`；tree hook summary 仅在 summarize 时接受 + fromHook 贯穿持久化与事件；skill/template collision 保留先加载（TS winner=first）；env 测试共享锁消除并行污染 |
 | S10（复核轮，2026-08-01） | `f154f9c` | `4488ad55c` | open 不再经持久化 setter 应用 settings default thinking（新 session 内存初始态，reopen 投影持久化 tier）；`ModelRuntime` 引入可注入 `ModelCatalog`（默认 catalog + 自定义 runtime 注入，同 ID 双协议 reopen 测试）；branch-summary retry：backoff 取消返回 cancelled/aborted 结果（非错误）、成功/失败 End 生命周期配对、maxTokens 强制 2048、quota/billing body 排除重试；settings extra path 支持 file-or-directory（不再多拼 skills/prompts 子目录）、ancestor context 顺序 root→cwd；system prompt 补 working dir/active tools/context 真实路径/skill XML + 无 read 工具隐藏 skills，删除未调用第二套 builder；tree hook 支持 summary override + replaceInstructions override；before-provider-payload 带 model、after-response headers 为 Record<string,string>；P3 测试改进（reopen 不再改进程 cwd、build_fails_early 真调 build） |
 | 第十轮（2026-08-01） | `b9b6869` | `4488ad55c`（未变） | navigate_tree 默认 summarize=false + 选项面（custom/replace/label）+ BranchSummary phase；next_turn 运行中排队（HarnessHandle）；flush 失败 restore 重放队列（恢复后由被排队 model 服务）；substitute_args 单趟全语法（defaults/$0/不递归）；fixture 刷新链路可用（bun 捕获真实 TS 源码）；PLAN/parity 校准 |

@@ -150,44 +150,34 @@ impl ModelRuntime {
     }
 }
 
-/// The default catalog: Anthropic always maps to the Messages protocol;
-/// OpenAI models split by generation (reasoning families to Responses, the
-/// rest to Completions). A custom runtime injects its own catalog when the
-/// session's protocol must be exact.
+/// The default catalog: an EXACT table of known models with their protocol
+/// and parameters. An unknown model id resolves to `None` — the crate never
+/// guesses a protocol or parameters for an arbitrary id; consumers inject
+/// their own catalog (registry) for full coverage.
 struct DefaultModelCatalog;
 
 impl ModelCatalog for DefaultModelCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        let api = match provider {
-            "anthropic" => "anthropic".to_string(),
-            "openai" => {
-                if is_responses_model(model_id) {
-                    "openai_responses".to_string()
-                } else {
-                    "openai_completions".to_string()
-                }
+        let (api, context_window, max_tokens): (&str, usize, usize) = match (provider, model_id) {
+            ("anthropic", "claude-sonnet-4-6") => ("anthropic", 200_000, 8_192),
+            ("anthropic", "claude-opus-4-8") => ("anthropic", 200_000, 16_384),
+            ("anthropic", "claude-haiku-4-5") => ("anthropic", 200_000, 8_192),
+            ("openai", "gpt-5") | ("openai", "gpt-5-mini") => ("openai_responses", 200_000, 16_384),
+            ("openai", "gpt-4o") | ("openai", "gpt-4o-mini") => {
+                ("openai_completions", 128_000, 8_192)
             }
             _ => return None,
         };
         Some(Model {
             provider: provider.to_string(),
-            api,
+            api: api.into(),
             id: model_id.to_string(),
-            context_window: 200_000,
-            max_tokens: 8_192,
+            context_window,
+            max_tokens,
             thinking: crate::types::ThinkingKind::None,
             metadata: Default::default(),
         })
     }
-}
-
-/// Whether an OpenAI model id maps to the Responses API (the modern default
-/// for reasoning-capable models).
-fn is_responses_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    ["gpt-5", "o1-", "o3-", "o4-", "o5-", "o1", "o3", "o4", "o5"]
-        .iter()
-        .any(|p| id == *p || id.starts_with(&format!("{p}-")))
 }
 
 impl ModelRuntime {

@@ -17,6 +17,9 @@ use crate::session::{SessionStorage, SessionTreeEntry};
 use crate::tool::AgentTool;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
+use crate::tools::find::FindTool;
+use crate::tools::grep::GrepTool;
+use crate::tools::ls::LsTool;
 use crate::tools::read::ReadTool;
 use crate::tools::write::WriteTool;
 use crate::trust::{TrustManager, TrustStatus};
@@ -72,10 +75,13 @@ impl AssemblyConfig {
         }
     }
 
-    async fn apply(self, harness: &mut AgentHarness<crate::session::jsonl::JsonlSessionStorage>) {
-        let _ = harness.set_tools(Arc::from(self.tools));
+    async fn apply(
+        self,
+        harness: &mut AgentHarness<crate::session::jsonl::JsonlSessionStorage>,
+    ) -> Result<(), anyhow::Error> {
+        harness.set_tools(Arc::from(self.tools))?;
         if let Some(names) = self.active_tool_names {
-            let _ = harness.set_active_tools(names).await;
+            harness.set_active_tools(names).await?;
         }
         harness.set_resources(self.resources);
         harness.set_stream_options(self.stream_options);
@@ -83,6 +89,7 @@ impl AssemblyConfig {
         harness.set_follow_up_mode(self.follow_up_mode);
         harness.set_compaction_settings(self.compaction);
         harness.set_retry_settings(self.retry);
+        Ok(())
     }
 }
 
@@ -94,7 +101,17 @@ pub struct AgentSession {
     cwd: PathBuf,
     runtime: ModelRuntime,
     system_prompt: String,
+    /// The base prompt the system-prompt builder starts from; kept so a
+    /// fork re-installs the builder rather than freezing a rendered prompt.
+    base_prompt: String,
     tools: Vec<Arc<dyn AgentTool>>,
+    /// The facade's pending next-turn messages (TS coding-agent
+    /// `_pendingNextTurnMessages`): delivered AFTER the prompt's own user
+    /// message as asides, distinct from the harness's queued-first queue.
+    pending_next_turn: Arc<std::sync::Mutex<Vec<AgentMessage>>>,
+    /// Set when a reopened session's model could not be resolved exactly and
+    /// the initial model was used instead (TS `modelFallbackMessage`).
+    model_fallback_notice: Option<String>,
 }
 
 impl AgentSession {
@@ -104,7 +121,17 @@ impl AgentSession {
     /// template by name with `substituteArgs`.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let expanded = self.expand_prompt(text);
-        self.harness.prompt(&expanded).await
+        // The facade delivers its pending next-turn messages as asides AFTER
+        // the prompt's own user message (user-first); the harness's own
+        // queue keeps pi-agent-core queued-first semantics.
+        let asides = std::mem::take(&mut *self.pending_next_turn.lock().unwrap());
+        self.harness
+            .prompt_input(crate::harness::PromptInput {
+                text: expanded,
+                images: Vec::new(),
+                asides,
+            })
+            .await
     }
 
     /// The TS `_expandSkillCommand` + `expandPromptTemplate` expansion.
@@ -192,14 +219,24 @@ impl AgentSession {
         self.harness.handle().follow_up(message);
     }
 
-    /// Queue a next-turn message.
+    /// Queue a next-turn message delivered after the next prompt's own
+    /// message (TS coding-agent `nextTurn` asides).
     pub fn next_turn(&self, text: &str) {
-        self.harness.handle().next_turn(text, Vec::new());
+        self.pending_next_turn
+            .lock()
+            .unwrap()
+            .push(AgentMessage::user(text));
     }
 
-    /// Whether next-turn messages are queued.
+    /// The model-fallback notice when a reopened session's model could not
+    /// be restored exactly (TS `modelFallbackMessage`), if any.
+    pub fn model_fallback_notice(&self) -> Option<&str> {
+        self.model_fallback_notice.as_deref()
+    }
+
+    /// Whether next-turn messages are queued (facade pending or harness).
     pub fn has_next_turn(&self) -> bool {
-        self.harness.has_next_turn()
+        !self.pending_next_turn.lock().unwrap().is_empty() || self.harness.has_next_turn()
     }
 
     /// Abort the active run and any retry backoff.
@@ -439,7 +476,10 @@ impl AgentSession {
                 cwd: self.cwd,
                 runtime: self.runtime,
                 system_prompt: self.system_prompt,
+                base_prompt: self.base_prompt,
                 tools: self.tools,
+                pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
+                model_fallback_notice: None,
             },
             selected_text,
         })
@@ -466,13 +506,30 @@ impl AgentSession {
         let mut harness = AgentHarness::new(session, self.system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
             .with_tool_cwd(self.cwd.clone());
+        // Re-install the system-prompt builder (not just the rendered
+        // prompt), so a fork keeps rebuilding on active-tool/resource
+        // changes.
+        let base_prompt = self.base_prompt.clone();
+        let cwd = self.cwd.clone();
+        harness.set_system_prompt_builder(
+            move |active_tools: &[String], resources: &HarnessResources| {
+                crate::system_prompt::build_harness_prompt(
+                    &base_prompt,
+                    &cwd,
+                    active_tools,
+                    &resources.context_files,
+                    &resources.skills,
+                )
+            },
+        );
         // Restore projects the session's own model onto the harness.
         harness = harness.with_model_resolver(model_resolver(&self.runtime));
         let observer = harness.request_observer();
         harness.rebind_stream_resolver(self.runtime.resolver_with_observer(observer));
         // Re-apply the captured assembly state so a fork is identical to the
-        // session it came from.
-        config.apply(&mut harness).await;
+        // session it came from; propagate every error (a fork must never
+        // silently come back half-assembled).
+        config.apply(&mut harness).await?;
         Ok(harness)
     }
 }
@@ -679,6 +736,9 @@ impl AgentSessionBuilder {
 
         let session_path = session.storage().path().to_path_buf();
         // TS default tool set: read/bash/edit/write only.
+        // The registry mounts ALL seven built-in tools (TS); the initial
+        // ACTIVE subset is the TS default four, so grep/find/ls remain
+        // enableable later via set_active_tools.
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
             vec![
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
@@ -686,6 +746,9 @@ impl AgentSessionBuilder {
                     as Arc<dyn AgentTool>,
                 Arc::new(EditTool) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
+                Arc::new(GrepTool) as Arc<dyn AgentTool>,
+                Arc::new(FindTool) as Arc<dyn AgentTool>,
+                Arc::new(LsTool) as Arc<dyn AgentTool>,
             ]
         } else {
             self.tools.clone()
@@ -693,7 +756,7 @@ impl AgentSessionBuilder {
         let base_prompt = self
             .system_prompt
             .clone()
-            .unwrap_or_else(|| "You are a helpful coding agent.".into());
+            .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
         let active_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         let system_prompt = crate::system_prompt::build_harness_prompt(
             &base_prompt,
@@ -718,23 +781,23 @@ impl AgentSessionBuilder {
             Some(runtime) => runtime.clone(),
             None => ModelRuntime::from_env(),
         };
+        let mut fallback_notice = None;
         let model = match &self.model {
             Some(model) => model.clone(),
             None => match &session_model {
-                Some(mref) => {
-                    // A reopened session's model must resolve exactly: a
-                    // catalog miss is an explicit error, never a silent
-                    // fallback to a different provider/protocol.
-                    runtime
-                        .resolve_model(&mref.provider, &mref.model_id)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "session model {}/{} cannot be restored: no catalog entry",
-                                mref.provider,
-                                mref.model_id
-                            )
-                        })?
-                }
+                Some(mref) => match runtime.resolve_model(&mref.provider, &mref.model_id) {
+                    Some(model) => model,
+                    None => {
+                        // TS falls back to the initial model and surfaces a
+                        // notice (`modelFallbackMessage`); the crate never
+                        // guesses an unknown model's protocol.
+                        fallback_notice = Some(format!(
+                            "session model {}/{} could not be restored exactly;                              using the initial model instead",
+                            mref.provider, mref.model_id
+                        ));
+                        default_model()
+                    }
+                },
                 None => settings
                     .default_model
                     .clone()
@@ -757,6 +820,33 @@ impl AgentSessionBuilder {
             },
         };
 
+        // A new session persists its initial model and thinking entries (TS
+        // writes them on session creation); they buffer in the deferred
+        // storage until the first assistant message materializes the file,
+        // so a close/reopen or a pre-first-message fork projects the same
+        // configuration.
+        let has_thinking_entry = if restore {
+            session.build_session_context().await?.has_thinking_entry
+        } else {
+            let _ = session
+                .append_model_change(&model.provider, &model.id)
+                .await?;
+            let initial_thinking = settings.default_thinking_level.clone().unwrap_or_else(|| {
+                if model.thinking == crate::types::ThinkingKind::None {
+                    "off".into()
+                } else {
+                    "medium".into()
+                }
+            });
+            let _ = session
+                .append_thinking_level_change(&initial_thinking)
+                .await?;
+            true
+        };
+        // The model's thinking capability, captured before `model` moves
+        // into the harness.
+        let model_thinking = model.thinking;
+
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
         let mut harness = AgentHarness::new(session, system_prompt.clone(), model, stream_fn)
@@ -764,6 +854,16 @@ impl AgentSessionBuilder {
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
             .with_resources(resources);
+        if self.tools.is_empty() {
+            // Initial active subset: the TS default four. In-memory only —
+            // no `active_tools_change` entry is written for the default.
+            harness.set_initial_active_tools(vec![
+                "read".into(),
+                "bash".into(),
+                "edit".into(),
+                "write".into(),
+            ]);
+        }
         harness = harness.with_model_resolver(model_resolver(&runtime));
         // Install the prompt builder: the harness rebuilds the system prompt
         // whenever the effective tool selection or resources change, so the
@@ -810,13 +910,17 @@ impl AgentSessionBuilder {
         }
         // Default thinking tier: applied in-memory to BOTH the agent state
         // and the shared runtime snapshot (so the first turn does not wipe
-        // it), for a new session and for a reopened session that carries no
-        // persisted thinking entry (TS falls back to the settings default).
-        // Never through the persisting setter; a persisted entry wins.
-        if let Some(level) = settings.default_thinking_level.clone()
-            && harness.agent().state().thinking_level.is_none()
-        {
-            harness.set_initial_thinking_level(Some(level));
+        // it). A session with no PERSISTED thinking entry falls back to the
+        // settings default, else the TS default `medium` (clamped to `off`
+        // for non-thinking models). An explicit persisted `"off"` is a real
+        // decision and is never overridden.
+        if !has_thinking_entry {
+            let level = settings.default_thinking_level.clone().or_else(|| {
+                (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string())
+            });
+            if let Some(level) = level {
+                harness.set_initial_thinking_level(Some(level));
+            }
         }
 
         Ok(AgentSession {
@@ -826,7 +930,10 @@ impl AgentSessionBuilder {
             cwd,
             runtime,
             system_prompt,
+            base_prompt,
             tools,
+            pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
+            model_fallback_notice: fallback_notice,
         })
     }
 

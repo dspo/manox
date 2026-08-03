@@ -9,6 +9,20 @@
 /// instruction context files (AGENTS.md / CLAUDE.md), and the mounted skills.
 /// This is the facade's single prompt builder — skills appear as an index so
 /// the model knows what is invocable (TS `buildSystemPrompt`).
+/// The default coding-agent base prompt: identity, active-tool guidance,
+/// and editing guidelines (the UI-documentation sections of the TS default
+/// prompt are intentionally out of scope).
+pub const DEFAULT_BASE_PROMPT: &str = "You are a coding agent — an AI assistant that helps with software \
+    engineering tasks in the working directory below. You have access to tools for reading, \
+    writing, and editing files, running shell commands, and searching code.\n\n\
+    Guidelines:\n\
+    - Follow the user's instructions carefully.\n\
+    - When making changes, prefer small, incremental edits over large rewrites.\n\
+    - Verify your changes by reading the file before and after editing.\n\
+    - Preserve exact file paths, function names, and error messages.\n\
+    - Rely on actual tool results; never fabricate file contents or command output.\n\
+    - When a task is ambiguous, ask for clarification instead of guessing.";
+
 /// Build the harness system prompt from the base prompt, the working
 /// directory, the active tool set, the project instruction context files
 /// (AGENTS.md / CLAUDE.md, each with its real path), and the mounted skills
