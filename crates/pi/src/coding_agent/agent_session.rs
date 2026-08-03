@@ -119,6 +119,10 @@ pub struct AgentSession {
     /// Whether the system prompt is a caller-provided custom prompt (TS
     /// `customPrompt` replacement semantics), preserved across forks.
     custom_prompt: bool,
+    /// The agent config dir; `set_model`/`set_thinking_level` persist the
+    /// default model / thinking level to its global settings file (TS
+    /// `setDefaultModelAndProvider`/`setDefaultThinkingLevel`).
+    agent_dir: PathBuf,
 }
 
 impl AgentSession {
@@ -296,23 +300,58 @@ impl AgentSession {
     /// settings default (else `medium`), otherwise the user preference is kept
     /// and clamped.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
+        // Compute the effective thinking level up front: TS
+        // `_getThinkingLevelForModelSwitch` keeps the user preference when
+        // the current model supports thinking, else restores the settings
+        // default; `setThinkingLevel` clamps against the NEW model.
         let current_level = self.harness.agent().state().thinking_level.clone();
         let current_supports = self.harness.model().thinking != crate::types::ThinkingKind::None;
         let desired = if current_supports {
-            Some(current_level.unwrap_or_else(|| "off".into()))
+            Some(current_level.clone().unwrap_or_else(|| "off".into()))
         } else {
             self.settings_thinking_default
                 .clone()
                 .or_else(|| Some("medium".into()))
         };
+        // The in-memory tier normalizes `off` to `None` (agent semantics);
+        // comparisons and the settings default use that form.
+        let effective = clamp_thinking(&model, &self.runtime.thinking_levels(&model), desired)
+            .filter(|l| l != "off");
+
+        // TS persists the default model/provider on every switch; failures
+        // surface as errors. The settings file is written first so a
+        // later failure cannot leave a half-applied switch.
+        self.persist_global_settings(|settings| {
+            settings.default_provider = Some(model.provider.clone());
+            settings.default_model = Some(model.id.clone());
+        })
+        .await?;
+
         self.harness.set_model(model.clone()).await?;
-        let clamped = clamp_thinking(&model, &self.runtime.thinking_levels(&model), desired);
-        self.harness.set_initial_thinking_level(clamped.clone());
-        let _ = self
-            .harness
-            .session()
-            .append_thinking_level_change(clamped.clone().unwrap_or_else(|| "off".into()).as_str())
-            .await?;
+        // TS `setThinkingLevel`: persist only when the effective level
+        // actually changes (append errors are not surfaced — TS does not
+        // await the entry write either).
+        if effective != current_level {
+            let _ = self
+                .harness
+                .session()
+                .append_thinking_level_change(
+                    effective.clone().unwrap_or_else(|| "off".into()).as_str(),
+                )
+                .await;
+            // TS updates the settings default only when the new model
+            // supports thinking or the level is not `off`.
+            if model.thinking != crate::types::ThinkingKind::None || effective.is_some() {
+                self.settings_thinking_default = effective.clone();
+                let default = effective.clone();
+                let _ = self
+                    .persist_global_settings(move |settings| {
+                        settings.default_thinking_level = default;
+                    })
+                    .await;
+            }
+        }
+        self.harness.set_initial_thinking_level(effective);
         Ok(())
     }
 
@@ -321,20 +360,50 @@ impl AgentSession {
         self.harness.agent().state().thinking_level.clone()
     }
 
-    /// Set the reasoning tier (persisted).
+    /// Set the reasoning tier (persisted). `None` reads as `"off"` (the
+    /// facade's contract, mirrored by the harness); the effective level is
+    /// clamped against the current model and persisted only when it changes
+    /// (TS `setThinkingLevel`).
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
-        // TS `setThinkingLevel`: clamp against the current model's supported
-        // levels, persist, and apply in memory.
+        let desired = Some(level.unwrap_or_else(|| "off".into()));
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
-        let clamped = clamp_thinking(&model, &levels, level);
-        let _ = self
-            .harness
-            .session()
-            .append_thinking_level_change(clamped.clone().unwrap_or_else(|| "off".into()).as_str())
-            .await?;
-        self.harness.set_initial_thinking_level(clamped);
+        let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
+        let previous = self.harness.agent().state().thinking_level.clone();
+        if effective != previous {
+            let _ = self
+                .harness
+                .session()
+                .append_thinking_level_change(
+                    effective.clone().unwrap_or_else(|| "off".into()).as_str(),
+                )
+                .await;
+            if model.thinking != crate::types::ThinkingKind::None || effective.is_some() {
+                self.settings_thinking_default = effective.clone();
+                let default = effective.clone();
+                let _ = self
+                    .persist_global_settings(move |settings| {
+                        settings.default_thinking_level = default;
+                    })
+                    .await;
+            }
+        }
+        self.harness.set_initial_thinking_level(effective);
         Ok(())
+    }
+
+    /// Persist a mutation to the global settings file (agent dir); the file
+    /// is reloaded first so other keys survive (TS settings manager writes
+    /// the whole user settings object).
+    async fn persist_global_settings(
+        &self,
+        mutate: impl FnOnce(&mut crate::settings::Settings),
+    ) -> Result<(), anyhow::Error> {
+        let mut settings = crate::settings::Settings::load_global_at(&self.agent_dir).await?;
+        mutate(&mut settings);
+        settings
+            .save(&crate::settings::Settings::global_path(&self.agent_dir))
+            .await
     }
 
     /// The full mounted tool set.
@@ -526,8 +595,9 @@ impl AgentSession {
                 tools: self.tools,
                 pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
                 model_fallback_notice: None,
-                settings_thinking_default: None,
+                settings_thinking_default: self.settings_thinking_default.clone(),
                 custom_prompt: self.custom_prompt,
+                agent_dir: self.agent_dir.clone(),
             },
             selected_text,
         })
@@ -1061,6 +1131,7 @@ impl AgentSessionBuilder {
             model_fallback_notice: fallback_notice,
             settings_thinking_default,
             custom_prompt,
+            agent_dir,
         })
     }
 
@@ -1783,8 +1854,11 @@ mod tests {
     async fn catalog_miss_falls_back_with_notice() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
+            .with_agent_dir(&agent_dir)
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
             .with_model_runtime(fake_runtime())
@@ -2111,6 +2185,181 @@ mod tests {
 
     /// A custom catalog can restrict a model's supported thinking levels
     /// (TS `thinkingLevelMap`), and xhigh clamps to the supported max.
+    /// `set_thinking_level(None)` reads as `"off"` (facade contract): on a
+    /// thinking model it disables thinking, stays off across a prompt, and a
+    /// reopen projects the same off.
+    #[tokio::test]
+    async fn set_thinking_level_none_disables_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        let session_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&session_dir)
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // None == off: never interpreted as "no preference -> medium".
+        session.set_thinking_level(None).await.unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level,
+            None,
+            "None disables thinking on a thinking-capable model"
+        );
+        // A real prompt runs with thinking off.
+        let _ = session.prompt("hello").await.unwrap();
+        // Reopen projects the persisted off (not a fallback to medium).
+        let reopened = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&session_dir)
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .open(session.harness.session().storage().path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.harness.agent().state().thinking_level,
+            None,
+            "persisted off survives reopen on a thinking-capable model"
+        );
+    }
+
+    /// Thinking entries persist only when the effective level changes: a
+    /// high -> high model switch writes no extra entry; the preference
+    /// survives a non-thinking round trip and a fork.
+    #[tokio::test]
+    async fn thinking_entries_are_deduplicated_and_preference_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        let session_dir = dir.path().join("sessions");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&session_dir)
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        // Raise the preference to high (one thinking entry).
+        session
+            .set_thinking_level(Some("high".into()))
+            .await
+            .unwrap();
+
+        // A high -> high model switch changes nothing: no extra entry.
+        let another_thinking = Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            id: "thinking-b".into(),
+            ..test_model()
+        };
+        session.set_model(another_thinking).await.unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("high")
+        );
+        async fn thinking_entry_count(s: &AgentSession) -> usize {
+            s.harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
+                .count()
+        }
+        // Assembly persisted the initial medium entry; the explicit high is
+        // the second. A high -> high model switch must not add a third.
+        assert_eq!(
+            thinking_entry_count(&session).await,
+            2,
+            "initial medium + explicit high; high -> high adds nothing"
+        );
+
+        // Non-thinking round trip keeps the high preference: switching back
+        // restores high, not the assembly default.
+        session
+            .set_model(Model {
+                thinking: crate::types::ThinkingKind::None,
+                id: "flat".into(),
+                ..test_model()
+            })
+            .await
+            .unwrap();
+        session
+            .set_model(Model {
+                thinking: crate::types::ThinkingKind::Enabled,
+                id: "thinking-c".into(),
+                ..test_model()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            session.harness.agent().state().thinking_level.as_deref(),
+            Some("high"),
+            "user preference, not the assembly default, survives a round trip"
+        );
+
+        // A fork inherits the preference (not the assembly default).
+        let entries = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap();
+        let leaf = entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
+            .map(|e| e.id().to_string())
+            .unwrap();
+        // A fork needs a materialized session file: the deferred-first
+        // assistant contract writes disk only once an assistant message
+        // exists, so run one prompt before branching.
+        let _ = session.prompt("branch here").await.unwrap();
+        let mut fork = session
+            .fork(&leaf, ForkPosition::AtEntry)
+            .await
+            .unwrap()
+            .session;
+        fork.set_model(Model {
+            thinking: crate::types::ThinkingKind::None,
+            id: "flat-2".into(),
+            ..test_model()
+        })
+        .await
+        .unwrap();
+        fork.set_model(Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            id: "thinking-d".into(),
+            ..test_model()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fork.harness.agent().state().thinking_level.as_deref(),
+            Some("high"),
+            "fork inherits the preference"
+        );
+    }
+
     #[tokio::test]
     async fn custom_catalog_restricts_thinking_levels() {
         let dir = tempfile::tempdir().unwrap();
@@ -2132,9 +2381,12 @@ mod tests {
             }
         }
         let runtime = fake_runtime().with_catalog(Arc::new(CappedCatalog));
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
             .with_model_runtime(runtime)
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
