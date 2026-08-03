@@ -773,6 +773,10 @@ pub struct AgentHarness<S: SessionStorage> {
     /// crate stays registry-free, so the consumer plugs in its registry;
     /// without one a restore keeps the construction-time model.
     model_resolver: Option<ModelResolver>,
+    /// The active-tool subset a restore uses when the path carries no
+    /// `active_tools_change` entry — the facade's default four tools. `None`
+    /// restores the full registry (TS default).
+    restore_active_tool_default: Option<Vec<String>>,
     /// Whether cache-miss notices are shown in the transcript (TS
     /// `showCacheMissNotices`; the harness records it for UI consumers).
     show_cache_miss_notices: bool,
@@ -899,6 +903,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             show_cache_miss_notices: false,
             branch_summary_reserve: crate::compaction::branch_summarization::RESERVE_TOKENS,
             system_prompt_builder: None,
+            restore_active_tool_default: None,
         }
     }
 
@@ -1225,6 +1230,13 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     pub fn set_initial_active_tools(&mut self, names: Vec<String>) {
         self.active_tool_names = Some(names);
         self.apply_active_tools();
+    }
+
+    /// The active-tool subset a restore falls back to when the path carries
+    /// no `active_tools_change` entry — the facade's default four tools, so
+    /// a reopened default session does not drift to the full registry.
+    pub fn set_restore_active_tool_default(&mut self, names: Vec<String>) {
+        self.restore_active_tool_default = Some(names);
     }
 
     /// Whether cache-miss notices are shown.
@@ -2499,7 +2511,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.clear_transcript_state();
         self.agent.replace_transcript(context.messages);
         self.agent.set_thinking_level(context.thinking_level);
-        self.active_tool_names = context.active_tool_names;
+        self.active_tool_names = context
+            .active_tool_names
+            .or_else(|| self.restore_active_tool_default.clone());
         self.apply_active_tools();
         self.rebuild_system_prompt();
         if let (Some(resolver), Some(model_ref)) = (&self.model_resolver, &context.model)

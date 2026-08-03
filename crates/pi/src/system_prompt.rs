@@ -9,26 +9,28 @@
 /// instruction context files (AGENTS.md / CLAUDE.md), and the mounted skills.
 /// This is the facade's single prompt builder — skills appear as an index so
 /// the model knows what is invocable (TS `buildSystemPrompt`).
-/// The default coding-agent base prompt: identity, active-tool guidance,
-/// and editing guidelines (the UI-documentation sections of the TS default
-/// prompt are intentionally out of scope).
-pub const DEFAULT_BASE_PROMPT: &str = "You are a coding agent — an AI assistant that helps with software \
-    engineering tasks in the working directory below. You have access to tools for reading, \
-    writing, and editing files, running shell commands, and searching code.\n\n\
+/// The default coding-agent base prompt, ported from the TS
+/// `buildSystemPrompt` non-UI core: the identity line and the always-present
+/// guidelines. The UI documentation section and per-tool snippets are
+/// dynamic (added by [`build_harness_prompt`]).
+pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operating inside pi, a coding agent harness. \
+    You help users by reading files, executing commands, editing code, and writing new files.\n\n\
+    In addition to the tools below, you may have access to other custom tools depending on the project.\n\n\
     Guidelines:\n\
-    - Follow the user's instructions carefully.\n\
-    - When making changes, prefer small, incremental edits over large rewrites.\n\
-    - Verify your changes by reading the file before and after editing.\n\
-    - Preserve exact file paths, function names, and error messages.\n\
-    - Rely on actual tool results; never fabricate file contents or command output.\n\
-    - When a task is ambiguous, ask for clarification instead of guessing.";
+    - Be concise in your responses\n\
+    - Show file paths clearly when working with files";
 
-/// Build the harness system prompt from the base prompt, the working
-/// directory, the active tool set, the project instruction context files
-/// (AGENTS.md / CLAUDE.md, each with its real path), and the mounted skills
-/// as invocable XML blocks with read guidance — the facade's single prompt
-/// builder. Skills are hidden when no `read` tool is mounted (they cannot
-/// be referenced usefully).
+/// One-line tool snippets for the Available tools list (TS `toolSnippets`).
+const TOOL_SNIPPETS: &[(&str, &str)] = &[
+    ("read", "Read a file from the filesystem"),
+    ("bash", "Run a shell command"),
+    ("edit", "Edit a file with a patch"),
+    ("write", "Write a file"),
+    ("grep", "Search file contents"),
+    ("find", "Locate files"),
+    ("ls", "List directory contents"),
+];
+
 pub fn build_harness_prompt(
     base: &str,
     cwd: &std::path::Path,
@@ -37,24 +39,35 @@ pub fn build_harness_prompt(
     skills: &[crate::harness::Skill],
 ) -> String {
     let mut prompt = base.to_string();
-    prompt.push_str(&format!("\n\nWorking directory: {}\n", cwd.display()));
-    if !active_tools.is_empty() {
-        prompt.push_str(&format!("\nAvailable tools: {}\n", active_tools.join(", ")));
+    prompt.push_str("\n\nAvailable tools:\n");
+    if active_tools.is_empty() {
+        prompt.push_str("(none)\n");
+    } else {
+        for name in active_tools {
+            let snippet = TOOL_SNIPPETS
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, s)| *s)
+                .unwrap_or("Available");
+            prompt.push_str(&format!("- {name}: {snippet}\n"));
+        }
     }
     if !context_files.is_empty() {
-        prompt.push_str("\n# Project instructions\n");
+        prompt.push_str("\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
         for file in context_files {
             prompt.push_str(&format!(
-                "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
-                file.location, file.content
+                "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+                xml_escape(&file.location),
+                file.content
             ));
         }
+        prompt.push_str("</project_context>\n");
     }
     let has_read = active_tools.iter().any(|t| t == "read");
     if has_read && !skills.is_empty() {
-        prompt.push_str("\n# Skills\n");
         prompt.push_str(
-            "Skills are markdown files you can read for detailed instructions.              Use the read tool on a skill's path before relying on it.\n",
+            "\nSkills are markdown files you can read for detailed instructions; \
+             use the read tool on a skill's path before relying on it.\n",
         );
         for skill in skills {
             prompt.push_str(&format!(
@@ -65,6 +78,7 @@ pub fn build_harness_prompt(
             ));
         }
     }
+    prompt.push_str(&format!("\nCurrent working directory: {}\n", cwd.display()));
     prompt
 }
 
@@ -99,20 +113,22 @@ mod tests {
         }];
         let tools = vec!["read".to_string(), "bash".to_string()];
         let prompt = build_harness_prompt(
-            "Base prompt.",
+            DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
             &tools,
             &context,
             &skills,
         );
-        assert!(prompt.contains("Working directory: /proj"));
-        assert!(prompt.contains("Available tools: read, bash"));
+        assert!(prompt.contains("Current working directory: /proj"));
+        assert!(prompt.contains("- read: Read a file from the filesystem"));
+        assert!(prompt.contains("- bash: Run a shell command"));
         assert!(prompt.contains(
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
         ));
         assert!(prompt.contains(
             "<skill name=\"review\">\n<description>review the diff</description>\n<path>/proj/.pi/skills/review.md</path>\n</skill>"
         ));
+        assert!(prompt.contains("Be concise in your responses"));
     }
 
     #[test]

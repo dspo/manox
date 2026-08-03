@@ -222,6 +222,11 @@ impl AgentSession {
     /// Queue a next-turn message delivered after the next prompt's own
     /// message (TS coding-agent `nextTurn` asides).
     pub fn next_turn(&self, text: &str) {
+        // Refuse after shutdown: the facade's queue contract matches the
+        // harness's (no further operations once shut down).
+        if self.is_shutdown() {
+            return;
+        }
         self.pending_next_turn
             .lock()
             .unwrap()
@@ -253,6 +258,7 @@ impl AgentSession {
     /// operations.
     pub fn request_shutdown(&self) {
         self.harness.request_shutdown();
+        self.pending_next_turn.lock().unwrap().clear();
     }
 
     /// Whether shutdown was requested.
@@ -561,14 +567,6 @@ fn default_agent_dir() -> PathBuf {
         .unwrap_or_else(|_| expand_tilde("~/.pi/agent"))
 }
 
-/// The wire-API shape for a provider's default protocol.
-fn api_for_provider(provider: &str) -> String {
-    match provider {
-        "openai" => "openai_responses".into(),
-        _ => "anthropic".into(),
-    }
-}
-
 /// The default model when none is configured: anthropic, from `ANTHROPIC_MODEL`
 /// or a sensible default.
 pub fn default_model() -> Model {
@@ -753,11 +751,27 @@ impl AgentSessionBuilder {
         } else {
             self.tools.clone()
         };
+        // The facade's initial active subset: the TS default four when no
+        // custom tool list is given. It drives BOTH the initial system
+        // prompt and the in-memory harness state, and is the restore default
+        // when a reopened path carries no `active_tools_change` entry.
+        let facade_initial_active: Option<Vec<String>> = if self.tools.is_empty() {
+            Some(vec![
+                "read".into(),
+                "bash".into(),
+                "edit".into(),
+                "write".into(),
+            ])
+        } else {
+            None
+        };
+        let active_tools: Vec<String> = facade_initial_active
+            .clone()
+            .unwrap_or_else(|| tools.iter().map(|t| t.name().to_string()).collect());
         let base_prompt = self
             .system_prompt
             .clone()
             .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
-        let active_tools: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         let system_prompt = crate::system_prompt::build_harness_prompt(
             &base_prompt,
             &cwd,
@@ -781,43 +795,53 @@ impl AgentSessionBuilder {
             Some(runtime) => runtime.clone(),
             None => ModelRuntime::from_env(),
         };
+        // The settings/catalog initial model — resolved through the runtime
+        // catalog (never a hand-built guess of protocol or parameters).
+        let settings_initial_model = settings.default_model.as_ref().and_then(|id| {
+            let provider = settings
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| "anthropic".into());
+            runtime.resolve_model(&provider, id)
+        });
         let mut fallback_notice = None;
         let model = match &self.model {
             Some(model) => model.clone(),
             None => match &session_model {
+                // Exact restored model first; a miss falls back to the
+                // settings/catalog initial model, else the default, with an
+                // observable notice (TS `modelFallbackMessage`).
                 Some(mref) => match runtime.resolve_model(&mref.provider, &mref.model_id) {
                     Some(model) => model,
                     None => {
-                        // TS falls back to the initial model and surfaces a
-                        // notice (`modelFallbackMessage`); the crate never
-                        // guesses an unknown model's protocol.
                         fallback_notice = Some(format!(
-                            "session model {}/{} could not be restored exactly;                              using the initial model instead",
+                            "session model {}/{} could not be restored exactly; \
+                             using the initial model instead",
                             mref.provider, mref.model_id
                         ));
-                        default_model()
+                        settings_initial_model.clone().unwrap_or_else(default_model)
                     }
                 },
-                None => settings
-                    .default_model
-                    .clone()
-                    .map(|id| {
-                        let provider = settings
-                            .default_provider
-                            .clone()
-                            .unwrap_or_else(|| "anthropic".into());
-                        Model {
-                            api: api_for_provider(&provider),
-                            provider,
-                            id,
-                            context_window: 200_000,
-                            max_tokens: 8_192,
-                            thinking: crate::types::ThinkingKind::None,
-                            metadata: Default::default(),
-                        }
-                    })
-                    .unwrap_or_else(default_model),
+                None => settings_initial_model.unwrap_or_else(default_model),
             },
+        };
+
+        // The final clamped thinking level: the settings default clamped to
+        // `off` for non-thinking models, else the TS default `medium` (also
+        // clamped). One value drives BOTH the persisted initial entry and
+        // the in-memory state, so the first turn equals a reopen.
+        let model_thinking = model.thinking;
+        let clamped_thinking = match settings.default_thinking_level.clone() {
+            Some(level) => {
+                if model_thinking == crate::types::ThinkingKind::None && level != "off" {
+                    Some("off".to_string())
+                } else {
+                    Some(level)
+                }
+            }
+            None => {
+                (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string())
+            }
         };
 
         // A new session persists its initial model and thinking entries (TS
@@ -831,21 +855,16 @@ impl AgentSessionBuilder {
             let _ = session
                 .append_model_change(&model.provider, &model.id)
                 .await?;
-            let initial_thinking = settings.default_thinking_level.clone().unwrap_or_else(|| {
-                if model.thinking == crate::types::ThinkingKind::None {
-                    "off".into()
-                } else {
-                    "medium".into()
-                }
-            });
             let _ = session
-                .append_thinking_level_change(&initial_thinking)
+                .append_thinking_level_change(
+                    clamped_thinking
+                        .clone()
+                        .unwrap_or_else(|| "off".into())
+                        .as_str(),
+                )
                 .await?;
             true
         };
-        // The model's thinking capability, captured before `model` moves
-        // into the harness.
-        let model_thinking = model.thinking;
 
         let stream_fn = runtime.resolver()(&model)?;
         let resolver = runtime.resolver();
@@ -854,15 +873,12 @@ impl AgentSessionBuilder {
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
             .with_resources(resources);
-        if self.tools.is_empty() {
+        if let Some(names) = facade_initial_active {
             // Initial active subset: the TS default four. In-memory only —
-            // no `active_tools_change` entry is written for the default.
-            harness.set_initial_active_tools(vec![
-                "read".into(),
-                "bash".into(),
-                "edit".into(),
-                "write".into(),
-            ]);
+            // no `active_tools_change` entry is written for the default; a
+            // restore with no entry also falls back to these four.
+            harness.set_initial_active_tools(names.clone());
+            harness.set_restore_active_tool_default(names);
         }
         harness = harness.with_model_resolver(model_resolver(&runtime));
         // Install the prompt builder: the harness rebuilds the system prompt
@@ -908,19 +924,16 @@ impl AgentSessionBuilder {
         if restore {
             harness.restore().await?;
         }
-        // Default thinking tier: applied in-memory to BOTH the agent state
-        // and the shared runtime snapshot (so the first turn does not wipe
-        // it). A session with no PERSISTED thinking entry falls back to the
-        // settings default, else the TS default `medium` (clamped to `off`
-        // for non-thinking models). An explicit persisted `"off"` is a real
-        // decision and is never overridden.
-        if !has_thinking_entry {
-            let level = settings.default_thinking_level.clone().or_else(|| {
-                (model_thinking != crate::types::ThinkingKind::None).then(|| "medium".to_string())
-            });
-            if let Some(level) = level {
-                harness.set_initial_thinking_level(Some(level));
-            }
+        // Apply the clamped thinking level in-memory to BOTH the agent state
+        // and the shared runtime snapshot — for a NEW session (so the first
+        // turn matches the persisted entry and a reopen) and for a reopened
+        // session with no persisted entry. An explicit persisted `"off"` is
+        // a real decision and is never overridden.
+        if !restore || !has_thinking_entry {
+            // The in-memory tier is `None` for off (agent semantics); the
+            // persisted wire value stays "off".
+            let level = clamped_thinking.filter(|l| l != "off");
+            harness.set_initial_thinking_level(level);
         }
 
         Ok(AgentSession {
@@ -1514,6 +1527,259 @@ mod tests {
         session.set_active_tools(vec!["bash".into()]).await.unwrap();
         let system_prompt = session.harness.agent().state().system_prompt.clone();
         assert!(!system_prompt.contains("<skill"), "{system_prompt}");
+    }
+
+    /// Facade next_turn delivers AFTER the prompt's user message (user-first
+    /// asides); the harness's own queue stays queued-first.
+    #[tokio::test]
+    async fn facade_next_turn_is_delivered_after_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.next_turn("aside");
+        assert!(session.has_next_turn());
+        let messages = session.prompt("direct").await.unwrap();
+        assert!(!session.has_next_turn());
+        let texts: Vec<String> = messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User { content, .. } => content.iter().find_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["direct", "aside"], "{texts:?}");
+    }
+
+    /// All seven built-ins are registered; the initial ACTIVE subset is the
+    /// TS default four, survives reopen, and grep/find/ls stay enableable.
+    #[tokio::test]
+    async fn default_tool_registry_seven_active_four_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        // Registry: all seven. Active: the default four.
+        let registry: Vec<String> = session.tools();
+        assert_eq!(registry.len(), 7, "{registry:?}");
+        assert_eq!(
+            session.active_tool_names().unwrap(),
+            vec!["read", "bash", "edit", "write"]
+        );
+        // The system prompt advertises the four, not the seven.
+        let prompt = session.harness.agent().state().system_prompt.clone();
+        assert!(prompt.contains("- read: Read a file"));
+        assert!(!prompt.contains("- grep:"), "{prompt}");
+        session.prompt("hi").await.unwrap();
+        let path = session.close().await.unwrap();
+
+        // Reopen: the default four persist (no active_tools_change entry).
+        let resumed = create_agent_session()
+            .with_model_runtime(fake_runtime())
+            .open(path)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.active_tool_names().unwrap(),
+            vec!["read", "bash", "edit", "write"],
+            "reopen keeps the default four"
+        );
+        let prompt = resumed.harness.agent().state().system_prompt.clone();
+        assert!(!prompt.contains("- grep:"), "{prompt}");
+
+        // grep stays enableable after the fact.
+        let mut resumed = resumed;
+        resumed.set_active_tools(vec!["grep".into()]).await.unwrap();
+        assert_eq!(resumed.active_tool_names().unwrap(), vec!["grep"]);
+        let prompt = resumed.harness.agent().state().system_prompt.clone();
+        assert!(prompt.contains("- grep: Search file contents"), "{prompt}");
+    }
+
+    /// The first turn's thinking level equals a reopen's (both clamped and
+    /// persisted); an explicit persisted "off" beats a settings default.
+    #[tokio::test]
+    async fn thinking_first_turn_matches_reopen_and_off_wins_over_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        let agent_dir = dir.path().join("agent");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        // Settings default: high.
+        tokio::fs::create_dir_all(agent_dir.join("settings.json").parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultThinkingLevel": "high"}"#,
+        )
+        .await
+        .unwrap();
+
+        // Non-thinking model: the default clamps to off, and the first turn
+        // matches a reopen.
+        let non_thinking = Model {
+            thinking: crate::types::ThinkingKind::None,
+            ..test_model()
+        };
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .with_model(non_thinking)
+            .build()
+            .await
+            .unwrap();
+        let first_level = session.harness.agent().state().thinking_level.clone();
+        assert_eq!(first_level, None, "non-thinking model clamps to off (None)");
+        session.prompt("hi").await.unwrap();
+        let path = session.close().await.unwrap();
+        let resumed = create_agent_session()
+            .with_agent_dir(&agent_dir)
+            .with_model_runtime(fake_runtime())
+            .open(path)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.harness.agent().state().thinking_level,
+            None,
+            "reopen matches the first turn (off)"
+        );
+    }
+
+    /// A catalog miss on reopen falls back to the initial model with an
+    /// observable notice.
+    #[tokio::test]
+    async fn catalog_miss_falls_back_with_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("hi").await.unwrap();
+        // Switch to a model the catalog cannot resolve (unknown provider).
+        let unknown = Model {
+            provider: "other".into(),
+            id: "unknown-model".into(),
+            ..test_model()
+        };
+        session.set_model(unknown).await.unwrap();
+        let path = session.close().await.unwrap();
+
+        let resumed = create_agent_session()
+            .with_model_runtime(fake_runtime())
+            .open(path)
+            .await
+            .unwrap();
+        assert!(
+            resumed.model_fallback_notice().is_some(),
+            "fallback notice expected"
+        );
+        assert!(
+            resumed
+                .model_fallback_notice()
+                .unwrap()
+                .contains("unknown-model")
+        );
+    }
+
+    /// Fork keeps the prompt builder: changing tools after forking rebuilds
+    /// the fork's prompt.
+    #[tokio::test]
+    async fn fork_keeps_the_prompt_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let entries = session
+            .harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap();
+        let first_user = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .next()
+            .unwrap();
+        let ForkResult {
+            session: mut forked,
+            ..
+        } = session
+            .fork(&first_user, ForkPosition::AtEntry)
+            .await
+            .unwrap();
+        // Narrow the fork's tools; the prompt must rebuild (no grep).
+        forked
+            .set_active_tools(vec!["read".into(), "edit".into()])
+            .await
+            .unwrap();
+        let prompt = forked.harness.agent().state().system_prompt.clone();
+        assert!(prompt.contains("- read: Read a file"));
+        assert!(!prompt.contains("- grep:"), "{prompt}");
+    }
+
+    /// Facade shutdown clears its pending next-turn queue and refuses more.
+    #[tokio::test]
+    async fn facade_shutdown_clears_pending_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.next_turn("queued");
+        assert!(session.has_next_turn());
+        session.request_shutdown();
+        assert!(!session.has_next_turn(), "shutdown clears the facade queue");
+        session.next_turn("after");
+        assert!(
+            !session.has_next_turn(),
+            "shutdown refuses further enqueues"
+        );
     }
 
     #[tokio::test]
