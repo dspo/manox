@@ -174,6 +174,20 @@ pub type PrepareTurnHook = Arc<
         > + Send
         + Sync,
 >;
+/// Decides whether the run should stop after a turn (TS `shouldStopAfterTurn`).
+/// The `Arc<dyn Fn>` twin of [`crate::types::StopAfterTurnFn`] so
+/// `create_loop_config` can clone it into a per-run `Box` closure, mirroring
+/// the other observation hooks.
+pub type StopAfterTurnHook = Arc<
+    dyn Fn(
+            &crate::types::AgentMessage,
+            &[crate::types::AgentMessage],
+            &crate::types::AgentContext,
+            &[crate::types::AgentMessage],
+        ) -> bool
+        + Send
+        + Sync,
+>;
 
 #[derive(Default)]
 pub struct LoopHooks {
@@ -184,6 +198,9 @@ pub struct LoopHooks {
     /// TS `prepareNextTurn` seam for applying runtime mutations (model,
     /// thinking level) queued mid-run.
     pub prepare_next_turn: Option<PrepareTurnHook>,
+    /// Stops the run after a turn settles — the TS `shouldStopAfterTurn`
+    /// seam for a graceful stop before the next LLM call.
+    pub should_stop_after_turn: Option<StopAfterTurnHook>,
 }
 
 /// The Agent wraps the raw agent loop with state management, event
@@ -607,12 +624,21 @@ impl Agent {
             let h = Arc::clone(h);
             Box::new(move || h()) as PrepareTurnFn
         });
+        let should_stop_after_turn = self.loop_hooks.should_stop_after_turn.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(
+                move |msg: &AgentMessage,
+                      results: &[AgentMessage],
+                      ctx: &AgentContext,
+                      new: &[AgentMessage]| { h(msg, results, ctx, new) },
+            ) as crate::types::StopAfterTurnFn
+        });
         AgentLoopConfig {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
             prepare_next_turn,
             stream_resolver: self.stream_resolver.clone(),
-            should_stop_after_turn: None,
+            should_stop_after_turn,
             before_tool_call: before_tool,
             after_tool_call: after_tool,
             before_provider_request: before_provider,

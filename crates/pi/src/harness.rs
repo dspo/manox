@@ -3298,6 +3298,7 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
         before_tool_call: Some(before_tool_call),
         after_tool_call: Some(after_tool_call),
         prepare_next_turn: Some(prepare_next_turn),
+        should_stop_after_turn: None,
     }
 }
 

@@ -604,8 +604,19 @@ pub type PrepareTurnFn = Box<
         > + Send
         + Sync,
 >;
-/// Decides whether the run should stop after a turn.
-pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + Send + Sync>;
+/// Decides whether the run should stop after a turn (TS
+/// `shouldStopAfterTurn`), called after `turn_end` and `prepareNextTurn` and
+/// before the next LLM call. Sync like the other decision hooks
+/// (`before_tool_call`/`after_tool_call`); the TS `Promise<boolean>` allowance
+/// is a superset not exercised by the graceful-stop contract.
+///
+/// Args mirror the TS `ShouldStopAfterTurnContext` fields, in order:
+/// `(message, tool_results, context, new_messages)`. Plain `&` params carry
+/// implicit higher-ranked lifetimes so callers can box a closure straight
+/// (a lifetime-parameterized context struct would defeat closure→`dyn` HRTB).
+pub type StopAfterTurnFn = Box<
+    dyn Fn(&AgentMessage, &[AgentMessage], &AgentContext, &[AgentMessage]) -> bool + Send + Sync,
+>;
 /// Gates a tool call before execution; `Some(reason)` blocks it.
 pub type BeforeToolCallFn = Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 /// Patches a tool result after execution.

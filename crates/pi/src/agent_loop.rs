@@ -330,7 +330,7 @@ async fn run_loop_inner(
             }
 
             sink.emit(AgentEvent::TurnEnd {
-                message: Box::new(message),
+                message: Box::new(message.clone()),
                 tool_results: tool_results.clone(),
             })
             .await?;
@@ -351,18 +351,17 @@ async fn run_loop_inner(
                 }
             }
 
-            // Check early stop.
-            if let Some(ref should_stop) = config.should_stop_after_turn {
-                let last_msg = context.messages.last().cloned();
-                if let Some(last_msg) = last_msg
-                    && should_stop(&last_msg, &tool_results)
-                {
-                    sink.emit(AgentEvent::AgentEnd {
-                        messages: new_messages.clone(),
-                    })
-                    .await?;
-                    return Ok(());
-                }
+            // Check early stop (TS `shouldStopAfterTurn`, after `turn_end` and
+            // `prepareNextTurn`). The turn's assistant `message` is passed, not
+            // the last appended tool result.
+            if let Some(ref should_stop) = config.should_stop_after_turn
+                && should_stop(&message, &tool_results, context, new_messages)
+            {
+                sink.emit(AgentEvent::AgentEnd {
+                    messages: new_messages.clone(),
+                })
+                .await?;
+                return Ok(());
             }
 
             // Check max turns.
@@ -1074,6 +1073,241 @@ mod tests {
         assert!(
             turn_count >= 2,
             "expected at least 2 turns, got {turn_count}"
+        );
+    }
+
+    // ── should_stop_after_turn: TS `shouldStopAfterTurn` graceful stop ────────
+
+    // The hook fires after `turn_end` + `prepareNextTurn`, receives the turn's
+    // assistant `message` (not the last appended tool result), and — on true —
+    // ends the run before the next LLM call.
+    #[tokio::test]
+    async fn should_stop_after_turn_receives_assistant_message_and_stops_run() {
+        let sink = MockSink::new();
+        let captured: Arc<Mutex<Option<AgentMessage>>> = Arc::new(Mutex::new(None));
+        let captured_hook = Arc::clone(&captured);
+        let config = AgentLoopConfig {
+            max_turns: Some(10),
+            should_stop_after_turn: Some(Box::new(
+                move |msg: &AgentMessage,
+                      _results: &[AgentMessage],
+                      _ctx: &AgentContext,
+                      _new: &[AgentMessage]| {
+                    *captured_hook.lock().unwrap() = Some(msg.clone());
+                    true
+                },
+            )),
+            ..Default::default()
+        };
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                api: "test".into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
+            metadata: Default::default(),
+            stream_options: Default::default(),
+        };
+
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let text_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "Tool executed successfully.".into(),
+                signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        // Two responses queued; should_stop must cut the run after the first so
+        // text_msg is never consumed.
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg, text_msg]));
+
+        let result = run_loop(
+            &[AgentMessage::user("echo hello")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let captured_msg = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("should_stop_after_turn fired");
+        assert!(
+            matches!(
+                captured_msg,
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::ToolUse),
+                    ..
+                }
+            ),
+            "should_stop received the turn's assistant message, not a tool result: {captured_msg:?}"
+        );
+
+        let events = sink.events.lock().unwrap();
+        let turn_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count();
+        assert_eq!(
+            turn_count, 1,
+            "should_stop ends the run before a second turn"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    // A false return lets the run proceed to the next turn (the tool loop
+    // continues as if no hook were set).
+    #[tokio::test]
+    async fn should_stop_after_turn_false_lets_run_continue() {
+        let sink = MockSink::new();
+        let fired = Arc::new(Mutex::new(0u32));
+        let fired_hook = Arc::clone(&fired);
+        let config = AgentLoopConfig {
+            max_turns: Some(10),
+            should_stop_after_turn: Some(Box::new(
+                move |_msg: &AgentMessage,
+                      _results: &[AgentMessage],
+                      _ctx: &AgentContext,
+                      _new: &[AgentMessage]| {
+                    *fired_hook.lock().unwrap() += 1;
+                    false
+                },
+            )),
+            ..Default::default()
+        };
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: Arc::from(vec![Arc::new(EchoTool) as Arc<dyn AgentTool>]),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                api: "test".into(),
+                context_window: 100_000,
+                max_tokens: 8_192,
+                thinking: ThinkingKind::None,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
+            metadata: Default::default(),
+            stream_options: Default::default(),
+        };
+
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "echo".into(),
+                input: serde_json::json!({"message": "hello"}),
+                thought_signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let text_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+                signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg, text_msg]));
+
+        let result = run_loop(
+            &[AgentMessage::user("echo hello")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            *fired.lock().unwrap(),
+            2,
+            "hook fires once per turn across 2 turns"
+        );
+        let events = sink.events.lock().unwrap();
+        let turn_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnStart))
+            .count();
+        assert_eq!(
+            turn_count, 2,
+            "a false return lets the run reach the second turn"
         );
     }
 
