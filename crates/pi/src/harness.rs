@@ -300,9 +300,18 @@ impl Drop for ActiveGuard {
 }
 
 impl HarnessControl {
+    /// Listeners are cloned out before any of them runs, so the lock is never
+    /// held across a callback. A listener that drops its own subscription takes
+    /// this same non-reentrant lock, and holding it here would hang the thread.
     fn emit_harness(&self, event: HarnessEvent) {
-        let listeners = self.harness_listeners.lock().unwrap();
-        for (_, listener) in listeners.iter() {
+        let listeners: Vec<HarnessListener> = self
+            .harness_listeners
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, listener)| Arc::clone(listener))
+            .collect();
+        for listener in listeners {
             listener(event.clone());
         }
     }
@@ -352,7 +361,11 @@ impl HarnessHandle {
     /// every queue (TS abort). Returns whether a run or backoff was active.
     ///
     /// The discarded queue contents ride on the emitted
-    /// [`HarnessEvent::Abort`], so undelivered user input is recoverable.
+    /// [`HarnessEvent::Abort`], so undelivered user input is recoverable. The
+    /// event announces the abort itself, not the presence of input: aborting
+    /// with nothing queued still emits it, with both lists empty. Unlike
+    /// [`HarnessHandle::request_shutdown`] this is not terminal and not
+    /// idempotent — a session may be aborted and then used again.
     pub fn abort(&self) -> bool {
         self.run.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
@@ -8768,6 +8781,39 @@ pub(crate) mod tests {
             with_pending.iter().any(|p| *p),
             "the queued mutation is reported as pending: {with_pending:?}"
         );
+    }
+
+    /// A one-shot listener unsubscribes from inside its own callback, which
+    /// takes the listener lock the emit path also needs. Holding that lock
+    /// across the callback hangs the thread, so this test would never return.
+    #[tokio::test]
+    async fn a_listener_may_unsubscribe_itself_from_inside_its_callback() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slot: Arc<std::sync::Mutex<Option<HarnessSubscription>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let counter = Arc::clone(&seen);
+        let self_drop = Arc::clone(&slot);
+        let sub = harness.subscribe_harness(Arc::new(move |_event| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Unsubscribe from within the callback.
+            drop(self_drop.lock().unwrap().take());
+        }));
+        *slot.lock().unwrap() = Some(sub);
+
+        harness.next_turn("first", Vec::new());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Having removed itself, it hears nothing more.
+        harness.next_turn("second", Vec::new());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
