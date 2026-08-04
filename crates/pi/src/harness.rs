@@ -8586,6 +8586,26 @@ pub(crate) mod tests {
                 .is_some(),
             "the recorded id names a real session entry"
         );
+
+        // Alignment is per position, not merely per length: each id must name
+        // the entry holding the message sitting at that same index.
+        for (i, message) in transcript.iter().enumerate() {
+            let Some(Some(id)) = harness.message_entry_ids.get(i) else {
+                continue;
+            };
+            let entry = harness.session().storage().get_entry(id).await.unwrap();
+            let Some(SessionTreeEntry::Message {
+                message: stored, ..
+            }) = entry
+            else {
+                panic!("id at index {i} does not name a message entry");
+            };
+            assert_eq!(
+                serde_json::to_value(&stored).unwrap(),
+                serde_json::to_value(message).unwrap(),
+                "id at index {i} names a different message than the transcript holds"
+            );
+        }
     }
 
     /// Duplicate tool names are refused by `set_tools`; unknown active tools
