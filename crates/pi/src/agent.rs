@@ -83,6 +83,12 @@ impl PendingMessageQueue {
     fn clear(&mut self) {
         self.messages.clear();
     }
+
+    /// Empty the queue and return everything in it, ignoring the mode — an
+    /// abort discards the whole queue, not one turn's worth.
+    fn take_all(&mut self) -> Vec<AgentMessage> {
+        std::mem::take(&mut self.messages)
+    }
 }
 
 /// A listener invoked for every run event.
@@ -868,10 +874,15 @@ impl RunHandle {
         }
     }
 
-    /// Drop every queued steering and follow-up message.
-    pub fn clear_queues(&self) {
-        self.steering_queue.lock().unwrap().clear();
-        self.follow_up_queue.lock().unwrap().clear();
+    /// Take every queued steering and follow-up message, emptying both queues.
+    ///
+    /// The drained messages are returned rather than dropped: they are user
+    /// input that was never delivered, and a caller aborting a run needs them
+    /// to put back.
+    pub fn clear_queues(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
+        let steer = self.steering_queue.lock().unwrap().take_all();
+        let follow_up = self.follow_up_queue.lock().unwrap().take_all();
+        (steer, follow_up)
     }
 
     /// Number of queued steering messages.
