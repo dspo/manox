@@ -89,6 +89,10 @@ impl PendingMessageQueue {
     fn take_all(&mut self) -> Vec<AgentMessage> {
         std::mem::take(&mut self.messages)
     }
+
+    fn snapshot(&self) -> Vec<AgentMessage> {
+        self.messages.clone()
+    }
 }
 
 /// A listener invoked for every run event.
@@ -433,9 +437,15 @@ impl Agent {
     }
 
     /// Remove every queued steering and follow-up message.
-    pub fn clear_all_queues(&self) {
-        self.steering_queue.lock().unwrap().clear();
-        self.follow_up_queue.lock().unwrap().clear();
+    /// Take every queued steering and follow-up message, emptying both queues.
+    ///
+    /// The drained messages are returned rather than dropped: they are user
+    /// input that was never delivered, and a caller emptying the queues needs
+    /// them to put back.
+    pub fn clear_queues(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
+        let steer = self.steering_queue.lock().unwrap().take_all();
+        let follow_up = self.follow_up_queue.lock().unwrap().take_all();
+        (steer, follow_up)
     }
 
     /// The steering queue drain mode.
@@ -472,6 +482,16 @@ impl Agent {
     pub fn has_queued_messages(&self) -> bool {
         self.steering_queue.lock().unwrap().has_items()
             || self.follow_up_queue.lock().unwrap().has_items()
+    }
+
+    /// The queued steering messages, for a consumer re-rendering pending input.
+    pub fn queued_steering_messages(&self) -> Vec<AgentMessage> {
+        self.steering_queue.lock().unwrap().snapshot()
+    }
+
+    /// The queued follow-up messages.
+    pub fn queued_follow_up_messages(&self) -> Vec<AgentMessage> {
+        self.follow_up_queue.lock().unwrap().snapshot()
     }
 
     /// Abort the current run, if one is active.
