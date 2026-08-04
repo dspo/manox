@@ -529,6 +529,16 @@ impl Agent {
         self.state.messages = messages;
     }
 
+    /// Append a message the run did not produce.
+    ///
+    /// The transcript otherwise grows only through `MessageEnd`. This is the
+    /// seam for state that happened outside a turn — a shell command the user
+    /// ran — which the next request must carry even though no stream produced
+    /// it.
+    pub fn append_to_transcript(&mut self, message: AgentMessage) {
+        self.state.messages.push(message);
+    }
+
     /// Start a new prompt from text.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.is_running() {

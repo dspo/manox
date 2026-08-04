@@ -161,7 +161,7 @@ fn to_message_params(
             }
             // `prepare_for_wire` has already projected these onto user
             // messages; the arm only satisfies exhaustiveness.
-            AgentMessage::Custom { .. } => {}
+            AgentMessage::BashExecution { .. } | AgentMessage::Custom { .. } => {}
         }
     }
     flush_images(&mut out, &mut pending_images);

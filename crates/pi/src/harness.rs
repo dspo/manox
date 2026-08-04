@@ -156,6 +156,10 @@ struct HarnessControl {
     /// only after their session append succeeds, so a failed write keeps the
     /// tail for the next flush.
     pending_mutations: std::sync::Mutex<Vec<PendingMutation>>,
+    /// Messages the mid-run boundary made durable, awaiting the transcript
+    /// sync the harness performs once the run settles. The agent transcript
+    /// otherwise grows only through `MessageEnd`, which these never produce.
+    flushed_messages: std::sync::Mutex<Vec<AgentMessage>>,
     /// Messages queued by `next_turn`, prepended to the next prompt batch —
     /// the TS `nextTurnQueue`. Shared so the decoupled handle can enqueue
     /// mid-run without holding `&mut self`.
@@ -415,6 +419,19 @@ impl HarnessHandle {
                 content,
                 timestamp: chrono::Utc::now(),
             });
+    }
+
+    /// Record a message produced outside the turn while a run is in flight.
+    ///
+    /// The message is held until the run reaches a turn boundary, so it lands
+    /// after that turn's own messages rather than between a tool call and its
+    /// result.
+    pub fn append_message(&self, message: AgentMessage) {
+        self.control
+            .pending_mutations
+            .lock()
+            .unwrap()
+            .push(PendingMutation::Message(message));
     }
 }
 
@@ -854,6 +871,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 stream_options: crate::types::StreamOptions::default(),
             }),
             pending_mutations: std::sync::Mutex::new(Vec::new()),
+            flushed_messages: std::sync::Mutex::new(Vec::new()),
             next_turn_queue: std::sync::Mutex::new(Vec::new()),
             harness_listeners: std::sync::Mutex::new(Vec::new()),
             shutdown: std::sync::atomic::AtomicBool::new(false),
@@ -1386,7 +1404,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     pub async fn append_message(&mut self, message: AgentMessage) -> Result<(), anyhow::Error> {
         self.ensure_running()?;
         if self.phase == AgentHarnessPhase::Idle {
-            self.session.append_message(message).await?;
+            self.session.append_message(message.clone()).await?;
+            // Session-first: a message the next request must carry is only
+            // added to the live transcript once it is durable, so a failed
+            // append cannot leave the two disagreeing.
+            self.agent.append_to_transcript(message);
         } else {
             self.control
                 .pending_mutations
@@ -1564,6 +1586,12 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// for the next flush instead of dropping it. Runtime state is synced by
     /// [`AgentHarness::apply_turn_runtime`], not here.
     async fn flush_pending_mutations(&mut self) -> Result<(), anyhow::Error> {
+        // Adopt whatever the mid-run boundary already made durable: those
+        // messages produced no `MessageEnd`, so this is the only path by which
+        // they reach the transcript.
+        for message in self.control.flushed_messages.lock().unwrap().drain(..) {
+            self.agent.append_to_transcript(message);
+        }
         loop {
             let next = self
                 .control
@@ -1590,7 +1618,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                     self.session.append_active_tools_change(&names).await?;
                 }
                 PendingMutation::Message(message) => {
-                    self.session.append_message(message).await?;
+                    self.session.append_message(message.clone()).await?;
+                    // Deferred to here rather than to the run that queued it,
+                    // so the message lands after that turn's own messages
+                    // instead of splitting a tool call from its result.
+                    self.agent.append_to_transcript(message);
                 }
             }
             // The append succeeded: drop the entry and continue.
@@ -3260,6 +3292,7 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
         let runtime = Arc::clone(&runtime);
         let durable = Arc::clone(&durable);
         Box::pin(async move {
+            let mut appended_messages = Vec::new();
             loop {
                 let next = runtime.pending_mutations.lock().unwrap().first().cloned();
                 let Some(mutation) = next else { break };
@@ -3279,6 +3312,15 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
                     }
                     PendingMutation::Message(message) => {
                         durable.append_message(message.clone()).await?;
+                        // Recorded for both consumers of this boundary: the
+                        // loop's in-flight context, and the agent transcript
+                        // the harness syncs once the run settles.
+                        runtime
+                            .flushed_messages
+                            .lock()
+                            .unwrap()
+                            .push(message.clone());
+                        appended_messages.push(message.clone());
                     }
                 }
                 runtime.pending_mutations.lock().unwrap().remove(0);
@@ -3288,6 +3330,7 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
                 model: snapshot.model.clone(),
                 thinking_level: snapshot.thinking_level.clone(),
                 active_tool_names: snapshot.active_tool_names.clone(),
+                appended_messages,
             };
             Ok(Some(update))
         })
@@ -8063,30 +8106,52 @@ pub(crate) mod tests {
                 if matches!(event, AgentEvent::TurnEnd { .. })
                     && turns.fetch_add(1, AtomicOrdering::SeqCst) == 0
                 {
-                    // This runs mid-run: queue via the handle's own path by
-                    // calling the harness method through a spawned task is not
-                    // possible (needs &mut), so exercise the mutation queue
-                    // directly via handle.set_model as the queue probe; the
-                    // append path is covered by the idle case and the flush
-                    // machinery already tested.
-                    let _ = handle;
+                    // Mid-run, from inside the turn: the harness method needs
+                    // `&mut`, so the handle is the only way in.
+                    handle.append_message(AgentMessage::BashExecution {
+                        command: "echo mid-run".into(),
+                        output: "mid-run".into(),
+                        exit_code: Some(0),
+                        cancelled: false,
+                        truncated: false,
+                        full_output_path: None,
+                        exclude_from_context: None,
+                        timestamp: chrono::Utc::now(),
+                    });
                 }
             })
         }));
         let _ = harness.prompt("turn").await.unwrap();
-        // The mid-run appended message landed via the mutation queue: it is
-        // in the session after the run settles.
+
+        // The queued execution is durable once the run settles.
         let entries = harness.session().storage().get_entries().await.unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
                 SessionTreeEntry::Message {
-                    message: AgentMessage::User { content, .. },
+                    message: AgentMessage::BashExecution { command, .. },
                     ..
-                } if matches!(&content[0], ContentBlock::Text { text, .. } if text == "appended")
+                } if command == "echo mid-run"
             )),
-            "idle append persisted"
+            "the mid-run append flushed to the session"
         );
+
+        // And it lands after the turn's own tool results, not between a tool
+        // call and its result — a split turn would be rejected by the provider.
+        let messages = harness.agent().state().messages.clone();
+        let bash_at = messages
+            .iter()
+            .position(|m| matches!(m, AgentMessage::BashExecution { .. }))
+            .expect("the execution is in the live transcript");
+        let last_result = messages
+            .iter()
+            .rposition(|m| matches!(m, AgentMessage::ToolResult { .. }));
+        if let Some(last_result) = last_result {
+            assert!(
+                bash_at > last_result,
+                "execution at {bash_at} must follow the turn's last tool result at {last_result}"
+            );
+        }
     }
 
     /// Duplicate tool names are refused by `set_tools`; unknown active tools

@@ -285,14 +285,16 @@ async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
     })
 }
 
-/// All text blocks of a user or assistant message, joined by newlines; empty
-/// for other roles.
+/// All text blocks of a message, joined by newlines. Shell executions
+/// contribute nothing: the session list searches conversation text, and a
+/// command's output would swamp it.
 fn message_text(message: &AgentMessage) -> String {
     let content = match message {
         AgentMessage::User { content, .. }
         | AgentMessage::Assistant { content, .. }
         | AgentMessage::ToolResult { content, .. }
         | AgentMessage::Custom { content, .. } => content,
+        AgentMessage::BashExecution { .. } => return String::new(),
     };
     content
         .iter()

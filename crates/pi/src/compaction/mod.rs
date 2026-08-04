@@ -233,6 +233,18 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
         AgentMessage::User { content, .. } => chars_of(content),
         AgentMessage::ToolResult { content, .. } => chars_of(content),
         AgentMessage::Custom { content, .. } => chars_of(content),
+        // Count what the model reads, not what was captured: an execution
+        // withheld from the context contributes nothing and must not push the
+        // estimate toward a compaction it does not cause.
+        AgentMessage::BashExecution {
+            exclude_from_context: Some(true),
+            ..
+        } => 0,
+        AgentMessage::BashExecution { .. } => {
+            crate::provider::transform::bash_execution_to_text(message)
+                .encode_utf16()
+                .count() as u64
+        }
         AgentMessage::Assistant { content, .. } => content
             .iter()
             .map(|b| match b {
@@ -334,8 +346,8 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
 /// Adjust the cut point to the first safe boundary at or after the candidate.
 ///
 /// A boundary is safe when the retained tail both starts on a message a
-/// provider accepts as the first request message (`User`, `Assistant`, or
-/// `Custom`) and contains no `ToolResult` orphaned by the cut — a result
+/// provider accepts as the first request message (anything but a
+/// `ToolResult`) and contains no `ToolResult` orphaned by the cut — a result
 /// whose `ToolUse` was left behind in the summarized prefix. The tail must
 /// never start on a `ToolResult` (its `ToolUse` precedes it), and a cut must
 /// not land between a `tool_use` and its result when a `Custom` sits between
@@ -443,6 +455,18 @@ pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
         match msg {
             AgentMessage::User { content, .. } | AgentMessage::Custom { content, .. } => {
                 let text = content_text(content);
+                if !text.is_empty() {
+                    parts.push(format!("[User]: {text}"));
+                }
+            }
+            // Summarized as the model saw it; a withheld execution was never
+            // part of the conversation being summarized.
+            AgentMessage::BashExecution {
+                exclude_from_context: Some(true),
+                ..
+            } => {}
+            AgentMessage::BashExecution { .. } => {
+                let text = crate::provider::transform::bash_execution_to_text(msg);
                 if !text.is_empty() {
                     parts.push(format!("[User]: {text}"));
                 }
@@ -1073,6 +1097,66 @@ mod tests {
         // An emoji is one scalar but two UTF-16 code units — the heuristic
         // follows the JS `string.length` semantics.
         assert_eq!(estimate_tokens(&make_user("💥💥")), 1);
+    }
+
+    #[test]
+    fn estimate_tokens_counts_the_bash_projection_not_the_capture() {
+        let visible = AgentMessage::BashExecution {
+            command: "ls".into(),
+            output: "hi".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let projected = crate::provider::transform::bash_execution_to_text(&visible);
+        assert_eq!(
+            estimate_tokens(&visible),
+            (projected.encode_utf16().count() as u64).div_ceil(4)
+        );
+
+        // A withheld execution is not in the model's context, so it cannot
+        // push the estimate toward a compaction it does not cause.
+        let excluded = AgentMessage::BashExecution {
+            command: "cat big".into(),
+            output: "x".repeat(10_000),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: Some(true),
+            timestamp: chrono::Utc::now(),
+        };
+        assert_eq!(estimate_tokens(&excluded), 0);
+    }
+
+    #[test]
+    fn serialized_conversation_folds_bash_and_omits_withheld() {
+        let visible = AgentMessage::BashExecution {
+            command: "ls".into(),
+            output: "hi".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let excluded = AgentMessage::BashExecution {
+            command: "cat secret".into(),
+            output: "token".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: Some(true),
+            timestamp: chrono::Utc::now(),
+        };
+        let text = serialize_conversation(&[visible, excluded]);
+        assert!(text.contains("[User]: Ran `ls`"), "{text}");
+        assert!(!text.contains("token"), "{text}");
     }
 
     #[test]

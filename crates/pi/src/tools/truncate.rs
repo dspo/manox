@@ -39,6 +39,58 @@ pub struct TruncatedOutput {
     pub original_lines: usize,
 }
 
+/// Truncate output keeping only its tail.
+///
+/// Shell output carries its signal at the end — the failing line, the final
+/// summary — so a command's transcript keeps the last `max_lines` lines that
+/// fit in `max_bytes` and drops the head. When even the final line exceeds
+/// the byte budget, its tail is kept rather than nothing.
+pub fn truncate_tail(output: &str, config: &TruncateConfig) -> TruncatedOutput {
+    let original_bytes = output.len();
+    let lines: Vec<&str> = output.split('\n').collect();
+    let original_lines = lines.len();
+
+    if original_lines <= config.max_lines && original_bytes <= config.max_bytes {
+        return TruncatedOutput {
+            content: output.to_string(),
+            was_truncated: false,
+            original_bytes,
+            original_lines,
+        };
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut kept_bytes = 0usize;
+    for line in lines.iter().rev() {
+        if kept.len() >= config.max_lines {
+            break;
+        }
+        // Every line but the first kept one also carries its separator.
+        let line_bytes = line.len() + usize::from(!kept.is_empty());
+        if kept_bytes + line_bytes > config.max_bytes {
+            if kept.is_empty() {
+                let start = line
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|i| line.len() - i <= config.max_bytes)
+                    .unwrap_or(line.len());
+                kept.push(&line[start..]);
+            }
+            break;
+        }
+        kept.push(line);
+        kept_bytes += line_bytes;
+    }
+    kept.reverse();
+
+    TruncatedOutput {
+        content: kept.join("\n"),
+        was_truncated: true,
+        original_bytes,
+        original_lines,
+    }
+}
+
 /// Truncate output to fit within the configured limits.
 ///
 /// Truncation is applied in this order:
@@ -139,6 +191,51 @@ mod tests {
         // Should have roughly 10 lines + truncation marker.
         let output_lines = result.content.lines().count();
         assert!(output_lines < 20, "got {output_lines} lines, expected < 20");
+    }
+
+    #[test]
+    fn tail_truncation_keeps_the_end() {
+        let config = TruncateConfig {
+            max_lines: 3,
+            max_bytes: usize::MAX,
+        };
+        let input = (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        let result = truncate_tail(&input.join("\n"), &config);
+        assert!(result.was_truncated);
+        assert_eq!(result.content, "line 7\nline 8\nline 9");
+        assert_eq!(result.original_lines, 10);
+    }
+
+    #[test]
+    fn tail_truncation_passes_short_output_through() {
+        let result = truncate_tail("a\nb", &TruncateConfig::default());
+        assert!(!result.was_truncated);
+        assert_eq!(result.content, "a\nb");
+    }
+
+    #[test]
+    fn tail_truncation_keeps_a_partial_final_line() {
+        // A single line over budget still yields its tail rather than nothing.
+        let config = TruncateConfig {
+            max_lines: 100,
+            max_bytes: 8,
+        };
+        let result = truncate_tail(&"x".repeat(50), &config);
+        assert!(result.was_truncated);
+        assert_eq!(result.content, "x".repeat(8));
+    }
+
+    #[test]
+    fn tail_truncation_splits_multibyte_on_a_boundary() {
+        let config = TruncateConfig {
+            max_lines: 100,
+            max_bytes: 7,
+        };
+        let result = truncate_tail("日本語テスト", &config);
+        assert!(result.was_truncated);
+        // Never a partial code point, and never over budget.
+        assert!(result.content.len() <= 7, "{:?}", result.content);
+        assert!("日本語テスト".ends_with(&result.content));
     }
 
     #[test]
