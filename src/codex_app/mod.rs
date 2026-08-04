@@ -11,6 +11,7 @@
 //!   不应阻塞终端，cx 注入完成即让出终端，App 在后台继续运行。
 //! - `model_reasoning_effort` 与注入脚本的默认 effort 共用，保持下拉默认值与后端一致。
 
+pub mod catalog;
 pub mod cdp;
 pub mod inject;
 
@@ -60,8 +61,12 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     }
 
     // 2. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
-    let prepared =
-        prepare_codex_launch_home_for_app(default_model, provider, selection.selected_wire_api)?;
+    let prepared = prepare_codex_launch_home_for_app(
+        default_model,
+        provider,
+        selection.selected_wire_api,
+        &selection.injected_models,
+    )?;
     let CodexAppPrepared {
         codex_home,
         env_key,

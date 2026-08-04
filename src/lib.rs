@@ -654,6 +654,9 @@ fn merge_codex_config(
     // 模型上下文窗口 token 数（来自 `[Nm]` 后缀），写入 codex config.toml 的
     // `model_context_window`。None 则不写、保留用户既有值。
     context_window: Option<i64>,
+    // 本地模型目录（ModelsResponse JSON）路径，写入 config.toml 的 `model_catalog_json`。
+    // 让引擎「认识」自定义模型、跳过 fallback 元数据对上下文窗口的钳制。None 则不写。
+    model_catalog_json: Option<&str>,
 ) -> Result<String> {
     let project_section = format!(
         "[projects.{}]",
@@ -687,7 +690,10 @@ fn merge_codex_config(
                     || trimmed.starts_with("model_reasoning_effort =")
                     // cx 本次要重写 model_context_window 时，剥离用户旧值以免冲突。
                     || (context_window.is_some()
-                        && trimmed.starts_with("model_context_window =")))
+                        && trimmed.starts_with("model_context_window ="))
+                    // cx 本次要重写 model_catalog_json 时，剥离用户旧值以免冲突。
+                    || (model_catalog_json.is_some()
+                        && trimmed.starts_with("model_catalog_json =")))
             {
                 continue;
             }
@@ -700,12 +706,16 @@ fn merge_codex_config(
     let context_window_line = context_window
         .map(|n| format!("model_context_window = {n}\n"))
         .unwrap_or_default();
+    let model_catalog_json_line = model_catalog_json
+        .map(|p| format!("model_catalog_json = {}\n", toml_basic_string(p)))
+        .unwrap_or_default();
     let mut rendered = format!(
-        "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n{}[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
+        "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n{}{}[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
         toml_basic_string(api_model_id),
         toml_basic_string(provider_key),
         toml_basic_string(&reasoning_effort),
         context_window_line,
+        model_catalog_json_line,
         toml_basic_string(provider_key),
         toml_basic_string(provider_name),
         toml_basic_string(&model.endpoint_url),
@@ -729,7 +739,7 @@ fn merge_codex_config(
 /// 返回 (发给 provider/agent 的 base id, Option<上下文 token 数>)。
 /// `[1m]` → 1_000_000；`[3m]` → 3_000_000；无后缀则 base = 原 id、hint = None。
 /// `model[1mm]` 这类不匹配的尾缀原样保留。
-fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) {
+pub(crate) fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) {
     use regex::Regex;
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\[(\d+)m\]$").unwrap());
@@ -776,6 +786,7 @@ fn prepare_codex_launch_home(
         &env_key,
         api_model_id,
         context_window,
+        None,
     )?;
     write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
 
@@ -800,6 +811,7 @@ fn prepare_codex_launch_home_for_app(
     model: &ResolvedModel,
     provider: &ResolvedProvider,
     wire_api: WireApi,
+    injected_models: &[ResolvedModel],
 ) -> Result<CodexAppPrepared> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let codex_dir = cx_state_dir()?.join(".codex");
@@ -820,6 +832,21 @@ fn prepare_codex_launch_home_for_app(
     let reasoning_effort =
         extract_reasoning_effort(existing_config.as_deref()).unwrap_or_else(|| "high".to_string());
     let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
+    // 生成本地模型目录（仅收录带 [Nm] 后缀的模型），让引擎跳过 fallback 对上下文窗口的钳制。
+    // 无后缀模型时目录为空（引擎拒绝空目录），此时不写 model_catalog_json，保持现状。
+    let catalog_path = codex_dir.join("model-catalog.json");
+    let catalog = codex_app::catalog::build_model_catalog(injected_models);
+    let has_catalog_entries = catalog["models"]
+        .as_array()
+        .map(|models| !models.is_empty())
+        .unwrap_or(false);
+    let model_catalog_json = if has_catalog_entries {
+        write_private_file(&catalog_path, &serde_json::to_string_pretty(&catalog)?)?;
+        println!("[cx] 注入模型目录: {}", catalog_path.display());
+        Some(catalog_path.to_string_lossy().to_string())
+    } else {
+        None
+    };
     let merged_config = merge_codex_config(
         existing_config.as_deref(),
         model,
@@ -830,6 +857,7 @@ fn prepare_codex_launch_home_for_app(
         &env_key,
         api_model_id,
         context_window,
+        model_catalog_json.as_deref(),
     )?;
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
@@ -5288,6 +5316,7 @@ trust_level = "trusted"
             "DASHSCOPE_API_KEY",
             "qwen3.6-plus",
             None,
+            None,
         )
         .unwrap();
 
@@ -5337,6 +5366,7 @@ trust_level = "trusted"
             "ANTHROPIC_API_KEY",
             "claude-sonnet",
             None,
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"wire_api = "anthropic_messages""#));
@@ -5350,6 +5380,7 @@ trust_level = "trusted"
             "OpenAI",
             "OPENAI_API_KEY",
             "gpt-4o",
+            None,
             None,
         )
         .unwrap();
@@ -5369,6 +5400,7 @@ trust_level = "trusted"
             "DASHSCOPE_API_KEY",
             "glm-5.2",
             Some(1_000_000),
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"model = "glm-5.2""#));
@@ -5389,6 +5421,7 @@ trust_level = "trusted"
             "Bailian",
             "DASHSCOPE_API_KEY",
             "glm-5.1",
+            None,
             None,
         )
         .unwrap();
@@ -5411,6 +5444,7 @@ trust_level = "trusted"
             "DASHSCOPE_API_KEY",
             "glm-5.2",
             Some(1_000_000),
+            None,
         )
         .unwrap();
         assert!(merged.contains("model_context_window = 1000000"));
@@ -5421,6 +5455,63 @@ trust_level = "trusted"
             1,
             "model_context_window 不应重复"
         );
+    }
+
+    #[test]
+    fn merge_codex_config_writes_model_catalog_json_when_provided() {
+        let merged = merge_codex_config(
+            None,
+            &test_resolved_model(
+                "deepseek-v4-pro[1m]",
+                "https://api.deepseek.com/v1",
+                WireApi::Responses,
+            ),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "deepseek",
+            "DeepSeek",
+            "DEEPSEEK_API_KEY",
+            "deepseek-v4-pro",
+            Some(1_000_000),
+            Some("/tmp/cx-home/.codex/model-catalog.json"),
+        )
+        .unwrap();
+        assert!(
+            merged.contains(r#"model_catalog_json = "/tmp/cx-home/.codex/model-catalog.json""#)
+        );
+        // 只出现一次。
+        assert_eq!(
+            merged.matches("model_catalog_json").count(),
+            1,
+            "model_catalog_json 不应重复"
+        );
+    }
+
+    #[test]
+    fn merge_codex_config_strips_user_catalog_when_rewriting() {
+        // cx 重写 model_catalog_json 时，剥离用户旧值以免冲突。
+        let existing = "model_catalog_json = \"/old/path.json\"\n";
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model(
+                "deepseek-v4-pro[1m]",
+                "https://api.deepseek.com/v1",
+                WireApi::Responses,
+            ),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "deepseek",
+            "DeepSeek",
+            "DEEPSEEK_API_KEY",
+            "deepseek-v4-pro",
+            Some(1_000_000),
+            Some("/tmp/cx-home/.codex/model-catalog.json"),
+        )
+        .unwrap();
+        assert!(
+            merged.contains(r#"model_catalog_json = "/tmp/cx-home/.codex/model-catalog.json""#)
+        );
+        assert!(!merged.contains("/old/path.json"));
     }
 
     #[test]
@@ -5506,6 +5597,7 @@ trust_level = "trusted"
             "CX_PROVIDER_KEY",
             "qwen3.6-plus",
             None,
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"model_reasoning_effort = "low""#));
@@ -5529,6 +5621,7 @@ trust_level = "trusted"
             "Custom",
             "CX_PROVIDER_KEY",
             "qwen3.6-plus",
+            None,
             None,
         )
         .unwrap();
