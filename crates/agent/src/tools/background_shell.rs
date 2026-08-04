@@ -378,11 +378,20 @@ mod tests {
         assert!(r1.is_running, "should still be running");
         assert!(r1.new_output.contains("hello"), "got: {}", r1.new_output);
 
-        // Wait for the process to finish, then poll again.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let r2 = poll(&id).expect("poll 2");
+        // Poll until it exits rather than guessing how long that takes: the
+        // command sleeps 0.2s of its own, so a fixed budget races it.
+        let mut rest = String::new();
+        let mut r2 = r1;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            r2 = poll(&id).expect("poll 2");
+            rest.push_str(&r2.new_output);
+            if !r2.is_running {
+                break;
+            }
+        }
         assert!(!r2.is_running, "should have exited");
-        assert!(r2.new_output.contains("world"), "got: {}", r2.new_output);
+        assert!(rest.contains("world"), "got: {rest}");
         assert!(r2.exit_code.is_some(), "exit code should be set");
     }
 
@@ -415,15 +424,21 @@ mod tests {
         assert!(r1.new_output.contains('a'), "got: {}", r1.new_output);
         assert!(!r1.new_output.contains('c'), "c not yet: {}", r1.new_output);
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let r2 = poll(&id).expect("poll 2");
-        assert!(r2.new_output.contains('b'), "got: {}", r2.new_output);
-        assert!(r2.new_output.contains('c'), "got: {}", r2.new_output);
-        assert!(
-            !r2.new_output.contains('a'),
-            "a already consumed: {}",
-            r2.new_output
-        );
+        // Accumulate until the command has finished writing. A fixed sleep
+        // races the subprocess: the remaining writes need ~200ms of its own
+        // sleeps plus process overhead, which a loaded machine can exceed.
+        let mut rest = String::new();
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            rest.push_str(&poll(&id).expect("poll 2").new_output);
+            if rest.contains('c') {
+                break;
+            }
+        }
+        assert!(rest.contains('b'), "got: {rest}");
+        assert!(rest.contains('c'), "got: {rest}");
+        // The point of the test: bytes already returned are not repeated.
+        assert!(!rest.contains('a'), "a already consumed: {rest}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -442,9 +457,15 @@ mod tests {
         )
         .await
         .expect("spawn");
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Wait for the terminal status instead of assuming 100ms is enough.
         let task = crate::background_task::get_by_str(&id).expect("registered task");
+        for _ in 0..100 {
+            if task.status() != crate::background_task::TaskStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert_eq!(task.status(), crate::background_task::TaskStatus::Failed);
         assert_eq!(task.exit_code(), Some(7));
         let events = crate::background_task::drain_thread_events("test-thread-failed");
