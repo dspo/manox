@@ -83,11 +83,11 @@ pub struct ToolCallCtx {
 /// `w_full` + `min_w_0` column, so a long unbreakable run cannot push past the
 /// env-card gutter.
 ///
-/// Mounts a fresh `Entity<Markdown>` per frame — used for static chrome
-/// (notices, errors, tool output, sub-message bodies) where cross-block
-/// selection is not required (code blocks carry their own hover copy button).
-/// The owned streaming body uses the `MessageItem`'s persistent
-/// `Entity<Markdown>` directly (see `render_assistant`).
+/// Mounts a fresh `Entity<Markdown>` per frame — used for static chrome and
+/// defensive fallbacks (sub-message bodies, tool-output / reasoning fallbacks)
+/// where cross-block selection is not required (code blocks carry their own
+/// hover copy button). Text bodies use the `MessageItem`'s persistent
+/// `Entity<Markdown>` directly (see `ensure_markdown`).
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
@@ -104,6 +104,43 @@ fn markdown_tv(
     .into_any_element()
 }
 
+/// Mount the item's persistent text body when present; otherwise fall back to a
+/// per-frame `markdown_tv` mount so the same renderer output appears while
+/// selection degrades to per-frame. Every text-body render shares this path.
+fn body_or_static(
+    body: Option<Entity<Markdown>>,
+    id: impl Into<gpui::ElementId>,
+    text: String,
+    theme: &Theme,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    body.map(|md| md.into_any_element())
+        .unwrap_or_else(|| markdown_tv(id, text, theme, false, cx))
+}
+
+/// The persistent text body for a conversation item, if it has one: the
+/// streaming flag (true only for a mid-stream `Assistant`) plus the body's
+/// current source. `None` for items without a text body — their content
+/// renders via `TerminalPanel`, activity-entry markdown, or static chrome.
+fn text_body_of(kind: &ConvItem) -> Option<(bool, String)> {
+    match kind {
+        ConvItem::Assistant {
+            text, streaming, ..
+        } => Some((*streaming, text.clone())),
+        ConvItem::User { text, .. } => Some((false, text.clone())),
+        ConvItem::Error(msg) => Some((false, msg.clone())),
+        ConvItem::Notice(msg) => Some((false, msg.clone())),
+        ConvItem::TeamMessage { content, .. } => Some((false, content.clone())),
+        ConvItem::Recap { summary, .. } => Some((false, summary.clone())),
+        ConvItem::Retry {
+            detail: Some(detail),
+            ..
+        } => Some((false, detail.clone())),
+        ConvItem::PlanReview { plan_text, .. } => Some((false, plan_text.clone())),
+        _ => None,
+    }
+}
+
 /// One renderable conversation item, owned by its own gpui `Entity` so a
 /// streaming delta notifies (and re-renders) only this item rather than the
 /// whole workspace. `id` is the item's stable list index (the conversation
@@ -112,13 +149,15 @@ fn markdown_tv(
 /// creation time so a finished bubble keeps its model label after the user
 /// switches models.
 ///
-/// `markdown` holds the owned `Entity<Markdown>` for text-bearing items
-/// (Assistant, Reasoning): a stateful document carrying parse-once incremental
-/// parsing + document-level selection, so a streaming delta re-parses only the
-/// tail and a cross-block drag selects one continuous range with Cmd/Ctrl+C
-/// copy. `None` for non-text items (ToolCall, Error, …) — those render static
-/// chrome via `markdown_tv`, which mounts a fresh `Entity<Markdown>` per frame
-/// (no persistent selection; code blocks carry their own hover copy button).
+/// `markdown` holds the owned `Entity<Markdown>` for items with a text body
+/// (Assistant, User, Error, Notice, TeamMessage, Recap, Retry, PlanReview): a
+/// stateful document carrying parse-once incremental parsing + document-level
+/// selection, so a streaming delta re-parses only the tail and a cross-block
+/// drag selects one continuous range with Cmd/Ctrl+C copy. `None` for other
+/// items (Thinking, ToolCall, AgentTask, …): reasoning and tool-call bodies
+/// own their own persistent entities, and the remaining static chrome mounts a
+/// fresh `Entity<Markdown>` per frame via `markdown_tv` (no persistent
+/// selection; code blocks carry their own hover copy button).
 pub struct MessageItem {
     kind: ConvItem,
     role: String,
@@ -148,31 +187,42 @@ impl MessageItem {
         &mut self.kind
     }
 
-    /// Lazily create the owned `Entity<Markdown>` for a text-bearing item,
-    /// seeded with the kind's streaming flag (true mid-stream, false for
-    /// finalized/historical bodies). Returns the entity handle so the caller can
-    /// mount it. `None` for non-text items (they have no owned markdown body).
+    /// Lazily create (or re-sync) the owned `Entity<Markdown>` for an item with
+    /// a text body, seeded with the kind's streaming flag (true mid-stream,
+    /// false for finalized/historical bodies) and the body's current source.
+    /// Returns the entity handle so the caller can mount it. `None` for items
+    /// without a text body (they have no owned markdown body).
     fn ensure_markdown(&mut self, cx: &mut gpui::Context<Self>) -> Option<Entity<Markdown>> {
-        let is_text = matches!(self.kind, ConvItem::Assistant { .. });
-        if is_text && self.markdown.is_none() {
-            let streaming = match &self.kind {
-                ConvItem::Assistant { streaming, .. } => *streaming,
-                _ => false,
-            };
-            let id = self.id;
-            let cwd = std::env::current_dir().ok();
-            self.markdown = Some(cx.new(|cx| {
-                Markdown::new(("md", id), "")
-                    .theme(cx.theme())
-                    .heading_mode(HeadingMode::Uniform)
-                    .streaming(streaming)
-                    .on_open_link(Some(Arc::new(move |url, kind| match kind {
-                        LinkKind::Url => {
-                            let _ = open::that(&url);
-                        }
-                        LinkKind::FilePath => open_file_in_vscode(&url, cwd.as_deref()),
-                    })))
-            }));
+        let (streaming, current) = text_body_of(&self.kind)?;
+        match &self.markdown {
+            None => {
+                let id = self.id;
+                let cwd = std::env::current_dir().ok();
+                self.markdown = Some(cx.new(|cx| {
+                    Markdown::new(("md", id), current)
+                        .theme(cx.theme())
+                        .heading_mode(HeadingMode::Uniform)
+                        .streaming(streaming)
+                        .on_open_link(Some(Arc::new(move |url, kind| match kind {
+                            LinkKind::Url => {
+                                let _ = open::that(&url);
+                            }
+                            LinkKind::FilePath => open_file_in_vscode(&url, cwd.as_deref()),
+                        })))
+                }));
+            }
+            // A streaming body is synced incrementally by `update_text`; a
+            // finalized body is re-synced here because it can be rewritten in
+            // place (e.g. `Retry` coalescing a new detail) — the mounted entity
+            // must never lag the item's current text.
+            Some(md) if !streaming => {
+                md.update(cx, |m, cx| {
+                    if m.source() != current {
+                        m.replace(current.clone(), cx);
+                    }
+                });
+            }
+            Some(_) => {}
         }
         self.markdown.clone()
     }
@@ -569,6 +619,7 @@ pub fn render_item(
                 ix,
                 role,
                 theme,
+                body,
                 cx,
             ),
         },
@@ -591,19 +642,19 @@ pub fn render_item(
             }
         }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
-        ConvItem::Error(msg) => render_error(msg, ix, theme, cx),
-        ConvItem::Notice(msg) => render_notice(msg, ix, theme, cx),
+        ConvItem::Error(msg) => render_error(msg, ix, theme, body, cx),
+        ConvItem::Notice(msg) => render_notice(msg, ix, theme, body, cx),
         ConvItem::TeamMessage { from, content } => {
-            render_team_message(from, content, ix, theme, cx)
+            render_team_message(from, content, ix, theme, body, cx)
         }
         ConvItem::PlanReview { plan_text, active } => {
-            render_plan_review_card(plan_text, *active, ix, theme, tool_ctx, cx)
+            render_plan_review_card(plan_text, *active, ix, theme, tool_ctx, body, cx)
         }
         ConvItem::Recap {
             summary,
             collapsed,
             user_toggled: _,
-        } => render_recap(summary, *collapsed, ix, theme, tool_ctx, cx),
+        } => render_recap(summary, *collapsed, ix, theme, tool_ctx, body, cx),
         ConvItem::Retry {
             attempt,
             max_attempts,
@@ -622,6 +673,7 @@ pub fn render_item(
             ix,
             theme,
             tool_ctx,
+            body,
             cx,
         ),
         ConvItem::BackgroundTask(bt) => render_background_task(bt, ix, theme, tool_ctx, cx),
@@ -673,6 +725,7 @@ fn render_user(
     ix: usize,
     model: &str,
     theme: &Theme,
+    body: Option<Entity<Markdown>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let UserRenderContent {
@@ -727,6 +780,7 @@ fn render_user(
         })
     };
 
+    let body_el = body_or_static(body, ("user-text", ix), text.to_string(), theme, cx);
     let mut header_el = h_flex()
         .items_center()
         .gap_1()
@@ -764,13 +818,7 @@ fn render_user(
                         .rounded(theme.radius)
                         .object_fit(gpui::ObjectFit::ScaleDown)
                 }))
-                .child(markdown_tv(
-                    ("user-text", ix),
-                    text.to_string(),
-                    theme,
-                    false,
-                    cx,
-                )),
+                .child(body_el),
         )
         .into_any_element()
 }
@@ -964,7 +1012,13 @@ fn render_banner(
 }
 
 /// Render an error message + copy button.
-pub fn render_error(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
+pub fn render_error(
+    msg: &str,
+    ix: usize,
+    theme: &Theme,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
+) -> gpui::AnyElement {
     render_banner(
         theme.danger,
         i18n::t("message-error"),
@@ -973,7 +1027,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::
         ix,
         "copy-error",
         msg.to_string(),
-        markdown_tv(("error", ix), msg.to_string(), theme, false, cx),
+        body_or_static(body, ("error", ix), msg.to_string(), theme, cx),
         theme,
         None,
     )
@@ -982,7 +1036,13 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::
 /// Render an ephemeral system notice — status toggles, slash-command acks.
 /// Neutral tones so positive state changes (e.g. "Danger mode is on") do not
 /// read as a runtime error.
-pub fn render_notice(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
+pub fn render_notice(
+    msg: &str,
+    ix: usize,
+    theme: &Theme,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
+) -> gpui::AnyElement {
     render_banner(
         theme.muted_foreground,
         i18n::t("message-notice"),
@@ -991,7 +1051,7 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui:
         ix,
         "copy-notice",
         msg.to_string(),
-        markdown_tv(("notice", ix), msg.to_string(), theme, false, cx),
+        body_or_static(body, ("notice", ix), msg.to_string(), theme, cx),
         theme,
         None,
     )
@@ -1006,6 +1066,7 @@ pub fn render_team_message(
     content: &str,
     ix: usize,
     theme: &Theme,
+    body: Option<Entity<Markdown>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     // The whole label row is accent-colored, so `from` inherits primary here.
@@ -1018,7 +1079,7 @@ pub fn render_team_message(
         ix,
         "copy-team-msg",
         content.to_string(),
-        markdown_tv(("team-msg", ix), content.to_string(), theme, false, cx),
+        body_or_static(body, ("team-msg", ix), content.to_string(), theme, cx),
         theme,
         None,
     )
@@ -1034,6 +1095,7 @@ pub fn render_recap(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    body: Option<Entity<Markdown>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
@@ -1071,7 +1133,7 @@ pub fn render_recap(
         ix,
         "copy-recap",
         summary.to_string(),
-        markdown_tv(("recap", ix), summary.to_string(), theme, false, cx),
+        body_or_static(body, ("recap", ix), summary.to_string(), theme, cx),
         theme,
         Some(CollapsibleBanner {
             collapsed,
@@ -1099,6 +1161,7 @@ pub fn render_retry(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    body: Option<Entity<Markdown>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let badge: SharedString = i18n::t_str(
@@ -1137,8 +1200,8 @@ pub fn render_retry(
             cx.notify();
         });
     }) as Box<dyn Fn(&mut App) + 'static>;
-    let body = detail
-        .map(|d| markdown_tv(("retry", ix), d.to_string(), theme, false, cx))
+    let body_el = detail
+        .map(|d| body_or_static(body, ("retry", ix), d.to_string(), theme, cx))
         .unwrap_or_else(|| gpui::div().into_any_element());
     let collapsible = if detail.is_some() {
         Some(CollapsibleBanner {
@@ -1161,7 +1224,7 @@ pub fn render_retry(
         ix,
         "copy-retry",
         copy_text,
-        body,
+        body_el,
         theme,
         collapsible,
     )
@@ -1731,6 +1794,7 @@ fn render_plan_review_card(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    body: Option<Entity<Markdown>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let Some(weak) = tool_ctx.map(|c| c.weak.clone()) else {
@@ -1742,11 +1806,11 @@ fn render_plan_review_card(
             .border_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .child(markdown_tv(
+            .child(body_or_static(
+                body,
                 ("plan-review", ix),
                 plan_text.to_string(),
                 theme,
-                false,
                 cx,
             ))
             .into_any_element();
@@ -1813,11 +1877,11 @@ fn render_plan_review_card(
         .child(copy_btn)
         .child(sidebar_btn);
 
-    let body = gpui::div().w_full().min_w_0().p_1().child(markdown_tv(
+    let plan_body = gpui::div().w_full().min_w_0().p_1().child(body_or_static(
+        body,
         ("plan-review", ix),
         plan_text.to_string(),
         theme,
-        false,
         cx,
     ));
     if !active {
@@ -1836,7 +1900,7 @@ fn render_plan_review_card(
             .border_color(theme.border)
             .bg(theme.background)
             .child(header)
-            .child(body)
+            .child(plan_body)
             .into_any_element();
     }
 
@@ -1893,7 +1957,7 @@ fn render_plan_review_card(
         .bg(theme.background)
         .shadow_lg()
         .child(header)
-        .child(body)
+        .child(plan_body)
         .child(footer)
         .with_animation(
             format!("plan-card-slide-{ix}"),
@@ -4115,5 +4179,79 @@ mod tests {
             item,
             ConvItem::User { text, .. } if text.contains("internal directive")
         )));
+    }
+
+    /// Regression: user messages (and every other text-bearing kind) must feed
+    /// a persistent `Entity<Markdown>`. A per-frame `markdown_tv` mount would
+    /// reset document selection each frame, so the body could not be selected
+    /// or copied; `text_body_of` decides which kinds own a persistent body.
+    #[test]
+    fn text_body_of_identifies_all_selectable_bodies() {
+        let user = ConvItem::User {
+            text: "hello".into(),
+            images: Vec::new(),
+            meta: None,
+            display_state: crate::conversation::UserMessageDisplayState::Normal,
+        };
+        assert_eq!(text_body_of(&user), Some((false, "hello".into())));
+
+        let assistant = ConvItem::Assistant {
+            text: "hi".into(),
+            streaming: true,
+            token_usage: None,
+            activity_summary: None,
+        };
+        assert_eq!(text_body_of(&assistant), Some((true, "hi".into())));
+
+        let error = ConvItem::Error("boom".into());
+        assert_eq!(text_body_of(&error), Some((false, "boom".into())));
+
+        let notice = ConvItem::Notice("n".into());
+        assert_eq!(text_body_of(&notice), Some((false, "n".into())));
+
+        let team = ConvItem::TeamMessage {
+            from: "alice".into(),
+            content: "peer body".into(),
+        };
+        assert_eq!(text_body_of(&team), Some((false, "peer body".into())));
+
+        let recap = ConvItem::Recap {
+            summary: "sum".into(),
+            collapsed: true,
+            user_toggled: false,
+        };
+        assert_eq!(text_body_of(&recap), Some((false, "sum".into())));
+
+        let retry = ConvItem::Retry {
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 1,
+            reason: "429".into(),
+            detail: Some("provider body".into()),
+            collapsed: true,
+            user_toggled: false,
+        };
+        assert_eq!(text_body_of(&retry), Some((false, "provider body".into())));
+        let retry_no_detail = ConvItem::Retry {
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 1,
+            reason: "429".into(),
+            detail: None,
+            collapsed: true,
+            user_toggled: false,
+        };
+        assert_eq!(text_body_of(&retry_no_detail), None);
+
+        let plan = ConvItem::PlanReview {
+            plan_text: "implement plan".into(),
+            active: true,
+        };
+        assert_eq!(text_body_of(&plan), Some((false, "implement plan".into())));
+
+        // Non-text kinds own their persistence elsewhere (activity entries /
+        // `TerminalPanel`) and must not mount a body markdown entity.
+        let thinking = ConvItem::Thinking(ThinkingContainer::new());
+        assert_eq!(text_body_of(&thinking), None);
     }
 }
