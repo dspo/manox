@@ -406,7 +406,7 @@ workspace-mode-notice = { $mode ->
    *[danger] Danger: tool calls need no approval, bash runs outside the sandbox.
 }
 workspace-approval-autopilot-allowed = ✔ Auto-approved: {$tool}
-workspace-approval-autopilot-escalated = ✗ Denied: {$tool} — {$reason}
+workspace-approval-autopilot-escalated = ✗ Escalated for your review: {$tool} — {$reason}
 workspace-project-choose = Choose project
 workspace-project-new = New project
 workspace-project-blank = Create blank project

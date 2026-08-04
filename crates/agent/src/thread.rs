@@ -4993,6 +4993,18 @@ impl Thread {
             );
         })?;
         this.update(cx, |_, cx| {
+            // Surface the card in the message list first: the question card
+            // renders on the matching `ToolCall` item, so it must exist
+            // before the authorization event parks the turn on the response.
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: crate::tools::ASK_USER_QUESTION.to_string(),
+                title: title.clone(),
+                status: ToolCallStatus::PendingApproval,
+                input: Some(input.clone()),
+            });
+        })?;
+        this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCallAuthorization {
                 id: id.clone(),
                 tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
@@ -5009,16 +5021,16 @@ impl Thread {
             this.pending_authorizations.remove(&id);
             this.pending_auth_meta.remove(&id);
         })?;
-
         let verdict = match response {
-            ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
-                // A free-form reply is not an explicit approval; a selected
-                // option label is the user's verdict on the single question.
-                if response.is_some() {
-                    EscalationVerdict::Deny
-                } else if answers.iter().any(|(_, a)| a.contains("Always allow")) {
+            ToolAuthorizationResponse::AskUserQuestion { answers, .. } => {
+                // A selected option label is the user's explicit verdict and
+                // wins over any supplemental text; a reply with no selection
+                // is not an approval. Labels are the system constants defined
+                // above — rendered verbatim, never localized — so exact
+                // matching is stable.
+                if answers.iter().any(|(_, a)| a == "Always allow") {
                     EscalationVerdict::AlwaysAllow
-                } else if answers.iter().any(|(_, a)| a.contains("Allow once")) {
+                } else if answers.iter().any(|(_, a)| a == "Allow once") {
                     EscalationVerdict::AllowOnce
                 } else {
                     EscalationVerdict::Deny
@@ -10714,10 +10726,21 @@ mod tests {
         });
         let weak = thread.downgrade();
         let auto_responder = thread.clone();
+        // Capture the question-card `ToolCall` event: the card renders on a
+        // `PendingApproval` conversation item, so escalation must emit one
+        // before parking on the user's verdict.
+        let card_statuses: Arc<std::sync::Mutex<Vec<super::ToolCallStatus>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let card_cap = card_statuses.clone();
         cx.update(|cx| {
             cx.subscribe(
                 &thread,
                 move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCall { name, status, .. } = ev
+                        && name.as_str() == crate::tools::ASK_USER_QUESTION
+                    {
+                        card_cap.lock().unwrap().push(*status);
+                    }
                     if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
                         auto_responder.update(cx, |t, cx| {
                             t.respond_authorization(
@@ -10774,6 +10797,13 @@ mod tests {
             assert!(t.reviewer_allowed.contains("tu_escalated_allow"));
             assert_eq!(t.consecutive_tool_denials, 0);
         });
+        assert!(
+            card_statuses
+                .lock()
+                .unwrap()
+                .contains(&super::ToolCallStatus::PendingApproval),
+            "escalation must emit a PendingApproval ToolCall card"
+        );
         let _ = std::fs::remove_file("/tmp/manox-escalated-allow-test.txt");
     }
 
