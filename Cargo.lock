@@ -6754,6 +6754,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-extensions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "brush-builtins",
+ "brush-core",
+ "libc",
+ "pi",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

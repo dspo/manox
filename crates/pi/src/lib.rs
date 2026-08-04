@@ -10,6 +10,7 @@
 //   StreamFn      — how the harness calls an LLM (provider-agnostic)
 //   ExecutionEnv  — how the harness accesses filesystem and shell
 
+pub mod background;
 pub mod cache_stats;
 pub mod coding_agent;
 pub mod compaction;
@@ -34,6 +35,7 @@ pub use agent::QueueMode;
 pub use agent::RunHandle;
 pub use agent_loop::run_loop;
 pub use agent_loop::{EventSink, StreamFn};
+pub use background::{BackgroundTaskRegistry, PollResult, TaskError, TaskId};
 pub use env::ExecutionEnv;
 pub use harness::AgentHarness;
 pub use harness::{NavigateTreeOptions, NavigateTreeResult};
@@ -45,4 +47,5 @@ pub use tool::{
     AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext, ToolState,
 };
 pub use tools::ToolRegistry;
+pub use tools::bash::{BashExecRequest, BashOperations};
 pub use types::{AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState};
