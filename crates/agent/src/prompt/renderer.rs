@@ -70,6 +70,10 @@ const TPL_WRAPPER_ASK_USER_QUESTIONS_ZH_CN: &str =
 const TPL_WRAPPER_TOOL_DENIED_EN: &str = include_str!("templates/en/wrapper/tool_denied.tera.md");
 const TPL_WRAPPER_TOOL_DENIED_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/tool_denied.tera.md");
+const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN: &str =
+    include_str!("templates/en/wrapper/escalated_approval_question.tera.md");
+const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN: &str =
+    include_str!("templates/zh-CN/wrapper/escalated_approval_question.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE_EN: &str =
     include_str!("templates/en/wrapper/compaction_preamble.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN: &str =
@@ -165,6 +169,11 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperToolDenied,
         TPL_WRAPPER_TOOL_DENIED_EN,
         TPL_WRAPPER_TOOL_DENIED_ZH_CN,
+    ),
+    (
+        PromptTemplate::WrapperEscalatedApprovalQuestion,
+        TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN,
+        TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN,
     ),
     (
         PromptTemplate::WrapperCompactionPreamble,
@@ -450,8 +459,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 22);
-        assert_eq!(REGISTRATIONS.len(), 22);
+        assert_eq!(template::ALL.len(), 23);
+        assert_eq!(REGISTRATIONS.len(), 23);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -648,6 +657,19 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperAskUserQuestions,
+                lang,
+            );
+            assert_clean(
+                &render(
+                    PromptTemplate::WrapperEscalatedApprovalQuestion,
+                    lang,
+                    &crate::prompt::EscalatedApprovalQuestionData {
+                        tool_title: "Bash".to_string(),
+                        reason: "network access".to_string(),
+                    },
+                )
+                .unwrap(),
+                PromptTemplate::WrapperEscalatedApprovalQuestion,
                 lang,
             );
             assert_clean(

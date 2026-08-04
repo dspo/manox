@@ -135,6 +135,15 @@ pub struct AskUserQuestionsData {
     pub response: Option<String>,
 }
 
+/// The reviewer's refusal surfaced to the user for a manual verdict. Rendered
+/// as the question text of the AskUserQuestion-style escalation card; the
+/// chosen option label rides back as the answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct EscalatedApprovalQuestionData {
+    pub tool_title: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecoveryFailureData {
     pub reason: String,

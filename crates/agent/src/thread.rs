@@ -358,6 +358,23 @@ pub struct PendingAuthMeta {
     pub input: serde_json::Value,
 }
 
+/// A tool call the AutoPilot reviewer refused, escalated for the user's
+/// manual verdict. The reviewer's reason rides the question card and, when
+/// the user declines, the denial fed back to the model.
+struct EscalatedCall {
+    tu: LanguageModelToolUse,
+    reason: String,
+}
+
+/// The user's verdict on an escalated call, resolved from the question
+/// card's selected option or the UI's three-way decision.
+#[derive(Clone, Copy)]
+enum EscalationVerdict {
+    AllowOnce,
+    AlwaysAllow,
+    Deny,
+}
+
 /// Per-turn cap on recovery continuations (tool-use JSON parse error +
 /// max-tokens truncation). Guards the main thread — which has no `max_turns` —
 /// against a model that loops on unparseable JSON or keeps hitting the output
@@ -4217,16 +4234,12 @@ impl Thread {
             }
 
             // AutoPilot: ask the safety reviewer for each pending call.
-            // Allow verdicts flow into `free_tus`; Ask verdicts deny the
-            // call and return the reason to the model. An
-            // `ApprovalDecision` event is emitted for the MessageList
-            // record. When the side-call policy disables the reviewer, all
-            // calls are denied (fail-closed).
-            // Track tool_use IDs that were denied during auto-review so
-            // synthesize_unrun_tool_result does not add a second tool_result
-            // for the same id (which causes a 400 from the API).
-            let mut denied_tool_use_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            // Allow verdicts flow into `free_tus`; Ask verdicts are collected
+            // into `escalated` for the user's manual verdict (run serially
+            // after the interactive queue). An `ApprovalDecision` event is
+            // emitted for the MessageList record. When the side-call policy
+            // disables the reviewer, every call escalates (fail-closed).
+            let mut escalated: Vec<EscalatedCall> = Vec::new();
             if !auto_review_tus.is_empty() {
                 let review_enabled = crate::settings::side_calls().approval_policy().enabled;
                 let wk_root = this
@@ -4247,8 +4260,7 @@ impl Thread {
                                     verdict: verdict.clone(),
                                 });
                             });
-                            Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
-                            denied_tool_use_ids.insert(tu.id.clone());
+                            escalated.push(EscalatedCall { tu, reason });
                         }
                     }
                     Some(_) if !review_enabled => {
@@ -4265,8 +4277,7 @@ impl Thread {
                                     verdict: verdict.clone(),
                                 });
                             });
-                            Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
-                            denied_tool_use_ids.insert(tu.id.clone());
+                            escalated.push(EscalatedCall { tu, reason });
                         }
                     }
                     Some(model) => {
@@ -4336,10 +4347,7 @@ impl Thread {
                                     // reason is what wedges the model into
                                     // re-try loops.
                                     let reason = truncate_str(reason, REVIEWER_REASON_CAP);
-                                    Self::deny_tool_with_reason(
-                                        this, &tu, &title, &reason, lang, cx,
-                                    )?;
-                                    denied_tool_use_ids.insert(tu.id.clone());
+                                    escalated.push(EscalatedCall { tu, reason });
                                 }
                             }
                         }
@@ -4410,10 +4418,33 @@ impl Thread {
                 }
             }
 
-            // Merge denied tool_use IDs into fulfilled so synthesize_unrun_tool_result
-            // does not add a second tool_result for tool_uses already handled by
-            // deny_tool_with_reason above.
-            fulfilled.extend(denied_tool_use_ids);
+            // AutoPilot `Ask` verdicts escalate to the user instead of feeding
+            // the refusal straight back to the model. Escalated calls wait on
+            // an AskUserQuestion-style card, serialized like interactive tools
+            // so the single-slot question overlay never holds two prompts; a
+            // cancelled turn or a sibling error skips the rest (they are
+            // synthesized below).
+            for call in escalated {
+                if cancel.is_cancelled() || first_err.is_some() {
+                    break;
+                }
+                let tu_id = call.tu.id.clone();
+                let task: Task<Result<()>> = this.update(cx, |_this, cx| {
+                    let cancel = cancel.clone();
+                    cx.spawn(async move |this, cx: &mut AsyncApp| {
+                        Self::run_escalated_approval_inner(this, call, cancel, cx).await
+                    })
+                })?;
+                match task.await {
+                    Ok(()) => {
+                        fulfilled.insert(tu_id);
+                    }
+                    Err(e) if first_err.is_none() => {
+                        first_err = Some(e);
+                    }
+                    Err(_) => {}
+                }
+            }
 
             // Cancel or error may have left tool_uses without a paired
             // tool_result. Anthropic requires every tool_use to have one or the
@@ -4901,6 +4932,119 @@ impl Thread {
         Self::emit_tool_result(&this, &id, &name, &title, &output, is_error, cx)?;
         Self::append_tool_result(&this, tu, output, is_error, cx)?;
         Ok(())
+    }
+
+    /// AutoPilot `Ask` verdicts escalate to the user instead of feeding the
+    /// refusal straight back to the model. A question card carries the
+    /// reviewer's reason and asks Allow once / Always allow / Deny; an
+    /// explicit approval runs the call (the id joins `reviewer_allowed` so
+    /// the fallback gate lets it through), anything else denies it with the
+    /// reviewer's reason. Escalations are serialized by the caller — the
+    /// single-slot question card can never hold two prompts.
+    async fn run_escalated_approval_inner(
+        this: gpui::WeakEntity<Self>,
+        call: EscalatedCall,
+        cancel: CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let EscalatedCall { tu, reason } = call;
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let (title, lang) = this.read_with(cx, |this, _| {
+            let wk_root = this.worktree.as_ref().map(|w| w.path.clone());
+            (
+                tool_title(&name, &tu.input, wk_root.as_deref()),
+                this.agent_language,
+            )
+        })?;
+
+        let question = crate::prompt::render(
+            crate::prompt::PromptTemplate::WrapperEscalatedApprovalQuestion,
+            lang,
+            &crate::prompt::EscalatedApprovalQuestionData {
+                tool_title: title.clone(),
+                reason: reason.clone(),
+            },
+        )
+        .expect("escalated approval question render");
+        let input = serde_json::json!({
+            "questions": [{
+                "question": question,
+                "header": crate::i18n::t("workspace-approval-title").to_string(),
+                "multiSelect": false,
+                "options": [
+                    {"label": "Allow once", "description": "Run this call once."},
+                    {"label": "Always allow", "description": "Allow this tool for the rest of the session."},
+                    {"label": "Deny", "description": "Refuse; the reason is returned to the model."},
+                ]
+            }]
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        this.update(cx, |this, _cx| {
+            this.pending_authorizations.insert(id.clone(), tx);
+            this.pending_auth_meta.insert(
+                id.clone(),
+                PendingAuthMeta {
+                    tool_name: name.clone(),
+                    summary: title.clone(),
+                    input: input.clone(),
+                },
+            );
+        })?;
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCallAuthorization {
+                id: id.clone(),
+                tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+                summary: title.clone(),
+                input,
+            });
+        })?;
+
+        let response = tokio::select! {
+            r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+            _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        };
+        this.update(cx, |this, _cx| {
+            this.pending_authorizations.remove(&id);
+            this.pending_auth_meta.remove(&id);
+        })?;
+
+        let verdict = match response {
+            ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
+                // A free-form reply is not an explicit approval; a selected
+                // option label is the user's verdict on the single question.
+                if response.is_some() {
+                    EscalationVerdict::Deny
+                } else if answers.iter().any(|(_, a)| a.contains("Always allow")) {
+                    EscalationVerdict::AlwaysAllow
+                } else if answers.iter().any(|(_, a)| a.contains("Allow once")) {
+                    EscalationVerdict::AllowOnce
+                } else {
+                    EscalationVerdict::Deny
+                }
+            }
+            ToolAuthorizationResponse::Decision(d) => match d {
+                PermissionDecision::AlwaysAllow => EscalationVerdict::AlwaysAllow,
+                PermissionDecision::AllowOnce => EscalationVerdict::AllowOnce,
+                PermissionDecision::Deny => EscalationVerdict::Deny,
+            },
+        };
+
+        match verdict {
+            EscalationVerdict::AllowOnce | EscalationVerdict::AlwaysAllow => {
+                if matches!(verdict, EscalationVerdict::AlwaysAllow) {
+                    this.update(cx, |this, _| this.permission.set_always_allowed(&name))?;
+                }
+                this.update(cx, |this, _| {
+                    this.reviewer_allowed.insert(id);
+                })?;
+                Self::run_tool_inner(this, tu, cancel, cx).await
+            }
+            EscalationVerdict::Deny => {
+                Self::deny_tool_with_reason(&this, &tu, &title, &reason, lang, cx)
+            }
+        }
     }
 
     /// Run a single tool call: authorize (if needed) → run → append a ToolResult message → emit.
@@ -10476,6 +10620,29 @@ mod tests {
             rec.title = Some("breaker".into());
             super::Thread::restore(rec, Some(model), cx)
         });
+        // Fail-closed `Ask` verdicts now escalate to an AskUserQuestion card
+        // awaiting a user verdict; auto-deny every escalated call so the
+        // denial streak arms the breaker exactly as before.
+        let weak = thread.downgrade();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                        let _ = weak.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::Decision(
+                                    crate::tool::PermissionDecision::Deny,
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
         cx.update(|cx| {
             thread.update(cx, |thread, cx| thread.run_turn(cx));
         });
@@ -10525,5 +10692,341 @@ mod tests {
                 });
             assert!(directive, "breaker directive was injected into history");
         });
+    }
+    /// An escalated `Ask` verdict answered with AllowOnce runs the call: the
+    /// id joins `reviewer_allowed` so the fallback gate lets it through, and
+    /// the denial streak stays untouched.
+    #[test]
+    fn escalated_ask_allow_once_runs_the_call() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("escalated-allow", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let weak = thread.downgrade();
+        let auto_responder = thread.clone();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                        auto_responder.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::Decision(
+                                    crate::tool::PermissionDecision::AllowOnce,
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_escalated_allow".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-escalated-allow-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_escalated_approval_inner(
+                        weak,
+                        super::EscalatedCall {
+                            tu,
+                            reason: "reviewer flagged it".to_string(),
+                        },
+                        CancellationToken::new(),
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "escalated approval failed: {:?}", res.err());
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(
+                !result.is_error,
+                "allowed call must run, got: {}",
+                result.content
+            );
+            assert!(t.reviewer_allowed.contains("tu_escalated_allow"));
+            assert_eq!(t.consecutive_tool_denials, 0);
+        });
+        let _ = std::fs::remove_file("/tmp/manox-escalated-allow-test.txt");
+    }
+
+    /// An escalated `Ask` verdict answered with AlwaysAllow plants a session
+    /// grant for the tool in addition to running the call.
+    #[test]
+    fn escalated_ask_always_allow_plants_grant_and_runs() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("escalated-allow-all", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let weak = thread.downgrade();
+        let auto_responder = thread.clone();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                        auto_responder.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::Decision(
+                                    crate::tool::PermissionDecision::AlwaysAllow,
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_escalated_always".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-escalated-always-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_escalated_approval_inner(
+                        weak,
+                        super::EscalatedCall {
+                            tu,
+                            reason: "reviewer flagged it".to_string(),
+                        },
+                        CancellationToken::new(),
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "escalated approval failed: {:?}", res.err());
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            assert!(
+                t.permission.is_always_allowed(crate::tools::WRITE),
+                "AlwaysAllow must plant a session grant"
+            );
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(!result.is_error, "call must run, got: {}", result.content);
+        });
+        let _ = std::fs::remove_file("/tmp/manox-escalated-always-test.txt");
+    }
+
+    /// An escalated `Ask` verdict answered through the question card's option
+    /// labels (the UI's `AskUserQuestion` response path) resolves the same as
+    /// a bare AllowOnce decision.
+    #[test]
+    fn escalated_ask_resolves_option_label_answer() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("escalated-label", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let weak = thread.downgrade();
+        let auto_responder = thread.clone();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                        auto_responder.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::AskUserQuestion {
+                                    answers: vec![(
+                                        "Approve?".to_string(),
+                                        "Allow once".to_string(),
+                                    )],
+                                    response: None,
+                                },
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_escalated_label".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-escalated-label-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_escalated_approval_inner(
+                        weak,
+                        super::EscalatedCall {
+                            tu,
+                            reason: "reviewer flagged it".to_string(),
+                        },
+                        CancellationToken::new(),
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "escalated approval failed: {:?}", res.err());
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(
+                !result.is_error,
+                "label-approved call must run, got: {}",
+                result.content
+            );
+        });
+        let _ = std::fs::remove_file("/tmp/manox-escalated-label-test.txt");
+    }
+
+    /// An escalated `Ask` verdict denied by the user feeds the denial back
+    /// with the reviewer's reason and advances the breaker streak.
+    #[test]
+    fn escalated_ask_denied_feed_back_and_streak() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("escalated-deny", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let weak = thread.downgrade();
+        let auto_responder = thread.clone();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                        auto_responder.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::Decision(
+                                    crate::tool::PermissionDecision::Deny,
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_escalated_deny".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-escalated-deny-test.txt", "content": "no"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_escalated_approval_inner(
+                        weak,
+                        super::EscalatedCall {
+                            tu,
+                            reason: "risky network call".to_string(),
+                        },
+                        CancellationToken::new(),
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "escalated denial failed: {:?}", res.err());
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(result.is_error, "denied call must error");
+            assert!(
+                result.content.contains("risky network call"),
+                "denial must carry the reviewer's reason, got: {}",
+                result.content
+            );
+            assert_eq!(t.consecutive_tool_denials, 1);
+        });
+        assert!(
+            !std::path::Path::new("/tmp/manox-escalated-deny-test.txt").exists(),
+            "denied call must not have written the file"
+        );
     }
 }
