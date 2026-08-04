@@ -32,7 +32,7 @@ use crate::types::{
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesParams {
     let (reasoning, include) = reasoning_params(context);
-    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
+    let messages = crate::provider::transform::prepare_for_wire(&context.messages);
     ResponsesParams {
         model: context.model.id.clone(),
         input: to_input(context, &messages),
@@ -174,7 +174,8 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
                     output: tool_result_output(content),
                 }));
             }
-            // Custom messages are harness-internal; never sent to the API.
+            // `prepare_for_wire` has already projected these onto user
+            // messages; the arm only satisfies exhaustiveness.
             AgentMessage::Custom { .. } => continue,
         }
         msg_index += 1;
@@ -1016,6 +1017,25 @@ mod tests {
         assert_eq!(output["call_id"], "call_1");
         assert_eq!(output["output"], "No result provided");
         assert_eq!(v["input"][4]["role"], "user");
+    }
+
+    #[test]
+    fn custom_message_reaches_the_request_as_user_text() {
+        let custom = AgentMessage::Custom {
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "remember this".into(),
+                signature: None,
+            }],
+            display: false,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let v = request(&ctx(vec![custom], ThinkingKind::None, None));
+        let input = v["input"].as_array().unwrap();
+        let last = input.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"][0]["text"], "remember this");
     }
 
     // ── usage ───────────────────────────────────────────────────────────────

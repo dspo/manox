@@ -79,6 +79,7 @@
 | 溢出分类 | ✅ | 20 种跨厂商子串 + 限流排除 + 413；terminal/mid_stream 两构造点统一 ProviderError::Overflow |
 | Prompt caching | ✅ | 按 TS Pi 对齐：CacheRetention 三态挂 AgentContext；Anthropic 三断点、Completions prompt_cache_key 门控、Responses 无 URL 门控 |
 | 悬空 tool call 修复 | ✅ | 请求线边界共享 repair_tool_flow（对齐 TS transformMessages 第二趟）+ error/aborted 剥离 |
+| 角色投影（convertToLlm） | ✅（S22，2026-08-04） | `transform::convert_to_llm` 把 harness-only 角色投影到线上三角色，`prepare_for_wire` 固定「先投影再修复」顺序（对齐 TS `agent-loop.ts` 调 `convertToLlm` → adapter 内 `transformMessages`）。修 bug：`custom_message` entry 经 `session_entry_to_context_messages` 进 transcript，却被三个 translator 静默丢弃，模型永不可见；现投影为 user 消息（blocks 原样，images 存活）。摘要载体已由 session 侧 eager 投影为 tagged user 消息，不二次包裹。`repair_tool_flow` 保留 `Custom` 臂——compaction 在未投影的 transcript 上推理切点，`find_safe_cut` 依赖「Custom 不关闭 tool turn」这一形状可达 |
 | 请求级 options | ✅（S3，2026-08-01） | `StreamOptions`（headers/timeout/max_tokens）从 harness turn snapshot 流入每次请求（`AgentContext.stream_options` overlay 于 builder options；idle setter + `HarnessHandle::set_stream_options` 运行中生效） |
 | 请求 hooks | ✅（S3，2026-08-01） | `RequestObserver`（before_payload / after_response）在每次 attempt 触发（含重试）；provider builder 挂接，harness `request_observer()` 映射到 `BeforeProviderPayload`/`AfterProviderResponse` hook 点 |
 
@@ -110,6 +111,7 @@
 - **grep/find 进程内化**（ignore + regex + globset），TS shell 出系统 grep/find
 - **manox 自创恢复项不移植**：空响应 nudge、拒绝熔断、取消级联清理（TS agent-loop 皆无）
 - **registry 不进 crate**：模型解析经 consumer 插接的 ModelResolver，crate 保持 registry-free
+- **`convertToLlm`/`transformContext` 不做成 `AgentLoopConfig` seam**：TS 把两者做成可插拔字段是为 extension 系统（明确不移植）。`convert_to_llm` 落为请求路径上的纯函数；`transformContext` 的语义已被 `before_provider_request`（`Fn(&AgentContext) -> AgentContext`，可改消息/system prompt/model/tools）严格覆盖。附带记一处命名错位：TS 自己的 `beforeProviderRequest` 是 stream-options hook，对应 Rust 的 `BeforeProviderPayload`；Rust 同名 hook 对应 TS 的 `transformContext`。两个 TS 面均已覆盖，仅名字交叉，不改名（churn 换零行为变更）
 - **Hook 推迟项（已收窄）**：`before_provider_payload`/`after_provider_response` 已接 RequestObserver（S3/S8/S10，带 model + headers map）；`session_before_tree`/`session_tree` 已接 typed hooks（S1/S10，含 summary override + fromHook）；`summarization_retry_*` 已由 RetryEvent observer 承载（S10）；`model_update`/`tools_update`/`resources_update` 已由 HarnessEvent 承载（S4）；`thinking_level_update` 未单独发事件（随 thinking setter 的 HarnessEvent 覆盖）。剩余：extension loader 相关变体（动态 extension 明确不移植）
 
 ## 已知余项（对齐缺口，按严重度排序）
@@ -131,6 +133,7 @@
 
 | 轮次 | Rust 基线 | TS 基线 | 结果 |
 |---|---|---|---|
+| S22（2026-08-04） | `a9bfcd9` | `4488ad55c` | 修 `custom_message` 不进 provider 的 bug（本轮唯一线上 bug，非 parity 缺口）：session 把 entry 投影成 `AgentMessage::Custom` 进 transcript，三个 translator 全部丢弃并注释「harness-internal; never sent to the API」，而 TS `convertToLlm` 映射为 user 消息——同一条 entry 在 TS 模型可见、Rust 不可见。新增 `transform::convert_to_llm` + `prepare_for_wire`（投影→修复），三个 translator 改调后者，丢弃臂降级为纯 exhaustiveness。顺序有语义：投影后的 custom 是 user 消息，会关闭打开的 tool turn（对齐 TS 在 `Message[]` 上跑 `transformMessages`）；`repair_tool_flow` 仍保留 `Custom` 臂，因 compaction 在未投影 transcript 上推理，`find_safe_cut` 依赖该形状可达。不加 `AgentLoopConfig` seam（理由见 §9）。前缀缓存：投影每轮确定性相同，跨 turn 前缀仍字节一致，含 `custom_message` 的旧 session 仅首轮一次 miss（透明回退）。新增 8 测试（三 translator 各一端到端、投影为 user、images 存活、摘要载体不双包、投影后关闭 tool turn、纯净 transcript 字节不变钉住缓存不变量）；487→495 |
 | S21（独立核对轮，2026-08-04） | `702262e` | `4488ad55c` | 不依赖本文件自述、逐项回源码重核 TS Pi 覆盖率。修正 split-turn 失真文档：`compaction/mod.rs` 的 `CompactionPreparation` doc comment 与 `turn_prefix_messages`/`is_split_turn` 字段注释、`build_preparation` doc comment 末句均声称「split-turn 未实现、字段恒空恒 false」，实则 Phase 3A（`4b7605d`）已接线——`harness.rs` compact 走 `find_cut_point_split`，`summarize_via_model` 有 history+prefix 双摘要分支，`compaction/mod.rs` 有 `find_cut_point_split_detects_mid_turn_cut`，`examples/split_turn_compact.rs` 在 example gate 内。注释改为面向终态（prefix 的角色、`is_split_turn` 选择哪条摘要路径），不叙述沿革；`harness.rs` 两处测试断言消息由全局口径（「the Rust port never splits a turn」/「turnPrefixMessages is always empty」）收窄为该 transcript 的局部事实。核对副产物：`ContentBlock::Image`、`PromptInput.images`、`clamp_cache_key` 的 Unicode 正确性（`chars().take(64)`）均已存在，前轮记为缺口者为误报 |
 | S0（收口校准，2026-08-01） | `b9b6869` + dirty（10 改 2 增，未提交） | `4488ad55c`（未变） | 修 fixture 尾随空格（`git diff --check` 通过）；repository/navigation、coding-agent facade、settings/trust/cache 逐条状态化（🟡/🚫 不再用模块级 ✅ 掩盖）；`search` 标删除、`output_guard` 标默认关闭、hashline 标接受并冻结；schemars 从待办删除；**S0 完成后冻结共享基线，其余 agent 在此基线上开始** |
 | S1（2026-08-01） | `4033883` | `4488ad55c` | branch summarization 按 TS 重写（getMessageFromEntry/prepareBranchEntries/BRANCH_SUMMARY_PROMPT/preamble/usage/read+modified files）；navigate label/abort/hook（session_before_tree/session_tree）；append_branch_summary details 对齐 TS wire shape；差分 fixture branch-summary-preparation |
