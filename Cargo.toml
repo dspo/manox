@@ -14,6 +14,7 @@ members = [
     "crates/agent-ui",
     "crates/manox",
     "crates/pi",
+    "crates/pi-extensions",
     "crates/terminal",
     "crates/terminal-ui",
     "crates/components",
@@ -45,6 +46,7 @@ manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
 pi = { path = "crates/pi" }
+pi-extensions = { path = "crates/pi-extensions" }
 
 anyhow = "1"
 async-channel = "2"
@@ -178,3 +180,4 @@ psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
+
