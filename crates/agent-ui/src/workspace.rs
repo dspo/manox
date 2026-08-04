@@ -4233,7 +4233,7 @@ impl Workspace {
         // Color the trigger when open so the affordance matches the dropdown's
         // presence (a clicked "..." otherwise looks identical to a hovered one).
         let trigger = if open {
-            trigger.text_color(theme.accent)
+            trigger.text_color(theme.accent_foreground)
         } else {
             trigger
         };
@@ -4554,7 +4554,12 @@ impl Workspace {
             .border_1()
             .border_color(accent)
             .cursor_pointer()
-            .child(gpui::div().text_xs().text_color(accent).child(label))
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.accent_foreground)
+                    .child(label),
+            )
             .child(
                 Icon::new(if open {
                     IconName::ChevronUp
@@ -4608,7 +4613,7 @@ impl Workspace {
             .child(
                 gpui::div()
                     .text_xs()
-                    .text_color(accent)
+                    .text_color(theme.accent_foreground)
                     .child(format!("◎ {title_label}")),
             )
             .child(goal_popover_row(&objective_label, &objective, fg, muted))
@@ -4871,8 +4876,17 @@ impl Workspace {
             .border_1()
             .border_color(accent)
             .cursor_pointer()
-            .child(Icon::new(IconName::User).xsmall().text_color(accent))
-            .child(gpui::div().text_xs().text_color(accent).child(label))
+            .child(
+                Icon::new(IconName::User)
+                    .xsmall()
+                    .text_color(theme.accent_foreground),
+            )
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.accent_foreground)
+                    .child(label),
+            )
             .child(
                 Icon::new(if open {
                     IconName::ChevronUp
@@ -4909,7 +4923,7 @@ impl Workspace {
                     .enumerate()
                     .map(|(ix, (name, role, running, owned))| {
                         let dot_color = if running {
-                            theme.accent
+                            theme.accent_foreground
                         } else {
                             theme.muted_foreground
                         };
@@ -5226,7 +5240,7 @@ impl Workspace {
         } else {
             ButtonCustomVariant::new(cx)
                 .color(theme.accent)
-                .foreground(theme.accent)
+                .foreground(theme.accent_foreground)
                 .hover(theme.accent.opacity(0.18))
                 .active(theme.accent.opacity(0.28))
         };
@@ -5710,7 +5724,7 @@ impl Workspace {
                                 .child(
                                     Icon::new(IconName::FolderOpen)
                                         .small()
-                                        .text_color(theme.accent),
+                                        .text_color(theme.accent_foreground),
                                 )
                                 .child(
                                     gpui::div()

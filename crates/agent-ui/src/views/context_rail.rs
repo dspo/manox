@@ -577,7 +577,7 @@ impl ContextRail {
             ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
                 crate::views::braille_spinner::BrailleSpinner::new()
                     .xsmall()
-                    .color(theme.accent)
+                    .color(theme.accent_foreground)
                     .into_any_element()
             }
             ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()

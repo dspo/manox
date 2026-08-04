@@ -73,9 +73,10 @@ fn main() {
         // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and
         // italic cuts: message body inherits Light, markdown bold/headings and
         // tool-call titles resolve to Medium via nearest-weight matching, italic
-        // syntax plus reasoning/tool cards hit the italic cuts. IBM Plex Mono
-        // stays the UI-chrome family (sidebar, buttons, settings, menus) at its
-        // full weight range.
+        // syntax plus reasoning/tool cards hit the italic cuts. JetBrains Mono
+        // NL (no-ligature cut) is the UI-chrome family (sidebar, buttons,
+        // settings, menus); NL avoids ligatures so operator sequences in
+        // labels never collapse into symbols.
         // Both are registered before any view renders so the first frame already
         // resolves to the embedded faces rather than a system fallback.
         cx.text_system()
@@ -89,16 +90,16 @@ fn main() {
                     "../assets/fonts/lilex/Lilex-MediumItalic.ttf"
                 )),
                 Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"
+                    "../assets/fonts/jetbrains-mono/JetBrainsMonoNL-Regular.ttf"
                 )),
                 Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf"
+                    "../assets/fonts/jetbrains-mono/JetBrainsMonoNL-Bold.ttf"
                 )),
                 Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Italic.ttf"
+                    "../assets/fonts/jetbrains-mono/JetBrainsMonoNL-Italic.ttf"
                 )),
                 Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-BoldItalic.ttf"
+                    "../assets/fonts/jetbrains-mono/JetBrainsMonoNL-BoldItalic.ttf"
                 )),
             ])
             .expect("failed to register embedded fonts");
@@ -106,7 +107,7 @@ fn main() {
         // Lilex is the family name embedded in the TTFs (not "Lilex Mono").
         {
             let theme = Theme::global_mut(cx);
-            theme.font_family = "IBM Plex Mono".into();
+            theme.font_family = "JetBrains Mono NL".into();
             theme.mono_font_family = "Lilex".into();
             theme.font_size = px(14.);
             theme.mono_font_size = px(14.);

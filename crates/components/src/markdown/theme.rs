@@ -60,7 +60,7 @@ impl MdStyles {
             // background; a fixed blue keeps the drag highlight legible across
             // light/dark themes.
             selection_bg: hsla(211.0 / 360.0, 0.85, 0.6, 0.4),
-            link_color: theme.accent,
+            link_color: theme.accent_foreground,
         }
     }
 }

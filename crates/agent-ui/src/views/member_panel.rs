@@ -159,7 +159,7 @@ impl MemberPanel {
         let dot_color = if !alive {
             theme.muted_foreground
         } else if running {
-            theme.accent
+            theme.accent_foreground
         } else {
             theme.muted_foreground
         };
@@ -220,7 +220,7 @@ impl MemberPanel {
                 .child(
                     gpui::div()
                         .text_xs()
-                        .text_color(theme.accent)
+                        .text_color(theme.accent_foreground)
                         .child(format!("[{}]", t.status)),
                 )
                 .child(
