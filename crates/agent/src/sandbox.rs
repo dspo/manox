@@ -472,12 +472,6 @@ impl SandboxPolicy {
     pub fn network(&self) -> &NetworkPolicy {
         &self.network
     }
-
-    /// Whether `/tmp` scratch is admitted for the FS write check — true in
-    /// project mode, false under a worktree.
-    pub fn admits_tmp_scratch(&self) -> bool {
-        self.admit_tmp_scratch
-    }
 }
 
 /// Canonicalize a path that may not yet exist: resolve the longest existing
@@ -584,6 +578,16 @@ pub fn is_cross_app_automation(command: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Test-only observation of the `/tmp` scratch admission. `is_writable` is the
+/// production surface; the flag is reachable through it only where `$TMPDIR`
+/// differs from `/tmp`, which is why the tests need to read it directly.
+#[cfg(test)]
+impl SandboxPolicy {
+    fn admits_tmp_scratch(&self) -> bool {
+        self.admit_tmp_scratch
+    }
 }
 
 #[cfg(test)]
@@ -1030,13 +1034,23 @@ mod tests {
         let wt =
             SandboxPolicy::for_project(Path::new(FIXTURE_PROJECT)).with_worktree(worktree, git_dir);
         // Worktree mode withdraws the `/tmp` scratch admission. Asserted on the
-        // admission itself rather than on a `/tmp` path: where `$TMPDIR` is
-        // `/tmp` (Linux) that path is writable as the temp root regardless, so
-        // a path-based assertion would test the platform, not the policy.
+        // admission itself because where `$TMPDIR` is `/tmp` (Linux) such a
+        // path is writable as the temp root regardless, so a path-based
+        // assertion there would test the platform rather than the policy.
         assert!(
             !wt.admits_tmp_scratch(),
             "worktree mode must not admit /tmp (isolation)"
         );
+        // The flag alone does not prove `is_writable` consults it. That branch
+        // is only reachable when `$TMPDIR` is distinct from `/tmp`, since
+        // otherwise the path matches the temp root first — so the end-to-end
+        // check is conditioned on the tmpdir, not on the platform.
+        if !is_under_tmp(&temp_root()) {
+            assert!(
+                !wt.is_writable(Path::new("/tmp/scratch-file")),
+                "is_writable must honour the withdrawn admission"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
