@@ -193,8 +193,8 @@ async fn main() {
 
     let stats = session.stats().await.expect("stats");
     println!(
-        "session stats: entries={} messages={}",
-        stats.entries, stats.messages
+        "session stats: messages={} tokens={} cost={:.6}",
+        stats.message_count, stats.total_tokens, stats.cost_total
     );
 
     // Close and reopen: the session resumes.

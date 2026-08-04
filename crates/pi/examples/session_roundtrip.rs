@@ -67,7 +67,10 @@ async fn main() {
     let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
         .await
         .expect("reopen");
-    let entries = storage.get_entries().await.expect("entries");
+    let entries = storage
+        .get_entries(Default::default())
+        .await
+        .expect("entries");
     println!(
         "reopened: {} entries, leaf={:?}",
         entries.len(),

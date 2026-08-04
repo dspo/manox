@@ -3670,8 +3670,89 @@ pub(crate) mod tests {
             *self.leaf_id.lock().unwrap() = leaf_id.map(|s| s.to_string());
             Ok(())
         }
-        async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-            Ok(self.entries.lock().unwrap().clone())
+        async fn get_entries(
+            &self,
+            cursor: crate::session::SessionEntryCursor,
+        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+            let entries = self.entries.lock().unwrap();
+            let tail = entries.iter().skip(cursor.after_entry_seq);
+            Ok(match cursor.limit {
+                Some(limit) => tail.take(limit).cloned().collect(),
+                None => tail.cloned().collect(),
+            })
+        }
+        async fn find_entries(
+            &self,
+            entry_type: crate::session::EntryType,
+        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| crate::session::entry_kind(e) == entry_type)
+                .cloned()
+                .collect())
+        }
+        async fn get_label(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    SessionTreeEntry::Label {
+                        target_id, label, ..
+                    } if target_id == id => Some(label.as_deref().unwrap_or("").trim().to_string()),
+                    _ => None,
+                })
+                .next_back()
+                .filter(|l| !l.is_empty()))
+        }
+        async fn get_session_name(&self) -> Result<Option<String>, anyhow::Error> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    SessionTreeEntry::SessionInfo { name, .. } => {
+                        Some(name.as_deref().unwrap_or("").trim().to_string())
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .filter(|n| !n.is_empty()))
+        }
+        async fn get_session_stats(&self) -> Result<crate::session::SessionStats, anyhow::Error> {
+            let entries = self.entries.lock().unwrap();
+            let mut stats = crate::session::SessionStats::default();
+            for entry in entries.iter() {
+                let usage = match entry {
+                    SessionTreeEntry::Message { message, .. } => {
+                        stats.message_count += 1;
+                        match message {
+                            AgentMessage::Assistant { usage, .. } => Some(&**usage),
+                            _ => None,
+                        }
+                    }
+                    SessionTreeEntry::Compaction { usage, .. }
+                    | SessionTreeEntry::BranchSummary { usage, .. } => usage.as_ref(),
+                    _ => None,
+                };
+                let Some(usage) = usage.filter(|u| u.cost.is_some()) else {
+                    continue;
+                };
+                let cost = usage.cost.as_ref().expect("filtered on cost presence");
+                stats.cached_tokens += usage.cache_read_input_tokens;
+                stats.uncached_tokens += usage.input_tokens + usage.cache_creation_input_tokens;
+                stats.total_tokens += usage.input_tokens
+                    + usage.output_tokens
+                    + usage.cache_read_input_tokens
+                    + usage.cache_creation_input_tokens;
+                stats.cost_total += cost.total;
+            }
+            Ok(stats)
         }
         async fn get_path(
             &self,
@@ -3829,7 +3910,12 @@ pub(crate) mod tests {
         // One append_entry for the compaction; no spurious leaf write.
         assert_eq!(after - before, 1);
 
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let compaction_id = match entries.last() {
             Some(SessionTreeEntry::Compaction { id, .. }) => id.clone(),
             other => panic!("expected a compaction entry, got {:?}", other),
@@ -3982,7 +4068,7 @@ pub(crate) mod tests {
             harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .iter()
@@ -4166,7 +4252,7 @@ pub(crate) mod tests {
         harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .expect("entries")
             .into_iter()
@@ -4234,7 +4320,12 @@ pub(crate) mod tests {
         );
 
         // The session keeps the failed turn and exactly one boundary.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -5047,7 +5138,12 @@ pub(crate) mod tests {
         );
         // The mutation persisted and the harness state caught up.
         assert_eq!(harness.model().id, "claude-opus");
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -5334,7 +5430,12 @@ pub(crate) mod tests {
         );
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let first_reply = entries
             .iter()
             .find_map(|e| match e {
@@ -5373,7 +5474,12 @@ pub(crate) mod tests {
         // The hook summary replaced the model call: only the two prompts'
         // turns streamed, no summarization request.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let summary = entries
             .iter()
             .find_map(|e| match e {
@@ -5530,7 +5636,12 @@ pub(crate) mod tests {
         }));
 
         async fn model_changes(harness: &AgentHarness<MemStorage>) -> Vec<String> {
-            let entries = harness.session().storage().get_entries().await.unwrap();
+            let entries = harness
+                .session()
+                .storage()
+                .get_entries(Default::default())
+                .await
+                .unwrap();
             entries
                 .iter()
                 .filter_map(|e| match e {
@@ -5851,7 +5962,12 @@ pub(crate) mod tests {
             Arc::new(TestStreamFn),
         );
         h1.set_model(responses.clone()).await.unwrap();
-        let entries = h1.session().storage().get_entries().await.unwrap();
+        let entries = h1
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
 
         // Harness 2 restores the session and prompts under the restored model.
         let mut h2 = AgentHarness::new(
@@ -5910,7 +6026,12 @@ pub(crate) mod tests {
         )
         .with_stream_resolver(resolver);
         h1.set_model(broken.clone()).await.unwrap();
-        let entries = h1.session().storage().get_entries().await.unwrap();
+        let entries = h1
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
 
         let mut h2 = AgentHarness::new(
             Session::new(MemStorage::from_entries(entries)),
@@ -6021,7 +6142,12 @@ pub(crate) mod tests {
             Some("high")
         );
 
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -6110,7 +6236,7 @@ pub(crate) mod tests {
         let entries_before = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -6127,7 +6253,7 @@ pub(crate) mod tests {
         let entries_after = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -6159,7 +6285,7 @@ pub(crate) mod tests {
         let entries_before = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -6177,7 +6303,7 @@ pub(crate) mod tests {
             harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .len(),
@@ -6268,7 +6394,7 @@ pub(crate) mod tests {
         let compaction = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .iter()
@@ -6705,7 +6831,7 @@ pub(crate) mod tests {
         let entries_before = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -6732,7 +6858,7 @@ pub(crate) mod tests {
             harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .len(),
@@ -6888,7 +7014,7 @@ pub(crate) mod tests {
         let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
-        let entries = storage.get_entries().await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
         let boundary = entries.iter().find_map(|e| match e {
             SessionTreeEntry::Compaction {
                 summary,
@@ -7224,7 +7350,7 @@ pub(crate) mod tests {
         let entry_count = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -7233,7 +7359,7 @@ pub(crate) mod tests {
             harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .len(),
@@ -7287,7 +7413,12 @@ pub(crate) mod tests {
         assert_eq!(harness.model().id, "claude-opus");
         assert_eq!(harness.agent().state().model.id, "claude-opus");
 
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         match entries.last() {
             Some(SessionTreeEntry::ModelChange {
                 provider, model_id, ..
@@ -7324,7 +7455,7 @@ pub(crate) mod tests {
         let before = harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -7337,7 +7468,7 @@ pub(crate) mod tests {
             harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .len(),
@@ -7350,7 +7481,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(mounted_names(&harness), ["echo"]);
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         match entries.last() {
             Some(SessionTreeEntry::ActiveToolsChange {
                 active_tool_names, ..
@@ -7534,7 +7670,12 @@ pub(crate) mod tests {
         assert_eq!(entries.len(), 3, "{entries:?}");
 
         // A fresh harness over the same session restores exactly the prefix.
-        let entries_snapshot = harness.session().storage().get_entries().await.unwrap();
+        let entries_snapshot = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let mut reopened = AgentHarness::new(
             Session::new(MemStorage::from_entries(entries_snapshot)),
             "You are a test assistant.",
@@ -7692,7 +7833,12 @@ pub(crate) mod tests {
 
         // The first turn's assistant reply: navigating back to it keeps the
         // whole first turn on the active path.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
@@ -7731,7 +7877,12 @@ pub(crate) mod tests {
         );
 
         // A branch summary entry was appended.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries
                 .iter()
@@ -7774,7 +7925,12 @@ pub(crate) mod tests {
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
 
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
@@ -7793,7 +7949,12 @@ pub(crate) mod tests {
         assert_eq!(harness.agent().state().messages.len(), 2);
         assert!(result.summary_entry_id.is_none());
         assert!(!result.cancelled);
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             !entries
                 .iter()
@@ -7851,7 +8012,12 @@ pub(crate) mod tests {
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
 
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
@@ -7877,7 +8043,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let summary_id = result.summary_entry_id.expect("summary entry");
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -7910,7 +8081,12 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -7957,7 +8133,12 @@ pub(crate) mod tests {
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
         let leaf_before = harness.session().leaf_id().await.unwrap();
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let first_reply_id = entries
             .iter()
             .find_map(|e| match e {
@@ -7982,7 +8163,12 @@ pub(crate) mod tests {
             .unwrap();
         assert!(result.cancelled && result.aborted);
         assert_eq!(harness.session().leaf_id().await.unwrap(), leaf_before);
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             !entries
                 .iter()
@@ -8007,7 +8193,12 @@ pub(crate) mod tests {
             .unwrap();
         assert!(result.cancelled && !result.aborted);
         assert_eq!(harness.session().leaf_id().await.unwrap(), leaf_before);
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             !entries
                 .iter()
@@ -8081,7 +8272,12 @@ pub(crate) mod tests {
             .append_message(AgentMessage::user("appended"))
             .await
             .unwrap();
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -8124,7 +8320,12 @@ pub(crate) mod tests {
         let _ = harness.prompt("turn").await.unwrap();
 
         // The queued execution is durable once the run settles.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             entries.iter().any(|e| matches!(
                 e,
@@ -8298,7 +8499,12 @@ pub(crate) mod tests {
 
         let _ = harness.prompt("use the tool").await;
         // Shutdown cleared the mutation queue: no model_change was persisted.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             !entries
                 .iter()
@@ -8436,7 +8642,12 @@ pub(crate) mod tests {
             harness.active_tool_names().map(|n| n.to_vec()),
             Some(vec!["echo".to_string()])
         );
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(entries.iter().any(|e| matches!(
             e,
             SessionTreeEntry::ActiveToolsChange { active_tool_names, .. }
@@ -8536,7 +8747,12 @@ pub(crate) mod tests {
         }));
 
         let _ = harness.prompt("use the tool").await.unwrap();
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         // model_change sits before the new model's assistant reply.
         let model_change_at = entries
             .iter()
@@ -9099,7 +9315,12 @@ pub(crate) mod tests {
         );
 
         // Injected messages persist like any prompt message.
-        let entries = harness.session().storage().get_entries().await.unwrap();
+        let entries = harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let persisted: Vec<&str> = entries
             .iter()
             .filter_map(|e| match e {

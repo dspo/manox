@@ -435,8 +435,101 @@ impl SessionStorage for JsonlSessionStorage {
         self.append_entry_locked(&entry).await
     }
 
-    async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
-        Ok(self.entries.lock().await.clone())
+    async fn get_entries(
+        &self,
+        cursor: crate::session::SessionEntryCursor,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        let entries = self.entries.lock().await;
+        let tail = entries.iter().skip(cursor.after_entry_seq);
+        Ok(match cursor.limit {
+            Some(limit) => tail.take(limit).cloned().collect(),
+            None => tail.cloned().collect(),
+        })
+    }
+
+    async fn find_entries(
+        &self,
+        entry_type: crate::session::EntryType,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        Ok(self
+            .entries
+            .lock()
+            .await
+            .iter()
+            .filter(|e| crate::session::entry_kind(e) == entry_type)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_label(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+        Ok(self
+            .entries
+            .lock()
+            .await
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Label {
+                    target_id, label, ..
+                } if target_id == id => Some(label.as_deref().unwrap_or("").trim()),
+                _ => None,
+            })
+            // The latest label for a target wins; a blank one clears it.
+            .next_back()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string))
+    }
+
+    async fn get_session_name(&self) -> Result<Option<String>, anyhow::Error> {
+        Ok(self
+            .entries
+            .lock()
+            .await
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::SessionInfo { name, .. } => {
+                    Some(name.as_deref().unwrap_or("").trim())
+                }
+                _ => None,
+            })
+            .next_back()
+            .filter(|n| !n.is_empty())
+            .map(str::to_string))
+    }
+
+    async fn get_session_stats(&self) -> Result<crate::session::SessionStats, anyhow::Error> {
+        let entries = self.entries.lock().await;
+        let mut stats = crate::session::SessionStats::default();
+        for entry in entries.iter() {
+            let usage = match entry {
+                SessionTreeEntry::Message { message, .. } => {
+                    stats.message_count += 1;
+                    match message {
+                        crate::types::AgentMessage::Assistant { usage, .. } => Some(&**usage),
+                        _ => None,
+                    }
+                }
+                SessionTreeEntry::Compaction { usage, .. }
+                | SessionTreeEntry::BranchSummary { usage, .. } => usage.as_ref(),
+                _ => None,
+            };
+            // An entry recorded before cost accounting reports no cost; its
+            // tokens are unpriced and stay out of every figure, so the totals
+            // describe one consistent set of calls.
+            let Some(usage) = usage.filter(|u| u.cost.is_some()) else {
+                continue;
+            };
+            let cost = usage.cost.as_ref().expect("filtered on cost presence");
+            stats.cached_tokens += usage.cache_read_input_tokens;
+            stats.uncached_tokens += usage.input_tokens + usage.cache_creation_input_tokens;
+            // Summed from the classes rather than the provider's reported
+            // total, which only some shapes populate.
+            stats.total_tokens += usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_creation_input_tokens;
+            stats.cost_total += cost.total;
+        }
+        Ok(stats)
     }
 
     async fn get_path(
@@ -512,8 +605,328 @@ mod tests {
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().id(), "test-1");
 
-        let all = storage.get_entries().await.unwrap();
+        let all = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    /// An assistant entry whose usage is priced, so it counts toward stats.
+    fn priced_assistant(id: &str, input: u64, output: u64, cache_read: u64) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: crate::types::AgentMessage::Assistant {
+                content: Vec::new(),
+                model: "m".into(),
+                provider: "p".into(),
+                api: "a".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(crate::types::StopReason::Stop),
+                usage: Box::new(crate::types::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_read_input_tokens: cache_read,
+                    cost: Some(crate::types::Cost {
+                        total: 0.5,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn session_stats_aggregate_priced_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        storage
+            .append_entry(&priced_assistant("a1", 10, 5, 3))
+            .await
+            .unwrap();
+        // A user message counts toward the message total but carries no usage.
+        storage
+            .append_entry(&SessionTreeEntry::Message {
+                id: "u1".into(),
+                parent_id: Some("a1".into()),
+                timestamp: chrono::Utc::now(),
+                message: crate::types::AgentMessage::user("hi"),
+            })
+            .await
+            .unwrap();
+        // A compaction is a model call the session paid for too.
+        storage
+            .append_entry(&SessionTreeEntry::Compaction {
+                id: "c1".into(),
+                parent_id: Some("u1".into()),
+                timestamp: chrono::Utc::now(),
+                summary: "s".into(),
+                first_kept_entry_id: None,
+                tokens_before: 0,
+                retained_tail: None,
+                details: None,
+                usage: Some(crate::types::Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cost: Some(crate::types::Cost {
+                        total: 1.5,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                from_hook: None,
+            })
+            .await
+            .unwrap();
+
+        let stats = storage.get_session_stats().await.unwrap();
+        assert_eq!(stats.message_count, 2, "both message entries count");
+        assert_eq!(stats.cached_tokens, 3);
+        assert_eq!(stats.uncached_tokens, 110);
+        assert_eq!(stats.total_tokens, 138);
+        assert!(
+            (stats.cost_total - 2.0).abs() < 1e-9,
+            "{}",
+            stats.cost_total
+        );
+    }
+
+    #[tokio::test]
+    async fn session_stats_skip_unpriced_usage_but_still_count_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        let mut entry = priced_assistant("a1", 10, 5, 3);
+        if let SessionTreeEntry::Message {
+            message: crate::types::AgentMessage::Assistant { usage, .. },
+            ..
+        } = &mut entry
+        {
+            usage.cost = None;
+        }
+        storage.append_entry(&entry).await.unwrap();
+
+        let stats = storage.get_session_stats().await.unwrap();
+        assert_eq!(stats.message_count, 1);
+        assert_eq!(stats.total_tokens, 0, "unpriced tokens stay out");
+        assert_eq!(stats.cost_total, 0.0);
+    }
+
+    #[tokio::test]
+    async fn session_stats_sum_the_classes_not_the_reported_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        let mut entry = priced_assistant("a1", 60, 30, 10);
+        if let SessionTreeEntry::Message {
+            message: crate::types::AgentMessage::Assistant { usage, .. },
+            ..
+        } = &mut entry
+        {
+            // Only some provider shapes report a total; trusting it would make
+            // the aggregate disagree between shapes.
+            usage.total_tokens = 9999;
+        }
+        storage.append_entry(&entry).await.unwrap();
+
+        let stats = storage.get_session_stats().await.unwrap();
+        assert_eq!(stats.total_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn labels_resolve_to_the_latest_and_blank_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let target = SessionTreeEntry::Message {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: crate::types::AgentMessage::user("hi"),
+        };
+        storage.append_entry(&target).await.unwrap();
+        for (id, label) in [
+            ("l1", Some("first")),
+            ("l2", Some("  second  ")),
+            ("l3", None),
+            ("l4", Some("final")),
+        ] {
+            storage
+                .append_entry(&SessionTreeEntry::Label {
+                    id: id.into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    target_id: "m1".into(),
+                    label: label.map(Into::into),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            storage.get_label("m1").await.unwrap().as_deref(),
+            Some("final")
+        );
+        assert_eq!(storage.get_label("nope").await.unwrap(), None);
+
+        // Rebuilt from the file on reopen, not only maintained on append.
+        drop(storage);
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        assert_eq!(
+            reopened.get_label("m1").await.unwrap().as_deref(),
+            Some("final")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_label_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::Label {
+                id: "l1".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                target_id: "m1".into(),
+                label: Some("   ".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.get_label("m1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn session_name_takes_the_latest_and_trims() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        assert_eq!(storage.get_session_name().await.unwrap(), None);
+        for (id, name) in [("s1", Some("old")), ("s2", Some("  new  "))] {
+            storage
+                .append_entry(&SessionTreeEntry::SessionInfo {
+                    id: id.into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    name: name.map(Into::into),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            storage.get_session_name().await.unwrap().as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_entries_filters_by_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::Message {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                message: crate::types::AgentMessage::user("hi"),
+            })
+            .await
+            .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::SessionInfo {
+                id: "s1".into(),
+                parent_id: Some("m1".into()),
+                timestamp: chrono::Utc::now(),
+                name: Some("n".into()),
+            })
+            .await
+            .unwrap();
+
+        use crate::session::EntryType;
+        assert_eq!(
+            storage
+                .find_entries(EntryType::Message)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .find_entries(EntryType::SessionInfo)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            storage
+                .find_entries(EntryType::Compaction)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_cursor_windows_in_append_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::create(&dir.path().join("s.jsonl"), meta())
+            .await
+            .unwrap();
+        for i in 0..5 {
+            storage
+                .append_entry(&SessionTreeEntry::Message {
+                    id: format!("m{i}"),
+                    parent_id: (i > 0).then(|| format!("m{}", i - 1)),
+                    timestamp: chrono::Utc::now(),
+                    message: crate::types::AgentMessage::user(format!("{i}")),
+                })
+                .await
+                .unwrap();
+        }
+        use crate::session::SessionEntryCursor;
+
+        let window = storage
+            .get_entries(SessionEntryCursor {
+                after_entry_seq: 2,
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        let ids: Vec<&str> = window.iter().map(|e| e.id()).collect();
+        assert_eq!(ids, vec!["m2", "m3"], "forward order from the cursor");
+
+        let tail = storage
+            .get_entries(SessionEntryCursor {
+                after_entry_seq: 3,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 2, "no limit reads to the end");
+
+        // A cursor past the end is how a poller sits idle, not an error.
+        let past = storage
+            .get_entries(SessionEntryCursor {
+                after_entry_seq: 99,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(past.is_empty());
     }
 
     #[tokio::test]
@@ -640,7 +1053,7 @@ mod tests {
         }
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
-        let entries = storage.get_entries().await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
 
@@ -1005,7 +1418,7 @@ mod tests {
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
 
-        let entries = storage.get_entries().await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 3);
         // No `leaf` entry: the cursor is the last appended entry.
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
@@ -1078,7 +1491,7 @@ mod tests {
         tokio::fs::write(&path, contents).await.unwrap();
 
         let storage = JsonlSessionStorage::open(&path).await.unwrap();
-        let entries = storage.get_entries().await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 2);
 
         match &entries[0] {
@@ -1165,7 +1578,7 @@ mod tests {
         // Trailing leaf redirects the cursor to its targetId.
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("b1".into()));
 
-        let entries = storage.get_entries().await.unwrap();
+        let entries = storage.get_entries(Default::default()).await.unwrap();
         assert_eq!(entries.len(), 7);
 
         match &entries[0] {
@@ -1303,7 +1716,11 @@ mod tests {
             Some(m2.clone())
         );
 
-        let entries = session.storage().get_entries().await.unwrap();
+        let entries = session
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         // m1, the leaf entry, m2 — leaf is persisted, not an in-memory override.
         assert_eq!(entries.len(), 3);
         assert!(entries.iter().any(|e| e.id() == m1));
@@ -1318,7 +1735,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.get_leaf_id().await.unwrap(), Some(m2.clone()));
-        assert_eq!(reopened.get_entries().await.unwrap().len(), 3);
+        assert_eq!(
+            reopened
+                .get_entries(Default::default())
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
 
         // The walked context skips the leaf entry: m2 → m1, no leaf in path.
         let session = Session::new(reopened);
@@ -1594,7 +2018,10 @@ mod tests {
         let err = storage.append_entry(&dup).await.unwrap_err();
         assert!(err.to_string().contains("duplicate entry id m1"), "{err}");
         // The rejected entry left no trace: the file and index hold one entry.
-        assert_eq!(storage.get_entries().await.unwrap().len(), 1);
+        assert_eq!(
+            storage.get_entries(Default::default()).await.unwrap().len(),
+            1
+        );
         assert_eq!(storage.get_leaf_id().await.unwrap().as_deref(), Some("m1"));
     }
 
@@ -1613,7 +2040,13 @@ mod tests {
         };
         let err = storage.append_entry(&entry).await.unwrap_err();
         assert!(err.to_string().contains("empty id"), "{err}");
-        assert!(storage.get_entries().await.unwrap().is_empty());
+        assert!(
+            storage
+                .get_entries(Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A header line with an empty id or cwd is corruption, not a valid
