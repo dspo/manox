@@ -32,7 +32,7 @@ pub fn to_request(
         None => (None, None),
     };
     let (thinking, reasoning_effort) = thinking_params(context);
-    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
+    let messages = crate::provider::transform::prepare_for_wire(&context.messages);
     ChatCompletionParams {
         model: context.model.id.clone(),
         messages: to_message_params(context, &messages, base_url),
@@ -159,7 +159,8 @@ fn to_message_params(
                 });
                 pending_images.extend(images);
             }
-            // Custom messages are harness-internal; never sent to the API.
+            // `prepare_for_wire` has already projected these onto user
+            // messages; the arm only satisfies exhaustiveness.
             AgentMessage::Custom { .. } => {}
         }
     }
@@ -569,6 +570,26 @@ mod tests {
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "t1");
         assert_eq!(last["content"], "[error] No result provided");
+    }
+
+    #[test]
+    fn custom_message_reaches_the_request_as_user_text() {
+        let custom = AgentMessage::Custom {
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "remember this".into(),
+                signature: None,
+            }],
+            display: false,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let v = request(&ctx(vec![custom], ThinkingKind::None, None));
+        let msgs = v["messages"].as_array().unwrap();
+        // The system prompt leads; the projected custom message follows it.
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(last["content"], "remember this");
     }
 
     #[test]

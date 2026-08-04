@@ -46,7 +46,7 @@ fn map_budget(level: &str, max_tokens: usize) -> u64 {
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCreateParams {
     let cache_control = cache_control(context);
-    let messages = crate::provider::transform::repair_tool_flow(&context.messages);
+    let messages = crate::provider::transform::prepare_for_wire(&context.messages);
     let max_tokens = options.max_tokens.unwrap_or(context.model.max_tokens);
     MessageCreateParams {
         model: context.model.id.clone(),
@@ -205,9 +205,9 @@ fn to_message_params(
                         .collect(),
                 });
             }
-            AgentMessage::Custom { .. } => {
-                // Custom messages are harness-internal; never sent to the API.
-            }
+            // `prepare_for_wire` has already projected these onto user
+            // messages; the arm only satisfies exhaustiveness.
+            AgentMessage::Custom { .. } => {}
         }
     }
     flush(&mut out, &mut pending_results);
@@ -746,6 +746,27 @@ mod tests {
         assert_eq!(block["tool_use_id"], "t1");
         assert_eq!(block["is_error"], true);
         assert_eq!(block["content"][0]["text"], "No result provided");
+    }
+
+    #[test]
+    fn custom_message_reaches_the_request_as_user_text() {
+        let custom = AgentMessage::Custom {
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "remember this".into(),
+                signature: None,
+            }],
+            display: false,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let c = ctx(vec![custom], ThinkingKind::None, None);
+        let req = to_request(&c, &StreamOptions::default());
+        let messages = serde_json::to_value(&req.messages).unwrap();
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "remember this");
     }
 
     #[test]

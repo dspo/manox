@@ -1,11 +1,12 @@
-// Request-time transcript repair shared by every provider shape.
+// Request-time transcript preparation shared by every provider shape.
 //
-// A transcript can contain tool calls whose result never arrived — a turn
-// whose persistence failed partway, or a run interrupted between the
-// assistant's tool call and its result. Providers reject a bare tool call,
-// which would make the session impossible to continue, so every such call
-// is paired with a synthetic error result before messages are converted to
-// the wire format.
+// Two passes run in order. `convert_to_llm` projects the harness-only roles
+// onto the three the wire protocols accept, so a shape translator only ever
+// matches user/assistant/toolResult. `repair_tool_flow` then pairs every tool
+// call whose result never arrived — a turn whose persistence failed partway,
+// or a run interrupted between the call and its result — with a synthetic
+// error result, since providers reject a bare tool call and would otherwise
+// make the session impossible to continue.
 
 use std::collections::HashSet;
 
@@ -15,12 +16,54 @@ use crate::types::{AgentMessage, ContentBlock, StopReason};
 /// result never made it into the transcript.
 const NO_RESULT_TEXT: &str = "No result provided";
 
+/// Project harness roles onto wire roles, then repair the tool flow.
+///
+/// The order matters: a projected `Custom` message is a user message, and a
+/// user message closes an open tool turn, so converting first is what makes a
+/// custom message between a tool call and its result end that turn.
+pub fn prepare_for_wire(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    repair_tool_flow(&convert_to_llm(messages))
+}
+
+/// Project harness-only message roles onto the wire roles.
+///
+/// A `Custom` message carries content the model is meant to read — a
+/// harness-injected note, a resource digest — and reaches the provider as a
+/// user message, so the roles a shape translator must handle reduce to
+/// user/assistant/toolResult. Its blocks carry over untouched, images
+/// included.
+///
+/// Summary carriers are already user messages by the time they are here: the
+/// session projects a compaction or branch-summary entry into a tagged user
+/// message when it rebuilds the transcript, so this pass leaves them alone
+/// rather than wrapping them twice.
+pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    messages
+        .iter()
+        .map(|msg| match msg {
+            AgentMessage::Custom {
+                content, timestamp, ..
+            } => AgentMessage::User {
+                content: content.clone(),
+                timestamp: *timestamp,
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// Pair every unresolved tool call with a synthetic error result.
 ///
 /// A call counts as resolved when a later tool result names its id;
 /// otherwise a result reading "No result provided" is inserted where the
 /// call's turn ends — before the next assistant or user message, or at the
 /// end of the transcript. Clean transcripts pass through unchanged.
+///
+/// On the wire path `convert_to_llm` runs first, so a `Custom` arrives here
+/// already a user message and closes an open tool turn. Compaction reasons
+/// about unconverted transcripts, where a `Custom` sits mid tool chain
+/// without closing it — the cut analysis in `find_safe_cut` depends on that
+/// shape being reachable.
 pub fn repair_tool_flow(messages: &[AgentMessage]) -> Vec<AgentMessage> {
     let mut result = Vec::with_capacity(messages.len());
     // Tool calls of the latest assistant turn, awaiting their results.
@@ -264,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_messages_do_not_close_a_tool_turn() {
+    fn unconverted_custom_messages_do_not_close_a_tool_turn() {
         let messages = vec![
             assistant(vec![tool_use("c1", "read")]),
             AgentMessage::Custom {
@@ -279,8 +322,122 @@ mod tests {
         let repaired = repair_tool_flow(&messages);
         // The synthetic result lands before the user message, after the
         // custom one — the custom message itself does not end the tool turn.
+        // Compaction's cut analysis depends on this shape being reachable.
         assert_eq!(repaired.len(), 4);
         synthetic_at(&repaired, 2);
+    }
+
+    #[test]
+    fn converted_custom_message_closes_the_tool_turn() {
+        // On the wire path the custom message is a user message by the time
+        // repair runs, so it ends the turn and the synthetic result precedes
+        // it rather than following it.
+        let messages = vec![
+            assistant(vec![tool_use("c1", "read")]),
+            AgentMessage::Custom {
+                custom_type: "note".into(),
+                content: vec![],
+                display: false,
+                details: None,
+                timestamp: chrono::Utc::now(),
+            },
+            AgentMessage::user("next"),
+        ];
+        let prepared = prepare_for_wire(&messages);
+        assert_eq!(prepared.len(), 4);
+        synthetic_at(&prepared, 1);
+    }
+
+    #[test]
+    fn custom_message_becomes_a_user_message() {
+        let messages = vec![AgentMessage::Custom {
+            custom_type: "note".into(),
+            content: vec![ContentBlock::Text {
+                text: "remember this".into(),
+                signature: None,
+            }],
+            display: false,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let converted = convert_to_llm(&messages);
+        match &converted[0] {
+            AgentMessage::User { content, .. } => assert!(matches!(
+                &content[0],
+                ContentBlock::Text { text, .. } if text == "remember this"
+            )),
+            other => panic!("custom message must project onto a user message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_message_images_survive_conversion() {
+        let messages = vec![AgentMessage::Custom {
+            custom_type: "screenshot".into(),
+            content: vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                    signature: None,
+                },
+                ContentBlock::Image {
+                    data: "aGk=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ],
+            display: false,
+            details: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let converted = convert_to_llm(&messages);
+        match &converted[0] {
+            AgentMessage::User { content, .. } => {
+                assert_eq!(content.len(), 2);
+                assert!(matches!(
+                    &content[1],
+                    ContentBlock::Image { data, mime_type }
+                        if data == "aGk=" && mime_type == "image/png"
+                ));
+            }
+            other => panic!("expected a user message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_tagged_summary_carriers_are_not_wrapped_twice() {
+        // The session projects compaction and branch summaries into tagged
+        // user messages when it rebuilds the transcript; conversion leaves
+        // them byte-identical rather than re-wrapping them.
+        let now = chrono::Utc::now();
+        let messages = vec![
+            crate::session::compaction_summary_message("history", now),
+            crate::session::branch_summary_message("branch", now),
+        ];
+        let converted = convert_to_llm(&messages);
+        assert_eq!(
+            serde_json::to_value(&converted).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn clean_transcripts_pass_through_wire_preparation_unchanged() {
+        // The prefix-caching invariant: a transcript of only wire roles is
+        // byte-identical before and after preparation, so cross-turn request
+        // prefixes do not shift.
+        let messages = vec![
+            AgentMessage::user("q"),
+            assistant(vec![tool_use("c1", "read")]),
+            tool_result("c1"),
+            assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+                signature: None,
+            }]),
+        ];
+        let prepared = prepare_for_wire(&messages);
+        assert_eq!(
+            serde_json::to_value(&prepared).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
     }
 
     #[test]
