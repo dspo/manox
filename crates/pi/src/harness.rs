@@ -66,31 +66,51 @@ impl Default for RetrySettings {
     }
 }
 
+/// Which model call a retry lifecycle belongs to.
+///
+/// Retries are scheduled from three unrelated places, and an observer that
+/// cannot tell them apart cannot report or act on them differently — a failing
+/// turn and a failing summarization call warrant different responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOperation {
+    /// The agent turn itself.
+    Turn,
+    /// A compaction's summarization call.
+    Compaction,
+    /// A branch summary's summarization call.
+    BranchSummary,
+}
+
 /// A retry lifecycle event, mirroring the TS `auto_retry_start` /
 /// `auto_retry_end` session events.
 #[derive(Debug, Clone)]
 pub enum RetryEvent {
     /// A retry was scheduled: attempt `attempt` (1-indexed) retries the
-    /// failed turn after `delay`, up to `max_attempts`.
+    /// failed call after `delay`, up to `max_attempts`.
     Start {
+        operation: RetryOperation,
         attempt: u32,
         max_attempts: u32,
         delay: std::time::Duration,
         error_message: String,
     },
-    /// The retry lifecycle ended: `success` when a retry turn completed,
-    /// otherwise the failure that exhausted the budget (or a cancellation)
-    /// as `final_error`.
+    /// The scheduled backoff elapsed and the attempt is starting. A cancelled
+    /// backoff goes straight from `Start` to `End` without this.
+    AttemptStart {
+        operation: RetryOperation,
+        attempt: u32,
+    },
+    /// The retry lifecycle ended: `success` when a retry completed, otherwise
+    /// the failure that exhausted the budget (or a cancellation) as
+    /// `final_error`.
     End {
+        operation: RetryOperation,
         success: bool,
         attempt: u32,
         final_error: Option<String>,
     },
 }
 
-/// Whether a summarization error is transient and worth retrying (TS
-/// `isRetryableAssistantError`): retryable HTTP statuses and transport
-/// failures; auth, quota/billing, and invalid requests are not.
 /// Whether a summarization error is transient and worth retrying (TS
 /// `isRetryableAssistantError`): retryable HTTP statuses and transport
 /// failures; auth, quota/billing, and invalid requests are not. A retryable
@@ -180,7 +200,12 @@ struct HarnessControl {
     message_entry_ids: std::sync::Mutex<Vec<Option<String>>>,
     /// Harness-level event listeners (queue updates, settled, mutations).
     /// Shared so the decoupled handle can emit without holding `&mut self`.
-    harness_listeners: std::sync::Mutex<Vec<HarnessListener>>,
+    harness_listeners: std::sync::Mutex<Vec<(u64, HarnessListener)>>,
+    /// Source of listener ids, so a subscription can identify its own entry.
+    next_harness_listener_id: std::sync::atomic::AtomicU64,
+    /// Whether the mid-turn boundary drained any mutation since the last save
+    /// point, so that save point reports the whole boundary's work.
+    flushed_any_mutation: std::sync::atomic::AtomicBool,
     /// Whether shutdown was requested; all structured operations are refused
     /// while set.
     shutdown: std::sync::atomic::AtomicBool,
@@ -220,10 +245,36 @@ pub enum HarnessEvent {
     },
     /// The mounted resources changed.
     ResourcesUpdate,
+    /// Session writes are flushed: everything up to this point is durable, so
+    /// a consumer tracking recoverable state can mark a checkpoint.
+    SavePoint { had_pending_mutations: bool },
+    /// A run was aborted, carrying the queued messages that were discarded so
+    /// a consumer can put the user's unsent input back where it came from.
+    Abort {
+        cleared_steer: Vec<AgentMessage>,
+        cleared_follow_up: Vec<AgentMessage>,
+    },
 }
 
 /// A harness-level event listener (sync, fire-and-forget).
 pub type HarnessListener = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
+
+/// A harness event subscription. Dropping it unsubscribes, so a listener
+/// cannot outlive the consumer that registered it.
+pub struct HarnessSubscription {
+    id: u64,
+    control: Arc<HarnessControl>,
+}
+
+impl Drop for HarnessSubscription {
+    fn drop(&mut self) {
+        self.control
+            .harness_listeners
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != self.id);
+    }
+}
 
 /// Sets the harness's active count for the duration of an operation and
 /// decrements it on drop, so a shared handle's `wait_for_idle` observes the
@@ -249,7 +300,7 @@ impl Drop for ActiveGuard {
 impl HarnessControl {
     fn emit_harness(&self, event: HarnessEvent) {
         let listeners = self.harness_listeners.lock().unwrap();
-        for listener in listeners.iter() {
+        for (_, listener) in listeners.iter() {
             listener(event.clone());
         }
     }
@@ -297,12 +348,19 @@ impl HarnessHandle {
 
     /// Abort the agent run and cancel any in-flight retry backoff, clearing
     /// every queue (TS abort). Returns whether a run or backoff was active.
+    ///
+    /// The discarded queue contents ride on the emitted
+    /// [`HarnessEvent::Abort`], so undelivered user input is recoverable.
     pub fn abort(&self) -> bool {
         self.run.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
         self.control.operation_cancel.lock().unwrap().cancel();
-        self.run.clear_queues();
+        let (cleared_steer, cleared_follow_up) = self.run.clear_queues();
         self.control.next_turn_queue.lock().unwrap().clear();
+        self.control.emit_harness(HarnessEvent::Abort {
+            cleared_steer,
+            cleared_follow_up,
+        });
         true
     }
 
@@ -395,9 +453,13 @@ impl HarnessHandle {
         self.run.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
         self.control.operation_cancel.lock().unwrap().cancel();
-        self.run.clear_queues();
+        let (cleared_steer, cleared_follow_up) = self.run.clear_queues();
         self.control.next_turn_queue.lock().unwrap().clear();
         self.control.pending_mutations.lock().unwrap().clear();
+        self.control.emit_harness(HarnessEvent::Abort {
+            cleared_steer,
+            cleared_follow_up,
+        });
     }
 
     /// Queue a user message for the next prompt batch — the TS mid-run
@@ -874,6 +936,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             flushed_messages: std::sync::Mutex::new(Vec::new()),
             next_turn_queue: std::sync::Mutex::new(Vec::new()),
             harness_listeners: std::sync::Mutex::new(Vec::new()),
+            next_harness_listener_id: std::sync::atomic::AtomicU64::new(0),
+            flushed_any_mutation: std::sync::atomic::AtomicBool::new(false),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             operation_cancel: std::sync::Mutex::new(CancellationToken::new()),
             fixed_api,
@@ -1312,12 +1376,21 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Subscribe to harness-level events (queue updates, settled, runtime
     /// mutations). Listeners are sync callbacks fired in registration order
     /// at the moment the state changes.
-    pub fn subscribe_harness(&mut self, listener: HarnessListener) {
+    /// Delivery stops when the returned subscription is dropped.
+    pub fn subscribe_harness(&mut self, listener: HarnessListener) -> HarnessSubscription {
+        let id = self
+            .control
+            .next_harness_listener_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.control
             .harness_listeners
             .lock()
             .unwrap()
-            .push(listener);
+            .push((id, listener));
+        HarnessSubscription {
+            id,
+            control: Arc::clone(&self.control),
+        }
     }
 
     /// Fire a harness event to every registered listener.
@@ -1592,6 +1665,23 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         for message in self.control.flushed_messages.lock().unwrap().drain(..) {
             self.agent.append_to_transcript(message);
         }
+        let had_pending_mutations = !self.control.pending_mutations.lock().unwrap().is_empty()
+            || self
+                .control
+                .flushed_any_mutation
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+        let result = self.flush_pending_mutations_inner().await;
+        // Reached whether or not the queue drained cleanly: the save point
+        // reports what is durable, and a partial flush still advanced that.
+        self.control.emit_harness(HarnessEvent::SavePoint {
+            had_pending_mutations,
+        });
+        result
+    }
+
+    /// Drain the mutation queue, popping each entry only after its append
+    /// succeeds so a failure leaves the rest queued for the next flush.
+    async fn flush_pending_mutations_inner(&mut self) -> Result<(), anyhow::Error> {
         loop {
             let next = self
                 .control
@@ -1863,6 +1953,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 let attempt = self.retry_attempt;
                 self.retry_attempt = 0;
                 self.emit_retry(RetryEvent::End {
+                    operation: RetryOperation::Turn,
                     success: true,
                     attempt,
                     final_error: None,
@@ -1920,6 +2011,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 let attempt = self.retry_attempt;
                 self.retry_attempt = 0;
                 self.emit_retry(RetryEvent::End {
+                    operation: RetryOperation::Turn,
                     success: false,
                     attempt,
                     final_error: error_message.clone(),
@@ -2006,6 +2098,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         *self.control.retry_cancel.lock().unwrap() = cancel.clone();
         self.phase = AgentHarnessPhase::Retry;
         self.emit_retry(RetryEvent::Start {
+            operation: RetryOperation::Turn,
             attempt: self.retry_attempt,
             max_attempts: settings.max_retries,
             delay,
@@ -2026,10 +2119,17 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             _ = tokio::time::sleep(delay) => true,
         };
         self.phase = AgentHarnessPhase::Idle;
+        if slept {
+            self.emit_retry(RetryEvent::AttemptStart {
+                operation: RetryOperation::Turn,
+                attempt: self.retry_attempt,
+            });
+        }
         if !slept {
             let attempt = self.retry_attempt;
             self.retry_attempt = 0;
             self.emit_retry(RetryEvent::End {
+                operation: RetryOperation::Turn,
                 success: false,
                 attempt,
                 final_error: Some("Retry cancelled".into()),
@@ -2374,6 +2474,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                         // lifecycle as a success.
                         if started {
                             self.emit_retry(RetryEvent::End {
+                                operation: RetryOperation::BranchSummary,
                                 success: true,
                                 attempt,
                                 final_error: None,
@@ -2397,6 +2498,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                             break Err(e);
                         }
                         self.emit_retry(RetryEvent::Start {
+                            operation: RetryOperation::BranchSummary,
                             attempt,
                             max_attempts: retry.max_retries,
                             delay,
@@ -2407,12 +2509,19 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                             _ = tokio::time::sleep(delay) => false,
                             _ = signal.cancelled() => true,
                         };
+                        if !cancelled {
+                            self.emit_retry(RetryEvent::AttemptStart {
+                                operation: RetryOperation::BranchSummary,
+                                attempt,
+                            });
+                        }
                         if cancelled {
                             // TS: an aborted summarization cancels the
                             // navigation — a result, not an error, and no
                             // cursor move or entry append.
                             if started {
                                 self.emit_retry(RetryEvent::End {
+                                    operation: RetryOperation::BranchSummary,
                                     success: false,
                                     attempt,
                                     final_error: Some("branch summary cancelled".into()),
@@ -2436,6 +2545,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 Err(e) => {
                     if started {
                         self.emit_retry(RetryEvent::End {
+                            operation: RetryOperation::BranchSummary,
                             success: false,
                             attempt,
                             final_error: Some(e.to_string()),
@@ -3324,6 +3434,11 @@ fn build_loop_hooks<S: SessionStorage + 'static>(
                     }
                 }
                 runtime.pending_mutations.lock().unwrap().remove(0);
+                // The save point at the end of the run reports the whole
+                // boundary's work, including what this mid-turn flush drained.
+                runtime
+                    .flushed_any_mutation
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             let snapshot = runtime.turn_runtime.lock().unwrap();
             let update = crate::types::TurnUpdate {
@@ -4901,19 +5016,29 @@ pub(crate) mod tests {
         harness.prompt("first").await.unwrap();
         harness.prompt("second").await.unwrap();
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events.len(), 3, "{events:?}");
         assert!(matches!(
             &events[0],
             RetryEvent::Start {
+                operation: RetryOperation::Turn,
                 attempt: 1,
                 max_attempts: 3,
                 error_message,
                 ..
             } if error_message.contains("overloaded")
         ));
+        // The backoff elapsed, so the attempt announced itself before running.
         assert!(matches!(
             &events[1],
+            RetryEvent::AttemptStart {
+                operation: RetryOperation::Turn,
+                attempt: 1,
+            }
+        ));
+        assert!(matches!(
+            &events[2],
             RetryEvent::End {
+                operation: RetryOperation::Turn,
                 success: true,
                 attempt: 1,
                 final_error: None,
@@ -8421,7 +8546,7 @@ pub(crate) mod tests {
             test_model(),
             Arc::new(TestStreamFn),
         );
-        harness.subscribe_harness(Arc::new(move |e| {
+        let _sub = harness.subscribe_harness(Arc::new(move |e| {
             events_slot.lock().unwrap().push(e);
         }));
         harness.next_turn("queued", Vec::new());
@@ -8456,6 +8581,125 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("shut down"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn abort_reports_the_queued_messages_it_discarded() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slot = Arc::clone(&events);
+        let _sub = harness.subscribe_harness(Arc::new(move |e| slot.lock().unwrap().push(e)));
+
+        let handle = harness.handle();
+        handle.steer(AgentMessage::user("steer one"));
+        handle.steer(AgentMessage::user("steer two"));
+        handle.follow_up(AgentMessage::user("follow one"));
+        handle.abort();
+
+        let events = events.lock().unwrap();
+        let aborted = events
+            .iter()
+            .find_map(|e| match e {
+                HarnessEvent::Abort {
+                    cleared_steer,
+                    cleared_follow_up,
+                } => Some((cleared_steer, cleared_follow_up)),
+                _ => None,
+            })
+            .expect("abort emits its cleared queues");
+        // Every undelivered message is handed back, so a consumer can restore
+        // the user's input rather than silently losing it.
+        assert_eq!(aborted.0.len(), 2, "{:?}", aborted.0);
+        assert_eq!(aborted.1.len(), 1, "{:?}", aborted.1);
+        assert!(!harness.agent().has_queued_messages(), "queues emptied");
+    }
+
+    #[tokio::test]
+    async fn save_point_reports_whether_mutations_were_pending() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slot = Arc::clone(&events);
+        let _sub = harness.subscribe_harness(Arc::new(move |e| slot.lock().unwrap().push(e)));
+
+        harness.prompt("clean turn").await.unwrap();
+        let clean: Vec<bool> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::SavePoint {
+                    had_pending_mutations,
+                } => Some(*had_pending_mutations),
+                _ => None,
+            })
+            .collect();
+        assert!(!clean.is_empty(), "a settled turn reaches a save point");
+        assert!(
+            clean.iter().all(|p| !p),
+            "nothing was queued, so nothing was pending: {clean:?}"
+        );
+
+        // A mutation queued mid-run is pending at the next boundary.
+        events.lock().unwrap().clear();
+        let handle = harness.handle();
+        handle.append_message(AgentMessage::user("queued aside"));
+        harness.prompt("second turn").await.unwrap();
+        let with_pending: Vec<bool> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::SavePoint {
+                    had_pending_mutations,
+                } => Some(*had_pending_mutations),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            with_pending.iter().any(|p| *p),
+            "the queued mutation is reported as pending: {with_pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_harness_subscription_stops_delivery() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slot = Arc::clone(&events);
+        let sub = harness.subscribe_harness(Arc::new(move |e| slot.lock().unwrap().push(e)));
+
+        harness.next_turn("first", Vec::new());
+        let delivered = events.lock().unwrap().len();
+        assert!(delivered > 0, "the live subscription receives events");
+
+        drop(sub);
+        harness.next_turn("second", Vec::new());
+        assert_eq!(
+            events.lock().unwrap().len(),
+            delivered,
+            "a dropped subscription receives nothing further"
+        );
     }
 
     /// Shutdown drops queued (unpersisted) mutations: a mid-run model

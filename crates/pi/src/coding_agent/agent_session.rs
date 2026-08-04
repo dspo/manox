@@ -661,9 +661,13 @@ impl AgentSession {
         self.harness.follow_up_mode()
     }
 
-    /// Subscribe to harness-level events.
-    pub fn subscribe_harness(&mut self, listener: crate::harness::HarnessListener) {
-        self.harness.subscribe_harness(listener);
+    /// Subscribe to harness-level events. Delivery stops when the returned
+    /// subscription is dropped.
+    pub fn subscribe_harness(
+        &mut self,
+        listener: crate::harness::HarnessListener,
+    ) -> crate::harness::HarnessSubscription {
+        self.harness.subscribe_harness(listener)
     }
 
     /// Configure the compaction policy.
