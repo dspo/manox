@@ -283,8 +283,28 @@ pub trait SessionStorage: Send + Sync {
     /// new leaf.
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error>;
 
-    /// Get all entries, optionally filtered.
-    async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
+    /// Get a window of entries in append order. See [`SessionEntryCursor`].
+    async fn get_entries(
+        &self,
+        cursor: SessionEntryCursor,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
+
+    /// Every entry of one type, in append order.
+    async fn find_entries(
+        &self,
+        entry_type: EntryType,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error>;
+
+    /// The label attached to an entry. Later labels supersede earlier ones for
+    /// the same target, and a blank label reads as no label — that is how a
+    /// label is cleared.
+    async fn get_label(&self, id: &str) -> Result<Option<String>, anyhow::Error>;
+
+    /// The session's name: the latest one set, blank reading as unnamed.
+    async fn get_session_name(&self) -> Result<Option<String>, anyhow::Error>;
+
+    /// What the session cost. See [`SessionStats`].
+    async fn get_session_stats(&self) -> Result<SessionStats, anyhow::Error>;
 
     /// Walk from the leaf to the root, returning the full path in
     /// chronological order. Compaction boundaries do not stop the walk —
@@ -626,48 +646,63 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
-    /// Coarse session statistics over the whole entry list: entry count,
-    /// message count, branch count, and the latest activity timestamp.
+    /// What this session cost. See [`SessionStats`].
     pub async fn stats(&self) -> Result<SessionStats, anyhow::Error> {
-        let entries = self.storage.get_entries().await?;
-        let messages = entries
-            .iter()
-            .filter(|e| matches!(e, SessionTreeEntry::Message { .. }))
-            .count();
-        let branches = entries
-            .iter()
-            .filter(|e| matches!(e, SessionTreeEntry::Leaf { .. }))
-            .count();
-        let last_activity = entries.iter().map(|e| e.timestamp()).max();
-        Ok(SessionStats {
-            entries: entries.len(),
-            messages,
-            branches: branches + 1,
-            last_activity,
-        })
+        self.storage.get_session_stats().await
     }
 
-    /// A page of entries from the full list, newest first, with a cursor flag
-    /// for callers that page onward.
-    pub async fn paginate(
+    /// The label attached to an entry, if any.
+    pub async fn label(&self, id: &str) -> Result<Option<String>, anyhow::Error> {
+        self.storage.get_label(id).await
+    }
+
+    /// The session's name, if one was set.
+    pub async fn name(&self) -> Result<Option<String>, anyhow::Error> {
+        self.storage.get_session_name().await
+    }
+
+    /// Every entry of one type, in append order.
+    pub async fn find_entries(
         &self,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(Vec<SessionTreeEntry>, bool), anyhow::Error> {
-        let entries = self.storage.get_entries().await?;
-        let total = entries.len();
-        let page = entries.into_iter().rev().skip(offset).take(limit).collect();
-        Ok((page, offset + limit < total))
+        entry_type: EntryType,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        self.storage.find_entries(entry_type).await
+    }
+
+    /// A window of entries in append order. See [`SessionEntryCursor`].
+    pub async fn page(
+        &self,
+        cursor: SessionEntryCursor,
+    ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+        self.storage.get_entries(cursor).await
     }
 }
 
-/// Coarse session statistics, computed over the whole entry list.
+/// A window into the append-ordered entry list: everything after
+/// `after_entry_seq`, capped at `limit`.
+///
+/// The default reads the whole list from the start. A cursor past the end
+/// yields no entries rather than an error, so a caller polling for new entries
+/// can hold a cursor across appends without special-casing the boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionEntryCursor {
+    pub after_entry_seq: usize,
+    pub limit: Option<usize>,
+}
+
+/// What a session cost, aggregated over every entry that carries usage.
+///
+/// `message_count` counts message entries whatever their role; the token and
+/// cost figures come only from entries reporting a complete usage block —
+/// assistant messages plus the compaction and branch-summary calls, which are
+/// model calls the session paid for too.
 #[derive(Debug, Clone, Default)]
 pub struct SessionStats {
-    pub entries: usize,
-    pub messages: usize,
-    pub branches: usize,
-    pub last_activity: Option<DateTime<Utc>>,
+    pub message_count: usize,
+    pub cached_tokens: u64,
+    pub uncached_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_total: f64,
 }
 
 /// The projected session state an agent is restored from.
@@ -1400,8 +1435,9 @@ impl<S: SessionStorage> Session<S> {
     }
 }
 
-/// The entry-type tag of an entry.
-fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
+/// The entry-type tag of an entry. Sole discriminator, shared by the branch
+/// queries and the type-filtered entry scan.
+pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
     match entry {
         SessionTreeEntry::Message { .. } => EntryType::Message,
         SessionTreeEntry::Compaction { .. } => EntryType::Compaction,

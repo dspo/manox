@@ -1495,7 +1495,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         // The second user message: forking before it keeps the first turn.
@@ -1547,7 +1547,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let first_assistant = entries
@@ -1591,7 +1591,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let assistant = entries
@@ -1872,7 +1872,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let first_user = entries
@@ -2269,7 +2269,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let first_user = entries
@@ -2519,7 +2519,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let levels: Vec<String> = entries
@@ -2633,7 +2633,7 @@ mod tests {
             s.harness
                 .session()
                 .storage()
-                .get_entries()
+                .get_entries(Default::default())
                 .await
                 .unwrap()
                 .iter()
@@ -2677,7 +2677,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let leaf = entries
@@ -2915,7 +2915,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -2935,7 +2935,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap()
             .len();
@@ -3080,7 +3080,7 @@ mod tests {
             .harness
             .session()
             .storage()
-            .get_entries()
+            .get_entries(Default::default())
             .await
             .unwrap();
         let leaf = entries

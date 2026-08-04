@@ -109,7 +109,7 @@ impl SessionRepository {
             },
         )
         .await?;
-        for entry in source_storage.get_entries().await? {
+        for entry in source_storage.get_entries(Default::default()).await? {
             storage.append_entry(&entry).await?;
         }
         Ok(Session::new(storage))
@@ -154,7 +154,7 @@ impl SessionRepository {
             String,
             (String, chrono::DateTime<chrono::Utc>),
         > = std::collections::HashMap::new();
-        for e in source_storage.get_entries().await?.iter() {
+        for e in source_storage.get_entries(Default::default()).await?.iter() {
             if let SessionTreeEntry::Label {
                 target_id,
                 label,
@@ -233,7 +233,7 @@ async fn session_files(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
 /// yields `None` and is skipped by `list`.
 async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
     let storage = JsonlSessionStorage::open(path).await?;
-    let entries = storage.get_entries().await?;
+    let entries = storage.get_entries(Default::default()).await?;
     let mut name: Option<String> = None;
     let mut message_count = 0usize;
     let mut first_message = String::new();
@@ -452,7 +452,11 @@ mod tests {
             .unwrap();
         session.append_message(assistant("a2")).await.unwrap();
         // A label on the first reply and a second branch exploring elsewhere.
-        let entries = session.storage().get_entries().await.unwrap();
+        let entries = session
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let a1_id = entries
             .iter()
             .find_map(|e| match e {
@@ -474,7 +478,11 @@ mod tests {
             .create_branched_session(&repo.list().await.unwrap()[0].path, &a1_id)
             .await
             .unwrap();
-        let fork_entries = fork.storage().get_entries().await.unwrap();
+        let fork_entries = fork
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let fork_ids: Vec<&str> = fork_entries.iter().map(|e| e.id()).collect();
         assert_eq!(fork_ids.len(), 3, "u1 + a1 + rebuilt label");
         // The retained path is linear: a1's parent is u1, not the stripped
@@ -532,7 +540,11 @@ mod tests {
             .await
             .unwrap();
         session.append_message(assistant("a1")).await.unwrap();
-        let entries = session.storage().get_entries().await.unwrap();
+        let entries = session
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let a1_id = entries
             .iter()
             .find_map(|e| match e {
@@ -559,7 +571,11 @@ mod tests {
             .create_branched_session(&repo.list().await.unwrap()[0].path, &a1_id)
             .await
             .unwrap();
-        let fork_entries = fork.storage().get_entries().await.unwrap();
+        let fork_entries = fork
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         assert!(
             !fork_entries
                 .iter()
@@ -574,7 +590,11 @@ mod tests {
             .await
             .unwrap();
         session2.append_message(assistant("a1")).await.unwrap();
-        let entries = session2.storage().get_entries().await.unwrap();
+        let entries = session2
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let a1_id = entries
             .iter()
             .find_map(|e| match e {
@@ -598,7 +618,11 @@ mod tests {
             .create_branched_session(session2.storage().path(), &a1_id)
             .await
             .unwrap();
-        let fork_entries = fork.storage().get_entries().await.unwrap();
+        let fork_entries = fork
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
         let labels: Vec<&str> = fork_entries
             .iter()
             .filter_map(|e| match e {

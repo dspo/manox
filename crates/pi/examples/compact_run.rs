@@ -128,7 +128,11 @@ async fn main() {
         .await
         .expect("reopen");
     let mut found = None;
-    for entry in storage.get_entries().await.expect("entries") {
+    for entry in storage
+        .get_entries(Default::default())
+        .await
+        .expect("entries")
+    {
         if let SessionTreeEntry::Compaction {
             first_kept_entry_id,
             tokens_before,

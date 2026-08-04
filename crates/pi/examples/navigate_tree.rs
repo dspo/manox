@@ -117,7 +117,12 @@ async fn main() {
     );
 
     // Navigate back to the first turn's reply.
-    let entries = harness.session().storage().get_entries().await.unwrap();
+    let entries = harness
+        .session()
+        .storage()
+        .get_entries(Default::default())
+        .await
+        .unwrap();
     let first_reply = entries
         .iter()
         .find_map(|e| match e {
@@ -153,7 +158,7 @@ async fn main() {
     // Reopen: the branch (leaf entry) and the branch summary survive.
     let reopened = JsonlSessionStorage::open(&path).await.expect("reopen");
     let storage = reopened;
-    let entries = storage.get_entries().await.unwrap();
+    let entries = storage.get_entries(Default::default()).await.unwrap();
     let has_leaf = entries
         .iter()
         .any(|e| matches!(e, SessionTreeEntry::Leaf { .. }));
