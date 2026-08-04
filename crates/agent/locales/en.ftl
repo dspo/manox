@@ -448,6 +448,7 @@ turn-navigator-copied = Message copied to clipboard.
 slash-danger-desc = Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Strongly hint to explore deeply and produce a <proposed_plan> block; bare `/plan` nudges planning, `/plan <prompt>` plans against your prompt
 slash-exit-desc = Archive the current thread and start a fresh one
+slash-new-desc = Archive the current thread and start a fresh one that keeps the project, approval mode, and model
 slash-goal-desc = Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
 workspace-chip-goal-active = Goal active
