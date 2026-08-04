@@ -2266,16 +2266,58 @@ impl Workspace {
     /// Archive the active thread and navigate to a fresh empty one. Shared
     /// by the `/exit` slash command and the `cmd-;` keybinding.
     pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // No-op while a turn is running: `attach_thread` would park the thread
-        // in the background and clear `pending_auths`, stranding tool approvals.
-        if self.thread.read(cx).is_running() {
+        if !self.archive_active_thread_if_idle(cx) {
             return;
+        }
+        self.start_new_thread(None, window, cx);
+    }
+
+    /// Archive the active thread if it is idle; `false` when a turn is
+    /// running (attaching would park the thread and clear `pending_auths`,
+    /// stranding tool approvals). Marks the thread archived and persists via
+    /// the store, which refreshes the sidebar list.
+    fn archive_active_thread_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.thread.read(cx).is_running() {
+            return false;
         }
         let id = self.thread.read(cx).id.0.clone();
         self.thread.update(cx, |t, cx| t.set_archived(true, cx));
         let store = agent::thread_store_global();
         store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
-        self.start_new_thread(None, window, cx);
+        true
+    }
+
+    /// Archive the active thread and open a fresh one that inherits the
+    /// outgoing thread's project, model, approval mode, and reasoning effort —
+    /// `/new` starts a clean conversation without dropping the working
+    /// context. No-op while a turn is running (see
+    /// `archive_active_thread_if_idle`).
+    pub(crate) fn archive_current_thread_inheriting(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.archive_active_thread_if_idle(cx) {
+            return;
+        }
+        let old = self.thread.clone();
+        let cwd = old.read(cx).cwd().to_path_buf();
+        let project = old.read(cx).project().cloned();
+        let model = old.read(cx).model().cloned();
+        let effort = old.read(cx).reasoning_effort();
+        let approval = old.read(cx).approval_mode();
+        let new = Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx);
+        new.update(cx, |t, cx| {
+            if let Some(dir) = project {
+                t.set_project(dir, cx);
+            }
+            if let Some(model) = model {
+                t.set_model(model, cx);
+            }
+            t.set_reasoning_effort(effort, cx);
+            t.set_approval_mode(approval, cx);
+        });
+        self.attach_thread(new, window, cx);
     }
 
     /// Park the active thread into the background (preserving its run + event

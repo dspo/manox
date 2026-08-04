@@ -14,8 +14,10 @@
 //! unsandboxed bash, see [`DangerCommand`]), `/plan` (enter/exit plan mode,
 //! see [`PlanCommand`]), `/goal` (set a completion condition, see
 //! [`GoalCommand`]), `/compact` (manual context compaction, see
-//! [`CompactCommand`]), and `/exit` (archive the current thread and start
-//! a fresh one, see [`ExitCommand`]). Markdown prompt-macros
+//! [`CompactCommand`]), `/exit` (archive the current thread and start
+//! a fresh one, see [`ExitCommand`]), and `/new` (archive the current
+//! thread and start a fresh one that keeps the project, approval mode,
+//! and model, see [`NewCommand`]). Markdown prompt-macros
 //! (`/gitwork:deliver`, etc.) are mirrored in at runtime via the
 //! [`MarkdownSlashCommand`] adapter, and plugin/user skills via the
 //! [`SkillSlashCommand`] adapter — so `/<plugin>:<skill>` is slash-invocable
@@ -129,6 +131,7 @@ pub fn init(_cx: &mut App) {
         Box::new(GoalCommand),
         Box::new(CompactCommand),
         Box::new(ExitCommand),
+        Box::new(NewCommand),
     ];
     // Names already claimed by built-ins and (below) markdown macros, so a
     // skill sharing one is skipped — keeps one popover row per name and routes
@@ -139,6 +142,7 @@ pub fn init(_cx: &mut App) {
         "goal".to_string(),
         "compact".to_string(),
         "exit".to_string(),
+        "new".to_string(),
     ]);
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -579,6 +583,30 @@ impl SlashCommand for ExitCommand {
     }
 }
 
+/// `/new` — archive the current thread and open a fresh one that inherits
+/// the outgoing thread's project, approval mode, and model: the conversation
+/// starts empty but keeps the working context.
+struct NewCommand;
+
+impl SlashCommand for NewCommand {
+    fn name(&self) -> &str {
+        "new"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-new-desc")
+    }
+    fn execute(
+        &self,
+        _args: &str,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.archive_current_thread_inheriting(window, cx);
+        SlashResult::Handled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +666,7 @@ mod tests {
         assert!(r.get("goal").is_some());
         assert!(r.get("compact").is_some());
         assert!(r.get("exit").is_some());
+        assert!(r.get("new").is_some());
         assert!(r.get("nope").is_none());
     }
 
@@ -679,6 +708,18 @@ mod tests {
         let p = parse("/exit").unwrap();
         assert_eq!(p.name, "exit");
         assert_eq!(p.args, "");
+    }
+
+    #[test]
+    fn parse_new_command() {
+        // `/new` is a bare command; trailing args are tolerated but ignored.
+        register_for_tests();
+        let p = parse("/new").unwrap();
+        assert_eq!(p.name, "new");
+        assert_eq!(p.args, "");
+        let p = parse("/new fresh start").unwrap();
+        assert_eq!(p.name, "new");
+        assert_eq!(p.args, "fresh start");
     }
 
     #[test]
@@ -762,6 +803,7 @@ mod tests {
             Box::new(GoalCommand),
             Box::new(CompactCommand),
             Box::new(ExitCommand),
+            Box::new(NewCommand),
         ]));
     }
 }

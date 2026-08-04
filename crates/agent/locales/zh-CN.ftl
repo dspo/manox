@@ -398,6 +398,7 @@ slash-plan-desc = 强烈提示深入探索并以 <proposed_plan> 块产出计划
 slash-goal-desc = 创建或管理持久目标（`/goal <目标>`、pause、resume、edit、clear）
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
 slash-exit-desc = 归档当前会话并开始一个新会话
+slash-new-desc = 归档当前会话并开始新会话，保留项目、驾驶模式与模型
 workspace-chip-goal-active = 目标进行中
 goal-popover-title = 目标
 goal-popover-objective = 目标内容
