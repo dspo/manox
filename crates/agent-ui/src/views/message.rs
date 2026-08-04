@@ -2643,7 +2643,13 @@ fn render_background_task(
         .border_1()
         .border_color(theme.border)
         .when(is_running, |s| {
-            s.child(BrailleSpinner::new().xsmall().color(icon_color))
+            // The card row centers its children; pin the status indicator to
+            // the title's first line, not the two-line column's middle.
+            s.child(
+                gpui::div()
+                    .self_flex_start()
+                    .child(BrailleSpinner::new().xsmall().color(icon_color)),
+            )
         })
         .when(!is_running, |s| {
             let icon: Icon = match bt.status {
@@ -2652,7 +2658,11 @@ fn render_background_task(
                 TaskStatus::Stopped | TaskStatus::SessionEnded => Icon::new(IconName::Minus),
                 _ => unreachable!(),
             };
-            s.child(icon.xsmall().text_color(icon_color))
+            s.child(
+                gpui::div()
+                    .self_flex_start()
+                    .child(icon.xsmall().text_color(icon_color)),
+            )
         })
         .child(
             // flex_1 + min_w_0 give the text divs a definite width so
