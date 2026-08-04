@@ -1128,7 +1128,11 @@ fn render_thread_item(
                             )
                         })
                         .when(item.pinned, |this| {
-                            this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
+                            this.child(
+                                Icon::new(IconName::Star)
+                                    .xsmall()
+                                    .text_color(theme.accent_foreground),
+                            )
                         })
                         .when(item.errored, |this| {
                             this.child(

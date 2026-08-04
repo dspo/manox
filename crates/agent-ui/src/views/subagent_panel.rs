@@ -47,7 +47,7 @@ pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElem
     match status {
         ToolCallStatus::PendingApproval | ToolCallStatus::Running => BrailleSpinner::new()
             .xsmall()
-            .color(theme.accent)
+            .color(theme.accent_foreground)
             .into_any_element(),
         ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()
             .path("icons/circle-check-big.svg")

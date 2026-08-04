@@ -764,7 +764,7 @@ fn render_user(
                 .rounded(theme.radius)
                 .bg(accent.opacity(0.15))
                 .text_xs()
-                .text_color(accent)
+                .text_color(theme.accent_foreground)
                 .child(i18n::t("message-steer-pending-badge")),
         )
     } else {
@@ -775,7 +775,7 @@ fn render_user(
                 .rounded(theme.radius)
                 .bg(accent.opacity(0.15))
                 .text_xs()
-                .text_color(accent)
+                .text_color(theme.accent_foreground)
                 .child(i18n::t("message-steered-badge"))
         })
     };
@@ -1815,7 +1815,7 @@ fn render_plan_review_card(
             ))
             .into_any_element();
     };
-    let accent = theme.accent;
+    let accent = theme.accent_foreground;
 
     let download_btn = Button::new(("plan-download", ix))
         .ghost()
@@ -2478,7 +2478,7 @@ fn agent_terminal_icon(status: ToolCallStatus) -> Icon {
 fn agent_status_indicator(status: ToolCallStatus, theme: &Theme) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let color = match status {
-        ToolCallStatus::Running | ToolCallStatus::PendingApproval => theme.accent,
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval => theme.accent_foreground,
         ToolCallStatus::Success | ToolCallStatus::Continued => theme.success,
         ToolCallStatus::Error | ToolCallStatus::Denied => theme.danger,
         ToolCallStatus::Cancelled => theme.muted_foreground,
@@ -2597,7 +2597,7 @@ fn render_background_task(
         TaskStatus::SessionEnded => i18n::t("background-task-status-session-ended"),
     };
     let icon_color = match bt.status {
-        TaskStatus::Running | TaskStatus::Stopping => theme.accent,
+        TaskStatus::Running | TaskStatus::Stopping => theme.accent_foreground,
         TaskStatus::Completed => theme.success,
         TaskStatus::Failed | TaskStatus::TimedOut => theme.danger,
         TaskStatus::Stopped | TaskStatus::SessionEnded => theme.muted_foreground,
