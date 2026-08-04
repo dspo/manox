@@ -1219,74 +1219,90 @@ impl ConversationState {
                     }
                 } else {
                     // Ordinary tool call: fold into the active activity
-                    // segment. A fresh segment opens when the previous one
-                    // went terminal (turn ended) or no segment exists yet —
-                    // so parallel tool calls in one model response AND tool
-                    // calls across the whole turn's tool-use loop aggregate
-                    // into one status line. The segment is seeded with the
-                    // turn's start time so the elapsed covers the whole turn.
-                    let turn_started_at = self.turn_started_at;
-                    let (cix, pushed) = match self.find_active_activity_segment(cx) {
-                        Some(i) => (i, false),
-                        None => {
-                            let i = self.items.len();
-                            self.items.push(cx.new(|_| {
-                                let mut container = ThinkingContainer::new();
-                                container.started_at = turn_started_at;
-                                MessageItem::new(
-                                    ConvItem::Thinking(container),
-                                    role.to_string(),
-                                    i,
-                                    weak,
-                                )
-                            }));
-                            (i, true)
-                        }
-                    };
-                    let id = id.clone();
-                    let name = name.clone();
-                    let title = title.clone();
-                    let status = *status;
-                    let entry_input = input.clone().unwrap_or(serde_json::Value::Null);
-                    self.items[cix].update(cx, |item, cx| {
-                        if let ConvItem::Thinking(t) = item.kind_mut() {
-                            if let Some(entry) = t.get_tool_entry_mut(&id) {
-                                entry.title = title;
-                                entry.name = name;
-                                entry.status = status;
-                                entry.input = entry_input;
-                                if matches!(
-                                    status,
-                                    ToolCallStatus::Success
-                                        | ToolCallStatus::Error
-                                        | ToolCallStatus::Denied
-                                ) && !entry.streaming
-                                {
-                                    entry.collapsed = !entry.user_toggled;
-                                }
-                            } else {
-                                t.entries.push(ActivityEntry::Tool(ToolCallItem {
-                                    id,
-                                    name,
-                                    title,
-                                    status,
-                                    output: String::new(),
-                                    is_error: false,
-                                    input: entry_input,
-                                    streaming: matches!(status, ToolCallStatus::Running),
-                                    collapsed: true,
-                                    user_toggled: false,
-                                    panel: None,
-                                }));
+                    // segment, unless a top-level card already owns this id —
+                    // an AutoPilot escalation anchor (`name` = AskUserQuestion)
+                    // absorbs the real tool's lifecycle in place (renaming to
+                    // the actual tool) instead of spawning a parallel segment.
+                    if let Some(ix) = self.find_tool(id, cx) {
+                        let name = name.clone();
+                        let title = title.clone();
+                        let status = *status;
+                        let input = input.clone().unwrap_or(serde_json::Value::Null);
+                        self.items[ix].update(cx, |item, cx| {
+                            if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                t.name = name;
+                                t.title = title;
+                                t.status = status;
+                                t.input = input;
+                                t.collapsed = !t.user_toggled;
                             }
-                            t.recompute_streaming();
-                        }
-                        cx.notify();
-                    });
-                    if pushed {
-                        ApplyOutcome::Appended
+                            cx.notify();
+                        });
+                        ApplyOutcome::Remeasure(ix)
                     } else {
-                        ApplyOutcome::Remeasure(cix)
+                        let turn_started_at = self.turn_started_at;
+                        let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                            Some(i) => (i, false),
+                            None => {
+                                let i = self.items.len();
+                                self.items.push(cx.new(|_| {
+                                    let mut container = ThinkingContainer::new();
+                                    container.started_at = turn_started_at;
+                                    MessageItem::new(
+                                        ConvItem::Thinking(container),
+                                        role.to_string(),
+                                        i,
+                                        weak,
+                                    )
+                                }));
+                                (i, true)
+                            }
+                        };
+                        let id = id.clone();
+                        let name = name.clone();
+                        let title = title.clone();
+                        let status = *status;
+                        let entry_input = input.clone().unwrap_or(serde_json::Value::Null);
+                        self.items[cix].update(cx, |item, cx| {
+                            if let ConvItem::Thinking(t) = item.kind_mut() {
+                                if let Some(entry) = t.get_tool_entry_mut(&id) {
+                                    entry.title = title;
+                                    entry.name = name;
+                                    entry.status = status;
+                                    entry.input = entry_input;
+                                    if matches!(
+                                        status,
+                                        ToolCallStatus::Success
+                                            | ToolCallStatus::Error
+                                            | ToolCallStatus::Denied
+                                    ) && !entry.streaming
+                                    {
+                                        entry.collapsed = !entry.user_toggled;
+                                    }
+                                } else {
+                                    t.entries.push(ActivityEntry::Tool(ToolCallItem {
+                                        id,
+                                        name,
+                                        title,
+                                        status,
+                                        output: String::new(),
+                                        is_error: false,
+                                        input: entry_input,
+                                        streaming: matches!(status, ToolCallStatus::Running),
+                                        collapsed: true,
+                                        user_toggled: false,
+                                        panel: None,
+                                    }));
+                                }
+                                t.recompute_streaming();
+                            }
+                            cx.notify();
+                        });
+                        if pushed {
+                            ApplyOutcome::Appended
+                        } else {
+                            ApplyOutcome::Remeasure(cix)
+                        }
                     }
                 }
             }

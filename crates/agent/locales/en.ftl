@@ -379,11 +379,7 @@ workspace-unknown-command = Unknown command: /{$name} (open the `/` menu to see 
 workspace-unknown-skill = Unknown skill: /{$name} (open the `/` menu to see installed skills)
 workspace-no-model = No model configured
 workspace-approval-title = Tool call approval
-workspace-approval-tool = Tool: {$name}
 workspace-queued = ({$count} more queued for approval)
-workspace-deny = Deny
-workspace-always-allow = Always allow
-workspace-allow-once = Allow once
 workspace-inbound-title = Built-in browser wants to act on Manox
 workspace-inbound-intent = Request: {$intent}
 workspace-inbound-note = This request is always confirmed, regardless of approval mode — a web page must never drive the agent unprompted.
@@ -410,7 +406,7 @@ workspace-mode-notice = { $mode ->
    *[danger] Danger: tool calls need no approval, bash runs outside the sandbox.
 }
 workspace-approval-autopilot-allowed = ✔ Auto-approved: {$tool}
-workspace-approval-autopilot-escalated = ✗ Denied: {$tool} — {$reason}
+workspace-approval-autopilot-escalated = ✗ Escalated for your review: {$tool} — {$reason}
 workspace-project-choose = Choose project
 workspace-project-new = New project
 workspace-project-blank = Create blank project

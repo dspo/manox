@@ -51,7 +51,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Overlays
 
-- [ApprovalOverlay](#approvaloverlay) · [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
+- [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
 
 ### EditorPane
 
@@ -462,7 +462,11 @@ Always-visible chip showing the thread's [CollaborationMode](#collaboration-mode
 
 ##### AskDrawer
 
-Replaces [Composer](#composer) when `pending_ask` is set.
+Replaces [Composer](#composer) when `pending_ask` is set. Every
+`ThreadEvent::ToolCallAuthorization` — interactive tools, bubbled sub-agent
+auth, and AutoPilot escalations (reviewer `Ask` verdicts awaiting a user
+verdict) — surfaces here as the question card; the payload's options carry
+the decision.
 
 #### AskDrawer
 
@@ -562,11 +566,6 @@ Trigger: [TitleBarGoalChip](#titlebargoalchip) or bare `/goal`. Shows the author
 
 Absolute-positioned over [Body](#body), with scrim.
 
-#### ApprovalOverlay
-
-Trigger: tool requires approval. Centered modal + scrim (`bg:foreground/0.6`): tool name, input preview, Deny / Allow Once / Always Allow buttons.
-
-> Source: `agent-ui/src/workspace.rs`
 
 #### PlanReviewCard
 
@@ -744,7 +743,7 @@ A right-pane tab (`RightTab::PlanPreview`, an equal citizen of the right tab bar
 
 #### InboundWriteOverlay
 
-A scrim + card modal mirroring the [ApprovalOverlay](#approvaloverlay), surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is mode-blind — a web page must never gain a write path because the agent runs in Danger — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound approval pipeline (`pending_auths` / `resolve_auth`). Stacked in `pending_inbounds` (LIFO); queued behind any open outbound approval overlay so only one modal shows at a time. Cleared on terminal `Stop` / `Error`.
+A scrim + card modal surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is mode-blind — a web page must never gain a write path because the agent runs in Danger — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound question-card pipeline (`pending_ask` / `resolve_auth`). Stacked in `pending_inbounds`.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -1067,7 +1066,7 @@ States of a [ToolCallCard](#toolcallcard).
 
 #### PendingApproval
 
-Waiting for user, triggers [ApprovalOverlay](#approvaloverlay).
+Waiting for user, surfaces as the [AskUserQuestion](#askuserquestion) card.
 
 #### Running
 

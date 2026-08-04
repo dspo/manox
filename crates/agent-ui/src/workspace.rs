@@ -123,17 +123,6 @@ struct SubagentSession {
     order: Vec<String>,
 }
 
-/// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
-///
-/// Only interactive tools (`AskUserQuestion`) and bubbled sub-agent auth
-/// reach the overlay now — the AutoPilot reviewer denies `Ask` verdicts
-/// inline rather than escalating to the user.
-struct PendingAuth {
-    id: String,
-    tool_name: String,
-    summary: String,
-}
-
 /// A completed `<proposed_plan>` block awaiting the user's three-way review
 /// verdict. Carries the plan text for the overlay body and (on an implement
 /// verdict) for re-injection as the implement turn's seed.
@@ -316,14 +305,9 @@ pub struct Workspace {
     /// In-memory only; never persisted so the user's drag state stays
     /// session-local.
     sidebar_width: Pixels,
-    /// Pending tool-call authorizations, keyed by their (possibly composite)
-    /// id. Multiple can be open at once when parallel sub-agents each bubble an
-    /// approval request — the overlay shows the most recent and queues the rest,
-    /// resolving them one at a time so no `oneshot` is stranded by overwrite.
-    pending_auths: Vec<PendingAuth>,
-    /// Pending inbound-write requests from built-in browser tabs. Stacked
-    /// like `pending_auths`; the overlay shows the most recent and queues the
-    /// rest. Each carries its own `Thread::respond_inbound` id.
+    /// Pending inbound-write requests from built-in browser tabs. Stacked;
+    /// the overlay shows the most recent and queues the rest. Each carries
+    /// its own `Thread::respond_inbound` id.
     pending_inbounds: Vec<PendingInbound>,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
@@ -631,7 +615,6 @@ impl Workspace {
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
-            pending_auths: Vec::new(),
             pending_inbounds: Vec::new(),
             pending_ask: None,
             ask_step: 0,
@@ -704,26 +687,14 @@ impl Workspace {
         let thread = self.thread.clone();
         cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
             match ev {
-                ThreadEvent::ToolCallAuthorization {
-                    id,
-                    tool_name,
-                    summary,
-                    input,
-                } => {
-                    if tool_name == agent::tools::ASK_USER_QUESTION {
-                        // The question card is the only surface for an
-                        // interactive tool — it never queues as a generic
-                        // approval entry.
-                        this.pending_ask = parse_pending_ask(id.clone(), input.clone());
-                        this.ask_step = 0;
-                        this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
-                    } else {
-                        this.pending_auths.push(PendingAuth {
-                            id: id.clone(),
-                            tool_name: tool_name.clone(),
-                            summary: summary.clone(),
-                        });
-                    }
+                ThreadEvent::ToolCallAuthorization { id, input, .. } => {
+                    // Every authorization — interactive tools, bubbled
+                    // sub-agent auth, AutoPilot escalations — surfaces as the
+                    // AskUserQuestion card; the question payload carries the
+                    // decision options.
+                    this.pending_ask = parse_pending_ask(id.clone(), input.clone());
+                    this.ask_step = 0;
+                    this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
                     this.context_rail.update(cx, |r, cx| {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
@@ -962,9 +933,9 @@ impl Workspace {
                 ThreadEvent::InboundAuthorization { id, intent, .. } => {
                     // A built-in browser tab requested an inbound write. This
                     // axis ignores `ApprovalMode` — always confirm, never let
-                    // a page drive the agent unprompted — so it is stacked
-                    // separately from `pending_auths` and resolved through
-                    // `Thread::respond_inbound`, not the outbound pipeline.
+                    // a page drive the agent unprompted — so it stacks in its
+                    // own queue and resolves through `Thread::respond_inbound`,
+                    // not the outbound question-card pipeline.
                     this.pending_inbounds.push(PendingInbound {
                         id: id.clone(),
                         intent: intent.clone(),
@@ -1724,7 +1695,7 @@ impl Workspace {
 
     fn blocking_overlay_active(&self) -> bool {
         self.pending_plan_review.is_some()
-            || !self.pending_auths.is_empty()
+            || self.pending_ask.is_some()
             || !self.pending_inbounds.is_empty()
             || self.blank_project_parent.is_some()
     }
@@ -2036,7 +2007,6 @@ impl Workspace {
         self.list_count = count;
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
-        self.pending_auths.clear();
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any.
         self.pending_plan_review = self.pending_plans.remove(&new_id);
@@ -2182,46 +2152,29 @@ impl Workspace {
         .detach();
     }
 
-    /// Re-surface any pending authorizations on the current thread that were
+    /// Re-surface any pending authorization on the current thread that was
     /// emitted while the thread was in the background (no subscription). Called
-    /// after switching threads so the overlay appears without requiring the
-    /// user to wait for the next event.
+    /// after switching threads so the question card appears without requiring
+    /// the user to wait for the next event.
     fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
         // Query the thread for any pending authorization metadata that was
         // stored when the auth event was originally emitted. If the thread was
         // parked waiting for user approval while in the background, re-surface
-        // the events so the overlay appears immediately upon switching back.
-        let entries: Vec<(String, String, String, serde_json::Value)> = self
+        // the events so the question card appears immediately upon switching
+        // back. Every authorization surfaces as the AskUserQuestion card.
+        let entries: Vec<(String, String, serde_json::Value)> = self
             .thread
             .read(cx)
             .pending_auth_entries()
             .into_iter()
-            .map(|(id, meta)| {
-                (
-                    id,
-                    meta.tool_name.clone(),
-                    meta.summary.clone(),
-                    meta.input.clone(),
-                )
-            })
+            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.input.clone()))
             .collect();
-        for (id, tool_name, summary, input) in entries {
-            // AskUserQuestion needs its interactive card state rebuilt too —
-            // without `pending_ask` the generic approval overlay would surface
-            // for a tool that must only ever show the question card.
-            if tool_name == agent::tools::ASK_USER_QUESTION {
-                self.pending_ask = parse_pending_ask(id.clone(), input);
-                self.ask_step = 0;
-                self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
-                continue;
-            }
-            self.pending_auths.push(PendingAuth {
-                id,
-                tool_name,
-                summary,
-            });
+        for (id, _tool_name, input) in entries {
+            self.pending_ask = parse_pending_ask(id.clone(), input);
+            self.ask_step = 0;
+            self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         }
-        if !self.pending_auths.is_empty() || self.pending_ask.is_some() {
+        if self.pending_ask.is_some() {
             cx.notify();
         }
     }
@@ -2273,8 +2226,8 @@ impl Workspace {
     }
 
     /// Archive the active thread if it is idle; `false` when a turn is
-    /// running (attaching would park the thread and clear `pending_auths`,
-    /// stranding tool approvals). Marks the thread archived and persists via
+    /// running (attaching would park the thread and clear `pending_ask`,
+    /// stranding a user verdict). Marks the thread archived and persists via
     /// the store, which refreshes the sidebar list.
     fn archive_active_thread_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
         if self.thread.read(cx).is_running() {
@@ -3570,24 +3523,15 @@ impl Workspace {
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
-        // When an AskUserQuestion card is open its "Cancel" button calls this; the
-        // generic approval overlay is suppressed while a card is open, so the
-        // card is the only caller in that state. Resolve the card's specific id
-        // rather than the queue tail, so a non-ask auth queued behind the card
-        // is not accidentally dismissed.
-        let id = match self.pending_ask.as_ref() {
-            Some(ask) => ask.id.clone(),
-            None => match self.pending_auths.last() {
-                Some(a) => a.id.clone(),
-                None => return,
-            },
+        // An AskUserQuestion card's "Cancel" button calls this; the card is
+        // the only pending surface, so resolve its id directly.
+        let Some(ask) = self.pending_ask.as_ref() else {
+            return;
         };
-        self.pending_auths.retain(|a| a.id != id);
-        if self.pending_ask.as_ref().is_some_and(|a| a.id == id) {
-            self.pending_ask = None;
-            self.ask_step = 0;
-            self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
-        }
+        let id = ask.id.clone();
+        self.pending_ask = None;
+        self.ask_step = 0;
+        self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
@@ -3846,132 +3790,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let auth = self.pending_auths.last()?;
-        let summary = auth.summary.clone();
-        let tool_name = auth.tool_name.clone();
-        // When several auths are queued behind the visible one, signal that
-        // dismissing this card will surface the next.
-        let queued = self.pending_auths.len().saturating_sub(1);
-
-        Some(
-            gpui::div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                // Scrim must use the dark foreground, not `background`. A white
-                // veil over a white conversation does not dim, so the page shows
-                // through and the modal reads as transparent.
-                .bg(theme.foreground.opacity(0.6))
-                .child(
-                    v_flex()
-                        .w(px(420.))
-                        .p_4()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(Icon::new(IconName::Info).small().text_color(theme.warning))
-                                .child(
-                                    gpui::div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(i18n::t("workspace-approval-title")),
-                                ),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t_str(
-                                    "workspace-approval-tool",
-                                    &[("name", tool_name.as_str())],
-                                )),
-                        )
-                        .children(if queued > 0 {
-                            Some(
-                                gpui::div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t_count("workspace-queued", queued as i64)),
-                            )
-                        } else {
-                            None
-                        })
-                        .child(
-                            gpui::div()
-                                .p_2()
-                                .rounded(theme.radius)
-                                .bg(theme.secondary)
-                                .text_xs()
-                                .font_family(theme.mono_font_family.clone())
-                                // Permission summaries read as tool-call output, so
-                                // they render in Lilex LightItalic.
-                                .italic()
-                                .font_weight(gpui::FontWeight::LIGHT)
-                                .text_color(theme.foreground)
-                                .child(summary),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("auth-deny")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("workspace-deny"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.resolve_auth(PermissionDecision::Deny, cx);
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("auth-allow")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("workspace-always-allow"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.resolve_auth(
-                                                    PermissionDecision::AlwaysAllow,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("auth-once")
-                                        .primary()
-                                        .small()
-                                        .label(i18n::t("workspace-allow-once"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.resolve_auth(
-                                                    PermissionDecision::AllowOnce,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// Confirmation overlay for an inbound-write request from a built-in
-    /// browser tab. Mirrors `render_auth_overlay`'s scrim + card layout but
+    /// browser tab. Scrim + card layout like the question-card surface, but
     /// resolves through `respond_inbound` (the mode-blind axis).
     fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let req = self.pending_inbounds.last()?;
@@ -5847,10 +5667,7 @@ impl Workspace {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.pending_ask.is_some()
-            || !self.pending_auths.is_empty()
-            || self.pending_plan_review.is_some()
-        {
+        if self.pending_ask.is_some() || self.pending_plan_review.is_some() {
             return None;
         }
         self.blank_project_parent.as_ref()?;
@@ -6159,8 +5976,7 @@ impl Render for Workspace {
             && self.thread.read(cx).has_interacted()
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
         let overlay = self
-            .render_auth_overlay(&theme, cx)
-            .or_else(|| self.render_inbound_overlay(&theme, cx))
+            .render_inbound_overlay(&theme, cx)
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
         let turn_navigator_overlay =
             self.render_turn_navigator_overlay(window, &theme, right_pane_open, show_rail, cx);
