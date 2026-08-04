@@ -580,9 +580,29 @@ pub fn is_cross_app_automation(command: &str) -> bool {
     false
 }
 
+/// Test-only observation of the `/tmp` scratch admission. `is_writable` is the
+/// production surface; the flag is reachable through it only where `$TMPDIR`
+/// differs from `/tmp`, which is why the tests need to read it directly.
+#[cfg(test)]
+impl SandboxPolicy {
+    fn admits_tmp_scratch(&self) -> bool {
+        self.admit_tmp_scratch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A project root that is never the platform tmpdir.
+    ///
+    /// `$TMPDIR` is `/var/folders/…` on macOS but `/tmp` itself on Linux, where
+    /// a `/tmp/…` fixture lands inside `temp_root()` and is writable no matter
+    /// what the policy says — so any assertion that a path is NOT writable
+    /// would pass on one platform and fail on the other while testing nothing.
+    const FIXTURE_PROJECT: &str = "/manox-sandbox-fixture/project";
+    const FIXTURE_GIT: &str = "/manox-sandbox-fixture/project/.git";
+    const FIXTURE_WORKTREE: &str = "/manox-sandbox-fixture/project/.claude/worktrees/wt-1";
 
     fn policy() -> SandboxPolicy {
         SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"))
@@ -882,9 +902,9 @@ mod tests {
 
     #[test]
     fn with_worktree_opens_bound_git_and_network() {
-        let project = Path::new("/tmp/manox-sandbox-test");
+        let project = Path::new(FIXTURE_PROJECT);
         let git_dir = project.join(".git");
-        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let worktree = Path::new(FIXTURE_WORKTREE);
         let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
         // The bound repo's .git is NOT FS-writable (it is not under the
         // worktree or $TMPDIR, and the `.git` component is protected). bash
@@ -905,17 +925,17 @@ mod tests {
         // The c5aefe4d escape: cd into a SIBLING worktree and git ops against
         // its .git. Only the bound repo's .git is de-protected; a sibling's
         // .git stays blocked.
-        let project = Path::new("/tmp/manox-sandbox-test");
+        let project = Path::new(FIXTURE_PROJECT);
         let git_dir = project.join(".git");
-        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let worktree = Path::new(FIXTURE_WORKTREE);
         let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
-        let sibling = Path::new("/tmp/manox-sibling-worktree/.git/config");
+        let sibling = Path::new("/manox-sandbox-fixture/sibling/.git/config");
         assert!(
             !p.is_write_allowed(sibling),
             "sibling worktree's .git must stay blocked"
         );
         assert!(
-            !p.is_writable(Path::new("/tmp/manox-sibling-worktree/x")),
+            !p.is_writable(Path::new("/manox-sandbox-fixture/sibling/x")),
             "sibling worktree path must stay non-writable"
         );
     }
@@ -957,9 +977,9 @@ mod tests {
         // A sub-agent with worktree isolation: writable = its worktree + temp
         // only, git ops against the bound .git work, the parent's project root
         // is out of reach.
-        let parent_project = Path::new("/tmp/parent-project");
+        let parent_project = Path::new("/manox-sandbox-fixture/parent");
         let git_dir = parent_project.join(".git");
-        let child_wt = Path::new("/tmp/parent-project/.claude/worktrees/sub-1");
+        let child_wt = Path::new("/manox-sandbox-fixture/parent/.claude/worktrees/sub-1");
         let p = SandboxPolicy::for_worktree(child_wt, &git_dir);
         assert!(p.is_write_allowed(&child_wt.join("src/lib.rs")));
         // Parent project root is NOT writable for the child.
@@ -981,9 +1001,9 @@ mod tests {
         // P4: entering a worktree must confine FS writes to the worktree — a
         // stray absolute path into the main checkout (thread 56ed5d5f msg133)
         // is rejected so the main checkout is not polluted from the worktree.
-        let project = Path::new("/tmp/manox-sandbox-test");
+        let project = Path::new(FIXTURE_PROJECT);
         let git_dir = project.join(".git");
-        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let worktree = Path::new(FIXTURE_WORKTREE);
         let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
         assert!(p.is_write_allowed(&worktree.join("src/lib.rs")));
         assert!(
@@ -1004,19 +1024,33 @@ mod tests {
         // while bash could write there. Now `/tmp` + `/private/tmp` are
         // admitted FS-side in project mode (so `write_file` can author scratch),
         // but NOT in worktree mode (isolation: write the worktree).
-        let p = SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"));
+        let p = SandboxPolicy::for_project(Path::new(FIXTURE_PROJECT));
         assert!(p.is_writable(Path::new("/tmp/scratch-file")));
         assert!(p.is_writable(Path::new("/private/tmp/scratch-file")));
         assert!(p.is_writable(&std::env::temp_dir().join("scratch-file")));
 
-        let git_dir = Path::new("/tmp/manox-sandbox-test/.git");
-        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
-        let wt = SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"))
-            .with_worktree(worktree, git_dir);
+        let git_dir = Path::new(FIXTURE_GIT);
+        let worktree = Path::new(FIXTURE_WORKTREE);
+        let wt =
+            SandboxPolicy::for_project(Path::new(FIXTURE_PROJECT)).with_worktree(worktree, git_dir);
+        // Worktree mode withdraws the `/tmp` scratch admission. Asserted on the
+        // admission itself because where `$TMPDIR` is `/tmp` (Linux) such a
+        // path is writable as the temp root regardless, so a path-based
+        // assertion there would test the platform rather than the policy.
         assert!(
-            !wt.is_writable(Path::new("/tmp/scratch-file")),
+            !wt.admits_tmp_scratch(),
             "worktree mode must not admit /tmp (isolation)"
         );
+        // The flag alone does not prove `is_writable` consults it. That branch
+        // is only reachable when `$TMPDIR` is distinct from `/tmp`, since
+        // otherwise the path matches the temp root first — so the end-to-end
+        // check is conditioned on the tmpdir, not on the platform.
+        if !is_under_tmp(&temp_root()) {
+            assert!(
+                !wt.is_writable(Path::new("/tmp/scratch-file")),
+                "is_writable must honour the withdrawn admission"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
