@@ -176,7 +176,7 @@ fn to_input(context: &AgentContext, messages: &[AgentMessage]) -> Vec<InputItem>
             }
             // `prepare_for_wire` has already projected these onto user
             // messages; the arm only satisfies exhaustiveness.
-            AgentMessage::Custom { .. } => continue,
+            AgentMessage::BashExecution { .. } | AgentMessage::Custom { .. } => continue,
         }
         msg_index += 1;
     }

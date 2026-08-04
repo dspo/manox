@@ -159,6 +159,30 @@ pub enum AgentMessage {
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
+    /// A shell command the user ran outside the model's tool calls, recorded so
+    /// the transcript reflects what happened in the working tree.
+    #[serde(rename = "bashExecution", rename_all = "camelCase")]
+    BashExecution {
+        command: String,
+        /// Combined stdout and stderr, already truncated.
+        output: String,
+        /// `None` when the process was killed before reporting a status.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        cancelled: bool,
+        #[serde(default)]
+        truncated: bool,
+        /// Where the untruncated output was spilled, when it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_output_path: Option<String>,
+        /// Withholds the execution from the model while keeping it in the
+        /// session — the transcript records it, the provider never sees it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exclude_from_context: Option<bool>,
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
+        timestamp: DateTime<Utc>,
+    },
     /// Extension point for custom message types.
     #[serde(rename = "custom", rename_all = "camelCase")]
     Custom {
@@ -194,6 +218,7 @@ impl AgentMessage {
             AgentMessage::User { timestamp, .. }
             | AgentMessage::Assistant { timestamp, .. }
             | AgentMessage::ToolResult { timestamp, .. }
+            | AgentMessage::BashExecution { timestamp, .. }
             | AgentMessage::Custom { timestamp, .. } => *timestamp,
         }
     }
@@ -587,12 +612,16 @@ pub type MessageQueueFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
 /// The refresh a `prepare_next_turn` returns for the next turn: the model
 /// and thinking level snapshot (TS `AgentLoopTurnUpdate`). The loop applies
 /// it to its in-flight context before the next provider request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TurnUpdate {
     pub model: Model,
     pub thinking_level: Option<String>,
     /// Active tool subset for the next turn; `None` keeps the current set.
     pub active_tool_names: Option<Vec<String>>,
+    /// Messages recorded outside the turn — a shell command the user ran —
+    /// that became durable during this boundary and so must join the context
+    /// the next request carries.
+    pub appended_messages: Vec<AgentMessage>,
 }
 
 /// Refreshes the context/model before a turn; `None` keeps the current turn.
@@ -827,5 +856,67 @@ mod tests {
         assert_eq!(tr_reround["toolCallId"], "tc_1");
         assert_eq!(tr_reround["toolName"], "read");
         assert_eq!(tr_reround["isError"], false);
+    }
+
+    #[test]
+    fn bash_execution_roundtrips_ts_pi_v3_shape() {
+        let wire = json!({
+            "role": "bashExecution",
+            "command": "cargo test",
+            "output": "ok",
+            "exitCode": 1,
+            "cancelled": false,
+            "truncated": true,
+            "fullOutputPath": "/tmp/pi-bash-1.log",
+            "excludeFromContext": true,
+            "timestamp": 1_700_000_000_000i64
+        });
+        let msg: AgentMessage = serde_json::from_value(wire).unwrap();
+        match &msg {
+            AgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                truncated,
+                full_output_path,
+                exclude_from_context,
+                ..
+            } => {
+                assert_eq!(command, "cargo test");
+                assert_eq!(output, "ok");
+                assert_eq!(*exit_code, Some(1));
+                assert!(!cancelled);
+                assert!(truncated);
+                assert_eq!(full_output_path.as_deref(), Some("/tmp/pi-bash-1.log"));
+                assert_eq!(*exclude_from_context, Some(true));
+            }
+            other => panic!("expected BashExecution, got {other:?}"),
+        }
+        let reround = serde_json::to_value(&msg).unwrap();
+        assert_eq!(reround["role"], "bashExecution");
+        assert_eq!(reround["exitCode"], 1);
+        assert_eq!(reround["fullOutputPath"], "/tmp/pi-bash-1.log");
+        assert_eq!(reround["excludeFromContext"], true);
+        assert_eq!(reround["timestamp"], 1_700_000_000_000i64);
+    }
+
+    #[test]
+    fn bash_execution_omits_unset_optional_fields() {
+        let msg = AgentMessage::BashExecution {
+            command: "ls".into(),
+            output: String::new(),
+            exit_code: None,
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: None,
+            timestamp: Utc::now(),
+        };
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert!(wire.get("exitCode").is_none());
+        assert!(wire.get("fullOutputPath").is_none());
+        assert!(wire.get("excludeFromContext").is_none());
+        assert_eq!(wire["cancelled"], true);
     }
 }

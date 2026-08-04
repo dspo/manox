@@ -349,6 +349,10 @@ async fn run_loop_inner(
                         .cloned()
                         .collect();
                 }
+                // Messages recorded outside the turn join the context here, at
+                // a turn boundary, so they follow the turn's own messages
+                // instead of splitting a tool call from its result.
+                context.messages.extend(update.appended_messages);
             }
 
             // Check early stop (TS `shouldStopAfterTurn`, after `turn_end` and

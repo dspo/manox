@@ -517,6 +517,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_execution_entry_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::Message {
+                id: "b1".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                message: AgentMessage::BashExecution {
+                    command: "cargo test".into(),
+                    output: "tail".into(),
+                    exit_code: Some(101),
+                    cancelled: false,
+                    truncated: true,
+                    full_output_path: Some("/tmp/pi-bash-1.log".into()),
+                    exclude_from_context: Some(true),
+                    timestamp: chrono::Utc::now(),
+                },
+            })
+            .await
+            .unwrap();
+        drop(storage);
+
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let entry = reopened.get_entry("b1").await.unwrap().unwrap();
+        let SessionTreeEntry::Message { message, .. } = entry else {
+            panic!("expected a message entry");
+        };
+        match message {
+            AgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                truncated,
+                full_output_path,
+                exclude_from_context,
+                ..
+            } => {
+                assert_eq!(command, "cargo test");
+                assert_eq!(output, "tail");
+                assert_eq!(exit_code, Some(101));
+                assert!(truncated);
+                assert_eq!(full_output_path.as_deref(), Some("/tmp/pi-bash-1.log"));
+                // The withholding must survive the round trip, or a reopened
+                // session would start feeding the model what the user hid.
+                assert_eq!(exclude_from_context, Some(true));
+            }
+            other => panic!("expected BashExecution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_jsonl_leaf_tracking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");

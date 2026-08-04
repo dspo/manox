@@ -31,7 +31,8 @@ pub fn prepare_for_wire(messages: &[AgentMessage]) -> Vec<AgentMessage> {
 /// harness-injected note, a resource digest — and reaches the provider as a
 /// user message, so the roles a shape translator must handle reduce to
 /// user/assistant/toolResult. Its blocks carry over untouched, images
-/// included.
+/// included. A `BashExecution` becomes the rendered transcript of the command,
+/// or drops entirely when it was recorded with `exclude_from_context`.
 ///
 /// Summary carriers are already user messages by the time they are here: the
 /// session projects a compaction or branch-summary entry into a tagged user
@@ -40,16 +41,63 @@ pub fn prepare_for_wire(messages: &[AgentMessage]) -> Vec<AgentMessage> {
 pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
     messages
         .iter()
-        .map(|msg| match msg {
+        .filter_map(|msg| match msg {
             AgentMessage::Custom {
                 content, timestamp, ..
-            } => AgentMessage::User {
+            } => Some(AgentMessage::User {
                 content: content.clone(),
                 timestamp: *timestamp,
-            },
-            other => other.clone(),
+            }),
+            AgentMessage::BashExecution {
+                exclude_from_context: Some(true),
+                ..
+            } => None,
+            AgentMessage::BashExecution { timestamp, .. } => Some(AgentMessage::User {
+                content: vec![ContentBlock::Text {
+                    text: bash_execution_to_text(msg),
+                    signature: None,
+                }],
+                timestamp: *timestamp,
+            }),
+            other => Some(other.clone()),
         })
         .collect()
+}
+
+/// Render a shell execution as the text the model reads.
+///
+/// The command leads, its output follows fenced, and the trailing note carries
+/// whatever the model needs to interpret the result: cancellation, a non-zero
+/// status, or where the untruncated output went.
+pub fn bash_execution_to_text(message: &AgentMessage) -> String {
+    let AgentMessage::BashExecution {
+        command,
+        output,
+        exit_code,
+        cancelled,
+        truncated,
+        full_output_path,
+        ..
+    } = message
+    else {
+        return String::new();
+    };
+
+    let mut text = format!("Ran `{command}`\n");
+    if output.is_empty() {
+        text.push_str("(no output)");
+    } else {
+        text.push_str(&format!("```\n{output}\n```"));
+    }
+    if *cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if let Some(code) = exit_code.filter(|c| *c != 0) {
+        text.push_str(&format!("\n\nCommand exited with code {code}"));
+    }
+    if *truncated && let Some(path) = full_output_path {
+        text.push_str(&format!("\n\n[Output truncated. Full output: {path}]"));
+    }
+    text
 }
 
 /// Pair every unresolved tool call with a synthetic error result.
@@ -110,7 +158,9 @@ pub fn repair_tool_flow(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                 insert_synthetic_results(&mut result, &mut pending, &mut resolved);
                 result.push(msg.clone());
             }
-            AgentMessage::Custom { .. } => result.push(msg.clone()),
+            AgentMessage::BashExecution { .. } | AgentMessage::Custom { .. } => {
+                result.push(msg.clone())
+            }
         }
     }
     insert_synthetic_results(&mut result, &mut pending, &mut resolved);
@@ -417,6 +467,108 @@ mod tests {
             serde_json::to_value(&converted).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
+    }
+
+    fn bash(output: &str, exit_code: Option<i32>, cancelled: bool) -> AgentMessage {
+        AgentMessage::BashExecution {
+            command: "ls".into(),
+            output: output.into(),
+            exit_code,
+            cancelled,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn bash_execution_renders_every_trailing_note() {
+        assert_eq!(
+            bash_execution_to_text(&bash("hi", Some(0), false)),
+            "Ran `ls`\n```\nhi\n```"
+        );
+        assert_eq!(
+            bash_execution_to_text(&bash("", Some(0), false)),
+            "Ran `ls`\n(no output)"
+        );
+        assert_eq!(
+            bash_execution_to_text(&bash("hi", None, true)),
+            "Ran `ls`\n```\nhi\n```\n\n(command cancelled)"
+        );
+        assert_eq!(
+            bash_execution_to_text(&bash("hi", Some(1), false)),
+            "Ran `ls`\n```\nhi\n```\n\nCommand exited with code 1"
+        );
+        // Cancellation wins over an exit code, matching the recorded shape
+        // where a killed process reports no status.
+        assert_eq!(
+            bash_execution_to_text(&bash("hi", Some(1), true)),
+            "Ran `ls`\n```\nhi\n```\n\n(command cancelled)"
+        );
+    }
+
+    #[test]
+    fn truncated_bash_execution_points_at_the_full_output() {
+        let msg = AgentMessage::BashExecution {
+            command: "cargo test".into(),
+            output: "tail".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: true,
+            full_output_path: Some("/tmp/pi-bash-1.log".into()),
+            exclude_from_context: None,
+            timestamp: chrono::Utc::now(),
+        };
+        assert_eq!(
+            bash_execution_to_text(&msg),
+            "Ran `cargo test`\n```\ntail\n```\n\n[Output truncated. Full output: /tmp/pi-bash-1.log]"
+        );
+    }
+
+    #[test]
+    fn bash_execution_projects_to_user_text() {
+        let converted = convert_to_llm(&[bash("hi", Some(0), false)]);
+        match &converted[0] {
+            AgentMessage::User { content, .. } => assert!(matches!(
+                &content[0],
+                ContentBlock::Text { text, .. } if text == "Ran `ls`\n```\nhi\n```"
+            )),
+            other => panic!("expected a user message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn excluded_bash_execution_never_reaches_the_provider() {
+        let excluded = AgentMessage::BashExecution {
+            command: "cat secret".into(),
+            output: "token".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+            exclude_from_context: Some(true),
+            timestamp: chrono::Utc::now(),
+        };
+        let prepared = prepare_for_wire(&[AgentMessage::user("q"), excluded]);
+        assert_eq!(prepared.len(), 1);
+        // Not merely stripped of content — absent, so nothing hints at it.
+        let wire = serde_json::to_string(&prepared).unwrap();
+        assert!(!wire.contains("token"), "{wire}");
+    }
+
+    #[test]
+    fn converted_bash_execution_closes_the_tool_turn() {
+        let messages = vec![
+            assistant(vec![tool_use("c1", "read")]),
+            bash("hi", Some(0), false),
+        ];
+        let prepared = prepare_for_wire(&messages);
+        // The synthetic result precedes the projected user message; a bare
+        // tool call would otherwise be the last thing before it.
+        assert_eq!(prepared.len(), 3);
+        synthetic_at(&prepared, 1);
+        assert!(matches!(&prepared[2], AgentMessage::User { .. }));
     }
 
     #[test]

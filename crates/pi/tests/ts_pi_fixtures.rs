@@ -356,6 +356,7 @@ fn role_name(message: &pi::AgentMessage) -> String {
         }
         pi::AgentMessage::Assistant { .. } => "assistant".into(),
         pi::AgentMessage::Custom { .. } => "custom".into(),
+        pi::AgentMessage::BashExecution { .. } => "bashExecution".into(),
         pi::AgentMessage::ToolResult { .. } => "toolResult".into(),
     }
 }

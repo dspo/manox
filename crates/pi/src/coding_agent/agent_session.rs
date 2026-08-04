@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use tokio_util::sync::CancellationToken;
 
 use crate::harness::{AgentHarness, HarnessResources, NavigateTreeOptions};
 use crate::session::jsonl::JsonlSessionMetadata;
@@ -30,6 +31,9 @@ use crate::trust::{TrustManager, TrustStatus};
 use crate::types::{AgentMessage, Model, StopReason};
 
 use super::model_runtime::{ModelCatalog, ModelRuntime};
+
+/// Ceiling for a user-run shell command, matching the bash tool's default.
+const BASH_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 use super::resource_loader::ResourceLoader;
 
 /// Per-agent-dir mutex registry so concurrent `patch_global_settings` calls
@@ -150,6 +154,13 @@ pub struct AgentSession {
     /// default model / thinking level to its global settings file (TS
     /// `setDefaultModelAndProvider`/`setDefaultThinkingLevel`).
     agent_dir: PathBuf,
+    /// Prepended to every `execute_bash` command, so a user-run command sees
+    /// the same shell setup as the bash tool's.
+    shell_command_prefix: Option<String>,
+    /// Cancellation tokens of the in-flight `execute_bash` calls; `abort_bash`
+    /// cancels them all, killing each command's process tree. Held by `Arc` so
+    /// a finishing call can identify and drop its own entry.
+    bash_signals: Arc<std::sync::Mutex<Vec<Arc<CancellationToken>>>>,
 }
 
 impl AgentSession {
@@ -307,6 +318,105 @@ impl AgentSession {
     /// Resolve once the harness is fully settled after shutdown.
     pub async fn wait_for_shutdown(&self) {
         self.harness.wait_for_shutdown().await;
+    }
+
+    /// Run a shell command the user typed and record it in the transcript.
+    ///
+    /// The command runs against the session cwd through the same execution
+    /// environment the bash tool uses, and its result is recorded so the model
+    /// sees what the user did to the working tree. `exclude_from_context`
+    /// keeps the execution in the session while withholding it from the model.
+    ///
+    /// Output is truncated tail-first — a shell's verdict is on its last
+    /// lines — and the untruncated text spills next to the session file, where
+    /// the recorded message points at it.
+    pub async fn execute_bash(
+        &mut self,
+        command: &str,
+        exclude_from_context: bool,
+    ) -> Result<AgentMessage, anyhow::Error> {
+        let signal = Arc::new(CancellationToken::new());
+        self.bash_signals.lock().unwrap().push(Arc::clone(&signal));
+        let resolved = match &self.shell_command_prefix {
+            Some(prefix) => format!("{prefix}\n{command}"),
+            None => command.to_string(),
+        };
+
+        let env = Arc::clone(self.harness.agent().tool_context());
+        let outcome = env
+            .env()
+            .exec(&resolved, BASH_EXECUTION_TIMEOUT, (*signal).clone())
+            .await;
+        self.bash_signals
+            .lock()
+            .unwrap()
+            .retain(|t| !Arc::ptr_eq(t, &signal));
+
+        let cancelled = signal.is_cancelled();
+        let (raw, exit_code) = match outcome {
+            Ok(result) => {
+                let mut combined = result.stdout;
+                if !result.stderr.is_empty() {
+                    if !combined.is_empty() && !combined.ends_with('\n') {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&result.stderr);
+                }
+                let code = (!cancelled).then_some(result.exit_code);
+                (combined, code)
+            }
+            // A cancelled or timed-out command has no status to report; the
+            // recorded message says so rather than inventing an exit code.
+            // `ExecutionEnv::exec` discards whatever the process had already
+            // written, so the output is empty rather than partial.
+            Err(crate::env::ExecutionError::Aborted) => (String::new(), None),
+            Err(crate::env::ExecutionError::Timeout(_)) => (String::new(), None),
+            Err(err) => return Err(err.into()),
+        };
+
+        let truncation = crate::tools::truncate::truncate_tail(&raw, &Default::default());
+        let full_output_path = if truncation.was_truncated {
+            let path = self
+                .session_dir
+                .join(format!("bash-{}.log", uuid::Uuid::new_v4()));
+            match env.env().write_file(&path, &raw).await {
+                Ok(()) => Some(path.to_string_lossy().into_owned()),
+                // The spill is a convenience pointer; losing it must not lose
+                // the execution itself.
+                Err(err) => {
+                    tracing::warn!("failed to spill full bash output to {path:?}: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let message = AgentMessage::BashExecution {
+            command: command.to_string(),
+            output: truncation.content,
+            exit_code,
+            cancelled,
+            truncated: truncation.was_truncated,
+            full_output_path,
+            exclude_from_context: exclude_from_context.then_some(true),
+            timestamp: chrono::Utc::now(),
+        };
+        self.append_message(message.clone()).await?;
+        Ok(message)
+    }
+
+    /// Cancel every in-flight [`AgentSession::execute_bash`], killing each
+    /// command's process tree.
+    pub fn abort_bash(&self) {
+        for signal in self.bash_signals.lock().unwrap().drain(..) {
+            signal.cancel();
+        }
+    }
+
+    /// Whether a [`AgentSession::execute_bash`] is in flight.
+    pub fn is_bash_running(&self) -> bool {
+        !self.bash_signals.lock().unwrap().is_empty()
     }
 
     /// Append a message: immediately when idle, through the mutation queue
@@ -689,6 +799,8 @@ impl AgentSession {
                 settings_thinking_default: self.settings_thinking_default.clone(),
                 custom_prompt: self.custom_prompt,
                 agent_dir: self.agent_dir.clone(),
+                shell_command_prefix: self.shell_command_prefix.clone(),
+                bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
             },
             selected_text,
         })
@@ -1223,6 +1335,8 @@ impl AgentSessionBuilder {
             settings_thinking_default,
             custom_prompt,
             agent_dir,
+            shell_command_prefix: settings.shell_command_prefix.clone(),
+            bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -1544,6 +1658,154 @@ mod tests {
             "read must resolve relative to the session cwd: {:?}",
             result.details
         );
+    }
+
+    #[tokio::test]
+    async fn execute_bash_records_the_execution_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let sessions = dir.path().join("sessions");
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&sessions)
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        let recorded = session.execute_bash("echo hi", false).await.unwrap();
+        match &recorded {
+            AgentMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled,
+                ..
+            } => {
+                assert_eq!(command, "echo hi");
+                assert_eq!(output.trim(), "hi");
+                assert_eq!(*exit_code, Some(0));
+                assert!(!cancelled);
+            }
+            other => panic!("expected BashExecution, got {other:?}"),
+        }
+        assert!(!session.is_bash_running());
+        // A session file materializes on its first assistant message, so the
+        // turn is what puts the already-recorded execution on disk.
+        session.prompt("go").await.unwrap();
+        let path = session.close().await.unwrap();
+
+        // The execution is part of the transcript a reopened session restores.
+        let reopened = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&sessions)
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .open(path)
+            .await
+            .unwrap();
+        assert!(
+            reopened.harness_messages().iter().any(
+                |m| matches!(m, AgentMessage::BashExecution { command, .. } if command == "echo hi")
+            ),
+            "the restored transcript carries the execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_bash_runs_against_the_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        tokio::fs::write(cwd.join("marker.txt"), "x").await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        let recorded = session.execute_bash("ls marker.txt", false).await.unwrap();
+        let AgentMessage::BashExecution {
+            output, exit_code, ..
+        } = &recorded
+        else {
+            panic!("expected BashExecution");
+        };
+        assert_eq!(*exit_code, Some(0), "output: {output}");
+        assert!(output.contains("marker.txt"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn excluded_execution_persists_but_stays_out_of_the_model_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        session.execute_bash("echo secret", true).await.unwrap();
+        // Recorded in the transcript…
+        let messages = session.harness_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::BashExecution { .. })),
+            "the execution is recorded"
+        );
+        // …and withheld from what the provider would receive.
+        let prepared = crate::provider::transform::prepare_for_wire(messages);
+        let wire = serde_json::to_string(&prepared).unwrap();
+        assert!(!wire.contains("secret"), "{wire}");
+    }
+
+    #[tokio::test]
+    async fn bash_output_over_budget_spills_beside_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        // More lines than the tail budget keeps.
+        let recorded = session.execute_bash("seq 1 5000", false).await.unwrap();
+        let AgentMessage::BashExecution {
+            output,
+            truncated,
+            full_output_path,
+            ..
+        } = &recorded
+        else {
+            panic!("expected BashExecution");
+        };
+        assert!(truncated, "5000 lines exceed the tail budget");
+        // The tail is what survives — a shell's verdict is at the end.
+        assert!(output.contains("5000"), "the tail is kept");
+        assert!(!output.starts_with("1\n"), "the head is dropped");
+        let spill = full_output_path.as_deref().expect("spill path recorded");
+        let full = tokio::fs::read_to_string(spill).await.unwrap();
+        assert!(full.starts_with("1\n"), "the spill holds the whole output");
+        assert!(full.contains("5000"), "the spill holds the tail too");
     }
 
     /// build → close → open with a WRONG cwd → fork: the session metadata
