@@ -59,6 +59,16 @@ fn settings_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
     m
 }
 
+/// How much of the context window a conversation occupies. `tokens` and
+/// `percent` are `None` when the figure is unknowable — see
+/// [`AgentSession::context_usage`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextUsage {
+    pub tokens: Option<u64>,
+    pub context_window: u64,
+    pub percent: Option<f64>,
+}
+
 /// Where a fork attaches the new session: at the selected entry, or before
 /// the selected user message (which focuses its parent and reports its text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +669,92 @@ impl AgentSession {
     /// The follow-up queue drain mode.
     pub fn follow_up_mode(&self) -> crate::agent::QueueMode {
         self.harness.follow_up_mode()
+    }
+
+    /// Whether the model is producing a message right now.
+    pub fn is_streaming(&self) -> bool {
+        self.harness.agent().state().is_streaming
+    }
+
+    /// Whether nothing is in flight. The synchronous counterpart to
+    /// [`AgentSession::wait_for_idle`], for a caller that needs to ask rather
+    /// than wait.
+    pub fn is_idle(&self) -> bool {
+        self.harness.phase() == crate::harness::AgentHarnessPhase::Idle
+            && !self.harness.agent().state().is_streaming
+    }
+
+    /// The session's id, as recorded in its file header.
+    pub fn session_id(&self) -> &str {
+        &self.harness.session().storage().metadata.id
+    }
+
+    /// The session's display name, if one was set.
+    pub async fn session_name(&self) -> Result<Option<String>, anyhow::Error> {
+        self.harness.session().name().await
+    }
+
+    /// The queued steering messages, in delivery order.
+    pub fn steering_messages(&self) -> Vec<AgentMessage> {
+        self.harness.agent().queued_steering_messages()
+    }
+
+    /// The queued follow-up messages, in delivery order.
+    pub fn follow_up_messages(&self) -> Vec<AgentMessage> {
+        self.harness.agent().queued_follow_up_messages()
+    }
+
+    /// Empty both queues, returning what was discarded so a caller can put
+    /// undelivered input back.
+    pub fn clear_queues(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
+        self.harness.agent().clear_queues()
+    }
+
+    /// How much of the context window the conversation occupies.
+    ///
+    /// `None` when the model declares no window. `tokens`/`percent` are `None`
+    /// while the figure is unknowable: right after a compaction the newest
+    /// assistant usage describes the pre-compaction context, so reporting it
+    /// would count the whole summarized history that no longer exists. The
+    /// figure becomes known again once an assistant answers past the boundary.
+    pub async fn context_usage(&self) -> Result<Option<ContextUsage>, anyhow::Error> {
+        let context_window = self.harness.model().context_window as u64;
+        if context_window == 0 {
+            return Ok(None);
+        }
+
+        let branch = self.harness.session().get_branch().await?;
+        let latest_compaction = branch
+            .iter()
+            .rposition(|e| matches!(e, SessionTreeEntry::Compaction { .. }));
+        if let Some(boundary) = latest_compaction {
+            let trusted = branch[boundary + 1..].iter().any(|e| {
+                matches!(
+                    e,
+                    SessionTreeEntry::Message {
+                        message: AgentMessage::Assistant { stop_reason, usage, .. },
+                        ..
+                    } if !matches!(
+                        stop_reason,
+                        Some(StopReason::Aborted) | Some(StopReason::Error)
+                    ) && crate::compaction::calculate_context_tokens(usage) > 0
+                )
+            });
+            if !trusted {
+                return Ok(Some(ContextUsage {
+                    tokens: None,
+                    context_window,
+                    percent: None,
+                }));
+            }
+        }
+
+        let tokens = crate::compaction::estimate_context_tokens(self.harness_messages()).tokens;
+        Ok(Some(ContextUsage {
+            tokens: Some(tokens),
+            context_window,
+            percent: Some(tokens as f64 / context_window as f64 * 100.0),
+        }))
     }
 
     /// Subscribe to harness-level events. Delivery stops when the returned
@@ -1415,7 +1511,13 @@ mod tests {
                 diagnostics: None,
                 raw_stop_reason: None,
                 stop_reason: Some(StopReason::Stop),
-                usage: Default::default(),
+                // Non-zero, so context-usage reporting has an anchor to trust
+                // the way a real provider response would give it one.
+                usage: Box::new(crate::types::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                }),
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             })
@@ -1661,6 +1763,148 @@ mod tests {
             !result.is_error,
             "read must resolve relative to the session cwd: {:?}",
             result.details
+        );
+    }
+
+    #[tokio::test]
+    async fn context_usage_is_unknown_until_an_assistant_answers_past_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        // A keep-recent window small enough that this short transcript has a
+        // cut point at all.
+        session.set_compaction_settings(crate::compaction::CompactionSettings {
+            keep_recent_tokens: 1,
+            ..Default::default()
+        });
+        for i in 0..4 {
+            session.prompt(&format!("turn {i}")).await.unwrap();
+        }
+        let before = session.context_usage().await.unwrap().unwrap();
+        assert!(before.tokens.is_some(), "plain turns report their usage");
+
+        session.compact().await.unwrap();
+        let after = session.context_usage().await.unwrap().unwrap();
+        // The newest assistant usage describes the pre-compaction context, so
+        // reporting it would count history that no longer exists.
+        assert_eq!(after.tokens, None);
+        assert_eq!(after.percent, None);
+        assert_eq!(after.context_window, test_model().context_window as u64);
+
+        session.prompt("after compaction").await.unwrap();
+        let recovered = session.context_usage().await.unwrap().unwrap();
+        assert!(
+            recovered.tokens.is_some(),
+            "an assistant past the boundary makes the figure knowable again"
+        );
+        assert!(recovered.percent.unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn context_usage_is_none_without_a_context_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(Model {
+                context_window: 0,
+                ..test_model()
+            })
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(session.context_usage().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn queued_messages_are_readable_and_clearable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        session.steer(AgentMessage::user("steer one"));
+        session.steer(AgentMessage::user("steer two"));
+        session.follow_up(AgentMessage::user("follow one"));
+        assert_eq!(session.steering_messages().len(), 2);
+        assert_eq!(session.follow_up_messages().len(), 1);
+
+        let (steer, follow_up) = session.clear_queues();
+        assert_eq!(steer.len(), 2);
+        assert_eq!(follow_up.len(), 1);
+        assert!(session.steering_messages().is_empty());
+        assert!(session.follow_up_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_and_streaming_predicates_track_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        assert!(session.is_idle(), "a fresh session is idle");
+        assert!(!session.is_streaming());
+        session.prompt("go").await.unwrap();
+        session.wait_for_idle().await;
+        assert!(session.is_idle(), "settled again after the turn");
+        assert!(!session.is_streaming());
+    }
+
+    #[tokio::test]
+    async fn session_id_and_name_match_what_was_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        // The id is the one in the file name the session writes to.
+        let id = session.session_id().to_string();
+        assert!(!id.is_empty());
+        assert!(
+            session.path().to_string_lossy().contains(&id),
+            "path {:?} carries id {id}",
+            session.path()
+        );
+
+        assert_eq!(session.session_name().await.unwrap(), None);
+        session.set_session_name("my session").await.unwrap();
+        assert_eq!(
+            session.session_name().await.unwrap().as_deref(),
+            Some("my session")
         );
     }
 

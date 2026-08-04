@@ -1429,7 +1429,11 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.abort();
         self.control.retry_cancel.lock().unwrap().cancel();
         self.control.operation_cancel.lock().unwrap().cancel();
-        self.agent.clear_all_queues();
+        let (cleared_steer, cleared_follow_up) = self.agent.clear_queues();
+        self.control.emit_harness(HarnessEvent::Abort {
+            cleared_steer,
+            cleared_follow_up,
+        });
         self.control.next_turn_queue.lock().unwrap().clear();
         // Drop unpersisted mutations: after shutdown nothing flushes them, so
         // they must not linger and surface on a later run.
