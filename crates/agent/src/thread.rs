@@ -4967,15 +4967,32 @@ impl Thread {
             },
         )
         .expect("escalated approval question render");
+        // Resolve the decision labels once: they ride the payload verbatim and
+        // the verdict parsing below compares against these exact strings, so a
+        // UI locale swap while the card is open can neither flip nor strand
+        // the verdict — the drawer renders and returns the labels captured
+        // here, whatever locale it re-localizes its own chrome into.
+        let allow_once_label = crate::i18n::t("workspace-escalation-allow-once");
+        let always_allow_label = crate::i18n::t("workspace-escalation-always-allow");
+        let deny_label = crate::i18n::t("workspace-escalation-deny");
         let input = serde_json::json!({
             "questions": [{
                 "question": question,
                 "header": crate::i18n::t("workspace-approval-title").to_string(),
                 "multiSelect": false,
                 "options": [
-                    {"label": "Allow once", "description": "Run this call once."},
-                    {"label": "Always allow", "description": "Allow this tool for the rest of the session."},
-                    {"label": "Deny", "description": "Refuse; the reason is returned to the model."},
+                    {
+                        "label": allow_once_label.to_string(),
+                        "description": crate::i18n::t("workspace-escalation-allow-once-desc").to_string(),
+                    },
+                    {
+                        "label": always_allow_label.to_string(),
+                        "description": crate::i18n::t("workspace-escalation-always-allow-desc").to_string(),
+                    },
+                    {
+                        "label": deny_label.to_string(),
+                        "description": crate::i18n::t("workspace-escalation-deny-desc").to_string(),
+                    },
                 ]
             }]
         });
@@ -5025,12 +5042,18 @@ impl Thread {
             ToolAuthorizationResponse::AskUserQuestion { answers, .. } => {
                 // A selected option label is the user's explicit verdict and
                 // wins over any supplemental text; a reply with no selection
-                // is not an approval. Labels are the system constants defined
-                // above — rendered verbatim, never localized — so exact
-                // matching is stable.
-                if answers.iter().any(|(_, a)| a == "Always allow") {
+                // is not an approval. Matched against the labels captured at
+                // card construction above — the exact strings the drawer
+                // displayed — not re-resolved here.
+                if answers
+                    .iter()
+                    .any(|(_, a)| a.as_str() == always_allow_label.as_str())
+                {
                     EscalationVerdict::AlwaysAllow
-                } else if answers.iter().any(|(_, a)| a == "Allow once") {
+                } else if answers
+                    .iter()
+                    .any(|(_, a)| a.as_str() == allow_once_label.as_str())
+                {
                     EscalationVerdict::AllowOnce
                 } else {
                     EscalationVerdict::Deny
@@ -10890,7 +10913,10 @@ mod tests {
 
     /// An escalated `Ask` verdict answered through the question card's option
     /// labels (the UI's `AskUserQuestion` response path) resolves the same as
-    /// a bare AllowOnce decision.
+    /// a bare AllowOnce decision. The responder echoes the label out of the
+    /// authorization event's own payload — the exact round-trip the drawer
+    /// performs (parse payload, send the stored label back) — so the
+    /// assertion holds in any UI locale.
     #[test]
     fn escalated_ask_resolves_option_label_answer() {
         use std::sync::Mutex;
@@ -10913,15 +10939,16 @@ mod tests {
             cx.subscribe(
                 &thread,
                 move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
-                    if let super::ThreadEvent::ToolCallAuthorization { id, .. } = ev {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, input, .. } = ev {
+                        let label = input["questions"][0]["options"][0]["label"]
+                            .as_str()
+                            .expect("escalation card carries option labels")
+                            .to_string();
                         auto_responder.update(cx, |t, cx| {
                             t.respond_authorization(
                                 id,
                                 super::ToolAuthorizationResponse::AskUserQuestion {
-                                    answers: vec![(
-                                        "Approve?".to_string(),
-                                        "Allow once".to_string(),
-                                    )],
+                                    answers: vec![("Approve?".to_string(), label)],
                                     response: None,
                                 },
                                 cx,

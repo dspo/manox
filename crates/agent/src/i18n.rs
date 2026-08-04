@@ -293,4 +293,25 @@ mod tests {
         set_lang(Language::ZhCn);
         assert_eq!(current(), Language::ZhCn);
     }
+
+    /// The escalation card's decision vocabulary must exist in both locales:
+    /// the verdict parser matches the card's own payload labels, and a missing
+    /// key renders as the key itself, which would still match — but only
+    /// because both sides degrade identically. Pin the real strings so a
+    /// rename or a dropped translation fails loudly here.
+    #[test]
+    fn escalation_labels_localized() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
+        set_lang(Language::En);
+        assert_eq!(t("workspace-escalation-allow-once").as_ref(), "Allow once");
+        assert_eq!(
+            t("workspace-escalation-always-allow").as_ref(),
+            "Always allow"
+        );
+        assert_eq!(t("workspace-escalation-deny").as_ref(), "Deny");
+        set_lang(Language::ZhCn);
+        assert_eq!(t("workspace-escalation-allow-once").as_ref(), "允许一次");
+        assert_eq!(t("workspace-escalation-always-allow").as_ref(), "始终允许");
+        assert_eq!(t("workspace-escalation-deny").as_ref(), "拒绝");
+    }
 }
