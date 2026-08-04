@@ -147,11 +147,13 @@ impl BashOperations for PersistentShellOperations {
             // the spawned groups orphaned. Reap them now that the `run_string`
             // borrow is released.
             if matches!(outcome, Outcome::Cancelled | Outcome::TimedOut) {
+                // brush only tracks stopped/background jobs, so a foreground
+                // command may not be reaped here; it exits on its own. The
+                // job table is left intact — a previous `&` task must stay
+                // waitable across a cancelled run.
                 kill_jobs(sh, libc::SIGTERM);
                 tokio::time::sleep(Duration::from_millis(CANCELLATION_GRACE_MS)).await;
                 kill_jobs(sh, libc::SIGKILL);
-                let _ = sh.jobs_mut().poll();
-                sh.jobs_mut().jobs.clear();
             }
 
             // `params` drops here, closing the pipe write ends so the readers
@@ -421,7 +423,7 @@ mod tests {
         assert!(matches!(result, Err(ExecutionError::Aborted)));
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "the sleeping command is killed, not awaited"
+            "the cancelled run returns promptly, not after the command exits"
         );
     }
 

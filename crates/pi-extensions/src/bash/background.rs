@@ -22,8 +22,12 @@ const GC_AFTER_EXIT: Duration = Duration::from_secs(300);
 struct TaskEntry {
     /// All bytes seen so far (front-dropped past `MAX_BUFFER_BYTES`).
     buffer: Mutex<Vec<u8>>,
-    /// Byte offset the last `poll` read up to.
-    read_cursor: Mutex<usize>,
+    /// Logical byte offset the last `poll` read up to, relative to the
+    /// stream start (front-dropped bytes are accounted via `total_drained`).
+    read_cursor: Mutex<u64>,
+    /// Bytes dropped from the front of the ring, so the buffer's first byte
+    /// corresponds to logical offset `total_drained`.
+    total_drained: AtomicU64,
     /// Total bytes ever produced (even after the ring drops old bytes).
     total_bytes: AtomicU64,
     /// `None` while running, `Some(Some(code))` on clean exit, `Some(None)`
@@ -42,6 +46,7 @@ impl TaskEntry {
         TaskEntry {
             buffer: Mutex::new(Vec::new()),
             read_cursor: Mutex::new(0),
+            total_drained: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
             exit_code: Mutex::new(None),
             child: Mutex::new(Some(child)),
@@ -56,6 +61,8 @@ impl TaskEntry {
         let overflow = buf.len().saturating_sub(MAX_BUFFER_BYTES);
         if overflow > 0 {
             buf.drain(..overflow);
+            self.total_drained
+                .fetch_add(overflow as u64, Ordering::Relaxed);
         }
         self.total_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -144,6 +151,7 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
             .arg(command)
             .current_dir(cwd)
             .process_group(0)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -178,8 +186,12 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
         let buf = entry.buffer.lock().expect("buffer lock poisoned");
 
         let mut cursor = entry.read_cursor.lock().expect("cursor lock poisoned");
-        let new_output = String::from_utf8_lossy(&buf[*cursor..]).to_string();
-        *cursor = buf.len();
+        // The buffer's first byte sits at logical offset `total_drained`, so
+        // the read start is the cursor clamped into the retained window.
+        let drained = entry.total_drained.load(Ordering::Relaxed);
+        let start = cursor.saturating_sub(drained).min(buf.len() as u64) as usize;
+        let new_output = String::from_utf8_lossy(&buf[start..]).to_string();
+        *cursor = drained + buf.len() as u64;
         let is_running = entry
             .exit_code
             .lock()
@@ -202,6 +214,16 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
             .cloned()
             .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
         entry.touch();
+        // An exited task's group id may have been recycled by the OS; do not
+        // signal it.
+        if entry
+            .exit_code
+            .lock()
+            .expect("exit lock poisoned")
+            .is_some()
+        {
+            return Ok(());
+        }
         // Signal the recorded process group; the child handle is not touched
         // so no mutex guard crosses an await.
         let pid = *entry.pid.lock().expect("pid lock poisoned");
@@ -408,5 +430,28 @@ mod tests {
         }
         assert!(saw_one, "first command output observed");
         assert!(saw_two, "second command output observed");
+    }
+
+    #[tokio::test]
+    async fn poll_survives_ring_buffer_overflow() {
+        let registry = BackgroundRegistry::new();
+        // Output far past the ring cap, then a tail marker: the logical read
+        // cursor must keep incrementing past front-dropped bytes.
+        let id = registry
+            .spawn(
+                "head -c 400000 /dev/zero | tr '\\0' a; echo MARKER; sleep 0.2; echo TAIL",
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        let mut saw_tail = false;
+        for _ in 0..200 {
+            let poll = registry.poll(&id).await.unwrap();
+            if poll.new_output.contains("TAIL") {
+                saw_tail = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_tail, "output after overflow is still observable");
     }
 }

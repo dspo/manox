@@ -63,9 +63,10 @@ impl AgentTool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a shell command. State (cwd, exported vars, functions) persists across calls. \
-         Optionally run in the background with `run_in_background: true` and collect output via \
-         `bash_output`; stop it with `task_stop`. Use `head_lines`/`tail_lines` to keep a \
-         selection of the output instead of piping through `head`/`tail`."
+         Optionally run in the background with `run_in_background: true` — the command starts in a \
+         fresh shell (no persistent state) at the session cwd — and collect output via `bash_output`; \
+         stop it with `task_stop`. Use `head_lines`/`tail_lines` to keep a selection of the output \
+         instead of piping through `head`/`tail`."
     }
 
     fn is_read_only(&self) -> bool {
