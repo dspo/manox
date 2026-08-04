@@ -13,6 +13,7 @@ members = [
     "crates/agent",
     "crates/agent-ui",
     "crates/manox",
+    "crates/pi",
     "crates/terminal",
     "crates/terminal-ui",
     "crates/components",
@@ -43,6 +44,7 @@ lsp = { path = "crates/lsp" }
 manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
+pi = { path = "crates/pi" }
 
 anyhow = "1"
 async-channel = "2"
@@ -57,6 +59,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["derive"] }
+jsonschema = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 zstd = "0.13"
@@ -70,6 +73,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
+regex = "1"
 # markdown-rs (mdast) — markdown 解析。经 gpui-component 已在 Cargo.lock,workspace 声明复用同一版本。
 markdown = "1"
 # ropey — SyntaxHighlighter::update 接收 &Rope;版本对齐 gpui-component 在 Cargo.lock 锁定的 2.0.0-beta.1。

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Port Pi to Rust"
+  short_description: "Port and track TS Pi core in Rust"
+  default_prompt: "Use $port-pi to compare the latest TS Pi core with crate pi and implement the next parity slice."

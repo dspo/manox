@@ -1,0 +1,23 @@
+input: "Run $1 then $2. All: $@. Slice: ${@:2}. Slice3: ${@:1:2}. Args: $ARGUMENTS."
+args: ["build","test","lint"]
+expected: "Run build then test. All: build test lint. Slice: test lint. Slice3: build test. Args: build test lint."
+
+input: "Pos: ${1:-fallback}. Empty: ${2:-fallback}. All: ${@:-fallback}. Args: ${ARGUMENTS:-fallback}."
+args: ["build"]
+expected: "Pos: build. Empty: fallback. All: build. Args: build."
+
+input: "No args: ${1:-x} ${@:-none} ${ARGUMENTS:-none} $1 $@."
+args: []
+expected: "No args: x none none  ."
+
+input: "$0 | ${0:-def} | $1 | ${@:0} | ${@:2:1} | ${@:9}"
+args: ["a","b"]
+expected: " | def | a | a b | b | "
+
+input: "Keep literal args: $1 $2."
+args: ["$@ and $ARGUMENTS and $1"]
+expected: "Keep literal args: $@ and $ARGUMENTS and $1 ."
+
+input: "Slice bounds: ${@:5} | ${@:2:1} | ${@:1:9}."
+args: ["a","b","c"]
+expected: "Slice bounds:  | b | a b c."

@@ -1,0 +1,24 @@
+roles: ["user","assistant","assistant","assistant","custom","branchSummary","compactionSummary"]
+readFiles: ["b.rs"]
+modifiedFiles: ["a.rs","old.rs"]
+conversation:
+[User]: first
+
+[Assistant]: hi
+
+[Assistant tool calls]: write(path="a.rs")
+
+[Assistant tool calls]: read(path="b.rs")
+
+[User]: custom note
+
+[User]: The following is a summary of a branch that this conversation came back from:
+
+<summary>
+prior branch</summary>
+
+[User]: The conversation history before this point was compacted into the following summary:
+
+<summary>
+prior compaction
+</summary>
