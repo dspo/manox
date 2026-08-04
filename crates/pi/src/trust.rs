@@ -81,12 +81,14 @@ impl TrustManager {
     pub fn load(path: &Path) -> Result<Self, anyhow::Error> {
         match std::fs::read_to_string(path) {
             Ok(json) => {
-                let wire: HashMap<String, bool> = serde_json::from_str(&json)
+                // A cleared decision is written as `null`, so an entry may hold
+                // one; it reads as undecided, the same as an absent key.
+                let wire: HashMap<String, Option<bool>> = serde_json::from_str(&json)
                     .map_err(|e| anyhow::anyhow!("invalid trust file {}: {e}", path.display()))?;
                 Ok(TrustManager {
                     decisions: wire
                         .into_iter()
-                        .map(|(k, v)| (PathBuf::from(k), v))
+                        .filter_map(|(k, v)| v.map(|v| (PathBuf::from(k), v)))
                         .collect(),
                 })
             }
@@ -170,5 +172,23 @@ mod tests {
     fn load_missing_file_is_no_decisions() {
         let loaded = TrustManager::load(Path::new("/nonexistent/trust.json")).unwrap();
         assert_eq!(loaded.check(Path::new("/proj")), TrustStatus::Undecided);
+    }
+
+    #[test]
+    fn a_cleared_decision_loads_as_undecided() {
+        // Clearing a decision writes `null` for that path, so a real trust
+        // file can hold one; it must read as undecided, not as a parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        std::fs::write(
+            &path,
+            r#"{"/a/trusted": true, "/a/blocked": false, "/a/cleared": null}"#,
+        )
+        .unwrap();
+
+        let tm = TrustManager::load(&path).expect("a null entry must not fail the load");
+        assert_eq!(tm.check(Path::new("/a/trusted")), TrustStatus::Trusted);
+        assert_eq!(tm.check(Path::new("/a/blocked")), TrustStatus::Untrusted);
+        assert_eq!(tm.check(Path::new("/a/cleared")), TrustStatus::Undecided);
     }
 }

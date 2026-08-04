@@ -21,7 +21,7 @@ impl FindTool {
     /// Default max output lines.
     const DEFAULT_MAX_LINES: usize = 2000;
     /// Default limit for results.
-    const DEFAULT_LIMIT: usize = 200;
+    const DEFAULT_LIMIT: usize = 1000;
 }
 
 #[async_trait::async_trait]

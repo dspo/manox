@@ -23,8 +23,8 @@ impl GrepTool {
     const DEFAULT_MAX_BYTES: usize = 128 * 1024;
     /// Default max output lines.
     const DEFAULT_MAX_LINES: usize = 2000;
-    /// Default max matches.
-    const DEFAULT_LIMIT: usize = 200;
+    /// Default max matches, matching the upstream tool.
+    const DEFAULT_LIMIT: usize = 100;
 }
 
 #[async_trait::async_trait]
@@ -252,10 +252,17 @@ fn search_files(
                 continue;
             }
 
+            // Paths read relative to the search root: an absolute path repeats
+            // the root on every match, spending context on nothing.
+            let display_path = path
+                .strip_prefix(search_path)
+                .unwrap_or(path)
+                .display()
+                .to_string();
             let formatted = if context_lines > 0 {
-                format_with_context(&lines, line_idx, context_lines, path)
+                format_with_context(&lines, line_idx, context_lines, &display_path)
             } else {
-                format!("{}:{}:{}", path.display(), line_idx + 1, line)
+                format!("{display_path}:{}:{}", line_idx + 1, line)
             };
 
             if !matched_paths.iter().any(|p| p == path) {
@@ -269,12 +276,12 @@ fn search_files(
 }
 
 /// Format a match with surrounding context lines.
-fn format_with_context(lines: &[&str], line_idx: usize, context: usize, path: &Path) -> String {
+fn format_with_context(lines: &[&str], line_idx: usize, context: usize, path: &str) -> String {
     let start = line_idx.saturating_sub(context);
     let end = (line_idx + context + 1).min(lines.len());
 
     let mut output = String::new();
-    output.push_str(&format!("--- {} ---\n", path.display()));
+    output.push_str(&format!("--- {path} ---\n"));
 
     for (i, line) in lines.iter().enumerate().take(end).skip(start) {
         let marker = if i == line_idx { ">" } else { " " };
@@ -307,9 +314,29 @@ mod tests {
     }
 
     #[test]
+    fn matches_report_paths_relative_to_the_search_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("hit.rs"), "fn needle() {}\n").unwrap();
+
+        let regex = RegexBuilder::new("needle").build().unwrap();
+        let (matches, _) = search_files(dir.path(), &regex, &None, 0, 10);
+        let output = matches.join("\n");
+        assert!(
+            output.contains("src/deep/hit.rs:1:"),
+            "path must be relative to the search root: {output}"
+        );
+        assert!(
+            !output.contains(&dir.path().display().to_string()),
+            "the absolute root must not repeat on every match: {output}"
+        );
+    }
+
+    #[test]
     fn test_format_with_context() {
         let lines: Vec<&str> = vec!["line0", "line1", "line2", "line3", "line4"];
-        let output = format_with_context(&lines, 2, 1, Path::new("test.txt"));
+        let output = format_with_context(&lines, 2, 1, "test.txt");
         assert!(output.contains("test.txt"));
         assert!(output.contains("> 3:line2"));
         assert!(output.contains("  2:line1"));
