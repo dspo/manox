@@ -76,14 +76,6 @@ pub struct FileOperations {
 /// The compaction preparation handed to the `session_before_compact` hook:
 /// the exact messages being summarized and kept, plus the surrounding context
 /// the summarization folds in (previous summary, file operations, settings).
-///
-/// This is a *partial* mirror of the TS `CompactionPreparation`: split-turn
-/// compaction is not implemented (the Rust cut always lands on a whole-turn
-/// boundary), so `turn_prefix_messages` is always empty and `is_split_turn` is
-/// always false. A single turn that exceeds the keep-recent window is kept
-/// intact rather than split-and-merged; closing that gap is tracked separately
-/// — half-implementing the cut without the dual summarization would drop the
-/// prefix messages, so the field stays structurally present but inert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPreparation {
@@ -93,11 +85,14 @@ pub struct CompactionPreparation {
     pub first_kept_entry_id: Option<String>,
     /// The messages replaced by the summary.
     pub messages_to_summarize: Vec<AgentMessage>,
-    /// Messages prefixing a split turn's retained suffix — always empty here.
+    /// The discarded prefix of a split turn, summarized separately from the
+    /// history so the retained suffix keeps its tool chain intact. Empty when
+    /// the cut landed on a whole-turn boundary.
     pub turn_prefix_messages: Vec<AgentMessage>,
     /// The messages kept intact after the boundary.
     pub retained_tail: Vec<AgentMessage>,
-    /// Whether the cut splits an in-progress turn — always false here.
+    /// Whether the cut splits a turn, selecting the dual-summarization path
+    /// over the single-call one.
     pub is_split_turn: bool,
     /// Estimated context tokens before compaction.
     pub tokens_before: u64,
@@ -639,9 +634,7 @@ pub fn build_turn_prefix_prompt(prefix_messages: &[AgentMessage]) -> String {
 ///
 /// Returns `None` when nothing would be summarized — mirroring TS
 /// `prepareCompaction` returning `undefined`, which the session layer answers
-/// with "Nothing to compact". Split-turn is not implemented (see
-/// [`CompactionPreparation`]); the cut stays on a whole-turn boundary, so
-/// `turn_prefix_messages` is empty and `is_split_turn` is false.
+/// with "Nothing to compact".
 pub fn build_preparation(
     branch: &[SessionTreeEntry],
     messages: &[AgentMessage],

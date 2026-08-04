@@ -2669,9 +2669,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         // The hook fires after the cut analysis — mirroring TS, which prepares
         // the compaction then emits the event with `preparation` +
         // `branchEntries` — so the handler decides on the specific content.
-        // The typed event carries the full TS `CompactionPreparation`
-        // (split-turn is always false here) plus the session branch and custom
-        // instructions, rather than a trimmed ad-hoc payload.
+        // The typed event carries the full TS `CompactionPreparation` plus the
+        // session branch and custom instructions, rather than a trimmed ad-hoc
+        // payload.
         let event = SessionBeforeCompactEvent {
             kind: "session_before_compact",
             preparation: &preparation,
@@ -6343,7 +6343,7 @@ pub(crate) mod tests {
                 .get("isSplitTurn")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true),
-            "the Rust port never splits a turn"
+            "this transcript's cut lands on a whole-turn boundary"
         );
         let messages_to_summarize = preparation
             .get("messagesToSummarize")
@@ -6361,14 +6361,13 @@ pub(crate) mod tests {
             !retained_tail.is_empty(),
             "retainedTail holds the kept suffix"
         );
-        // The Rust port has no split-turn prefix.
         assert!(
             preparation
                 .get("turnPrefixMessages")
                 .and_then(|v| v.as_array())
                 .map(|a| a.is_empty())
                 .unwrap_or(false),
-            "turnPrefixMessages is always empty"
+            "a whole-turn cut contributes no turn prefix"
         );
         // No prior compaction on this branch.
         assert!(
