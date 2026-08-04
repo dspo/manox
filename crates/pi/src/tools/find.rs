@@ -21,7 +21,7 @@ impl FindTool {
     /// Default max output lines.
     const DEFAULT_MAX_LINES: usize = 2000;
     /// Default limit for results.
-    const DEFAULT_LIMIT: usize = 200;
+    const DEFAULT_LIMIT: usize = 1000;
 }
 
 #[async_trait::async_trait]
@@ -117,11 +117,16 @@ impl AgentTool for FindTool {
                 break;
             }
 
-            // Emit paths relative to the search root.
-            let display_path = if let Ok(rel) = path.strip_prefix(&search_path) {
-                rel.display().to_string()
-            } else {
-                path.display().to_string()
+            // Emit paths relative to the search root. Searching a single file
+            // strips to nothing, so that case falls back to the file name
+            // rather than emitting an empty line.
+            let display_path = match path.strip_prefix(&search_path) {
+                Ok(rel) if rel.as_os_str().is_empty() => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                Ok(rel) => rel.display().to_string(),
+                Err(_) => path.display().to_string(),
             };
 
             results.push(display_path);
@@ -167,6 +172,54 @@ fn resolve_path(ctx: &dyn ToolContext, path_str: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Searching a single file strips the root to nothing, so the result must
+    /// fall back to the file name rather than emitting a blank line.
+    #[tokio::test]
+    async fn searching_a_single_file_reports_its_name() {
+        struct Ctx {
+            env: crate::env::TokioExecutionEnv,
+            cwd: PathBuf,
+            state: crate::tool::ToolState,
+        }
+        impl ToolContext for Ctx {
+            fn env(&self) -> &dyn crate::env::ExecutionEnv {
+                &self.env
+            }
+            fn cwd(&self) -> &Path {
+                &self.cwd
+            }
+            fn tool_state(&self) -> &crate::tool::ToolState {
+                &self.state
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.rs"), "x").unwrap();
+        let ctx = Ctx {
+            env: crate::env::TokioExecutionEnv::new(dir.path()),
+            cwd: dir.path().to_path_buf(),
+            state: crate::tool::ToolState::new(),
+        };
+
+        let result = FindTool
+            .execute(
+                "t1",
+                serde_json::json!({ "pattern": "*.rs", "path": "target.rs" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text: {other:?}"),
+        };
+        assert!(
+            text.contains("target.rs"),
+            "a single-file search must name the file: {text}"
+        );
+    }
 
     #[test]
     fn test_find_tool_schema() {
