@@ -5044,7 +5044,9 @@ impl Thread {
                 // wins over any supplemental text; a reply with no selection
                 // is not an approval. Matched against the labels captured at
                 // card construction above — the exact strings the drawer
-                // displayed — not re-resolved here.
+                // displayed — not re-resolved here. An unrecognized answer
+                // falls through to Deny by design: a conservative default,
+                // not a missed match arm.
                 if answers
                     .iter()
                     .any(|(_, a)| a.as_str() == always_allow_label.as_str())
@@ -10999,6 +11001,97 @@ mod tests {
             );
         });
         let _ = std::fs::remove_file("/tmp/manox-escalated-label-test.txt");
+    }
+
+    /// The Always-allow option label round-trips the same way: echoed out of
+    /// the payload (options[1], the drawer's exact path), resolved as the
+    /// AlwaysAllow verdict — session grant planted and the call runs.
+    #[test]
+    fn escalated_ask_always_allow_label_round_trip() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("escalated-always-label", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let weak = thread.downgrade();
+        let auto_responder = thread.clone();
+        cx.update(|cx| {
+            cx.subscribe(
+                &thread,
+                move |_, ev: &super::ThreadEvent, cx: &mut gpui::App| {
+                    if let super::ThreadEvent::ToolCallAuthorization { id, input, .. } = ev {
+                        let label = input["questions"][0]["options"][1]["label"]
+                            .as_str()
+                            .expect("escalation card carries option labels")
+                            .to_string();
+                        auto_responder.update(cx, |t, cx| {
+                            t.respond_authorization(
+                                id,
+                                super::ToolAuthorizationResponse::AskUserQuestion {
+                                    answers: vec![("Approve?".to_string(), label)],
+                                    response: None,
+                                },
+                                cx,
+                            );
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_escalated_always_label".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-escalated-always-label-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_escalated_approval_inner(
+                        weak,
+                        super::EscalatedCall {
+                            tu,
+                            reason: "reviewer flagged it".to_string(),
+                        },
+                        CancellationToken::new(),
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "escalated approval failed: {:?}", res.err());
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            assert!(
+                t.permission.is_always_allowed(crate::tools::WRITE),
+                "AlwaysAllow label must plant a session grant"
+            );
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(
+                !result.is_error,
+                "label-approved call must run, got: {}",
+                result.content
+            );
+        });
+        let _ = std::fs::remove_file("/tmp/manox-escalated-always-label-test.txt");
     }
 
     /// An escalated `Ask` verdict denied by the user feeds the denial back
