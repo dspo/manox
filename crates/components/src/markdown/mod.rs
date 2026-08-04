@@ -1123,6 +1123,9 @@ fn list_block(
                 .w_full()
                 .min_w_0()
                 .gap_2()
+                // `h_flex()` centers cross-axis by default; pin the marker to
+                // the first line so a wrapped or nested item never floats it.
+                .items_start()
                 .child(
                     div()
                         .w(px(16.))
