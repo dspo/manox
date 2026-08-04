@@ -8,59 +8,93 @@
 //! module maps them all onto [`ProviderError::Overflow`], which the loop layer
 //! answers with a single compact-and-retry.
 
+use std::sync::LazyLock;
+
+use regex::{RegexSet, RegexSetBuilder};
+
 use crate::provider::ProviderError;
 
-/// Lowercase message fragments meaning "input too large", gathered across
-/// providers (Anthropic / OpenAI / Gemini / DashScope / Ollama /
-/// llama.cpp-style servers / Bedrock). Plain substrings — no regex dependency.
-const OVERFLOW_PATTERNS: &[&str] = &[
-    "context_length_exceeded",
-    "context length exceeded",
-    "prompt is too long",
-    "prompt too long",
-    "request_too_large",
-    "request too large",
-    "payload too large",
-    // DashScope InvalidParameter: "Range of input length should be [1, N]".
-    "range of input length should be",
-    "input length should be",
-    "exceeds the context window",
-    "exceed the context window",
-    "context window exceeded",
-    "maximum context length",
-    "exceeds the maximum",
-    "too many tokens",
-    "token limit exceeded",
-    "reduce the length",
-    "reduce your prompt",
-    "input is too long",
-    "input too long",
-];
+/// Message shapes meaning "input too large", gathered across providers.
+///
+/// The patterns are anchored on the digits and structure each provider emits
+/// rather than on bare keywords, because the two failure directions are not
+/// symmetric: a false positive routes a *retryable* failure into the
+/// non-retryable overflow path, spending a compaction and forfeiting the
+/// retry budget for a request that would have succeeded, while a false
+/// negative merely leaves the user to compact by hand. So `exceeds the
+/// maximum` alone is not enough — "temperature exceeds the maximum allowed
+/// value" must not match.
+static OVERFLOW_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSetBuilder::new([
+        r"prompt is too long",                    // Anthropic token overflow
+        r"request_too_large",                     // Anthropic byte-size overflow (413)
+        r"input is too long for requested model", // Amazon Bedrock
+        r"exceeds the context window",            // OpenAI Completions & Responses
+        r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // LiteLLM-style proxies
+        r"input token count.*exceeds the maximum", // Google Gemini
+        r"maximum prompt length is \d+",           // xAI
+        r"reduce the length of the messages",      // Groq
+        r"maximum context length is \d+ tokens",   // OpenRouter
+        r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", // OpenRouter/Poolside
+        r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)", // Together AI
+        r"exceeds the limit of \d+",           // GitHub Copilot
+        r"exceeds the available context size", // llama.cpp
+        r"greater than the context length",    // LM Studio
+        r"context window exceeds limit",       // MiniMax
+        r"exceeded model token limit",         // Kimi For Coding
+        r"too large for model with \d+ maximum context length", // Mistral
+        r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?", // DS4
+        r"model_context_window_exceeded",      // z.ai
+        r"prompt too long; exceeded (?:max )?context length", // Ollama
+        r"range of input length should be",    // DashScope / Qwen
+        r"context[_ ]length[_ ]exceeded",
+        r"too many tokens",
+        r"token limit exceeded",
+        r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)", // Cerebras: status line, empty body
+    ])
+    .case_insensitive(true)
+    .build()
+    .expect("overflow patterns are valid regexes")
+});
 
-/// Lowercase fragments that look overflow-adjacent but mean throttling or
-/// quota — checked first so a transient rate limit is never misrouted into
-/// the (non-retryable) overflow path. Bedrock throttles with "Too many
-/// tokens, please wait", which would otherwise match `too many tokens`.
-const EXCLUSION_PATTERNS: &[&str] = &[
-    "rate limit",
-    "rate_limit",
-    "too many requests",
-    "throttl",
-    "please wait",
-    "quota",
-    "insufficient",
-];
+/// Message shapes that look overflow-adjacent but mean throttling, quota, or
+/// billing — checked first so a transient limit is never misrouted into the
+/// non-retryable overflow path.
+///
+/// Deliberately broader than the TS set. TS anchors its Bedrock exclusion on
+/// `^Throttling error:`, prose its own `formatBedrockError` produces; this
+/// crate ships no Bedrock adapter and so sees the raw AWS body
+/// `ThrottlingException: Too many tokens, please wait before trying again.`,
+/// which fails that anchor while matching `too many tokens`. Keeping the
+/// unanchored fragments is what stops the false positive the TS pattern set
+/// only avoids by virtue of its normalizing layer.
+static EXCLUSION_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSetBuilder::new([
+        r"^(?:throttling error|service unavailable):",
+        r"rate[ _]limit",
+        r"too many requests",
+        r"throttl",
+        r"please wait",
+        r"quota",
+        r"insufficient",
+    ])
+    .case_insensitive(true)
+    .build()
+    .expect("exclusion patterns are valid regexes")
+});
 
 /// Whether a provider failure describes a context-window overflow.
+///
+/// A 413 short-circuits on the status alone: the status is stronger evidence
+/// than any body match, and an empty-bodied 413 carries no text to match.
 pub fn classify(status: Option<u16>, body: &str) -> bool {
-    let body = body.to_lowercase();
-    if EXCLUSION_PATTERNS.iter().any(|p| body.contains(p)) {
+    if EXCLUSION_PATTERNS.is_match(body) {
         return false;
     }
     if status == Some(413) {
         return true;
     }
-    OVERFLOW_PATTERNS.iter().any(|p| body.contains(p))
+    OVERFLOW_PATTERNS.is_match(body)
 }
 
 /// Build the terminal error for a rejected handshake, classifying overflow.
@@ -175,6 +209,88 @@ mod tests {
         let body =
             r#"{"error":{"message":"invalid temperature: only 0.6 is allowed for this model"}}"#;
         assert!(!classify(Some(400), body));
+    }
+
+    #[test]
+    fn keyword_only_matches_are_not_overflow() {
+        // Each of these contains a fragment an unanchored keyword set would
+        // match, in a message that has nothing to do with the context window.
+        for body in [
+            "invalid temperature: exceeds the maximum allowed value",
+            "the requested image size exceeds the limit of this endpoint",
+            "please reduce the length of your model name",
+            "payload too large: attachment exceeds 20MB",
+        ] {
+            assert!(!classify(Some(400), body), "{body}");
+        }
+    }
+
+    #[test]
+    fn provider_shapes_with_digits_are_overflow() {
+        for body in [
+            // xAI
+            "This model's maximum prompt length is 131072 but the request contains 537812 tokens",
+            // Together AI
+            "The input (265330 tokens) is longer than the model's context length (262144 tokens).",
+            // DS4
+            "Prompt has 5000 tokens, but the configured context size is 4096 tokens",
+            // Mistral
+            "Prompt contains 9001 tokens, too large for model with 8192 maximum context length",
+            // LiteLLM-style proxy
+            "Requested token count exceeds the model's maximum context length of 131072 tokens",
+            // OpenAI-compatible parenthesized form
+            "Input length (265330) exceeds model's maximum context length (262144).",
+            // Google Gemini
+            "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+            // OpenRouter/Poolside
+            "Input length 300000 exceeds the maximum allowed input length of 262144 tokens.",
+            // GitHub Copilot
+            "prompt token count of 150000 exceeds the limit of 128000",
+            // Kimi For Coding
+            "Your request exceeded model token limit: 131072 (requested: 200000)",
+            // llama.cpp
+            "the request exceeds the available context size, try increasing it",
+            // LM Studio
+            "tokens to keep from the initial prompt is greater than the context length",
+            // MiniMax
+            "invalid params, context window exceeds limit",
+            // Ollama
+            "prompt too long; exceeded max context length by 4096 tokens",
+            // Amazon Bedrock
+            "Input is too long for requested model",
+        ] {
+            assert!(classify(Some(400), body), "{body}");
+        }
+    }
+
+    #[test]
+    fn cerebras_empty_body_status_line_is_overflow_only_when_anchored() {
+        assert!(classify(Some(400), "400 status code (no body)"));
+        assert!(classify(Some(400), "413 (no body)"));
+        // The same text mid-sentence describes an upstream hop, not this
+        // request's input size.
+        assert!(!classify(
+            Some(500),
+            "got 400 status code (no body) from upstream"
+        ));
+    }
+
+    #[test]
+    fn raw_bedrock_throttling_is_not_overflow() {
+        // Without a Bedrock adapter the body arrives unnormalized, so the
+        // anchored `^Throttling error:` pattern TS relies on does not fire —
+        // the unanchored fragments are what keep this out of the overflow
+        // path. This is the case that pins the broader exclusion set.
+        let body = "ThrottlingException: Too many tokens, please wait before trying again.";
+        assert!(!classify(Some(429), body));
+    }
+
+    #[test]
+    fn service_unavailable_prefix_is_not_overflow() {
+        assert!(!classify(
+            Some(503),
+            "Service unavailable: too many tokens in flight"
+        ));
     }
 
     #[test]
