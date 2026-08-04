@@ -253,12 +253,17 @@ fn search_files(
             }
 
             // Paths read relative to the search root: an absolute path repeats
-            // the root on every match, spending context on nothing.
-            let display_path = path
-                .strip_prefix(search_path)
-                .unwrap_or(path)
-                .display()
-                .to_string();
+            // the root on every match, spending context on nothing. Searching a
+            // single file strips to nothing, so that case falls back to the
+            // file name rather than emitting an empty path.
+            let display_path = match path.strip_prefix(search_path) {
+                Ok(rel) if rel.as_os_str().is_empty() => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                Ok(rel) => rel.display().to_string(),
+                Err(_) => path.display().to_string(),
+            };
             let formatted = if context_lines > 0 {
                 format_with_context(&lines, line_idx, context_lines, &display_path)
             } else {
@@ -330,6 +335,23 @@ mod tests {
         assert!(
             !output.contains(&dir.path().display().to_string()),
             "the absolute root must not repeat on every match: {output}"
+        );
+    }
+
+    #[test]
+    fn searching_a_single_file_reports_its_name() {
+        // Stripping the search root off the root itself leaves nothing, so this
+        // case must fall back to the file name or the match loses its path.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("target.rs");
+        std::fs::write(&file, "fn needle() {}\n").unwrap();
+
+        let regex = RegexBuilder::new("needle").build().unwrap();
+        let (matches, _) = search_files(&file, &regex, &None, 0, 10);
+        let output = matches.join("\n");
+        assert!(
+            output.starts_with("target.rs:1:"),
+            "a single-file search must still name the file: {output}"
         );
     }
 

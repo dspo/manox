@@ -191,4 +191,21 @@ mod tests {
         assert_eq!(tm.check(Path::new("/a/blocked")), TrustStatus::Untrusted);
         assert_eq!(tm.check(Path::new("/a/cleared")), TrustStatus::Undecided);
     }
+
+    #[test]
+    fn a_cleared_decision_does_not_stop_the_ancestor_walk() {
+        // `findNearestTrustEntry` returns only on an explicit true/false, so a
+        // cleared entry falls through and the walk continues upward. Verified
+        // by executing the upstream function's own logic: with
+        // {"/a": true, "/a/b": null} it resolves /a/b/c to trusted via /a.
+        // Pinned because the intuitive reading — "cleared means stop" — is
+        // wrong and would silently distrust projects their parent trusts.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust.json");
+        std::fs::write(&path, r#"{"/a": true, "/a/b": null}"#).unwrap();
+
+        let tm = TrustManager::load(&path).unwrap();
+        assert_eq!(tm.check(Path::new("/a/b/c")), TrustStatus::Trusted);
+        assert_eq!(tm.check(Path::new("/a/b")), TrustStatus::Trusted);
+    }
 }
