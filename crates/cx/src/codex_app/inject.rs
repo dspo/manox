@@ -120,16 +120,19 @@ const PATCH_BODY: &str = r#"(function () {
     return null;
   }
 
-  // 一个数组是否「看起来是模型描述符数组」（元素含 string model 字段）。
-  function modelArrayPatchable(v, allowEmpty) {
-    return Array.isArray(v) && (allowEmpty || v.length > 0) &&
+  // 一个数组是否「看起来是模型描述符数组」（非空、元素含 string model 字段）。
+  // 纯字符串数组（模型名列表，如 available_models）绝不在此替换——renderer 的
+  // effort 下拉把描述符数组喂给 .flatMap(({supportedReasoningEfforts}) => …)，
+  // 若把字符串数组换成描述符（或反之），字段解构即抛 TypeError 崩掉整个页面。
+  function isDescriptorArray(v) {
+    return Array.isArray(v) && v.length > 0 &&
       v.every(function (x) { return x && typeof x === "object" && typeof x.model === "string"; });
   }
   // 把一个模型描述符数组**原地替换**为我们的模型列表（保留同一数组引用，使 React 持有的引用仍指向它）。
   // CDP 实测：子菜单 UI 渲染时不按 `hidden` 过滤，且似乎只取数组前几项——因此「追加+隐藏」无效，
   // 必须清空原生、只填自定义模型（用 splice 原地改，不能换引用）。
-  function patchModelArray(models, allowEmpty) {
-    if (!modelArrayPatchable(models, allowEmpty)) return false;
+  function patchModelArray(models) {
+    if (!isDescriptorArray(models)) return false;
     // 已经是「仅我们的模型」就跳过（避免重复 splice 触发无谓变更）。
     const already = models.length === CX_MODELS.length &&
       models.every(function (it) { return CX_NAMES.indexOf(it.model) >= 0; });
@@ -138,24 +141,26 @@ const PATCH_BODY: &str = r#"(function () {
     Array.prototype.splice.apply(models, [0, models.length].concat(replacement));
     return true;
   }
-  // 字符串名数组（available_models 等）。
+  // 字符串名数组（仅追加我们的模型名，不动已有内容）。
   function patchNameArray(arr) {
     if (!Array.isArray(arr) || !arr.every(function (x) { return typeof x === "string"; })) return false;
     let changed = false;
     CX_NAMES.forEach(function (n) { if (arr.indexOf(n) < 0) { arr.push(n); changed = true; } });
     return changed;
   }
-  // 对一个对象的常见模型字段做 patch。
+  // 对一个对象的已知模型字段做 patch。字段名严格白名单：绝不 patch 任意 `.models`，
+  // 因为同名属性在 React state 里可能承载字符串名数组（modelSettings.models 等），
+  // 就地改错形态会让 renderer 的 flatMap 解构崩溃。
   function patchModelContainer(v) {
     if (!v || typeof v !== "object") return false;
     let changed = false;
-    if (patchModelArray(v.models, ("defaultModel" in v) || ("availableModels" in v))) changed = true;
-    if (patchNameArray(v.models)) changed = true;
-    if (patchModelArray(v.data)) changed = true;
-    if (patchModelArray(v.result)) changed = true;
-    if (v.pages && patchModelArray(v.pages[0] && v.pages[0].data)) changed = true;
-    if (v.result && patchModelArray(v.result.data)) changed = true;
-    if (v.result && patchModelArray(v.result.models)) changed = true;
+    if (isDescriptorArray(v.models) && patchModelArray(v.models)) changed = true;
+    for (const f of ["data", "result"]) {
+      if (isDescriptorArray(v[f]) && patchModelArray(v[f])) changed = true;
+    }
+    if (v.pages && isDescriptorArray(v.pages[0] && v.pages[0].data) && patchModelArray(v.pages[0].data)) changed = true;
+    if (v.result && isDescriptorArray(v.result.data) && patchModelArray(v.result.data)) changed = true;
+    if (v.result && isDescriptorArray(v.result.models) && patchModelArray(v.result.models)) changed = true;
     for (const f of ["availableModels", "available_models"]) {
       const av = v[f];
       if (av instanceof Set) { CX_NAMES.forEach(function (n) { if (!av.has(n)) { av.add(n); changed = true; } }); }
