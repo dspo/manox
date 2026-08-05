@@ -304,12 +304,14 @@ impl TerminalView {
             }
             return;
         }
-        // Forward release to the TUI if it has captured the mouse.
+        // Forward release to the TUI if it has captured the mouse. Clear
+        // pressed_button even when mouse mode is off so a stale value does
+        // not gate MOUSE_DRAG if the TUI re-enables it later.
+        let button = self.pressed_button.take().unwrap_or(0);
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
         if mode.intersects(TermMode::MOUSE_MODE) {
             let (row, col) = self.px_to_grid(ev.position, window);
-            let button = self.pressed_button.unwrap_or(0) | modifier_bits(&ev.modifiers);
-            self.pressed_button = None;
+            let button = button | modifier_bits(&ev.modifiers);
             if let Some(report) =
                 mouse::encode(button, MouseAction::Release, col as u32, row as u32, mode)
             {
