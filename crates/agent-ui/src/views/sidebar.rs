@@ -835,9 +835,9 @@ fn build_agent_model_cascade(
     menu
 }
 
-/// Leading icon for a unified sidebar row. Threads use a generic
-/// message-square glyph; external agent sessions use their brand SVG (resolved
-/// by `ExtrasAssetSource`, tinted via `text_color`).
+/// Leading icon for a unified sidebar row. Manox threads carry the brand
+/// mark; external agent sessions use their own brand SVG (resolved by
+/// `ExtrasAssetSource`, tinted via `text_color`).
 #[derive(Clone)]
 enum RowIcon {
     Thread,
@@ -1071,8 +1071,9 @@ fn render_thread_item(
     };
 
     let leading_icon = match icon {
-        RowIcon::Thread => Icon::new(IconName::Bot)
-            .small()
+        RowIcon::Thread => gpui::svg()
+            .path("icons/manox.svg")
+            .size(px(16.))
             .text_color(theme.muted_foreground)
             .into_any_element(),
         RowIcon::External(path) => gpui::svg()
