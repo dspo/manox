@@ -1062,6 +1062,90 @@ fn injected_models_for_codex_app(
     models
 }
 
+/// 构造 ChatGPT.app 启动所需的 `Selection`：provider 下全部 Responses 模型作为注入目录，
+/// 调用方选中的默认模型置顶（`injected_models[0]` = 默认模型的既有约定，
+/// 写入 config.toml 的 `model =` 并在注入脚本里标记 `isDefault`）。
+fn build_chatgpt_selection(
+    config: &CxConfig,
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+    default_model_id: &str,
+) -> Result<Selection> {
+    let agent = find_agent(config, "Codex.app").context("配置中缺少 `Codex.app` agent")?;
+    let provider = providers_for_agent(config, "Codex.app")
+        .into_iter()
+        .find(|p| p.name == provider_name)
+        .with_context(|| format!("`Codex.app` 下未找到 provider `{provider_name}`"))?;
+    let mut injected = injected_models_for_codex_app(all_models, &provider.name);
+    if injected.is_empty() {
+        bail!(
+            "Provider `{provider_name}` 下没有支持 Responses wire api 的模型，无法注入 ChatGPT.app"
+        );
+    }
+    let index = injected
+        .iter()
+        .position(|m| m.id == default_model_id)
+        .with_context(|| {
+            format!("Provider `{provider_name}` 的注入目录中未找到模型 `{default_model_id}`")
+        })?;
+    let default_model = injected.remove(index);
+    injected.insert(0, default_model.clone());
+    Ok(Selection {
+        agent_id: agent.id,
+        agent_binary: agent.binary,
+        agent_args: agent.args,
+        agent_env: agent.env,
+        selected_wire_api: WireApi::Responses,
+        provider,
+        model: Some(default_model),
+        injected_models: injected,
+    })
+}
+
+/// ChatGPT.app 的 API Key 非交互解析（GUI 嵌入路径）：无 stdin 可补齐，缺失即报错。
+fn resolve_codex_app_apikey(provider: &ResolvedProvider) -> Result<String> {
+    let Some(source) = provider.apikey_source.as_deref() else {
+        bail!(
+            "Provider `{}` 需要 API Key 但未配置 apikey_source",
+            provider.name
+        );
+    };
+    let apikey = resolve_apikey(source)
+        .with_context(|| format!("解析 Provider `{}` 的 API Key 失败", provider.name))?;
+    if apikey.is_empty() {
+        bail!("ChatGPT.app 需要 API Key，但未提供");
+    }
+    Ok(apikey)
+}
+
+/// ChatGPT.app 的 API Key 交互解析（CLI 路径）：Keychain 缺失时提示输入并回写。
+fn resolve_codex_app_apikey_interactive(provider: &ResolvedProvider) -> Result<String> {
+    let Some(source) = provider.apikey_source.as_deref() else {
+        bail!(
+            "Provider `{}` 需要 API Key 但未配置 apikey_source",
+            provider.name
+        );
+    };
+    let apikey = resolve_apikey_interactive(source)?;
+    if apikey.is_empty() {
+        bail!("ChatGPT.app 需要 API Key，但未提供");
+    }
+    Ok(apikey)
+}
+
+/// 非交互启动 ChatGPT.app：显式指定 provider 与默认模型，无 TUI。供 GUI 嵌入方
+/// （manox 系统菜单）调用——选中模型作为默认模型，同时注入该 provider 下全部
+/// Responses 模型目录。阻塞调用（配置加载、模型列表构建、CDP 注入最长约 20s），
+/// 调用方应在后台线程执行。
+pub fn launch_chatgpt_app(provider_name: &str, default_model_id: &str) -> Result<()> {
+    let config = load_config()?;
+    let mut all_models = build_all_models(&config);
+    apply_probe_cache(&mut all_models);
+    let selection = build_chatgpt_selection(&config, &all_models, provider_name, default_model_id)?;
+    let apikey = resolve_codex_app_apikey(&selection.provider)?;
+    codex_app::launch_with_injection(&selection, &apikey, &[])
+}
+
 // ══════════════════════════════════════════════════
 // CLI definition（clap derive）
 // ══════════════════════════════════════════════════
@@ -1407,8 +1491,9 @@ fn run_launcher(
         if socket.is_some() {
             eprintln!("cx: --socket 对 Codex.app 无效（GUI detach，无 IPC 注入）");
         }
+        let apikey = resolve_codex_app_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
-        return codex_app::launch_with_injection(&selection, &passthrough_args);
+        return codex_app::launch_with_injection(&selection, &apikey, &passthrough_args);
     }
 
     let spec = build_launch_spec(&selection, &passthrough_args, pty, socket, cwd)?;
@@ -4577,6 +4662,107 @@ mod tests {
         };
 
         assert!(apply_selected_model_tab_name(&selection).is_ok());
+    }
+
+    // ── ChatGPT.app selection tests ──
+
+    fn chatgpt_test_config() -> CxConfig {
+        CxConfig {
+            providers: vec![ProviderConfig {
+                name: "TestProv".into(),
+                apikey_source: Some("literal:test".into()),
+                models: ProviderModels::Inline(BTreeMap::from([
+                    (
+                        "model-a".into(),
+                        ProviderModelConfig {
+                            wire_apis: vec!["responses".into()],
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "model-b".into(),
+                        ProviderModelConfig {
+                            wire_apis: vec!["responses".into()],
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                endpoints: BTreeMap::from([(
+                    "responses".into(),
+                    ProviderEndpointSpec::Url("https://example.com".into()),
+                )]),
+                env: BTreeMap::new(),
+            }],
+            agents: default_agent_configs(),
+        }
+    }
+
+    fn chatgpt_test_models(provider_name: &str) -> Vec<ResolvedModel> {
+        ["model-a", "model-b"]
+            .into_iter()
+            .map(|id| ResolvedModel {
+                id: id.into(),
+                desc: String::new(),
+                wire_api: WireApi::Responses,
+                model_wire_apis: vec![WireApi::Responses],
+                provider_name: provider_name.into(),
+                endpoint_url: "https://example.com".into(),
+                visible_agents: vec!["Codex.app".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: BTreeMap::new(),
+                apikey_source: None,
+                max_tokens: None,
+                context: None,
+                supports_tools: true,
+                supports_images: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_chatgpt_selection_moves_selected_default_first() {
+        let config = chatgpt_test_config();
+        let models = chatgpt_test_models("TestProv");
+        let selection = build_chatgpt_selection(&config, &models, "TestProv", "model-b").unwrap();
+        assert_eq!(selection.agent_id, "Codex.app");
+        assert_eq!(selection.selected_wire_api, WireApi::Responses);
+        assert_eq!(selection.model.as_ref().unwrap().id, "model-b");
+        let ids: Vec<&str> = selection
+            .injected_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["model-b", "model-a"]);
+        assert_eq!(selection.provider.name, "TestProv");
+    }
+
+    #[test]
+    fn build_chatgpt_selection_unknown_provider_errors() {
+        let config = chatgpt_test_config();
+        let models = chatgpt_test_models("TestProv");
+        let err = build_chatgpt_selection(&config, &models, "NoSuchProv", "model-a")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("未找到 provider"), "{err}");
+    }
+
+    #[test]
+    fn build_chatgpt_selection_unknown_model_errors() {
+        let config = chatgpt_test_config();
+        let models = chatgpt_test_models("TestProv");
+        let err = build_chatgpt_selection(&config, &models, "TestProv", "ghost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("注入目录中未找到模型"), "{err}");
+    }
+
+    #[test]
+    fn build_chatgpt_selection_empty_catalog_errors() {
+        let config = chatgpt_test_config();
+        let err = build_chatgpt_selection(&config, &[], "TestProv", "model-a")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("没有支持 Responses"), "{err}");
     }
 
     // ── env injection tests ──

@@ -5,6 +5,7 @@
 
 pub mod assets;
 pub mod browser_host;
+pub mod chatgpt_app;
 pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;
@@ -16,6 +17,8 @@ pub mod workspace;
 
 pub use views::settings::SettingsView;
 pub use workspace::Workspace;
+
+pub use chatgpt_app::LaunchChatGptApp;
 
 // Open/close the right-side markdown composer, plus the global OpenSettings
 // action that flips the Workspace into the Settings overlay. AskPrev/AskNext

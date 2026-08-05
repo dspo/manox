@@ -437,6 +437,11 @@ menu-terminal = 终端
 menu-new-terminal = 新建终端标签页
 menu-close-terminal = 关闭终端标签页
 menu-about = 关于 Manox
+menu-agent = Agent
+
+## ChatGPT.app 启动通知（Agent → ChatGPT.app 菜单级联）
+chatgpt-app-launched = 已启动 ChatGPT.app · { $provider } · { $model }
+chatgpt-app-launch-failed = 启动 ChatGPT.app 失败
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = 终端运行中… 输入以交互
@@ -541,4 +546,3 @@ background-task-status-timed-out = 已超时
 background-task-status-stopped = 已停止
 background-task-status-session-ended = 会话已结束
 background-task-stop = 停止
-

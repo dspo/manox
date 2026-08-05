@@ -11,7 +11,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### 顶层
 
-- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
+- [Window](#window) · [NativeMenuBar](#nativemenubar) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
@@ -92,6 +92,12 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 #### Window
 
 Top-level native window, title "manox", min 900×600.
+
+> Source: `manox/src/main.rs`
+
+#### NativeMenuBar
+
+macOS menu bar built by `build_app_menus()`: `manox` (About/Settings…/Quit), `Terminal` (new/close tab), and `Agent` → `ChatGPT.app` → provider → model cascade. Models mirror the provider registry snapshot filtered by `visible_agents()` containing `Codex.app` (Responses-capable models), grouped by provider. Picking a model dispatches `LaunchChatGptApp { provider, model }`, routed through the App-level action handler to `Workspace::launch_chatgpt_app`, which starts ChatGPT.app via cx's injection path on a background thread (selected model = default; the provider's full Responses catalog is injected). Text-only — gpui native menu items carry no images. Rebuilt by `i18n::rebuild_menus` on UI-language change and after a provider-registry reload.
 
 > Source: `manox/src/main.rs`
 
