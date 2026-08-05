@@ -27,6 +27,7 @@ pub mod model_alias;
 pub mod optimizer;
 pub mod path_env;
 pub mod paths;
+pub mod pi_bridge;
 pub mod plan;
 pub mod plugin;
 pub mod prefix_stability;

@@ -193,6 +193,7 @@ impl ExternalSessionSummary {
 /// `.sock` extension + parent dir). Returns `None` for paths that do not end in
 /// `.sock`. cx does not yet expose `SessionHandle::session_id()`, so this is
 /// the derivation until that lands upstream.
+#[cfg(feature = "harness-manox")]
 pub(crate) fn cx_session_id_from_socket(path: &std::path::Path) -> Option<String> {
     let file = path.file_name()?.to_str()?;
     let trimmed = file.strip_suffix(".sock")?;
@@ -249,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "harness-manox")]
     fn cx_session_id_extracted_from_socket_path() {
         let p = std::path::Path::new("/home/u/.config/cx/sessions/abcdef0123.sock");
         assert_eq!(cx_session_id_from_socket(p).as_deref(), Some("abcdef0123"));

@@ -2,8 +2,22 @@
 //!
 //! Workspace top-level view + `ConversationState` + views. Holds an
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
+//!
+//! Harness selection: `harness-manox` (default) mounts the manox harness;
+//! `harness-pi` mounts the `pi_backend` adapter over crates/pi. Exactly one
+//! must be enabled.
+
+// Exactly one harness backend must be selected.
+#[cfg(all(feature = "harness-manox", feature = "harness-pi"))]
+compile_error!(
+    "features `harness-manox` and `harness-pi` are mutually exclusive; enable exactly one"
+);
+#[cfg(not(any(feature = "harness-manox", feature = "harness-pi")))]
+compile_error!("enable one of the harness features: `harness-manox` (default) or `harness-pi`");
 
 pub mod assets;
+// TODO(pi-wire): browser tabs — the embedded webview host is a manox surface.
+#[cfg(feature = "harness-manox")]
 pub mod browser_host;
 pub mod chatgpt_app;
 pub mod cockpit;
@@ -11,6 +25,11 @@ pub mod conversation;
 pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
+// The pi harness backend — compiled only when the bin selects `harness-pi`.
+#[cfg(feature = "harness-pi")]
+pub mod pi_backend;
+// TODO(pi-wire): slash commands — backed by the manox command/skill registries.
+#[cfg(feature = "harness-manox")]
 pub mod slash_command;
 pub mod views;
 pub mod workspace;

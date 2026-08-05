@@ -21,6 +21,7 @@ use crate::views::braille_spinner::BrailleSpinner;
 #[derive(Clone, Debug)]
 pub(crate) struct SubagentInfo {
     pub id: String,
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))] // TODO(pi-wire)
     pub parent_id: Option<String>,
     pub subagent_type: String,
     pub description: String,
@@ -28,6 +29,7 @@ pub(crate) struct SubagentInfo {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct SubagentSnapshot {
     pub info: SubagentInfo,
     pub messages: Vec<Message>,
@@ -68,6 +70,7 @@ pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElem
 /// Recursively recover sub-agent navigation entries from persisted Agent tool
 /// results. The result envelope already owns the child messages, so no database
 /// schema or additional UI-note persistence is needed.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) fn snapshots_from_messages(messages: &[Message]) -> Vec<SubagentSnapshot> {
     fn visit(messages: &[Message], parent_id: Option<&str>, out: &mut Vec<SubagentSnapshot>) {
         let mut entries: HashMap<String, usize> = HashMap::new();
@@ -118,6 +121,7 @@ pub(crate) fn snapshots_from_messages(messages: &[Message]) -> Vec<SubagentSnaps
     out
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct SubagentPanel {
     info: SubagentInfo,
     child: Option<Entity<Thread>>,
@@ -127,7 +131,9 @@ pub(crate) struct SubagentPanel {
     stick_to_bottom: bool,
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 impl SubagentPanel {
+    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
     pub(crate) fn live(
         child: Entity<Thread>,
         root_thread_id: String,
@@ -168,6 +174,8 @@ impl SubagentPanel {
                         } => {
                             this.info.status = ToolCallStatus::Cancelled;
                         }
+                        // TODO(pi-wire): member/sub-agent observation panels.
+                        #[cfg(feature = "harness-manox")]
                         ThreadEvent::SubagentStarted {
                             id,
                             subagent_type,
@@ -190,6 +198,7 @@ impl SubagentPanel {
                                 );
                             });
                         }
+                        #[cfg(feature = "harness-manox")]
                         ThreadEvent::SubagentProgress { id, status, .. } => {
                             let _ = weak_workspace.update(cx, |workspace, cx| {
                                 workspace.update_subagent_status(&root_thread_id, id, *status, cx);
@@ -362,6 +371,7 @@ impl Render for SubagentPanel {
     }
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 fn build_conversation(
     child: &Entity<Thread>,
     messages: &[Message],
@@ -387,6 +397,7 @@ fn build_conversation(
     })
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
     let path = thread.read(cx).cwd();
     (!path.as_os_str().is_empty()).then(|| SharedString::from(path.to_string_lossy().to_string()))

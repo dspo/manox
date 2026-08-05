@@ -40,7 +40,10 @@ publish = false
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 agent = { path = "crates/agent" }
-agent-ui = { path = "crates/agent-ui" }
+# default-features = false so the app bin picks exactly one harness
+# feature (harness-manox / harness-pi); direct `cargo check -p agent-ui`
+# still falls back to agent-ui's own default (harness-manox).
+agent-ui = { path = "crates/agent-ui", default-features = false }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }

@@ -4,6 +4,9 @@ pub mod braille_spinner;
 pub mod browser_view;
 pub mod completion;
 pub mod composer_menu;
+// TODO(pi-wire): context rail is manox-harness chrome; kept compiled so
+// shared layout helpers (e.g. ENV_CONTENT_INSET) stay reachable.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub mod context_rail;
 pub mod management_shell;
 pub mod member_panel;
@@ -14,6 +17,8 @@ pub mod settings;
 pub mod sidebar;
 pub mod subagent_panel;
 pub mod title_menu;
+// TODO(pi-wire): turn navigator is unwired chrome under harness-pi.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub mod turn_navigator;
 
 use gpui::prelude::*;

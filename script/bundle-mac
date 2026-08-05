@@ -6,6 +6,11 @@ set -euo pipefail
 #
 # Usage: script/bundle-mac [options]
 # Options:
+#   --harness <pi|manox>  Which harness core the app is built on (default: manox).
+#                         The flavors get distinct names/identifiers from
+#                         [package.metadata.bundle.harness.<h>] in
+#                         crates/manox/Cargo.toml, so both can coexist in
+#                         /Applications.
 #   -d    Compile in debug mode
 #   -o    Open the resulting .app after bundling
 #   -i    Install the .app to /Applications
@@ -15,6 +20,7 @@ build_flag="--release"
 target_dir="release"
 open_result=false
 install_result=false
+harness="manox"
 
 help_info() {
     echo "
@@ -22,6 +28,7 @@ Usage: ${0##*/} [options]
 Bundle manox as a macOS .app.
 
 Options:
+  --harness <pi|manox>  Harness core to build (default: manox)
   -d    Compile in debug mode
   -o    Open the resulting .app after bundling
   -i    Install the .app to /Applications
@@ -29,13 +36,27 @@ Options:
 "
 }
 
-while getopts 'doih' flag; do
-    case "${flag}" in
-        o) open_result=true;;
-        d) build_flag=""; target_dir="debug";;
-        i) install_result=true;;
-        h) help_info; exit 0;;
+set_harness() {
+    harness="$1"
+    if [[ "$harness" != "pi" && "$harness" != "manox" ]]; then
+        echo "Error: --harness expects 'pi' or 'manox' (got '${harness}')"
+        exit 1
+    fi
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --harness)
+            [[ $# -ge 2 ]] || { echo "Error: --harness requires a value"; exit 1; }
+            set_harness "$2"; shift;;
+        --harness=*) set_harness "${1#--harness=}";;
+        -d) build_flag=""; target_dir="debug";;
+        -o) open_result=true;;
+        -i) install_result=true;;
+        -h|--help) help_info; exit 0;;
+        *) echo "Error: unknown option '$1'"; help_info; exit 1;;
     esac
+    shift
 done
 
 # --- Detect target triple ---
@@ -49,16 +70,38 @@ if [[ "$target_triple" != *-apple-darwin ]]; then
 fi
 
 # --- Build ---
-echo "Building manox binary"
-cargo build ${build_flag} --package manox --target "$target_triple"
+echo "Building manox binary (harness: ${harness})"
+feature_args=()
+if [[ "$harness" == "pi" ]]; then
+    feature_args=(--no-default-features --features harness-pi)
+fi
+cargo build ${build_flag} ${feature_args[@]+"${feature_args[@]}"} --package manox --target "$target_triple"
 
 # --- Read bundle configuration from Cargo.toml ---
 # Single source of truth: [package.metadata.bundle] in crates/manox/Cargo.toml.
 bundle_toml="crates/manox/Cargo.toml"
 # Extract values from the bundle section (not the [package] section).
-# The bundle "name" is the display name ("Manox"), distinct from the crate name ("manox").
-bundle_id=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^identifier = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
-app_name=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^name = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
+# The bundle "name" is the display name ("Manox"), distinct from the crate
+# name ("manox"). Per-harness tables ([package.metadata.bundle.harness.<h>])
+# override the base table so each flavor gets its own name/identifier.
+read_bundle_value() {
+    local section="$1" key="$2"
+    awk -v section="$section" -v key="$key" '
+        $0 == "[" section "]" { in_section = 1; next }
+        /^\[/ { in_section = 0 }
+        in_section && $1 == key && $2 == "=" {
+            line = $0
+            sub(/^[^"]*"/, "", line)
+            sub(/".*$/, "", line)
+            print line
+            exit
+        }
+    ' "${bundle_toml}"
+}
+bundle_id=$(read_bundle_value "package.metadata.bundle.harness.${harness}" "identifier")
+[[ -n "${bundle_id}" ]] || bundle_id=$(read_bundle_value "package.metadata.bundle" "identifier")
+app_name=$(read_bundle_value "package.metadata.bundle.harness.${harness}" "name")
+[[ -n "${app_name}" ]] || app_name=$(read_bundle_value "package.metadata.bundle" "name")
 # version is workspace-inherited; resolve via cargo metadata
 app_version=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
     | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \

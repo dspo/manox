@@ -7,6 +7,48 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ---
 
+## harness-pi 接线状态（阶段 1 基线）
+
+构建期通过 feature 选择 harness 核心：`harness-manox`（默认，现有自研
+harness）与 `harness-pi`（crates/pi + pi-extensions）。pi 侧不新建 UI——
+`agent-ui::pi_backend` 适配层让 pi 会话直接说现有 UI 的语言
+（`ThreadEvent` 流 + `agent::Message` 历史），打磨过的渲染管线
+（`build_items` / `ConversationState` / message 视图）原样复用。
+
+暂时接不了线的 UI/UX 用 `#[cfg(feature = "harness-manox")]` 跳过，
+每处紧邻 `// TODO(pi-wire): <能力>` 标记。剩余接线量 =
+`rg 'TODO\(pi-wire\)' | wc -l`。**基线：49 处**（2026-08-05，
+`codex/pi-main-path`）。
+
+| 能力 | harness-pi 状态 | 说明 |
+| --- | --- | --- |
+| 会话主路径（流式文本 / thinking / 工具卡片 / cancel） | ✅ 已接线 | `pi_backend::session` + `adapt` |
+| 单会话持久化与重启恢复 | ✅ 已接线 | pi jsonl，`pi-sessions/` 下最新会话 |
+| 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ 已接线 | 复用现有渲染管线 |
+| Composer 文本输入 / steer / abort | ✅ 已接线 | 空闲 `prompt()`，运行中 `steer()` |
+| Settings（provider 凭据 / 模型注册表） | ✅ 已接线 | provider 层是 pi 的注入式适配器 |
+| 审批（ToolCallAuthorization / AskUserQuestion / inbound 写入） | ⏳ 未接线 | 本阶段明确后排；pi 工具集全量放开 |
+| MCP | ⏳ 未接线 | init 跳过 mcp registry |
+| Sidebar / 线程列表 / 多会话 | ⏳ 未接线 | 依赖 manox thread store；pi 为固定单会话 |
+| ContextRail / Cockpit | ⏳ 未接线 | 读取 manox usage/plan/compact 状态 |
+| Plan 模式（PlanPreview / PlanReview 卡片） | ⏳ 未接线 | plan 是 manox 流程 |
+| Member / Subagent 观察面板 | ⏳ 未接线 | pi-extensions SubagentTool 已装配，观察 UI 未接 |
+| Browser 标签 | ⏳ 未接线 | webview host 是 manox surface |
+| Terminal 标签 | ⏳ 未接线 | init 未注册 terminal store |
+| Slash commands / skills / @mentions | ⏳ 未接线 | 依赖 manox command/skill/agent_def 注册表 |
+| 图片附件 / Plus 菜单 | ⏳ 未接线 | pi prompt 当前仅文本 |
+| 模型选择器 | ⏳ 未接线 | 固定取 registry 第一个模型 |
+| Project / Goal / Team chips | ⏳ 未接线 | 依赖 manox 项目与目标体系 |
+| 后台线程 / 归档 / 外部会话（Codex/Claude CLI） | ⏳ 未接线 | manox 多会话编排 |
+| TurnNavigator | ⏳ 未接线 | 代码保留，overlay 未在 pi 布局挂载 |
+
+约束：crates/pi 只做 TS Pi 对齐与扩展点（`AgentSession::subscribe` 是唯一
+已落地的公开面补齐）；harness 能力扩展一律走 crates/pi-extensions；manox
+单向适应这两个 crate。默认 feature 保持 `harness-manox`；翻转默认值与
+TODO(pi-wire) 清零属后续对齐阶段。
+
+---
+
 ## 索引
 
 ### 顶层
