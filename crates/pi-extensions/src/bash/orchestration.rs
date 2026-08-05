@@ -14,7 +14,6 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use pi::BackgroundTaskRegistry;
 use pi::coding_agent::AgentSession;
@@ -27,8 +26,6 @@ use super::background::{BackgroundRegistry, TaskStatusInfo};
 /// How a completion summary reaches the bound session (`HarnessHandle::steer`).
 type Steerer = Arc<dyn Fn(AgentMessage) + Send + Sync>;
 
-/// How often the completion watcher probes a task's status.
-const WATCH_INTERVAL: Duration = Duration::from_millis(200);
 /// Tail size of a task's output included in the completion summary.
 const SUMMARY_TAIL_BYTES: usize = 2 * 1024;
 
@@ -136,29 +133,31 @@ impl BackgroundManager {
         let tasks = Arc::clone(&self.tasks);
         let tid = id.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(WATCH_INTERVAL).await;
-                match registry.status(&tid, SUMMARY_TAIL_BYTES) {
-                    Ok(status) if !status.is_running => {
-                        // Exactly-once: `kill_all` (abort / teardown) drains
-                        // the set first, so a killed task must not steer a
-                        // "completed" summary into the session.
-                        if tasks.lock().expect("tasks lock poisoned").remove(&tid) {
-                            let steerer = steerer.lock().expect("steerer lock poisoned").clone();
-                            finish_task(&tid, &status, steerer.as_ref(), &event_tx);
-                        }
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(e) => {
-                        let _ = event_tx.send(BackgroundEvent::Failed {
-                            id: tid.clone(),
-                            reason: e.to_string(),
-                        });
-                        tasks.lock().expect("tasks lock poisoned").remove(&tid);
-                        break;
-                    }
+            // Event-driven: the drain task notifies the moment the exit is
+            // recorded, so no polling interval delays the completion.
+            if registry.wait_exit(&tid).await.is_err() {
+                let _ = event_tx.send(BackgroundEvent::Failed {
+                    id: tid.clone(),
+                    reason: "task disappeared before exit".into(),
+                });
+                return;
+            }
+            let status = match registry.status(&tid, SUMMARY_TAIL_BYTES) {
+                Ok(status) => status,
+                Err(e) => {
+                    let _ = event_tx.send(BackgroundEvent::Failed {
+                        id: tid.clone(),
+                        reason: e.to_string(),
+                    });
+                    return;
                 }
+            };
+            // Exactly-once: `kill_all` (abort / teardown) drains the set
+            // first, so a killed task must not steer a "completed" summary
+            // into the session.
+            if tasks.lock().expect("tasks lock poisoned").remove(&tid) {
+                let steerer = steerer.lock().expect("steerer lock poisoned").clone();
+                finish_task(&tid, &status, steerer.as_ref(), &event_tx);
             }
         });
         Ok(id)
@@ -234,6 +233,7 @@ mod tests {
     use super::*;
     use pi::types::ContentBlock;
     use std::path::Path;
+    use std::time::Duration;
 
     fn new_manager() -> BackgroundManager {
         BackgroundManager::new(Arc::new(BackgroundRegistry::new()))
