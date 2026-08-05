@@ -1,2 +1,10 @@
 target/
 .issues/
+
+# cx 运行时产物（原 cx 仓库 .gitignore 条目）
+.omx/
+.remora/
+cx.db
+cx-stats.jpg
+cx-stats.png
+cx-stats.svg
