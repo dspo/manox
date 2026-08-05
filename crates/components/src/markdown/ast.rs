@@ -34,9 +34,9 @@ pub struct LinkSpan {
 
 /// A contiguous run of inline text with style overlays on top of the base
 /// font/color (which `RichText` inherits from `window.text_style()`).
-/// `code_ranges` marks inline-code segments that get a rounded wash behind the
-/// glyphs — the wash is painted by the renderer, not carried as a run
-/// `background_color`, so it can be rounded and caller-customized.
+/// `code_ranges` marks inline-code segments (including surrounding backticks)
+/// that are rendered in a caller-customized foreground color rather than the
+/// base text color.
 #[derive(Clone, Debug, Default)]
 pub struct InlineRuns {
     pub text: String,
@@ -440,9 +440,9 @@ struct ActiveStyle {
 impl ActiveStyle {
     /// Build the highlight for the current segment. Returns `None` when no
     /// overlay is active so plain text stays a single base-style run. Inline
-    /// code contributes no highlight here — its wash is painted separately by
-    /// the renderer from `InlineRuns::code_ranges`, so it can be rounded and
-    /// caller-customized rather than a flat run background.
+    /// code contributes no highlight here — its foreground color is applied
+    /// separately by the renderer from `InlineRuns::code_ranges` as a
+    /// caller-customized color rather than a run background.
     fn highlight(&self) -> Option<HighlightStyle> {
         let hs = HighlightStyle {
             font_weight: self.bold.then_some(FontWeight::BOLD),
@@ -479,10 +479,13 @@ fn collect_inline(children: &[Node], active: ActiveStyle, runs: &mut InlineRuns)
             }
             Node::InlineCode(c) => {
                 // `InlineCode.value` is literal text, not inline children; it
-                // inherits any surrounding emphasis and records its byte range
-                // for the rounded wash the renderer paints behind the glyphs.
+                // inherits any surrounding emphasis. Backticks are included in
+                // the rendered text and the byte range is recorded for the
+                // renderer to paint the span in the inline-code foreground color.
                 let start = runs.text.len();
+                runs.text.push('`');
                 runs.text.push_str(&c.value);
+                runs.text.push('`');
                 let end = runs.text.len();
                 runs.code_ranges.push(start..end);
                 if let Some(hs) = active.highlight() {
@@ -563,6 +566,24 @@ mod tests {
         assert!(!runs.highlights.is_empty());
         // The `code` segment is recorded as a code range, not a highlight bg.
         assert_eq!(runs.code_ranges.len(), 1);
+    }
+
+    #[test]
+    fn inline_code_with_emphasis_produces_overlapping_ranges() {
+        // Regression test: **`code`** produces both emphasis and code highlights
+        // covering the same range. These must be merged (not duplicated) when
+        // building StyledText highlights to preserve the non-overlapping constraint.
+        let blocks = parse("**`bold_code`**");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        // Text includes backticks: `bold_code`
+        assert_eq!(runs.text, "`bold_code`");
+        // Both emphasis highlight and code range cover the same span
+        assert_eq!(runs.highlights.len(), 1);
+        assert_eq!(runs.code_ranges.len(), 1);
+        assert_eq!(runs.highlights[0].0, runs.code_ranges[0]);
     }
 
     #[test]

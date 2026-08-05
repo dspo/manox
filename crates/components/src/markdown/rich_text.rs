@@ -1,13 +1,14 @@
-//! `RichText` — a text element that paints rounded washes behind inline-code
-//! spans and participates in document-level selection.
+//! `RichText` — a text element that paints inline-code spans in a foreground
+//! color and participates in document-level selection.
 //!
-//! The element composes a `StyledText` for shaping/glyph painting (its runs
-//! carry no `background_color`, so `StyledText` paints no flat wash) and adds
-//! its own overlay pass before the glyphs: rounded quads for code spans, then a
-//! flat selection rect for the slice of the document selection that falls inside
-//! this block, then the text on top. Code-span geometry comes from
-//! `TextLayout::position_for_index`; the selection slice is the intersection of
-//! the block's virtual-document range with the shared `DocSelection`.
+//! The element composes a `StyledText` for shaping/glyph painting. Inline-code
+//! spans receive a foreground-color highlight so `StyledText` paints the glyphs
+//! (including backticks) in the inline-code color. The element adds its own
+//! overlay pass before the glyphs: a flat selection rect for the slice of the
+//! document selection that falls inside this block, then the text on top.
+//! Code-span geometry comes from `TextLayout::position_for_index`; the selection
+//! slice is the intersection of the block's virtual-document range with the shared
+//! `DocSelection`.
 //!
 //! Per-block mouse/keyboard listeners are gone: a drag that crosses block
 //! boundaries is driven by the document container, which hit-tests this block's
@@ -17,29 +18,27 @@
 use std::ops::Range;
 
 use gpui::{
-    App, BorderStyle, Corners, Edges, Element, GlobalElementId, HighlightStyle, Hsla,
-    InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, SharedString, StyledText,
-    TextLayout, Window, fill, point, px, quad, size, transparent_black,
+    App, Element, GlobalElementId, HighlightStyle, Hsla, InspectorElementId, IntoElement, LayoutId,
+    Pixels, SharedString, StyledText, TextLayout, Window, fill, point, px, size,
 };
 
 use crate::markdown::ast::LinkSpan;
 use crate::markdown::selection::{BlockHit, DocSelection};
 
-/// One rounded-wash span: a byte range, a fill color, and a corner radius.
-/// The renderer maps `InlineRuns::code_ranges` onto these at render time so the
-/// wash is caller-customizable (`Markdown::inline_code`) rather than a fixed
-/// theme color baked into a run.
+/// One inline-code span: a byte range (including surrounding backticks) and
+/// a foreground color. The renderer maps `InlineRuns::code_ranges` onto these
+/// at render time so the color is caller-customizable (`Markdown::inline_code`)
+/// rather than a fixed theme color baked into a run.
 #[derive(Clone)]
 pub struct CodeSpan {
     pub range: Range<usize>,
-    pub bg: Hsla,
-    pub radius: Pixels,
+    pub fg: Hsla,
 }
 
-/// A text element with rounded inline-code washes that participates in the
-/// document-level selection. The block's virtual-document start offset, the
-/// shared `DocSelection`, and the cross-leaf join separator are supplied by
-/// the document renderer.
+/// A text element that renders inline-code spans in a caller-customized
+/// foreground color and participates in document-level selection. The block's
+/// virtual-document start offset, the shared `DocSelection`, and the cross-leaf
+/// join separator are supplied by the document renderer.
 pub struct RichText {
     text: SharedString,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
@@ -108,6 +107,41 @@ impl RichText {
     }
 }
 
+/// Merge code-span foreground highlights into an existing highlight list.
+///
+/// When emphasis (bold/italic/strikethrough) wraps inline code, both highlights
+/// cover the same byte range. This function merges the `color` field into the
+/// existing emphasis highlight rather than creating a duplicate range, preserving
+/// the non-overlapping + sorted constraint required by `StyledText::compute_runs`.
+///
+/// Three branches:
+/// - **Same-range merge**: code range matches an existing highlight → set `color`
+/// - **Ordered insert**: code range falls between two existing highlights → insert
+/// - **Tail append**: code range extends beyond all existing highlights → push
+fn merge_code_highlights(
+    highlights: &mut Vec<(Range<usize>, HighlightStyle)>,
+    code_spans: &[CodeSpan],
+) {
+    for span in code_spans {
+        let code_highlight = HighlightStyle {
+            color: Some(span.fg),
+            ..Default::default()
+        };
+        if let Some(existing) = highlights
+            .iter_mut()
+            .find(|(range, _)| range == &span.range)
+        {
+            existing.1.color = code_highlight.color;
+        } else {
+            let pos = highlights
+                .iter()
+                .position(|(range, _)| range.start > span.range.start)
+                .unwrap_or(highlights.len());
+            highlights.insert(pos, (span.range.clone(), code_highlight));
+        }
+    }
+}
+
 impl IntoElement for RichText {
     type Element = Self;
 
@@ -135,12 +169,12 @@ impl Element for RichText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        // Runs carry no `background_color` for code spans — the wash is painted
-        // separately from `code_spans` so it can be rounded. `StyledText`
-        // inherits the base font/color from `window.text_style()` (the parent
-        // div's `.text_sm()`/`.text_color()`/…), matching the old contract.
-        let mut styled =
-            StyledText::new(self.text.clone()).with_highlights(self.highlights.iter().cloned());
+        // Merge code-span foreground colors into the emphasis highlight list,
+        // preserving the non-overlapping + sorted constraint required by
+        // `StyledText::compute_runs`.
+        let mut all_highlights = self.highlights.clone();
+        merge_code_highlights(&mut all_highlights, &self.code_spans);
+        let mut styled = StyledText::new(self.text.clone()).with_highlights(all_highlights);
         let (layout_id, _) = styled.request_layout(None, inspector_id, window, cx);
         (layout_id, styled)
     }
@@ -184,14 +218,7 @@ impl Element for RichText {
             link_spans: self.link_spans.clone(),
         });
 
-        // 1. Rounded code-span washes, painted behind the glyphs.
-        for span in &self.code_spans {
-            for quad_bounds in span_quads(&layout, span.range.start, span.range.end, px(3.)) {
-                window.paint_quad(rounded_quad(quad_bounds, span.bg, span.radius));
-            }
-        }
-
-        // 2. The slice of the document selection that falls inside this block,
+        // 1. The slice of the document selection that falls inside this block,
         //    painted behind the glyphs. Local byte indices are the block's
         //    virtual-document range shifted by `doc_start`.
         let block_len = layout.len();
@@ -205,7 +232,7 @@ impl Element for RichText {
             }
         }
 
-        // 3. Link underlines, painted behind the glyphs. Each link span gets a
+        // 2. Link underlines, painted behind the glyphs. Each link span gets a
         //    1px underline at the font baseline.
         if self.link_color.a > 0.0 {
             for link in &self.link_spans {
@@ -220,9 +247,8 @@ impl Element for RichText {
             }
         }
 
-        // 4. Text on top. `StyledText::paint` draws the glyph runs; since none
-        //    carry a `background_color`, no flat wash is painted over the
-        //    overlays above.
+        // 3. Text on top. `StyledText::paint` draws the glyph runs with
+        //    foreground-color highlights for inline-code spans.
         styled.paint(None, inspector_id, bounds, &mut (), &mut (), window, _cx);
     }
 }
@@ -278,18 +304,6 @@ fn span_quads(
     out
 }
 
-/// A filled rounded quad — the inline-code pill.
-fn rounded_quad(bounds: gpui::Bounds<Pixels>, bg: Hsla, radius: Pixels) -> PaintQuad {
-    quad(
-        bounds,
-        Corners::all(radius),
-        bg,
-        Edges::default(),
-        transparent_black(),
-        BorderStyle::default(),
-    )
-}
-
 /// Largest char boundary `<= i`, so a mid-codepoint byte index slices the
 /// `SharedString` without panicking.
 #[allow(dead_code)]
@@ -311,11 +325,88 @@ mod tests {
     fn code_span_is_clone_and_carries_style() {
         let span = CodeSpan {
             range: 0..5,
-            bg: Hsla::default(),
-            radius: px(4.),
+            fg: Hsla::default(),
         };
         let cloned = span.clone();
         assert_eq!(cloned.range, span.range);
-        assert_eq!(cloned.radius, span.radius);
+        assert_eq!(cloned.fg, span.fg);
+    }
+
+    fn blue() -> Hsla {
+        gpui::hsla(0.6, 0.8, 0.5, 1.0)
+    }
+
+    #[test]
+    fn merge_code_same_range_sets_color() {
+        // **`code`** → emphasis highlight (bold) at 0..6, code span at 0..6
+        let mut highlights = vec![(
+            0..6,
+            HighlightStyle {
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..Default::default()
+            },
+        )];
+        let code_spans = vec![CodeSpan {
+            range: 0..6,
+            fg: blue(),
+        }];
+        merge_code_highlights(&mut highlights, &code_spans);
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].0, 0..6);
+        assert_eq!(highlights[0].1.color, Some(blue()));
+        // bold weight preserved
+        assert_eq!(highlights[0].1.font_weight, Some(gpui::FontWeight::BOLD));
+    }
+
+    #[test]
+    fn merge_code_inserts_in_sorted_order() {
+        // `a` **`code`** `b` → emphasis at 8..14, code spans at 0..3, 8..14, 19..22
+        let mut highlights = vec![(
+            8..14,
+            HighlightStyle {
+                font_weight: Some(gpui::FontWeight::BOLD),
+                ..Default::default()
+            },
+        )];
+        let code_spans = vec![
+            CodeSpan {
+                range: 0..3,
+                fg: blue(),
+            },
+            CodeSpan {
+                range: 8..14,
+                fg: blue(),
+            },
+            CodeSpan {
+                range: 19..22,
+                fg: blue(),
+            },
+        ];
+        merge_code_highlights(&mut highlights, &code_spans);
+        assert_eq!(highlights.len(), 3);
+        // sorted by range.start
+        assert_eq!(highlights[0].0, 0..3);
+        assert_eq!(highlights[1].0, 8..14);
+        assert_eq!(highlights[2].0, 19..22);
+        // all carry blue color
+        for h in &highlights {
+            assert_eq!(h.1.color, Some(blue()));
+        }
+        // bold preserved on the middle one
+        assert_eq!(highlights[1].1.font_weight, Some(gpui::FontWeight::BOLD));
+    }
+
+    #[test]
+    fn merge_code_appends_at_tail() {
+        // no existing highlights, just a code span
+        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = vec![];
+        let code_spans = vec![CodeSpan {
+            range: 5..10,
+            fg: blue(),
+        }];
+        merge_code_highlights(&mut highlights, &code_spans);
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].0, 5..10);
+        assert_eq!(highlights[0].1.color, Some(blue()));
     }
 }
