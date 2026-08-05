@@ -107,6 +107,49 @@ impl Default for BackgroundRegistry {
     }
 }
 
+/// Non-consuming snapshot of a task: unlike `poll`, `status` does not
+/// advance the read cursor, so an orchestrator can watch for completion and
+/// build a summary without stealing output the model still expects to fetch
+/// via `bash_output`.
+#[derive(Debug, Clone)]
+pub struct TaskStatusInfo {
+    pub is_running: bool,
+    pub exit_code: Option<Option<i32>>,
+    /// Tail of the accumulated output, truncated to `max_tail_bytes`.
+    pub output_tail: String,
+}
+
+impl BackgroundRegistry {
+    pub fn status(
+        &self,
+        id: &pi::TaskId,
+        max_tail_bytes: usize,
+    ) -> Result<TaskStatusInfo, pi::TaskError> {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
+        entry.touch();
+        let buf = entry.buffer.lock().expect("buffer lock poisoned");
+        let start = buf.len().saturating_sub(max_tail_bytes);
+        let output_tail = String::from_utf8_lossy(&buf[start..]).to_string();
+        let is_running = entry
+            .exit_code
+            .lock()
+            .expect("exit lock poisoned")
+            .is_none();
+        let exit_code = *entry.exit_code.lock().expect("exit lock poisoned");
+        Ok(TaskStatusInfo {
+            is_running,
+            exit_code,
+            output_tail,
+        })
+    }
+}
+
 /// Drain a task's pipes into its ring buffer, then record the exit code.
 async fn drain_task(
     mut stdout: tokio::process::ChildStdout,
