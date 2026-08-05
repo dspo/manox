@@ -14,7 +14,7 @@
 //! each block's `RichText` re-registers its geometry during paint. The root's
 //! mouse listeners hit-test against that registry to drive the shared
 //! `DocSelection`; the key listener copies it. `RichText` composes `StyledText`
-//! for shaping/glyph-painting and overlays rounded inline-code washes + the
+//! for shaping/glyph-painting and overlays inline-code foreground colors + the
 //! document-selection slice for the block. The base font/color is inherited from
 //! `window.text_style()` (set by the parent `div`'s `.text_sm()`/`.text_color()`/…)
 //! at layout time, so the renderer never constructs a `TextStyle`.
@@ -132,12 +132,11 @@ impl Markdown {
         self
     }
 
-    /// Override the inline-code pill wash + corner radius. Without this the
-    /// renderer falls back to `theme.secondary` / `theme.radius`.
-    pub fn inline_code(mut self, bg: Hsla, radius: Pixels) -> Self {
+    /// Override the inline-code foreground color. Without this the renderer
+    /// falls back to `theme.info`.
+    pub fn inline_code(mut self, fg: Hsla) -> Self {
         if let Some(styles) = &mut self.styles {
-            styles.inline_code_bg = bg;
-            styles.inline_code_radius = radius;
+            styles.inline_code_fg = fg;
         }
         self
     }
@@ -445,15 +444,14 @@ fn render_block(
 }
 
 /// Map `InlineRuns::code_ranges` onto `CodeSpan` overlays carrying the
-/// caller-customized wash + radius. Shared by every inline mount (paragraph,
-/// heading, table cell) so the inline-code pill is consistent across them.
+/// caller-customized foreground color. Shared by every inline mount (paragraph,
+/// heading, table cell) so inline-code styling is consistent across them.
 fn code_spans(runs: &InlineRuns, styles: &MdStyles) -> Vec<CodeSpan> {
     runs.code_ranges
         .iter()
         .map(|range| CodeSpan {
             range: range.clone(),
-            bg: styles.inline_code_bg,
-            radius: styles.inline_code_radius,
+            fg: styles.inline_code_fg,
         })
         .collect()
 }

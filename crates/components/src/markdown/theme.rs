@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Hsla, Pixels, hsla};
+use gpui::{Hsla, hsla};
 use gpui_component::Theme;
 use gpui_component::highlighter::HighlightTheme;
 
@@ -27,11 +27,9 @@ pub struct MdStyles {
     pub diff_add_bg: Hsla,
     pub diff_del_fg: Hsla,
     pub diff_del_bg: Hsla,
-    /// Inline-code pill: the wash behind `` `code` `` spans and the corner
-    /// radius. Carried here so callers can override via `Markdown::inline_code`
-    /// without touching the theme.
-    pub inline_code_bg: Hsla,
-    pub inline_code_radius: Pixels,
+    /// Inline-code foreground color. Carried here so callers can override via
+    /// `Markdown::inline_code` without touching the theme.
+    pub inline_code_fg: Hsla,
     /// Flat wash behind selected glyphs in selectable code/diff blocks.
     pub selection_bg: Hsla,
     /// Underline color for clickable link spans.
@@ -53,8 +51,7 @@ impl MdStyles {
             diff_add_bg: hsla(success.h, success.s, success.l, 0.15),
             diff_del_fg: danger,
             diff_del_bg: hsla(danger.h, danger.s, danger.l, 0.15),
-            inline_code_bg: theme.secondary,
-            inline_code_radius: theme.radius,
+            inline_code_fg: theme.info,
             // The universal light-blue text-selection tint. `theme.accent` varies
             // per palette and at low alpha can vanish against the message
             // background; a fixed blue keeps the drag highlight legible across
