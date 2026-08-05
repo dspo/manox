@@ -6,8 +6,8 @@
 //! 与模型实际上下文规模无关。
 //!
 //! 解法：通过 config.toml 的 `model_catalog_json` 提供本地模型目录（`ModelsResponse`），
-//! 让引擎「认识」这些自定义模型。这里只收录带显式 `[Nm]` 上下文后缀的模型
-//! （如 `deepseek-v4-pro[1m]`），并把 `context_window`/`max_context_window` 设为后缀声明的值；
+//! 让引擎「认识」这些自定义模型。这里只收录带显式上下文后缀的模型
+//! （如 `deepseek-v4-pro[1m]`、`qwen3.7-max[200k]`），并把 `context_window`/`max_context_window` 设为后缀声明的值；
 //! 无后缀的模型不进入目录，继续走引擎 fallback，避免对未知上下文规模的模型夸大窗口。
 //!
 //! 其余描述符字段对齐引擎 fallback（`model_info_from_slug`）：所有可省略字段
@@ -22,14 +22,14 @@ use serde_json::{Value, json};
 /// （来自 app 内置 codex 引擎捆绑的 `prompt.md`，需随引擎版本同步）。
 const BASE_INSTRUCTIONS: &str = include_str!("base_instructions.txt");
 
-/// 构建 `{"models": [...]}` 模型目录。仅收录带 `[Nm]` 上下文后缀的模型。
+/// 构建 `{"models": [...]}` 模型目录。仅收录带上下文后缀的模型（如 `[1m]`、`[200k]`）。
 pub fn build_model_catalog(models: &[ResolvedModel]) -> Value {
     let entries: Vec<Value> = models.iter().filter_map(model_entry).collect();
     json!({ "models": entries })
 }
 
 /// 单个模型条目：字段对齐引擎 fallback，仅覆盖上下文窗口。
-/// 返回 `None` 表示该模型没有显式 `[Nm]` 后缀，不应进入目录。
+/// 返回 `None` 表示该模型没有上下文后缀，不应进入目录。
 fn model_entry(model: &ResolvedModel) -> Option<Value> {
     let (api_id, context) = crate::parse_model_context_suffix(&model.id);
     let context = context?;
@@ -49,6 +49,7 @@ fn model_entry(model: &ResolvedModel) -> Option<Value> {
         "experimental_supported_tools": [],
         "context_window": context,
         "max_context_window": context,
+        "effective_context_window_percent": 95,
     }))
 }
 
@@ -87,10 +88,11 @@ mod tests {
             .iter()
             .map(|e| (e["slug"].as_str().unwrap(), e))
             .collect();
-        // [Nm] 后缀被剥离，且 context/max_context_window 取后缀声明的值。
+        // 上下文后缀被剥离，且 context/max_context_window 取后缀声明的值。
         assert!(by_slug.contains_key("qwen3.7-max"));
         assert_eq!(by_slug["qwen3.7-max"]["context_window"], 1_000_000);
         assert_eq!(by_slug["qwen3.7-max"]["max_context_window"], 1_000_000);
+        assert_eq!(by_slug["qwen3.7-max"]["effective_context_window_percent"], 95);
         assert_eq!(by_slug["glm-5.2"]["context_window"], 3_000_000);
         // fallback 行为：base_instructions 内联、其余字段由引擎 serde 默认补齐。
         assert!(
@@ -99,6 +101,22 @@ mod tests {
                 .unwrap()
                 .starts_with("You are a coding agent running in the Codex CLI")
         );
+    }
+
+    #[test]
+    fn catalog_handles_non_nm_suffixes() {
+        // Unified parser handles [200k], [1M], [1m123k], etc.
+        let models = vec![rm("model-a[200k]"), rm("model-b[1M]"), rm("model-c[1m123k]")];
+        let catalog = build_model_catalog(&models);
+        let entries = catalog["models"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        let by_slug: BTreeMap<_, _> = entries
+            .iter()
+            .map(|e| (e["slug"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(by_slug["model-a"]["context_window"], 200_000);
+        assert_eq!(by_slug["model-b"]["context_window"], 1_000_000);
+        assert_eq!(by_slug["model-c"]["context_window"], 1_123_000);
     }
 
     #[test]

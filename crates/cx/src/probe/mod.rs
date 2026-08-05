@@ -405,8 +405,8 @@ mod tests {
         assert_eq!(resolve_api_model_id(""), "");
         // 只有后缀
         assert_eq!(resolve_api_model_id("[1m]"), "");
-        // 类似但不匹配的模式
-        assert_eq!(resolve_api_model_id("model[1]"), "model[1]");
+        // 统一解析器现在处理更多格式：[1] → 1 token, [1mm] → 无效, [m] → 无效
+        assert_eq!(resolve_api_model_id("model[1]"), "model");
         assert_eq!(resolve_api_model_id("model[1mm]"), "model[1mm]");
         assert_eq!(resolve_api_model_id("model[m]"), "model[m]");
     }

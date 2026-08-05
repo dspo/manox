@@ -39,7 +39,7 @@ const REASONING_EFFORTS: &[(&str, &str)] = &[
 
 /// 生成完整注入脚本。`default_reasoning_effort` 应与 config.toml 的 `model_reasoning_effort` 一致。
 ///
-/// Model IDs injected into the renderer have the `[Nm]` context-window suffix
+/// Model IDs injected into the renderer have the context-window suffix
 /// stripped — it is a cx-internal convention that providers do not recognise.
 pub fn build_injection_script(models: &[ResolvedModel], default_reasoning_effort: &str) -> String {
     let default_model = models.first().map(|m| m.api_model_id()).unwrap_or_default();
@@ -69,8 +69,14 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
     let arr: Vec<_> = models
         .iter()
         .map(|m| {
-            // The id sent to the API must not carry the `[Nm]` context suffix.
+            // The id sent to the API must not carry the context suffix.
             let api_id = m.api_model_id();
+            // Context window: prefer suffix hint (e.g. [1m] → 1M), else model.context.
+            let (_, suffix_ctx) = crate::parse_model_context_suffix(&m.id);
+            let ctx: u64 = suffix_ctx
+                .map(|v| v as u64)
+                .or(m.context)
+                .unwrap_or(272_000);
             json!({
                 "model": api_id,
                 "id": api_id,
@@ -90,6 +96,9 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
                 "additionalSpeedTiers": [],
                 "serviceTiers": [],
                 "defaultServiceTier": null,
+                "contextWindow": ctx,
+                "maxContextWindow": ctx,
+                "effectiveContextWindowPercent": 95,
             })
         })
         .collect();
@@ -359,12 +368,22 @@ mod tests {
     fn injection_script_strips_context_window_suffix() {
         let models = vec![rm("qwen3.7-max[1m]"), rm("glm-5.2[1m123k]")];
         let script = build_injection_script(&models, "high");
-        // The [Nm] suffix must not leak into the injected model IDs.
+        // The context suffix must not leak into the injected model IDs.
         assert!(script.contains("\"qwen3.7-max\""));
         assert!(script.contains("\"glm-5.2\""));
         assert!(!script.contains("[1m]"));
         assert!(!script.contains("[1m123k]"));
         assert!(script.contains("window.__cxDefaultModel = \"qwen3.7-max\""));
+    }
+
+    #[test]
+    fn injection_script_includes_context_window_fields() {
+        let models = vec![rm("qwen3.7-max[1m]")];
+        let script = build_injection_script(&models, "high");
+        // Context window fields must be present in model descriptors.
+        assert!(script.contains(r#""contextWindow":1000000"#));
+        assert!(script.contains(r#""maxContextWindow":1000000"#));
+        assert!(script.contains(r#""effectiveContextWindowPercent":95"#));
     }
 
     #[test]
