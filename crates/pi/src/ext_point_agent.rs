@@ -41,23 +41,44 @@ impl AgentDef {
     pub fn parse_md(input: &str) -> Result<Self, String> {
         let (frontmatter, body) = split_frontmatter(input)?;
         let mut def: AgentDef =
-            serde_yaml::from_str(frontmatter).map_err(|e| format!("invalid frontmatter: {e}"))?;
+            serde_yaml::from_str(&frontmatter).map_err(|e| format!("invalid frontmatter: {e}"))?;
         def.system_prompt = body.trim().to_string();
         Ok(def)
     }
 }
 
 /// Split `---\n...\n---\nbody` into the frontmatter YAML and the body.
-fn split_frontmatter(input: &str) -> Result<(&str, &str), String> {
+///
+/// The closing delimiter must be a whole `---` line; a BOM is stripped; an
+/// empty body is rejected so a manifest never yields an empty system prompt.
+fn split_frontmatter(input: &str) -> Result<(String, String), String> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let rest = input
         .strip_prefix("---")
         .ok_or_else(|| "manifest must start with `---`".to_string())?;
-    let end = rest
-        .find("\n---")
-        .ok_or_else(|| "unterminated frontmatter delimiter".to_string())?;
-    let frontmatter = &rest[..end];
-    let body = &rest[end + "\n---".len()..];
-    Ok((frontmatter, body))
+    let rest = rest
+        .strip_prefix('\n')
+        .ok_or_else(|| "manifest frontmatter must start on the next line".to_string())?;
+    let mut frontmatter = String::new();
+    let mut body_start: Option<usize> = None;
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" {
+            body_start = Some(offset + line.len());
+            break;
+        }
+        frontmatter.push_str(line);
+        offset += line.len();
+    }
+    let body = match body_start {
+        Some(start) => &rest[start..],
+        None => return Err("unterminated frontmatter delimiter".to_string()),
+    };
+    if body.trim().is_empty() {
+        return Err("manifest body is empty".to_string());
+    }
+    Ok((frontmatter, body.to_string()))
 }
 
 /// Registry of agent definitions, keyed by name.
@@ -82,7 +103,9 @@ impl AgentRegistry {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.agents.keys().map(|k| k.as_str()).collect()
+        let mut names: Vec<&str> = self.agents.keys().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names
     }
 
     pub fn all(&self) -> Vec<&AgentDef> {
@@ -158,6 +181,18 @@ mod tests {
         assert!(AgentDef::parse_md("no frontmatter").is_err());
         let unterminated = "---\nname: X\ndescription: d\nbody without close";
         assert!(AgentDef::parse_md(unterminated).is_err());
+        // An empty body must not yield an empty system prompt.
+        let empty_body = "---\nname: X\ndescription: d\n---\n";
+        assert!(AgentDef::parse_md(empty_body).is_err());
+    }
+
+    #[test]
+    fn parse_md_strips_bom_and_rejects_non_whole_line_close() {
+        let bom = "\u{feff}---\nname: X\ndescription: d\n---\nbody";
+        assert_eq!(AgentDef::parse_md(bom).unwrap().name, "X");
+        // A `---` inside a frontmatter scalar must not close the block.
+        let inner = "---\nname: X\ndescription: |-\n  --- not close\n---\nbody";
+        assert_eq!(AgentDef::parse_md(inner).unwrap().name, "X");
     }
 
     #[test]

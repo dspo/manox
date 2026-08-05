@@ -74,10 +74,6 @@ impl AgentTool for SubagentTool {
                 "prompt": {
                     "type": "string",
                     "description": "The task for the subagent"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Short description of the task (shown in the UI)"
                 }
             },
             "required": ["subagent_type", "prompt"]
@@ -88,7 +84,7 @@ impl AgentTool for SubagentTool {
         &self,
         _tool_call_id: &str,
         params: JsonValue,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let subagent_type = params["subagent_type"]
@@ -100,22 +96,44 @@ impl AgentTool for SubagentTool {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
+        // A declared model override cannot be applied by this dispatcher
+        // (model resolution is the assembly layer's job); refuse loudly
+        // rather than silently running the default model.
+        if def.model.is_some() {
+            return Err(ToolError::InvalidArguments(format!(
+                "agent `{subagent_type}` declares a model override, which the dispatcher does not support yet"
+            )));
+        }
 
         let selected = select_tools(&self.tools, def);
-        // `def.model` is not applied here: the core is registry-free, so
-        // model resolution is the assembly layer's job.
+        // The subagent transcript lives in a throwaway temp directory so a
+        // read-only Explore call does not litter the user's project.
+        let session_dir =
+            tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
         let mut session = create_agent_session()
             .with_cwd(ctx.cwd())
+            .with_session_dir(session_dir.path())
             .with_system_prompt(def.system_prompt.clone())
             .with_tools(selected)
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
 
-        let messages = session
-            .prompt(prompt)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("subagent failed: {e}")))?;
+        // The caller's abort signal must interrupt the subagent mid-run; the
+        // inner session runs on its own token, so race it here.
+        let sig = signal.clone();
+        let mut prompt_fut = Box::pin(session.prompt(prompt));
+        let messages = tokio::select! {
+            r = prompt_fut.as_mut() => {
+                r.map_err(|e| ToolError::ExecutionFailed(format!("subagent failed: {e}")))?
+            }
+            _ = sig.cancelled() => {
+                drop(prompt_fut);
+                let _ = session.abort();
+                return Err(ToolError::Aborted);
+            }
+        };
+
         let text = collect_text(&messages);
 
         let config = TruncateConfig {
@@ -125,8 +143,9 @@ impl AgentTool for SubagentTool {
         let truncated = truncate::truncate(&text, &config);
         let mut out = truncated.content;
         if truncated.was_truncated {
+            let kept = out.lines().count();
             out.push_str(&format!(
-                "\n\n[output truncated: {} lines, {} bytes]",
+                "\n\n[output truncated: {kept} of {} lines kept, {} bytes]",
                 truncated.original_lines, truncated.original_bytes
             ));
         }
@@ -135,33 +154,54 @@ impl AgentTool for SubagentTool {
 }
 
 /// Resolve a definition's tool names against the caller's tool snapshot.
-/// An empty `tools` list means the full snapshot.
+/// An empty `tools` list means the full snapshot, minus the `agent` tool
+/// itself: a subagent must not inherit the ability to spawn subagents.
 fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
-    if def.tools.is_empty() {
-        return tools.to_vec();
-    }
-    tools
+    let selected: Vec<_> = tools
         .iter()
-        .filter(|t| def.tools.iter().any(|n| n == t.name()))
+        .filter(|t| t.name() != "agent")
+        .filter(|t| def.tools.is_empty() || def.tools.iter().any(|n| n == t.name()))
         .cloned()
-        .collect()
-}
-
-/// Concatenate the subagent's assistant text blocks, newest last.
-fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
-    use pi::types::{AgentMessage, ContentBlock};
-    let mut out = String::new();
-    for message in messages {
-        if let AgentMessage::Assistant { content, .. } = message {
-            for block in content {
-                if let ContentBlock::Text { text, .. } = block {
-                    out.push_str(text);
-                    out.push('\n');
-                }
+        .collect();
+    if !def.tools.is_empty() {
+        for name in &def.tools {
+            if !selected.iter().any(|t| t.name() == name) {
+                tracing::warn!(
+                    agent = %def.name,
+                    tool = %name,
+                    "agent definition names a tool not in the caller's snapshot"
+                );
             }
         }
     }
-    out.trim().to_string()
+    selected
+}
+
+/// Concatenate the subagent's final answer: the text blocks of the last
+/// assistant message that carried no tool calls, skipping intermediate
+/// narration and tool-result turns.
+fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
+    use pi::types::{AgentMessage, ContentBlock};
+    for message in messages.iter().rev() {
+        let AgentMessage::Assistant { content, .. } = message else {
+            continue;
+        };
+        if content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        {
+            continue;
+        }
+        let mut out = String::new();
+        for block in content {
+            if let ContentBlock::Text { text, .. } = block {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+        return out.trim().to_string();
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -187,6 +227,24 @@ mod tests {
             name: "X".into(),
             description: "d".into(),
             tools: vec!["read".into()],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let selected = select_tools(&tools, &def);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name(), "read");
+    }
+
+    #[test]
+    fn select_tools_never_inherits_the_agent_tool() {
+        // A subagent must not be able to spawn subagents implicitly.
+        let subagent = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
+        let tools: Vec<Arc<dyn AgentTool>> =
+            vec![Arc::new(pi::tools::read::ReadTool), Arc::new(subagent)];
+        let def = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec![],
             model: None,
             system_prompt: "p".into(),
         };
@@ -308,6 +366,32 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("unknown subagent_type: nope"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn declared_model_override_is_rejected() {
+        let mut registry = AgentRegistry::new();
+        registry.register(AgentDef {
+            name: "M".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: Some("some-model".into()),
+            system_prompt: "p".into(),
+        });
+        let tool = SubagentTool::new(Arc::new(registry), vec![]);
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"subagent_type": "M", "prompt": "hi"}),
+                CancellationToken::new(),
+                &ctx("/tmp"),
+            )
+            .await;
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("does not support"),
+            "refuses loudly instead of silently ignoring: {err}"
+        );
     }
 
     #[tokio::test]
