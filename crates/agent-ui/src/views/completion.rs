@@ -10,10 +10,13 @@
 use std::rc::Rc;
 
 use agent::i18n;
+#[cfg(feature = "harness-manox")]
 use agent::{agent_def, skill};
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 
+// TODO(pi-wire): slash commands — backed by the manox command/skill registries.
+#[cfg(feature = "harness-manox")]
 use crate::slash_command::SlashCommandRegistry;
 use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
 
@@ -100,23 +103,35 @@ pub fn detect(value: &str, cursor: usize) -> Option<Detection> {
 /// `slash_command::init` surface here with `CompletionKind::Skill` via each
 /// adapter's `kind()`, so `/git` lists `gitwork:deliver` with the skill icon.
 pub fn slash_source(query: &str) -> Vec<CompletionItem> {
-    let Some(reg) = SlashCommandRegistry::global() else {
-        return Vec::new();
-    };
-    let items: Vec<CompletionItem> = reg
-        .commands()
-        .map(|cmd| CompletionItem {
-            name: cmd.name().to_string().into(),
-            description: cmd.description().to_string().into(),
-            kind: cmd.kind(),
-        })
-        .collect();
-    filter_sort(items, query)
+    // TODO(pi-wire): slash commands — manox registry.
+    #[cfg(feature = "harness-pi")]
+    {
+        let _ = query;
+        Vec::new()
+    }
+    #[cfg(feature = "harness-manox")]
+    {
+        let Some(reg) = SlashCommandRegistry::global() else {
+            return Vec::new();
+        };
+        let items: Vec<CompletionItem> = reg
+            .commands()
+            .map(|cmd| CompletionItem {
+                name: cmd.name().to_string().into(),
+                description: cmd.description().to_string().into(),
+                kind: cmd.kind(),
+            })
+            .collect();
+        filter_sort(items, query)
+    }
 }
 
 /// Skills + subagents, filtered + sorted by `query`.
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
+    #[cfg_attr(feature = "harness-pi", allow(unused_mut))] // TODO(pi-wire): registries offline
     let mut items = Vec::new();
+    // TODO(pi-wire): skill/subagent mentions — manox registries.
+    #[cfg(feature = "harness-manox")]
     for def in skill::global().list() {
         items.push(CompletionItem {
             name: def.name.clone().into(),
@@ -124,6 +139,7 @@ pub fn mention_source(query: &str) -> Vec<CompletionItem> {
             kind: CompletionKind::Skill,
         });
     }
+    #[cfg(feature = "harness-manox")]
     for def in agent_def::global().list() {
         items.push(CompletionItem {
             name: def.def.name.clone().into(),

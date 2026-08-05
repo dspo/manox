@@ -9,67 +9,115 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+#[cfg(feature = "harness-manox")]
 use std::rc::Rc;
+#[cfg(feature = "harness-manox")]
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
+#[cfg(feature = "harness-manox")]
 use agent::provider::registry;
+#[cfg(feature = "harness-manox")]
 use agent::settings;
+#[cfg(feature = "harness-manox")]
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
-use agent::{
-    PermissionDecision, PlanReviewChoice, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
-    save_thread,
-};
+#[cfg(feature = "harness-manox")]
+use agent::{PermissionDecision, PlanReviewChoice, ReasoningEffort};
+#[cfg(feature = "harness-manox")]
+use agent::{Thread, save_thread};
+use agent::{ThreadEvent, ThreadId, i18n};
+#[cfg(feature = "harness-manox")]
+use gpui::DismissEvent;
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
-    DismissEvent, DragMoveEvent, Entity, FocusHandle, FollowMode, ListAlignment, ListOffset,
-    ListSizingBehavior, ListState, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_out_quint, prelude::*,
-    px,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
+    FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState, MouseButton, Pixels,
+    Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
+    ease_out_quint, prelude::*, px,
 };
+#[cfg(feature = "harness-manox")]
+use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
+/// Shared across both harnesses: workspace struct fields hold
+/// `Option<Entity<PopupMenu>>` regardless of feature.
+use gpui_component::menu::PopupMenu;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
-    TITLE_BAR_HEIGHT, Theme, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, TITLE_BAR_HEIGHT,
+    Theme, TitleBar,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
-    menu::{PopupMenu, PopupMenuItem},
-    notification::Notification,
-    tab::{Tab, TabBar},
-    tag::{Tag, TagVariant},
     v_flex,
 };
-use manox_components::markdown::{HeadingMode, Markdown};
+#[cfg(feature = "harness-manox")]
+use gpui_component::{
+    StyledExt as _,
+    menu::PopupMenuItem,
+    tab::{Tab, TabBar},
+    tag::{Tag, TagVariant},
+};
+/// `WindowExt::push_notification` + `Notification` are shared: the
+/// ChatGPT.app launch path (#410) reports outcomes under either harness.
+use gpui_component::{WindowExt as _, notification::Notification};
+#[cfg(feature = "harness-manox")]
+use manox_components::markdown::HeadingMode;
+use manox_components::markdown::Markdown;
 
+#[cfg(feature = "harness-manox")]
 use crate::cockpit::CockpitPhase;
-use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
+#[cfg(feature = "harness-manox")]
+use crate::conversation::ConvItem;
+use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
+#[cfg(feature = "harness-manox")]
 use crate::external_session::{ExternalSession, SessionKind};
+#[cfg(feature = "harness-manox")]
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
     slash_source,
 };
-use crate::views::composer_menu::{
-    PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
-};
+#[cfg(feature = "harness-manox")]
+use crate::views::composer_menu::build_plus_menu;
+use crate::views::composer_menu::{PendingAttachment, load_attachment, render_attachment_chips};
 use crate::views::member_panel::MemberPanel;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
+#[cfg(feature = "harness-manox")]
 use crate::views::sidebar::{Sidebar, SidebarEvent};
+use crate::views::subagent_panel::{SubagentInfo, SubagentPanel};
+#[cfg(feature = "harness-manox")]
 use crate::views::subagent_panel::{
-    SubagentInfo, SubagentPanel, SubagentSnapshot, snapshots_from_messages, subagent_display_title,
+    SubagentSnapshot, snapshots_from_messages, subagent_display_title,
 };
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
+#[cfg(feature = "harness-manox")]
 use crate::{
-    CloseBrowserTab, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
-    OpenBrowserTab, OpenSettings, ToggleTurnNavigator,
+    CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
+    ToggleTurnNavigator,
 };
+use crate::{FocusConversation, OpenSettings};
+#[cfg(feature = "harness-manox")]
 use terminal::Terminal;
 use terminal_ui::TerminalView;
+
+/// The session entity driving the workspace. manox-harness builds mount the
+/// full `agent::Thread`; pi-harness builds mount the `pi_backend::PiSession`
+/// adapter, which quacks like a thread (same `ThreadEvent` stream, same
+/// `agent::Message` history) so the polished render pipeline is reused.
+#[cfg(feature = "harness-manox")]
+pub(crate) type ThreadEntity = agent::Thread;
+#[cfg(feature = "harness-pi")]
+pub(crate) type ThreadEntity = crate::pi_backend::PiSession;
+
+/// manox threads persist through the thread store; pi sessions persist
+/// themselves to jsonl, so under `harness-pi` the save call sites compile to
+/// this no-op (one shared name keeps the ~15 call sites untouched).
+#[cfg(feature = "harness-pi")]
+fn save_thread(_thread: Entity<ThreadEntity>, _touch: bool, _cx: &mut App) {
+    // TODO(pi-wire): pi jsonl persistence is automatic; nothing to do here.
+}
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
@@ -77,6 +125,7 @@ use terminal_ui::TerminalView;
 /// [`SubagentPanel`]; `Browser(id)` is an untrusted embedded webview (see
 /// [`BrowserView`]).
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 enum RightTab {
     Editor,
     Member(String),
@@ -96,6 +145,7 @@ fn ensure_subagent_tab(tabs: &mut Vec<RightTab>, id: &str) -> usize {
     tabs.len() - 1
 }
 
+#[cfg(feature = "harness-manox")]
 fn remove_subagent_tabs(tabs: &mut Vec<RightTab>, active: &mut usize) {
     let mut ix = 0;
     while ix < tabs.len() {
@@ -112,12 +162,14 @@ fn remove_subagent_tabs(tabs: &mut Vec<RightTab>, active: &mut usize) {
     }
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct SubagentRecord {
     info: SubagentInfo,
     panel: Entity<SubagentPanel>,
 }
 
 #[derive(Default)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct SubagentSession {
     records: BTreeMap<String, SubagentRecord>,
     order: Vec<String>,
@@ -136,6 +188,7 @@ struct PendingPlanReview {
 /// because the agent runs in Danger — so the overlay always shows and the
 /// decision always routes through `Thread::respond_inbound`, not the outbound
 /// approval pipeline.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct PendingInbound {
     id: String,
     intent: String,
@@ -150,6 +203,7 @@ struct PendingAsk {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardSnapshot {
     pub id: String,
     pub step: usize,
@@ -160,6 +214,7 @@ pub(crate) struct AskCardSnapshot {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardQuestion {
     pub question: String,
     pub header: String,
@@ -168,6 +223,7 @@ pub(crate) struct AskCardQuestion {
 }
 
 #[derive(Clone)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardOption {
     pub label: String,
     pub description: String,
@@ -214,7 +270,7 @@ const MSG_LIST_OVERDRAW: f32 = 2048.;
 /// `background_threads` — it never touches `conversation`/`self.thread`, so a
 /// background thread's events cannot be misattributed to the foreground thread.
 struct BackgroundThread {
-    entity: Entity<Thread>,
+    entity: Entity<ThreadEntity>,
     _sub: Subscription,
 }
 
@@ -244,15 +300,19 @@ struct QueuedFollowUp {
     state: FollowUpState,
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
-    pub(crate) thread: Entity<Thread>,
+    pub(crate) thread: Entity<ThreadEntity>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
     /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
     /// while parked marks the thread unread for the sidebar red dot.
     background_threads: Vec<BackgroundThread>,
+    // TODO(pi-wire): sidebar/thread list — needs the manox thread store; the
+    // pi stage runs a single fixed session with no sidebar.
+    #[cfg(feature = "harness-manox")]
     pub(crate) sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -298,6 +358,8 @@ pub struct Workspace {
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
     /// view via [`manox_webview::webview::WebView`]'s `Drop`.
+    // TODO(pi-wire): browser tabs.
+    #[cfg(feature = "harness-manox")]
     pub(crate) browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
@@ -437,6 +499,8 @@ pub struct Workspace {
     /// plan snapshot, per-cell counter animation state) that used to live
     /// directly on `Workspace`, plus strong handles to the active thread and conversation
     /// it renders against. Writes flow through `self.context_rail.update`.
+    // TODO(pi-wire): context rail — reads manox usage/plan/compact state.
+    #[cfg(feature = "harness-manox")]
     context_rail: Entity<crate::views::context_rail::ContextRail>,
     /// Live external agent CLI sessions (claude / codex / copilot) launched from
     /// the sidebar `+` menu. In-memory only — never persisted. Each owns its
@@ -462,6 +526,7 @@ pub struct Workspace {
 /// of the conversation. Future overlays can extend this enum rather than
 /// carrying parallel `bool` flags.
 #[derive(Default)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 enum ViewMode {
     #[default]
     Workspace,
@@ -473,27 +538,36 @@ enum ViewMode {
 /// Right-side composer width. Wide enough for rendered markdown
 /// (headings, lists, code blocks) alongside the 1100px window.
 const EDITOR_PANEL_WIDTH: f32 = 640.;
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_MIN_WIDTH: f32 = 320.;
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_MAX_WIDTH: f32 = 960.;
 /// Width of the drag handle between the main column and the editor pane.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_DIVIDER_WIDTH: f32 = 6.;
 // Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(SIDEBAR_WIDTH))`).
 // Kept here so the editor pane's resize clamp can reserve space for the
 // sidebar + main column without depending on the sidebar's internals.
 const SIDEBAR_WIDTH: f32 = 260.;
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_MIN_WIDTH: f32 = 200.;
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_MAX_WIDTH: f32 = 480.;
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct TurnNavigatorLayout {
     left_inset: Pixels,
     right_inset: Pixels,
     panel_width: Pixels,
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 fn turn_navigator_layout(
     window_width: Pixels,
     sidebar_width: Pixels,
@@ -536,6 +610,7 @@ const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
 /// ghost view, mirroring the `DraggedDock` drag-ghost pattern.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct DraggedEditorDivider;
 
 impl Render for DraggedEditorDivider {
@@ -547,6 +622,7 @@ impl Render for DraggedEditorDivider {
 /// Drag payload for the sidebar divider. Same shape as the editor divider's
 /// payload; the two are distinguished by type so their drag-move handlers
 /// can each run only on the matching payload.
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct DraggedSidebarDivider;
 
 impl Render for DraggedSidebarDivider {
@@ -558,10 +634,18 @@ impl Render for DraggedSidebarDivider {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        #[cfg(feature = "harness-manox")]
         let auto_compact = settings::load().auto_compact;
         let thread = {
             let id = ThreadId(uuid::Uuid::new_v4().to_string());
-            Thread::new(id, cwd.clone(), cx)
+            #[cfg(feature = "harness-manox")]
+            {
+                Thread::new(id, cwd.clone(), cx)
+            }
+            #[cfg(feature = "harness-pi")]
+            {
+                crate::pi_backend::PiSession::new(id, cwd.clone(), cx)
+            }
         };
 
         let input_state = cx.new(|cx| {
@@ -582,22 +666,27 @@ impl Workspace {
                 .placeholder(i18n::t("workspace-composer-placeholder"))
         });
 
+        #[cfg(feature = "harness-manox")]
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
-        let weak_workspace = cx.weak_entity();
-        let context_rail = cx.new(|_| {
-            crate::views::context_rail::ContextRail::new(
-                thread.clone(),
-                weak_workspace,
-                auto_compact.enabled,
-                auto_compact.threshold,
-            )
-        });
+        #[cfg(feature = "harness-manox")]
+        let context_rail = {
+            let weak_workspace = cx.weak_entity();
+            cx.new(|_| {
+                crate::views::context_rail::ContextRail::new(
+                    thread.clone(),
+                    weak_workspace,
+                    auto_compact.enabled,
+                    auto_compact.threshold,
+                )
+            })
+        };
 
         let mut ws = Self {
             cwd,
             thread,
             background_threads: Vec::new(),
+            #[cfg(feature = "harness-manox")]
             sidebar,
             conversation: conversation.clone(),
             input_state,
@@ -612,6 +701,7 @@ impl Workspace {
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
             subagent_sessions: HashMap::new(),
+            #[cfg(feature = "harness-manox")]
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -662,31 +752,76 @@ impl Workspace {
             settings_view: None,
             settings_sub: None,
             terminal_view: None,
+            #[cfg(feature = "harness-manox")]
             context_rail,
             external_sessions: Vec::new(),
             active_external: None,
             git_status_gen: 0,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
-        ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
+        #[cfg(feature = "harness-manox")]
+        {
+            ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
+        }
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
-        let id = ws.thread.read(cx).id.0.clone();
-        ws.sidebar
-            .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
-        // The initial thread is the one the user lands on at startup: clear any
-        // unread red dot it carried from a prior background completion.
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.set_unread(&id, false, cx));
+        #[cfg(feature = "harness-manox")]
+        {
+            let id = ws.thread.read(cx).id.0.clone();
+            ws.sidebar
+                .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
+            // The initial thread is the one the user lands on at startup: clear
+            // any unread red dot it carried from a prior background completion.
+            let store = agent::thread_store_global();
+            store.update(cx, |s, cx| s.set_unread(&id, false, cx));
+        }
         ws
+    }
+
+    /// Rebuild the conversation view from the current thread's message
+    /// history. The harness-pi restore hook: `PiSession` rebuilds the pi
+    /// session asynchronously, then asks the workspace to re-render once the
+    /// restored history lands.
+    #[cfg(feature = "harness-pi")]
+    pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
+        let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        let usage = self.thread.read(cx).request_token_usage().clone();
+        let notes = self.thread.read(cx).ui_notes().to_vec();
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        let running = self.thread.read(cx).is_running();
+        let cwd = thread_cwd(&self.thread, cx);
+        let new_conv = cx.new(|cx| {
+            ConversationState::rebuild_from_messages(
+                &messages,
+                &usage,
+                &role,
+                running,
+                &notes,
+                crate::conversation::ApplyCtx {
+                    weak: weak.clone(),
+                    cwd,
+                },
+                cx,
+            )
+        });
+        self.conversation = new_conv;
+        let count = self.conversation.read(cx).items().len();
+        self.list_state.reset(count);
+        self.list_count = count;
+        self.list_state.scroll_to_end();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        cx.notify();
     }
 
     fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
         let thread = self.thread.clone();
         cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
             match ev {
+                // TODO(pi-wire): approval UI — pi tools run ungated in this stage.
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::ToolCallAuthorization { id, input, .. } => {
                     // Every authorization — interactive tools, bubbled
                     // sub-agent auth, AutoPilot escalations — surfaces as the
@@ -701,12 +836,15 @@ impl Workspace {
                     });
                     cx.notify();
                 }
+                // TODO(pi-wire): plan preview — plan mode is a manox flow.
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::PlanDelta { .. } => {
                     // Live plan text streaming in; the finalized plan surfaces
                     // as a PlanReady review prompt at turn end. Deltas only
                     // refresh so a future real-time preview can hook here.
                     cx.notify();
                 }
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::PlanReady { plan_text } => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -721,6 +859,7 @@ impl Workspace {
                     this.list_state.set_follow_mode(FollowMode::Tail);
                     cx.notify();
                 }
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::PlanUpdated { snapshot } => {
                     let snapshot = snapshot.clone();
                     this.context_rail.update(cx, |r, cx| {
@@ -755,11 +894,15 @@ impl Workspace {
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
                     // The conversation view itself stays unchanged (no item).
-                    let thread_id = this.thread.read(cx).id.0.clone();
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.record_model_change(&thread_id, from.as_deref(), to, cx);
-                    });
+                    #[cfg(feature = "harness-manox")]
+                    {
+                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| {
+                            s.record_model_change(&thread_id, from.as_deref(), to, cx);
+                        });
+                    }
+                    let _ = (from, to);
                     cx.notify();
                 }
                 ThreadEvent::ReasoningEffortChanged { .. } => {
@@ -770,12 +913,15 @@ impl Workspace {
                 ThreadEvent::TokenUsageUpdated(_) => {
                     cx.notify();
                 }
+                // TODO(pi-wire): context rail metrics.
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::SideCallMetricsUpdated(metrics) => {
                     this.context_rail.update(cx, |rail, cx| {
                         rail.side_calls = metrics.clone();
                         cx.notify();
                     });
                 }
+                #[cfg(feature = "harness-manox")]
                 ThreadEvent::MainCallMetricsUpdated(metric) => {
                     this.context_rail.update(cx, |rail, cx| {
                         rail.main_call = Some(metric.clone());
@@ -786,14 +932,18 @@ impl Workspace {
                     // Light up the sidebar running indicator immediately —
                     // before the first streaming delta arrives (model warm-up,
                     // network latency). Terminal `Stop`/`Error` below clear it.
-                    let thread_id = this.thread.read(cx).id.0.clone();
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
+                    #[cfg(feature = "harness-manox")]
+                    {
+                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
+                    }
                     // Drive the Thinking status row's per-second "for Xs"
                     // counter while this turn is live. The ticker polls
                     // `turn_active` and self-terminates on the terminal stop.
                     this.turn_active = true;
                     this.spawn_thinking_ticker(cx);
+                    #[cfg(feature = "harness-manox")]
                     this.context_rail.update(cx, |r, _cx| {
                         r.cockpit_phase = CockpitPhase::Thinking;
                     });
@@ -803,6 +953,8 @@ impl Workspace {
                     failed,
                     stranded_steer_ids,
                 } => {
+                    #[cfg(feature = "harness-pi")]
+                    let _ = failed;
                     // Seal the conversation's streaming state at the
                     // authoritative turn boundary: a turn that ended without
                     // a terminal `Stop` (provider error, stream closed without
@@ -829,17 +981,21 @@ impl Workspace {
                     this.mark_stranded_steers_failed(stranded_steer_ids, cx);
                     let thread_id = this.thread.read(cx).id.0.clone();
                     save_thread(this.thread.clone(), true, cx);
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_idle(&thread_id, cx);
-                        // Clear any mid-turn error flag: the turn recovered and
-                        // completed successfully (or was cancelled, which also
-                        // supersedes a stale error indicator).
-                        if !*failed {
-                            s.set_errored(&thread_id, false, cx);
-                        }
-                    });
+                    #[cfg(feature = "harness-manox")]
+                    {
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| {
+                            s.mark_idle(&thread_id, cx);
+                            // Clear any mid-turn error flag: the turn recovered and
+                            // completed successfully (or was cancelled, which also
+                            // supersedes a stale error indicator).
+                            if !*failed {
+                                s.set_errored(&thread_id, false, cx);
+                            }
+                        });
+                    }
                     this.turn_active = false;
+                    #[cfg(feature = "harness-manox")]
                     this.context_rail.update(cx, |r, _cx| {
                         r.cockpit_phase = if *failed {
                             CockpitPhase::Failed
@@ -849,6 +1005,7 @@ impl Workspace {
                     });
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
+                    #[cfg(feature = "harness-manox")]
                     this.spawn_git_status_refresh(cx);
                     // Dispatch last: `run_turn` emits `TurnStarted`
                     // synchronously, so no terminal bookkeeping above may run
@@ -890,6 +1047,7 @@ impl Workspace {
                         // (the parked Task is cancelled on the thread side)
                         // and dismisses stranded inbound-write overlays whose
                         // decision oneshot the thread just dropped.
+                        #[cfg(feature = "harness-manox")]
                         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
                             host.clear_yields_for_thread(this, cx);
                         }
@@ -958,12 +1116,15 @@ impl Workspace {
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(e) = ev {
                         let thread_id = this.thread.read(cx).id.0.clone();
-                        let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| {
-                            s.mark_idle(&thread_id, cx);
-                            s.set_errored(&thread_id, true, cx);
-                            s.set_unread(&thread_id, true, cx);
-                        });
+                        #[cfg(feature = "harness-manox")]
+                        {
+                            let store = agent::thread_store_global();
+                            store.update(cx, |s, cx| {
+                                s.mark_idle(&thread_id, cx);
+                                s.set_errored(&thread_id, true, cx);
+                                s.set_unread(&thread_id, true, cx);
+                            });
+                        }
                         this.turn_active = false;
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -981,10 +1142,12 @@ impl Workspace {
                         // Symmetric to the terminal `Stop` arm: retire parked
                         // browser yields + stranded inbound overlays so an
                         // aborted turn leaves no stale banner behind.
+                        #[cfg(feature = "harness-manox")]
                         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
                             host.clear_yields_for_thread(this, cx);
                         }
                         this.pending_inbounds.clear();
+                        #[cfg(feature = "harness-manox")]
                         this.context_rail.update(cx, |r, _cx| {
                             r.cockpit_phase = CockpitPhase::Failed;
                         });
@@ -1001,31 +1164,37 @@ impl Workspace {
                     // flips back to Streaming; a `Running` tool call caches its
                     // title and flips RunningTool; other tool statuses return to
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
+                    // TODO(pi-wire): context rail cockpit phase.
+                    #[cfg(feature = "harness-manox")]
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
-                    let root_thread_id = this.thread.read(cx).id.0.clone();
-                    match ev {
-                        ThreadEvent::SubagentStarted {
-                            id,
-                            subagent_type,
-                            description,
-                            child,
-                        } => this.register_live_subagent(
-                            root_thread_id,
-                            SubagentInfo {
-                                id: id.clone(),
-                                parent_id: None,
-                                subagent_type: subagent_type.clone(),
-                                description: description.clone(),
-                                status: agent::ToolCallStatus::Running,
-                            },
-                            child.clone(),
-                            cx,
-                        ),
-                        ThreadEvent::SubagentProgress { id, status, .. } => {
-                            this.update_subagent_status(&root_thread_id, id, *status, cx);
+                    // TODO(pi-wire): member/sub-agent observation panels.
+                    #[cfg(feature = "harness-manox")]
+                    {
+                        let root_thread_id = this.thread.read(cx).id.0.clone();
+                        match ev {
+                            ThreadEvent::SubagentStarted {
+                                id,
+                                subagent_type,
+                                description,
+                                child,
+                            } => this.register_live_subagent(
+                                root_thread_id,
+                                SubagentInfo {
+                                    id: id.clone(),
+                                    parent_id: None,
+                                    subagent_type: subagent_type.clone(),
+                                    description: description.clone(),
+                                    status: agent::ToolCallStatus::Running,
+                                },
+                                child.clone(),
+                                cx,
+                            ),
+                            ThreadEvent::SubagentProgress { id, status, .. } => {
+                                this.update_subagent_status(&root_thread_id, id, *status, cx);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -1055,9 +1224,10 @@ impl Workspace {
     /// The parked entry is left in `background_threads` (reclaimed on a later
     /// `open_thread`); self-removal from within the callback would drop the very
     /// subscription running it.
+    #[cfg(feature = "harness-manox")]
     fn subscribe_background_thread(
         &self,
-        thread: Entity<Thread>,
+        thread: Entity<ThreadEntity>,
         cx: &mut Context<Self>,
     ) -> Subscription {
         let id = thread.read(cx).id.0.clone();
@@ -1112,6 +1282,7 @@ impl Workspace {
         )
     }
 
+    #[cfg(feature = "harness-manox")]
     fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let sidebar = self.sidebar.clone();
         cx.subscribe_in(
@@ -1224,6 +1395,7 @@ impl Workspace {
 
     /// Switch to the terminal pane, creating the terminal tab on first focus.
     /// The terminal runs in the workspace's cwd with the user's shell.
+    #[cfg(feature = "harness-manox")]
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1249,6 +1421,7 @@ impl Workspace {
 
     /// Open a fresh terminal tab (cmd-t). If one already exists it is reused
     /// rather than replaced, so an in-flight session isn't killed.
+    #[cfg(feature = "harness-manox")]
     pub fn open_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.focus_terminal(cx);
     }
@@ -1256,6 +1429,7 @@ impl Workspace {
     /// Close the terminal tab and return to the conversation pane. Dropping
     /// the `TerminalView` drops the underlying `Terminal`, whose `PtySource`
     /// kills the child and detaches the reader/waiter threads.
+    #[cfg(feature = "harness-manox")]
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
@@ -1272,6 +1446,7 @@ impl Workspace {
     /// `project_cwd` is `Some(path)` when launched from a project folder's `+`
     /// button — the CLI runs in that project's directory. `None` uses the
     /// workspace's default cwd.
+    #[cfg(feature = "harness-manox")]
     pub fn spawn_external_session(
         &mut self,
         kind: SessionKind,
@@ -1430,6 +1605,7 @@ impl Workspace {
     /// because the `ExternalSession` owns the live `TerminalView` + handle.
     /// Focuses the terminal view on the next frame so the user can type
     /// immediately without clicking into the TUI.
+    #[cfg(feature = "harness-manox")]
     pub fn attach_external_session(
         &mut self,
         id: &str,
@@ -1458,6 +1634,7 @@ impl Workspace {
     /// the `TerminalView` element is mounted (the view-mode flip schedules a
     /// re-render) before the focus is set — GPUI can't focus an element that
     /// hasn't rendered its `track_focus` yet.
+    #[cfg(feature = "harness-manox")]
     fn focus_external_view(
         &self,
         view: Entity<terminal_ui::TerminalView>,
@@ -1474,6 +1651,7 @@ impl Workspace {
     /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
     /// the titlebar when the active session's title changed. No-op when the
     /// session was already removed (a spurious title after close).
+    #[cfg(feature = "harness-manox")]
     fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
         let active = self.active_external.as_deref() == Some(id);
         let new = title.as_deref().filter(|t| !t.is_empty());
@@ -1488,6 +1666,7 @@ impl Workspace {
             true
         });
         if changed {
+            #[cfg(feature = "harness-manox")]
             self.sync_sidebar_external(cx);
             if active {
                 cx.notify();
@@ -1501,6 +1680,7 @@ impl Workspace {
     /// already-dead child is best-effort (warn-logged). Removal itself —
     /// including sidebar sync + fallback-to-conversation — is shared with the
     /// natural-exit path in [`remove_external_session`].
+    #[cfg(feature = "harness-manox")]
     pub fn close_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let kill_handle = self
             .external_sessions
@@ -1522,6 +1702,7 @@ impl Workspace {
     /// drops, and cx's `SessionHandle::Drop` does best-effort reap + socket
     /// cleanup. If the removed session was the active one, fall back to the
     /// conversation pane.
+    #[cfg(feature = "harness-manox")]
     fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.active_external.as_deref() == Some(id);
         self.external_sessions.retain(|s| s.id != id);
@@ -1535,6 +1716,7 @@ impl Workspace {
     /// Push a fresh projection of the live external sessions to the sidebar so
     /// its "External" section reflects spawns / closes without owning the
     /// PTY-bearing structs.
+    #[cfg(feature = "harness-manox")]
     fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
         let summaries: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
         self.sidebar
@@ -1546,6 +1728,7 @@ impl Workspace {
     /// Returns the allocated `BrowserTabId` so callers (the host, tool
     /// surface) can drive the tab afterwards. The webview is built untrusted:
     /// no Tauri command surface, only the notify/inbound bridges.
+    #[cfg(feature = "harness-manox")]
     pub fn open_browser_tab(
         &mut self,
         url: &str,
@@ -1569,6 +1752,7 @@ impl Workspace {
     /// Close and recycle a browser tab by id. Dropping the `BrowserView`
     /// drops the underlying native webview, whose `Drop` hides and detaches
     /// the platform view. No-op if the id is not live.
+    #[cfg(feature = "harness-manox")]
     pub fn close_browser_tab(&mut self, tab_id: BrowserTabId, cx: &mut Context<Self>) {
         if self.browser_views.remove(&tab_id).is_none() {
             return;
@@ -1717,6 +1901,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_up(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.completion.as_mut() {
             state.move_selection(-1);
@@ -1724,6 +1909,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_down(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.completion.as_mut() {
             state.move_selection(1);
@@ -1731,12 +1917,14 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_confirm_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.completion.as_ref().map(|s| s.selected).unwrap_or(0);
         self.completion_confirm(ix, window, cx);
     }
 
     /// Close the title bar "..." dropdown, dropping the menu entity + subscription.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_title_menu(&mut self) {
         self.title_menu_open = false;
         self.title_menu = None;
@@ -1744,17 +1932,20 @@ impl Workspace {
     }
 
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_access_menu(&mut self) {
         self.access_open = false;
     }
 
     /// Close the project-chip dropdown.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_project_chip_menu(&mut self) {
         self.project_chip_open = false;
         self.project_chip_menu = None;
         self.project_chip_menu_sub = None;
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn blocking_overlay_active(&self) -> bool {
         self.pending_plan_review.is_some()
             || self.pending_ask.is_some()
@@ -1762,6 +1953,7 @@ impl Workspace {
             || self.blank_project_parent.is_some()
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.turn_navigator.is_some() {
             self.close_turn_navigator(window, cx);
@@ -1870,6 +2062,7 @@ impl Workspace {
     /// anchored, so it is a single atomic state change — no frame protection
     /// needed against a stale `scroll_to_bottom` (there is no such flag on a
     /// `ListState`).
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Normal);
         self.list_state.scroll_to(ListOffset {
@@ -1879,6 +2072,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.turn_navigator.take().is_none() {
             return;
@@ -1890,6 +2084,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn drop_turn_navigator(&mut self, cx: &mut Context<Self>) {
         if self.turn_navigator.take().is_some() {
             self.turn_navigator_sub = None;
@@ -1898,6 +2093,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_turn_navigator_overlay(
         &self,
         window: &mut Window,
@@ -1953,9 +2149,10 @@ impl Workspace {
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
+    #[cfg(feature = "harness-manox")]
     fn attach_thread(
         &mut self,
-        new_thread: Entity<Thread>,
+        new_thread: Entity<ThreadEntity>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2180,6 +2377,7 @@ impl Workspace {
     ///
     /// Uses `cx.background_executor().timer()` — never `tokio::time` on the
     /// gpui foreground (that panics: no current tokio runtime).
+    #[cfg(feature = "harness-manox")]
     fn spawn_git_status_refresh(&mut self, cx: &mut Context<Self>) {
         self.git_status_gen = self.git_status_gen.wrapping_add(1);
         let entity = cx.entity().clone();
@@ -2218,6 +2416,7 @@ impl Workspace {
     /// emitted while the thread was in the background (no subscription). Called
     /// after switching threads so the question card appears without requiring
     /// the user to wait for the next event.
+    #[cfg(feature = "harness-manox")]
     fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
         // Query the thread for any pending authorization metadata that was
         // stored when the auth event was originally emitted. If the thread was
@@ -2247,6 +2446,7 @@ impl Workspace {
     /// and the swapped-in snapshot is visible to all existing threads' model
     /// menus. A failed reload keeps the previous registry and surfaces a
     /// notice; the new thread is still created either way.
+    #[cfg(feature = "harness-manox")]
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
@@ -2284,6 +2484,7 @@ impl Workspace {
 
     /// Archive the active thread and navigate to a fresh empty one. Shared
     /// by the `/exit` slash command and the `cmd-;` keybinding.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.archive_active_thread_if_idle(cx) {
             return;
@@ -2295,6 +2496,7 @@ impl Workspace {
     /// running (attaching would park the thread and clear `pending_ask`,
     /// stranding a user verdict). Marks the thread archived and persists via
     /// the store, which refreshes the sidebar list.
+    #[cfg(feature = "harness-manox")]
     fn archive_active_thread_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
         if self.thread.read(cx).is_running() {
             return false;
@@ -2311,6 +2513,7 @@ impl Workspace {
     /// `/new` starts a clean conversation without dropping the working
     /// context. No-op while a turn is running (see
     /// `archive_active_thread_if_idle`).
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn archive_current_thread_inheriting(
         &mut self,
         window: &mut Window,
@@ -2346,6 +2549,7 @@ impl Workspace {
     /// spam empty threads. `attach_thread` does the actual parking: a running
     /// thread is moved into `background_threads` with a terminal-`Stop`/`Error`
     /// subscription that flips its sidebar row to idle + unread when it lands.
+    #[cfg(feature = "harness-manox")]
     fn background_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.thread.read(cx).is_running() {
             return;
@@ -2354,6 +2558,7 @@ impl Workspace {
         self.start_new_thread(project, window, cx);
     }
 
+    #[cfg(feature = "harness-manox")]
     fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         // If the thread is already running in the background, reclaim it
         // instead of loading a stale snapshot from the db.
@@ -2376,6 +2581,8 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
+        // TODO(pi-wire): AskUserQuestion resolution — approval UI.
+        #[cfg(feature = "harness-manox")]
         if self.pending_ask.is_some() {
             self.pending_attachments = attachments;
             if !text.trim().is_empty() || self.pending_ask_has_selection() {
@@ -2417,6 +2624,8 @@ impl Workspace {
         // while a turn is running is parked in the follow-up queue as raw text
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
+        // TODO(pi-wire): slash commands — manox registry feature.
+        #[cfg(feature = "harness-manox")]
         if !self.thread.read(cx).is_running()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
@@ -2489,6 +2698,7 @@ impl Workspace {
     /// `allowed-tools` whitelist for the turn. An unknown command (adapter
     /// registered but the data registry miss — shouldn't normally happen)
     /// surfaces an error and drops the turn.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn run_command_turn(&mut self, name: &str, args: &str, cx: &mut Context<Self>) {
         let display_text = if args.is_empty() {
             format!("/{name}")
@@ -2524,6 +2734,7 @@ impl Workspace {
     /// injects the skill body (plus the appended args) as the turn's user
     /// message. An unknown skill (adapter registered but the data registry
     /// miss — shouldn't normally happen) surfaces an error and drops the turn.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn run_skill_turn(&mut self, key: &str, args: &str, cx: &mut Context<Self>) {
         let display_text = if args.is_empty() {
             format!("/{key}")
@@ -2674,6 +2885,7 @@ impl Workspace {
     /// Canonical steers that drained while the thread was in the background are
     /// already present in `messages` and are discarded from the stash; a still
     /// pending steer recreates its optimistic bubble.
+    #[cfg(feature = "harness-manox")]
     fn restore_queued_follow_ups(
         &mut self,
         thread_id: &str,
@@ -2744,6 +2956,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn consume_background_steer(&mut self, thread_id: &str, message_id: &str) {
         let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
             return;
@@ -2763,10 +2976,11 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "harness-manox")]
     fn finish_background_follow_ups(
         &mut self,
         thread_id: &str,
-        thread: &Entity<Thread>,
+        thread: &Entity<ThreadEntity>,
         cancelled: bool,
         stranded_steer_ids: &[String],
         cx: &mut Context<Self>,
@@ -3016,6 +3230,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn undo_last_queued(&mut self, cx: &mut Context<Self>) {
         if let Some(item) = self.queued_follow_ups.pop_back() {
             let steer_id = match &item.state {
@@ -3058,6 +3273,7 @@ impl Workspace {
             .collect()
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor_open {
             self.close_editor(window, cx);
@@ -3067,6 +3283,7 @@ impl Workspace {
     }
 
     /// Whether the right pane has any tab (Editor or Member) showing.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn right_pane_open(&self) -> bool {
         !self.right_tabs.is_empty()
     }
@@ -3097,6 +3314,7 @@ impl Workspace {
     /// `removed_ix` shift left by one, so a still-live active tab to the right
     /// must decrement; the active tab itself being removed (and being the
     /// last) falls back to the new last tab.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn reseat_active_after_close(&mut self, removed_ix: usize) {
         if self.active_right_tab > removed_ix {
             self.active_right_tab -= 1;
@@ -3109,6 +3327,7 @@ impl Workspace {
     /// into the editor so writing continues there. If an Editor tab is already
     /// present, just focus it. Submit from the editor with Cmd-Enter; close with
     /// Ctrl-G / Cmd-W to move the draft back.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Close any open inline menus so they don't linger behind the hidden footer.
         self.close_completion(cx);
@@ -3133,6 +3352,7 @@ impl Workspace {
 
     /// Close the Editor tab without submitting: move the draft back into the
     /// inline composer and reveal it again. No-op when no Editor tab is present.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.editor_tab_ix() else {
             return;
@@ -3155,11 +3375,12 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn register_live_subagent(
         &mut self,
         root_thread_id: String,
         info: SubagentInfo,
-        child: Entity<Thread>,
+        child: Entity<ThreadEntity>,
         cx: &mut Context<Self>,
     ) {
         let id = info.id.clone();
@@ -3184,6 +3405,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn update_subagent_status(
         &mut self,
         root_thread_id: &str,
@@ -3221,6 +3443,7 @@ impl Workspace {
         self.set_active_right_tab(ix, cx);
     }
 
+    #[cfg(feature = "harness-manox")]
     fn sync_subagents_to_rail(&mut self, cx: &mut Context<Self>) {
         let root_thread_id = self.thread.read(cx).id.0.clone();
         let agents = self
@@ -3238,6 +3461,7 @@ impl Workspace {
             .update(cx, |rail, cx| rail.set_agents(agents, cx));
     }
 
+    #[cfg(feature = "harness-manox")]
     fn rebuild_subagent_observations(
         &mut self,
         snapshots: Vec<SubagentSnapshot>,
@@ -3257,6 +3481,7 @@ impl Workspace {
         self.sync_subagents_to_rail(cx);
     }
 
+    #[cfg(feature = "harness-manox")]
     fn close_subagent_tabs(&mut self) {
         remove_subagent_tabs(&mut self.right_tabs, &mut self.active_right_tab);
         self.editor_open = self
@@ -3268,6 +3493,7 @@ impl Workspace {
     /// Focus a member's observation tab, creating it if absent. The panel is
     /// built from the member's `Thread` + role, read off the leader's active
     /// team; no-op if no team or no such member.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Some(ix) = self
             .right_tabs
@@ -3307,6 +3533,7 @@ impl Workspace {
     /// Close a right-pane tab by index. The Editor tab routes through
     /// `close_editor` to preserve draft-transfer semantics; a Member tab drops
     /// its panel; a Browser tab drops its webview.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
             self.close_editor(window, cx);
@@ -3342,8 +3569,13 @@ impl Workspace {
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
             cx.notify();
+            // Under harness-pi the browser block below is cfg'd away, making
+            // this the function's tail statement.
+            #[cfg_attr(feature = "harness-pi", allow(clippy::needless_return))]
             return;
         }
+        // TODO(pi-wire): browser tabs.
+        #[cfg(feature = "harness-manox")]
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
             self.close_browser_tab(id, cx);
         }
@@ -3351,6 +3583,7 @@ impl Workspace {
     /// Close the active right-pane tab if it is a browser tab. No-op
     /// otherwise (the keybinding is global; it should not close Editor or
     /// Member tabs that happen to be active).
+    #[cfg(feature = "harness-manox")]
     pub fn close_active_browser_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(self.active_right_tab).cloned() {
             self.close_browser_tab(id, cx);
@@ -3359,6 +3592,7 @@ impl Workspace {
 
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_editor_preview(!self.editor_preview, window, cx);
     }
@@ -3366,6 +3600,7 @@ impl Workspace {
     /// Switch the editor panel to preview (`Write` tab) or rendered markdown
     /// (`Preview` tab). No-op when the panel is closed or already in that mode.
     /// Returning to `Write` focuses the editor so typing works immediately.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn set_editor_preview(&mut self, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.editor_open || self.editor_preview == preview {
             return;
@@ -3423,6 +3658,7 @@ impl Workspace {
 
     /// Open the plan text in a right-pane PlanPreview tab (peer of Editor).
     /// If a PlanPreview tab already exists, update its text and focus it.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn open_plan_in_editor(&mut self, plan_text: String, cx: &mut Context<Self>) {
         if let Some(ix) = self
             .right_tabs
@@ -3469,6 +3705,7 @@ impl Workspace {
     /// through `ThreadStore::pin_thread`; the in-memory `Thread` mirror is
     /// flipped first so the menu label updates immediately on the next
     /// re-open. Notifies the workspace so the menu trigger re-renders.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn title_menu_toggle_pin(&mut self, cx: &mut Context<Self>) {
         let id = self.thread.read(cx).id.0.clone();
         let next = !self.thread.read(cx).is_pinned();
@@ -3483,6 +3720,7 @@ impl Workspace {
         self.add_info_message(msg.to_string(), cx);
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn title_menu_archive(&mut self, cx: &mut Context<Self>) {
         let id = self.thread.read(cx).id.0.clone();
         let next = !self.thread.read(cx).archived();
@@ -3503,6 +3741,7 @@ impl Workspace {
     /// Copy a string to the system clipboard, then push a localized notice
     /// so the user sees what landed in the clipboard. Single funnel for all
     /// `titlebar-copy-*` actions so the notice phrasing stays consistent.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn title_menu_copy(&mut self, label_key: &str, value: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
         self.add_info_message(i18n::t(label_key).to_string(), cx);
@@ -3569,6 +3808,7 @@ impl Workspace {
     /// Toggle Danger mode on the current thread. Pushes a notice so the
     /// user sees the state change in the conversation. Called by the
     /// `/danger` slash command and the access-chip dropdown.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn toggle_danger(&mut self, cx: &mut Context<Self>) {
         let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Danger {
             ApprovalMode::AutoPilot
@@ -3581,6 +3821,7 @@ impl Workspace {
     /// Enable Danger mode and immediately send `prompt` as a user turn
     /// (the `/danger [prompt]` form). If Danger is already on it stays on;
     /// the prompt still runs.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn start_danger_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.thread.read(cx).approval_mode() != ApprovalMode::Danger {
             self.apply_approval_mode(ApprovalMode::Danger, cx);
@@ -3588,6 +3829,7 @@ impl Workspace {
         self.send_user_turn(prompt, Vec::new(), cx);
     }
 
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
         // An AskUserQuestion card's "Cancel" button calls this; the card is
         // the only pending surface, so resolve its id directly.
@@ -3612,6 +3854,7 @@ impl Workspace {
     /// tab. Routed through `Thread::respond_inbound` — separate from the
     /// outbound `resolve_auth` pipeline because this axis is `ApprovalMode`-
     /// blind by design.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn resolve_inbound(&mut self, allowed: bool, cx: &mut Context<Self>) {
         let Some(req) = self.pending_inbounds.pop() else {
             return;
@@ -3672,6 +3915,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_mut()
             && let Some(sel) = ask.selections.get_mut(qi)
@@ -3698,6 +3942,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn ask_prev(&mut self, cx: &mut Context<Self>) {
         if self.ask_step > 0 {
             self.ask_step -= 1;
@@ -3705,6 +3950,7 @@ impl Workspace {
         }
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn ask_next(&mut self, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_ref()
             && self.ask_step < ask.questions.len() - 1
@@ -3716,6 +3962,7 @@ impl Workspace {
 
     /// Submit the ask drawer: gather selected options plus an optional global
     /// supplemental note from the composer.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn resolve_ask_with_response(
         &mut self,
         response_override: Option<String>,
@@ -3771,6 +4018,7 @@ impl Workspace {
     /// seed; the rail's plan overview seeds later from the model's first
     /// `UpdatePlan` call. Staying in Plan mode is not a verdict — the user
     /// simply keeps typing.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn respond_plan_review(
         &mut self,
         choice: PlanReviewChoice,
@@ -3859,6 +4107,7 @@ impl Workspace {
     /// Confirmation overlay for an inbound-write request from a built-in
     /// browser tab. Scrim + card layout like the question-card surface, but
     /// resolves through `respond_inbound` (the mode-blind axis).
+    #[cfg(feature = "harness-manox")]
     fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let req = self.pending_inbounds.last()?;
         let intent = req.intent.clone();
@@ -3959,6 +4208,7 @@ impl Workspace {
     /// showing `provider · model · effort` with the model name tinted to
     /// match its wire API. Open: a PopupMenu with Provider submenus, a
     /// separator, then High / Max effort items.
+    #[cfg(feature = "harness-manox")]
     fn render_model_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
         let model = self.thread.read(cx).model().cloned();
@@ -4077,6 +4327,7 @@ impl Workspace {
     }
 
     /// Wire API → text color for the composer model label.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn wire_api_text_color(wire: WireApi, theme: &Theme) -> gpui::Hsla {
         match wire {
             WireApi::Anthropic => theme.primary,
@@ -4086,6 +4337,7 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "harness-manox")]
     /// WireApi → Tag variant + label mapping for the model menu.
     fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
         match wire {
@@ -4095,6 +4347,7 @@ impl Workspace {
             WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
         }
     }
+    #[cfg(feature = "harness-manox")]
     /// Cascading model menu grouped by provider, followed by a separator and
     /// reasoning-effort items (High / Max). Each model row shows a wire-api Tag.
     fn build_model_popup_menu(
@@ -4178,6 +4431,7 @@ impl Workspace {
         menu
     }
 
+    #[cfg(feature = "harness-manox")]
     /// Title bar "..." trigger + dropdown (conversation menu).
     ///
     /// Closed: a small ghost icon button (horizontal ellipsis) next to the
@@ -4369,12 +4623,32 @@ impl Workspace {
             });
         }
         let queue = self.render_queued_follow_ups(theme, cx);
+        // TODO(pi-wire): attachments (+ menu), project picker, goal/team chips,
+        // approval menu, model selector — manox surfaces.
+        #[cfg(feature = "harness-manox")]
         let plus = self.render_plus_button(cx);
+        #[cfg(feature = "harness-pi")]
+        let plus: AnyElement = gpui::div().into_any_element();
+        #[cfg(feature = "harness-manox")]
         let project_chip = self.render_project_chip(theme, cx);
+        #[cfg(feature = "harness-pi")]
+        let project_chip: AnyElement = gpui::div().into_any_element();
+        #[cfg(feature = "harness-manox")]
         let goal_chip = self.render_goal_chip(theme, cx);
+        #[cfg(feature = "harness-pi")]
+        let goal_chip: Option<AnyElement> = None;
+        #[cfg(feature = "harness-manox")]
         let team_chip = self.render_team_chip(theme, cx);
+        #[cfg(feature = "harness-pi")]
+        let team_chip: Option<AnyElement> = None;
+        #[cfg(feature = "harness-manox")]
         let access = self.render_access_placeholder(theme, cx);
+        #[cfg(feature = "harness-pi")]
+        let access: AnyElement = gpui::div().into_any_element();
+        #[cfg(feature = "harness-manox")]
         let model = self.render_model_selector(theme, cx);
+        #[cfg(feature = "harness-pi")]
+        let model: AnyElement = gpui::div().into_any_element();
         let send = self.render_send_button(
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
             cx,
@@ -4588,6 +4862,7 @@ impl Workspace {
     /// `◎ Goal active · {elapsed}` in accent colors so the autonomous-loop
     /// posture is legible at a glance. Clicking toggles the status popover
     /// (condition / elapsed / evaluations / last reason / Clear).
+    #[cfg(feature = "harness-manox")]
     fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let g = self.thread.read(cx).goal()?;
         let accent = theme.accent;
@@ -4903,6 +5178,7 @@ impl Workspace {
     /// each worker member (name / role / status dot / task count). Clicking a
     /// row opens that member's observation tab in the right pane. The leader is
     /// not listed (it is the main conversation).
+    #[cfg(feature = "harness-manox")]
     fn render_team_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let team = self.thread.read(cx).team().cloned()?;
         // Collect member roster metadata in one pass so we never hold a borrow
@@ -5081,6 +5357,7 @@ impl Workspace {
     /// The popover is `max_w(360)` to fit the longest bilingual subtitle
     /// ("Unrestricted access to the internet and any file on your computer")
     /// without wrapping.
+    #[cfg(feature = "harness-manox")]
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
@@ -5168,6 +5445,7 @@ impl Workspace {
     }
 
     /// The composer `+` button and its popup menu ("add / plugins").
+    #[cfg(feature = "harness-manox")]
     fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let trigger = Button::new("composer-plus")
             .ghost()
@@ -5204,7 +5482,7 @@ impl Workspace {
             )
             .into_any_element()
     }
-
+    #[cfg(feature = "harness-manox")]
     fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
         let ws = cx.entity().downgrade();
@@ -5241,6 +5519,7 @@ impl Workspace {
         self.plus_menu_sub = Some(sub);
     }
 
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_plus_menu(&mut self) {
         self.plus_open = false;
         self.plus_menu = None;
@@ -5248,6 +5527,7 @@ impl Workspace {
     }
 
     /// Open the native file picker and add chosen paths as pending attachments.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
@@ -5367,6 +5647,7 @@ impl Workspace {
     }
 
     /// Pending-attachment chips shown above the composer, each removable.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.pending_attachments.is_empty() {
             return None;
@@ -5391,6 +5672,7 @@ impl Workspace {
     /// (or "Choose project" when unbound). Opens a dropdown listing recent
     /// projects followed by "Create blank project" / "Select folder" actions.
     /// Mirrors the access-chip pattern.
+    #[cfg(feature = "harness-manox")]
     fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
         let open = self.project_chip_open;
@@ -5641,6 +5923,7 @@ impl Workspace {
     }
 
     /// Open the blank-project flow: pick a parent directory, then prompt for name.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn open_blank_project(&mut self, cx: &mut Context<Self>) {
         if self.project_picker_pending {
             return;
@@ -5670,6 +5953,7 @@ impl Workspace {
     }
 
     /// Lazily create the blank-project name input (needs a Window).
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn ensure_blank_project_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.blank_project_parent.is_none() {
             return;
@@ -5681,6 +5965,7 @@ impl Workspace {
     }
 
     /// Submit the blank project: create the directory and bind it.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn confirm_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(parent) = self.blank_project_parent.take() else {
             return;
@@ -5706,6 +5991,7 @@ impl Workspace {
     }
 
     /// Cancel the blank project overlay.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn cancel_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.blank_project_parent = None;
         self.blank_project_name_input = None;
@@ -5713,6 +5999,7 @@ impl Workspace {
     }
 
     /// Shared inner logic for "Select folder" (directory picker → bind project).
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn choose_project_inner(&mut self, cx: &mut Context<Self>) {
         if self.project_picker_pending {
             return;
@@ -5741,6 +6028,7 @@ impl Workspace {
     }
 
     /// Overlay prompting for the blank-project folder name.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_blank_project_overlay(
         &self,
         _window: &mut Window,
@@ -5840,6 +6128,191 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "harness-manox")]
+        {
+            self.render_manox(window, cx)
+        }
+        #[cfg(feature = "harness-pi")]
+        {
+            self.render_pi(window, cx)
+        }
+    }
+}
+impl Workspace {
+    /// The pi-stage workspace chrome: title bar + conversation column +
+    /// composer. Everything not yet wired to the pi backend is absent by
+    /// construction; search `TODO(pi-wire)` for the remaining surface.
+    #[cfg(feature = "harness-pi")]
+    fn render_pi(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings overlay: provider credentials/models are configured here,
+        // so it stays even though the rest of the chrome is reduced.
+        if matches!(self.view_mode, ViewMode::Settings) {
+            let settings = self
+                .settings_view
+                .as_ref()
+                .expect("enter_settings must have created the SettingsView")
+                .clone();
+            let (anim_id, sign) = if self.exiting_settings {
+                (
+                    format!("settings-exit-{}", self.settings_transition_gen),
+                    1.0,
+                )
+            } else {
+                (
+                    format!("settings-enter-{}", self.settings_transition_gen),
+                    -1.0,
+                )
+            };
+            let panel_w = px(280.0);
+            let anim_el = gpui::div().size_full().child(settings).with_animation(
+                anim_id,
+                Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
+                move |el, delta| {
+                    let offset = panel_w * sign * (1.0 - delta);
+                    el.relative().ml(offset)
+                },
+            );
+            return h_flex().size_full().child(anim_el);
+        }
+
+        let theme = cx.theme().clone();
+        let running = self.thread.read(cx).is_running();
+        let title_text: SharedString = {
+            let s = self.thread.read(cx).display_title();
+            if s.is_empty() {
+                "Manox Pi".to_string()
+            } else {
+                s
+            }
+        }
+        .into();
+        let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
+
+        let footer = if first_screen {
+            None
+        } else {
+            Some(
+                v_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(theme.background)
+                    .py_2()
+                    .gap_2()
+                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
+                    .child(centered(self.render_composer(running, window, &theme, cx))),
+            )
+        };
+
+        let hero = first_screen.then(|| {
+            centered(
+                v_flex()
+                    .w_full()
+                    .gap_4()
+                    .child(
+                        gpui::div()
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child("Manox Pi"),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(i18n::t("workspace-hero-subtitle")),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(640.))
+                            .child(self.render_composer(running, window, &theme, cx)),
+                    ),
+            )
+        });
+
+        let list = (!first_screen).then(|| {
+            let conv = self.conversation.clone();
+            let list_state = self.list_state.clone();
+            let list_el = gpui::list(list_state, move |ix, _window, cx| {
+                let item = conv.read(cx).items().get(ix).cloned();
+                match item {
+                    Some(item) => v_flex()
+                        .w_full()
+                        .pt_1()
+                        .pb_4()
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .child(item)
+                        .into_any_element(),
+                    None => gpui::div().into_any_element(),
+                }
+            })
+            .with_sizing_behavior(ListSizingBehavior::Auto)
+            .w_full()
+            .h_full()
+            .min_h_0()
+            .min_w_0()
+            .font_family(theme.mono_font_family.clone())
+            .font_weight(gpui::FontWeight::LIGHT);
+            v_flex()
+                .flex_1()
+                .h_full()
+                .min_h_0()
+                .min_w_0()
+                .overflow_hidden()
+                .child(list_el)
+        });
+
+        h_flex()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.enter_settings(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                this.focus_conversation(cx);
+            }))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .relative()
+                    .child(
+                        TitleBar::new().child(
+                            h_flex().gap_2().items_center().flex_1().min_w_0().child(
+                                gpui::div()
+                                    .text_sm()
+                                    .text_left()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(title_text),
+                            ),
+                        ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .pt(TITLE_BAR_HEIGHT)
+                            .pb_2()
+                            .children(hero)
+                            .children(list)
+                            .children(footer),
+                    ),
+            )
+    }
+}
+
+impl Workspace {
+    /// The full manox workspace chrome: sidebar, conversation column, context
+    /// rail, right pane, approval overlays. Untouched by the pi port.
+    #[cfg(feature = "harness-manox")]
+    fn render_manox(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
         }
@@ -6726,7 +7199,7 @@ impl Render for Workspace {
 /// `TerminalPanel` prompt line. Reads the `Thread` entity (not the `Workspace`)
 /// so it stays safe inside a `Workspace::update` closure, where reading the
 /// `Workspace` itself would double-lease. `None` only when the path is empty.
-fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
+fn thread_cwd(thread: &Entity<ThreadEntity>, cx: &App) -> Option<SharedString> {
     let cwd = thread.read(cx).cwd();
     if cwd.as_os_str().is_empty() {
         None
@@ -6735,6 +7208,7 @@ fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
     }
 }
 
+#[cfg(feature = "harness-manox")]
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
     // Out-of-range counts violate the tool contract. No card is shown for
@@ -6799,6 +7273,7 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
     })
 }
 
+#[cfg(feature = "harness-manox")]
 fn strip_recommended_suffix(label: String) -> (String, bool) {
     let lower = label.to_lowercase();
     for suffix in [" (Recommended)", "（推荐）", " (推荐)", "（Recommended）"] {
@@ -6817,6 +7292,7 @@ fn strip_recommended_suffix(label: String) -> (String, bool) {
 /// active theme (light/dark) without bespoke palettes per mode. The
 /// AutoPilot accent uses `info` (green) as a "this is the safe default"
 /// signal — staying gray would be visually identical to a disabled state.
+#[cfg(feature = "harness-manox")]
 fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
     match mode {
         ApprovalMode::AutoPilot => (
@@ -6834,6 +7310,7 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
 
 /// Format a `Duration` as a compact elapsed-time string for the goal chip
 /// (`42s`, `3m 42s`, `1h 5m`). Not localized — the format is universal.
+#[cfg(feature = "harness-manox")]
 fn format_elapsed(d: std::time::Duration) -> String {
     let total_secs = d.as_secs();
     let h = total_secs / 3600;
@@ -6849,6 +7326,7 @@ fn format_elapsed(d: std::time::Duration) -> String {
 }
 
 /// One label/value row in the goal status popover.
+#[cfg(feature = "harness-manox")]
 fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla) -> gpui::Div {
     h_flex()
         .w_full()
@@ -6891,6 +7369,7 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
 /// for the opaque card chrome — that path doesn't go through `PopupMenu`
 /// at all, sidestepping the per-`ElementItem` `flex_1`/`min_h(26)` wrapper
 /// that was producing both the height-leak bug and the clip-to-26 bug.
+#[cfg(feature = "harness-manox")]
 fn build_approval_content(
     workspace: WeakEntity<Workspace>,
     current: ApprovalMode,
@@ -6997,6 +7476,7 @@ impl Workspace {
     /// Switch the thread's `ApprovalMode`, post a localized notice, and close
     /// the popover. Centralized so slash command, chip click, and the
     /// future settings-panel wiring all funnel through one path.
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
         let mode_key = match mode {
             ApprovalMode::AutoPilot => "autopilot",
@@ -7030,8 +7510,9 @@ fn truncate_follow_up(s: &str) -> String {
 /// Append a deferred follow-up to a parked thread without touching the
 /// foreground conversation view. The canonical history is rebuilt when the
 /// user switches back to this task.
+#[cfg(feature = "harness-manox")]
 fn append_deferred_turn_to_thread(
-    thread: &Entity<Thread>,
+    thread: &Entity<ThreadEntity>,
     turn: DeferredUserTurn,
     cx: &mut Context<Workspace>,
 ) {
@@ -7052,6 +7533,7 @@ fn append_deferred_turn_to_thread(
 }
 
 #[cfg(test)]
+#[cfg(feature = "harness-manox")]
 mod tests {
     use super::*;
 

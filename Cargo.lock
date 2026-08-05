@@ -193,6 +193,8 @@ dependencies = [
  "manox-components",
  "manox-webview",
  "open",
+ "pi",
+ "pi-extensions",
  "rust-embed",
  "serde",
  "serde_json",

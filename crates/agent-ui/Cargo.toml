@@ -8,6 +8,17 @@ publish.workspace = true
 name = "agent_ui"
 path = "src/lib.rs"
 
+[features]
+default = ["harness-manox"]
+# The manox self-built harness backend (the polished, feature-complete path).
+# Mutually exclusive with `harness-pi`; the `manox` bin guards both ways.
+harness-manox = []
+# Mount the pi harness backend: the workspace drives a `pi_backend::PiSession`
+# adapter (cfg-gated module) instead of the manox `agent::Thread`. Selected at
+# build time by the `manox` bin (`--no-default-features --features harness-pi`);
+# the default build never compiles the pi dependencies.
+harness-pi = ["dep:pi", "dep:pi-extensions"]
+
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
@@ -35,6 +46,10 @@ manox-webview.workspace = true
 # cx library —— `AgentBuilder` / `SessionHandle` to spawn external agent CLIs
 # (claude/codex/copilot) and hold the PTY handle for an `ExternalSession`.
 cx.workspace = true
+
+# pi harness backend — only compiled for the `harness-pi` feature.
+pi = { workspace = true, optional = true }
+pi-extensions = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent = { workspace = true, features = ["test-support"] }

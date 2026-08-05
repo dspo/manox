@@ -19,7 +19,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "harness-manox")]
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::conversation::{
     ActivityEntry, AgentTaskItem, BackgroundTaskItem, ConvItem, ThinkingContainer, ToolCallItem,
@@ -31,17 +33,20 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-use gpui::{
-    Animation, AnimationExt as _, App, ClipboardItem, CursorStyle, Entity, Render, SharedString,
-    WeakEntity, ease_out_quint, px,
-};
+#[cfg(feature = "harness-manox")]
+use gpui::{Animation, AnimationExt as _, CursorStyle, ease_out_quint};
+use gpui::{App, ClipboardItem, Entity, Render, SharedString, WeakEntity, px};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
-    tag::{Tag, TagVariant},
     tooltip::Tooltip,
     v_flex,
+};
+#[cfg(feature = "harness-manox")]
+use gpui_component::{
+    Disableable as _,
+    tag::{Tag, TagVariant},
 };
 use manox_components::markdown::ast::LinkKind;
 use manox_components::markdown::terminal_panel::GitSummary;
@@ -70,6 +75,8 @@ pub struct AgentTaskCtx {
 #[derive(Clone)]
 pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
+    // TODO(pi-wire): AskUserQuestion cards are manox-harness only for now.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) ask: Option<AskCardSnapshot>,
 }
 
@@ -631,6 +638,8 @@ pub fn render_item(
         } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
+            // TODO(pi-wire): AskUserQuestion card — approval UI.
+            #[cfg(feature = "harness-manox")]
             if t.name == agent::tools::ASK_USER_QUESTION {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
@@ -640,6 +649,8 @@ pub fn render_item(
                 // defensive orphan — render it as a plain card.
                 render_tool_call(t, ix, theme, tool_ctx, cx)
             }
+            #[cfg(feature = "harness-pi")]
+            render_tool_call(t, ix, theme, tool_ctx, cx)
         }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
         ConvItem::Error(msg) => render_error(msg, ix, theme, body, cx),
@@ -647,9 +658,13 @@ pub fn render_item(
         ConvItem::TeamMessage { from, content } => {
             render_team_message(from, content, ix, theme, body, cx)
         }
+        // TODO(pi-wire): plan review — plan mode is a manox flow.
+        #[cfg(feature = "harness-manox")]
         ConvItem::PlanReview { plan_text, active } => {
             render_plan_review_card(plan_text, *active, ix, theme, tool_ctx, body, cx)
         }
+        #[cfg(feature = "harness-pi")]
+        ConvItem::PlanReview { .. } => gpui::div().into_any_element(),
         ConvItem::Recap {
             summary,
             collapsed,
@@ -1788,6 +1803,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
 /// [PlanPreviewTab] — and the footer carries the three verdicts that delegate to
 /// `Workspace::respond_plan_review`. The composer below stays live so the user
 /// can discuss or refine the plan instead of picking a verdict.
+#[cfg(feature = "harness-manox")]
 fn render_plan_review_card(
     plan_text: &str,
     active: bool,
@@ -1967,6 +1983,7 @@ fn render_plan_review_card(
         .into_any_element()
 }
 
+#[cfg(feature = "harness-manox")]
 fn render_ask_user_card(
     item: &ToolCallItem,
     ix: usize,

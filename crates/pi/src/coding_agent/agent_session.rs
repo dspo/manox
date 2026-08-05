@@ -766,6 +766,19 @@ impl AgentSession {
         self.harness.subscribe_harness(listener)
     }
 
+    /// Subscribe to the agent loop's streaming content events (`AgentEvent`).
+    ///
+    /// Unlike [`Self::subscribe_harness`] (lifecycle only: queues, settle,
+    /// abort), this carries the actual transcript traffic — message
+    /// start/update/end, tool execution start/update/end, turn boundaries —
+    /// which is what a UI consumer needs to render a live session. Listeners
+    /// are awaited inline with each emission, so all events for a run are
+    /// observed by the time the run settles. Delivery stops when the returned
+    /// subscription is dropped.
+    pub fn subscribe(&self, listener: crate::agent::AgentListener) -> crate::agent::Subscription {
+        self.harness.agent().subscribe(listener)
+    }
+
     /// Configure the compaction policy.
     pub fn set_compaction_settings(&mut self, settings: crate::compaction::CompactionSettings) {
         self.harness.set_compaction_settings(settings);
@@ -3554,5 +3567,53 @@ mod tests {
                 None => unsafe { std::env::remove_var(v) },
             }
         }
+    }
+
+    /// `subscribe` forwards the agent loop's streaming content events — the
+    /// UI-facing surface. A plain scripted stream still exercises the
+    /// lifecycle backstops (MessageStart/MessageEnd the loop emits when the
+    /// stream itself sent none), so the listener must see turn + message
+    /// boundaries by the time `prompt` settles.
+    #[tokio::test]
+    async fn subscribe_forwards_agent_loop_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let record = Arc::clone(&seen);
+        let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
+            let kind = match event {
+                AgentEvent::AgentStart => "agent_start",
+                AgentEvent::TurnStart => "turn_start",
+                AgentEvent::MessageStart { .. } => "message_start",
+                AgentEvent::MessageUpdate { .. } => "message_update",
+                AgentEvent::MessageEnd { .. } => "message_end",
+                AgentEvent::ToolExecutionStart { .. } => "tool_start",
+                AgentEvent::ToolExecutionEnd { .. } => "tool_end",
+                _ => "other",
+            };
+            record.lock().unwrap().push(kind);
+            Box::pin(async {})
+        }));
+
+        session.prompt("hello").await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"turn_start"), "saw turn start: {seen:?}");
+        assert!(
+            seen.contains(&"message_start"),
+            "saw message start: {seen:?}"
+        );
+        assert!(seen.contains(&"message_end"), "saw message end: {seen:?}");
     }
 }

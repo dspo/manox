@@ -10,6 +10,14 @@ use std::borrow::Cow;
 
 mod about;
 
+// The harness backend is selected at build time; exactly one must be active.
+#[cfg(all(feature = "harness-manox", feature = "harness-pi"))]
+compile_error!(
+    "features `harness-manox` and `harness-pi` are mutually exclusive; enable exactly one"
+);
+#[cfg(not(any(feature = "harness-manox", feature = "harness-pi")))]
+compile_error!("enable one of the harness features: `harness-manox` (default) or `harness-pi`");
+
 actions!(manox, [Quit, ToggleFullscreen, OpenAbout]);
 
 /// Minimum window width budget, left to right:
@@ -65,10 +73,22 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
-        agent::init(cx);
-        terminal::init(cx);
-        terminal_ui::init(cx);
-        agent_ui::slash_command::init(cx);
+        #[cfg(feature = "harness-manox")]
+        {
+            agent::init(cx);
+            terminal::init(cx);
+            terminal_ui::init(cx);
+            agent_ui::slash_command::init(cx);
+        }
+        #[cfg(feature = "harness-pi")]
+        {
+            // Minimal pi init: tokio runtime, i18n bundle, provider registry.
+            // TODO(pi-wire): mcp / thread_store / skill / command / hook /
+            // lsp / hashline / agent_def / terminal registries stay unwired.
+            agent::runtime::init(cx);
+            agent::i18n::init();
+            agent::provider::registry::init(cx);
+        }
 
         // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and
         // italic cuts: message body inherits Light, markdown bold/headings and
@@ -149,26 +169,36 @@ fn main() {
             // Terminal tab: cmd-t opens, cmd-shift-t focuses, cmd-shift-c
             // returns to the conversation pane. Handlers live on the active
             // Workspace (see `Workspace::Render`).
+            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-t", agent_ui::NewTerminalTab, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-c", agent_ui::FocusConversation, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-t", agent_ui::NewTerminalTab, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
             // Built-in browser. cmd-b opens a new browser tab in the right
             // pane, cmd-shift-b closes the active browser tab.
+            // TODO(pi-wire): browser tabs are unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserTab, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserTab, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-alt-b", agent_ui::OpenBrowserTab, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserTab, None),
             // Park the active running thread into the background and open a
@@ -176,6 +206,8 @@ fn main() {
             // this task" gesture. No-op when idle. cmd-b stays the browser key
             // on macOS, so ctrl-b is free there; on other platforms the browser
             // tab moved to ctrl-alt-b to free ctrl-b for this action.
+            // TODO(pi-wire): background threads are unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             gpui::KeyBinding::new("ctrl-b", agent_ui::BackgroundCurrentThread, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
@@ -186,8 +218,11 @@ fn main() {
             // Cockpit milestone panel: cmd/ctrl-shift-m collapses or expands
             // the plan-steps section in the "Conversation Info" card. The
             // header is also clickable; this is the keyboard affordance.
+            // TODO(pi-wire): cockpit panel is unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-m", agent_ui::ToggleCockpitTasks, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-m", agent_ui::ToggleCockpitTasks, None),
             // Completion popover (driven while the composer Input is focused and
@@ -224,8 +259,11 @@ fn main() {
                 Some("completion == open > Input"),
             ),
             // Archive the current thread and start a fresh one.
+            // TODO(pi-wire): thread archival is unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-;", agent_ui::ArchiveCurrentThread, None),
+            #[cfg(feature = "harness-manox")]
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-;", agent_ui::ArchiveCurrentThread, None),
             // Open turn navigator (additional binding alongside cmd-m).
@@ -269,6 +307,8 @@ fn main() {
         // Terminal actions share the same deferred-dispatch path as Settings:
         // menu items fire App-level handlers, which reach the active window's
         // Workspace via the stashed handles.
+        #[cfg(feature = "harness-manox")]
+        // TODO(pi-wire): terminal tabs are unwired under harness-pi.
         cx.on_action(|_: &agent_ui::NewTerminalTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
@@ -282,6 +322,7 @@ fn main() {
                 }
             });
         });
+        #[cfg(feature = "harness-manox")]
         cx.on_action(|_: &agent_ui::FocusTerminal, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
@@ -308,6 +349,7 @@ fn main() {
                 }
             });
         });
+        #[cfg(feature = "harness-manox")]
         cx.on_action(|_: &agent_ui::CloseTerminalTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
@@ -321,6 +363,8 @@ fn main() {
                 }
             });
         });
+        #[cfg(feature = "harness-manox")]
+        // TODO(pi-wire): browser tabs are unwired under harness-pi.
         cx.on_action(|_: &agent_ui::OpenBrowserTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
@@ -340,6 +384,7 @@ fn main() {
                 }
             });
         });
+        #[cfg(feature = "harness-manox")]
         cx.on_action(|_: &agent_ui::CloseBrowserTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
@@ -395,6 +440,9 @@ fn main() {
             let handle = cx
                 .open_window(window_options, |window, cx| {
                     window.activate_window();
+                    #[cfg(feature = "harness-pi")]
+                    window.set_window_title("Manox Pi");
+                    #[cfg(feature = "harness-manox")]
                     window.set_window_title("manox");
                     Theme::change(ThemeMode::Light, Some(window), cx);
 
@@ -414,6 +462,8 @@ fn main() {
             // closure with no `&mut App`, so the drainer (which owns an
             // `AsyncApp`) is the cx-bearing sink that emits onto the owning
             // thread.
+            // TODO(pi-wire): the embedded browser host is manox-only chrome.
+            #[cfg(feature = "harness-manox")]
             if let Some(workspace) = agent_ui::dispatch::workspace_global() {
                 agent_ui::browser_host::WorkspaceBrowserHost::install(workspace.clone(), cx);
             }
@@ -457,6 +507,8 @@ fn build_app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action(agent::i18n::t("menu-quit"), Quit),
             ]),
+            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             Menu::new(agent::i18n::t("menu-terminal")).items([
                 MenuItem::action(
                     agent::i18n::t("menu-new-terminal"),
@@ -477,14 +529,18 @@ fn build_app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
             MenuItem::separator(),
+            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
+            #[cfg(feature = "harness-manox")]
             MenuItem::action(
                 agent::i18n::t("menu-new-terminal"),
                 agent_ui::NewTerminalTab,
             ),
+            #[cfg(feature = "harness-manox")]
             MenuItem::action(
                 agent::i18n::t("menu-close-terminal"),
                 agent_ui::CloseTerminalTab,
             ),
+            #[cfg(feature = "harness-manox")]
             MenuItem::separator(),
             MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]

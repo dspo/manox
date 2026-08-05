@@ -73,6 +73,8 @@ impl BrowserView {
         // single owner of routing; the webview crate's OnceLock keeps the
         // first-attached closures, so every BrowserView attaches the same
         // host-owned closures (a later open never finds a stale handler).
+        // TODO(pi-wire): browser host bridges — manox surface.
+        #[cfg(feature = "harness-manox")]
         let builder = crate::browser_host::WorkspaceBrowserHost::attach_to_builder(builder);
         let wry = builder
             .apply(|b| b.with_url(url))
@@ -237,6 +239,7 @@ impl Render for BrowserView {
                                 // Resume the parked yield Task via the host;
                                 // clear the banner locally either way.
                                 this.set_yielded(false, cx);
+                                #[cfg(feature = "harness-manox")]
                                 if let Some(host) =
                                     crate::browser_host::WorkspaceBrowserHost::concrete()
                                 {
