@@ -77,6 +77,13 @@ pub fn enabled_plugins_file() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("enabled_plugins.txt"))
 }
 
+/// File recording installed plugins that are explicitly disabled, one plugin
+/// name per line. A disabled plugin stays on disk (so it survives as
+/// installed) but is excluded from the loader-scanned set until re-enabled.
+pub fn disabled_plugins_file() -> Result<PathBuf> {
+    Ok(manox_config_dir()?.join("disabled_plugins.txt"))
+}
+
 /// `$HOME/.config/cx/manox/settings.toml` — plain-file user preferences (UI
 /// language, …). Read once at startup by [`crate::settings`]; absence is normal
 /// on a fresh machine and yields defaults.

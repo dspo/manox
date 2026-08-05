@@ -271,6 +271,10 @@ plugins-install = 安装
 plugins-uninstall = 卸载
 plugins-installed = 已安装
 plugins-not-installed = 未安装
+plugins-enabled = 已启用
+plugins-disabled = 已禁用
+plugins-enable = 启用
+plugins-disable = 禁用
 plugins-description = 描述
 
 plugins-marketplace-url = Git URL，例如 https://github.com/org/marketplace.git
@@ -287,6 +291,8 @@ plugins-notice-marketplace-updated = 市场已更新。
 plugins-notice-marketplace-removed = 市场已删除。
 plugins-notice-plugin-installed = 插件已安装。重启 manox 后会加载新注册的工具、技能、agent、hook 和 MCP 服务器。
 plugins-notice-plugin-removed = 插件已移除。重启 manox 后会卸载启动时加载的运行时注册表。
+plugins-notice-plugin-enabled = 插件已启用。重启 manox 后会加载其工具、技能、agent、hook 和 MCP 服务器。
+plugins-notice-plugin-disabled = 插件已禁用。重启 manox 后会卸载启动时加载的运行时注册表。
 
 plugins-skill-new = 新建用户技能
 plugins-skill-edit = 编辑用户技能
