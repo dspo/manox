@@ -830,7 +830,15 @@ impl Workspace {
                     let thread_id = this.thread.read(cx).id.0.clone();
                     save_thread(this.thread.clone(), true, cx);
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                    store.update(cx, |s, cx| {
+                        s.mark_idle(&thread_id, cx);
+                        // Clear any mid-turn error flag: the turn recovered and
+                        // completed successfully (or was cancelled, which also
+                        // supersedes a stale error indicator).
+                        if !*failed {
+                            s.set_errored(&thread_id, false, cx);
+                        }
+                    });
                     this.turn_active = false;
                     this.context_rail.update(cx, |r, _cx| {
                         r.cockpit_phase = if *failed {
@@ -1066,6 +1074,7 @@ impl Workspace {
                 }
                 ThreadEvent::TurnFinished {
                     cancelled,
+                    failed,
                     stranded_steer_ids,
                     ..
                 } => {
@@ -1079,6 +1088,9 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        if !*failed {
+                            s.set_errored(&id, false, cx);
+                        }
                         s.set_unread(&id, true, cx);
                     });
                 }
@@ -6563,7 +6575,12 @@ impl Render for Workspace {
                                             .flex_1()
                                             .min_w_0()
                                             .pr_4()
-                                            .child(Icon::new(IconName::Bot).small())
+                                            .child(
+                                                gpui::svg()
+                                                    .path("icons/manox.svg")
+                                                    .size(px(16.))
+                                                    .text_color(theme.muted_foreground),
+                                            )
                                             .child(
                                                 gpui::div()
                                                     .text_sm()

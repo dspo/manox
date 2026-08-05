@@ -323,6 +323,10 @@ plugins-install = Install
 plugins-uninstall = Uninstall
 plugins-installed = Installed
 plugins-not-installed = Not installed
+plugins-enabled = Enabled
+plugins-disabled = Disabled
+plugins-enable = Enable
+plugins-disable = Disable
 plugins-description = Description
 
 plugins-marketplace-url = Git URL, for example https://github.com/org/marketplace.git
@@ -339,6 +343,8 @@ plugins-notice-marketplace-updated = Marketplace updated.
 plugins-notice-marketplace-removed = Marketplace removed.
 plugins-notice-plugin-installed = Plugin installed. Restart manox to load newly registered tools, skills, agents, hooks, and MCP servers.
 plugins-notice-plugin-removed = Plugin removed. Restart manox to unload runtime registries that were loaded at startup.
+plugins-notice-plugin-enabled = Plugin enabled. Restart manox to load its tools, skills, agents, hooks, and MCP servers.
+plugins-notice-plugin-disabled = Plugin disabled. Restart manox to unload runtime registries loaded at startup.
 
 plugins-skill-new = New user skill
 plugins-skill-edit = Edit user skill

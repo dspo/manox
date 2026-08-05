@@ -7,6 +7,9 @@
 #
 # LLM 直连 ~/.config/cx/cx.providers.config.yaml 定义的 providers。
 #
+# cx / cx-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
+# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/cx-providers）。
+#
 # gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
 [workspace]
 members = [
@@ -23,6 +26,8 @@ members = [
     "crates/webview",
     "crates/http_proxy",
     "crates/webview-macros",
+    "crates/cx",
+    "crates/cx-providers",
 ]
 resolver = "2"
 
@@ -47,6 +52,11 @@ manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
+# cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
+# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。cx-providers 为 provider
+# 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。
+cx = { path = "crates/cx" }
+cx-providers = { path = "crates/cx-providers" }
 
 anyhow = "1"
 async-channel = "2"
@@ -147,14 +157,6 @@ unic-langid = "0.9"
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"
 
-# cx-providers —— provider 配置解析的单一事实来源（与 cx 共享）。锁 cx 仓库已合并的确定 rev。
-cx-providers = { git = "https://github.com/dspo/cx.git", rev = "1afae806945a2e3849d092ba381d2b483f1f155b" }
-
-# cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library。SessionHandle 暴露
-# PTY 的 read/write_bytes/resize/socket_path/kill/wait，manox 经 CxSessionSource
-# 驱动 CLI TUI 渲染到 Terminal。与 cx-providers 同 rev 锁定（同一仓库）。
-cx = { git = "https://github.com/dspo/cx.git", rev = "1afae806945a2e3849d092ba381d2b483f1f155b" }
-
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
@@ -180,4 +182,3 @@ psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
-

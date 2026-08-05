@@ -10,7 +10,7 @@
 //! installed plugins, and loaders scan a single directory.
 //!
 //! The loaders (skills / commands / agents / hooks) consume
-//! [`PluginManager::installed_roots`]; this module is the only writer of
+//! [`PluginManager::installed`]; this module is the only writer of
 //! `plugins_dir`, so there is no race over plugin contents at runtime.
 
 use std::path::{Path, PathBuf};
@@ -79,6 +79,9 @@ pub struct MarketplacePluginRecord {
     pub description: Option<String>,
     pub source: String,
     pub installed: bool,
+    /// Whether the plugin is installed and not explicitly disabled. Meaningful
+    /// only when `installed` is true.
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,8 @@ pub struct InstalledPluginRecord {
     pub root: PathBuf,
     pub description: Option<String>,
     pub version: Option<String>,
+    /// Whether the plugin is currently enabled (not in the disabled list).
+    pub enabled: bool,
 }
 
 /// Filesystem-backed plugin manager. State is stored under
@@ -239,20 +244,22 @@ impl PluginManager {
     }
 
     /// List the plugins declared by one cached marketplace plus their current
-    /// installed status in the user's config dir.
+    /// installed/enabled status in the user's config dir.
     pub fn list_marketplace_plugins(slug: &str) -> Result<Vec<MarketplacePluginRecord>> {
         let repo_root = paths::marketplace_cache_dir()?.join(slug);
         let index = Self::load_marketplace_index(&repo_root)?;
-        let installed: std::collections::HashSet<String> = Self::installed()
+        let installed: std::collections::HashSet<String> = Self::all_installed()
             .into_iter()
             .map(|plugin| plugin.name)
             .collect();
+        let disabled = Self::disabled_names();
         let mut out: Vec<MarketplacePluginRecord> = index
             .plugins
             .into_iter()
             .map(|plugin| MarketplacePluginRecord {
                 marketplace_slug: slug.to_string(),
                 installed: installed.contains(&plugin.name),
+                enabled: installed.contains(&plugin.name) && !disabled.contains(&plugin.name),
                 name: plugin.name,
                 description: plugin.description,
                 source: plugin.source,
@@ -263,7 +270,8 @@ impl PluginManager {
     }
 
     /// Install a plugin from a marketplace: resolve its `source` path, copy the
-    /// tree into `plugins_dir/<name>`, and record it as enabled.
+    /// tree into `plugins_dir/<name>`, and record it as enabled. Reinstalling
+    /// or updating an existing plugin preserves its enabled/disabled state.
     pub fn install(marketplace_slug: &str, plugin_name: &str) -> Result<()> {
         let repo_root = paths::marketplace_cache_dir()?.join(marketplace_slug);
         let index = Self::load_marketplace_index(&repo_root)?;
@@ -292,18 +300,57 @@ impl PluginManager {
         Self::set_enabled(plugin_name, &dest, marketplace_slug)
     }
 
-    /// Remove an installed plugin and drop it from the enabled list.
+    /// Remove an installed plugin and drop it from the enabled and disabled
+    /// lists. A disabled plugin is removed the same way as an enabled one.
     pub fn uninstall(plugin_name: &str) -> Result<()> {
         let dest = paths::plugin_root(plugin_name)?;
         if dest.exists() {
             std::fs::remove_dir_all(&dest)
                 .with_context(|| format!("removing {}", dest.display()))?;
         }
-        Self::remove_enabled(plugin_name)
+        Self::remove_enabled(plugin_name)?;
+        Self::set_disabled(plugin_name, false)
     }
 
-    /// Installed plugins that loaders should scan, in stable (alphabetical) order.
+    /// Re-enable an installed plugin: drop its name from the disabled list so
+    /// loaders scan it again on the next start.
+    pub fn enable(plugin_name: &str) -> Result<()> {
+        Self::require_installed(plugin_name)?;
+        Self::set_disabled(plugin_name, false)
+    }
+
+    /// Disable an installed plugin: add its name to the disabled list so
+    /// loaders stop scanning it on the next start. Files stay on disk — only
+    /// `uninstall` removes them.
+    pub fn disable(plugin_name: &str) -> Result<()> {
+        Self::require_installed(plugin_name)?;
+        Self::set_disabled(plugin_name, true)
+    }
+
+    /// Plugins that loaders should scan — the enabled subset of installed
+    /// plugins, in stable (alphabetical) order.
     pub fn installed() -> Vec<InstalledPlugin> {
+        let disabled = Self::disabled_names();
+        Self::all_installed()
+            .into_iter()
+            .filter(|plugin| !disabled.contains(&plugin.name))
+            .collect()
+    }
+
+    /// Fail unless `plugin_name` is an installed plugin, keeping the disabled
+    /// list free of names with no installed tree behind them.
+    fn require_installed(plugin_name: &str) -> Result<()> {
+        if Self::all_installed().iter().any(|p| p.name == plugin_name) {
+            Ok(())
+        } else {
+            anyhow::bail!("plugin {} is not installed", plugin_name)
+        }
+    }
+
+    /// Installed plugins regardless of enabled state, in stable (alphabetical)
+    /// order. A disabled plugin stays installed (its files remain on disk) and
+    /// is still listed in the management UI.
+    pub fn all_installed() -> Vec<InstalledPlugin> {
         let mut out = Vec::new();
         let Ok(file) = paths::enabled_plugins_file() else {
             return out;
@@ -338,9 +385,11 @@ impl PluginManager {
     /// Installed plugins plus the parsed manifest fields used by the plugin
     /// management UI.
     pub fn installed_details() -> Vec<InstalledPluginRecord> {
+        let disabled = Self::disabled_names();
         let mut out = Vec::new();
-        for plugin in Self::installed() {
+        for plugin in Self::all_installed() {
             let manifest = load_plugin_manifest(&plugin.root);
+            let enabled = !disabled.contains(&plugin.name);
             out.push(InstalledPluginRecord {
                 name: plugin.name,
                 marketplace: plugin.marketplace,
@@ -353,10 +402,37 @@ impl PluginManager {
                     .as_ref()
                     .ok()
                     .and_then(|manifest| manifest.version.clone()),
+                enabled,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Names currently listed in the disabled-plugins file.
+    fn disabled_names() -> std::collections::HashSet<String> {
+        let Ok(file) = paths::disabled_plugins_file() else {
+            return std::collections::HashSet::new();
+        };
+        let Ok(raw) = std::fs::read_to_string(&file) else {
+            return std::collections::HashSet::new();
+        };
+        raw.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn set_disabled(name: &str, disabled: bool) -> Result<()> {
+        let file = paths::disabled_plugins_file()?;
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let existing = std::fs::read_to_string(&file).unwrap_or_default();
+        let body = compose_disabled_body(&existing, name, disabled);
+        std::fs::write(&file, body).context("writing disabled_plugins")?;
+        Ok(())
     }
 
     fn set_enabled(name: &str, _root: &Path, marketplace: &str) -> Result<()> {
@@ -493,6 +569,25 @@ fn compose_enabled_body(existing: &str, name: &str, marketplace: &str) -> String
     body
 }
 
+/// Compose the disabled-plugins file body from `existing` plus `name`.
+/// `disabled = true` inserts the name (idempotent); `false` removes it. The
+/// match is exact per line, so toggling `foo` never touches `foobar`. Pure for
+/// the same reason as `compose_enabled_body`.
+fn compose_disabled_body(existing: &str, name: &str, disabled: bool) -> String {
+    let mut lines: Vec<&str> = existing
+        .lines()
+        .filter(|l| !l.trim().is_empty() && l.trim() != name)
+        .collect();
+    if disabled {
+        lines.push(name);
+    }
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +659,30 @@ mod tests {
     fn compose_enabled_body_inserts_when_absent() {
         let body = compose_enabled_body("", "gitwork", "agent-marketplace");
         assert_eq!(body, "gitwork\tagent-marketplace\n");
+    }
+
+    #[test]
+    fn compose_disabled_body_inserts_and_removes_by_exact_name() {
+        let existing = "foo\nfoobar\n";
+        let body = compose_disabled_body(existing, "baz", true);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.contains(&"baz"));
+        assert!(lines.contains(&"foo"));
+        assert!(lines.contains(&"foobar"));
+
+        // Inserting an already-present name keeps exactly one entry.
+        let body2 = compose_disabled_body(&body, "baz", true);
+        assert_eq!(body2.lines().filter(|l| *l == "baz").count(), 1);
+
+        // Removing `foo` leaves `foobar` untouched (no prefix collision).
+        let body3 = compose_disabled_body(&body2, "foo", false);
+        let lines3: Vec<&str> = body3.lines().collect();
+        assert!(!lines3.contains(&"foo"));
+        assert!(lines3.contains(&"foobar"));
+    }
+
+    #[test]
+    fn compose_disabled_body_removing_from_empty_keeps_empty() {
+        assert_eq!(compose_disabled_body("", "foo", false), "");
     }
 }

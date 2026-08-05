@@ -177,6 +177,24 @@ impl PluginManagerView {
         );
     }
 
+    fn set_plugin_enabled(&mut self, plugin: String, enabled: bool, cx: &mut Context<Self>) {
+        self.run_task(
+            if enabled {
+                i18n::t("plugins-notice-plugin-enabled")
+            } else {
+                i18n::t("plugins-notice-plugin-disabled")
+            },
+            move || {
+                if enabled {
+                    PluginManager::enable(&plugin)
+                } else {
+                    PluginManager::disable(&plugin)
+                }
+            },
+            cx,
+        );
+    }
+
     fn edit_skill(
         &mut self,
         record: skill::SkillRecord,
@@ -837,7 +855,17 @@ fn marketplace_plugin_card(
     let name = plugin.name.clone();
     let name_action = plugin.name.clone();
     let marketplace_action = plugin.marketplace_slug.clone();
+    let name_toggle = plugin.name.clone();
+    let name_uninstall = plugin.name.clone();
     let installed = plugin.installed;
+    let enabled = plugin.enabled;
+    let (tag_label, tag_active) = if !installed {
+        (i18n::t("plugins-not-installed"), false)
+    } else if enabled {
+        (i18n::t("plugins-installed"), true)
+    } else {
+        (i18n::t("plugins-disabled"), false)
+    };
     item_card(&theme, false)
         .child(
             h_flex()
@@ -848,32 +876,56 @@ fn marketplace_plugin_card(
                     h_flex()
                         .flex_shrink_0()
                         .gap_1()
-                        .child(status_tag(
-                            if installed {
-                                i18n::t("plugins-installed")
-                            } else {
-                                i18n::t("plugins-not-installed")
-                            },
-                            installed,
-                        ))
-                        .child(
-                            Button::new(format!("install-{}-{}", marketplace, name_action))
+                        .child(status_tag(tag_label, tag_active))
+                        .when(installed, |el| {
+                            el.child(
+                                Button::new(format!("update-{}-{}", marketplace, name_action))
+                                    .small()
+                                    .outline()
+                                    .label(i18n::t("plugins-update"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.install_plugin(
+                                            marketplace_action.clone(),
+                                            name_action.clone(),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                        })
+                        .when(installed, |el| {
+                            el.child(
+                                Button::new(format!("toggle-{}-{}", marketplace, name_toggle))
+                                    .small()
+                                    .outline()
+                                    .label(if enabled {
+                                        i18n::t("plugins-disable")
+                                    } else {
+                                        i18n::t("plugins-enable")
+                                    })
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_plugin_enabled(name_toggle.clone(), !enabled, cx);
+                                    })),
+                            )
+                        })
+                        .when(installed, |el| {
+                            el.child(
+                                Button::new(format!(
+                                    "uninstall-{}-{}",
+                                    marketplace, name_uninstall
+                                ))
                                 .small()
-                                .outline()
-                                .label(if installed {
-                                    i18n::t("plugins-update")
-                                } else {
-                                    i18n::t("plugins-install")
-                                })
+                                .danger()
+                                .label(i18n::t("plugins-uninstall"))
                                 .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.install_plugin(
-                                        marketplace_action.clone(),
-                                        name_action.clone(),
-                                        cx,
-                                    );
-                                })),
-                        ),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.uninstall_plugin(name_uninstall.clone(), cx);
+                                    },
+                                )),
+                            )
+                        }),
                 ),
         )
         .into_any_element()
@@ -887,8 +939,10 @@ fn installed_plugin_card(
     let theme = cx.theme().clone();
     let name_update = plugin.name.clone();
     let market_update = plugin.marketplace.clone();
+    let name_toggle = plugin.name.clone();
     let name_delete = plugin.name.clone();
     let can_update = !plugin.marketplace.is_empty();
+    let enabled = plugin.enabled;
     let subtitle = format!(
         "{}{}",
         plugin.marketplace,
@@ -915,6 +969,14 @@ fn installed_plugin_card(
                     h_flex()
                         .flex_shrink_0()
                         .gap_1()
+                        .child(status_tag(
+                            if enabled {
+                                i18n::t("plugins-enabled")
+                            } else {
+                                i18n::t("plugins-disabled")
+                            },
+                            enabled,
+                        ))
                         .children(can_update.then(|| {
                             Button::new(format!("update-installed-{}", name_update))
                                 .small()
@@ -930,6 +992,20 @@ fn installed_plugin_card(
                                 }))
                                 .into_any_element()
                         }))
+                        .child(
+                            Button::new(format!("toggle-installed-{}", name_toggle))
+                                .small()
+                                .outline()
+                                .label(if enabled {
+                                    i18n::t("plugins-disable")
+                                } else {
+                                    i18n::t("plugins-enable")
+                                })
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_plugin_enabled(name_toggle.clone(), !enabled, cx);
+                                })),
+                        )
                         .child(
                             Button::new(format!("uninstall-{}", name_delete))
                                 .small()

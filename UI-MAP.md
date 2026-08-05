@@ -887,13 +887,13 @@ Content area dispatching on selected tab.
 
 #### MarketplaceTab
 
-URL input + add btn, marketplace cards (360px), installed plugin cards.
+URL input + add btn, marketplace cards (360px), plugin cards with install/update/enable-disable/uninstall actions.
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 
 #### PluginTab
 
-Installed plugin cards with update/uninstall buttons.
+Installed plugin cards with update/enable-disable/uninstall buttons.
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 
