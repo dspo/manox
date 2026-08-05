@@ -92,7 +92,10 @@ mod tests {
         assert!(by_slug.contains_key("qwen3.7-max"));
         assert_eq!(by_slug["qwen3.7-max"]["context_window"], 1_000_000);
         assert_eq!(by_slug["qwen3.7-max"]["max_context_window"], 1_000_000);
-        assert_eq!(by_slug["qwen3.7-max"]["effective_context_window_percent"], 95);
+        assert_eq!(
+            by_slug["qwen3.7-max"]["effective_context_window_percent"],
+            95
+        );
         assert_eq!(by_slug["glm-5.2"]["context_window"], 3_000_000);
         // fallback 行为：base_instructions 内联、其余字段由引擎 serde 默认补齐。
         assert!(
@@ -106,7 +109,11 @@ mod tests {
     #[test]
     fn catalog_handles_non_nm_suffixes() {
         // Unified parser handles [200k], [1M], [1m123k], etc.
-        let models = vec![rm("model-a[200k]"), rm("model-b[1M]"), rm("model-c[1m123k]")];
+        let models = vec![
+            rm("model-a[200k]"),
+            rm("model-b[1M]"),
+            rm("model-c[1m123k]"),
+        ];
         let catalog = build_model_catalog(&models);
         let entries = catalog["models"].as_array().unwrap();
         assert_eq!(entries.len(), 3);

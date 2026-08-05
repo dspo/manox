@@ -353,6 +353,26 @@ fn main() {
                 }
             });
         });
+        // ChatGPT.app launch from the `Agent → ChatGPT.app` cascade: same
+        // deferred App-level dispatch as the other menu actions; the provider +
+        // model payload travels inside the action instance.
+        cx.on_action(|action: &agent_ui::LaunchChatGptApp, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            let provider = action.provider.clone();
+            let model = action.model.clone();
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| {
+                            ws.launch_chatgpt_app(provider, model, window, cx)
+                        });
+                    });
+                }
+            });
+        });
 
         // Register the native-menu rebuilder so a live UI-language change can
         // re-resolve every menu label via the new locale (the bin owns
@@ -447,6 +467,7 @@ fn build_app_menus() -> Vec<Menu> {
                     agent_ui::CloseTerminalTab,
                 ),
             ]),
+            build_agent_menu(),
         ]
     }
     #[cfg(not(target_os = "macos"))]
@@ -468,4 +489,56 @@ fn build_app_menus() -> Vec<Menu> {
             MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]
     }
+}
+
+/// The `Agent` top-level menu: a single `ChatGPT.app` entry whose submenu
+/// cascades provider → model. Picking a model dispatches `LaunchChatGptApp`,
+/// which starts ChatGPT.app via cx's injection path (the bin's App-level
+/// action handler routes it to the Workspace). Native menu items carry no
+/// images in gpui, so the entry is text-only.
+#[cfg(target_os = "macos")]
+fn build_agent_menu() -> Menu {
+    let chatgpt = Menu::new("ChatGPT.app").items(build_chatgpt_menu_items());
+    let empty = chatgpt.items.is_empty();
+    let chatgpt = chatgpt.disabled(empty);
+    Menu::new(agent::i18n::t("menu-agent")).items([MenuItem::submenu(chatgpt)])
+}
+
+/// Items inside the `ChatGPT.app` submenu: one nested submenu per provider
+/// that exposes models visible to the `Codex.app` agent (i.e. Responses-capable
+/// models), one action item per model. Mirrors the provider registry snapshot
+/// at build time — `agent::i18n::rebuild_menus` re-runs menu construction after
+/// a registry reload. Provider submenus keep the registry's first-appearance
+/// order; models keep registry order within their provider.
+#[cfg(target_os = "macos")]
+fn build_chatgpt_menu_items() -> Vec<MenuItem> {
+    let registry = agent::provider::registry::global();
+    let mut providers: Vec<(String, Vec<String>)> = Vec::new();
+    for model in registry.models() {
+        if !model.visible_agents().iter().any(|a| a == "Codex.app") {
+            continue;
+        }
+        let provider = model.provider_name();
+        let model_id = model.name();
+        match providers.iter_mut().find(|(name, _)| *name == provider) {
+            Some((_, models)) => models.push(model_id),
+            None => providers.push((provider, vec![model_id])),
+        }
+    }
+    providers
+        .into_iter()
+        .map(|(provider, models)| {
+            MenuItem::submenu(
+                Menu::new(provider.clone()).items(models.into_iter().map(|model| {
+                    MenuItem::action(
+                        model.clone(),
+                        agent_ui::LaunchChatGptApp {
+                            provider: provider.clone(),
+                            model,
+                        },
+                    )
+                })),
+            )
+        })
+        .collect()
 }

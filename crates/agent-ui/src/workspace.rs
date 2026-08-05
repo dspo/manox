@@ -1374,6 +1374,56 @@ impl Workspace {
         self.attach_external_session(&id, window, cx);
     }
 
+    /// Launch ChatGPT.app through cx's injection path with the provider + model
+    /// picked in the macOS `Agent → ChatGPT.app` menu cascade. The launch blocks
+    /// (config load, model catalog build, CDP injection — up to ~20s), so it runs
+    /// on a background thread and reports the outcome as a notification; the app
+    /// itself detaches and keeps running independently of manox.
+    pub fn launch_chatgpt_app(
+        &mut self,
+        provider: String,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let launch_provider = provider.clone();
+            let launch_model = model.clone();
+            let result = cx
+                .background_spawn(
+                    async move { cx::launch_chatgpt_app(&launch_provider, &launch_model) },
+                )
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(i18n::t_str(
+                            "chatgpt-app-launched",
+                            &[("provider", &provider), ("model", &model)],
+                        )),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        provider = %provider,
+                        model = %model,
+                        "ChatGPT.app launch failed"
+                    );
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("chatgpt-app-launch-failed")
+                        )),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Display an already-running external session in the main area. Does not
     /// touch the foreground `Thread` (the thread entity stays mounted; only the
     /// view mode flips) — the session's terminal keeps running across switches
@@ -2222,6 +2272,10 @@ impl Workspace {
                         &[("error", &e.to_string())],
                     );
                     this.add_info_message(msg.to_string(), cx);
+                } else {
+                    // The registry snapshot swapped in; rebuild the native menus so
+                    // the `Agent → ChatGPT.app` cascade mirrors the new providers.
+                    i18n::rebuild_menus(cx);
                 }
             });
         })

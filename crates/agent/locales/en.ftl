@@ -489,6 +489,11 @@ menu-terminal = Terminal
 menu-new-terminal = New Terminal Tab
 menu-close-terminal = Close Terminal Tab
 menu-about = About Manox
+menu-agent = Agent
+
+## ChatGPT.app launch notifications (Agent → ChatGPT.app menu cascade)
+chatgpt-app-launched = Launched ChatGPT.app · { $provider } · { $model }
+chatgpt-app-launch-failed = Failed to launch ChatGPT.app
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = Terminal running… type to interact
@@ -600,4 +605,3 @@ background-task-status-timed-out = Timed out
 background-task-status-stopped = Stopped
 background-task-status-session-ended = Session ended
 background-task-stop = Stop
-

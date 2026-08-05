@@ -62,6 +62,17 @@ pub fn set_menu_rebuilder(rebuild: impl Fn(&mut App) + Send + Sync + 'static) {
     let _ = MENU_REBUILDER.set(Box::new(rebuild));
 }
 
+/// Re-run the registered native-menu rebuilder. The menu tree embeds dynamic
+/// content beyond localized labels (the `Agent → ChatGPT.app` provider/model
+/// cascade mirrors the provider registry), so callers that swap the registry —
+/// or otherwise change what the menus should show — rebuild through this.
+/// No-op before [`set_menu_rebuilder`] registers the closure.
+pub fn rebuild_menus(cx: &mut App) {
+    if let Some(rebuild) = MENU_REBUILDER.get() {
+        rebuild(cx);
+    }
+}
+
 /// Read `settings.toml`, resolve the UI locale, and build the bundle on the
 /// calling (startup) thread. Called once from `agent::init` before any UI
 /// render or system-prompt build. Any failure is non-fatal: warn and fall back

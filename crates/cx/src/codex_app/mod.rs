@@ -25,15 +25,20 @@ use crate::CodexAppPrepared;
 use crate::Selection;
 use crate::prepare_codex_launch_home_for_app;
 use crate::probe::runtime;
-use crate::resolve_apikey_interactive;
 use crate::warp;
 
 const DEFAULT_APP_PATH: &str = "/Applications/ChatGPT.app";
 /// 等待 ChatGPT.app renderer 注册到 CDP 的最长时长。
 const CDP_READY_TIMEOUT_SECS: u64 = 20;
 
-/// 启动 ChatGPT.app 并注入自定义模型列表到 renderer。
-pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]) -> Result<()> {
+/// 启动 ChatGPT.app 并注入自定义模型列表到 renderer。`apikey` 由调用方解析后传入：
+/// CLI 路径经 `resolve_apikey_interactive`（缺失时可交互补齐），GUI 嵌入路径
+/// （`crate::launch_chatgpt_app`）经非交互的 `resolve_apikey`。
+pub fn launch_with_injection(
+    selection: &Selection,
+    apikey: &str,
+    _passthrough_args: &[String],
+) -> Result<()> {
     let provider = &selection.provider;
     let default_model = selection
         .model
@@ -47,20 +52,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         );
     }
 
-    // 1. 解析 API Key
-    let apikey = if let Some(ref source) = provider.apikey_source {
-        resolve_apikey_interactive(source)?
-    } else {
-        bail!(
-            "Provider `{}` 需要 API Key 但未配置 apikey_source",
-            provider.name
-        );
-    };
-    if apikey.is_empty() {
-        bail!("ChatGPT.app 需要 API Key，但未提供");
-    }
-
-    // 2. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
+    // 1. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
     let prepared = prepare_codex_launch_home_for_app(
         default_model,
         provider,
@@ -73,16 +65,16 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         reasoning_effort,
     } = prepared;
 
-    // 3. 选取 CDP 端口（在 spawn 前确定，作为启动参数传入）
+    // 2. 选取 CDP 端口（在 spawn 前确定，作为启动参数传入）
     let debug_port = cdp::pick_debug_port()?;
 
-    // 4. 定位 App 并解析内部可执行二进制路径
+    // 3. 定位 App 并解析内部可执行二进制路径
     let binary = resolve_codex_binary()?;
 
-    // 5. Warp 集成：在启动前发出 session_start，并把 session ID 传给子进程
+    // 4. Warp 集成：在启动前发出 session_start，并把 session ID 传给子进程
     let warp_session = warp::maybe_emit_session_start("Codex.app", Some(&default_model.id));
 
-    // 6. 构造启动命令：直接启动二进制 + 远程调试端口。env 直接设到子进程（继承），不污染全局。
+    // 5. 构造启动命令：直接启动二进制 + 远程调试端口。env 直接设到子进程（继承），不污染全局。
     //    GUI app detach 运行：stdio 重定向到 null + 独立进程组，使 cx 退出后 App 仍存活、终端不被占。
     let origin = format!("http://127.0.0.1:{debug_port}");
     let mut command = Command::new(&binary);
@@ -92,7 +84,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
             &format!("--remote-allow-origins={origin}"),
         ])
         .env("CODEX_HOME", &codex_home)
-        .env(&env_key, &apikey)
+        .env(&env_key, apikey)
         .env("CX_MODEL", default_model.api_model_id())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -121,12 +113,12 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     );
     println!();
 
-    // 7. spawn（不等待），随后经 CDP 注入脚本
+    // 6. spawn（不等待），随后经 CDP 注入脚本
     let mut child = command
         .spawn()
         .with_context(|| format!("启动 ChatGPT.app 二进制失败: {}", binary.display()))?;
 
-    // 8. 等待 CDP 就绪并注入脚本（async，复用 probe 的 tokio runtime）
+    // 7. 等待 CDP 就绪并注入脚本（async，复用 probe 的 tokio runtime）
     let injected_clone = injected.clone();
     let reasoning_effort_clone = reasoning_effort.clone();
     let inject_result = runtime().block_on(async {
@@ -151,7 +143,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         return Err(err).context("CDP 注入失败，已终止 ChatGPT.app");
     }
 
-    // 9. Codex.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：
+    // 8. Codex.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：
     //    spawn 时已设独立进程组 + stdio→null，此处不 wait，drop(child) 不会杀子进程，
     //    cx 立即返回让出终端，App 在后台继续运行。
     //    （不同于 claude/codex-cli 那类终端内 agent——它们才需要 spawn+wait+退出摘要。）
