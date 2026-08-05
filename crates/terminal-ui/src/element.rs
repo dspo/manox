@@ -18,6 +18,7 @@ use gpui::{
     ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
     Window, fill, point, px, relative, rgba, size,
 };
+use terminal::alacritty_terminal::selection::SelectionRange;
 use terminal::{Cell, Flags, Terminal};
 
 use crate::grid_renderer::{BackgroundRegion, GridPlan, layout_grid};
@@ -51,6 +52,8 @@ pub struct PrepaintState {
     cell_width: Pixels,
     line_height_px: Pixels,
     background: Vec<BackgroundRegion>,
+    /// Pixel rects for the active text selection.
+    selection_rects: Vec<Bounds<Pixels>>,
     /// Pixel rects for search matches; `true` = the active match.
     search_rects: Vec<(Bounds<Pixels>, bool)>,
     /// Pre-shaped text runs with their paint origin.
@@ -116,6 +119,56 @@ impl TerminalElement {
                 prev = Some(line);
             }
             out.push((display_line, idx.point.column.0, idx.cell));
+        }
+        out
+    }
+
+    /// Convert a `SelectionRange` (grid coordinates) to pixel rects, one per
+    /// visible display line. For simple selection the column range varies per
+    /// line; for block selection all lines share the same column range.
+    fn selection_rects(
+        selection: Option<SelectionRange>,
+        offset: i32,
+        rows: i32,
+        cols: i32,
+        bounds: Bounds<Pixels>,
+        cell_w: Pixels,
+        lh: Pixels,
+    ) -> Vec<Bounds<Pixels>> {
+        let Some(sel) = selection else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let start_line = sel.start.line.0;
+        let end_line = sel.end.line.0;
+        let block = sel.is_block;
+
+        for grid_line in start_line..=end_line {
+            let display_row = grid_line + offset;
+            if !(0..rows).contains(&display_row) {
+                continue;
+            }
+            let (start_col, end_col) = if block {
+                (sel.start.column.0 as i32, sel.end.column.0 as i32)
+            } else {
+                let from = if grid_line == start_line {
+                    sel.start.column.0 as i32
+                } else {
+                    0
+                };
+                let to = if grid_line == end_line {
+                    sel.end.column.0 as i32
+                } else {
+                    // Middle lines span the full width. Clamp to cols-1 instead
+                    // of i32::MAX to avoid overflow when computing the width.
+                    cols - 1
+                };
+                (from, to)
+            };
+            let x = bounds.origin.x + start_col as f32 * cell_w;
+            let y = bounds.origin.y + display_row as f32 * lh;
+            let w = ((end_col - start_col + 1).max(1) as f32) * cell_w;
+            out.push(Bounds::new(point(x, y), size(w, lh)));
         }
         out
     }
@@ -219,10 +272,11 @@ impl Element for TerminalElement {
         // Build the paint plan from the terminal's renderable snapshot, then
         // shape every text run here so paint stays allocation-free.
         let origin = bounds.origin;
-        let (background, runs, cursor_grid, offset, term_rows) =
+        let (background, runs, cursor_grid, offset, term_rows, selection) =
             self.terminal.read_with(cx, |t, _cx| {
                 t.with_term(|term| {
                     let content = term.renderable_content();
+                    let selection = content.selection;
                     let cursor_pt = content.cursor.point;
                     let offset = term.grid().display_offset() as i32;
                     let cells = Self::display_cells(content);
@@ -234,9 +288,20 @@ impl Element for TerminalElement {
                         Some((cursor_display_line, cursor_pt.column.0 as i32)),
                         offset,
                         t.rows as i32,
+                        selection,
                     )
                 })
             });
+
+        let selection_rects = Self::selection_rects(
+            selection,
+            offset,
+            term_rows,
+            cols as i32,
+            bounds,
+            cell_width,
+            line_height_px,
+        );
 
         let mut shaped_runs: Vec<(Point<Pixels>, ShapedLine)> = Vec::with_capacity(runs.len());
         for run in &runs {
@@ -315,6 +380,7 @@ impl Element for TerminalElement {
             cell_width,
             line_height_px,
             background,
+            selection_rects,
             search_rects,
             shaped_runs,
             cursor,
@@ -347,6 +413,11 @@ impl Element for TerminalElement {
             let pos = point(x, y);
             let sz = size(w, h);
             window.paint_quad(fill(Bounds::new(pos, sz), region.color));
+        }
+
+        // Active selection highlight (semi-transparent blue).
+        for rect in &prepaint.selection_rects {
+            window.paint_quad(fill(*rect, rgba(0x3366ff66)));
         }
 
         // `/pattern` search highlights. The active match gets a stronger color.

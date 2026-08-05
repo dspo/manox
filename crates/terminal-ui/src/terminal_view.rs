@@ -24,6 +24,7 @@ use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
+use terminal::mappings::mouse::{self, MouseAction};
 use terminal::settings::BellMode;
 
 use crate::element::TerminalElement;
@@ -49,6 +50,11 @@ pub struct TerminalView {
     /// True while the left mouse button is held after a press in the element,
     /// so `on_mouse_move` extends the selection.
     selecting: bool,
+    /// The xterm button code of the mouse button currently held, when the TUI
+    /// has captured the mouse. `None` when no button is pressed or MOUSE_MODE
+    /// is not active. Used to gate MOUSE_DRAG forwarding (motion is only
+    /// reported while a button is held) and to encode the release report.
+    pressed_button: Option<u8>,
     /// In-flight IME marked (preedit) text, painted at the cursor by the
     /// element. Empty when no composition is active.
     marked_text: String,
@@ -75,6 +81,7 @@ impl TerminalView {
             font_size: px(s.font_size),
             line_height: s.line_height,
             selecting: false,
+            pressed_button: None,
             marked_text: String::new(),
             search: None,
             bell_flash: false,
@@ -224,42 +231,92 @@ impl TerminalView {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (row, col) = self.px_to_grid(ev.position, window);
+
         // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
-        if ev.modifiers.platform || ev.modifiers.control {
-            let (row, col) = self.px_to_grid(ev.position, window);
-            if let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col)) {
-                let _ = std::process::Command::new("open").arg(url).spawn();
-                return;
-            }
-        }
-        // Mouse-reporting modes: the TUI app owns the mouse; defer to the
-        // PTY report path (stage 5) instead of starting a local selection.
-        let mode = self.terminal.read_with(cx, |t, _| t.mode());
-        if mode.intersects(TermMode::MOUSE_MODE) || ev.button != MouseButton::Left {
+        if (ev.modifiers.platform || ev.modifiers.control)
+            && let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col))
+        {
+            let _ = std::process::Command::new("open").arg(url).spawn();
             return;
         }
-        let (row, col) = self.px_to_grid(ev.position, window);
+
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            if ev.modifiers.shift {
+                // Shift overrides mouse mode: start local selection so the
+                // user can select text even when the TUI has captured the
+                // mouse.
+                self.terminal
+                    .update(cx, |t, cx| t.start_selection(row, col, cx));
+                self.selecting = true;
+                return;
+            }
+            // Forward the click to the TUI app as an xterm mouse report.
+            let button = mouse_button_code(ev.button) | modifier_bits(&ev.modifiers);
+            if let Some(report) =
+                mouse::encode(button, MouseAction::Press, col as u32, row as u32, mode)
+            {
+                let _ = self.terminal.update(cx, |t, _| t.input(&report));
+                self.pressed_button = Some(button);
+            }
+            return;
+        }
+
+        if ev.button != MouseButton::Left {
+            return;
+        }
         self.terminal
             .update(cx, |t, cx| t.start_selection(row, col, cx));
         self.selecting = true;
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting {
+        if self.selecting {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            self.terminal
+                .update(cx, |t, cx| t.update_selection(row, col, cx));
             return;
         }
-        let (row, col) = self.px_to_grid(ev.position, window);
-        self.terminal
-            .update(cx, |t, cx| t.update_selection(row, col, cx));
+        // Forward motion to the TUI. MOUSE_MOTION reports motion whenever
+        // the mouse moves; MOUSE_DRAG only reports motion while a button is
+        // held (tracked via `pressed_button`).
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+        let can_report = mode.contains(TermMode::MOUSE_MOTION)
+            || (mode.contains(TermMode::MOUSE_DRAG) && self.pressed_button.is_some());
+        if can_report {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            let button = self.pressed_button.unwrap_or(0) | modifier_bits(&ev.modifiers);
+            if let Some(report) =
+                mouse::encode(button, MouseAction::Motion, col as u32, row as u32, mode)
+            {
+                let _ = self.terminal.update(cx, |t, _| t.input(&report));
+            }
+        }
     }
 
-    fn on_mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if ev.button != MouseButton::Left || !self.selecting {
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selecting {
+            self.selecting = false;
+            if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
             return;
         }
-        self.selecting = false;
-        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // Forward release to the TUI if it has captured the mouse. Clear
+        // pressed_button even when mouse mode is off so a stale value does
+        // not gate MOUSE_DRAG if the TUI re-enables it later.
+        let button = self.pressed_button.take().unwrap_or(0);
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            let button = button | modifier_bits(&ev.modifiers);
+            if let Some(report) =
+                mouse::encode(button, MouseAction::Release, col as u32, row as u32, mode)
+            {
+                let _ = self.terminal.update(cx, |t, _| t.input(&report));
+            }
         }
     }
 
@@ -549,6 +606,24 @@ impl InputHandler for TerminalInputHandler {
     ) -> Option<usize> {
         None
     }
+}
+
+/// Map a gpui `MouseButton` to an xterm button code (left=0, middle=1,
+/// right=2). Unrecognised buttons map to 0 (left) so the click is still
+/// forwarded rather than silently dropped.
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        _ => 0,
+    }
+}
+
+/// xterm modifier bits: shift=4, alt=8, control=16. Matches the encoding in
+/// `Terminal::mouse_wheel` (term.rs:278).
+fn modifier_bits(modifiers: &gpui::Modifiers) -> u8 {
+    (4 * modifiers.shift as u8) + (8 * modifiers.alt as u8) + (16 * modifiers.control as u8)
 }
 
 /// Map a vi-mode keystroke to an alacritty `ViMotion`. Returns `None` for
