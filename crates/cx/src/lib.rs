@@ -831,19 +831,14 @@ fn prepare_codex_launch_home_for_app(
         .as_array()
         .map(|models| !models.is_empty())
         .unwrap_or(false);
-    let suffix_count = catalog["models"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let suffix_count = catalog["models"].as_array().map(|a| a.len()).unwrap_or(0);
     println!(
         "[cx] 注入 {} 个模型（其中 {} 个有上下文后缀）",
         injected_models.len(),
         suffix_count
     );
     if !has_catalog_entries {
-        eprintln!(
-            "[cx] 警告: 无上下文后缀模型，所有模型将走引擎 fallback（258k）"
-        );
+        eprintln!("[cx] 警告: 无上下文后缀模型，所有模型将走引擎 fallback（258k）");
     }
     let model_catalog_json = if has_catalog_entries {
         write_private_file(&catalog_path, &serde_json::to_string_pretty(&catalog)?)?;
