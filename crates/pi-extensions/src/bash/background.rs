@@ -141,14 +141,9 @@ impl BackgroundRegistry {
         let buf = entry.buffer.lock().expect("buffer lock poisoned");
         let start = buf.len().saturating_sub(max_tail_bytes);
         let output_tail = String::from_utf8_lossy(&buf[start..]).to_string();
-        let is_running = entry
-            .exit_code
-            .lock()
-            .expect("exit lock poisoned")
-            .is_none();
         let exit_code = *entry.exit_code.lock().expect("exit lock poisoned");
         Ok(TaskStatusInfo {
-            is_running,
+            is_running: exit_code.is_none(),
             exit_code,
             output_tail,
         })

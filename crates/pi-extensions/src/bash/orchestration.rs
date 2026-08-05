@@ -94,7 +94,12 @@ impl BackgroundManager {
         let registry = Arc::clone(&self.registry);
         let tasks = Arc::clone(&self.tasks);
         let event_tx = self.event_tx.clone();
-        let runtime = self.runtime.clone();
+        // Refresh the handle in case construction happened outside a runtime;
+        // the listener itself may run on any thread.
+        let runtime = self
+            .runtime
+            .clone()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
         let listener: HarnessListener = Arc::new(move |event| {
             if matches!(event, pi::harness::HarnessEvent::Abort { .. }) {
                 let registry = Arc::clone(&registry);
@@ -165,16 +170,7 @@ impl BackgroundManager {
 
     /// Cancel every task this manager owns and emit `Killed` for each.
     pub async fn kill_all(&self) {
-        let ids: Vec<pi::TaskId> = self
-            .tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .drain()
-            .collect();
-        for id in ids {
-            let _ = self.registry.kill(&id).await;
-            let _ = self.event_tx.send(BackgroundEvent::Killed { id });
-        }
+        kill_all_tasks(&self.registry, &self.tasks, &self.event_tx).await;
     }
 
     /// Subscribe to background events; dropping the receiver unsubscribes.
