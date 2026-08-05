@@ -28,6 +28,7 @@ use gpui_component::{
 };
 
 use agent::i18n;
+#[cfg(feature = "harness-manox")]
 use agent::mcp;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
@@ -1045,6 +1046,7 @@ pub fn render_personalization(
 
 // --- MCP panel ------------------------------------------------------------
 
+#[cfg(feature = "harness-manox")]
 pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> AnyElement {
     let theme = cx.theme().clone();
     let entity = cx.entity();

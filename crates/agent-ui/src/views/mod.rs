@@ -9,12 +9,15 @@ pub mod composer_menu;
 #[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub mod context_rail;
 pub mod management_shell;
+#[cfg(feature = "harness-manox")]
 pub mod member_panel;
 pub mod message;
+#[cfg(feature = "harness-manox")]
 pub mod plugin_manager;
 pub mod popup_menu;
 pub mod settings;
 pub mod sidebar;
+#[cfg(feature = "harness-manox")]
 pub mod subagent_panel;
 pub mod title_menu;
 // TODO(pi-wire): turn navigator is unwired chrome under harness-pi.

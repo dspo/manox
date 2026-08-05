@@ -41,5 +41,5 @@ pub const TASK_STOP: &str = "TaskStop";
 
 pub const WRITE: &str = "Write";
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 include!("manox.rs");

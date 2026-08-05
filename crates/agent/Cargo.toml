@@ -7,7 +7,7 @@ publish.workspace = true
 [features]
 # The manox self-built harness drives `Thread` directly (the default path).
 # Mutually exclusive with `harness-pi`; the `manox` bin guards both ways.
-default = ["harness-manox"]
+default = []
 harness-manox = []
 # The pi harness backs `Thread` through `ThreadEngine` (see pi_engine.rs).
 # Selected by the `manox` bin (`--no-default-features --features harness-pi`);

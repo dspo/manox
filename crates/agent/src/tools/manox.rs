@@ -1,77 +1,77 @@
 // escalation or when no OS sandbox backend is available (see [`bash`]).
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod agent;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod ask_user;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod background_shell;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod bash;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod bash_output;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod code;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod descriptions;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod edit_file;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod file_lock;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod glob;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod goal;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod grep;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod list_directory;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod monitor;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod path_selector;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod pi_agent;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod read_file;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod self_info;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod skill;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod task_stop;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod tool_search;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod truncate;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod update_plan;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod web_explore;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod web_fetch;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod websocket;
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod worktree;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub mod write_file;
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use gpui::{App, AppContext as _, Task, WeakEntity};
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use schemars::JsonSchema;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use serde_json::{Map, Value};
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use std::sync::Arc;
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use crate::thread::Thread;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 use crate::tool::{AnyAgentTool, ToolRegistry};
 
 
@@ -83,7 +83,7 @@ use crate::tool::{AnyAgentTool, ToolRegistry};
 /// `$defs`/`definitions` so the schema is self-contained. LLM tool-calling
 /// APIs expect bare schemas — `$schema`/`title` cause 400 on strict
 /// OpenAI-compatible endpoints (e.g. 百炼/DashScope, see issue #211).
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn schema<T: JsonSchema>() -> Value {
     let mut value = serde_json::to_value(schemars::schema_for!(T)).expect("schema serialization");
     strip_schema_metadata(&mut value);
@@ -122,7 +122,7 @@ pub(crate) fn schema_for_tool(name: &str) -> Value {
 /// `schemars::schema_for!` emits document-level fields that LLM tool-calling
 /// APIs reject. Nested types produce `$defs` with `$ref` references — those
 /// must be inlined before stripping `$defs`, otherwise the schema is broken.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 fn strip_schema_metadata(value: &mut Value) {
     let defs = value
         .as_object()
@@ -148,7 +148,7 @@ fn strip_schema_metadata(value: &mut Value) {
 
 /// Recursively replace `{"$ref": "#/$defs/Foo"}` nodes with the inlined
 /// definition from `defs`, with its own refs resolved in turn.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 fn inline_refs(value: &mut Value, defs: &Map<String, Value>) {
     match value {
         Value::Object(map) => {
@@ -175,7 +175,7 @@ fn inline_refs(value: &mut Value, defs: &Map<String, Value>) {
 }
 
 /// Bridge a tokio task back to a gpui background `Task` via `async_channel`.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn bridge_tokio<F, R>(cx: &mut App, fut: F) -> Task<Result<String, String>>
 where
     F: std::future::Future<Output = Result<R, anyhow::Error>> + Send + 'static,
@@ -206,7 +206,7 @@ where
 /// spell absolute home paths or `set_project` to a resolved dir); the path is
 /// also not canonicalized, so `.`/`..` segments stay literal to keep snapshot
 /// keys a stable string.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
     debug_assert!(cwd.is_absolute(), "resolve_path cwd must be absolute");
     let p = input.as_ref();
@@ -226,7 +226,7 @@ pub(crate) fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
 /// The model escalates a write outside the writable set by routing through
 /// `bash` with `unsandboxed: true` (which triggers user approval); the error
 /// message says so.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn resolve_path_for_write<P: AsRef<Path>>(
     input: P,
     cwd: &Path,
@@ -272,7 +272,7 @@ pub(crate) fn resolve_path_for_write<P: AsRef<Path>>(
 /// showing first M)` plus a per-tool narrow hint plus `do not speculate about
 /// the truncated content` — is identical across tools, matching the
 /// `Command output too long. The first N bytes:` format.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) struct TruncatedText<'a> {
     text: &'a str,
     truncated: bool,
@@ -283,7 +283,7 @@ pub(crate) struct TruncatedText<'a> {
 impl<'a> TruncatedText<'a> {
     /// Wrap already-truncated text where the caller knows the byte cap and the
     /// dropped tail size. `dropped == 0` means no truncation occurred.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     pub(crate) fn new(text: &'a str, cap: usize, dropped: usize) -> Self {
         Self {
             text,
@@ -296,7 +296,7 @@ impl<'a> TruncatedText<'a> {
     /// Render with the uniform advisory. `hint` is folded into one line before
     /// the "do not guess" directive, e.g. "retry with a narrower command
     /// (`| head`, `LIMIT`, tighten the pattern)".
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     pub(crate) fn render(&self, hint: &str) -> String {
         if !self.truncated {
             return self.text.to_string();
@@ -315,7 +315,7 @@ impl<'a> TruncatedText<'a> {
 /// streaming capture buffer. Currently exercised by its own tests; kept for the
 /// next non-streaming tool that needs it.
 #[cfg_attr(not(test), allow(dead_code))]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
     if s.len() <= max {
         return TruncatedText::new(s, max, 0);
@@ -344,7 +344,7 @@ pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
 /// worktree-active thread, use [`base_tools_with_policy`] with a
 /// worktree-aware policy so the bound repo's `.git` and network open up.
 #[allow(dead_code)] // convenience constructor; the live paths use _with_policy
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
     let sandbox = crate::sandbox::SandboxPolicy::for_project(cwd.as_ref());
     base_tools_with_policy(cwd, sandbox, None, crate::language::Language::En)
@@ -353,7 +353,7 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
 /// Same as [`base_tools`] but with an explicit sandbox policy. The worktree
 /// path passes a `with_worktree` / `for_worktree` policy so git ops and network
 /// are admitted; the default path delegates to [`base_tools`].
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub(crate) fn base_tools_with_policy(
     cwd: Arc<PathBuf>,
     sandbox: crate::sandbox::SandboxPolicy,
@@ -442,7 +442,7 @@ pub(crate) fn base_tools_with_policy(
 /// Sub-agents do not use this — they build their own filtered registry from
 /// [`base_tools`] (plus their own `agent` tool), so `agent` / `self_info` /
 /// `monitor` / worktree / MCP stay main-thread-only.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub fn main_registry(
     cwd: PathBuf,
     parent: WeakEntity<Thread>,
@@ -455,7 +455,7 @@ pub fn main_registry(
 /// Same as [`main_registry`] but with an explicit sandbox policy. The worktree
 /// entry/exit path rebuilds the registry with a `with_worktree` policy so the
 /// whole tool set re-derives path confinement against the active worktree.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 pub fn main_registry_with_policy(
     cwd: PathBuf,
     sandbox: crate::sandbox::SandboxPolicy,
@@ -537,11 +537,11 @@ pub fn main_registry_with_policy(
 
 #[cfg(test)]
 mod tests {
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     use super::*;
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn base_tools_has_core_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn input_schemas_are_objects() {
         // Exercises the public `input_schema()` surface (the `schema::<T>()`
         // helper runs under the hood inside each tool); the Input structs are
@@ -575,11 +575,11 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn schema_strips_metadata_and_inlines_defs() {
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
         use crate::tool::AgentTool;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
         use crate::tools::ask_user::AskUserQuestionTool;
 
         let schema = AskUserQuestionTool.input_schema();
@@ -595,11 +595,11 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn schema_preserves_type_and_properties() {
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
         use crate::tool::AgentTool;
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
         use crate::tools::self_info::SelfInfoTool;
 
         let schema = SelfInfoTool::new().input_schema();
@@ -609,7 +609,7 @@ mod tests {
     }
 
     /// Recursively check that no `$ref` key exists anywhere in the value tree.
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn contains_ref(value: &Value) -> bool {
         match value {
             Value::Object(map) => map.contains_key("$ref") || map.values().any(contains_ref),
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn resolve_path_passes_absolute_through() {
         let cwd = Path::new("/Users/someone/proj");
         assert_eq!(
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn resolve_path_joins_relative_onto_cwd() {
         let cwd = Path::new("/Users/someone/proj");
         assert_eq!(
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn resolve_path_handles_dot_dot() {
         let cwd = Path::new("/Users/someone/proj");
         assert_eq!(
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn truncate_output_caps_at_char_boundary() {
         let s = "abcdef世";
         let t = truncate_output(s, 7);
@@ -671,7 +671,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn truncate_output_no_truncation_under_cap() {
         let t = truncate_output("short", 100);
         assert!(!t.truncated);
@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn render_prefixed_advisory_reports_total() {
         let t = TruncatedText::new("body", 100, 50);
         let r = t.render("narrow the pattern");
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn write_confinement_rejects_outside_project() {
         let cwd = Path::new("/tmp/manox-write-confinement");
         let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn write_confinement_rejects_dot_git() {
         let cwd = Path::new("/tmp/manox-write-confinement");
         let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn write_confinement_allows_project_and_tmp() {
         let cwd = Path::new("/tmp/manox-write-confinement");
         let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn read_not_confined() {
         let cwd = Path::new("/tmp/manox-write-confinement");
         let p = resolve_path("/etc/passwd", cwd);
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn read_only_flags_match_tool_search_categorization() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
         let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn update_plan_is_main_only() {
         // The main registry builds the `agent` spawn tool, which reads the
         // agent-definition registry; initialize it so construction succeeds.
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
     fn goal_tools_are_main_only_stable_and_hidden_in_plan_mode() {
         crate::agent_def::init();
         let base = base_tools(Arc::new(PathBuf::from(".")));

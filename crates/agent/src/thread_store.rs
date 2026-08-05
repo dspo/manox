@@ -5,7 +5,7 @@
 // repository plus a per-session UI-metadata sidecar. The public surface is
 // identical so the sidebar compiles against one shape.
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 include!("thread_store_manox.rs");
 
 #[cfg(feature = "harness-pi")]

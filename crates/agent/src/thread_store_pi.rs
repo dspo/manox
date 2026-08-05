@@ -334,9 +334,9 @@ fn session_info_to_summary(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>, cx: &mut App) {
+pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut App) {
     let _ = db;
-    let dir = tempfile::tempdir().unwrap().into_path();
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
     let entity = cx.new(|_| ThreadStore {
         summaries: Vec::new(),
         session_paths: HashMap::new(),

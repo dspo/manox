@@ -122,7 +122,7 @@ impl ThreadEngine for PiEngine {
     }
 
     fn cumulative_token_usage(&self) -> TokenUsage {
-        self.state.cumulative.lock().unwrap().clone()
+        *self.state.cumulative.lock().unwrap()
     }
 
     fn per_model_token_usage(&self) -> HashMap<String, TokenUsage> {
@@ -548,7 +548,7 @@ fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
 
 /// Accumulate the latest turn's usage into the engine state.
 fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = state.cumulative.lock().unwrap().clone();
+    let mut cumulative = *state.cumulative.lock().unwrap();
     let mut per_model = state.per_model.lock().unwrap().clone();
     let mut request = state.request_usage.lock().unwrap().clone();
     for m in session.harness_messages() {
@@ -562,8 +562,8 @@ fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
         cumulative = cumulative + u;
         per_model
             .entry(model.clone())
-            .and_modify(|acc| *acc = acc.clone() + u.clone())
-            .or_insert(u.clone());
+            .and_modify(|acc| *acc = *acc + u)
+            .or_insert(u);
         if let Some(last_user) = session
             .harness_messages()
             .iter()
@@ -574,7 +574,7 @@ fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
         }
         request
             .entry(last_user_id(session))
-            .and_modify(|acc| *acc = acc.clone() + u.clone())
+            .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
     }
     *state.cumulative.lock().unwrap() = cumulative;

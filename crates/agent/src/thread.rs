@@ -10,7 +10,7 @@
 //! its views compile against one shape; the pi build adapts the shared
 //! contract (`ThreadEvent`, message history, usage) rather than the reverse.
 
-#[cfg(feature = "harness-manox")]
+#[cfg(not(feature = "harness-pi"))]
 include!("thread_manox.rs");
 
 #[cfg(feature = "harness-pi")]

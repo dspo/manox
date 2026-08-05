@@ -637,6 +637,12 @@ impl Thread {
         cx.notify();
     }
 
+    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        self.pinned = pinned;
+        cx.notify();
+    }
+
+
     pub fn set_model(&mut self, model: AnyLanguageModel, cx: &mut Context<Self>) {
         let from = self.model.as_ref().map(|m| m.id());
         let to = model.id();
@@ -660,6 +666,13 @@ impl Thread {
         self.archived = archived;
         cx.notify();
     }
+}
+
+/// Human-readable tool card title from the pi tool name + arguments. The
+/// third parameter (manox's sub-agent description override) is unused by the
+/// pi backend, which never spawns manox sub-agents.
+pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> String {
+    crate::pi_engine::adapt::tool_title(name, args)
 }
 
 // Shared helpers the compact/estimation path calls with the same signature as

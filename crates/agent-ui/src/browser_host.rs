@@ -220,16 +220,22 @@ impl WorkspaceBrowserHost {
                         .expect("routes lock poisoned")
                         .get(&tab_id)
                         .and_then(|t| t.thread.upgrade());
+#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let Some(thread) = thread else {
                         continue;
                     };
+#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let id = format!(
                         "inbound-{}",
                         NEXT_INBOUND_ID.fetch_add(1, Ordering::Relaxed)
                     );
+#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let (tx_inbound, rx_inbound) = oneshot::channel::<bool>();
+#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let intent = write.intent.clone();
+#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let payload = write.payload.clone();
+                    #[cfg(feature = "harness-manox")]
                     thread.update(cx, |t, cx| {
                         t.register_inbound(id.clone(), intent, payload, tx_inbound, cx);
                     });
@@ -387,6 +393,7 @@ impl WorkspaceBrowserHost {
     /// "Done" button). Takes the pending oneshot — the parked `Task` resumes —
     /// and retires the banner. No-op when no yield is parked (e.g. the user
     /// clicks Done twice, or the yield already resolved via Stop cleanup).
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn resolve_handback(&self, id: BrowserTabId, cx: &mut App) {
         if let Some(tab) = self
             .routes
@@ -425,6 +432,7 @@ impl WorkspaceBrowserHost {
     /// owning thread id is read off `ws.thread`, and only the per-tab
     /// `BrowserView` entities are leased here — they are distinct from
     /// `Workspace`.
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn clear_yields_for_thread(&self, ws: &mut Workspace, cx: &mut Context<Workspace>) {
         let owner_id = ws.thread.entity_id();
         let owned: Vec<BrowserTabId> = self

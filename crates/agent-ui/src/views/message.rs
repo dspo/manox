@@ -2544,7 +2544,9 @@ pub fn render_agent_task(
         format!("{} · {}", item.subagent_type, item.description)
     };
 
+    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
     let id_for_click = item.id.clone();
+    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
     let weak = agent_ctx.map(|c| c.weak.clone());
 
     let tooltip_text = display_title.clone();
@@ -2561,11 +2563,13 @@ pub fn render_agent_task(
         .cursor_pointer()
         .hover(|s| s.bg(theme.secondary.opacity(0.5)))
         .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
-        .on_click(move |_, _window, cx: &mut App| {
+        .on_click(move |_, _window, _cx: &mut App| {
+            #[cfg(feature = "harness-manox")]
             let Some(weak) = weak.clone() else {
                 return;
             };
-            let _ = weak.update(cx, |w, cx| {
+            #[cfg(feature = "harness-manox")]
+            let _ = weak.update(_cx, |w, cx| {
                 w.open_subagent_tab_by_id(&id_for_click, cx);
             });
         });
