@@ -120,20 +120,20 @@ const PATCH_BODY: &str = r#"(function () {
     return null;
   }
 
-  // 一个数组是否「看起来是模型描述符数组」（非空、元素含 string model 字段）。
-  // 纯字符串数组（模型名列表，如 available_models）绝不在此替换——renderer 的
-  // effort 下拉把描述符数组喂给 .flatMap(({supportedReasoningEfforts}) => …)，
-  // 若把字符串数组换成描述符（或反之），字段解构即抛 TypeError 崩掉整个页面。
-  function isDescriptorArray(v) {
-    return Array.isArray(v) && v.length > 0 &&
-      v.every(function (x) { return x && typeof x === "object" && typeof x.model === "string"; });
+  // 数组是否「模型描述符数组」：空数组，或非空且元素全为含 string model 字段的对象。
+  // 关键约束：renderer 的 effort 下拉构造器 fSs 对数组元素解构 {supportedReasoningEfforts}
+  // 再 .flatMap——若把字符串名数组（CX_NAMES 形态）混入描述符槽位，解构得到 undefined 即崩页。
+  // 因此只允许「空数组」或「已是描述符形态」的数组被替换，纯字符串数组一律不动。
+  function isDescriptorSlot(v) {
+    return Array.isArray(v) && (v.length === 0 ||
+      v.every(function (x) { return x && typeof x === "object" && typeof x.model === "string"; }));
   }
-  // 把一个模型描述符数组**原地替换**为我们的模型列表（保留同一数组引用，使 React 持有的引用仍指向它）。
-  // CDP 实测：子菜单 UI 渲染时不按 `hidden` 过滤，且似乎只取数组前几项——因此「追加+隐藏」无效，
-  // 必须清空原生、只填自定义模型（用 splice 原地改，不能换引用）。
+  // 把一个描述符槽位**原地替换**为我们的模型列表（保留数组引用，React 持有的引用仍指向它）。
+  // 空槽位（引擎 model/list 超时未填充）也在此填入，否则下拉菜单无模型可选。
+  // CDP 实测：子菜单 UI 渲染时不按 `hidden` 过滤、且只取数组前几项——故必须清空原生、
+  // 只填自定义模型（用 splice 原地改，不能换引用）。
   function patchModelArray(models) {
-    if (!isDescriptorArray(models)) return false;
-    // 已经是「仅我们的模型」就跳过（避免重复 splice 触发无谓变更）。
+    if (!isDescriptorSlot(models)) return false;
     const already = models.length === CX_MODELS.length &&
       models.every(function (it) { return CX_NAMES.indexOf(it.model) >= 0; });
     if (already) return false;
@@ -141,26 +141,24 @@ const PATCH_BODY: &str = r#"(function () {
     Array.prototype.splice.apply(models, [0, models.length].concat(replacement));
     return true;
   }
-  // 字符串名数组（仅追加我们的模型名，不动已有内容）。
+  // 字符串名数组（仅追加我们的模型名，不动已有内容）。只用于 availableModels /
+  // available_models——绝不作用于 .models/.data/.result 等描述符槽位。
   function patchNameArray(arr) {
     if (!Array.isArray(arr) || !arr.every(function (x) { return typeof x === "string"; })) return false;
     let changed = false;
     CX_NAMES.forEach(function (n) { if (arr.indexOf(n) < 0) { arr.push(n); changed = true; } });
     return changed;
   }
-  // 对一个对象的已知模型字段做 patch。字段名严格白名单：绝不 patch 任意 `.models`，
-  // 因为同名属性在 React state 里可能承载字符串名数组（modelSettings.models 等），
-  // 就地改错形态会让 renderer 的 flatMap 解构崩溃。
+  // 对一个对象的已知模型字段做 patch。描述符槽位（.models/.data/.result 及嵌套）允许
+  // 空数组填充 + 描述符替换；字符串名追加仅限 availableModels/available_models。
   function patchModelContainer(v) {
     if (!v || typeof v !== "object") return false;
     let changed = false;
-    if (isDescriptorArray(v.models) && patchModelArray(v.models)) changed = true;
-    for (const f of ["data", "result"]) {
-      if (isDescriptorArray(v[f]) && patchModelArray(v[f])) changed = true;
-    }
-    if (v.pages && isDescriptorArray(v.pages[0] && v.pages[0].data) && patchModelArray(v.pages[0].data)) changed = true;
-    if (v.result && isDescriptorArray(v.result.data) && patchModelArray(v.result.data)) changed = true;
-    if (v.result && isDescriptorArray(v.result.models) && patchModelArray(v.result.models)) changed = true;
+    if (patchModelArray(v.models)) changed = true;
+    if (patchModelArray(v.data)) changed = true;
+    if (v.pages && patchModelArray(v.pages[0] && v.pages[0].data)) changed = true;
+    if (v.result && patchModelArray(v.result.data)) changed = true;
+    if (v.result && patchModelArray(v.result.models)) changed = true;
     for (const f of ["availableModels", "available_models"]) {
       const av = v[f];
       if (av instanceof Set) { CX_NAMES.forEach(function (n) { if (!av.has(n)) { av.add(n); changed = true; } }); }

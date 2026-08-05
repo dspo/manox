@@ -36,9 +36,14 @@ fn model_entry(model: &ResolvedModel) -> Option<Value> {
     Some(json!({
         "slug": api_id,
         "display_name": api_id,
-        "supported_reasoning_levels": [],
+        "supported_reasoning_levels": [
+            { "effort": "low", "description": "Fast responses with lighter reasoning" },
+            { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+            { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+            { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        ],
         "shell_type": "default",
-        "visibility": "none",
+        "visibility": "list",
         "supported_in_api": true,
         "priority": 99,
         "base_instructions": BASE_INSTRUCTIONS,
@@ -103,6 +108,17 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("You are a coding agent running in the Codex CLI")
+        );
+        // visibility = "list"：引擎据此将 hidden 报为 false，renderer 的模型过滤
+        // 器（_7r: !model.hidden）才会保留这些模型——"none" 会让下拉菜单为空。
+        assert_eq!(by_slug["qwen3.7-max"]["visibility"], "list");
+        // 非空的 reasoning levels：effort 下拉按 supportedReasoningEfforts 构造选项。
+        assert_eq!(
+            by_slug["qwen3.7-max"]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
         );
     }
 
