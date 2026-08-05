@@ -24,6 +24,7 @@ use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
+use terminal::mappings::mouse::{self, MouseAction};
 use terminal::settings::BellMode;
 
 use crate::element::TerminalElement;
@@ -224,42 +225,84 @@ impl TerminalView {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let (row, col) = self.px_to_grid(ev.position, window);
+
         // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
-        if ev.modifiers.platform || ev.modifiers.control {
-            let (row, col) = self.px_to_grid(ev.position, window);
-            if let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col)) {
-                let _ = std::process::Command::new("open").arg(url).spawn();
-                return;
-            }
-        }
-        // Mouse-reporting modes: the TUI app owns the mouse; defer to the
-        // PTY report path (stage 5) instead of starting a local selection.
-        let mode = self.terminal.read_with(cx, |t, _| t.mode());
-        if mode.intersects(TermMode::MOUSE_MODE) || ev.button != MouseButton::Left {
+        if (ev.modifiers.platform || ev.modifiers.control)
+            && let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col))
+        {
+            let _ = std::process::Command::new("open").arg(url).spawn();
             return;
         }
-        let (row, col) = self.px_to_grid(ev.position, window);
+
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            if ev.modifiers.shift {
+                // Shift overrides mouse mode: start local selection so the
+                // user can select text even when the TUI has captured the
+                // mouse.
+                self.terminal
+                    .update(cx, |t, cx| t.start_selection(row, col, cx));
+                self.selecting = true;
+                return;
+            }
+            // Forward the click to the TUI app as an xterm mouse report.
+            if ev.button == MouseButton::Left
+                && let Some(report) =
+                    mouse::encode(0, MouseAction::Press, col as u32, row as u32, mode)
+            {
+                let _ = self.terminal.update(cx, |t, _| t.input(&report));
+            }
+            return;
+        }
+
+        if ev.button != MouseButton::Left {
+            return;
+        }
         self.terminal
             .update(cx, |t, cx| t.start_selection(row, col, cx));
         self.selecting = true;
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting {
+        if self.selecting {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            self.terminal
+                .update(cx, |t, cx| t.update_selection(row, col, cx));
             return;
         }
-        let (row, col) = self.px_to_grid(ev.position, window);
-        self.terminal
-            .update(cx, |t, cx| t.update_selection(row, col, cx));
+        // Forward motion to the TUI if it has enabled motion/drag tracking.
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+        if mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG) {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            if let Some(report) =
+                mouse::encode(0, MouseAction::Motion, col as u32, row as u32, mode)
+            {
+                let _ = self.terminal.update(cx, |t, _| t.input(&report));
+            }
+        }
     }
 
-    fn on_mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if ev.button != MouseButton::Left || !self.selecting {
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selecting {
+            self.selecting = false;
+            if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
             return;
         }
-        self.selecting = false;
-        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // Forward release to the TUI if it has captured the mouse.
+        if ev.button == MouseButton::Left {
+            let mode = self.terminal.read_with(cx, |t, _| t.mode());
+            if mode.intersects(TermMode::MOUSE_MODE) {
+                let (row, col) = self.px_to_grid(ev.position, window);
+                if let Some(report) =
+                    mouse::encode(0, MouseAction::Release, col as u32, row as u32, mode)
+                {
+                    let _ = self.terminal.update(cx, |t, _| t.input(&report));
+                }
+            }
         }
     }
 
