@@ -24,6 +24,7 @@ pub mod grep;
 pub mod list_directory;
 pub mod monitor;
 pub mod path_selector;
+pub mod pi_agent;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;
@@ -461,6 +462,10 @@ pub fn main_registry_with_policy(
     reg.register(
         Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone(), lang)) as AnyAgentTool,
     );
+    // pi-engine subagent (Explore): the wiring smoke test that consumes
+    // pi-extensions from the manox registry. Read-only; coexists with the
+    // native `agent` tool.
+    reg.register(Arc::new(pi_agent::PiAgentTool) as AnyAgentTool);
     reg.register(self_info::new());
     // UpdatePlan: main-thread-only. Planning an overview is the lead agent's
     // concern; sub-agents run scoped work under their own turn caps and never

@@ -68,8 +68,10 @@ pub struct BackgroundManager {
     event_tx: broadcast::Sender<BackgroundEvent>,
     /// Tasks owned by this manager, killed together on abort / teardown.
     tasks: Arc<Mutex<HashSet<pi::TaskId>>>,
-    /// Lifecycle subscription; dropped with the manager.
-    _lifecycle: Option<HarnessSubscription>,
+    /// Lifecycle subscription; dropped with the manager. Guarded so the
+    /// manager can be shared behind an `Arc` (a bash tool holds it) while
+    /// still attaching to a session.
+    _lifecycle: Arc<Mutex<Option<HarnessSubscription>>>,
 }
 
 impl BackgroundManager {
@@ -81,13 +83,16 @@ impl BackgroundManager {
             runtime: tokio::runtime::Handle::try_current().ok(),
             event_tx,
             tasks: Arc::new(Mutex::new(HashSet::new())),
-            _lifecycle: None,
+            _lifecycle: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Bind an agent session: steer completions into it and cancel this
     /// manager's tasks when the run is aborted.
-    pub fn attach(&mut self, session: &mut AgentSession) {
+    ///
+    /// Re-entrant: calling `attach` again replaces the previous steerer and
+    /// lifecycle subscription (the old subscription drops and unsubscribes).
+    pub fn attach(&self, session: &mut AgentSession) {
         let handle = session.handle();
         *self.steerer.lock().expect("steerer lock poisoned") =
             Some(Arc::new(move |message| handle.steer(message)));
@@ -117,7 +122,8 @@ impl BackgroundManager {
                 }
             }
         });
-        self._lifecycle = Some(session.subscribe_harness(listener));
+        *self._lifecycle.lock().expect("lifecycle lock poisoned") =
+            Some(session.subscribe_harness(listener));
     }
 
     /// Start a background task under this manager and watch it to completion.

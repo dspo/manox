@@ -111,6 +111,19 @@ impl LanguageModel for ResponsesModel {
     fn wire_api(&self) -> crate::provider::WireApi {
         crate::provider::WireApi::Responses
     }
+
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    fn base_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
+    fn max_output_tokens(&self) -> u64 {
+        self.max_output_tokens
+    }
+
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
     }
