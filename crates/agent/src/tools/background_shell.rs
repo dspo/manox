@@ -207,9 +207,19 @@ pub async fn spawn(
         let (terminal_status, code) = tokio::select! {
             code = process.wait_for_exit() => {
                 process.cleanup_process_group_after_exit().await;
+                // A TaskStop in flight can lose this race: stop fires the cancel
+                // token, then close() kills the child — when the driver is next
+                // polled both select branches are ready and the pick is random.
+                // The killed child exits non-zero, but the terminal state belongs
+                // to the stop, so honor the requested stop status instead of
+                // misreporting Failed.
+                let stop_in_flight =
+                    bg_task_clone.status() == crate::background_task::TaskStatus::Stopping;
                 (
                     if code == Some(0) {
                         crate::background_task::TaskStatus::Completed
+                    } else if stop_in_flight {
+                        bg_task_clone.requested_stop_status()
                     } else {
                         crate::background_task::TaskStatus::Failed
                     },
