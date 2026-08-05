@@ -5,7 +5,9 @@
 // no dynamic loading, no out-of-process runtime — and assembles the
 // product-level bash tool on top.
 
+pub mod agents;
 pub mod bash;
 
+pub use agents::SubagentTool;
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use bash::persistent::PersistentShellOperations;

@@ -1,0 +1,448 @@
+// Agent dispatch — the `agent` tool that turns a registered agent
+// definition into a running subagent.
+//
+// Definitions are static manifests (see `pi::ext_point_agent`); this module
+// only provides the runtime half: resolving `subagent_type` against the
+// registry, mounting the definition's tool subset, and collecting the
+// subagent's final text.
+
+use std::sync::Arc;
+
+use pi::coding_agent::create_agent_session;
+use pi::ext_point_agent::{AgentDef, AgentRegistry};
+use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use pi::tools::truncate::{self, TruncateConfig};
+use serde_json::Value as JsonValue;
+use tokio_util::sync::CancellationToken;
+
+/// Default max bytes for the subagent's returned text.
+const DEFAULT_MAX_BYTES: usize = 128 * 1024;
+/// Default max lines for the subagent's returned text.
+const DEFAULT_MAX_LINES: usize = 2000;
+
+/// The built-in Explore definition, embedded as a manifest.
+pub fn explore_agent_def() -> AgentDef {
+    AgentDef::parse_md(include_str!("../../agents/explore.md"))
+        .expect("built-in Explore manifest must parse")
+}
+
+/// Register the built-in agent definitions.
+pub fn register_defaults(registry: &mut AgentRegistry) {
+    registry.register(explore_agent_def());
+}
+
+/// The `agent` tool — invoke an agent definition as a subagent.
+pub struct SubagentTool {
+    registry: Arc<AgentRegistry>,
+    /// Snapshot of the caller's full tool set, used to resolve `def.tools`.
+    tools: Vec<Arc<dyn AgentTool>>,
+}
+
+impl SubagentTool {
+    pub fn new(registry: Arc<AgentRegistry>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
+        SubagentTool { registry, tools }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SubagentTool {
+    fn name(&self) -> &str {
+        "agent"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a subagent from a registered agent definition to handle a focused task \
+         in isolation. Returns the subagent's final text."
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    fn requires_approval(&self, _params: &JsonValue) -> bool {
+        false
+    }
+
+    fn parameters_schema(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Name of the registered agent definition to invoke (e.g. Explore)"
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The task for the subagent"
+                }
+            },
+            "required": ["subagent_type", "prompt"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: JsonValue,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let subagent_type = params["subagent_type"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidArguments("subagent_type is required".into()))?;
+        let prompt = params["prompt"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidArguments("prompt is required".into()))?;
+        let def = self.registry.get(subagent_type).ok_or_else(|| {
+            ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
+        })?;
+        // A declared model override cannot be applied by this dispatcher
+        // (model resolution is the assembly layer's job); refuse loudly
+        // rather than silently running the default model.
+        if def.model.is_some() {
+            return Err(ToolError::InvalidArguments(format!(
+                "agent `{subagent_type}` declares a model override, which the dispatcher does not support yet"
+            )));
+        }
+
+        let selected = select_tools(&self.tools, def);
+        // The subagent transcript lives in a throwaway temp directory so a
+        // read-only Explore call does not litter the user's project.
+        let session_dir =
+            tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+        let mut session = create_agent_session()
+            .with_cwd(ctx.cwd())
+            .with_session_dir(session_dir.path())
+            .with_system_prompt(def.system_prompt.clone())
+            .with_tools(selected)
+            .build()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
+
+        // The caller's abort signal must interrupt the subagent mid-run; the
+        // inner session runs on its own token, so race it here.
+        let sig = signal.clone();
+        let mut prompt_fut = Box::pin(session.prompt(prompt));
+        let messages = tokio::select! {
+            r = prompt_fut.as_mut() => {
+                r.map_err(|e| ToolError::ExecutionFailed(format!("subagent failed: {e}")))?
+            }
+            _ = sig.cancelled() => {
+                drop(prompt_fut);
+                let _ = session.abort();
+                return Err(ToolError::Aborted);
+            }
+        };
+
+        let text = collect_text(&messages);
+
+        let config = TruncateConfig {
+            max_bytes: DEFAULT_MAX_BYTES,
+            max_lines: DEFAULT_MAX_LINES,
+        };
+        let truncated = truncate::truncate(&text, &config);
+        let mut out = truncated.content;
+        if truncated.was_truncated {
+            let kept = out.lines().count();
+            out.push_str(&format!(
+                "\n\n[output truncated: {kept} of {} lines kept, {} bytes]",
+                truncated.original_lines, truncated.original_bytes
+            ));
+        }
+        Ok(AgentToolResult::text(out))
+    }
+}
+
+/// Resolve a definition's tool names against the caller's tool snapshot.
+/// An empty `tools` list means the full snapshot, minus the `agent` tool
+/// itself: a subagent must not inherit the ability to spawn subagents.
+fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
+    let selected: Vec<_> = tools
+        .iter()
+        .filter(|t| t.name() != "agent")
+        .filter(|t| def.tools.is_empty() || def.tools.iter().any(|n| n == t.name()))
+        .cloned()
+        .collect();
+    if !def.tools.is_empty() {
+        for name in &def.tools {
+            if !selected.iter().any(|t| t.name() == name) {
+                tracing::warn!(
+                    agent = %def.name,
+                    tool = %name,
+                    "agent definition names a tool not in the caller's snapshot"
+                );
+            }
+        }
+    }
+    selected
+}
+
+/// Concatenate the subagent's final answer: the text blocks of the last
+/// assistant message that carried no tool calls, skipping intermediate
+/// narration and tool-result turns.
+fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
+    use pi::types::{AgentMessage, ContentBlock};
+    for message in messages.iter().rev() {
+        let AgentMessage::Assistant { content, .. } = message else {
+            continue;
+        };
+        if content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        {
+            continue;
+        }
+        let mut out = String::new();
+        for block in content {
+            if let ContentBlock::Text { text, .. } = block {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+        return out.trim().to_string();
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explore_manifest_parses() {
+        let def = explore_agent_def();
+        assert_eq!(def.name, "Explore");
+        assert_eq!(def.tools, vec!["read", "grep", "find", "ls"]);
+        assert!(def.system_prompt.contains("read-only codebase"));
+        assert!(def.description.to_lowercase().contains("read-only"));
+    }
+
+    #[test]
+    fn select_tools_filters_by_definition() {
+        let read = pi::tools::read::ReadTool;
+        let write = pi::tools::write::WriteTool;
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(read), Arc::new(write)];
+        let def = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec!["read".into()],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let selected = select_tools(&tools, &def);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name(), "read");
+    }
+
+    #[test]
+    fn select_tools_never_inherits_the_agent_tool() {
+        // A subagent must not be able to spawn subagents implicitly.
+        let subagent = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
+        let tools: Vec<Arc<dyn AgentTool>> =
+            vec![Arc::new(pi::tools::read::ReadTool), Arc::new(subagent)];
+        let def = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let selected = select_tools(&tools, &def);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name(), "read");
+    }
+
+    #[test]
+    fn select_tools_empty_means_all() {
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(pi::tools::read::ReadTool)];
+        let def = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        assert_eq!(select_tools(&tools, &def).len(), 1);
+    }
+
+    #[test]
+    fn subagent_tool_contract() {
+        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
+        assert_eq!(tool.name(), "agent");
+        assert!(
+            tool.parameters_schema()["required"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 2
+        );
+    }
+
+    /// Minimal `ExecutionEnv` standing in for the harness environment.
+    struct MockEnv {
+        cwd: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl pi::env::ExecutionEnv for MockEnv {
+        fn cwd(&self) -> &Path {
+            &self.cwd
+        }
+        fn join_path(&self, parts: &[&str]) -> PathBuf {
+            parts.iter().collect()
+        }
+        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, pi::env::FileError> {
+            Ok(path.to_path_buf())
+        }
+        async fn read_file(
+            &self,
+            _path: &Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, pi::env::FileError> {
+            Ok(String::new())
+        }
+        async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &Path) -> Result<bool, pi::env::FileError> {
+            Ok(true)
+        }
+        async fn file_info(&self, _path: &Path) -> Result<pi::env::FileInfo, pi::env::FileError> {
+            Ok(pi::env::FileInfo {
+                path: _path.to_path_buf(),
+                is_dir: false,
+                size: 0,
+            })
+        }
+        async fn list_dir(
+            &self,
+            _path: &Path,
+        ) -> Result<Vec<pi::env::FileInfo>, pi::env::FileError> {
+            Ok(vec![])
+        }
+        async fn create_dir(&self, _path: &Path) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn remove(&self, _path: &Path) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: std::time::Duration,
+            _signal: CancellationToken,
+        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
+            Ok(pi::env::CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    fn ctx(cwd: &str) -> pi::tool::LocalToolContext {
+        pi::tool::LocalToolContext::new(
+            Arc::new(MockEnv {
+                cwd: PathBuf::from(cwd),
+            }),
+            PathBuf::from(cwd),
+            Arc::new(pi::tool::ToolState::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn unknown_subagent_type_errors_before_spawning() {
+        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"subagent_type": "nope", "prompt": "hi"}),
+                CancellationToken::new(),
+                &ctx("/tmp"),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("unknown subagent_type: nope"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn declared_model_override_is_rejected() {
+        let mut registry = AgentRegistry::new();
+        registry.register(AgentDef {
+            name: "M".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: Some("some-model".into()),
+            system_prompt: "p".into(),
+        });
+        let tool = SubagentTool::new(Arc::new(registry), vec![]);
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"subagent_type": "M", "prompt": "hi"}),
+                CancellationToken::new(),
+                &ctx("/tmp"),
+            )
+            .await;
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("does not support"),
+            "refuses loudly instead of silently ignoring: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_arguments_are_rejected() {
+        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({}),
+                CancellationToken::new(),
+                &ctx("/tmp"),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_text_takes_assistant_text_blocks() {
+        use pi::types::{AgentMessage, ContentBlock};
+        let messages = vec![
+            AgentMessage::User {
+                content: vec![ContentBlock::Text {
+                    text: "user text".into(),
+                    signature: None,
+                }],
+                timestamp: chrono::Utc::now(),
+            },
+            AgentMessage::Assistant {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: " part 2".into(),
+                        signature: None,
+                    },
+                ],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "anthropic".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+                usage: Box::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert_eq!(collect_text(&messages), "answer\n part 2");
+    }
+}

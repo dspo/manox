@@ -17,9 +17,9 @@ brush-core = { workspace = true }
 brush-builtins = { workspace = true }
 libc.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
+chrono.workspace = true
 tempfile = "3"
+
 
 [lints.clippy]
 dbg_macro = "deny"
