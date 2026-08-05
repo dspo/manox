@@ -7,7 +7,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ---
 
-## harness-pi 接线状态（阶段 1 基线）
+## harness-pi 接线状态（阶段 2：Thread/ThreadStore 门面 + 三栏恢复）
 
 构建期通过 feature 选择 harness 核心：`harness-manox`（默认，现有自研
 harness）与 `harness-pi`（crates/pi + pi-extensions）。pi 侧不新建 UI——
@@ -29,15 +29,15 @@ harness）与 `harness-pi`（crates/pi + pi-extensions）。pi 侧不新建 UI�
 | Settings（provider 凭据 / 模型注册表） | ✅ 已接线 | provider 层是 pi 的注入式适配器 |
 | 审批（ToolCallAuthorization / AskUserQuestion / inbound 写入） | ⏳ 未接线 | 本阶段明确后排；pi 工具集全量放开 |
 | MCP | ⏳ 未接线 | init 跳过 mcp registry |
-| Sidebar / 线程列表 / 多会话 | ⏳ 未接线 | 依赖 manox thread store；pi 为固定单会话 |
-| ContextRail / Cockpit | ⏳ 未接线 | 读取 manox usage/plan/compact 状态 |
+| Sidebar / 会话列表 / 新建与切换 | ✅ 已接线 | pi `SessionRepository` + `session_meta` sidecar |
+| ContextRail / Cockpit | ✅ 已接线（骨架） | usage 来自 PiEngine 累计；plan/compact 为 manox 流 |
 | Plan 模式（PlanPreview / PlanReview 卡片） | ⏳ 未接线 | plan 是 manox 流程 |
 | Member / Subagent 观察面板 | ⏳ 未接线 | pi-extensions SubagentTool 已装配，观察 UI 未接 |
-| Browser 标签 | ⏳ 未接线 | webview host 是 manox surface |
-| Terminal 标签 | ⏳ 未接线 | init 未注册 terminal store |
+| Browser 标签 | ✅ 已接线 | webview host 两模式复用 |
+| Terminal 标签 | ✅ 已接线 | 平台 surface，两模式复用 |
 | Slash commands / skills / @mentions | ⏳ 未接线 | 依赖 manox command/skill/agent_def 注册表 |
 | 图片附件 / Plus 菜单 | ⏳ 未接线 | pi prompt 当前仅文本 |
-| 模型选择器 | ⏳ 未接线 | 固定取 registry 第一个模型 |
+| 模型选择器 | ✅ 已接线 | 经 `AgentSession::set_model` 热切换（同 provider） |
 | Project / Goal / Team chips | ⏳ 未接线 | 依赖 manox 项目与目标体系 |
 | 后台线程 / 归档 / 外部会话（Codex/Claude CLI） | ⏳ 未接线 | manox 多会话编排 |
 | TurnNavigator | ⏳ 未接线 | 代码保留，overlay 未在 pi 布局挂载 |
