@@ -6,6 +6,7 @@
 // either to the injected execution backend or to the background registry.
 
 pub mod background;
+pub mod orchestration;
 pub mod persistent;
 
 use std::path::{Path, PathBuf};
@@ -14,6 +15,8 @@ use std::time::Duration;
 
 use pi::BackgroundTaskRegistry;
 use pi::env::CommandResult;
+
+use orchestration::BackgroundManager;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use pi::tools::bash::{BashExecRequest, BashOperations};
 use pi::tools::truncate::{self, TruncateConfig};
@@ -34,6 +37,9 @@ pub struct BashTool {
     operations: Arc<dyn BashOperations>,
     registry: Arc<dyn BackgroundTaskRegistry>,
     command_prefix: Option<String>,
+    /// Optional orchestrator: when bound, background tasks are registered,
+    /// watched, and their completions steered into the agent session.
+    manager: Option<Arc<BackgroundManager>>,
 }
 
 impl BashTool {
@@ -45,12 +51,22 @@ impl BashTool {
             operations,
             registry,
             command_prefix: None,
+            manager: None,
         }
     }
 
     /// Prepend a command to every invocation (shell setup commands).
     pub fn with_command_prefix(mut self, prefix: Option<String>) -> Self {
         self.command_prefix = prefix;
+        self
+    }
+
+    /// Bind an orchestrator so background tasks participate in the agent
+    /// session's lifecycle. The manager's registry replaces the wrapper's
+    /// own, so tasks it spawns stay visible to `bash_output` / `task_stop`.
+    pub fn with_manager(mut self, manager: Arc<BackgroundManager>) -> Self {
+        self.registry = manager.registry.clone();
+        self.manager = Some(manager);
         self
     }
 }
@@ -170,10 +186,15 @@ impl BashTool {
         };
 
         if run_in_background {
-            let id = self
-                .registry
-                .spawn(&command, run_cwd)
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            let id = match &self.manager {
+                Some(manager) => manager
+                    .spawn(&command, run_cwd)
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
+                None => self
+                    .registry
+                    .spawn(&command, run_cwd)
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
+            };
             return Ok(AgentToolResult::text(format!(
                 "Started in background as `{id}`. Poll with `bash_output` (shell_id), stop with `task_stop`."
             )));
