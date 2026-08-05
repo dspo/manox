@@ -31,8 +31,8 @@ use cx_providers::{
     AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
     PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
     ProviderModels, ResolvedAgent, ResolvedModel, WireApi, active_provider_config_path,
-    canonical_agent_id, cx_state_dir, effective_agents_for_model, read_config_file, resolve_apikey,
-    resolved_agents,
+    canonical_agent_id, context_window_from_suffix, cx_state_dir, effective_agents_for_model,
+    read_config_file, resolve_apikey, resolved_agents,
 };
 
 mod codex_app;
@@ -737,16 +737,10 @@ fn merge_codex_config(
 /// `[1m]` → 1_000_000；`[3m]` → 3_000_000；无后缀则 base = 原 id、hint = None。
 /// `model[1mm]` 这类不匹配的尾缀原样保留。
 pub(crate) fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) {
-    use regex::Regex;
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\[(\d+)m\]$").unwrap());
-    match re.captures(model_id) {
-        Some(caps) => {
-            let full = caps.get(0).unwrap();
-            let base = &model_id[..full.start()];
-            let n: i64 = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
-            let hint = if n > 0 { Some(n * 1_000_000) } else { None };
-            (base, hint)
+    match context_window_from_suffix(model_id) {
+        Some(tokens) => {
+            let open = model_id.rfind('[').unwrap();
+            (&model_id[..open], Some(tokens as i64))
         }
         None => (model_id, None),
     }
@@ -829,7 +823,7 @@ fn prepare_codex_launch_home_for_app(
     let reasoning_effort =
         extract_reasoning_effort(existing_config.as_deref()).unwrap_or_else(|| "high".to_string());
     let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
-    // 生成本地模型目录（仅收录带 [Nm] 后缀的模型），让引擎跳过 fallback 对上下文窗口的钳制。
+    // 生成本地模型目录（收录带上下文后缀的模型），让引擎跳过 fallback 对上下文窗口的钳制。
     // 无后缀模型时目录为空（引擎拒绝空目录），此时不写 model_catalog_json，保持现状。
     let catalog_path = codex_dir.join("model-catalog.json");
     let catalog = codex_app::catalog::build_model_catalog(injected_models);
@@ -837,6 +831,20 @@ fn prepare_codex_launch_home_for_app(
         .as_array()
         .map(|models| !models.is_empty())
         .unwrap_or(false);
+    let suffix_count = catalog["models"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!(
+        "[cx] 注入 {} 个模型（其中 {} 个有上下文后缀）",
+        injected_models.len(),
+        suffix_count
+    );
+    if !has_catalog_entries {
+        eprintln!(
+            "[cx] 警告: 无上下文后缀模型，所有模型将走引擎 fallback（258k）"
+        );
+    }
     let model_catalog_json = if has_catalog_entries {
         write_private_file(&catalog_path, &serde_json::to_string_pretty(&catalog)?)?;
         println!("[cx] 注入模型目录: {}", catalog_path.display());
@@ -5531,6 +5539,19 @@ trust_level = "trusted"
             ("model[1mm]", None)
         );
         assert_eq!(parse_model_context_suffix("[1m]"), ("", Some(1_000_000)));
+        // Unified parser handles more formats: [200k], [1M], [1m123k], etc.
+        assert_eq!(
+            parse_model_context_suffix("model[200k]"),
+            ("model", Some(200_000))
+        );
+        assert_eq!(
+            parse_model_context_suffix("model[1M]"),
+            ("model", Some(1_000_000))
+        );
+        assert_eq!(
+            parse_model_context_suffix("model[1m123k]"),
+            ("model", Some(1_123_000))
+        );
     }
 
     #[test]

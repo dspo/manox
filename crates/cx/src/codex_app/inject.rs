@@ -71,6 +71,12 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
         .map(|m| {
             // The id sent to the API must not carry the `[Nm]` context suffix.
             let api_id = m.api_model_id();
+            // Context window: prefer suffix hint (e.g. [1m] → 1M), else model.context.
+            let (_, suffix_ctx) = crate::parse_model_context_suffix(&m.id);
+            let ctx: u64 = suffix_ctx
+                .map(|v| v as u64)
+                .or(m.context)
+                .unwrap_or(272_000);
             json!({
                 "model": api_id,
                 "id": api_id,
@@ -90,6 +96,9 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
                 "additionalSpeedTiers": [],
                 "serviceTiers": [],
                 "defaultServiceTier": null,
+                "contextWindow": ctx,
+                "maxContextWindow": ctx,
+                "effectiveContextWindowPercent": 95,
             })
         })
         .collect();
@@ -365,6 +374,16 @@ mod tests {
         assert!(!script.contains("[1m]"));
         assert!(!script.contains("[1m123k]"));
         assert!(script.contains("window.__cxDefaultModel = \"qwen3.7-max\""));
+    }
+
+    #[test]
+    fn injection_script_includes_context_window_fields() {
+        let models = vec![rm("qwen3.7-max[1m]")];
+        let script = build_injection_script(&models, "high");
+        // Context window fields must be present in model descriptors.
+        assert!(script.contains(r#""contextWindow":1000000"#));
+        assert!(script.contains(r#""maxContextWindow":1000000"#));
+        assert!(script.contains(r#""effectiveContextWindowPercent":95"#));
     }
 
     #[test]
