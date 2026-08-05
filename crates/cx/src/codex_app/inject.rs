@@ -96,6 +96,7 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
                 "additionalSpeedTiers": [],
                 "serviceTiers": [],
                 "defaultServiceTier": null,
+                "experimentalSupportedTools": [],
                 "contextWindow": ctx,
                 "maxContextWindow": ctx,
                 "effectiveContextWindowPercent": 95,
