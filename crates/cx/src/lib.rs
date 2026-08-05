@@ -646,9 +646,9 @@ fn merge_codex_config(
     provider_key: &str,
     provider_name: &str,
     env_key: &str,
-    // 发给 provider 的 model id（已剥除 cx 内部 `[Nm]` 上下文后缀）。
+    // 发给 provider 的 model id（已剥除 cx 内部上下文后缀）。
     api_model_id: &str,
-    // 模型上下文窗口 token 数（来自 `[Nm]` 后缀），写入 codex config.toml 的
+    // 模型上下文窗口 token 数（来自上下文后缀，如 `[1m]`/`[200k]`），写入 codex config.toml 的
     // `model_context_window`。None 则不写、保留用户既有值。
     context_window: Option<i64>,
     // 本地模型目录（ModelsResponse JSON）路径，写入 config.toml 的 `model_catalog_json`。
@@ -732,10 +732,10 @@ fn merge_codex_config(
     Ok(rendered)
 }
 
-/// 解析 model id 末尾的 `[Nm]` 上下文窗口后缀（cx 约定，如 `glm-5.2[1m]`）。
+/// 解析 model id 末尾的上下文窗口后缀（cx 约定，如 `glm-5.2[1m]`、`model[200k]`、`model[1m123k]`）。
 /// 返回 (发给 provider/agent 的 base id, Option<上下文 token 数>)。
-/// `[1m]` → 1_000_000；`[3m]` → 3_000_000；无后缀则 base = 原 id、hint = None。
-/// `model[1mm]` 这类不匹配的尾缀原样保留。
+/// `[1m]` → 1_000_000；`[200k]` → 200_000；无后缀则 base = 原 id、hint = None。
+/// 不匹配的尾缀（如 `model[1mm]`）原样保留。
 pub(crate) fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) {
     match context_window_from_suffix(model_id) {
         Some(tokens) => {
@@ -764,7 +764,7 @@ fn prepare_codex_launch_home(
     let provider_key = provider_config_key(&provider.name);
     let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
-    // 剥除 `[Nm]` 上下文后缀：provider 接收的是 base id（如 glm-5.2），
+    // 剥除上下文后缀：provider 接收的是 base id（如 glm-5.2），
     // 1m 上下文信息写入 codex 的 model_context_window。
     let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
     let merged_config = merge_codex_config(
@@ -2215,7 +2215,7 @@ fn build_launch_spec(
 
         // Inject a unified model identifier so agents and their tooling can
         // detect which model cx configured, regardless of the agent type.
-        // 用剥除 `[Nm]` 后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
+        // 用剥除上下文后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
         // ctx_hint（[1m] → 1_000_000）由各 agent 分支按需消费：copilot 写入
         // COPILOT_PROVIDER_MAX_PROMPT_TOKENS，codex 写入 model_context_window。
         let (api_model_id, ctx_hint) = parse_model_context_suffix(&model.id);
@@ -2237,7 +2237,7 @@ fn build_launch_spec(
                     model.endpoint_url.clone(),
                 );
                 env.insert("COPILOT_MODEL".into(), api_model_id.to_string());
-                // 透传 `[Nm]` 上下文后缀：copilot BYOK 用 COPILOT_PROVIDER_MAX_PROMPT_TOKENS
+                // 透传上下文后缀：copilot BYOK 用 COPILOT_PROVIDER_MAX_PROMPT_TOKENS
                 // 声明输入上下文窗口（覆盖其内置 catalog 与默认 128K）。
                 // 见 `copilot help providers`：token 限制解析顺序为
                 // manual env vars → built-in catalog → defaults。
@@ -4510,7 +4510,7 @@ mod tests {
 
     #[test]
     fn copilot_omits_max_prompt_tokens_without_suffix() {
-        // 无 `[Nm]` 后缀时不设 COPILOT_PROVIDER_MAX_PROMPT_TOKENS，
+        // 无上下文后缀时不设 COPILOT_PROVIDER_MAX_PROMPT_TOKENS，
         // 让 copilot 走 catalog / 默认值，行为不变。
         let fake_binary = create_fake_binary("copilot");
         let selection = Selection {
@@ -5418,7 +5418,7 @@ trust_level = "trusted"
 
     #[test]
     fn merge_codex_config_no_suffix_leaves_context_window_absent() {
-        // 无 [Nm] 后缀时不写 model_context_window，也不误删用户既有值。
+        // 无上下文后缀时不写 model_context_window，也不误删用户既有值。
         let existing = "model_context_window = 200000\napproval_policy = \"never\"\n";
         let merged = merge_codex_config(
             Some(existing),
@@ -5440,7 +5440,7 @@ trust_level = "trusted"
 
     #[test]
     fn merge_codex_config_suffix_overrides_user_context_window() {
-        // 有 [Nm] 后缀时 cx 重写 model_context_window，剥离用户旧值。
+        // 有上下文后缀时 cx 重写 model_context_window，剥离用户旧值。
         let existing = "model_context_window = 200000\n";
         let merged = merge_codex_config(
             Some(existing),
