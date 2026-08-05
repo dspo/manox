@@ -271,8 +271,7 @@ impl PluginManager {
 
     /// Install a plugin from a marketplace: resolve its `source` path, copy the
     /// tree into `plugins_dir/<name>`, and record it as enabled. Reinstalling
-    /// or updating an existing plugin clears any disabled state, so a fresh
-    /// copy is loaded on the next start.
+    /// or updating an existing plugin preserves its enabled/disabled state.
     pub fn install(marketplace_slug: &str, plugin_name: &str) -> Result<()> {
         let repo_root = paths::marketplace_cache_dir()?.join(marketplace_slug);
         let index = Self::load_marketplace_index(&repo_root)?;
@@ -298,8 +297,7 @@ impl PluginManager {
         }
         copy_tree(&source, &dest)
             .with_context(|| format!("copying {} -> {}", source.display(), dest.display()))?;
-        Self::set_enabled(plugin_name, &dest, marketplace_slug)?;
-        Self::set_disabled(plugin_name, false)
+        Self::set_enabled(plugin_name, &dest, marketplace_slug)
     }
 
     /// Remove an installed plugin and drop it from the enabled and disabled
@@ -317,6 +315,7 @@ impl PluginManager {
     /// Re-enable an installed plugin: drop its name from the disabled list so
     /// loaders scan it again on the next start.
     pub fn enable(plugin_name: &str) -> Result<()> {
+        Self::require_installed(plugin_name)?;
         Self::set_disabled(plugin_name, false)
     }
 
@@ -324,16 +323,28 @@ impl PluginManager {
     /// loaders stop scanning it on the next start. Files stay on disk — only
     /// `uninstall` removes them.
     pub fn disable(plugin_name: &str) -> Result<()> {
+        Self::require_installed(plugin_name)?;
         Self::set_disabled(plugin_name, true)
     }
 
     /// Plugins that loaders should scan — the enabled subset of installed
     /// plugins, in stable (alphabetical) order.
     pub fn installed() -> Vec<InstalledPlugin> {
+        let disabled = Self::disabled_names();
         Self::all_installed()
             .into_iter()
-            .filter(|plugin| !Self::is_disabled(&plugin.name))
+            .filter(|plugin| !disabled.contains(&plugin.name))
             .collect()
+    }
+
+    /// Fail unless `plugin_name` is an installed plugin, keeping the disabled
+    /// list free of names with no installed tree behind them.
+    fn require_installed(plugin_name: &str) -> Result<()> {
+        if Self::all_installed().iter().any(|p| p.name == plugin_name) {
+            Ok(())
+        } else {
+            anyhow::bail!("plugin {} is not installed", plugin_name)
+        }
     }
 
     /// Installed plugins regardless of enabled state, in stable (alphabetical)
@@ -374,10 +385,11 @@ impl PluginManager {
     /// Installed plugins plus the parsed manifest fields used by the plugin
     /// management UI.
     pub fn installed_details() -> Vec<InstalledPluginRecord> {
+        let disabled = Self::disabled_names();
         let mut out = Vec::new();
         for plugin in Self::all_installed() {
             let manifest = load_plugin_manifest(&plugin.root);
-            let enabled = !Self::is_disabled(&plugin.name);
+            let enabled = !disabled.contains(&plugin.name);
             out.push(InstalledPluginRecord {
                 name: plugin.name,
                 marketplace: plugin.marketplace,
@@ -395,11 +407,6 @@ impl PluginManager {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
-    }
-
-    /// Whether an installed plugin is currently disabled.
-    fn is_disabled(name: &str) -> bool {
-        Self::disabled_names().contains(name)
     }
 
     /// Names currently listed in the disabled-plugins file.
