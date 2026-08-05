@@ -142,9 +142,11 @@ fn map_model(model: &AnyLanguageModel) -> Result<Model, String> {
         provider: model.provider_id(),
         api: api.to_string(),
         id: model.id(),
-        // manox exposes no context-window accessor; use a conservative cap.
-        context_window: 200_000,
-        max_tokens: model.max_token_count() as usize,
+        // `max_token_count` is the context window; `max_output_tokens` is the
+        // per-response budget that goes on the wire as `max_tokens`. Mapping
+        // them the wrong way round would send a 200k/1M max_tokens and 400.
+        context_window: model.max_token_count() as usize,
+        max_tokens: model.max_output_tokens() as usize,
         thinking: if model.supports_thinking() {
             ThinkingKind::Enabled
         } else {
@@ -194,5 +196,73 @@ fn pi_result_text(result: &pi::tool::AgentToolResult) -> String {
         "(pi subagent failed)".to_string()
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language_model::{
+        LanguageModel as LanguageModelTrait, LanguageModelCompletionEvent, LanguageModelRequest,
+    };
+
+    /// A mock model whose window and output budget are deliberately far
+    /// apart, so a wrong mapping fails loudly.
+    struct MockModel;
+
+    impl LanguageModelTrait for MockModel {
+        fn id(&self) -> String {
+            "mock-1m".into()
+        }
+        fn name(&self) -> String {
+            "Mock 1M".into()
+        }
+        fn provider_id(&self) -> String {
+            "mock".into()
+        }
+        fn provider_name(&self) -> String {
+            "Mock".into()
+        }
+        fn wire_api(&self) -> WireApi {
+            WireApi::Anthropic
+        }
+        fn api_key(&self) -> &str {
+            "k"
+        }
+        fn base_url(&self) -> &str {
+            "https://mock"
+        }
+        fn max_token_count(&self) -> u64 {
+            1_000_000
+        }
+        fn max_output_tokens(&self) -> u64 {
+            8192
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            use futures::StreamExt as _;
+            Box::pin(async move { Ok(futures::stream::iter(std::iter::empty()).boxed()) })
+        }
+    }
+
+    #[test]
+    fn map_model_keeps_window_and_output_budget_apart() {
+        let model: AnyLanguageModel = Arc::new(MockModel);
+        let pi_model = map_model(&model).unwrap();
+        // The context window comes from `max_token_count`; the wire-facing
+        // `max_tokens` comes from the output budget. Mapping them the wrong
+        // way round would 400 on a real Anthropic call.
+        assert_eq!(pi_model.context_window, 1_000_000);
+        assert_eq!(pi_model.max_tokens, 8192);
+        assert_eq!(pi_model.api, "anthropic");
+        assert_eq!(pi_model.id, "mock-1m");
     }
 }

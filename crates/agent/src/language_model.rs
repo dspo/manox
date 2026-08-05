@@ -400,6 +400,11 @@ pub trait LanguageModel: Send + Sync {
     fn api_key(&self) -> &str;
     /// The provider endpoint URL (without the wire-specific path suffix).
     fn base_url(&self) -> &str;
+    /// Per-response output budget in tokens. Providers override; the default
+    /// falls back to the context window so wiring layers always get a value.
+    fn max_output_tokens(&self) -> u64 {
+        self.max_token_count()
+    }
 
     /// cx agent ids this model can drive (`claude` / `codex` / `copilot` / …),
     /// sourced from the provider config's endpoint `agents:` list. Empty means

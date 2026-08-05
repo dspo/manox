@@ -120,6 +120,10 @@ impl LanguageModel for ResponsesModel {
         &self.endpoint_url
     }
 
+    fn max_output_tokens(&self) -> u64 {
+        self.max_output_tokens
+    }
+
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
     }

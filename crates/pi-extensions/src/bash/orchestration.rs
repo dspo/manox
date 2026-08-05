@@ -89,6 +89,9 @@ impl BackgroundManager {
 
     /// Bind an agent session: steer completions into it and cancel this
     /// manager's tasks when the run is aborted.
+    ///
+    /// Re-entrant: calling `attach` again replaces the previous steerer and
+    /// lifecycle subscription (the old subscription drops and unsubscribes).
     pub fn attach(&self, session: &mut AgentSession) {
         let handle = session.handle();
         *self.steerer.lock().expect("steerer lock poisoned") =
