@@ -6563,7 +6563,12 @@ impl Render for Workspace {
                                             .flex_1()
                                             .min_w_0()
                                             .pr_4()
-                                            .child(Icon::new(IconName::Bot).small())
+                                            .child(
+                                                gpui::svg()
+                                                    .path("icons/manox.svg")
+                                                    .size(px(16.))
+                                                    .text_color(theme.muted_foreground),
+                                            )
                                             .child(
                                                 gpui::div()
                                                     .text_sm()
