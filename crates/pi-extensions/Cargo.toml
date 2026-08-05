@@ -17,6 +17,7 @@ brush-core = { workspace = true }
 brush-builtins = { workspace = true }
 libc.workspace = true
 tracing.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

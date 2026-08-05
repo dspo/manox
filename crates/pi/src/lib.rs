@@ -10,11 +10,12 @@
 //   StreamFn      — how the harness calls an LLM (provider-agnostic)
 //   ExecutionEnv  — how the harness accesses filesystem and shell
 
-pub mod background;
 pub mod cache_stats;
 pub mod coding_agent;
 pub mod compaction;
 pub mod env;
+pub mod ext_point_agent;
+pub mod ext_point_background;
 pub mod harness;
 pub mod hashline;
 pub mod output_guard;
@@ -35,8 +36,9 @@ pub use agent::QueueMode;
 pub use agent::RunHandle;
 pub use agent_loop::run_loop;
 pub use agent_loop::{EventSink, StreamFn};
-pub use background::{BackgroundTaskRegistry, PollResult, TaskError, TaskId};
 pub use env::ExecutionEnv;
+pub use ext_point_agent::{AgentDef, AgentRegistry};
+pub use ext_point_background::{BackgroundTaskRegistry, PollResult, TaskError, TaskId};
 pub use harness::AgentHarness;
 pub use harness::{NavigateTreeOptions, NavigateTreeResult};
 pub use provider::ProviderError;
