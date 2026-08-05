@@ -62,8 +62,10 @@ impl BashTool {
     }
 
     /// Bind an orchestrator so background tasks participate in the agent
-    /// session's lifecycle.
+    /// session's lifecycle. The manager's registry replaces the wrapper's
+    /// own, so tasks it spawns stay visible to `bash_output` / `task_stop`.
     pub fn with_manager(mut self, manager: Arc<BackgroundManager>) -> Self {
+        self.registry = manager.registry.clone();
         self.manager = Some(manager);
         self
     }
