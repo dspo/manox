@@ -130,6 +130,7 @@ impl TerminalElement {
         selection: Option<SelectionRange>,
         offset: i32,
         rows: i32,
+        cols: i32,
         bounds: Bounds<Pixels>,
         cell_w: Pixels,
         lh: Pixels,
@@ -158,10 +159,9 @@ impl TerminalElement {
                 let to = if grid_line == end_line {
                     sel.end.column.0 as i32
                 } else {
-                    // Use the maximum possible column — the grid may have
-                    // been resized, but any value >= visible cols still
-                    // paints the full line width.
-                    i32::MAX
+                    // Middle lines span the full width. Clamp to cols-1 instead
+                    // of i32::MAX to avoid overflow when computing the width.
+                    cols - 1
                 };
                 (from, to)
             };
@@ -297,6 +297,7 @@ impl Element for TerminalElement {
             selection,
             offset,
             term_rows,
+            cols as i32,
             bounds,
             cell_width,
             line_height_px,
