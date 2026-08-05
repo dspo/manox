@@ -508,8 +508,8 @@ fn build_agent_menu() -> Menu {
 /// that exposes models visible to the `Codex.app` agent (i.e. Responses-capable
 /// models), one action item per model. Mirrors the provider registry snapshot
 /// at build time — `agent::i18n::rebuild_menus` re-runs menu construction after
-/// a registry reload. Grouping assumes the registry lists a provider's models
-/// contiguously (same invariant the sidebar's model cascade relies on).
+/// a registry reload. Provider submenus keep the registry's first-appearance
+/// order; models keep registry order within their provider.
 #[cfg(target_os = "macos")]
 fn build_chatgpt_menu_items() -> Vec<MenuItem> {
     let registry = agent::provider::registry::global();
@@ -520,10 +520,9 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
         }
         let provider = model.provider_name();
         let model_id = model.name();
-        if let Some((_, models)) = providers.last_mut().filter(|(name, _)| *name == provider) {
-            models.push(model_id);
-        } else {
-            providers.push((provider, vec![model_id]));
+        match providers.iter_mut().find(|(name, _)| *name == provider) {
+            Some((_, models)) => models.push(model_id),
+            None => providers.push((provider, vec![model_id])),
         }
     }
     providers

@@ -437,7 +437,7 @@ menu-terminal = 终端
 menu-new-terminal = 新建终端标签页
 menu-close-terminal = 关闭终端标签页
 menu-about = 关于 Manox
-menu-agent = Agent
+menu-agent = 智能体
 
 ## ChatGPT.app 启动通知（Agent → ChatGPT.app 菜单级联）
 chatgpt-app-launched = 已启动 ChatGPT.app · { $provider } · { $model }
