@@ -501,6 +501,14 @@ mod tests {
         fn wire_api(&self) -> WireApi {
             WireApi::Anthropic
         }
+
+        fn api_key(&self) -> &str {
+            ""
+        }
+
+        fn base_url(&self) -> &str {
+            ""
+        }
         fn max_token_count(&self) -> u64 {
             1_000_000
         }

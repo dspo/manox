@@ -107,6 +107,15 @@ impl LanguageModel for CompletionsModel {
     fn wire_api(&self) -> crate::provider::WireApi {
         crate::provider::WireApi::Completions
     }
+
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    fn base_url(&self) -> &str {
+        &self.endpoint_url
+    }
+
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
     }

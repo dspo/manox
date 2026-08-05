@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use pi::coding_agent::ModelRuntime;
 use pi::coding_agent::create_agent_session;
 use pi::ext_point_agent::{AgentDef, AgentRegistry};
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -36,11 +37,34 @@ pub struct SubagentTool {
     registry: Arc<AgentRegistry>,
     /// Snapshot of the caller's full tool set, used to resolve `def.tools`.
     tools: Vec<Arc<dyn AgentTool>>,
+    /// Optional model runtime; without one the session is built from the
+    /// default env-backed runtime.
+    model_runtime: Option<ModelRuntime>,
+    /// Optional explicit model; without one the session uses its default.
+    model: Option<pi::types::Model>,
 }
 
 impl SubagentTool {
     pub fn new(registry: Arc<AgentRegistry>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
-        SubagentTool { registry, tools }
+        SubagentTool {
+            registry,
+            tools,
+            model_runtime: None,
+            model: None,
+        }
+    }
+
+    /// Inject the model runtime the subagent session runs on (the caller's
+    /// bridge into its own provider configuration).
+    pub fn with_model_runtime(mut self, runtime: ModelRuntime) -> Self {
+        self.model_runtime = Some(runtime);
+        self
+    }
+
+    /// Pin the model the subagent session uses (wired to the caller's model).
+    pub fn with_model(mut self, model: pi::types::Model) -> Self {
+        self.model = Some(model);
+        self
     }
 }
 
@@ -110,11 +134,18 @@ impl AgentTool for SubagentTool {
         // read-only Explore call does not litter the user's project.
         let session_dir =
             tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
-        let mut session = create_agent_session()
+        let mut builder = create_agent_session()
             .with_cwd(ctx.cwd())
             .with_session_dir(session_dir.path())
             .with_system_prompt(def.system_prompt.clone())
-            .with_tools(selected)
+            .with_tools(selected);
+        if let Some(runtime) = &self.model_runtime {
+            builder = builder.with_model_runtime(runtime.clone());
+        }
+        if let Some(model) = &self.model {
+            builder = builder.with_model(model.clone());
+        }
+        let mut session = builder
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;

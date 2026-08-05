@@ -395,6 +395,11 @@ pub trait LanguageModel: Send + Sync {
     fn provider_id(&self) -> String;
     fn provider_name(&self) -> String;
     fn wire_api(&self) -> WireApi;
+    /// The resolved API key this model speaks with. Exposed so wiring layers
+    /// (e.g. the pi bridge) can reuse the same credential.
+    fn api_key(&self) -> &str;
+    /// The provider endpoint URL (without the wire-specific path suffix).
+    fn base_url(&self) -> &str;
 
     /// cx agent ids this model can drive (`claude` / `codex` / `copilot` / …),
     /// sourced from the provider config's endpoint `agents:` list. Empty means
