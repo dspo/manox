@@ -338,23 +338,31 @@ pub struct HarnessHandle {
 
 impl HarnessHandle {
     /// Queue a steering message injected into the current or next turn.
-    pub fn steer(&self, message: AgentMessage) {
-        self.run.steer(message);
+    /// Returns the queue-local id, which `cancel_steer` accepts to retract it.
+    pub fn steer(&self, message: AgentMessage) -> String {
+        let id = self.run.steer(message);
         self.control.emit_queue_counts(
             self.run.queued_steering_count(),
             self.run.queued_follow_up_count(),
             self.control.next_turn_queue.lock().unwrap().len(),
         );
+        id
     }
 
     /// Queue a follow-up message that resumes a run that would otherwise stop.
-    pub fn follow_up(&self, message: AgentMessage) {
-        self.run.follow_up(message);
+    pub fn follow_up(&self, message: AgentMessage) -> String {
+        let id = self.run.follow_up(message);
         self.control.emit_queue_counts(
             self.run.queued_steering_count(),
             self.run.queued_follow_up_count(),
             self.control.next_turn_queue.lock().unwrap().len(),
         );
+        id
+    }
+
+    /// Retract a queued steer by id before the loop drains it.
+    pub fn cancel_steer(&self, id: &str) -> bool {
+        self.run.cancel_steer(id)
     }
 
     /// Abort the agent run and cancel any in-flight retry backoff, clearing

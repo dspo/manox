@@ -832,6 +832,7 @@ struct Registry {
     tasks: HashMap<String, Arc<BackgroundTask>>,
     /// For BackgroundBash, keep a back-reference to the shell state for
     /// BashOutput polling compatibility.
+    #[cfg(feature = "harness-manox")]
     bash_shells: HashMap<String, Arc<std::sync::Mutex<crate::tools::background_shell::ShellState>>>,
     next_id: u64,
 }
@@ -842,6 +843,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
     REGISTRY.get_or_init(|| {
         std::sync::Mutex::new(Registry {
             tasks: HashMap::new(),
+            #[cfg(feature = "harness-manox")]
             bash_shells: HashMap::new(),
             next_id: 1,
         })
@@ -894,6 +896,7 @@ pub fn register_for_goal(
     (id, task)
 }
 
+#[cfg(feature = "harness-manox")]
 pub(crate) fn register_bash_shell(
     shell_id: &str,
     state: Arc<std::sync::Mutex<crate::tools::background_shell::ShellState>>,
@@ -903,6 +906,7 @@ pub(crate) fn register_bash_shell(
 }
 
 /// Get the bash shell state for BashOutput polling.
+#[cfg(feature = "harness-manox")]
 pub(crate) fn get_bash_shell(
     shell_id: &str,
 ) -> Option<Arc<std::sync::Mutex<crate::tools::background_shell::ShellState>>> {
@@ -1023,6 +1027,7 @@ pub fn gc() {
             None => true,
         }
     });
+    #[cfg(feature = "harness-manox")]
     reg.bash_shells.retain(|_, state| {
         let s = state.lock().expect("shell state poisoned");
         match s.exited_at {
@@ -1139,6 +1144,7 @@ pub fn remove_all_for_thread(thread_id: &str) {
     let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks
         .retain(|_, task| task.owner_thread_id() != thread_id);
+    #[cfg(feature = "harness-manox")]
     reg.bash_shells.retain(|_, state| {
         let s = state.lock().expect("shell state poisoned");
         s.thread_id != thread_id

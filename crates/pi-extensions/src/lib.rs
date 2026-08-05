@@ -7,6 +7,7 @@
 
 pub mod agents;
 pub mod bash;
+pub mod session_meta;
 
 pub use agents::SubagentTool;
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};

@@ -42,6 +42,7 @@ pub fn side_calls() -> SideCallsSettings {
 /// the session-cached `claude_md_excludes`. Test builds are hermetic (an
 /// empty context loads nothing user- or machine-level), so thread tests never
 /// observe the developer's actual `~/.claude` tree or managed policy.
+#[cfg(feature = "harness-manox")]
 pub fn claude_md_load_context() -> crate::claude_md::LoadContext {
     #[cfg(test)]
     let ctx = crate::claude_md::LoadContext::default();
@@ -61,6 +62,7 @@ pub fn claude_md_load_context() -> crate::claude_md::LoadContext {
 /// so `agent::init` ordering does not matter; a mid-session settings edit
 /// takes effect next launch, matching the modes snapshot.
 #[cfg(not(test))]
+#[cfg(feature = "harness-manox")]
 fn claude_md_excludes() -> Vec<String> {
     static EXCLUDES: OnceLock<Vec<String>> = OnceLock::new();
     EXCLUDES.get_or_init(|| load().claude_md_excludes).clone()

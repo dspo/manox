@@ -35,8 +35,12 @@ pub enum QueueMode {
 }
 
 /// Pending message queue with a drain mode.
+///
+/// Messages carry a queue-local id so a caller can retract a specific steer
+/// before the loop drains it (`cancel`). The id never reaches the transcript —
+/// drain and snapshot unwrap it — so the message type stays untouched.
 struct PendingMessageQueue {
-    messages: Vec<AgentMessage>,
+    messages: Vec<(String, AgentMessage)>,
     mode: QueueMode,
 }
 
@@ -48,8 +52,17 @@ impl PendingMessageQueue {
         }
     }
 
-    fn enqueue(&mut self, message: AgentMessage) {
-        self.messages.push(message);
+    fn enqueue(&mut self, message: AgentMessage) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.messages.push((id.clone(), message));
+        id
+    }
+
+    /// Retract the message with the given id. False when it already drained.
+    fn cancel(&mut self, id: &str) -> bool {
+        let before = self.messages.len();
+        self.messages.retain(|(queued, _)| queued != id);
+        self.messages.len() != before
     }
 
     fn has_items(&self) -> bool {
@@ -59,7 +72,11 @@ impl PendingMessageQueue {
     fn drain(&mut self) -> Vec<AgentMessage> {
         match self.mode {
             QueueMode::All => {
-                let drained = self.messages.clone();
+                let drained = self
+                    .messages
+                    .iter()
+                    .map(|(_, message)| message.clone())
+                    .collect();
                 self.messages.clear();
                 drained
             }
@@ -67,7 +84,8 @@ impl PendingMessageQueue {
                 if self.messages.is_empty() {
                     return Vec::new();
                 }
-                vec![self.messages.remove(0)]
+                let (_, message) = self.messages.remove(0);
+                vec![message]
             }
         }
     }
@@ -84,14 +102,18 @@ impl PendingMessageQueue {
         self.messages.clear();
     }
 
-    /// Empty the queue and return everything in it, ignoring the mode — an
-    /// abort discards the whole queue, not one turn's worth.
     fn take_all(&mut self) -> Vec<AgentMessage> {
         std::mem::take(&mut self.messages)
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect()
     }
 
     fn snapshot(&self) -> Vec<AgentMessage> {
-        self.messages.clone()
+        self.messages
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect()
     }
 }
 
@@ -417,13 +439,20 @@ impl Agent {
     }
 
     /// Queue a message to be injected after the current assistant turn finishes.
-    pub fn steer(&mut self, message: AgentMessage) {
-        self.steering_queue.lock().unwrap().enqueue(message);
+    /// Returns the queue-local id, which `cancel_steer` accepts to retract it.
+    pub fn steer(&mut self, message: AgentMessage) -> String {
+        self.steering_queue.lock().unwrap().enqueue(message)
     }
 
     /// Queue a message to run only after the agent would otherwise stop.
-    pub fn follow_up(&mut self, message: AgentMessage) {
-        self.follow_up_queue.lock().unwrap().enqueue(message);
+    pub fn follow_up(&mut self, message: AgentMessage) -> String {
+        self.follow_up_queue.lock().unwrap().enqueue(message)
+    }
+
+    /// Retract a queued steer by id. False when it already drained or was
+    /// never queued — the message may still inject if the loop drained it.
+    pub fn cancel_steer(&self, id: &str) -> bool {
+        self.steering_queue.lock().unwrap().cancel(id)
     }
 
     /// Remove all queued steering messages.
@@ -878,13 +907,20 @@ pub struct RunHandle {
 
 impl RunHandle {
     /// Queue a steering message injected into the current or next turn.
-    pub fn steer(&self, message: AgentMessage) {
-        self.steering_queue.lock().unwrap().enqueue(message);
+    /// Returns the queue-local id, which `cancel_steer` accepts to retract it.
+    pub fn steer(&self, message: AgentMessage) -> String {
+        self.steering_queue.lock().unwrap().enqueue(message)
     }
 
     /// Queue a follow-up message that resumes a run that would otherwise stop.
-    pub fn follow_up(&self, message: AgentMessage) {
-        self.follow_up_queue.lock().unwrap().enqueue(message);
+    pub fn follow_up(&self, message: AgentMessage) -> String {
+        self.follow_up_queue.lock().unwrap().enqueue(message)
+    }
+
+    /// Retract a queued steer by id. False when it already drained or was
+    /// never queued — the message may still inject if the loop drained it.
+    pub fn cancel_steer(&self, id: &str) -> bool {
+        self.steering_queue.lock().unwrap().cancel(id)
     }
 
     /// Cancel the active run, if one is in flight.
