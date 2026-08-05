@@ -152,6 +152,8 @@ dependencies = [
  "libc",
  "lsp",
  "lsp-types",
+ "pi",
+ "pi-extensions",
  "reqwest 0.12.28",
  "rmcp",
  "rquickjs",

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use pi::BackgroundTaskRegistry;
 use pi::tool::{AgentTool, AgentToolResult, ToolError};
 use serde_json::Value as JsonValue;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Hard cap on the accumulated output buffer per task; older bytes are
@@ -33,6 +34,9 @@ struct TaskEntry {
     /// `None` while running, `Some(Some(code))` on clean exit, `Some(None)`
     /// when signaled.
     exit_code: Mutex<Option<Option<i32>>>,
+    /// Completion notification: the drain task sends the exit code the moment
+    /// it is recorded, so a watcher can await the exit instead of polling.
+    exit: watch::Sender<Option<Option<i32>>>,
     child: Mutex<Option<tokio::process::Child>>,
     /// The child pid, which is also its process-group id (`process_group(0)`);
     /// kept separate so `kill` can signal the group even after the drain task
@@ -49,6 +53,7 @@ impl TaskEntry {
             total_drained: AtomicU64::new(0),
             total_bytes: AtomicU64::new(0),
             exit_code: Mutex::new(None),
+            exit: watch::channel(None).0,
             child: Mutex::new(Some(child)),
             pid: Mutex::new(Some(pid)),
             last_activity: Mutex::new(Instant::now()),
@@ -107,6 +112,70 @@ impl Default for BackgroundRegistry {
     }
 }
 
+/// Non-consuming snapshot of a task: unlike `poll`, `status` does not
+/// advance the read cursor, so an orchestrator can watch for completion and
+/// build a summary without stealing output the model still expects to fetch
+/// via `bash_output`.
+#[derive(Debug, Clone)]
+pub struct TaskStatusInfo {
+    pub is_running: bool,
+    pub exit_code: Option<Option<i32>>,
+    /// Tail of the accumulated output, truncated to `max_tail_bytes`.
+    pub output_tail: String,
+}
+
+impl BackgroundRegistry {
+    pub fn status(
+        &self,
+        id: &pi::TaskId,
+        max_tail_bytes: usize,
+    ) -> Result<TaskStatusInfo, pi::TaskError> {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
+        entry.touch();
+        let buf = entry.buffer.lock().expect("buffer lock poisoned");
+        let start = buf.len().saturating_sub(max_tail_bytes);
+        let output_tail = String::from_utf8_lossy(&buf[start..]).to_string();
+        let exit_code = *entry.exit_code.lock().expect("exit lock poisoned");
+        Ok(TaskStatusInfo {
+            is_running: exit_code.is_none(),
+            exit_code,
+            output_tail,
+        })
+    }
+
+    /// Resolve when the task's exit code has been recorded. Unlike `poll`,
+    /// this does not advance the read cursor; a task that already exited
+    /// resolves immediately (the watch carries the current value).
+    pub async fn wait_exit(&self, id: &pi::TaskId) -> Result<(), pi::TaskError> {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
+        entry.touch();
+        let mut rx = entry.exit.subscribe();
+        if rx.borrow().is_some() {
+            return Ok(());
+        }
+        loop {
+            rx.changed()
+                .await
+                .map_err(|_| pi::TaskError::Other("task dropped before exit".into()))?;
+            if rx.borrow().is_some() {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Drain a task's pipes into its ring buffer, then record the exit code.
 async fn drain_task(
     mut stdout: tokio::process::ChildStdout,
@@ -139,6 +208,9 @@ async fn drain_task(
     }
     .flatten();
     *entry.exit_code.lock().expect("exit lock poisoned") = Some(code);
+    // Wake any waiter the moment the exit is recorded; a watcher awaiting
+    // `wait_exit` resumes without polling.
+    let _ = entry.exit.send(Some(code));
     entry.touch();
 }
 
@@ -453,5 +525,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(saw_tail, "output after overflow is still observable");
+    }
+}
+
+#[cfg(test)]
+mod wait_exit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_exit_resolves_on_completion() {
+        let registry = BackgroundRegistry::new();
+        let id = registry.spawn("sleep 0.1", Path::new("/tmp")).unwrap();
+        // Event-driven: resolves as soon as the drain records the exit.
+        tokio::time::timeout(Duration::from_secs(5), registry.wait_exit(&id))
+            .await
+            .expect("wait_exit must resolve")
+            .unwrap();
+        assert!(!registry.status(&id, 0).unwrap().is_running);
+    }
+
+    #[tokio::test]
+    async fn wait_exit_resolves_immediately_for_finished_task() {
+        let registry = BackgroundRegistry::new();
+        let id = registry.spawn("echo done", Path::new("/tmp")).unwrap();
+        registry.wait_exit(&id).await.unwrap();
+        // A second wait sees the watch's current value and returns at once.
+        let start = std::time::Instant::now();
+        registry.wait_exit(&id).await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

@@ -11,6 +11,8 @@ publish.workspace = true
 test-support = []
 
 [dependencies]
+pi.workspace = true
+pi-extensions.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 futures.workspace = true
