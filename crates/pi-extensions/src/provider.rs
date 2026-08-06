@@ -250,6 +250,17 @@ pub fn resolve_apikey(source: Option<&str>) -> Result<Option<String>, String> {
         return keychain_secret(service).map(Some);
     }
     if let Some(var) = source.strip_prefix("env:") {
+        // The kernel interpolation stops at the first non-identifier char,
+        // so an invalid name would resolve silently to the wrong variable;
+        // fail the provider instead (POSIX names: [_A-Za-z][_A-Za-z0-9]*).
+        let valid = !var.is_empty()
+            && var
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()));
+        if !valid {
+            return Err(format!("invalid environment variable name in `env:{var}`"));
+        }
         return Ok(Some(format!("${var}")));
     }
     if let Some(literal) = source.strip_prefix("literal:") {
@@ -386,23 +397,83 @@ fn known_model_meta(id: &str) -> KnownModelMeta {
     }
 }
 
-/// Split a raw model id into the wire-facing id and an optional `[Nm]`
+/// Split a raw model id into the wire-facing id and an optional trailing
 /// context-window hint (`deepseek-v4-flash[1m]` → `("deepseek-v4-flash",
-/// Some(1_000_000))`).
+/// Some(1_000_000))`). Grammar mirrors `cx_providers::parse_context_window`
+/// (`[200k]`, `[1m123k]`, bare numbers, k/m units); an unparseable or
+/// non-trailing group leaves the id intact (sent to the API verbatim).
 pub fn parse_model_id(raw: &str) -> (String, Option<u64>) {
-    if raw.ends_with(']')
-        && let Some(open) = raw.rfind('[')
-    {
-        let inner = &raw[open + 1..raw.len() - 1];
-        if let Some(digits) = inner.strip_suffix('m')
-            && !digits.is_empty()
-            && digits.chars().all(|c| c.is_ascii_digit())
-            && let Ok(n) = digits.parse::<u64>()
-        {
-            return (raw[..open].to_string(), Some(n * 1_000_000));
-        }
+    let Some(open) = trailing_bracket_open(raw) else {
+        return (raw.to_string(), None);
+    };
+    let inner = &raw[open + 1..raw.len() - 1];
+    match parse_context_window(inner) {
+        Some(window) => (raw[..open].to_string(), Some(window)),
+        None => (raw.to_string(), None),
     }
-    (raw.to_string(), None)
+}
+
+/// Byte index of the `[` opening a single trailing `[...]` group, or
+/// `None` when the id has no trailing group or multiple brackets.
+fn trailing_bracket_open(id: &str) -> Option<usize> {
+    if !id.ends_with(']') {
+        return None;
+    }
+    let open = id.rfind('[')?;
+    let prefix = &id[..open];
+    if prefix.contains('[') || prefix.contains(']') {
+        return None;
+    }
+    Some(open)
+}
+
+/// Parse a context-window suffix term list: digit runs with optional
+/// `k`/`m` unit letters, additive (`1m123k` = 1_123_000). Port of
+/// `cx_providers::parse_context_window` (kept in sync by tests; the
+/// extension cannot depend on cx-providers by design).
+fn parse_context_window(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return None;
+    }
+    let b = t.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut total: u64 = 0;
+    let mut saw_term = false;
+    while i < n {
+        if !b[i].is_ascii_digit() {
+            return None;
+        }
+        let mut j = i;
+        while j < n && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        let digits = &b[i..j];
+        if digits.len() > 1 && digits[0] == b'0' {
+            return None;
+        }
+        i = j;
+        let mult: u64 = if i < n {
+            match b[i] {
+                b'k' | b'K' => {
+                    i += 1;
+                    1_000
+                }
+                b'm' | b'M' => {
+                    i += 1;
+                    1_000_000
+                }
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let val: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        total = total.checked_add(val.checked_mul(mult)?)?;
+        saw_term = true;
+    }
+    saw_term.then_some(total)
 }
 
 /// Accept a yaml number or a quoted number.
@@ -450,8 +521,20 @@ fn build_model_config(
         cost: known.cost.unwrap_or_default(),
         api: None,
         base_url: None,
-        agents: effective_agents(config, wire_api, endpoint.agents(), &model_agents),
-        config_id: Some(raw_id.to_string()),
+        metadata: {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                "agents".to_string(),
+                serde_json::json!(effective_agents(
+                    config,
+                    wire_api,
+                    endpoint.agents(),
+                    &model_agents
+                )),
+            );
+            meta.insert("config_id".to_string(), serde_json::json!(raw_id));
+            meta
+        },
     }
 }
 
@@ -755,6 +838,28 @@ providers:
         assert_eq!(parse_model_id("m"), ("m".into(), None));
         assert_eq!(parse_model_id("m[1x]"), ("m[1x]".into(), None));
         assert_eq!(parse_model_id("m[]"), ("m[]".into(), None));
+        // cx suffix grammar parity: k units, additive terms, bare numbers,
+        // uppercase units; multi-group ids stay intact.
+        assert_eq!(
+            parse_model_id("glm-5.2[200k]"),
+            ("glm-5.2".into(), Some(200_000))
+        );
+        assert_eq!(parse_model_id("m[1m123k]"), ("m".into(), Some(1_123_000)));
+        assert_eq!(parse_model_id("m[65536]"), ("m".into(), Some(65_536)));
+        assert_eq!(parse_model_id("m[2M]"), ("m".into(), Some(2_000_000)));
+        assert_eq!(parse_model_id("m[1m][2m]"), ("m[1m][2m]".into(), None));
+        assert_eq!(parse_model_id("m[01m]"), ("m[01m]".into(), None));
+    }
+
+    #[test]
+    fn env_source_rejects_invalid_variable_names() {
+        assert_eq!(
+            resolve_apikey(Some("env:GOOD_NAME1")).unwrap().as_deref(),
+            Some("$GOOD_NAME1")
+        );
+        assert!(resolve_apikey(Some("env:MY-VAR")).is_err());
+        assert!(resolve_apikey(Some("env:1LEAD")).is_err());
+        assert!(resolve_apikey(Some("env:")).is_err());
     }
 
     #[test]

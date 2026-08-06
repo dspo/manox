@@ -9,6 +9,12 @@
 //! config format (e.g. the native cx providers yaml) is the extension's
 //! job (see `pi_extensions::provider`), mirroring how TS extensions own
 //! their own config schemas and only hand the kernel a `ProviderConfig`.
+//!
+//! Live consumption (usage telemetry, budgets, etc.) builds on the event
+//! seam instead of new registry hooks: subscribe via
+//! `AgentSession::subscribe` — `AgentEvent::MessageEnd` carries the full
+//! message including usage — and/or read `AgentSession::session_stats()`
+//! for transcript-derived totals.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -103,14 +109,11 @@ pub struct ProviderModelConfig {
     pub api: Option<Api>,
     /// Per-model endpoint override (falls back to the provider's `base_url`).
     pub base_url: Option<String>,
-    /// Agent visibility allow-list (cx domain; empty = visible to all).
-    /// Not part of the TS shape — carried into `Model.metadata["agents"]`
-    /// so host UIs can filter without a second config read.
-    pub agents: Vec<String>,
-    /// The raw config key this model was registered from (e.g. with a
-    /// `[1m]` context suffix), when the registering extension wants the
-    /// original reference back — carried in `Model.metadata["config_id"]`.
-    pub config_id: Option<String>,
+    /// Extension-supplied metadata carried verbatim into `Model.metadata`
+    /// (e.g. domain-specific visibility or provenance notes). The kernel
+    /// does not interpret it; on key conflicts the kernel's own entries
+    /// (name/reasoning/provider_display_name/cost/input) win.
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 /// A declarative provider registration — the TS `ProviderConfig` (subset:
@@ -202,10 +205,6 @@ impl ProviderRegistry {
                     "cacheWrite": model.cost.cache_write,
                 }),
             );
-            metadata.insert("agents".to_string(), json!(model.agents));
-            if let Some(config_id) = &model.config_id {
-                metadata.insert("config_id".to_string(), json!(config_id));
-            }
             metadata.insert(
                 "input".to_string(),
                 json!(
@@ -232,7 +231,12 @@ impl ProviderRegistry {
                     } else {
                         ThinkingKind::None
                     },
-                    metadata,
+                    metadata: {
+                        let mut merged = model.metadata.clone();
+                        // Kernel-owned keys win over extension-supplied ones.
+                        merged.extend(metadata);
+                        merged
+                    },
                 },
             );
         }
@@ -406,19 +410,12 @@ struct RegistryCatalog {
 
 impl ModelCatalog for RegistryCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        if let Some(model) = self.registry.resolve_model(provider, model_id) {
-            return Some(model);
-        }
-        // Legacy manox-style provider ids persisted by older sessions:
-        // "{wire}:{name}" (e.g. "anthropic:DeepSeek") aliases the
-        // registration name "{name}-{wire}" ("DeepSeek-anthropic").
-        if let Some((wire, name)) = provider.split_once(':') {
-            let aliased = format!("{name}-{wire}");
-            if let Some(model) = self.registry.resolve_model(&aliased, model_id) {
-                return Some(model);
-            }
-        }
-        DefaultModelCatalog.resolve(provider, model_id)
+        // Host-side compatibility layers (e.g. legacy provider-id aliases)
+        // wrap this catalog from the outside; the kernel only knows its own
+        // registration names.
+        self.registry
+            .resolve_model(provider, model_id)
+            .or_else(|| DefaultModelCatalog.resolve(provider, model_id))
     }
 }
 
@@ -495,8 +492,7 @@ mod tests {
             cost: Cost::default(),
             api: None,
             base_url: None,
-            agents: Vec::new(),
-            config_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -580,7 +576,6 @@ mod tests {
         let mut completions_model = model_cfg("chat-model");
         completions_model.api = Some(Api::OpenAiCompletions);
         completions_model.base_url = Some("https://override.example".into());
-        completions_model.agents = Vec::new();
         registry
             .register_provider(
                 "Test-mixed",
@@ -629,6 +624,27 @@ mod tests {
     }
 
     #[test]
+    fn extension_metadata_passes_through_without_overriding_kernel_keys() {
+        let registry = ProviderRegistry::new();
+        let mut model = model_cfg("m");
+        model
+            .metadata
+            .insert("agents".to_string(), json!(["claude"]));
+        model
+            .metadata
+            .insert("config_id".to_string(), json!("m[1m]"));
+        // A colliding key must lose to the kernel's own entry.
+        model.metadata.insert("name".to_string(), json!("intruder"));
+        registry
+            .register_provider("p", provider(vec![model]))
+            .unwrap();
+        let m = registry.resolve_model("p", "m").unwrap();
+        assert_eq!(m.metadata.get("agents").unwrap(), &json!(["claude"]));
+        assert_eq!(m.metadata.get("config_id").unwrap(), &json!("m[1m]"));
+        assert_eq!(m.metadata.get("name").unwrap(), &json!("m"));
+    }
+
+    #[test]
     fn interpolation_resolves_env_shapes() {
         let lookup = |name: &str| -> Option<String> {
             match name {
@@ -665,11 +681,12 @@ mod tests {
                 .resolve("DeepSeek-anthropic", "deepseek-v4-flash")
                 .is_some()
         );
-        // Legacy manox-style provider ids alias onto registration names.
+        // Legacy host-style provider ids are NOT the kernel's concern —
+        // host compatibility layers wrap the catalog instead.
         assert!(
             catalog
                 .resolve("anthropic:DeepSeek", "deepseek-v4-flash")
-                .is_some()
+                .is_none()
         );
         // Built-in provider ids still resolve through the default catalog.
         assert!(catalog.resolve("anthropic", "claude-sonnet-4-6").is_some());

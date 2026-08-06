@@ -295,16 +295,11 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    // New threads start from the latest provider config (parity with the
-    // manox build's new-thread reload); the previous snapshot is kept on
-    // failure. The blocking keychain/shell work runs off the async workers.
-    match tokio::task::spawn_blocking(crate::pi_providers::reload).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!("pi providers reload failed; keeping previous snapshot: {err:#}")
-        }
-        Err(err) => tracing::warn!("pi providers reload task failed: {err}"),
-    }
+    // Wait for the one-shot background registration from
+    // `pi_providers::init` — the actor never reloads providers itself, so
+    // thread creation no longer pays the keychain/shell cost, and the
+    // first turn never sees an empty registry.
+    crate::pi_providers::wait_ready().await;
     let Some(pi_model) = model else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
@@ -312,7 +307,9 @@ async fn run_actor(
         return;
     };
     let registry = crate::pi_providers::global();
-    let runtime = ModelRuntime::with_provider_registry(registry.clone());
+    let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
+        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
+    ));
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
@@ -364,6 +361,7 @@ async fn run_actor(
     let _ = notice_tx.send(BackendNotice::Ready { restored });
     if restored {
         sync_history(&session, &state);
+        sync_usage(&session, &state).await;
     }
 
     let mut run_steers: Vec<String> = Vec::new();
@@ -423,7 +421,7 @@ async fn run_actor(
                 }
                 state.running.store(false, Ordering::Relaxed);
                 sync_history(&session, &state);
-                sync_usage(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
                 let (steered, stranded) = if abort_requested || failed {
                     (Vec::new(), std::mem::take(&mut run_steers))
@@ -480,6 +478,7 @@ async fn run_actor(
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 sync_history(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd } => {
@@ -490,6 +489,7 @@ async fn run_actor(
                         _subscription = subscribe_session(&session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         sync_history(&session, &state);
+                        sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
                     }
                     Err(err) => {
@@ -548,11 +548,61 @@ fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     *state.history.lock().unwrap() = mapped;
 }
 
-/// Accumulate the latest turn's usage into the engine state.
-fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = *state.cumulative.lock().unwrap();
-    let mut per_model = state.per_model.lock().unwrap().clone();
-    let mut request = state.request_usage.lock().unwrap().clone();
+/// Mirror session usage into the engine state. Cumulative and per-model
+/// totals come from the kernel's stats over the full active branch —
+/// compacted history, tool results, and summarization usage included (TS
+/// `getSessionStats` semantics: totals reflect what was actually billed).
+/// Only the per-request attribution for the env card stays a thin
+/// presentation walk here.
+async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
+    let stats = match session.session_stats().await {
+        Ok(stats) => stats,
+        Err(err) => {
+            // Degrade to the assistant-only walk (the pre-stats mechanism)
+            // so a failing stats read never freezes UI usage at stale
+            // values. Loses tool-result/summary usage for this sync only.
+            tracing::warn!("pi session stats failed; falling back to message walk: {err:#}");
+            sync_usage_from_messages(session, state);
+            return;
+        }
+    };
+    let cumulative = token_usage_from_totals(&stats.tokens);
+    let mut per_model = HashMap::new();
+    for entry in &stats.per_model {
+        per_model.insert(entry.key.clone(), token_usage_from_totals(&entry.totals));
+    }
+    *state.cumulative.lock().unwrap() = cumulative;
+    *state.per_model.lock().unwrap() = per_model;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
+}
+
+/// Per-request attribution for the env card: the assistant usage of the
+/// transcript, attributed to the triggering (most recent) user message.
+/// Presentation-layer accounting, hence host-side.
+fn request_attribution(session: &AgentSession) -> HashMap<String, TokenUsage> {
+    let mut request: HashMap<String, TokenUsage> = HashMap::new();
+    let key = last_user_id(session);
+    for m in session.harness_messages() {
+        let AgentMessage::Assistant { usage, .. } = m else {
+            continue;
+        };
+        let u = to_token_usage(usage);
+        if u.total_tokens() == 0 {
+            continue;
+        }
+        request
+            .entry(key.clone())
+            .and_modify(|acc| *acc = *acc + u)
+            .or_insert(u);
+    }
+    request
+}
+
+/// Fallback aggregation when `session_stats()` is unavailable: assistant
+/// usage only, keyed by model id (the pre-stats mechanism).
+fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
+    let mut cumulative = TokenUsage::default();
+    let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
     for m in session.harness_messages() {
         let AgentMessage::Assistant { usage, model, .. } = m else {
             continue;
@@ -566,22 +616,20 @@ fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
             .entry(model.clone())
             .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
-        if let Some(last_user) = session
-            .harness_messages()
-            .iter()
-            .rev()
-            .find(|m| matches!(m, AgentMessage::User { .. }))
-        {
-            let _ = last_user;
-        }
-        request
-            .entry(last_user_id(session))
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
     }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
-    *state.request_usage.lock().unwrap() = request;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
+}
+
+/// Kernel usage totals → the facade's token usage shape.
+fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsage {
+    TokenUsage {
+        input_tokens: t.input,
+        output_tokens: t.output,
+        cache_creation_input_tokens: t.cache_write,
+        cache_read_input_tokens: t.cache_read,
+    }
 }
 
 /// The message id of the most recent user message, as the facade's history

@@ -231,6 +231,9 @@ struct Accumulator {
     tool_calls: Vec<ToolCallAcc>,
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
+    /// Rate card captured from the turn model at construction; priced
+    /// onto every usage snapshot in `current()`.
+    cost_rates: Option<crate::types::Cost>,
     started: bool,
 }
 
@@ -256,6 +259,7 @@ impl Accumulator {
             tool_calls: Vec::new(),
             stop_reason: None,
             usage: Box::new(Usage::default()),
+            cost_rates: crate::provider::model_cost_rates(&context.model),
             started: false,
         }
     }
@@ -286,7 +290,13 @@ impl Accumulator {
             diagnostics: None,
             stop_reason: self.stop_reason,
             raw_stop_reason: self.raw_finish_reason.clone(),
-            usage: self.usage.clone(),
+            usage: {
+                let mut usage = self.usage.clone();
+                if let Some(rates) = &self.cost_rates {
+                    usage.cost = Some(crate::provider::price_usage(rates, &usage));
+                }
+                usage
+            },
             error_message,
             timestamp: chrono::Utc::now(),
         }

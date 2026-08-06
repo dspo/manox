@@ -716,6 +716,19 @@ impl AgentSession {
         self.harness.agent().clear_queues()
     }
 
+    /// Session statistics aggregated over the full active-branch entries —
+    /// the TS `getSessionStats`. Assistant and tool-result usage plus
+    /// compaction/branch-summary usage all count, so totals reflect what was
+    /// actually billed across the session, not just the live context.
+    pub async fn session_stats(
+        &self,
+    ) -> Result<crate::coding_agent::usage::SessionStats, anyhow::Error> {
+        let entries = self.harness.session().get_branch().await?;
+        Ok(crate::coding_agent::usage::session_stats_from_entries(
+            &entries,
+        ))
+    }
+
     /// How much of the context window the conversation occupies.
     ///
     /// `None` when the model declares no window. `tokens`/`percent` are `None`
