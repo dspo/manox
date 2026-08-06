@@ -132,8 +132,9 @@ impl TerminalView {
         }
 
         // While the search overlay is open, keystrokes edit the pattern (the
-        // TUI does not receive them). esc closes; enter closes; cmd-g would
-        // cycle but is left to vi mode's own search for now.
+        // TUI does not receive them). esc closes; enter closes; Tab closes and
+        // sends the horizontal-tab byte to the PTY via the SendTab action;
+        // cmd-g would cycle but is left to vi mode's own search for now.
         if let Some(search) = self.search.as_mut() {
             match k.key.as_ref() {
                 "escape" => {
@@ -552,8 +553,12 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Tab closes the search overlay (if open) and sends the
+        // horizontal-tab byte to the PTY, so the user can search then
+        // immediately continue editing.
         if self.search.is_some() {
-            return;
+            self.search = None;
+            cx.notify();
         }
         let _ = self.terminal.update(cx, |t, _| t.input(b"\t"));
     }
@@ -565,7 +570,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if self.search.is_some() {
-            return;
+            self.search = None;
+            cx.notify();
         }
         let _ = self.terminal.update(cx, |t, _| t.input(b"\x1b[Z"));
     }
