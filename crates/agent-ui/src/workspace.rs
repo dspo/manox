@@ -1358,7 +1358,7 @@ impl Workspace {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let new = match &project {
             Some(dir) => Thread::new_in_project(id, dir.clone(), cx),
-            None => Thread::new(id, self.cwd.clone(), cx),
+            None => Thread::new_fresh(id, self.cwd.clone(), cx),
         };
         if let Some(dir) = &project {
             Self::register_project_in_store(dir, cx);
