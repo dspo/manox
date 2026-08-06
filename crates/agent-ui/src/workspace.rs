@@ -859,6 +859,15 @@ impl Workspace {
                     // Refresh the access chip + Danger badge; no conversation item.
                     cx.notify();
                 }
+                // The pi actor restores session history asynchronously; the
+                // attach-time conversation rebuild saw an empty transcript,
+                // so rebuild once the authoritative history lands (sidebar
+                // open, startup restore). Without this a reopened thread
+                // strands on the hero screen.
+                #[cfg(feature = "harness-pi")]
+                ThreadEvent::HistoryRestored => {
+                    this.rebuild_conversation_from_thread(cx);
+                }
                 ThreadEvent::ApprovalDecision {
                     tool_title,
                     verdict,
@@ -2573,11 +2582,13 @@ impl Workspace {
         let model = old.read(cx).model().cloned();
         let effort = old.read(cx).reasoning_effort();
         let approval = old.read(cx).approval_mode();
-        let new = Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx);
-        new.update(cx, |t, cx| {
-            if let Some(dir) = project {
-                t.set_project(dir, cx);
+        let new = match &project {
+            Some(dir) => {
+                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone(), cx)
             }
+            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
+        };
+        new.update(cx, |t, cx| {
             if let Some(model) = model {
                 t.set_model(model, cx);
             }
@@ -4112,11 +4123,15 @@ impl Workspace {
             let model = self.thread.read(cx).model().cloned();
             let effort = self.thread.read(cx).reasoning_effort();
             let approval = self.thread.read(cx).approval_mode();
-            let new = Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx);
+            let new = match &project {
+                Some(dir) => Thread::new_in_project(
+                    ThreadId(uuid::Uuid::new_v4().to_string()),
+                    dir.clone(),
+                    cx,
+                ),
+                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
+            };
             new.update(cx, |t, cx| {
-                if let Some(dir) = project {
-                    t.set_project(dir, cx);
-                }
                 if let Some(model) = model {
                     t.set_model(model, cx);
                 }

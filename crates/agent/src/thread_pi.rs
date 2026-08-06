@@ -263,23 +263,27 @@ pub struct Thread {
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Construct a new pi-backed thread: spawn the actor (build-or-restore the
-    /// newest session) and the gpui drainer that turns backend notices into
-    /// `ThreadEvent`s.
+    /// Startup constructor: restores the newest session when one exists.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, None, cx)
+        Self::open(id, cwd, None, None, false, cx)
     }
 
-    /// Construct a thread bound to a project directory: the session is
-    /// created with the project as its cwd in one step (no recreate), so
-    /// the sidebar never sees an orphaned pre-project session file.
+    /// A genuinely empty thread (sidebar new-conversation): never restores
+    /// the previous session.
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::open(id, cwd, None, None, true, cx)
+    }
+
+    /// Construct a thread bound to a project directory: a fresh session with
+    /// the project as its cwd in one step (no recreate, no restore), so the
+    /// sidebar never sees an orphaned pre-project session file.
     pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, project.clone(), None, Some(project), cx)
+        Self::open(id, project.clone(), None, Some(project), true, cx)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
     pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, Some(path), None, cx)
+        Self::open(id, cwd, Some(path), None, false, cx)
     }
 
     fn open(
@@ -287,6 +291,7 @@ impl Thread {
         cwd: PathBuf,
         initial_path: Option<PathBuf>,
         project: Option<PathBuf>,
+        fresh: bool,
         cx: &mut App,
     ) -> Entity<Self> {
         let model = crate::pi_providers::default_model();
@@ -298,6 +303,7 @@ impl Thread {
             model.clone(),
             sessions_dir.clone(),
             initial_path,
+            fresh,
         );
 
         cx.new(|cx| {

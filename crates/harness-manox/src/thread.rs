@@ -954,6 +954,19 @@ impl Drop for Thread {
 
 impl Thread {
     /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools plus the `agent` tool.
+    /// Parity constructor for the shared workspace flows: the manox harness
+    /// always starts fresh, so this aliases `new`.
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::new(id, cwd, cx)
+    }
+
+    /// Parity constructor: a fresh thread bound to a project directory.
+    pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
+        let entity = Self::new(id, project.clone(), cx);
+        entity.update(cx, |t, cx| t.set_project(project, cx));
+        entity
+    }
+
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let weak = cx.weak_entity();

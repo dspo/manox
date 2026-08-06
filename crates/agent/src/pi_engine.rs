@@ -80,6 +80,7 @@ pub fn spawn_engine(
     model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -98,6 +99,7 @@ pub fn spawn_engine(
         model,
         sessions_dir,
         initial_path,
+        fresh,
         cmd_rx,
         notice_tx,
         Arc::clone(&state),
@@ -286,11 +288,13 @@ fn session_builder(
         .with_tools(build_tools(cwd, runtime, model))
 }
 
+#[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
     model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
@@ -315,12 +319,18 @@ async fn run_actor(
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
     let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
-    let latest = repo.list().await.ok().and_then(|list| {
-        if let Some(requested) = &initial_path {
-            return list.into_iter().find(|info| info.path == *requested);
-        }
-        list.into_iter().find(|info| info.message_count > 0)
-    });
+    // `fresh` threads (sidebar new-conversation, project-bound creation)
+    // never inherit the previous session; startup and explicit opens do.
+    let latest = if fresh {
+        None
+    } else {
+        repo.list().await.ok().and_then(|list| {
+            if let Some(requested) = &initial_path {
+                return list.into_iter().find(|info| info.path == *requested);
+            }
+            list.into_iter().find(|info| info.message_count > 0)
+        })
+    };
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
