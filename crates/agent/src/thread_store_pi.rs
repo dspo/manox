@@ -195,6 +195,13 @@ impl ThreadStore {
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
         let entity = Thread::open_existing(ThreadId(id.to_string()), cwd, path, cx);
+        // Re-surface the bound project from the sidecar so the chip shows it.
+        if let Some(sum) = self.summaries.iter().find(|s| s.id == id)
+            && !sum.project.is_empty()
+        {
+            let dir = PathBuf::from(&sum.project);
+            entity.update(cx, |t, _| t.restore_project(dir));
+        }
         self.live_threads.insert(id.to_string(), entity.downgrade());
         Some(entity)
     }

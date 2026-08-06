@@ -304,6 +304,7 @@ impl Thread {
             sessions_dir.clone(),
             initial_path,
             fresh,
+            project.clone(),
         );
 
         cx.new(|cx| {
@@ -376,6 +377,13 @@ impl Thread {
                 engine,
             }
         })
+    }
+
+    /// Restore the bound project from a reopened session's sidecar without
+    /// recreating the session (used by the store on load).
+    pub fn restore_project(&mut self, dir: PathBuf) {
+        self.cwd = dir.clone();
+        self.project = Some(dir);
     }
 
     /// Replace the mirrored history with the engine's authoritative transcript
@@ -640,7 +648,7 @@ impl Thread {
         }
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
-        self.engine.new_session(dir);
+        self.engine.new_session(dir.clone(), Some(dir));
         cx.notify();
     }
 

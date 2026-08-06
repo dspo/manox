@@ -45,8 +45,12 @@ enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Create a fresh session in the given directory.
-    NewSession { cwd: PathBuf },
+    /// Create a fresh session in the given directory, optionally bound to a
+    /// project (persisted in the session sidecar).
+    NewSession {
+        cwd: PathBuf,
+        project: Option<PathBuf>,
+    },
     /// Close the session and stop the actor.
     Shutdown,
 }
@@ -81,6 +85,7 @@ pub fn spawn_engine(
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
     fresh: bool,
+    project: Option<PathBuf>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -100,6 +105,7 @@ pub fn spawn_engine(
         sessions_dir,
         initial_path,
         fresh,
+        project,
         cmd_rx,
         notice_tx,
         Arc::clone(&state),
@@ -172,8 +178,8 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Open { path });
     }
 
-    fn new_session(&self, cwd: PathBuf) {
-        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd });
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
+        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -306,6 +312,7 @@ async fn run_actor(
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
     fresh: bool,
+    project: Option<PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
@@ -388,6 +395,9 @@ async fn run_actor(
         }
     };
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+    if let Some(project) = &project {
+        write_project_sidecar(&sessions_dir, session.path(), project).await;
+    }
     refresh_session_list(&repo, &state).await;
 
     // Stream run events back to the gpui drainer. Re-registered after a
@@ -521,13 +531,16 @@ async fn run_actor(
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
-            SessionCmd::NewSession { cwd } => {
+            SessionCmd::NewSession { cwd, project } => {
                 let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
                 match builder.build().await {
                     Ok(s) => {
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+                        if let Some(project) = &project {
+                            write_project_sidecar(&sessions_dir, session.path(), project).await;
+                        }
                         sync_history(&session, &state);
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -594,6 +607,18 @@ async fn rebuild_session(
 fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     let mapped = adapt::harness_messages_to_messages(session.harness_messages());
     *state.history.lock().unwrap() = mapped;
+}
+
+/// Persist the bound project in the session sidecar so the sidebar groups
+/// the session under its project folder across restarts.
+async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.project = Some(project.to_string_lossy().to_string());
+    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+        tracing::warn!(error = %err, "failed to persist session project");
+    }
 }
 
 /// Mirror session usage into the engine state. Cumulative and per-model

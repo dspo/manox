@@ -68,7 +68,7 @@ pub trait ThreadEngine: Send + Sync {
     fn open_session(&self, path: PathBuf);
 
     /// Create a fresh session in the given directory.
-    fn new_session(&self, cwd: PathBuf);
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>);
 
     /// The session file the backend currently drives, if any.
     fn active_session_path(&self) -> Option<PathBuf>;
