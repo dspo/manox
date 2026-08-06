@@ -174,6 +174,48 @@ impl TerminalView {
             return;
         }
 
+        // Paste: cmd-v on mac, ctrl-v elsewhere.
+        #[cfg(target_os = "macos")]
+        let paste = k.modifiers.platform && k.key == "v";
+        #[cfg(not(target_os = "macos"))]
+        let paste = k.modifiers.control && !k.modifiers.shift && !k.modifiers.alt && k.key == "v";
+        if paste {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(text) = item.text()
+                && !text.is_empty()
+            {
+                self.terminal.read_with(cx, |t, _| {
+                    let _ = t.paste(&text);
+                });
+            }
+            return;
+        }
+
+        // Copy: cmd-c on mac, ctrl-c elsewhere. While the terminal is focused
+        // the reclaimed-keys whitelist shadows gpui-component Root's
+        // window-wide Copy binding, so these keys land here. With no
+        // selection: no-op on mac, `^C` elsewhere so interrupt stays reachable.
+        #[cfg(target_os = "macos")]
+        let copy = k.modifiers.platform && k.key == "c";
+        #[cfg(not(target_os = "macos"))]
+        let copy = k.modifiers.control && !k.modifiers.shift && !k.modifiers.alt && k.key == "c";
+        if copy {
+            match self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+                Some(text) if !text.is_empty() => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.terminal.update(cx, |t, _| t.clear_selection());
+                    cx.notify();
+                }
+                _ => {
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = self.terminal.update(cx, |t, _| t.input(b"\x03"));
+                    }
+                }
+            }
+            return;
+        }
+
         // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
         // on ctrl+shift+v.
         if k.modifiers.control && k.modifiers.shift && k.key == "v" {
@@ -189,13 +231,6 @@ impl TerminalView {
             if let Some(motion) = vi_motion_for(k) {
                 self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
             }
-            return;
-        }
-
-        // Tab is owned by the SendTab/SendShiftTab actions (Terminal key
-        // context); skip it here so a fallback dispatch can never double-send
-        // it to the PTY on top of the action.
-        if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
             return;
         }
 
@@ -428,10 +463,6 @@ impl Render for TerminalView {
             .bg(cx.theme().background)
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
-            .on_action(cx.listener(Self::action_send_tab))
-            .on_action(cx.listener(Self::action_send_shift_tab))
-            .on_action(cx.listener(Self::action_paste))
-            .on_action(cx.listener(Self::action_copy_selection))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -545,72 +576,6 @@ impl TerminalView {
             self.terminal.update(cx, |t, _| t.clear_selection());
         }
         cx.notify();
-    }
-
-    fn action_send_tab(
-        &mut self,
-        _: &crate::SendTab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Tab closes the search overlay (if open) and sends the
-        // horizontal-tab byte to the PTY, so the user can search then
-        // immediately continue editing.
-        if self.search.is_some() {
-            self.search = None;
-            cx.notify();
-        }
-        let _ = self.terminal.update(cx, |t, _| t.input(b"\t"));
-    }
-
-    fn action_send_shift_tab(
-        &mut self,
-        _: &crate::SendShiftTab,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.search.is_some() {
-            self.search = None;
-            cx.notify();
-        }
-        let _ = self.terminal.update(cx, |t, _| t.input(b"\x1b[Z"));
-    }
-
-    fn action_paste(&mut self, _: &crate::Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else {
-            return;
-        };
-        let Some(text) = item.text() else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        self.terminal.read_with(cx, |t, _| {
-            let _ = t.paste(&text);
-        });
-    }
-
-    fn action_copy_selection(
-        &mut self,
-        _: &crate::CopySelection,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = self.terminal.read_with(cx, |t, _| t.selection_to_string());
-        match text {
-            Some(text) if !text.is_empty() => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.terminal.update(cx, |t, _| t.clear_selection());
-                cx.notify();
-            }
-            _ => {
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = self.terminal.update(cx, |t, _| t.input(b"\x03"));
-                }
-            }
-        }
     }
 }
 

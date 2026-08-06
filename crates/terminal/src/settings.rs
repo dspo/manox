@@ -83,6 +83,15 @@ pub struct TerminalSettings {
     /// Extra env overrides passed to the child shell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// Keystrokes (gpui syntax) the terminal reclaims from workbench-level
+    /// bindings while it is focused — the whitelist of keys where the terminal
+    /// wins over GUI bindings such as gpui-component Root's focus traversal.
+    /// First phase defaults: tab / shift-tab / the platform copy key.
+    #[serde(
+        default = "default_reclaimed_keys",
+        skip_serializing_if = "is_default_reclaimed_keys"
+    )]
+    pub reclaimed_keys: Vec<String>,
 }
 
 impl Default for TerminalSettings {
@@ -97,6 +106,7 @@ impl Default for TerminalSettings {
             bell: BellMode::System,
             osc52_access: Osc52Access::Allow,
             env: Vec::new(),
+            reclaimed_keys: default_reclaimed_keys(),
         }
     }
 }
@@ -133,6 +143,17 @@ fn is_default_bell(b: &BellMode) -> bool {
 }
 fn is_default_osc52(a: &Osc52Access) -> bool {
     matches!(a, Osc52Access::Allow)
+}
+fn default_reclaimed_keys() -> Vec<String> {
+    let mut keys = vec!["tab".to_string(), "shift-tab".to_string()];
+    #[cfg(target_os = "macos")]
+    keys.push("cmd-c".to_string());
+    #[cfg(not(target_os = "macos"))]
+    keys.push("ctrl-c".to_string());
+    keys
+}
+fn is_default_reclaimed_keys(v: &Vec<String>) -> bool {
+    *v == default_reclaimed_keys()
 }
 
 /// Wrapper for parsing only the `[terminal]` table from the whole file.
@@ -195,6 +216,7 @@ mod tests {
         assert!(matches!(s.osc52_access, Osc52Access::Allow));
         assert!(s.env.is_empty());
         assert!(s.shell.is_none());
+        assert_eq!(s.reclaimed_keys, default_reclaimed_keys());
     }
 
     #[test]
@@ -209,6 +231,7 @@ scrolling_history = 5000
 cursor_shape = "beam"
 bell = "visual"
 osc52_access = "deny"
+reclaimed_keys = ["tab", "cmd-c"]
 "#;
         let root: Root = toml::from_str(raw).unwrap();
         let s = root.terminal;
@@ -218,5 +241,9 @@ osc52_access = "deny"
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Beam));
         assert!(matches!(s.bell, BellMode::Visual));
         assert!(matches!(s.osc52_access, Osc52Access::Deny));
+        assert_eq!(
+            s.reclaimed_keys,
+            vec!["tab".to_string(), "cmd-c".to_string()]
+        );
     }
 }

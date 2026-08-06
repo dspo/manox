@@ -16,36 +16,24 @@ pub mod theme;
 
 pub use terminal_view::TerminalView;
 
-gpui::actions!(terminal_ui, [SendTab, SendShiftTab, Paste, CopySelection]);
+gpui::actions!(terminal_ui, [ReclaimedKey]);
 
-/// Key bindings for the focused terminal view, registered in the `"Terminal"`
-/// key context so they shadow gpui-component Root's window-wide `tab`/copy
-/// bindings (Root's focus traversal would otherwise steal Tab, and its Copy
-/// action would swallow cmd/ctrl-c).
+/// Bindings for the configured reclaimed-keys whitelist (see
+/// `terminal::settings::TerminalSettings::reclaimed_keys`; first phase:
+/// tab / shift-tab / the platform copy key). Registered in the `"Terminal"`
+/// key context so they shadow gpui-component Root's window-wide bindings
+/// (focus traversal would otherwise steal Tab, its Copy action would swallow
+/// cmd/ctrl-c) while the terminal is focused. The `ReclaimedKey` action
+/// deliberately has no listener: with no action listener to stop propagation,
+/// the key falls through to `TerminalView::on_key_down`'s general PTY
+/// translation, so behavior stays fully generic.
 pub fn terminal_key_bindings() -> Vec<gpui::KeyBinding> {
-    let mut bindings = vec![
-        gpui::KeyBinding::new("tab", SendTab, Some("Terminal")),
-        gpui::KeyBinding::new("shift-tab", SendShiftTab, Some("Terminal")),
-    ];
-    #[cfg(target_os = "macos")]
-    {
-        bindings.push(gpui::KeyBinding::new("cmd-v", Paste, Some("Terminal")));
-        bindings.push(gpui::KeyBinding::new(
-            "cmd-c",
-            CopySelection,
-            Some("Terminal"),
-        ));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        bindings.push(gpui::KeyBinding::new("ctrl-v", Paste, Some("Terminal")));
-        bindings.push(gpui::KeyBinding::new(
-            "ctrl-c",
-            CopySelection,
-            Some("Terminal"),
-        ));
-    }
-    bindings
+    terminal::settings::load()
+        .reclaimed_keys
+        .into_iter()
+        .filter(|s| gpui::Keystroke::parse(s).is_ok())
+        .map(|s| gpui::KeyBinding::new(&s, ReclaimedKey, Some("Terminal")))
+        .collect()
 }
 
 /// Register terminal UI actions and workspace tab integration.
