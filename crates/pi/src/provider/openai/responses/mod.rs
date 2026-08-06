@@ -240,6 +240,9 @@ struct Accumulator {
     reasoning_blocks: HashMap<String, usize>,
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
+    /// Rate card captured from the turn model at construction; priced
+    /// onto every usage snapshot in `current()`.
+    cost_rates: Option<crate::types::Cost>,
     started: bool,
     /// A `response.completed` / `response.incomplete` / `response.failed`
     /// event arrived. A stream that ends without one is a protocol
@@ -259,6 +262,7 @@ impl Accumulator {
             reasoning_blocks: HashMap::new(),
             stop_reason: None,
             usage: Box::new(Usage::default()),
+            cost_rates: crate::provider::model_cost_rates(&context.model),
             started: false,
             terminal_seen: false,
         }
@@ -278,7 +282,13 @@ impl Accumulator {
             diagnostics: None,
             raw_stop_reason: None,
             stop_reason: self.stop_reason,
-            usage: self.usage.clone(),
+            usage: {
+                let mut usage = self.usage.clone();
+                if let Some(rates) = &self.cost_rates {
+                    usage.cost = Some(crate::provider::price_usage(rates, &usage));
+                }
+                usage
+            },
             error_message: None,
             timestamp: chrono::Utc::now(),
         }

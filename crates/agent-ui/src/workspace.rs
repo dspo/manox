@@ -4587,15 +4587,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        // Group by DISPLAY name via lookup (not adjacency): models() is
+        // sorted by registration name, so same-display-name providers with
+        // different registrations must still merge into one submenu.
         let mut providers: Vec<(String, Vec<pi::types::Model>)> = Vec::new();
         for m in agent::pi_providers::global().models() {
             let prov = agent::pi_providers::display_provider_name(&m);
-            if let Some(last) = providers.last_mut()
-                && last.0 == prov
-            {
-                last.1.push(m);
-            } else {
-                providers.push((prov, vec![m]));
+            match providers.iter_mut().find(|(name, _)| *name == prov) {
+                Some((_, models)) => models.push(m),
+                None => providers.push((prov, vec![m])),
             }
         }
         let mut menu = menu;

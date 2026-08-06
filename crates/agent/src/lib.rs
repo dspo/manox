@@ -13,7 +13,6 @@ pub mod i18n;
 pub mod language;
 pub mod language_model;
 pub mod message;
-pub mod model_alias;
 pub mod paths;
 pub mod pi_providers;
 pub mod plan;

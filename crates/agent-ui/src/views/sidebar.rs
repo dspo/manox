@@ -825,12 +825,11 @@ fn build_agent_model_cascade(
             config_id,
             display: agent::pi_providers::display_name(&m),
         };
-        if let Some(last) = providers.last_mut()
-            && last.0 == prov
-        {
-            last.1.push(entry);
-        } else {
-            providers.push((prov, vec![entry]));
+        // Lookup-based grouping (not adjacency): the registry is sorted by
+        // registration name, so equal display names must still merge.
+        match providers.iter_mut().find(|(name, _)| *name == prov) {
+            Some((_, entries)) => entries.push(entry),
+            None => providers.push((prov, vec![entry])),
         }
     }
 
