@@ -15,23 +15,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "harness-manox")]
+use agent::ReasoningEffort;
+use agent::i18n;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
-#[cfg(feature = "harness-manox")]
-use harness_manox::provider::registry;
 use agent::settings;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
-#[cfg(feature = "harness-manox")]
-use harness_manox::{PermissionDecision, PlanReviewChoice};
-#[cfg(feature = "harness-manox")]
-use harness_manox::{Thread, ThreadEvent, ThreadId, save_thread};
 #[cfg(not(feature = "harness-manox"))]
 use agent::{Thread, ThreadEvent, ThreadId, save_thread};
-#[cfg(feature = "harness-manox")]
-use agent::ReasoningEffort;
-use agent::i18n;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::DismissEvent;
 use gpui::{
@@ -63,6 +57,12 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
+#[cfg(feature = "harness-manox")]
+use harness_manox::provider::registry;
+#[cfg(feature = "harness-manox")]
+use harness_manox::{PermissionDecision, PlanReviewChoice};
+#[cfg(feature = "harness-manox")]
+use harness_manox::{Thread, ThreadEvent, ThreadId, save_thread};
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
@@ -116,7 +116,6 @@ use terminal_ui::TerminalView;
 pub(crate) type ThreadEntity = harness_manox::Thread;
 #[cfg(not(feature = "harness-manox"))]
 pub(crate) type ThreadEntity = agent::Thread;
-
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
@@ -3704,19 +3703,20 @@ impl Workspace {
     pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
         #[cfg(feature = "harness-pi")]
         {
-            return self
-                .thread
+            self.thread
                 .read(cx)
                 .model()
                 .map(agent::pi_providers::display_name)
-                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string());
+                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
         }
         #[cfg(not(feature = "harness-pi"))]
-        self.thread
-            .read(cx)
-            .model()
-            .map(|m| m.name().to_string())
-            .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+        {
+            self.thread
+                .read(cx)
+                .model()
+                .map(|m| m.name().to_string())
+                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+        }
     }
 
     /// Pin / unpin the active thread. The DB write + sidebar refresh runs
@@ -4571,7 +4571,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let mut providers: Vec<(String, Vec<harness_manox::language_model::AnyLanguageModel>)> = Vec::new();
+        let mut providers: Vec<(String, Vec<harness_manox::language_model::AnyLanguageModel>)> =
+            Vec::new();
         for m in registry::global().models() {
             let prov = m.provider_name();
             if let Some(last) = providers.last_mut()
@@ -4657,152 +4658,153 @@ impl Workspace {
         {
             use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
 
-        let open = self.title_menu_open;
-        let is_pinned = self.thread.read(cx).is_pinned();
-        let is_archived = self.thread.read(cx).archived();
+            let open = self.title_menu_open;
+            let is_pinned = self.thread.read(cx).is_pinned();
+            let is_archived = self.thread.read(cx).archived();
 
-        let trigger = Button::new("titlebar-trigger")
-            .ghost()
-            .small()
-            .icon(IconName::Ellipsis)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if this.title_menu_open {
-                    this.close_title_menu();
-                    cx.notify();
-                    return;
-                }
-                this.title_menu_open = true;
-                let workspace = cx.entity().downgrade();
-                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
-                    let cb = TitleMenuCallbacks {
-                        on_pin: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
-                            })
-                        },
-                        on_archive: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
-                            })
-                        },
-                        on_copy_id: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let id = this.thread.read(cx).id.0.clone();
-                                    this.title_menu_copy("titlebar-copied-id", id, cx);
-                                });
-                            })
-                        },
-                        on_copy_markdown: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let md = this.thread.read(cx).to_markdown();
-                                    this.title_menu_copy("titlebar-copied-markdown", md, cx);
-                                });
-                            })
-                        },
-                        on_copy_cwd: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let cwd = this.thread.read(cx).cwd().display().to_string();
-                                    this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
-                                });
-                            })
-                        },
-                        on_copy_deeplink: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let id = this.thread.read(cx).id.0.clone();
-                                    let link = format!("manox://thread/{id}");
-                                    this.title_menu_copy("titlebar-copied-deeplink", link, cx);
-                                });
-                            })
-                        },
-                        on_schedule: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    this.add_info_message(
-                                        i18n::t("titlebar-not-implemented").to_string(),
-                                        cx,
-                                    );
-                                });
-                            })
-                        },
-                        on_new_window: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    this.add_info_message(
-                                        i18n::t("titlebar-not-implemented").to_string(),
-                                        cx,
-                                    );
-                                });
-                            })
-                        },
-                        is_pinned,
-                        is_archived,
-                    };
-                    build_title_menu(menu, window, cx, cb)
-                });
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut Workspace,
-                     _menu: Entity<PopupMenu>,
-                     _: &DismissEvent,
-                     cx: &mut Context<Workspace>| {
+            let trigger = Button::new("titlebar-trigger")
+                .ghost()
+                .small()
+                .icon(IconName::Ellipsis)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.title_menu_open {
                         this.close_title_menu();
                         cx.notify();
-                    },
-                );
-                this.title_menu = Some(menu);
-                this.title_menu_sub = Some(sub);
-                cx.notify();
-            }));
+                        return;
+                    }
+                    this.title_menu_open = true;
+                    let workspace = cx.entity().downgrade();
+                    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        let cb = TitleMenuCallbacks {
+                            on_pin: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ =
+                                        ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                                })
+                            },
+                            on_archive: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
+                                })
+                            },
+                            on_copy_id: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let id = this.thread.read(cx).id.0.clone();
+                                        this.title_menu_copy("titlebar-copied-id", id, cx);
+                                    });
+                                })
+                            },
+                            on_copy_markdown: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let md = this.thread.read(cx).to_markdown();
+                                        this.title_menu_copy("titlebar-copied-markdown", md, cx);
+                                    });
+                                })
+                            },
+                            on_copy_cwd: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let cwd = this.thread.read(cx).cwd().display().to_string();
+                                        this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
+                                    });
+                                })
+                            },
+                            on_copy_deeplink: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let id = this.thread.read(cx).id.0.clone();
+                                        let link = format!("manox://thread/{id}");
+                                        this.title_menu_copy("titlebar-copied-deeplink", link, cx);
+                                    });
+                                })
+                            },
+                            on_schedule: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.add_info_message(
+                                            i18n::t("titlebar-not-implemented").to_string(),
+                                            cx,
+                                        );
+                                    });
+                                })
+                            },
+                            on_new_window: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.add_info_message(
+                                            i18n::t("titlebar-not-implemented").to_string(),
+                                            cx,
+                                        );
+                                    });
+                                })
+                            },
+                            is_pinned,
+                            is_archived,
+                        };
+                        build_title_menu(menu, window, cx, cb)
+                    });
+                    let sub = cx.subscribe(
+                        &menu,
+                        |this: &mut Workspace,
+                         _menu: Entity<PopupMenu>,
+                         _: &DismissEvent,
+                         cx: &mut Context<Workspace>| {
+                            this.close_title_menu();
+                            cx.notify();
+                        },
+                    );
+                    this.title_menu = Some(menu);
+                    this.title_menu_sub = Some(sub);
+                    cx.notify();
+                }));
 
-        // Color the trigger when open so the affordance matches the dropdown's
-        // presence (a clicked "..." otherwise looks identical to a hovered one).
-        let trigger = if open {
-            trigger.text_color(theme.accent_foreground)
-        } else {
-            trigger
-        };
+            // Color the trigger when open so the affordance matches the dropdown's
+            // presence (a clicked "..." otherwise looks identical to a hovered one).
+            let trigger = if open {
+                trigger.text_color(theme.accent_foreground)
+            } else {
+                trigger
+            };
 
-        if !open {
-            return trigger.into_any_element();
-        }
+            if !open {
+                return trigger.into_any_element();
+            }
 
-        let menu = self
-            .title_menu
-            .clone()
-            .expect("title_menu exists when open");
+            let menu = self
+                .title_menu
+                .clone()
+                .expect("title_menu exists when open");
 
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                // `deferred()` + `with_priority(1)` paints the dropdown after
-                // the whole conversation column tree, escaping overflow_hidden
-                // clipping from ancestor containers. `right_0()` keeps the menu
-                // within the viewport when the window sits near the screen edge.
-                deferred(
-                    gpui::div()
-                        .id("titlebar-dropdown")
-                        .absolute()
-                        .top_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    // `deferred()` + `with_priority(1)` paints the dropdown after
+                    // the whole conversation column tree, escaping overflow_hidden
+                    // clipping from ancestor containers. `right_0()` keeps the menu
+                    // within the viewport when the window sits near the screen edge.
+                    deferred(
+                        gpui::div()
+                            .id("titlebar-dropdown")
+                            .absolute()
+                            .top_full()
+                            .right_0()
+                            .occlude()
+                            .child(menu),
+                    )
+                    .with_priority(1),
                 )
-                .with_priority(1),
-            )
-            .into_any_element()
+                .into_any_element()
         }
         #[cfg(not(feature = "harness-manox"))]
         {

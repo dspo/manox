@@ -19,13 +19,9 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
-#[cfg(feature = "harness-manox")]
-use harness_manox::provider::registry;
-#[cfg(feature = "harness-manox")]
-use harness_manox::{Thread, ThreadEvent};
+use agent::i18n;
 #[cfg(not(feature = "harness-manox"))]
 use agent::{Thread, ThreadEvent};
-use agent::i18n;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -34,6 +30,10 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::provider::registry;
+#[cfg(feature = "harness-manox")]
+use harness_manox::{Thread, ThreadEvent};
 use std::path::PathBuf;
 
 use crate::Workspace;

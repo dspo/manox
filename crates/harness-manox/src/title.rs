@@ -21,8 +21,8 @@ use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, MessageContent, Role, TokenUsage,
 };
-use agent::message::Message;
 use crate::thread::truncate_summary;
+use agent::message::Message;
 
 /// Upper bound on raw streamed chars accumulated before stopping. Titles are
 /// short; this caps consumption so a chatty model cannot run on.

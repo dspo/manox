@@ -321,8 +321,7 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
 /// Poll a background shell by id. Returns the output produced since the last
 /// poll, plus running/exit status. Returns an error string for an unknown id.
 pub fn poll(shell_id: &str) -> Result<PollResult, String> {
-    let state = get_bash_shell(shell_id)
-        .ok_or_else(|| format!("Unknown shell id: {shell_id}"))?;
+    let state = get_bash_shell(shell_id).ok_or_else(|| format!("Unknown shell id: {shell_id}"))?;
 
     let mut s = state.lock().expect("shell state poisoned");
     let available = if s.read_cursor < s.buffer.len() {
@@ -358,6 +357,40 @@ pub fn snapshots(thread_id: &str) -> Vec<String> {
         .collect::<Vec<_>>();
     snapshots.sort();
     snapshots
+}
+
+// ── bash-shell registry (archived from agent::background_task) ─────────────
+
+static BASH_SHELLS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ShellState>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn bash_shells() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ShellState>>>,
+> {
+    BASH_SHELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn register_bash_shell(
+    shell_id: &str,
+    state: std::sync::Arc<std::sync::Mutex<ShellState>>,
+) {
+    bash_shells()
+        .lock()
+        .expect("registry poisoned")
+        .insert(shell_id.to_string(), state);
+}
+
+pub(crate) fn get_bash_shell(
+    shell_id: &str,
+) -> Option<std::sync::Arc<std::sync::Mutex<ShellState>>> {
+    bash_shells()
+        .lock()
+        .expect("registry poisoned")
+        .get(shell_id)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -516,22 +549,4 @@ mod tests {
         assert_eq!(task.status(), agent::background_task::TaskStatus::Stopped);
         assert!(!poll(&id).expect("poll stopped shell").is_running);
     }
-}
-
-// ── bash-shell registry (archived from agent::background_task) ─────────────
-
-static BASH_SHELLS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ShellState>>>>,
-> = std::sync::OnceLock::new();
-
-fn bash_shells() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<ShellState>>>> {
-    BASH_SHELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-pub(crate) fn register_bash_shell(shell_id: &str, state: std::sync::Arc<std::sync::Mutex<ShellState>>) {
-    bash_shells().lock().expect("registry poisoned").insert(shell_id.to_string(), state);
-}
-
-pub(crate) fn get_bash_shell(shell_id: &str) -> Option<std::sync::Arc<std::sync::Mutex<ShellState>>> {
-    bash_shells().lock().expect("registry poisoned").get(shell_id).cloned()
 }

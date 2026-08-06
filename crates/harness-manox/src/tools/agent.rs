@@ -26,11 +26,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_def::{self, AgentDefinition, AgentDefinitionFile};
 use crate::language_model::{AnyLanguageModel, MessageContent, Role, StopReason, TokenUsage};
-use agent::message::Message;
 use crate::provider::registry;
 use crate::thread::{self, Thread, ThreadEvent, ToolCallStatus};
 use crate::tool::permission::PermissionCache;
 use crate::tool::{AgentTool as AgentToolTrait, AnyAgentTool, ToolOutputSink, ToolRegistry};
+use agent::message::Message;
 
 /// Hard cap on sub-agent nesting depth. Main thread is depth 0; a sub-agent
 /// spawned at depth `MAX_DEPTH` cannot itself register the `agent` tool.

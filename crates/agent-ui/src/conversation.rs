@@ -11,15 +11,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(not(feature = "harness-manox"))]
+use agent::ThreadEvent;
 use agent::db::{UiNoteKind, UiNoteRecord};
 use agent::language_model::{MessageContent, Role, StopReason};
 use agent::thread::ApprovalMode;
-#[cfg(feature = "harness-manox")]
-use harness_manox::ThreadEvent;
-#[cfg(not(feature = "harness-manox"))]
-use agent::ThreadEvent;
 use agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
+#[cfg(feature = "harness-manox")]
+use harness_manox::ThreadEvent;
 
 use crate::Workspace;
 use crate::views::message::{MessageItem, build_items};

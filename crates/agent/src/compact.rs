@@ -993,9 +993,6 @@ mod tests {
         }
     }
 
-
-
-
     fn complete_state() -> CompactionState {
         collect_compaction_state(CompactionStateInput {
             cwd: std::path::Path::new("/repo"),
@@ -1043,5 +1040,4 @@ mod tests {
         ];
         assert_eq!(latest_compaction_state(&messages), Some(complete_state()));
     }
-
 }

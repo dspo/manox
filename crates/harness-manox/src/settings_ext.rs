@@ -1,6 +1,7 @@
 //! Side-call model selection for the retired manox harness (needs the
 //! manox model registry; the pi harness resolves its own models).
 
+#[cfg(not(test))]
 use std::sync::OnceLock;
 
 use agent::settings::{SideCallPolicy, SideCallsSettings, load};

@@ -13,12 +13,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(feature = "harness-manox")]
-use harness_manox::{ThreadStore, ThreadStoreEvent};
-#[cfg(not(feature = "harness-manox"))]
-use agent::{ThreadStore, ThreadStoreEvent};
 use agent::i18n;
 use agent::thread::ApprovalMode;
+#[cfg(not(feature = "harness-manox"))]
+use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
@@ -32,6 +30,8 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::{ThreadStore, ThreadStoreEvent};
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so
@@ -803,7 +803,10 @@ fn build_agent_model_cascade(
             .metadata
             .get("agents")
             .and_then(|v| v.as_array())
-            .map(|list| list.iter().any(|a| a.as_str().is_some_and(|a| a == agent_id)))
+            .map(|list| {
+                list.iter()
+                    .any(|a| a.as_str().is_some_and(|a| a == agent_id))
+            })
             .unwrap_or(true);
         if !visible {
             continue;

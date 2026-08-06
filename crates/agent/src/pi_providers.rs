@@ -66,7 +66,11 @@ pub fn reload() -> anyhow::Result<()> {
 /// the first registered model (sorted), else `None`.
 pub fn default_model() -> Option<pi::types::Model> {
     let reference = crate::settings::load().default_model;
-    if let Some(r) = reference.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    if let Some(r) = reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         if let Some(model) = crate::model_alias::resolve_pi_model_ref(r) {
             return Some(model);
         }

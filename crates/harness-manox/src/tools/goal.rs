@@ -5,10 +5,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use agent::db::GoalActor;
-use agent::goal::GoalStatus;
 use crate::thread::Thread;
 use crate::tool::{AgentTool, ToolContext};
+use agent::db::GoalActor;
+use agent::goal::GoalStatus;
 
 pub struct GetGoalTool {
     parent: WeakEntity<Thread>,

@@ -74,7 +74,7 @@ struct EndpointDetail {
     agents: Vec<String>,
     #[serde(default)]
     #[allow(dead_code)] // parsed for schema completeness; bearer_token is
-                       // covered by the registration's auth_header.
+    // covered by the registration's auth_header.
     copilot_auth: Option<String>,
 }
 
@@ -226,8 +226,7 @@ fn wire_api_to_api(wire_api: &str) -> Option<Api> {
 /// endpoint wire api.
 fn model_supports_wire_api(wire_apis: Option<&[String]>, endpoint_wire_api: &str) -> bool {
     match wire_apis {
-        None => true,
-        Some(list) if list.is_empty() => true,
+        None | Some([]) => true,
         Some(list) => list.iter().any(|w| w == endpoint_wire_api),
     }
 }
@@ -281,7 +280,11 @@ fn keychain_secret(service: &str) -> Result<String, String> {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
             "read {service:?} from Keychain: {}",
-            if stderr.is_empty() { "unknown error".to_string() } else { stderr }
+            if stderr.is_empty() {
+                "unknown error".to_string()
+            } else {
+                stderr
+            }
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
@@ -358,16 +361,21 @@ fn known_model_meta(id: &str) -> KnownModelMeta {
             cost: None,
             input: Some(vec![InputModality::Text, InputModality::Image]),
         },
-        "qwen3.7-plus" | "deepseek-v4.1" | "deepseek-v4-pro" | "glm-5.2" | "glm-5.1"
-        | "MiniMax/MiniMax-M2.7" | "kimi-k2.7-code" | "mimo-v2-pro" | "mimo-v2.5-pro" => {
-            KnownModelMeta {
-                context_window: 131_072,
-                max_tokens: 8_192,
-                reasoning: false,
-                cost: None,
-                input: None,
-            }
-        }
+        "qwen3.7-plus"
+        | "deepseek-v4.1"
+        | "deepseek-v4-pro"
+        | "glm-5.2"
+        | "glm-5.1"
+        | "MiniMax/MiniMax-M2.7"
+        | "kimi-k2.7-code"
+        | "mimo-v2-pro"
+        | "mimo-v2.5-pro" => KnownModelMeta {
+            context_window: 131_072,
+            max_tokens: 8_192,
+            reasoning: false,
+            cost: None,
+            input: None,
+        },
         _ => KnownModelMeta {
             context_window: 131_072,
             max_tokens: 8_192,
@@ -418,13 +426,13 @@ fn build_model_config(
 ) -> ProviderModelConfig {
     let (id, suffix_hint) = parse_model_id(raw_id);
     let known = known_model_meta(&id);
-    let yaml_context = cx_model.and_then(|m| m.context.as_ref()).and_then(value_as_u64);
+    let yaml_context = cx_model
+        .and_then(|m| m.context.as_ref())
+        .and_then(value_as_u64);
     let yaml_max_tokens = cx_model
         .and_then(|m| m.max_tokens.as_ref())
         .and_then(value_as_u64);
-    let context_window = yaml_context
-        .or(suffix_hint)
-        .unwrap_or(known.context_window);
+    let context_window = yaml_context.or(suffix_hint).unwrap_or(known.context_window);
     let max_tokens = yaml_max_tokens.unwrap_or(known.max_tokens);
     let desc = cx_model
         .and_then(|m| m.desc.clone())
@@ -462,7 +470,7 @@ fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
     let mut normalized: Vec<String> = Vec::new();
     for agent_id in agent_ids {
         let canonical = canonical_agent_id(agent_id).to_string();
-        if !normalized.iter().any(|existing| *existing == canonical) {
+        if !normalized.contains(&canonical) {
             normalized.push(canonical);
         }
     }
@@ -490,7 +498,7 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
     for agent in &config.agents {
         let Some(raw_id) = &agent.id else { continue };
         let id = canonical_agent_id(raw_id).to_string();
-        if ids.iter().any(|existing| *existing == id) {
+        if !ids.contains(&id) {
             continue;
         }
         if id == "codex" {
@@ -602,23 +610,32 @@ agents:
         let registry = register_fixture();
         let anthropic = registry.resolve_model("DeepSeek-anthropic", "deepseek-v4-flash");
         assert!(anthropic.is_some(), "[1m] suffix must be stripped");
-        assert!(registry
-            .resolve_model("DeepSeek-responses", "deepseek-v4-flash")
-            .is_none(), "flash only lists anthropic in wire_apis");
-        assert!(registry
-            .resolve_model("DeepSeek-responses", "deepseek-v4-pro")
-            .is_some());
+        assert!(
+            registry
+                .resolve_model("DeepSeek-responses", "deepseek-v4-flash")
+                .is_none(),
+            "flash only lists anthropic in wire_apis"
+        );
+        assert!(
+            registry
+                .resolve_model("DeepSeek-responses", "deepseek-v4-pro")
+                .is_some()
+        );
     }
 
     #[test]
     fn duplicate_model_ids_across_providers_coexist() {
         let registry = register_fixture();
-        assert!(registry
-            .resolve_model("DeepSeek-anthropic", "deepseek-v4-pro")
-            .is_some());
-        assert!(registry
-            .resolve_model("Token Plan-anthropic", "deepseek-v4-pro")
-            .is_some());
+        assert!(
+            registry
+                .resolve_model("DeepSeek-anthropic", "deepseek-v4-pro")
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_model("Token Plan-anthropic", "deepseek-v4-pro")
+                .is_some()
+        );
     }
 
     #[test]
@@ -705,8 +722,7 @@ providers:
     #[test]
     fn missing_file_registers_nothing() {
         let registry = pi::ProviderRegistry::new();
-        let count =
-            register_providers(&registry, "/nonexistent/cx.providers.config.yaml").unwrap();
+        let count = register_providers(&registry, "/nonexistent/cx.providers.config.yaml").unwrap();
         assert_eq!(count, 0);
     }
 

@@ -384,8 +384,6 @@ impl std::ops::Add for TokenUsage {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::ReasoningEffort;

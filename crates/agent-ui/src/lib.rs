@@ -7,7 +7,6 @@
 //! `harness-pi` mounts the `pi_backend` adapter over crates/pi. Exactly one
 //! must be enabled.
 
-
 pub mod assets;
 pub mod browser_host;
 pub mod chatgpt_app;

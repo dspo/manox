@@ -14,16 +14,16 @@
 
 use std::collections::HashMap;
 
-use agent::language_model::TokenUsage;
-use harness_manox::team::{Task, TaskListEvent, Team};
-use harness_manox::{Thread, ThreadEvent};
 use agent::i18n;
+use agent::language_model::TokenUsage;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Pixels, Render, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, px,
 };
 use gpui_component::{ActiveTheme as _, ElementExt as _, Theme, h_flex, v_flex};
+use harness_manox::team::{Task, TaskListEvent, Team};
+use harness_manox::{Thread, ThreadEvent};
 
 use crate::Workspace;
 use crate::conversation::ConversationState;

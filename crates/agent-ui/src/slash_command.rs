@@ -27,8 +27,8 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, SharedString, Window};
 
-use harness_manox::command::CommandDefinition;
 use agent::i18n;
+use harness_manox::command::CommandDefinition;
 use harness_manox::skill::SkillDefinition;
 
 use crate::views::completion::CompletionKind;

@@ -634,9 +634,9 @@ impl AgentTool for TeamDisbandTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::db::ThreadRecord;
     use crate::team::{Member, Team};
     use crate::thread::Thread;
+    use agent::db::ThreadRecord;
     use gpui::TestAppContext;
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;

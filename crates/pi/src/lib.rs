@@ -43,12 +43,12 @@ pub use ext_point_background::{BackgroundTaskRegistry, PollResult, TaskError, Ta
 pub use harness::AgentHarness;
 pub use harness::{NavigateTreeOptions, NavigateTreeResult};
 pub use provider::ProviderError;
-pub use provider_registry::{
-    Api, Cost, InputModality, ProviderConfig, ProviderModelConfig, ProviderRegistry,
-};
 pub use provider::anthropic::AnthropicStreamFn;
 pub use provider::openai::completions::CompletionsStreamFn;
 pub use provider::openai::responses::ResponsesStreamFn;
+pub use provider_registry::{
+    Api, Cost, InputModality, ProviderConfig, ProviderModelConfig, ProviderRegistry,
+};
 pub use tool::{
     AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext, ToolState,
 };

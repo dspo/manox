@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
-use pi::types::Model as PiModel;
 use crate::message::Message;
+use pi::types::Model as PiModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
 /// authoritative state the facade mirrors after a settled run.

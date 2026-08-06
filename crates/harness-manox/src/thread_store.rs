@@ -11,10 +11,10 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, WeakEntity};
 
-use agent::db::{ThreadSummary, ThreadsDatabase, default_db_path};
 use crate::language_model::AnyLanguageModel;
 use crate::provider::registry;
 use crate::thread::{Thread, ThreadId};
+use agent::db::{ThreadSummary, ThreadsDatabase, default_db_path};
 
 /// Events emitted by `ThreadStore` to the sidebar.
 #[derive(Debug, Clone)]

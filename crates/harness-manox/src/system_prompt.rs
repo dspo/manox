@@ -32,9 +32,9 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::thread::ApprovalMode;
 use agent::language::Language;
 use agent::prompt::{LanguagePromptData, MainSystemPromptData, PromptTemplate, render};
-use crate::thread::ApprovalMode;
 
 const STATIC_PROMPT_EN: &str = include_str!("system_prompt.en.md");
 const STATIC_PROMPT_ZH_CN: &str = include_str!("system_prompt.zh-CN.md");

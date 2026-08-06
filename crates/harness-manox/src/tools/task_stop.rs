@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use agent::background_task;
 use crate::tool::AgentTool;
 use crate::tools::{bridge_tokio, schema};
+use agent::background_task;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

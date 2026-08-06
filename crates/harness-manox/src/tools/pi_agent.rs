@@ -92,9 +92,7 @@ impl AgentToolTrait for PiAgentTool {
             let provider = format!("{}-{}", model.provider_name(), model.wire_api().display());
             let pi_model = registry
                 .resolve_model(&provider, &model.api_model_id())
-                .ok_or_else(|| {
-                    format!("model {:?} not in the pi provider registry", model.id())
-                })?;
+                .ok_or_else(|| format!("model {:?} not in the pi provider registry", model.id()))?;
             let runtime = ModelRuntime::with_provider_registry(registry);
 
             // The pi read-only tool set the Explore definition is restricted

@@ -24,14 +24,11 @@ use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use tokio_util::sync::CancellationToken;
 
-use agent::db::{GoalActor, ThreadRecord};
-use agent::goal::{GoalRuntime, GoalStatus, ThreadGoal};
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
     ReasoningEffort, Role, StopReason, TokenUsage,
 };
-use agent::message::Message;
 use crate::prefix_stability::{CacheInvalidationDetector, StablePrefix};
 use crate::proposed_plan::{ProposedPlanParser, ProposedPlanSegment};
 use crate::title_state::TitleState;
@@ -39,6 +36,9 @@ use crate::token_meter::TokenMeter;
 use crate::tool::ToolContext as _;
 use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
 use crate::tools;
+use agent::db::{GoalActor, ThreadRecord};
+use agent::goal::{GoalRuntime, GoalStatus, ThreadGoal};
+use agent::message::Message;
 
 // The shared facade types are structurally identical across both harness
 // generations; the retired build re-uses the pi facade's definitions so
@@ -3270,7 +3270,10 @@ impl Thread {
     /// history — crosses `max_input * threshold_pct` (see
     /// `compact::effective_context_tokens`).
     fn auto_compaction_target(&self) -> Option<usize> {
-        if !crate::settings_ext::side_calls().compaction_policy().enabled {
+        if !crate::settings_ext::side_calls()
+            .compaction_policy()
+            .enabled
+        {
             return None;
         }
         let settings = agent::settings::load();
@@ -3318,7 +3321,10 @@ impl Thread {
     /// there is nothing to summarize. Runs the side LLM call in a spawned task
     /// so the call site returns immediately.
     pub fn compact(&mut self, cx: &mut Context<Self>) {
-        if self.running_turn.is_some() || !crate::settings_ext::side_calls().compaction_policy().enabled
+        if self.running_turn.is_some()
+            || !crate::settings_ext::side_calls()
+                .compaction_policy()
+                .enabled
         {
             return;
         }
@@ -3367,7 +3373,10 @@ impl Thread {
         cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<bool> {
-        if !crate::settings_ext::side_calls().compaction_policy().enabled {
+        if !crate::settings_ext::side_calls()
+            .compaction_policy()
+            .enabled
+        {
             return Ok(false);
         }
         let insertion_ix = this.read_with(cx, |this, _| {
@@ -3440,7 +3449,8 @@ impl Thread {
         request.messages = crate::compaction_calls::coalesce_same_role(request.messages);
         let side_call_started = std::time::Instant::now();
         let (summary, usage) =
-            crate::compaction_calls::stream_summary(&compaction_model, request, cancel.clone(), cx).await?;
+            crate::compaction_calls::stream_summary(&compaction_model, request, cancel.clone(), cx)
+                .await?;
         let side_call_elapsed = side_call_started.elapsed();
 
         let capsule = this.read_with(cx, |this, _| {
@@ -6291,12 +6301,12 @@ fn maybe_replace_worktree_prefix(path: &str, worktree_root: Option<&std::path::P
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
-    use agent::db::GoalActor;
-    use agent::goal::GoalStatus;
     use crate::language_model::{
         AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, StopReason, TokenUsage,
     };
+    use agent::db::GoalActor;
+    use agent::goal::GoalStatus;
     use agent::message::Message;
     use serde_json::json;
     use std::sync::Arc;

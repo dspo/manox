@@ -10,10 +10,10 @@
 use std::rc::Rc;
 
 use agent::i18n;
-#[cfg(feature = "harness-manox")]
-use harness_manox::{agent_def, skill};
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
+#[cfg(feature = "harness-manox")]
+use harness_manox::{agent_def, skill};
 
 // TODO(pi-wire): slash commands — backed by the manox command/skill registries.
 #[cfg(feature = "harness-manox")]

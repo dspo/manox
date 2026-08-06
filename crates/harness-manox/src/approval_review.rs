@@ -1,18 +1,18 @@
 //! The manox harness approval-review side calls (streaming model calls).
 //! Shared verdict types live in `agent::approval`.
 
-use agent::approval::{ReviewBatchOutcome, ReviewItem, ReviewOutcome, ReviewVerdict};
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, MessageContent, Role,
 };
+use agent::approval::{ReviewBatchOutcome, ReviewItem, ReviewOutcome, ReviewVerdict};
+use futures::StreamExt as _;
+use gpui::AsyncApp;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::StreamExt as _;
-use gpui::AsyncApp;
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 const REVIEW_TIMEOUT: Duration = Duration::from_secs(8);

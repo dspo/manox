@@ -311,8 +311,8 @@ pub fn team_from_ctx(ctx: &dyn ToolContext) -> Option<Entity<Team>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::db::ThreadRecord;
     use crate::thread::ThreadEvent;
+    use agent::db::ThreadRecord;
     use gpui::TestAppContext;
     use std::sync::{Arc, Mutex};
 

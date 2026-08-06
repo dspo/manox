@@ -23,9 +23,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use agent::background_task::{self, TaskId, TaskKind, TaskStatus};
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::schema;
+use agent::background_task::{self, TaskId, TaskKind, TaskStatus};
 
 use super::websocket;
 

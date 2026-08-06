@@ -341,8 +341,6 @@ pub fn side_call_effort(
     Some(effort)
 }
 
-/// Resolve a side-call model override, falling back to the current main model.
-
 /// Resolve a side-call policy: user-configured fields win; empty/zero fields
 /// fall back to the per-purpose preset.
 pub fn resolve_side_call_policy(user: &SideCallPolicy, preset: SideCallPolicy) -> SideCallPolicy {

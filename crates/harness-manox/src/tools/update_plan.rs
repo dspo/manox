@@ -15,8 +15,8 @@
 use gpui::{App, AppContext as _, Task};
 use tokio_util::sync::CancellationToken;
 
-use agent::plan::{PlanSnapshot, PlanStepStatus};
 use crate::tool::{AgentTool as AgentToolTrait, ToolContext};
+use agent::plan::{PlanSnapshot, PlanStepStatus};
 
 /// The `UpdatePlan` tool. Stateless: the validated snapshot is re-derived from
 /// the call input by the thread (which owns the `PlanUpdated` emission), so the

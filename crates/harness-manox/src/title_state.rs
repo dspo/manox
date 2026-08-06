@@ -10,8 +10,8 @@
 use gpui::{App, AsyncApp, Context};
 
 use crate::language_model::{AnyLanguageModel, LanguageModelRequest, Role};
-use agent::message::Message;
 use crate::thread::{Thread, message_has_text};
+use agent::message::Message;
 
 /// Title state owned by `Thread`. Display precedence is rename > LLM title >
 /// mechanical summary (the summary fallback lives on `Thread`, which owns the

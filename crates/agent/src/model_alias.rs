@@ -18,7 +18,6 @@
 //! Falls back to `None` when nothing matches, in which case the caller inherits
 //! the parent thread's model — the same behavior as an unset `model` field.
 
-
 /// `(alias, segment_probe)` pairs. The probe must be the first hyphen/dot/
 /// underscore-delimited token of a live model id segment (case-insensitive),
 /// so `o3` matches `o3-mini` but not `proto3-server`, and `sonnet` matches

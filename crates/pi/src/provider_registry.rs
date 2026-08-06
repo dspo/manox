@@ -184,10 +184,7 @@ impl ProviderRegistry {
             }
         }
 
-        let display_name = config
-            .name
-            .clone()
-            .unwrap_or_else(|| name.to_string());
+        let display_name = config.name.clone().unwrap_or_else(|| name.to_string());
 
         let mut expanded: HashMap<String, Model> = HashMap::new();
         for model in &config.models {
@@ -211,14 +208,16 @@ impl ProviderRegistry {
             }
             metadata.insert(
                 "input".to_string(),
-                json!(model
-                    .input
-                    .iter()
-                    .map(|m| match m {
-                        InputModality::Text => "text",
-                        InputModality::Image => "image",
-                    })
-                    .collect::<Vec<_>>()),
+                json!(
+                    model
+                        .input
+                        .iter()
+                        .map(|m| match m {
+                            InputModality::Text => "text",
+                            InputModality::Image => "image",
+                        })
+                        .collect::<Vec<_>>()
+                ),
             );
             expanded.insert(
                 model.id.clone(),
@@ -242,7 +241,10 @@ impl ProviderRegistry {
             .lock()
             .unwrap()
             .insert(name.to_string(), config);
-        self.models.lock().unwrap().insert(name.to_string(), expanded);
+        self.models
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), expanded);
         Ok(())
     }
 
@@ -502,7 +504,10 @@ mod tests {
     fn register_expands_models_into_index() {
         let registry = ProviderRegistry::new();
         registry
-            .register_provider("Test-anthropic", provider(vec![model_cfg("m-1"), model_cfg("m-2")]))
+            .register_provider(
+                "Test-anthropic",
+                provider(vec![model_cfg("m-1"), model_cfg("m-2")]),
+            )
             .unwrap();
 
         let models = registry.models();
@@ -584,7 +589,11 @@ mod tests {
             .unwrap();
 
         let anthropic = registry
-            .resolve_stream(&registry.resolve_model("Test-mixed", "claude-model").unwrap())
+            .resolve_stream(
+                &registry
+                    .resolve_model("Test-mixed", "claude-model")
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(anthropic.api(), "anthropic");
 
@@ -597,9 +606,8 @@ mod tests {
     #[test]
     fn resolve_stream_falls_back_for_unknown_provider() {
         let registry = ProviderRegistry::new();
-        let fallback: StreamResolver = Arc::new(|model: &Model| {
-            Err(anyhow::anyhow!("fallback saw {:?}", model.provider))
-        });
+        let fallback: StreamResolver =
+            Arc::new(|model: &Model| Err(anyhow::anyhow!("fallback saw {:?}", model.provider)));
         registry.set_fallback_resolver(fallback);
 
         let model = Model {
@@ -646,12 +654,23 @@ mod tests {
     fn catalog_chains_to_default_and_aliases_legacy_ids() {
         let registry = Arc::new(ProviderRegistry::new());
         registry
-            .register_provider("DeepSeek-anthropic", provider(vec![model_cfg("deepseek-v4-flash")]))
+            .register_provider(
+                "DeepSeek-anthropic",
+                provider(vec![model_cfg("deepseek-v4-flash")]),
+            )
             .unwrap();
         let catalog = registry.catalog();
-        assert!(catalog.resolve("DeepSeek-anthropic", "deepseek-v4-flash").is_some());
+        assert!(
+            catalog
+                .resolve("DeepSeek-anthropic", "deepseek-v4-flash")
+                .is_some()
+        );
         // Legacy manox-style provider ids alias onto registration names.
-        assert!(catalog.resolve("anthropic:DeepSeek", "deepseek-v4-flash").is_some());
+        assert!(
+            catalog
+                .resolve("anthropic:DeepSeek", "deepseek-v4-flash")
+                .is_some()
+        );
         // Built-in provider ids still resolve through the default catalog.
         assert!(catalog.resolve("anthropic", "claude-sonnet-4-6").is_some());
         assert!(catalog.resolve("DeepSeek-anthropic", "nope").is_none());

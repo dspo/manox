@@ -44,7 +44,6 @@ use std::sync::Arc;
 use crate::thread::Thread;
 use crate::tool::{AnyAgentTool, ToolRegistry};
 
-
 // ─── shared helpers ───────────────────────────────────────────────────────
 
 /// Convert a schemars schema to a bare `{type, properties, required}` `Value`.
@@ -423,9 +422,12 @@ pub fn main_registry_with_policy(
     for tool in base_tools_with_policy(cwd.clone(), sandbox, None, lang) {
         reg.register(tool);
     }
-    reg.register(
-        Arc::new(crate::tools::agent::SpawnAgentTool::new(cwd, 0, parent.clone(), lang)) as AnyAgentTool,
-    );
+    reg.register(Arc::new(crate::tools::agent::SpawnAgentTool::new(
+        cwd,
+        0,
+        parent.clone(),
+        lang,
+    )) as AnyAgentTool);
     // pi-engine subagent (Explore): the wiring smoke test that consumes
     // pi-extensions from the manox registry. Read-only; coexists with the
     // native `agent` tool.

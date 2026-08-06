@@ -2,7 +2,7 @@
 //! The pi-side counterpart lives in `agent::model_alias::resolve_pi_model_ref`.
 
 use crate::language_model::AnyLanguageModel;
-use agent::model_alias::{matches_segment, ALIASES};
+use agent::model_alias::{ALIASES, matches_segment};
 
 /// Resolve a model reference (a manox id or a Claude/OpenAI alias) to a live
 /// model. Returns `None` when no model matches, leaving the caller to inherit.

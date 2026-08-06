@@ -35,14 +35,14 @@ use async_channel::{Receiver, Sender};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-#[cfg(feature = "harness-manox")]
-use harness_manox::thread::{Thread, ThreadEvent};
 #[cfg(not(feature = "harness-manox"))]
 use agent::thread::{Thread, ThreadEvent};
 use agent::webview_host::{
     BrowserHost, BrowserInboundWrite as AgentInboundWrite,
     BrowserNotification as AgentNotification, BrowserTabId,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::thread::{Thread, ThreadEvent};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;
@@ -223,20 +223,20 @@ impl WorkspaceBrowserHost {
                         .expect("routes lock poisoned")
                         .get(&tab_id)
                         .and_then(|t| t.thread.upgrade());
-#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let Some(thread) = thread else {
                         continue;
                     };
-#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let id = format!(
                         "inbound-{}",
                         NEXT_INBOUND_ID.fetch_add(1, Ordering::Relaxed)
                     );
-#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let (tx_inbound, rx_inbound) = oneshot::channel::<bool>();
-#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let intent = write.intent.clone();
-#[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                     let payload = write.payload.clone();
                     #[cfg(feature = "harness-manox")]
                     thread.update(cx, |t, cx| {

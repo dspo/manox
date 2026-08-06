@@ -32,13 +32,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use agent::language::Language;
 use crate::language_model::{
     LanguageModelRequestMessage, LanguageModelToolUse, MessageContent, Role,
 };
-use agent::message::Message;
 use crate::thread::ApprovalMode;
 use crate::tool::AgentTool;
+use agent::language::Language;
+use agent::message::Message;
 
 /// Read-only view of the turn's `Thread` state, built once per hook point.
 /// Extensions read this instead of holding a `WeakEntity<Thread>` and

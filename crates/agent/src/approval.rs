@@ -23,11 +23,6 @@ use std::collections::HashMap;
 
 use crate::language_model::TokenUsage;
 
-/// Per-call hard timeout for the reviewer. The reviewer is allowed to take
-/// longer than a streaming chunk — the user is already waiting for the tool
-/// to run, so a couple of seconds for an LLM judgment is acceptable. Past
-/// this bound we fail-closed to `Ask`.
-
 /// Verdict the reviewer returns for a single tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewVerdict {
@@ -57,4 +52,3 @@ pub struct ReviewOutcome {
     pub usage: Option<TokenUsage>,
     pub model_name: String,
 }
-

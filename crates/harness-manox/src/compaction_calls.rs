@@ -1,18 +1,18 @@
 //! The manox harness compaction side calls (request building + streaming
 //! summary). Pure compaction-state helpers live in `agent::compact`.
 
-use agent::compact::*;
-use agent::language_model::{MessageContent, Role, TokenUsage};
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage,
 };
+use agent::compact::*;
+use agent::language_model::{MessageContent, Role, TokenUsage};
+use agent::message::Message;
+use agent::thread::model_facing_content;
 use anyhow::Result;
 use futures::StreamExt as _;
 use gpui::AsyncApp;
 use tokio_util::sync::CancellationToken;
-use agent::message::Message;
-use agent::thread::model_facing_content;
 
 pub fn build_compaction_request(
     messages: &[Message],
@@ -195,7 +195,7 @@ pub async fn stream_summary(
     Ok((text, usage))
 }
 
-    #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use agent::message::Message;
@@ -206,7 +206,7 @@ mod tests {
         m
     }
 
-#[test]
+    #[test]
     fn coalesce_merges_consecutive_same_role() {
         use crate::language_model::MessageContent;
         let msgs = vec![

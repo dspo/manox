@@ -1927,7 +1927,11 @@ fn render_plan_review_card(
         .label(i18n::t("plan-drawer-clear"))
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_clear.update(cx, |w, cx| {
-                w.respond_plan_review(harness_manox::PlanReviewChoice::ImplementClearContext, window, cx);
+                w.respond_plan_review(
+                    harness_manox::PlanReviewChoice::ImplementClearContext,
+                    window,
+                    cx,
+                );
             });
         });
 
