@@ -96,7 +96,10 @@ impl EndpointSpec {
 
 #[derive(Debug, Default, Deserialize)]
 struct CxModel {
+    /// Free-form description from the yaml; intentionally not surfaced in
+    /// pickers (ids are the identifiers), kept for schema completeness.
     #[serde(default)]
+    #[allow(dead_code)]
     desc: Option<String>,
     /// Accepted as a number or a quoted number (yaml configs use both).
     #[serde(default)]
