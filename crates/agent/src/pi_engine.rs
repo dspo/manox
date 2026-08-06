@@ -139,9 +139,10 @@ impl ThreadEngine for PiEngine {
 
     fn steer(&self, text: String) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = self
-            .cmd_tx
-            .send(SessionCmd::Steer { id: id.clone(), text });
+        let _ = self.cmd_tx.send(SessionCmd::Steer {
+            id: id.clone(),
+            text,
+        });
         id
     }
 
@@ -149,9 +150,7 @@ impl ThreadEngine for PiEngine {
         // Optimistic: the actor retracts the steer asynchronously. True means
         // the retraction was queued, not that the message is gone from the
         // transcript — it may already have been drained into the running turn.
-        let _ = self
-            .cmd_tx
-            .send(SessionCmd::CancelSteer(id.to_string()));
+        let _ = self.cmd_tx.send(SessionCmd::CancelSteer(id.to_string()));
         true
     }
 
@@ -322,16 +321,12 @@ async fn run_actor(
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
     let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
-    let latest = repo
-        .list()
-        .await
-        .ok()
-        .and_then(|list| {
-            if let Some(requested) = &initial_path {
-                return list.into_iter().find(|info| info.path == *requested);
-            }
-            list.into_iter().find(|info| info.message_count > 0)
-        });
+    let latest = repo.list().await.ok().and_then(|list| {
+        if let Some(requested) = &initial_path {
+            return list.into_iter().find(|info| info.path == *requested);
+        }
+        list.into_iter().find(|info| info.message_count > 0)
+    });
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
@@ -425,9 +420,9 @@ async fn run_actor(
 
                 let failed = result.is_err();
                 if let Err(err) = &result {
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::Error(anyhow::anyhow!("{err:#}")),
-                    )));
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!("{err:#}"),
+                    ))));
                 }
                 state.running.store(false, Ordering::Relaxed);
                 sync_history(&session, &state);
@@ -477,7 +472,15 @@ async fn run_actor(
                 }
             }
             SessionCmd::Open { path } => {
-                rebuild_session(&mut session, &path, &sessions_dir, &runtime, &pi_model, &notice_tx).await;
+                rebuild_session(
+                    &mut session,
+                    &path,
+                    &sessions_dir,
+                    &runtime,
+                    &pi_model,
+                    &notice_tx,
+                )
+                .await;
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 sync_history(&session, &state);
@@ -609,7 +612,10 @@ fn to_token_usage(u: &pi::types::Usage) -> TokenUsage {
 
 /// Re-read the session directory and mirror the summary list into engine
 /// state (the sidebar's source of truth).
-async fn refresh_session_list(repo: &pi::session::repository::SessionRepository, state: &Arc<EngineState>) {
+async fn refresh_session_list(
+    repo: &pi::session::repository::SessionRepository,
+    state: &Arc<EngineState>,
+) {
     let mut out = Vec::new();
     if let Ok(list) = repo.list().await {
         for info in list {

@@ -94,9 +94,9 @@ pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::{Message, MessageProvenance, MessageUiMetadata};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
-pub use thread::{SideCallMetric, Thread, ThreadEvent, ThreadId, ToolCallStatus};
 #[cfg(not(feature = "harness-pi"))]
 pub use thread::PendingAuthMeta;
+pub use thread::{SideCallMetric, Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 #[cfg(not(feature = "harness-pi"))]
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};

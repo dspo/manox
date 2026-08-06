@@ -35,10 +35,7 @@ pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
 }
 
 /// Read the sidecar; a missing file yields the default (fresh session).
-pub async fn load(
-    session_dir: &Path,
-    session_path: &Path,
-) -> Result<SessionMeta, anyhow::Error> {
+pub async fn load(session_dir: &Path, session_path: &Path) -> Result<SessionMeta, anyhow::Error> {
     let path = meta_path(session_dir, session_path);
     match tokio::fs::read(&path).await {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -94,7 +91,9 @@ mod tests {
     async fn corrupt_sidecar_surfaces_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("abc.jsonl");
-        tokio::fs::write(meta_path(dir.path(), &session), "{not json").await.unwrap();
+        tokio::fs::write(meta_path(dir.path(), &session), "{not json")
+            .await
+            .unwrap();
         assert!(load(dir.path(), &session).await.is_err());
     }
 }
