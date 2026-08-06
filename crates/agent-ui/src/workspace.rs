@@ -2885,6 +2885,10 @@ impl Workspace {
             );
         }
         self.append_and_run_user_turn(turn, weak, cx);
+        // The conversation exists the moment the message is sent: refresh
+        // the sidebar list now (the transcript-side refresh on the user
+        // MessageEnd notice then fills in the summary text).
+        save_thread(self.thread.clone(), true, cx);
     }
 
     /// Push a user turn into the conversation UI and the thread's message

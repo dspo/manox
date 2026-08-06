@@ -349,6 +349,10 @@ impl Thread {
                                 t.running = false;
                                 cx.emit(ThreadEvent::Error(err));
                             }
+                            BackendNotice::SessionListDirty => {
+                                let store = crate::thread_store::global();
+                                store.update(cx, |s, cx| s.refresh(cx));
+                            }
                         })
                         .is_ok();
                     if !ok {

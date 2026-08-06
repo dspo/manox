@@ -278,6 +278,14 @@ fn subscribe_session(
     session.subscribe(Arc::new(move |event, _cancel| {
         let tx = event_tx.clone();
         Box::pin(async move {
+            // The user entry lands in the transcript right after the first
+            // TurnStart; its MessageEnd is the earliest reliable "the
+            // conversation now exists" signal for the sidebar.
+            if let AgentEvent::MessageEnd { message } = &event
+                && matches!(**message, AgentMessage::User { .. })
+            {
+                let _ = tx.send(BackendNotice::SessionListDirty);
+            }
             for te in adapt::agent_event_to_thread_events(&event) {
                 let _ = tx.send(BackendNotice::Event(Box::new(te)));
             }

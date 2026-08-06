@@ -104,6 +104,10 @@ pub enum BackendNotice {
     },
     /// The session could not be built at all.
     Fatal(anyhow::Error),
+    /// A user message landed in the session transcript; the sidebar list
+    /// should refresh so the conversation appears at send time, not at
+    /// turn end.
+    SessionListDirty,
 }
 
 /// An owned engine handle plus its notice channel receiver. Spawning the
