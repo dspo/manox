@@ -149,7 +149,13 @@ impl ThreadStore {
         let dir = self.sessions_dir.clone();
         let this = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            let list = load_summaries(&dir).await;
+            // The session directory scan uses tokio::fs, which needs a tokio
+            // runtime context; the gpui executor is not one, so hop onto the
+            // agent runtime and await the result back here.
+            let list = crate::runtime::handle()
+                .spawn(async move { load_summaries(&dir).await })
+                .await
+                .unwrap_or_default();
             this.update(cx, |s, cx| {
                 s.session_paths = list.iter().map(|(sum, path)| (sum.id.clone(), path.clone())).collect();
                 s.summaries = list.into_iter().map(|(sum, _)| sum).collect();
@@ -243,10 +249,16 @@ impl ThreadStore {
         };
         let dir = self.sessions_dir.clone();
         cx.spawn(async move |_, _| {
-            if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
-                update(&mut meta);
-                let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
-            }
+            let handle = crate::runtime::handle();
+            handle
+                .spawn(async move {
+                    if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
+                        update(&mut meta);
+                        let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
+                    }
+                })
+                .await
+                .ok();
         })
         .detach();
         cx.emit(ThreadStoreEvent::SummariesUpdated);
@@ -266,10 +278,16 @@ impl ThreadStore {
         };
         let dir = self.sessions_dir.clone();
         cx.spawn(async move |_, _| {
-            if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
-                update(&mut meta);
-                let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
-            }
+            let handle = crate::runtime::handle();
+            handle
+                .spawn(async move {
+                    if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
+                        update(&mut meta);
+                        let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
+                    }
+                })
+                .await
+                .ok();
         })
         .detach();
     }
