@@ -174,21 +174,6 @@ impl ThreadStore {
             this.update(cx, |s, cx| {
                 s.session_paths = list.iter().map(|(sum, path)| (sum.id.clone(), path.clone())).collect();
                 s.summaries = list.into_iter().map(|(sum, _)| sum).collect();
-                // Backfill known projects from session cwds so folders show
-                // up even without an explicit registration (first run and
-                // pre-registration sessions alike).
-                let candidates: Vec<String> = s
-                    .summaries
-                    .iter()
-                    .map(|sum| sum.project.clone())
-                    .filter(|p| !p.is_empty())
-                    .collect();
-                let new_projects = merge_new_projects(&mut s.known_projects, &candidates);
-                for path in new_projects {
-                    if let Err(e) = s.db.register_project(&path) {
-                        tracing::warn!(error = %e, "failed to persist project registration");
-                    }
-                }
                 cx.emit(ThreadStoreEvent::SummariesUpdated);
                 cx.notify();
             })
@@ -374,19 +359,6 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
     *TEST_OVERRIDE.lock().unwrap() = Some(entity);
 }
 
-/// Append candidates not already known, preserving first-seen order;
-/// returns the newly added paths (for persistence).
-fn merge_new_projects(known: &mut Vec<String>, candidates: &[String]) -> Vec<String> {
-    let mut added = Vec::new();
-    for path in candidates {
-        if !path.is_empty() && !known.contains(path) {
-            known.push(path.clone());
-            added.push(path.clone());
-        }
-    }
-    added
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
@@ -460,24 +432,5 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    #[test]
-    fn merge_new_projects_keeps_order_and_skips_duplicates() {
-        let mut known = vec!["/p/a".to_string()];
-        let added = merge_new_projects(
-            &mut known,
-            &[
-                "/p/b".into(),
-                "/p/a".into(),
-                String::new(),
-                "/p/c".into(),
-                "/p/b".into(),
-            ],
-        );
-        assert_eq!(added, vec!["/p/b".to_string(), "/p/c".to_string()]);
-        assert_eq!(
-            known,
-            vec!["/p/a".to_string(), "/p/b".to_string(), "/p/c".to_string()]
-        );
-    }
 }
 

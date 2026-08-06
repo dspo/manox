@@ -314,16 +314,12 @@ async fn run_actor(
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
-    let mut pi_model = model.or_else(crate::pi_providers::default_model);
-    // Session assembly preflights the model against the registry, so an
-    // unresolvable model cannot build. Right after launch the background
-    // registration (parallelized per provider) may still be in flight;
-    // wait for it only when no model is resolvable yet.
-    if pi_model.is_none() {
-        crate::pi_providers::wait_ready().await;
-        pi_model = crate::pi_providers::default_model();
-    }
-    let Some(pi_model) = pi_model else {
+    // Session assembly preflights the model against the registry, so resolve
+    // only after the one-shot background registration (parallelized per
+    // provider, sub-second) has landed — no race between construction-time
+    // capture and build-time preflight.
+    crate::pi_providers::wait_ready().await;
+    let Some(pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
