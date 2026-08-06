@@ -17,6 +17,7 @@ use agent::i18n;
 use agent::thread::ApprovalMode;
 #[cfg(not(feature = "harness-manox"))]
 use agent::{ThreadStore, ThreadStoreEvent};
+#[cfg_attr(not(feature = "harness-manox"), allow(unused_imports))]
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
@@ -231,13 +232,22 @@ impl Sidebar {
         self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
+        // Under the pi build the external-agent entries are compiled out,
+        // leaving the closure's window/cx unused.
+        #[cfg_attr(not(feature = "harness-manox"), allow(unused_variables))]
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
+            // The manox build keeps its brand label; the pi build uses the
+            // neutral "new conversation" label.
+            #[cfg(feature = "harness-manox")]
+            let new_session_label = i18n::t("sidebar-new-session-manox");
+            #[cfg(not(feature = "harness-manox"))]
+            let new_session_label = i18n::t("sidebar-new-session-pi");
             let sidebar_manox = sidebar.clone();
             menu = menu.item(
-                PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
+                PopupMenuItem::new(new_session_label)
                     .icon(
                         Icon::default()
                             .path("icons/manox.svg")
@@ -257,6 +267,9 @@ impl Sidebar {
                         });
                     }),
             );
+            // External-CLI session entries belong to the retired manox
+            // harness; the pi build offers only the new-conversation item.
+            #[cfg(feature = "harness-manox")]
             for kind in [
                 crate::external_session::SessionKind::ClaudeCode,
                 crate::external_session::SessionKind::Codex,
@@ -771,6 +784,7 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
     row.into_any_element()
 }
 
+#[cfg(feature = "harness-manox")]
 /// Build the provider→model cascade inside an external-agent submenu. Models
 /// are drawn from the shared pi provider registry, filtered by the agent's id
 /// (registration metadata `agents`, empty = visible to all); they are grouped

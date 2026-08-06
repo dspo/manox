@@ -742,10 +742,7 @@ impl Workspace {
             git_status_gen: 0,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
-        #[cfg(feature = "harness-manox")]
-        {
-            ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
-        }
+        ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         // Focus the composer so typing works immediately on the hero screen.
@@ -1208,7 +1205,6 @@ impl Workspace {
     /// The parked entry is left in `background_threads` (reclaimed on a later
     /// `open_thread`); self-removal from within the callback would drop the very
     /// subscription running it.
-    #[cfg(feature = "harness-manox")]
     fn subscribe_background_thread(
         &self,
         thread: Entity<ThreadEntity>,
@@ -1232,6 +1228,9 @@ impl Workspace {
                     stranded_steer_ids,
                     ..
                 } => {
+                    #[cfg(not(feature = "harness-manox"))]
+                    let _ = (cancelled, stranded_steer_ids);
+                    #[cfg(feature = "harness-manox")]
                     this.finish_background_follow_ups(
                         &id,
                         &parked_thread,
@@ -1266,7 +1265,6 @@ impl Workspace {
         )
     }
 
-    #[cfg(feature = "harness-manox")]
     fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let sidebar = self.sidebar.clone();
         cx.subscribe_in(
@@ -1278,6 +1276,10 @@ impl Workspace {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
+                // The external-CLI session subsystem stays with the retired
+                // manox harness; the pi build hides its entries and ignores
+                // the events.
+                #[cfg(feature = "harness-manox")]
                 SidebarEvent::SpawnExternalSession(kind, provider, model, project) => {
                     this.spawn_external_session(
                         *kind,
@@ -1288,9 +1290,17 @@ impl Workspace {
                         cx,
                     );
                 }
+                // The external-CLI session subsystem stays with the retired
+                // manox harness; the pi build hides its entries and ignores
+                // the events.
+                #[cfg(feature = "harness-manox")]
                 SidebarEvent::OpenExternalSession(id) => {
                     this.attach_external_session(id, window, cx);
                 }
+                // The external-CLI session subsystem stays with the retired
+                // manox harness; the pi build hides its entries and ignores
+                // the events.
+                #[cfg(feature = "harness-manox")]
                 SidebarEvent::ArchiveExternalSession(id) => {
                     this.close_external_session(id, cx);
                 }
@@ -1311,8 +1321,32 @@ impl Workspace {
                         this.start_new_thread(None, window, cx);
                     }
                 }
+                #[cfg(not(feature = "harness-manox"))]
+                _ => {}
             },
         )
+    }
+
+    /// New thread for the pi harness: no provider reload (registration is
+    /// one-shot; actors await readiness themselves). A project binds at
+    /// construction time — a single session creation, no orphaned session
+    /// file.
+    #[cfg(feature = "harness-pi")]
+    fn start_new_thread(
+        &mut self,
+        project: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = ThreadId(uuid::Uuid::new_v4().to_string());
+        let new = match &project {
+            Some(dir) => Thread::new_in_project(id, dir.clone(), cx),
+            None => Thread::new(id, self.cwd.clone(), cx),
+        };
+        if let Some(dir) = &project {
+            Self::register_project_in_store(dir, cx);
+        }
+        self.attach_thread(new, window, cx);
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -1917,7 +1951,6 @@ impl Workspace {
     }
 
     /// Close the project-chip dropdown.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_project_chip_menu(&mut self) {
         self.project_chip_open = false;
         self.project_chip_menu = None;
@@ -2128,7 +2161,6 @@ impl Workspace {
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
-    #[cfg(feature = "harness-manox")]
     fn attach_thread(
         &mut self,
         new_thread: Entity<ThreadEntity>,
@@ -2139,9 +2171,12 @@ impl Workspace {
         let old_thread = self.thread.clone();
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
-        self.close_subagent_tabs();
-        if old_id != new_id {
-            self.subagent_sessions.remove(&old_id);
+        #[cfg(feature = "harness-manox")]
+        {
+            self.close_subagent_tabs();
+            if old_id != new_id {
+                self.subagent_sessions.remove(&old_id);
+            }
         }
 
         // Save the outgoing thread's unsent composer text before switching, so
@@ -2198,6 +2233,7 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        #[cfg(feature = "harness-manox")]
         let subagent_snapshots = snapshots_from_messages(&messages);
         let usage = self.thread.read(cx).request_token_usage().clone();
         let notes = self.thread.read(cx).ui_notes().to_vec();
@@ -2259,6 +2295,7 @@ impl Workspace {
             self.sync_list_count(cx);
             self.list_state.set_follow_mode(FollowMode::Tail);
         }
+        #[cfg(feature = "harness-manox")]
         self.restore_queued_follow_ups(&new_id, &messages, running, cx);
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
@@ -2294,6 +2331,7 @@ impl Workspace {
             }
             cx.notify();
         });
+        #[cfg(feature = "harness-manox")]
         if self.subagent_sessions.contains_key(&new_id) {
             self.sync_subagents_to_rail(cx);
         } else {
@@ -2302,6 +2340,7 @@ impl Workspace {
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
+        #[cfg(feature = "harness-manox")]
         self.resurface_pending_auths(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
@@ -2311,6 +2350,7 @@ impl Workspace {
         store.update(cx, |s, cx| s.set_unread(&id, false, cx));
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
+        #[cfg(feature = "harness-manox")]
         self.spawn_git_status_refresh(cx);
         // Returning to a thread leaves the external-session view: without this
         // the render still takes the ExternalSession branch and the swapped-in
@@ -2557,7 +2597,6 @@ impl Workspace {
         }
     }
 
-    #[cfg(feature = "harness-manox")]
     fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         // If the thread is already running in the background, reclaim it
         // instead of loading a stale snapshot from the db.
@@ -4855,7 +4894,7 @@ impl Workspace {
         #[cfg(feature = "harness-manox")]
         let project_chip = self.render_project_chip(theme, cx);
         #[cfg(feature = "harness-pi")]
-        let project_chip: AnyElement = gpui::div().into_any_element();
+        let project_chip = self.render_project_chip_pi(theme, cx);
         #[cfg(feature = "harness-manox")]
         let goal_chip = self.render_goal_chip(theme, cx);
         #[cfg(feature = "harness-pi")]
@@ -5891,6 +5930,259 @@ impl Workspace {
         )
     }
 
+    /// The pi-harness project chip: bound-project indicator + dropdown with
+    /// recent projects (store `known_projects` plus session-cwd backfill),
+    /// blank-project creation and folder selection. Selection is only
+    /// allowed on empty threads (same guard as the manox chip). Data source
+    /// is the pi thread store only.
+    #[cfg(feature = "harness-pi")]
+    fn render_project_chip_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let project = self.thread.read(cx).project().cloned();
+        let open = self.project_chip_open;
+        let workspace = cx.entity().downgrade();
+
+        let (icon, label): (Option<IconName>, SharedString) = match &project {
+            Some(dir) => {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string();
+                (Some(IconName::FolderOpen), name.into())
+            }
+            None => (
+                Some(IconName::FolderOpen),
+                i18n::t("workspace-project-choose"),
+            ),
+        };
+
+        let trigger = h_flex()
+            .id("project-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .cursor_pointer()
+            .when_some(icon.clone(), |el, ic| {
+                el.child(Icon::new(ic).xsmall().text_color(theme.muted_foreground))
+            })
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.project_chip_open {
+                    this.close_project_chip_menu();
+                    cx.notify();
+                    return;
+                }
+                // Only allow project selection on empty threads.
+                let can_set = this.thread.read(cx).messages().is_empty();
+                if !can_set {
+                    return;
+                }
+                this.project_chip_open = true;
+
+                let ws = workspace.clone();
+                let theme = cx.theme().clone();
+                let ws_blank = ws.clone();
+                let ws_folder = ws.clone();
+
+                let menu = PopupMenu::build(window, cx, move |menu, _window, cx| {
+                    let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
+                    menu = menu.label(i18n::t("sidebar-section-projects"));
+
+                    // Recent projects: registered folders first (newest
+                    // first), then session cwds not yet registered.
+                    let store = agent::thread_store_global();
+                    let mut recent_projects: Vec<String> = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    {
+                        let store_ref = store.read(cx);
+                        for path in store_ref.known_projects().iter().rev() {
+                            if seen.insert(path.clone()) {
+                                recent_projects.push(path.clone());
+                            }
+                            if recent_projects.len() >= 20 {
+                                break;
+                            }
+                        }
+                        if recent_projects.len() < 20 {
+                            for sum in store_ref.summaries() {
+                                if sum.project.is_empty() || !seen.insert(sum.project.clone()) {
+                                    continue;
+                                }
+                                recent_projects.push(sum.project.clone());
+                                if recent_projects.len() >= 20 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    let ws_recent = ws.clone();
+                    let theme_recent = theme.clone();
+                    for path_str in &recent_projects {
+                        let path = std::path::PathBuf::from(path_str);
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path_str)
+                            .to_string();
+                        let display_path = path_str.clone();
+                        let click_path = path_str.clone();
+                        let ws_sel = ws_recent.clone();
+                        let themed = theme_recent.clone();
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_window, _cx| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::FolderOpen)
+                                            .xsmall()
+                                            .text_color(themed.muted_foreground),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_color(themed.foreground)
+                                            .child(name.clone()),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(themed.muted_foreground)
+                                            .child(display_path.clone()),
+                                    )
+                            })
+                            .on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    let p = std::path::PathBuf::from(&click_path);
+                                    let _ = ws_sel.update(cx, |this, cx| {
+                                        this.close_project_chip_menu();
+                                        this.thread
+                                            .update(cx, |t, cx| t.set_project(p.clone(), cx));
+                                        Self::register_project_in_store(&p, cx);
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        );
+                    }
+
+                    menu = menu.separator();
+                    menu = menu.label(i18n::t("workspace-project-new"));
+
+                    let themed_blank = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Plus)
+                                        .xsmall()
+                                        .text_color(themed_blank.muted_foreground),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_blank.foreground)
+                                        .child(i18n::t("workspace-project-blank")),
+                                )
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            let _ = ws_blank.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.open_blank_project(cx);
+                            });
+                        }),
+                    );
+
+                    let themed_folder = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .xsmall()
+                                        .text_color(themed_folder.muted_foreground),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_folder.foreground)
+                                        .child(i18n::t("workspace-project-select-folder")),
+                                )
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            let _ = ws_folder.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.choose_project_inner(cx);
+                            });
+                        }),
+                    );
+                    menu
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_project_chip_menu();
+                        cx.notify();
+                    },
+                );
+                this.project_chip_menu = Some(menu);
+                this.project_chip_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .project_chip_menu
+            .clone()
+            .expect("project_chip_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                deferred(
+                    gpui::div()
+                        .id("project-chip-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
     /// Project chip: a clickable control showing the current project basename
     /// (or "Choose project" when unbound). Opens a dropdown listing recent
     /// projects followed by "Create blank project" / "Select folder" actions.
@@ -5975,8 +6267,8 @@ impl Workspace {
                     let ws_recent = ws.clone();
                     let theme_recent = theme.clone();
 
-                    // Fetch synchronously from the store's cached summaries.
-                    let store = agent::thread_store_global();
+                    // Fetch synchronously from the manox store's cached
+                    // summaries (the pi store is not this chip's source).
                     let summaries = store.read(cx).summaries();
                     let mut seen = std::collections::HashSet::new();
                     let mut recent_projects: Vec<String> = Vec::new();
@@ -6145,8 +6437,17 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Register a bound project on the active variant's thread store so the
+    /// sidebar keeps its folder (persisted; survives restarts and archives).
+    fn register_project_in_store(path: &std::path::Path, cx: &mut Context<Self>) {
+        let path = path.to_string_lossy().to_string();
+        #[cfg(feature = "harness-manox")]
+        harness_manox::thread_store_global().update(cx, |s, cx| s.register_project(path, cx));
+        #[cfg(not(feature = "harness-manox"))]
+        agent::thread_store_global().update(cx, |s, cx| s.register_project(path, cx));
+    }
+
     /// Open the blank-project flow: pick a parent directory, then prompt for name.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn open_blank_project(&mut self, cx: &mut Context<Self>) {
         if self.project_picker_pending {
             return;
@@ -6176,7 +6477,6 @@ impl Workspace {
     }
 
     /// Lazily create the blank-project name input (needs a Window).
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn ensure_blank_project_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.blank_project_parent.is_none() {
             return;
@@ -6188,7 +6488,6 @@ impl Workspace {
     }
 
     /// Submit the blank project: create the directory and bind it.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn confirm_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(parent) = self.blank_project_parent.take() else {
             return;
@@ -6208,13 +6507,14 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.thread.update(cx, |t, cx| t.set_project(new_path, cx));
+        self.thread
+            .update(cx, |t, cx| t.set_project(new_path.clone(), cx));
+        Self::register_project_in_store(&new_path, cx);
         self.blank_project_name_input = None;
         cx.notify();
     }
 
     /// Cancel the blank project overlay.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn cancel_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.blank_project_parent = None;
         self.blank_project_name_input = None;
@@ -6222,7 +6522,6 @@ impl Workspace {
     }
 
     /// Shared inner logic for "Select folder" (directory picker → bind project).
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn choose_project_inner(&mut self, cx: &mut Context<Self>) {
         if self.project_picker_pending {
             return;
@@ -6241,7 +6540,9 @@ impl Workspace {
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
+                    this.thread
+                        .update(cx, |t, cx| t.set_project(path.clone(), cx));
+                    Self::register_project_in_store(&path, cx);
                 }
                 cx.notify();
             })
@@ -6251,7 +6552,6 @@ impl Workspace {
     }
 
     /// Overlay prompting for the blank-project folder name.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_blank_project_overlay(
         &self,
         _window: &mut Window,

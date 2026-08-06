@@ -267,18 +267,26 @@ impl Thread {
     /// newest session) and the gpui drainer that turns backend notices into
     /// `ThreadEvent`s.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, cx)
+        Self::open(id, cwd, None, None, cx)
+    }
+
+    /// Construct a thread bound to a project directory: the session is
+    /// created with the project as its cwd in one step (no recreate), so
+    /// the sidebar never sees an orphaned pre-project session file.
+    pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::open(id, project.clone(), None, Some(project), cx)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
     pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, Some(path), cx)
+        Self::open(id, cwd, Some(path), None, cx)
     }
 
     fn open(
         id: ThreadId,
         cwd: PathBuf,
         initial_path: Option<PathBuf>,
+        project: Option<PathBuf>,
         cx: &mut App,
     ) -> Entity<Self> {
         let model = crate::pi_providers::default_model();
@@ -343,7 +351,7 @@ impl Thread {
             Self {
                 id,
                 cwd,
-                project: None,
+                project,
                 model,
                 messages: Vec::new(),
                 reasoning_effort: ReasoningEffort::default(),
