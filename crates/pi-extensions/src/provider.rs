@@ -505,12 +505,11 @@ fn build_model_config(
         .and_then(value_as_u64);
     let context_window = yaml_context.or(suffix_hint).unwrap_or(known.context_window);
     let max_tokens = yaml_max_tokens.unwrap_or(known.max_tokens);
-    let desc = cx_model
-        .and_then(|m| m.desc.clone())
-        .filter(|desc| !desc.trim().is_empty());
+    // Display name is the wire id (users expect ids in the picker; the
+    // yaml `desc` is free-form marketing copy, not an identifier).
     let model_agents = cx_model.map(|m| m.agents.clone()).unwrap_or_default();
     ProviderModelConfig {
-        name: desc.unwrap_or_else(|| id.clone()),
+        name: id.clone(),
         id,
         reasoning: known.reasoning,
         input: known

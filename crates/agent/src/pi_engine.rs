@@ -310,15 +310,16 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
+    // Session assembly preflights the model against the registry, so resolve
+    // only after the one-shot background registration (parallelized per
+    // provider, sub-second) has landed. The snapshot must be fetched AFTER
+    // the wait: `global()` clones the current Arc, and the init thread
+    // swaps it once registration completes — an early handle stays empty.
+    crate::pi_providers::wait_ready().await;
     let registry = crate::pi_providers::global();
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
-    // Session assembly preflights the model against the registry, so resolve
-    // only after the one-shot background registration (parallelized per
-    // provider, sub-second) has landed — no race between construction-time
-    // capture and build-time preflight.
-    crate::pi_providers::wait_ready().await;
     let Some(pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
