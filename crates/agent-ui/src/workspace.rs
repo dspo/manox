@@ -627,7 +627,15 @@ impl Render for DraggedSidebarDivider {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // A GUI launch (Finder / Dock / `open`) leaves the process cwd at
+        // `/` — a meaningless working directory for a workbench. Fall back
+        // to the home dir; binding a project via the chip still wins.
+        if cwd.as_os_str() == "/" {
+            if let Some(home) = agent::paths::home_dir() {
+                cwd = home;
+            }
+        }
         let auto_compact = settings::load().auto_compact;
         let thread = {
             let id = ThreadId(uuid::Uuid::new_v4().to_string());
