@@ -6,10 +6,12 @@
 pub mod agent_session;
 pub mod model_runtime;
 pub mod resource_loader;
+pub mod usage;
 
 pub use agent_session::{AgentSession, AgentSessionBuilder};
 pub use model_runtime::ModelRuntime;
 pub use resource_loader::ResourceLoader;
+pub use usage::{ModelUsageBreakdown, SessionStats, UsageTotals};
 
 /// Convenience factory: a builder wired to the current directory with the
 /// default tool set and a model runtime that reads credentials from the

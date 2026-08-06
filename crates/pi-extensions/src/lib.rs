@@ -7,6 +7,7 @@
 
 pub mod agents;
 pub mod bash;
+pub mod model_ref;
 pub mod provider;
 pub mod session_meta;
 

@@ -312,7 +312,9 @@ async fn run_actor(
         return;
     };
     let registry = crate::pi_providers::global();
-    let runtime = ModelRuntime::with_provider_registry(registry.clone());
+    let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
+        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
+    ));
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
@@ -423,7 +425,7 @@ async fn run_actor(
                 }
                 state.running.store(false, Ordering::Relaxed);
                 sync_history(&session, &state);
-                sync_usage(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
                 let (steered, stranded) = if abort_requested || failed {
                     (Vec::new(), std::mem::take(&mut run_steers))
@@ -548,40 +550,53 @@ fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     *state.history.lock().unwrap() = mapped;
 }
 
-/// Accumulate the latest turn's usage into the engine state.
-fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = *state.cumulative.lock().unwrap();
-    let mut per_model = state.per_model.lock().unwrap().clone();
-    let mut request = state.request_usage.lock().unwrap().clone();
+/// Mirror session usage into the engine state. Cumulative and per-model
+/// totals come from the kernel's stats over the full active branch —
+/// compacted history, tool results, and summarization usage included (TS
+/// `getSessionStats` semantics: totals reflect what was actually billed).
+/// Only the per-request attribution for the env card stays a thin
+/// presentation walk here.
+async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
+    let stats = match session.session_stats().await {
+        Ok(stats) => stats,
+        Err(err) => {
+            tracing::warn!("pi session stats failed: {err:#}");
+            return;
+        }
+    };
+    let cumulative = token_usage_from_totals(&stats.tokens);
+    let mut per_model = HashMap::new();
+    for entry in &stats.per_model {
+        per_model.insert(entry.key.clone(), token_usage_from_totals(&entry.totals));
+    }
+    let mut request: HashMap<String, TokenUsage> = HashMap::new();
+    let key = last_user_id(session);
     for m in session.harness_messages() {
-        let AgentMessage::Assistant { usage, model, .. } = m else {
+        let AgentMessage::Assistant { usage, .. } = m else {
             continue;
         };
         let u = to_token_usage(usage);
         if u.total_tokens() == 0 {
             continue;
         }
-        cumulative = cumulative + u;
-        per_model
-            .entry(model.clone())
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
-        if let Some(last_user) = session
-            .harness_messages()
-            .iter()
-            .rev()
-            .find(|m| matches!(m, AgentMessage::User { .. }))
-        {
-            let _ = last_user;
-        }
         request
-            .entry(last_user_id(session))
+            .entry(key.clone())
             .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
     }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
     *state.request_usage.lock().unwrap() = request;
+}
+
+/// Kernel usage totals → the facade's token usage shape.
+fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsage {
+    TokenUsage {
+        input_tokens: t.input,
+        output_tokens: t.output,
+        cache_creation_input_tokens: t.cache_write,
+        cache_read_input_tokens: t.cache_read,
+    }
 }
 
 /// The message id of the most recent user message, as the facade's history

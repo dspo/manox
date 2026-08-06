@@ -36,6 +36,43 @@ pub trait RequestObserver: Send + Sync {
     fn after_response(&self, attempt: u32, status: u16, headers: &reqwest::header::HeaderMap);
 }
 
+use crate::types::{Cost, Model, Usage};
+
+/// The model's rate card from registration metadata (`cost`, USD per 1M
+/// tokens per class), when present and non-zero. The kernel never guesses
+/// rates: a model registered without pricing (or with an all-zero card)
+/// carries no cost.
+pub fn model_cost_rates(model: &Model) -> Option<Cost> {
+    let card = model.metadata.get("cost")?;
+    let rate = |key: &str| card.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let rates = Cost {
+        input: rate("input"),
+        output: rate("output"),
+        cache_read: rate("cacheRead"),
+        cache_write: rate("cacheWrite"),
+        total: 0.0,
+    };
+    (rates.input > 0.0 || rates.output > 0.0 || rates.cache_read > 0.0 || rates.cache_write > 0.0)
+        .then_some(rates)
+}
+
+/// Price a wire usage against a rate card (USD per 1M tokens per class) —
+/// the TS pi-ai per-message pricing step. `Cost.total` sums all classes.
+pub fn price_usage(rates: &Cost, usage: &Usage) -> Cost {
+    let per_million = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
+    let input = per_million(usage.input_tokens, rates.input);
+    let output = per_million(usage.output_tokens, rates.output);
+    let cache_read = per_million(usage.cache_read_input_tokens, rates.cache_read);
+    let cache_write = per_million(usage.cache_creation_input_tokens, rates.cache_write);
+    Cost {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total: input + output + cache_read + cache_write,
+    }
+}
+
 use thiserror::Error;
 
 /// Errors a provider can surface while streaming.
@@ -70,4 +107,63 @@ pub enum ProviderError {
     /// stream carries an `{"error": ...}` payload instead of protocol events.
     #[error("provider error mid-stream: {0}")]
     MidStream(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ThinkingKind;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn model_with_cost(card: Option<serde_json::Value>) -> Model {
+        let mut metadata = HashMap::new();
+        if let Some(v) = card {
+            metadata.insert("cost".to_string(), v);
+        }
+        Model {
+            provider: "p".into(),
+            api: "anthropic".into(),
+            id: "m".into(),
+            context_window: 1000,
+            max_tokens: 100,
+            thinking: ThinkingKind::None,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn rate_card_parses_and_prices_usage() {
+        let model = model_with_cost(Some(json!({
+            "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75
+        })));
+        let rates = model_cost_rates(&model).expect("rate card present");
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cache_read_input_tokens: 2_000_000,
+            cache_creation_input_tokens: 400_000,
+            cache_write_1h: None,
+            reasoning_tokens: None,
+            total_tokens: 0,
+            cost: None,
+        };
+        let cost = price_usage(&rates, &usage);
+        assert!((cost.input - 3.0).abs() < 1e-9);
+        assert!((cost.output - 1.5).abs() < 1e-9);
+        assert!((cost.cache_read - 0.6).abs() < 1e-9);
+        assert!((cost.cache_write - 1.5).abs() < 1e-9);
+        assert!((cost.total - 6.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_or_zero_rate_card_yields_no_cost() {
+        assert!(model_cost_rates(&model_with_cost(None)).is_none());
+        assert!(
+            model_cost_rates(&model_with_cost(Some(json!({
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0
+            }))))
+            .is_none()
+        );
+    }
 }

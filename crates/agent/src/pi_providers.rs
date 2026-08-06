@@ -86,7 +86,7 @@ pub fn default_model() -> Option<pi::types::Model> {
         .map(str::trim)
         .filter(|r| !r.is_empty())
     {
-        if let Some(model) = crate::model_alias::resolve_pi_model_ref(r) {
+        if let Some(model) = pi_extensions::model_ref::resolve_model_ref(&global(), r) {
             return Some(model);
         }
         tracing::warn!(reference = %r, "default_model did not resolve; falling back to first registered model");
@@ -94,21 +94,38 @@ pub fn default_model() -> Option<pi::types::Model> {
     let models = global().models();
     models
         .iter()
-        .find(|m| visible_to_agent(m, "claude"))
+        .find(|m| pi_extensions::model_ref::visible_to_agent(m, "claude"))
         .cloned()
         .or_else(|| models.into_iter().next())
 }
 
-/// Agent visibility from registration metadata: missing metadata (a
-/// non-cx registration) means visible; otherwise the effective agent list
-/// must contain `agent_id`.
-fn visible_to_agent(model: &pi::types::Model, agent_id: &str) -> bool {
-    model
-        .metadata
-        .get("agents")
-        .and_then(|v| v.as_array())
-        .map(|list| list.iter().any(|a| a.as_str() == Some(agent_id)))
-        .unwrap_or(true)
+/// Model catalog restoring legacy manox-style provider ids persisted by
+/// older sessions: `{wire}:{name}` (e.g. `anthropic:DeepSeek`) aliases the
+/// current registration name `{name}-{wire}` (`DeepSeek-anthropic`). A
+/// host-side compatibility layer — the kernel catalog only knows
+/// registration names.
+pub struct LegacyAliasCatalog {
+    registry: Arc<ProviderRegistry>,
+}
+
+impl LegacyAliasCatalog {
+    pub fn new(registry: Arc<ProviderRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl pi::coding_agent::model_runtime::ModelCatalog for LegacyAliasCatalog {
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<pi::types::Model> {
+        let catalog = self.registry.catalog();
+        if let Some(model) = catalog.resolve(provider, model_id) {
+            return Some(model);
+        }
+        if let Some((wire, name)) = provider.split_once(':') {
+            let aliased = format!("{name}-{wire}");
+            return catalog.resolve(&aliased, model_id);
+        }
+        None
+    }
 }
 
 /// Display name of a registered model (metadata `name`, else the id).
@@ -135,42 +152,52 @@ pub fn display_provider_name(model: &pi::types::Model) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn model_with_agents(agents: Option<serde_json::Value>) -> pi::types::Model {
-        let mut metadata = HashMap::new();
-        if let Some(v) = agents {
-            metadata.insert("agents".to_string(), v);
-        }
-        pi::types::Model {
-            provider: "p".into(),
-            api: "anthropic".into(),
-            id: "m".into(),
-            context_window: 1,
-            max_tokens: 1,
-            thinking: pi::types::ThinkingKind::None,
-            metadata,
-        }
-    }
+    use pi::coding_agent::model_runtime::ModelCatalog;
+    use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
 
     #[test]
-    fn visibility_reads_agents_metadata() {
-        use serde_json::json;
-        // Missing metadata (non-cx registration) is visible to everyone.
-        assert!(visible_to_agent(&model_with_agents(None), "claude"));
-        // Membership decides.
-        assert!(visible_to_agent(
-            &model_with_agents(Some(json!(["claude", "codex+"]))),
-            "claude"
-        ));
-        assert!(!visible_to_agent(
-            &model_with_agents(Some(json!(["codex+"]))),
-            "claude"
-        ));
-        // An empty effective list hides the model from every agent.
-        assert!(!visible_to_agent(
-            &model_with_agents(Some(json!([]))),
-            "claude"
-        ));
+    fn legacy_alias_catalog_resolves_old_provider_ids() {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_provider(
+                "DeepSeek-anthropic",
+                ProviderConfig {
+                    name: Some("DeepSeek".into()),
+                    base_url: Some("https://api.deepseek.com/anthropic".into()),
+                    api_key: Some("k".into()),
+                    api: Some(Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![ProviderModelConfig {
+                        id: "deepseek-v4-flash".into(),
+                        name: "deepseek-v4-flash".into(),
+                        reasoning: false,
+                        input: vec![],
+                        context_window: 1_000_000,
+                        max_tokens: 8_192,
+                        cost: Cost::default(),
+                        api: None,
+                        base_url: None,
+                        metadata: std::collections::HashMap::new(),
+                    }],
+                },
+            )
+            .unwrap();
+        let catalog = LegacyAliasCatalog::new(registry);
+        // Current registration names resolve directly.
+        assert!(
+            catalog
+                .resolve("DeepSeek-anthropic", "deepseek-v4-flash")
+                .is_some()
+        );
+        // Legacy manox-style ids alias onto them.
+        assert!(
+            catalog
+                .resolve("anthropic:DeepSeek", "deepseek-v4-flash")
+                .is_some()
+        );
+        // Unknown ids fall through to the default catalog chain.
+        assert!(catalog.resolve("anthropic", "claude-sonnet-4-6").is_some());
+        assert!(catalog.resolve("anthropic:DeepSeek", "nope").is_none());
     }
 }

@@ -450,8 +450,20 @@ fn build_model_config(
         cost: known.cost.unwrap_or_default(),
         api: None,
         base_url: None,
-        agents: effective_agents(config, wire_api, endpoint.agents(), &model_agents),
-        config_id: Some(raw_id.to_string()),
+        metadata: {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert(
+                "agents".to_string(),
+                serde_json::json!(effective_agents(
+                    config,
+                    wire_api,
+                    endpoint.agents(),
+                    &model_agents
+                )),
+            );
+            meta.insert("config_id".to_string(), serde_json::json!(raw_id));
+            meta
+        },
     }
 }
 
