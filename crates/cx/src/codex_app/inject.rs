@@ -156,6 +156,7 @@ const PATCH_BODY: &str = r#"(function () {
     let changed = false;
     if (patchModelArray(v.models)) changed = true;
     if (patchModelArray(v.data)) changed = true;
+    if (patchModelArray(v.result)) changed = true;
     if (v.pages && patchModelArray(v.pages[0] && v.pages[0].data)) changed = true;
     if (v.result && patchModelArray(v.result.data)) changed = true;
     if (v.result && patchModelArray(v.result.models)) changed = true;
