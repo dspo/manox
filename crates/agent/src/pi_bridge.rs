@@ -25,7 +25,9 @@ pub fn map_model(model: &AnyLanguageModel) -> Result<Model, String> {
     Ok(Model {
         provider: model.provider_id(),
         api: api.to_string(),
-        id: model.id(),
+        // The wire-facing id strips the `[1m]` context suffix and the
+        // `provider/` display prefix — the endpoint accepts the bare model.
+        id: model.api_model_id(),
         // `max_token_count` is the context window; `max_output_tokens` is the
         // per-response budget that goes on the wire as `max_tokens`. Mapping
         // them the wrong way round would send a 200k/1M max_tokens and 400.
