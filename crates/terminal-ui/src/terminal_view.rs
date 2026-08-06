@@ -50,6 +50,9 @@ pub struct TerminalView {
     /// True while the left mouse button is held after a press in the element,
     /// so `on_mouse_move` extends the selection.
     selecting: bool,
+    /// The element's window-space bounds from the latest prepaint, so mouse
+    /// handlers can translate window positions into element-local coordinates.
+    last_bounds: Option<Bounds<Pixels>>,
     /// The xterm button code of the mouse button currently held, when the TUI
     /// has captured the mouse. `None` when no button is pressed or MOUSE_MODE
     /// is not active. Used to gate MOUSE_DRAG forwarding (motion is only
@@ -81,6 +84,7 @@ impl TerminalView {
             font_size: px(s.font_size),
             line_height: s.line_height,
             selecting: false,
+            last_bounds: None,
             pressed_button: None,
             marked_text: String::new(),
             search: None,
@@ -169,18 +173,6 @@ impl TerminalView {
             return;
         }
 
-        // Tab / shift+tab always reach the PTY while the terminal is focused:
-        // Tab writes `\t` (a completion trigger in the agent TUI), shift+tab
-        // writes `\x1b[Z. Handled before anything else (save the search overlay
-        // above) so GPUI's focus traversal never steals Tab away from the TUI —
-        // `stop_propagation` keeps focus on the terminal.
-        if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
-            let seq = if k.modifiers.shift { "\x1b[Z" } else { "\t" };
-            let _ = self.terminal.update(cx, |t, _cx| t.input(seq.as_bytes()));
-            cx.stop_propagation();
-            return;
-        }
-
         // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
         // on ctrl+shift+v.
         if k.modifiers.control && k.modifiers.shift && k.key == "v" {
@@ -196,6 +188,12 @@ impl TerminalView {
             if let Some(motion) = vi_motion_for(k) {
                 self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
             }
+            return;
+        }
+
+        // Unbound cmd/super combos produce no PTY input; without this guard the
+        // printable branch would type a raw char for e.g. cmd-x.
+        if k.modifiers.platform {
             return;
         }
 
@@ -277,6 +275,7 @@ impl TerminalView {
             let (row, col) = self.px_to_grid(ev.position, window);
             self.terminal
                 .update(cx, |t, cx| t.update_selection(row, col, cx));
+            self.copy_selection_live(cx);
             return;
         }
         // Forward motion to the TUI. MOUSE_MOTION reports motion whenever
@@ -298,10 +297,7 @@ impl TerminalView {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
-            self.selecting = false;
-            if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            self.finalize_selection(cx);
             return;
         }
         // Forward release to the TUI if it has captured the mouse. Clear
@@ -355,9 +351,8 @@ impl TerminalView {
     fn px_to_grid(&self, pos: Point<Pixels>, window: &Window) -> (usize, usize) {
         let cell_w = self.cell_width(window);
         let line_h = px(f32::from(self.font_size) * self.line_height);
-        let col = (f32::from(pos.x) / f32::from(cell_w)).max(0.).floor() as usize;
-        let row = (f32::from(pos.y) / f32::from(line_h)).max(0.).floor() as usize;
-        (row, col)
+        let origin = self.last_bounds.map(|b| b.origin).unwrap_or_default();
+        grid_from_px(pos, origin, cell_w, line_h)
     }
 
     fn cell_width(&self, window: &Window) -> Pixels {
@@ -422,6 +417,11 @@ impl Render for TerminalView {
             .h_full()
             .bg(cx.theme().background)
             .track_focus(&self.focus_handle)
+            .key_context("Terminal")
+            .on_action(cx.listener(Self::action_send_tab))
+            .on_action(cx.listener(Self::action_send_shift_tab))
+            .on_action(cx.listener(Self::action_paste))
+            .on_action(cx.listener(Self::action_copy_selection))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -498,6 +498,104 @@ impl TerminalView {
             return;
         }
         let _ = self.terminal.update(cx, |t, _| t.input(text.as_bytes()));
+    }
+
+    /// Select-to-copy: mirror the in-flight selection into the clipboard on
+    /// every drag move, so the text is captured even when the release happens
+    /// outside the window (where no mouse-up reaches us).
+    fn copy_selection_live(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Whether a mouse-driven text selection is in flight; the element uses it
+    /// to decide whether to register the window-level mouse-up listener.
+    pub(crate) fn is_selecting(&self) -> bool {
+        self.selecting
+    }
+
+    /// Record the element's window-space bounds (written back by the element
+    /// each prepaint) so mouse positions can be made element-local.
+    pub(crate) fn set_last_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.last_bounds = Some(bounds);
+    }
+
+    /// End an in-flight selection and copy it to the clipboard
+    /// (select-to-copy). Idempotent: the div's `on_mouse_up` and the
+    /// window-level mouse-up listener both route here; the `selecting` flag
+    /// gates the second call.
+    pub(crate) fn finalize_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.terminal.update(cx, |t, _| t.clear_selection());
+        }
+        cx.notify();
+    }
+
+    fn action_send_tab(
+        &mut self,
+        _: &crate::SendTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.is_some() {
+            return;
+        }
+        let _ = self.terminal.update(cx, |t, _| t.input(b"\t"));
+    }
+
+    fn action_send_shift_tab(
+        &mut self,
+        _: &crate::SendShiftTab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.is_some() {
+            return;
+        }
+        let _ = self.terminal.update(cx, |t, _| t.input(b"\x1b[Z"));
+    }
+
+    fn action_paste(&mut self, _: &crate::Paste, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.terminal.read_with(cx, |t, _| {
+            let _ = t.paste(&text);
+        });
+    }
+
+    fn action_copy_selection(
+        &mut self,
+        _: &crate::CopySelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.terminal.read_with(cx, |t, _| t.selection_to_string());
+        match text {
+            Some(text) if !text.is_empty() => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.terminal.update(cx, |t, _| t.clear_selection());
+                cx.notify();
+            }
+            _ => {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = self.terminal.update(cx, |t, _| t.input(b"\x03"));
+                }
+            }
+        }
     }
 }
 
@@ -608,6 +706,24 @@ impl InputHandler for TerminalInputHandler {
     }
 }
 
+/// Map a window-space pixel position to `(row, col)` grid coordinates relative
+/// to the element's window-space origin. Positions left/above the origin clamp
+/// to 0 so drags outside the element stay bounded.
+fn grid_from_px(
+    pos: Point<Pixels>,
+    origin: Point<Pixels>,
+    cell_w: Pixels,
+    line_h: Pixels,
+) -> (usize, usize) {
+    let col = (f32::from(pos.x - origin.x) / f32::from(cell_w))
+        .floor()
+        .max(0.) as usize;
+    let row = (f32::from(pos.y - origin.y) / f32::from(line_h))
+        .floor()
+        .max(0.) as usize;
+    (row, col)
+}
+
 /// Map a gpui `MouseButton` to an xterm button code (left=0, middle=1,
 /// right=2). Unrecognised buttons map to 0 (left) so the click is still
 /// forwarded rather than silently dropped.
@@ -646,4 +762,38 @@ fn vi_motion_for(k: &Keystroke) -> Option<ViMotion> {
         "g" if shift => ViMotion::Low, // G → bottom
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::point;
+
+    #[test]
+    fn grid_from_px_subtracts_origin() {
+        let (row, col) = grid_from_px(
+            point(px(100.), px(50.)),
+            point(px(40.), px(20.)),
+            px(8.),
+            px(16.),
+        );
+        assert_eq!((row, col), (1, 7));
+    }
+
+    #[test]
+    fn grid_from_px_clamps_negative_to_zero() {
+        let (row, col) = grid_from_px(
+            point(px(10.), px(5.)),
+            point(px(40.), px(20.)),
+            px(8.),
+            px(16.),
+        );
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn grid_from_px_without_origin() {
+        let (row, col) = grid_from_px(point(px(16.), px(32.)), Point::default(), px(8.), px(16.));
+        assert_eq!((row, col), (2, 2));
+    }
 }

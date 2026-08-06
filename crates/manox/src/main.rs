@@ -262,6 +262,7 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-;", agent_ui::ToggleTurnNavigator, None),
         ]);
         cx.bind_keys(agent_ui::turn_navigator_key_bindings());
+        cx.bind_keys(terminal_ui::terminal_key_bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
             if let Some(handle) = cx.active_window() {
