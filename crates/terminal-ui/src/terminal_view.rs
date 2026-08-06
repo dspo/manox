@@ -16,8 +16,8 @@ use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div, px,
-    rgba,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, UTF16Selection,
+    Window, div, px, rgba,
 };
 use gpui_component::ActiveTheme as _;
 use terminal::Terminal;
@@ -50,6 +50,9 @@ pub struct TerminalView {
     /// True while the left mouse button is held after a press in the element,
     /// so `on_mouse_move` extends the selection.
     selecting: bool,
+    /// The element's window-space bounds from the latest prepaint, so mouse
+    /// handlers can translate window positions into element-local coordinates.
+    last_bounds: Option<Bounds<Pixels>>,
     /// The xterm button code of the mouse button currently held, when the TUI
     /// has captured the mouse. `None` when no button is pressed or MOUSE_MODE
     /// is not active. Used to gate MOUSE_DRAG forwarding (motion is only
@@ -62,12 +65,25 @@ pub struct TerminalView {
     search: Option<Search>,
     /// True while a visual bell flash is active; cleared by a timer.
     bell_flash: bool,
+    /// Keeps the app-level keystroke interceptor alive. While the view is
+    /// focused the terminal owns the keyboard: every key outside the
+    /// `commands_to_skip_shell` list is translated to the PTY before any
+    /// workbench binding or focus traversal can resolve.
+    key_interceptor: Option<Subscription>,
+    /// Parsed `commands_to_skip_shell`: keys that skip the terminal and keep
+    /// workbench precedence while it is focused.
+    skip_shell: Vec<Keystroke>,
 }
 
 impl TerminalView {
     pub fn new(terminal: Entity<Terminal>, cx: &mut App) -> Entity<Self> {
         let terminal_for_view = terminal.clone();
         let s = terminal::settings::load();
+        let skip_shell: Vec<Keystroke> = s
+            .commands_to_skip_shell
+            .iter()
+            .filter_map(|k| gpui::Keystroke::parse(k).ok())
+            .collect();
         let view = cx.new(move |cx| Self {
             terminal: terminal_for_view,
             focus_handle: cx.focus_handle(),
@@ -81,10 +97,13 @@ impl TerminalView {
             font_size: px(s.font_size),
             line_height: s.line_height,
             selecting: false,
+            last_bounds: None,
             pressed_button: None,
             marked_text: String::new(),
             search: None,
             bell_flash: false,
+            key_interceptor: None,
+            skip_shell,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
@@ -98,6 +117,40 @@ impl TerminalView {
             }
         })
         .detach();
+
+        // While focused, the terminal owns the keyboard: this interceptor
+        // runs before any binding or focus traversal resolves, translating
+        // every key through the general PTY pipeline (see
+        // `handle_terminal_key`). Only `commands_to_skip_shell` entries keep
+        // workbench precedence.
+        let interceptor = {
+            let weak = view.downgrade();
+            cx.intercept_keystrokes(move |ev, window, cx| {
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                let focused = view
+                    .read_with(cx, |v, _| v.focus_handle.clone())
+                    .is_focused(window);
+                if !focused {
+                    return;
+                }
+                let k = ev.keystroke.clone();
+                let skip = view.read_with(cx, |v, _| {
+                    v.skip_shell
+                        .iter()
+                        .any(|p| p.key == k.key && p.modifiers == k.modifiers)
+                });
+                if skip {
+                    return;
+                }
+                let consumed = view.update(cx, |v, cx| v.handle_terminal_key(&k, cx));
+                if consumed {
+                    cx.stop_propagation();
+                }
+            })
+        };
+        view.update(cx, |v, _| v.key_interceptor = Some(interceptor));
         view
     }
 
@@ -114,8 +167,16 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let k = &ev.keystroke;
+        // Fallback for skip-shell keys whose workbench binding did not fire;
+        // the interceptor handles everything else before bindings resolve.
+        let _ = self.handle_terminal_key(&ev.keystroke, cx);
+    }
 
+    /// Terminal-first key handling: search overlay, paste/copy, vi mode, and
+    /// the general `keys::to_esc_str` PTY translation. Returns `true` when the
+    /// key was consumed (the interceptor then stops propagation so no
+    /// workbench binding or focus traversal can steal it).
+    fn handle_terminal_key(&mut self, k: &Keystroke, cx: &mut Context<Self>) -> bool {
         // cmd/ctrl-f toggles the search overlay.
         if (k.modifiers.platform || k.modifiers.control) && k.key == "f" {
             if self.search.is_some() {
@@ -124,68 +185,105 @@ impl TerminalView {
                 self.search = Some(Search::default());
             }
             cx.notify();
-            return;
+            return true;
         }
 
         // While the search overlay is open, keystrokes edit the pattern (the
-        // TUI does not receive them). esc closes; enter closes; cmd-g would
-        // cycle but is left to vi mode's own search for now.
-        if let Some(search) = self.search.as_mut() {
+        // TUI does not receive them). esc closes; enter closes; Tab closes and
+        // sends the horizontal-tab byte to the PTY via the SendTab action;
+        // cmd-g would cycle but is left to vi mode's own search for now.
+        if self.search.is_some() {
             match k.key.as_ref() {
-                "escape" => {
+                "escape" | "enter" | "return" => {
                     self.search = None;
                     cx.notify();
-                    return;
-                }
-                "enter" | "return" => {
-                    self.search = None;
-                    cx.notify();
-                    return;
+                    return true;
                 }
                 "backspace" => {
-                    search.pattern.pop();
+                    if let Some(search) = self.search.as_mut() {
+                        search.pattern.pop();
+                    }
                     self.run_search(cx);
-                    return;
+                    return true;
                 }
-                _ => {}
-            }
-            // Append a single printable char to the pattern.
-            if !k.modifiers.control && !k.modifiers.platform {
-                let mut chars = k.key.chars();
-                if let Some(c) = chars.next()
-                    && chars.next().is_none()
-                    && c.is_ascii()
-                    && !c.is_ascii_control()
-                {
-                    let ch = if k.modifiers.shift && c.is_ascii_alphabetic() {
-                        c.to_ascii_uppercase()
-                    } else {
-                        c
-                    };
-                    search.pattern.push(ch);
-                    self.run_search(cx);
+                "tab" if !k.modifiers.control && !k.modifiers.platform => {
+                    // Close the overlay, then fall through to the general PTY
+                    // translation below (sends \t).
+                    self.search = None;
+                    cx.notify();
+                }
+                _ => {
+                    // Append a single printable char to the pattern.
+                    if !k.modifiers.control && !k.modifiers.platform {
+                        let mut chars = k.key.chars();
+                        if let Some(c) = chars.next()
+                            && chars.next().is_none()
+                            && c.is_ascii()
+                            && !c.is_ascii_control()
+                        {
+                            let ch = if k.modifiers.shift && c.is_ascii_alphabetic() {
+                                c.to_ascii_uppercase()
+                            } else {
+                                c
+                            };
+                            if let Some(search) = self.search.as_mut() {
+                                search.pattern.push(ch);
+                            }
+                            self.run_search(cx);
+                        }
+                    }
+                    return true;
                 }
             }
-            return;
         }
 
-        // Tab / shift+tab always reach the PTY while the terminal is focused:
-        // Tab writes `\t` (a completion trigger in the agent TUI), shift+tab
-        // writes `\x1b[Z. Handled before anything else (save the search overlay
-        // above) so GPUI's focus traversal never steals Tab away from the TUI —
-        // `stop_propagation` keeps focus on the terminal.
-        if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
-            let seq = if k.modifiers.shift { "\x1b[Z" } else { "\t" };
-            let _ = self.terminal.update(cx, |t, _cx| t.input(seq.as_bytes()));
-            cx.stop_propagation();
-            return;
+        // Paste: cmd-v on mac, ctrl-v elsewhere.
+        #[cfg(target_os = "macos")]
+        let paste = k.modifiers.platform && k.key == "v";
+        #[cfg(not(target_os = "macos"))]
+        let paste = k.modifiers.control && !k.modifiers.shift && !k.modifiers.alt && k.key == "v";
+        if paste {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(text) = item.text()
+                && !text.is_empty()
+            {
+                self.terminal.read_with(cx, |t, _| {
+                    let _ = t.paste(&text);
+                });
+            }
+            return true;
+        }
+
+        // Copy: cmd-c on mac, ctrl-c elsewhere. While the terminal is focused
+        // the reclaimed-keys whitelist shadows gpui-component Root's
+        // window-wide Copy binding, so these keys land here. With no
+        // selection: no-op on mac, `^C` elsewhere so interrupt stays reachable.
+        #[cfg(target_os = "macos")]
+        let copy = k.modifiers.platform && k.key == "c";
+        #[cfg(not(target_os = "macos"))]
+        let copy = k.modifiers.control && !k.modifiers.shift && !k.modifiers.alt && k.key == "c";
+        if copy {
+            match self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+                Some(text) if !text.is_empty() => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.terminal.update(cx, |t, _| t.clear_selection());
+                    cx.notify();
+                }
+                _ => {
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = self.terminal.update(cx, |t, _| t.input(b"\x03"));
+                    }
+                }
+            }
+            return true;
         }
 
         // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
         // on ctrl+shift+v.
         if k.modifiers.control && k.modifiers.shift && k.key == "v" {
             self.terminal.update(cx, |t, cx| t.toggle_vi_mode(cx));
-            return;
+            return true;
         }
 
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
@@ -196,12 +294,24 @@ impl TerminalView {
             if let Some(motion) = vi_motion_for(k) {
                 self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
             }
-            return;
+            return true;
+        }
+
+        // Unbound cmd/super combos produce no PTY input; without this guard the
+        // printable branch would type a raw char for e.g. cmd-x. `platform` is
+        // cmd/super/win (never ctrl, see gpui `Modifiers`), and the extra
+        // `!control` keeps ctrl-combos flowing to the control-char branch.
+        if k.modifiers.platform && !k.modifiers.control {
+            return true;
         }
 
         if let Some(s) = keys::to_esc_str(k, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
+            return true;
         }
+
+        // Bare modifiers / unknown keys: nothing to send.
+        false
     }
 
     /// Run the current search pattern against the terminal grid and store the
@@ -277,6 +387,7 @@ impl TerminalView {
             let (row, col) = self.px_to_grid(ev.position, window);
             self.terminal
                 .update(cx, |t, cx| t.update_selection(row, col, cx));
+            self.copy_selection_live(cx);
             return;
         }
         // Forward motion to the TUI. MOUSE_MOTION reports motion whenever
@@ -298,10 +409,7 @@ impl TerminalView {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
-            self.selecting = false;
-            if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            self.finalize_selection(cx);
             return;
         }
         // Forward release to the TUI if it has captured the mouse. Clear
@@ -355,9 +463,8 @@ impl TerminalView {
     fn px_to_grid(&self, pos: Point<Pixels>, window: &Window) -> (usize, usize) {
         let cell_w = self.cell_width(window);
         let line_h = px(f32::from(self.font_size) * self.line_height);
-        let col = (f32::from(pos.x) / f32::from(cell_w)).max(0.).floor() as usize;
-        let row = (f32::from(pos.y) / f32::from(line_h)).max(0.).floor() as usize;
-        (row, col)
+        let origin = self.last_bounds.map(|b| b.origin).unwrap_or_default();
+        grid_from_px(pos, origin, cell_w, line_h)
     }
 
     fn cell_width(&self, window: &Window) -> Pixels {
@@ -499,6 +606,43 @@ impl TerminalView {
         }
         let _ = self.terminal.update(cx, |t, _| t.input(text.as_bytes()));
     }
+
+    /// Select-to-copy: mirror the in-flight selection into the clipboard on
+    /// every drag move, so the text is captured even when the release happens
+    /// outside the window (where no mouse-up reaches us).
+    fn copy_selection_live(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Whether a mouse-driven text selection is in flight; the element uses it
+    /// to decide whether to register the window-level mouse-up listener.
+    pub(crate) fn is_selecting(&self) -> bool {
+        self.selecting
+    }
+
+    /// Record the element's window-space bounds (written back by the element
+    /// each prepaint) so mouse positions can be made element-local.
+    pub(crate) fn set_last_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.last_bounds = Some(bounds);
+    }
+
+    /// End an in-flight selection and copy it to the clipboard
+    /// (select-to-copy). Idempotent: the div's `on_mouse_up` and the
+    /// window-level mouse-up listener both route here; the `selecting` flag
+    /// gates the second call.
+    pub(crate) fn finalize_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.terminal.update(cx, |t, _| t.clear_selection());
+        }
+        cx.notify();
+    }
 }
 
 /// gpui `InputHandler` driving IME composition for a focused terminal view.
@@ -608,6 +752,24 @@ impl InputHandler for TerminalInputHandler {
     }
 }
 
+/// Map a window-space pixel position to `(row, col)` grid coordinates relative
+/// to the element's window-space origin. Positions left/above the origin clamp
+/// to 0 so drags outside the element stay bounded.
+fn grid_from_px(
+    pos: Point<Pixels>,
+    origin: Point<Pixels>,
+    cell_w: Pixels,
+    line_h: Pixels,
+) -> (usize, usize) {
+    let col = (f32::from(pos.x - origin.x) / f32::from(cell_w))
+        .floor()
+        .max(0.) as usize;
+    let row = (f32::from(pos.y - origin.y) / f32::from(line_h))
+        .floor()
+        .max(0.) as usize;
+    (row, col)
+}
+
 /// Map a gpui `MouseButton` to an xterm button code (left=0, middle=1,
 /// right=2). Unrecognised buttons map to 0 (left) so the click is still
 /// forwarded rather than silently dropped.
@@ -646,4 +808,38 @@ fn vi_motion_for(k: &Keystroke) -> Option<ViMotion> {
         "g" if shift => ViMotion::Low, // G → bottom
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::point;
+
+    #[test]
+    fn grid_from_px_subtracts_origin() {
+        let (row, col) = grid_from_px(
+            point(px(100.), px(50.)),
+            point(px(40.), px(20.)),
+            px(8.),
+            px(16.),
+        );
+        assert_eq!((row, col), (1, 7));
+    }
+
+    #[test]
+    fn grid_from_px_clamps_negative_to_zero() {
+        let (row, col) = grid_from_px(
+            point(px(10.), px(5.)),
+            point(px(40.), px(20.)),
+            px(8.),
+            px(16.),
+        );
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn grid_from_px_without_origin() {
+        let (row, col) = grid_from_px(point(px(16.), px(32.)), Point::default(), px(8.), px(16.));
+        assert_eq!((row, col), (2, 2));
+    }
 }

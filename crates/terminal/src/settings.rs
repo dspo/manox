@@ -83,6 +83,19 @@ pub struct TerminalSettings {
     /// Extra env overrides passed to the child shell.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
+    /// Keystrokes (gpui syntax) that skip the terminal and keep workbench
+    /// precedence while the terminal is focused — the terminal's keystroke
+    /// interceptor owns every other key and translates it to the PTY. Same
+    /// positive semantics as VS Code's
+    /// `terminal.integrated.commandsToSkipShell`; Zed solves the same conflict
+    /// statically via per-key `Terminal`-context override bindings, here the
+    /// conflict set is configurable. Defaults preserve the app's global
+    /// shortcuts.
+    #[serde(
+        default = "default_commands_to_skip_shell",
+        skip_serializing_if = "is_default_commands_to_skip_shell"
+    )]
+    pub commands_to_skip_shell: Vec<String>,
 }
 
 impl Default for TerminalSettings {
@@ -97,6 +110,7 @@ impl Default for TerminalSettings {
             bell: BellMode::System,
             osc52_access: Osc52Access::Allow,
             env: Vec::new(),
+            commands_to_skip_shell: default_commands_to_skip_shell(),
         }
     }
 }
@@ -133,6 +147,57 @@ fn is_default_bell(b: &BellMode) -> bool {
 }
 fn is_default_osc52(a: &Osc52Access) -> bool {
     matches!(a, Osc52Access::Allow)
+}
+fn default_commands_to_skip_shell() -> Vec<String> {
+    let mut keys = vec![
+        "f11".to_string(),
+        "ctrl-g".to_string(),
+        "ctrl-b".to_string(),
+        "ctrl-shift-c".to_string(),
+        "cmd-m".to_string(),
+        "ctrl-m".to_string(),
+    ];
+    #[cfg(target_os = "macos")]
+    keys.extend(
+        [
+            "cmd-q",
+            "cmd-ctrl-f",
+            "cmd-w",
+            "cmd-shift-p",
+            "cmd-,",
+            "cmd-t",
+            "cmd-shift-t",
+            "cmd-b",
+            "cmd-shift-b",
+            "cmd-alt-/",
+            "cmd-shift-m",
+            "cmd-;",
+            "cmd-shift-;",
+        ]
+        .map(str::to_string),
+    );
+    #[cfg(not(target_os = "macos"))]
+    keys.extend(
+        [
+            "alt-f4",
+            "ctrl-w",
+            "ctrl-shift-p",
+            "ctrl-,",
+            "ctrl-t",
+            "ctrl-shift-t",
+            "ctrl-alt-b",
+            "ctrl-shift-b",
+            "ctrl-alt-/",
+            "ctrl-shift-m",
+            "ctrl-;",
+            "ctrl-shift-;",
+        ]
+        .map(str::to_string),
+    );
+    keys
+}
+fn is_default_commands_to_skip_shell(v: &Vec<String>) -> bool {
+    *v == default_commands_to_skip_shell()
 }
 
 /// Wrapper for parsing only the `[terminal]` table from the whole file.
@@ -195,6 +260,7 @@ mod tests {
         assert!(matches!(s.osc52_access, Osc52Access::Allow));
         assert!(s.env.is_empty());
         assert!(s.shell.is_none());
+        assert_eq!(s.commands_to_skip_shell, default_commands_to_skip_shell());
     }
 
     #[test]
@@ -209,6 +275,7 @@ scrolling_history = 5000
 cursor_shape = "beam"
 bell = "visual"
 osc52_access = "deny"
+commands_to_skip_shell = ["ctrl-g"]
 "#;
         let root: Root = toml::from_str(raw).unwrap();
         let s = root.terminal;
@@ -218,5 +285,6 @@ osc52_access = "deny"
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Beam));
         assert!(matches!(s.bell, BellMode::Visual));
         assert!(matches!(s.osc52_access, Osc52Access::Deny));
+        assert_eq!(s.commands_to_skip_shell, vec!["ctrl-g".to_string()]);
     }
 }

@@ -13,10 +13,10 @@
 //! `TerminalView`'s wrapping `div`, keeping this element paint-only.
 
 use gpui::{
-    App, Bounds, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
-    ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
-    Window, fill, point, px, relative, rgba, size,
+    App, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures,
+    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    MouseUpEvent, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
+    TextAlign, TextRun, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
 };
 use terminal::alacritty_terminal::selection::SelectionRange;
 use terminal::{Cell, Flags, Terminal};
@@ -240,6 +240,10 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        // Same-frame write-back (no notify) so the view's mouse handlers can
+        // translate window-space positions into element-local coordinates.
+        self.view.update(cx, |v, _| v.set_last_bounds(bounds));
+
         let line_height_px = px(f32::from(self.font_size) * self.line_height);
 
         // Measure cell width from a single glyph of the monospace font.
@@ -466,6 +470,19 @@ impl Element for TerminalElement {
                 },
                 cx,
             );
+        }
+
+        // While a selection is in flight, finalize (select-to-copy) on mouse-up
+        // anywhere in the window: releases outside the terminal div never reach
+        // the div's own `on_mouse_up`.
+        if self.view.read_with(cx, |v, _| v.is_selecting()) {
+            let view = self.view.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                view.update(cx, |v, cx| v.finalize_selection(cx));
+            });
         }
     }
 }
