@@ -27,9 +27,9 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, SharedString, Window};
 
-use agent::command::CommandDefinition;
+use harness_manox::command::CommandDefinition;
 use agent::i18n;
-use agent::skill::SkillDefinition;
+use harness_manox::skill::SkillDefinition;
 
 use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
@@ -148,9 +148,9 @@ pub fn init(_cx: &mut App) {
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
     // The adapter delegates to `Workspace::run_command_turn`, which substitutes
     // `$ARGUMENTS` and applies `allowed-tools` via `Thread::submit_command`.
-    // `agent::command::try_global` is `None` only before `agent::init` (which
+    // `harness_manox::command::try_global` is `None` only before `agent::init` (which
     // `main` calls before us); fall back to no macros rather than panicking.
-    for (key, def) in agent::command::try_global()
+    for (key, def) in harness_manox::command::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -171,7 +171,7 @@ pub fn init(_cx: &mut App) {
     // message. A command and a skill may share a key (`gitwork:deliver`); the
     // command wins — skip a skill whose key an already-registered command owns,
     // so the popover shows one row and `parse`/`dispatch` hit the command path.
-    for (key, def) in agent::skill::try_global()
+    for (key, def) in harness_manox::skill::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -408,7 +408,7 @@ impl SlashCommand for GoalCommand {
                 if let Err(error) =
                     t.replace_goal(objective.to_string(), None, agent::db::GoalActor::User, cx)
                 {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    cx.emit(harness_manox::ThreadEvent::Error(error));
                 }
             });
             return SlashResult::Handled;
@@ -422,7 +422,7 @@ impl SlashCommand for GoalCommand {
                     agent::db::GoalActor::User,
                     cx,
                 ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    cx.emit(harness_manox::ThreadEvent::Error(error));
                 }
             });
             return SlashResult::Handled;
@@ -430,7 +430,7 @@ impl SlashCommand for GoalCommand {
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
             thread.update(cx, |t, cx| {
                 let Some(goal) = t.goal().cloned() else {
-                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                    cx.emit(harness_manox::ThreadEvent::Error(anyhow::anyhow!(
                         "thread has no Goal"
                     )));
                     return;
@@ -441,7 +441,7 @@ impl SlashCommand for GoalCommand {
                     match value.parse::<u64>() {
                         Ok(value) => Some(value),
                         Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            cx.emit(harness_manox::ThreadEvent::Error(error.into()));
                             return;
                         }
                     }
@@ -449,7 +449,7 @@ impl SlashCommand for GoalCommand {
                 if let Err(error) =
                     t.edit_goal(goal.objective, budget, agent::db::GoalActor::User, cx)
                 {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    cx.emit(harness_manox::ThreadEvent::Error(error));
                 }
             });
             return SlashResult::Handled;
@@ -466,7 +466,7 @@ impl SlashCommand for GoalCommand {
             "clear" => {
                 thread.update(cx, |t, cx| {
                     if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        cx.emit(harness_manox::ThreadEvent::Error(error));
                     }
                 });
                 cx.notify();
@@ -480,7 +480,7 @@ impl SlashCommand for GoalCommand {
                         agent::db::GoalActor::User,
                         cx,
                     ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        cx.emit(harness_manox::ThreadEvent::Error(error));
                     }
                 });
                 SlashResult::Handled
@@ -493,7 +493,7 @@ impl SlashCommand for GoalCommand {
                         agent::db::GoalActor::User,
                         cx,
                     ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        cx.emit(harness_manox::ThreadEvent::Error(error));
                     }
                 });
                 SlashResult::Handled
@@ -519,7 +519,7 @@ impl SlashCommand for GoalCommand {
                     thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string(), cx) {
                         Ok(()) => true,
                         Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error));
+                            cx.emit(harness_manox::ThreadEvent::Error(error));
                             false
                         }
                     });

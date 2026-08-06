@@ -41,5 +41,6 @@ pub const TASK_STOP: &str = "TaskStop";
 
 pub const WRITE: &str = "Write";
 
-#[cfg(not(feature = "harness-pi"))]
-include!("manox.rs");
+// The manox harness tool implementations moved to the `harness-manox`
+// crate (retired); the constants above remain the shared wire-name source
+// of truth.

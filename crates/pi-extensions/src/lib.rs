@@ -5,6 +5,7 @@
 // no dynamic loading, no out-of-process runtime — and assembles the
 // product-level bash tool on top.
 
+pub mod provider;
 pub mod agents;
 pub mod bash;
 pub mod session_meta;

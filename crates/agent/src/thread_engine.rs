@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{AnyLanguageModel, TokenUsage};
+use crate::language_model::TokenUsage;
+use pi::types::Model as PiModel;
 use crate::message::Message;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
@@ -40,7 +41,7 @@ pub trait ThreadEngine: Send + Sync {
     }
 
     /// The model the backend currently runs, if any.
-    fn model(&self) -> Option<AnyLanguageModel>;
+    fn model(&self) -> Option<PiModel>;
 
     /// Start a turn with the given user text. Events flow back through the
     /// engine's event channel (spawned with the engine); settlement lands in
@@ -58,7 +59,7 @@ pub trait ThreadEngine: Send + Sync {
     fn abort(&self);
 
     /// Hot-swap the model for the next provider request.
-    fn set_model(&self, model: AnyLanguageModel);
+    fn set_model(&self, model: PiModel);
 
     /// Map the reasoning effort onto the backend's thinking level.
     fn set_thinking_level(&self, level: Option<String>);

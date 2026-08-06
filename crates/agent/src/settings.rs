@@ -42,32 +42,6 @@ pub fn side_calls() -> SideCallsSettings {
 /// the session-cached `claude_md_excludes`. Test builds are hermetic (an
 /// empty context loads nothing user- or machine-level), so thread tests never
 /// observe the developer's actual `~/.claude` tree or managed policy.
-#[cfg(not(feature = "harness-pi"))]
-pub fn claude_md_load_context() -> crate::claude_md::LoadContext {
-    #[cfg(test)]
-    let ctx = crate::claude_md::LoadContext::default();
-    #[cfg(not(test))]
-    let ctx = crate::claude_md::LoadContext {
-        home: paths::home_dir(),
-        managed: crate::claude_md::managed_policy_path(),
-        excludes: claude_md_excludes(),
-        // External imports stay withheld until the approval flow (a later PR)
-        // wires the persisted per-anchor decision in here.
-        allow_external: false,
-    };
-    ctx
-}
-
-/// The session-cached `claude_md_excludes` list. Lazily settled on first use
-/// so `agent::init` ordering does not matter; a mid-session settings edit
-/// takes effect next launch, matching the modes snapshot.
-#[cfg(not(test))]
-#[cfg(not(feature = "harness-pi"))]
-fn claude_md_excludes() -> Vec<String> {
-    static EXCLUDES: OnceLock<Vec<String>> = OnceLock::new();
-    EXCLUDES.get_or_init(|| load().claude_md_excludes).clone()
-}
-
 /// Parsed view of `settings.toml`. Every field is optional so a missing or
 /// partial file still yields a usable (defaulted) result.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -82,6 +56,12 @@ pub struct Settings {
     /// [`crate::thread::Thread`]; changing it never disturbs existing threads.
     #[serde(default)]
     pub agent_language: Option<String>,
+
+    /// Default model for new pi-harness threads: a registry model id
+    /// (`deepseek-v4-flash`) or a Claude/OpenAI alias (`sonnet`). Unset or
+    /// unresolvable → the first registered model (sorted).
+    #[serde(default)]
+    pub default_model: Option<String>,
 
     /// Glob patterns matched against the canonical absolute paths of CLAUDE.md
     /// instruction files; matching files are excluded from the loaded set (the
@@ -362,30 +342,6 @@ pub fn side_call_effort(
 }
 
 /// Resolve a side-call model override, falling back to the current main model.
-/// An unavailable override warns once per model reference.
-pub fn side_call_model(
-    policy: &SideCallPolicy,
-    main: &crate::language_model::AnyLanguageModel,
-) -> crate::language_model::AnyLanguageModel {
-    if policy.model.trim().is_empty() {
-        return main.clone();
-    }
-    if let Some(model) = crate::model_alias::resolve_model_ref(policy.model.trim()) {
-        return model;
-    }
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let warned = WARNED.get_or_init(Default::default);
-    let mut warned = warned.lock().unwrap();
-    if warned.insert(policy.model.clone()) {
-        tracing::warn!(
-            model = policy.model,
-            fallback = main.id(),
-            "side-call model unavailable; falling back to main model"
-        );
-    }
-    main.clone()
-}
 
 /// Resolve a side-call policy: user-configured fields win; empty/zero fields
 /// fall back to the per-purpose preset.

@@ -7,13 +7,6 @@
 //! `harness-pi` mounts the `pi_backend` adapter over crates/pi. Exactly one
 //! must be enabled.
 
-// Exactly one harness backend must be selected.
-#[cfg(all(feature = "harness-manox", feature = "harness-pi"))]
-compile_error!(
-    "features `harness-manox` and `harness-pi` are mutually exclusive; enable exactly one"
-);
-#[cfg(not(any(feature = "harness-manox", feature = "harness-pi")))]
-compile_error!("enable one of the harness features: `harness-manox` (default) or `harness-pi`");
 
 pub mod assets;
 pub mod browser_host;

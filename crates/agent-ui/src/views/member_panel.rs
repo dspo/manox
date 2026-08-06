@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use agent::language_model::TokenUsage;
-use agent::team::{Task, TaskListEvent, Team};
-use agent::{Thread, ThreadEvent, i18n};
+use harness_manox::team::{Task, TaskListEvent, Team};
+use harness_manox::{Thread, ThreadEvent};
+use agent::i18n;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Pixels, Render, ScrollHandle, SharedString,

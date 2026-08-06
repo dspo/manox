@@ -17,16 +17,21 @@ use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use agent::provider::registry;
+#[cfg(feature = "harness-manox")]
+use harness_manox::provider::registry;
 use agent::settings;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 #[cfg(feature = "harness-manox")]
-use agent::{PermissionDecision, PlanReviewChoice, ReasoningEffort};
-use agent::{Thread, save_thread};
-use agent::{ThreadEvent, ThreadId, i18n};
+use harness_manox::{PermissionDecision, PlanReviewChoice};
+#[cfg(feature = "harness-manox")]
+use harness_manox::{Thread, ThreadEvent, ThreadId, save_thread};
+#[cfg(not(feature = "harness-manox"))]
+use agent::{Thread, ThreadEvent, ThreadId, save_thread};
+#[cfg(feature = "harness-manox")]
+use agent::ReasoningEffort;
+use agent::i18n;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::DismissEvent;
 use gpui::{
@@ -107,6 +112,9 @@ use terminal_ui::TerminalView;
 /// the manox build drives `agent::Thread` directly, the pi build drives the
 /// pi-backed facade — same `ThreadEvent` stream, same `agent::Message`
 /// history — so the polished render pipeline is reused unchanged.
+#[cfg(feature = "harness-manox")]
+pub(crate) type ThreadEntity = harness_manox::Thread;
+#[cfg(not(feature = "harness-manox"))]
 pub(crate) type ThreadEntity = agent::Thread;
 
 
@@ -2654,7 +2662,7 @@ impl Workspace {
                                 // Image attachments are a manox flow; the pi
                                 // backend prompts are text-only in this stage.
                                 #[cfg(feature = "harness-manox")]
-                                match agent::image::gpui_image_to_message_content(
+                                match harness_manox::image::gpui_image_to_message_content(
                                     std::sync::Arc::new(_img.clone()),
                                 ) {
                                     Some(content) => extra.push(content),
@@ -2716,7 +2724,7 @@ impl Workspace {
             .update(cx, |thread, cx| thread.submit_command(name, args, cx));
         if !hit {
             self.thread.update(cx, |_, cx| {
-                cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                     "{}",
                     i18n::t_str("workspace-unknown-command", &[("name", name)])
                 )));
@@ -2751,7 +2759,7 @@ impl Workspace {
             .update(cx, |thread, cx| thread.submit_skill(key, args, cx));
         if !hit {
             self.thread.update(cx, |_, cx| {
-                cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                     "{}",
                     i18n::t_str("workspace-unknown-skill", &[("name", key)])
                 )));
@@ -3694,6 +3702,16 @@ impl Workspace {
     }
 
     pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
+        #[cfg(feature = "harness-pi")]
+        {
+            return self
+                .thread
+                .read(cx)
+                .model()
+                .map(agent::pi_providers::display_name)
+                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string());
+        }
+        #[cfg(not(feature = "harness-pi"))]
         self.thread
             .read(cx)
             .model()
@@ -3843,7 +3861,7 @@ impl Workspace {
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
-                agent::ToolAuthorizationResponse::Decision(decision),
+                harness_manox::ToolAuthorizationResponse::Decision(decision),
                 cx,
             );
         });
@@ -3997,7 +4015,7 @@ impl Workspace {
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
-                agent::ToolAuthorizationResponse::AskUserQuestion { answers, response },
+                harness_manox::ToolAuthorizationResponse::AskUserQuestion { answers, response },
                 cx,
             );
         });
@@ -4034,7 +4052,7 @@ impl Workspace {
         // (never persisted) is retired in its place.
         let meta = self.user_turn_meta(cx);
         let ui = Self::message_ui_metadata(&meta);
-        let text = agent::implement_plan_user_message(&review.plan_text);
+        let text = harness_manox::implement_plan_user_message(&review.plan_text);
         let plan_text = review.plan_text.clone();
         if matches!(choice, PlanReviewChoice::ImplementClearContext) {
             // Clear context = archive this thread and continue on a fresh one
@@ -4347,6 +4365,202 @@ impl Workspace {
             WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
         }
     }
+    /// Wire api string → Tag variant + label for the pi model menu.
+    #[cfg(feature = "harness-pi")]
+    fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
+        match api {
+            "anthropic" => (TagVariant::Primary, "Anthropic"),
+            "openai_responses" => (TagVariant::Info, "Responses"),
+            "openai_completions" => (TagVariant::Warning, "Completions"),
+            _ => (TagVariant::Secondary, "N/A"),
+        }
+    }
+
+    /// Wire api string → text color for the pi composer model label.
+    #[cfg(feature = "harness-pi")]
+    fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
+        match api {
+            "anthropic" => theme.primary,
+            "openai_responses" => theme.info,
+            "openai_completions" => theme.warning,
+            _ => theme.muted_foreground,
+        }
+    }
+
+    /// The pi-harness model selector. Reads the shared pi provider registry
+    /// (the streaming source of truth): closed, a ghost button showing
+    /// `provider · model` with the model name tinted by wire api; open, a
+    /// PopupMenu of provider submenus.
+    #[cfg(feature = "harness-pi")]
+    fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.model_open;
+        let model = self.thread.read(cx).model().cloned();
+
+        let trigger = h_flex()
+            .id("model-trigger")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .cursor_pointer()
+            .children(if let Some(ref m) = model {
+                let model_color = Self::pi_wire_text_color(&m.api, theme);
+                let dot = || {
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("·")
+                };
+                vec![
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(agent::pi_providers::display_provider_name(m))
+                        .into_any_element(),
+                    dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(model_color)
+                        .child(agent::pi_providers::display_name(m))
+                        .into_any_element(),
+                ]
+            } else {
+                vec![
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(i18n::t("workspace-no-model").to_string())
+                        .into_any_element(),
+                ]
+            })
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.model_open {
+                    this.model_open = false;
+                    this.model_menu = None;
+                    this.model_menu_sub = None;
+                } else {
+                    this.model_open = true;
+                    let workspace = cx.entity().downgrade();
+                    let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+                        Self::build_model_popup_menu_pi(menu, workspace, window, cx)
+                    });
+                    let sub = cx.subscribe(
+                        &menu,
+                        |this: &mut Workspace,
+                         _menu: Entity<PopupMenu>,
+                         _: &DismissEvent,
+                         cx: &mut Context<Workspace>| {
+                            this.model_open = false;
+                            this.model_menu = None;
+                            this.model_menu_sub = None;
+                            cx.notify();
+                        },
+                    );
+                    this.model_menu = Some(menu);
+                    this.model_menu_sub = Some(sub);
+                }
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .model_menu
+            .clone()
+            .expect("model_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                deferred(
+                    gpui::div()
+                        .id("model-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    #[cfg(feature = "harness-pi")]
+    /// Model menu for the pi harness: grouped by provider display name;
+    /// each row shows a wire-api Tag and selects through the registry.
+    fn build_model_popup_menu_pi(
+        menu: PopupMenu,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let mut providers: Vec<(String, Vec<pi::types::Model>)> = Vec::new();
+        for m in agent::pi_providers::global().models() {
+            let prov = agent::pi_providers::display_provider_name(&m);
+            if let Some(last) = providers.last_mut()
+                && last.0 == prov
+            {
+                last.1.push(m);
+            } else {
+                providers.push((prov, vec![m]));
+            }
+        }
+        let mut menu = menu;
+        if providers.is_empty() {
+            return menu.item(PopupMenuItem::Label("No models configured".into()));
+        }
+        for (prov_name, models) in providers {
+            let ws = workspace.clone();
+            menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
+                let mut submenu = submenu;
+                for m in &models {
+                    let model = m.clone();
+                    let model_name = agent::pi_providers::display_name(&model);
+                    let (variant, label) = Self::pi_wire_tag_variant(&model.api);
+                    let ws = ws.clone();
+                    submenu = submenu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Tag::new()
+                                        .with_variant(variant)
+                                        .outline()
+                                        .small()
+                                        .child(label),
+                                )
+                                .child(model_name.clone())
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            let model = model.clone();
+                            let _ = ws.update(cx, |this, cx| {
+                                this.thread.update(cx, |t, cx| t.set_model(model, cx));
+                            });
+                        }),
+                    );
+                }
+                submenu
+            });
+        }
+        menu
+    }
+
     #[cfg(feature = "harness-manox")]
     /// Cascading model menu grouped by provider, followed by a separator and
     /// reasoning-effort items (High / Max). Each model row shows a wire-api Tag.
@@ -4357,7 +4571,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
+        let mut providers: Vec<(String, Vec<harness_manox::language_model::AnyLanguageModel>)> = Vec::new();
         for m in registry::global().models() {
             let prov = m.provider_name();
             if let Some(last) = providers.last_mut()
@@ -4655,7 +4869,7 @@ impl Workspace {
         #[cfg(feature = "harness-manox")]
         let model = self.render_model_selector(theme, cx);
         #[cfg(feature = "harness-pi")]
-        let model: AnyElement = gpui::div().into_any_element();
+        let model = self.render_model_selector_pi(theme, cx);
         let send = self.render_send_button(
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
             cx,
@@ -5741,7 +5955,7 @@ impl Workspace {
                 this.project_chip_open = true;
 
                 // Fetch recent projects from the store.
-                let store = agent::thread_store_global();
+                let store = harness_manox::thread_store_global();
                 let recent = store.update(cx, |s, cx| s.fetch_recent_projects(20, cx));
 
                 let ws = workspace.clone();

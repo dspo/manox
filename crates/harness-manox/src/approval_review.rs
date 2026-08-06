@@ -1,0 +1,657 @@
+//! The manox harness approval-review side calls (streaming model calls).
+//! Shared verdict types live in `agent::approval`.
+
+use agent::approval::{ReviewBatchOutcome, ReviewItem, ReviewOutcome, ReviewVerdict};
+use crate::language_model::{
+    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
+    LanguageModelRequestMessage, MessageContent, Role,
+};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use futures::StreamExt as _;
+use gpui::AsyncApp;
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(8);
+#[derive(Debug, Deserialize)]
+struct VerdictPayload {
+    verdict: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct BatchVerdictPayload {
+    id: String,
+    verdict: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+/// Vet every AutoPilot tool call from one assistant response in one side
+/// request. Missing or malformed per-id verdicts fail closed independently.
+pub async fn review_batch(
+    model: &AnyLanguageModel,
+    items: &[ReviewItem],
+    cwd: &Path,
+    lang: agent::language::Language,
+    cancel: CancellationToken,
+    cx: &AsyncApp,
+) -> ReviewBatchOutcome {
+    review_batch_with_timeout(model, items, cwd, lang, cancel, REVIEW_TIMEOUT, cx).await
+}
+
+async fn review_batch_with_timeout(
+    model: &AnyLanguageModel,
+    items: &[ReviewItem],
+    cwd: &Path,
+    lang: agent::language::Language,
+    cancel: CancellationToken,
+    timeout: Duration,
+    cx: &AsyncApp,
+) -> ReviewBatchOutcome {
+    if items.is_empty() {
+        return ReviewBatchOutcome {
+            verdicts: HashMap::new(),
+            usage: None,
+            model_name: model.name(),
+        };
+    }
+    let fallback = || ReviewVerdict::Ask {
+        reason: "autopilot reviewer unavailable; tool call denied".to_string(),
+    };
+    let fail_closed = || {
+        items
+            .iter()
+            .map(|item| (item.id.clone(), fallback()))
+            .collect::<HashMap<_, _>>()
+    };
+
+    let policy = crate::settings_ext::side_calls().approval_policy();
+    let model = crate::settings_ext::side_call_model(&policy, model);
+    let model_name = model.name();
+    let calls: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "tool_name": item.tool_name,
+                "tool_title": item.tool_title,
+                "tool_input": truncate_tool_input(&item.tool_input),
+            })
+        })
+        .collect();
+    let batch_override = match lang {
+        agent::language::Language::En => {
+            "\n\n## Batch override\nThe user message contains an array of calls. Review every call and return only a JSON array with one object per id: [{\"id\":\"...\",\"verdict\":\"ALLOW|ASK\",\"reason\":\"<=200 chars\"}]. This replaces the single-object output format above for this request."
+        }
+        agent::language::Language::ZhCn => {
+            "\n\n## 批量覆盖规则\n用户消息包含一组调用。逐项审核，只返回 JSON 数组，每个 id 一个对象：[{\"id\":\"...\",\"verdict\":\"ALLOW|ASK\",\"reason\":\"不超过200字\"}]。本规则替代上面的单对象输出格式。"
+        }
+    };
+    let system = format!(
+        "{}{}",
+        agent::prompt::render_static(agent::prompt::PromptTemplate::SideCallApprovalSystem, lang,)
+            .expect("approval system prompt render"),
+        batch_override
+    );
+    let user = serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "calls": calls,
+    })
+    .to_string();
+    let request = LanguageModelRequest {
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(system)],
+                cache: true,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(user)],
+                cache: false,
+            },
+        ],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: Some(0.0),
+        thinking_allowed: false,
+        reasoning_effort: agent::settings::side_call_effort(
+            &policy,
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: agent::settings::side_call_output_cap(policy),
+    };
+
+    let call = async move {
+        let stream = model.stream_completion(request, cx).await.ok()?;
+        futures::pin_mut!(stream);
+        let mut text = String::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.ok()? {
+                LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
+                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
+                LanguageModelCompletionEvent::Stop(_) => break,
+                _ => {}
+            }
+        }
+        Some((text, usage))
+    };
+    let outcome = tokio::select! {
+        result = call => result,
+        _ = cx.background_executor().timer(timeout) => None,
+        _ = cancel.cancelled() => None,
+    };
+    let Some((text, usage)) = outcome else {
+        return ReviewBatchOutcome {
+            verdicts: fail_closed(),
+            usage: None,
+            model_name,
+        };
+    };
+    ReviewBatchOutcome {
+        verdicts: parse_batch_verdicts(&text, items),
+        usage,
+        model_name,
+    }
+}
+
+fn parse_batch_verdicts(text: &str, items: &[ReviewItem]) -> HashMap<String, ReviewVerdict> {
+    let trimmed = text.trim();
+    let json = serde_json::from_str::<Vec<BatchVerdictPayload>>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('[')?;
+            let end = trimmed.rfind(']')?;
+            serde_json::from_str(&trimmed[start..=end]).ok()
+        });
+    let mut parsed = HashMap::new();
+    if let Some(payloads) = json {
+        let expected: std::collections::HashSet<&str> =
+            items.iter().map(|item| item.id.as_str()).collect();
+        for payload in payloads {
+            if !expected.contains(payload.id.as_str()) || parsed.contains_key(&payload.id) {
+                continue;
+            }
+            if let Some(verdict) = verdict_from(VerdictPayload {
+                verdict: payload.verdict,
+                reason: payload.reason,
+            }) {
+                parsed.insert(payload.id, verdict);
+            }
+        }
+    }
+    for item in items {
+        parsed
+            .entry(item.id.clone())
+            .or_insert_with(|| ReviewVerdict::Ask {
+                reason: "autopilot reviewer verdict missing or malformed; tool call denied"
+                    .to_string(),
+            });
+    }
+    parsed
+}
+
+/// Vet a single tool call under `AutoPilot`. Blocks until the reviewer
+/// responds, the per-call timeout elapses, or `cancel` fires — every
+/// non-success path returns [`ReviewVerdict::Ask`].
+///
+/// `model` is the same `AnyLanguageModel` the owning thread uses for its main
+/// loop. We deliberately do not include the thread's full message history:
+/// the reviewer needs only the call itself plus a sliver of context (cwd) to
+/// make a sound decision, and excluding history keeps the reviewer's own
+/// provider-side prompt cache hot across calls.
+/// Cap for any individual string field inside the reviewer prompt's tool
+/// payload. The reviewer only needs enough context to judge safety; 2 KiB is
+/// well past any plausible `command` / `path` / `pattern` while keeping a
+/// 50 KiB `write_file` content from blowing the prompt budget.
+const REVIEWER_FIELD_CAP: usize = 2048;
+
+/// Deep-clone a `serde_json::Value`, replacing any string field longer than
+/// [`REVIEWER_FIELD_CAP`] with a truncated form: the longest char-aligned
+/// prefix not exceeding [`REVIEWER_FIELD_CAP`] bytes, plus a byte-length
+/// marker. The original value is left intact — only the reviewer's serialized
+/// view is affected.
+fn truncate_tool_input(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.len() <= REVIEWER_FIELD_CAP {
+                v.clone()
+            } else {
+                // Snap the cut to the nearest preceding char boundary so a
+                // multi-byte UTF-8 sequence is never split mid-character.
+                let head_end = s.floor_char_boundary(REVIEWER_FIELD_CAP);
+                let head = &s[..head_end];
+                serde_json::Value::String(format!(
+                    "{head}…[truncated {} bytes]",
+                    s.len() - head_end
+                ))
+            }
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(truncate_tool_input).collect())
+        }
+        serde_json::Value::Object(o) => {
+            let mut m = serde_json::Map::with_capacity(o.len());
+            for (k, v) in o {
+                m.insert(k.clone(), truncate_tool_input(v));
+            }
+            serde_json::Value::Object(m)
+        }
+        _ => v.clone(),
+    }
+}
+
+// too_many_arguments: each parameter is a distinct review input the caller
+// already holds as a separate owned value; bundling them into a struct would
+// reshape the public side-call API for one call site. Mirrors the same allow
+// used on `claude_md::push_source` and the bash entry points.
+#[allow(clippy::too_many_arguments)]
+pub async fn review(
+    model: &AnyLanguageModel,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_title: &str,
+    cwd: &Path,
+    lang: agent::language::Language,
+    cancel: CancellationToken,
+    cx: &AsyncApp,
+) -> ReviewOutcome {
+    let policy = crate::settings_ext::side_calls().approval_policy();
+    let model = crate::settings_ext::side_call_model(&policy, model);
+    let model_name = model.name();
+    let user_prompt = agent::prompt::render(
+        agent::prompt::PromptTemplate::SideCallApprovalUser,
+        lang,
+        &agent::prompt::ApprovalReviewPromptData {
+            cwd: cwd.display().to_string(),
+            tool_name: tool_name.to_string(),
+            tool_title: tool_title.to_string(),
+            tool_input: serde_json::to_string_pretty(&truncate_tool_input(tool_input))
+                .unwrap_or_else(|_| "<unprintable input>".to_string()),
+        },
+    )
+    .expect("approval user prompt render");
+
+    let request = LanguageModelRequest {
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(
+                    agent::prompt::render_static(
+                        agent::prompt::PromptTemplate::SideCallApprovalSystem,
+                        lang,
+                    )
+                    .expect("approval system prompt render"),
+                )],
+                cache: true,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(user_prompt)],
+                cache: false,
+            },
+        ],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: Some(0.0),
+        thinking_allowed: false,
+        reasoning_effort: agent::settings::side_call_effort(
+            &crate::settings_ext::side_calls().approval_policy(),
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: agent::settings::side_call_output_cap(
+            crate::settings_ext::side_calls().approval_policy(),
+        ),
+    };
+
+    let model = Arc::clone(&model);
+    let call = async move {
+        let stream = match model.stream_completion(request, cx).await {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        futures::pin_mut!(stream);
+        let mut text = String::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            let Ok(event) = event else { return None };
+            match event {
+                LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
+                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
+                LanguageModelCompletionEvent::Stop(_) => break,
+                _ => {}
+            }
+        }
+        Some((text, usage))
+    };
+
+    // Race the reviewer call against a hard deadline and cancellation. `review`
+    // runs inline on the gpui foreground executor — there is no tokio runtime
+    // context here, so `tokio::time::timeout` would panic at `Handle::current`
+    // and abort the process. The timer comes from the gpui executor instead.
+    // `call` is itself safe on the foreground executor: `stream_completion`
+    // spawns its HTTP work onto the global tokio runtime and forwards events
+    // back through an executor-agnostic async_channel.
+    let outcome = tokio::select! {
+        result = call => result,
+        _ = cx.background_executor().timer(REVIEW_TIMEOUT) => None,
+        _ = cancel.cancelled() => None,
+    };
+    let Some((text, usage)) = outcome else {
+        return ReviewOutcome {
+            verdict: ReviewVerdict::Ask {
+                reason: "autopilot reviewer unavailable; tool call denied".to_string(),
+            },
+            usage: None,
+            model_name,
+        };
+    };
+
+    ReviewOutcome {
+        verdict: parse_verdict(&text).unwrap_or(ReviewVerdict::Ask {
+            reason: "autopilot reviewer response unparseable; tool call denied".to_string(),
+        }),
+        usage,
+        model_name,
+    }
+}
+
+fn parse_verdict(text: &str) -> Option<ReviewVerdict> {
+    let trimmed = text.trim();
+    // Plain JSON: just parse it.
+    if let Some(v) = try_parse_payload(trimmed) {
+        return verdict_from(v);
+    }
+    // Prose-wrapped JSON. The reviewer prompt forbids extra text, but
+    // models occasionally add a preamble or, worse, an example in the same
+    // response. Take the most-recently-emitted balanced `{...}` block so a
+    // trailing format example doesn't swallow the actual answer.
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] != b'{' {
+            continue;
+        }
+        if let Some(end) = find_matching_close(bytes, i)
+            && let Some(payload) = try_parse_payload(&trimmed[i..=end])
+        {
+            return verdict_from(payload);
+        }
+    }
+    None
+}
+
+fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut j = start;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if escape {
+            escape = false;
+        } else if c == b'\\' {
+            escape = true;
+        } else if c == b'"' {
+            in_string = !in_string;
+        } else if !in_string {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+fn try_parse_payload(s: &str) -> Option<VerdictPayload> {
+    serde_json::from_str(s).ok()
+}
+
+fn verdict_from(payload: VerdictPayload) -> Option<ReviewVerdict> {
+    let reason = payload
+        .reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+    match payload.verdict.to_ascii_uppercase().as_str() {
+        "ALLOW" => Some(ReviewVerdict::Allow),
+        "ASK" => Some(ReviewVerdict::Ask {
+            reason: reason.unwrap_or_else(|| "autopilot reviewer denied the call".to_string()),
+        }),
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PendingReviewModel;
+
+    impl crate::language_model::LanguageModel for PendingReviewModel {
+        fn id(&self) -> String {
+            "test/pending-review".into()
+        }
+        fn name(&self) -> String {
+            "pending-review".into()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+
+        fn api_key(&self) -> &str {
+            ""
+        }
+
+        fn base_url(&self) -> &str {
+            ""
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            Box::pin(futures::future::pending())
+        }
+    }
+
+    #[test]
+    fn parses_allow_without_reason() {
+        let v = parse_verdict(r#"{"verdict":"ALLOW"}"#).unwrap();
+        assert_eq!(v, ReviewVerdict::Allow);
+    }
+
+    #[test]
+    fn parses_ask_with_reason() {
+        let v = parse_verdict(r#"{"verdict":"ASK","reason":"network access"}"#).unwrap();
+        assert_eq!(
+            v,
+            ReviewVerdict::Ask {
+                reason: "network access".into()
+            }
+        );
+    }
+
+    #[test]
+    fn tolerates_surrounding_prose_and_fences() {
+        let v = parse_verdict("Here is my judgment:\n```json\n{\"verdict\":\"ALLOW\",\"reason\":\"read-only\"}\n```\n").unwrap();
+        assert_eq!(
+            v,
+            ReviewVerdict::Allow,
+            "should drop preamble and code fences"
+        );
+    }
+
+    #[test]
+    fn falls_through_on_unknown_verdict() {
+        assert!(parse_verdict(r#"{"verdict":"MAYBE"}"#).is_none());
+    }
+
+    #[test]
+    fn falls_through_on_garbage() {
+        assert!(parse_verdict("not json at all").is_none());
+    }
+
+    #[test]
+    fn picks_latest_object_when_format_example_precedes() {
+        // The reviewer prompt forbids prose, but a model may still wrap the
+        // answer in text or, worse, include a format example before its
+        // actual verdict. The brace-scan should prefer the most recently
+        // emitted object, not the first one.
+        let v = parse_verdict(
+            r#"Format: {"verdict":"ALLOW"} and my answer: {"verdict":"ASK","reason":"risky"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            ReviewVerdict::Ask {
+                reason: "risky".into()
+            }
+        );
+    }
+
+    #[test]
+    fn truncate_tool_input_caps_long_string_fields() {
+        let big = "x".repeat(10_000);
+        let v = serde_json::json!({
+            "command": "ls -la",
+            "content": big,
+            "nested": { "deep": big.clone() },
+            "list": ["short", big.clone()],
+        });
+        let out = truncate_tool_input(&v);
+        assert_eq!(out["command"], "ls -la");
+        let content = out["content"].as_str().unwrap();
+        assert!(content.starts_with(&"x".repeat(REVIEWER_FIELD_CAP)));
+        assert!(content.contains("truncated"));
+        let deep = out["nested"]["deep"].as_str().unwrap();
+        assert!(deep.contains("truncated"));
+        let arr = out["list"].as_array().unwrap();
+        assert_eq!(arr[0], "short");
+        assert!(arr[1].as_str().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_tool_input_truncates_multibyte_at_char_boundary() {
+        // REVIEWER_FIELD_CAP (2048) is not divisible by 3, so byte-slicing a
+        // long CJK string would land mid-character and panic. The cut must
+        // snap to the preceding char boundary instead.
+        let big = "文".repeat(4_000); // 12_000 bytes
+        let out = truncate_tool_input(&serde_json::json!({ "content": big }));
+        let content = out["content"].as_str().unwrap();
+        assert!(content.starts_with('文'));
+        assert!(content.contains("…[truncated "));
+        let head_end = content.find('…').unwrap();
+        assert!(head_end <= REVIEWER_FIELD_CAP);
+        assert!(content.is_char_boundary(head_end));
+    }
+
+    #[test]
+    fn batch_parser_fails_closed_per_missing_or_malformed_id() {
+        let items = vec![
+            ReviewItem {
+                id: "a".into(),
+                tool_name: "Read".into(),
+                tool_title: "read".into(),
+                tool_input: serde_json::json!({}),
+            },
+            ReviewItem {
+                id: "b".into(),
+                tool_name: "Bash".into(),
+                tool_title: "bash".into(),
+                tool_input: serde_json::json!({}),
+            },
+            ReviewItem {
+                id: "c".into(),
+                tool_name: "Write".into(),
+                tool_title: "write".into(),
+                tool_input: serde_json::json!({}),
+            },
+        ];
+        let parsed = parse_batch_verdicts(
+            r#"[{"id":"a","verdict":"ALLOW"},{"id":"b","verdict":"MAYBE"}]"#,
+            &items,
+        );
+        assert_eq!(parsed["a"], ReviewVerdict::Allow);
+        assert!(matches!(parsed["b"], ReviewVerdict::Ask { .. }));
+        assert!(matches!(parsed["c"], ReviewVerdict::Ask { .. }));
+    }
+
+    #[test]
+    fn batch_timeout_fails_closed_for_every_id() {
+        use std::sync::{Arc, Mutex};
+
+        let items = vec![
+            ReviewItem {
+                id: "a".into(),
+                tool_name: "Bash".into(),
+                tool_title: "bash".into(),
+                tool_input: serde_json::json!({"command":"echo a"}),
+            },
+            ReviewItem {
+                id: "b".into(),
+                tool_name: "Write".into(),
+                tool_title: "write".into(),
+                tool_input: serde_json::json!({"path":"b"}),
+            },
+        ];
+        let model: AnyLanguageModel = Arc::new(PendingReviewModel);
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        let cx = gpui::TestAppContext::single();
+        cx.spawn(|cx| {
+            let cx = cx.clone();
+            async move {
+                let outcome = review_batch_with_timeout(
+                    &model,
+                    &items,
+                    Path::new("/tmp"),
+                    agent::language::Language::En,
+                    CancellationToken::new(),
+                    Duration::from_millis(5),
+                    &cx,
+                )
+                .await;
+                *captured.lock().unwrap() = Some(outcome);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        let outcome = result.lock().unwrap().take().expect("review timeout");
+        assert_eq!(outcome.verdicts.len(), 2);
+        assert!(
+            outcome
+                .verdicts
+                .values()
+                .all(|verdict| matches!(verdict, ReviewVerdict::Ask { .. }))
+        );
+        assert!(outcome.usage.is_none());
+    }
+}

@@ -1,11 +1,9 @@
 //! Plugin, skill, marketplace, and MCP management view.
 
-use agent::{
-    i18n,
-    mcp::config::{self as mcp_config, McpServerConfig, McpServerTransportConfig},
-    plugin::PluginManager,
-    skill::{self, SkillOrigin, UserSkillDraft},
-};
+use agent::i18n;
+use agent::plugin::PluginManager;
+use harness_manox::mcp::config::{self as mcp_config, McpServerConfig, McpServerTransportConfig};
+use harness_manox::skill::{self, SkillOrigin, UserSkillDraft};
 use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,

@@ -35,6 +35,9 @@ use async_channel::{Receiver, Sender};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
+#[cfg(feature = "harness-manox")]
+use harness_manox::thread::{Thread, ThreadEvent};
+#[cfg(not(feature = "harness-manox"))]
 use agent::thread::{Thread, ThreadEvent};
 use agent::webview_host::{
     BrowserHost, BrowserInboundWrite as AgentInboundWrite,

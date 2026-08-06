@@ -13,8 +13,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::provider::registry;
-use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
+#[cfg(feature = "harness-manox")]
+use harness_manox::{ThreadStore, ThreadStoreEvent};
+#[cfg(not(feature = "harness-manox"))]
+use agent::{ThreadStore, ThreadStoreEvent};
+use agent::i18n;
+use agent::thread::ApprovalMode;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
@@ -160,6 +164,9 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
+        #[cfg(feature = "harness-manox")]
+        let store = harness_manox::thread_store_global();
+        #[cfg(not(feature = "harness-manox"))]
         let store = agent::thread_store_global();
         let sub = cx.subscribe(
             &store,
@@ -765,12 +772,14 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
 }
 
 /// Build the provider→model cascade inside an external-agent submenu. Models
-/// are drawn from `registry::global().models()` filtered by the agent's id
-/// (`visible_agents`); they are grouped by provider, each provider a nested
-/// submenu. Picking a model emits `SpawnExternalSession(kind, provider, model,
-/// project)` to the sidebar — the project path (if any) is read from the
-/// sidebar's `new_session_project` field so the workspace can set the CWD for
-/// external CLI sessions.
+/// are drawn from the shared pi provider registry, filtered by the agent's id
+/// (registration metadata `agents`, empty = visible to all); they are grouped
+/// by provider display name, each provider a nested submenu. Picking a model
+/// emits `SpawnExternalSession(kind, provider, model, project)` to the
+/// sidebar — the project path (if any) is read from the sidebar's
+/// `new_session_project` field so the workspace can set the CWD for external
+/// CLI sessions. The emitted model id is the raw cx config key
+/// (`metadata["config_id"]`), which cx matches verbatim.
 fn build_agent_model_cascade(
     menu: PopupMenu,
     kind: crate::external_session::SessionKind,
@@ -779,18 +788,46 @@ fn build_agent_model_cascade(
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
-    for m in registry::global().models() {
-        if !m.visible_agents().iter().any(|a| a == agent_id) {
+    /// One cascade entry: the raw cx config key plus its display name.
+    struct Entry {
+        config_id: String,
+        display: String,
+    }
+    let mut providers: Vec<(String, Vec<Entry>)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for m in agent::pi_providers::global().models() {
+        // Missing metadata = non-cx registration (visible); otherwise the
+        // effective agent list must contain the cascade's agent (parity
+        // with the retired manox `visible_agents` filter).
+        let visible = m
+            .metadata
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .map(|list| list.iter().any(|a| a.as_str().is_some_and(|a| a == agent_id)))
+            .unwrap_or(true);
+        if !visible {
             continue;
         }
-        let prov = m.provider_name().to_string();
+        let prov = agent::pi_providers::display_provider_name(&m);
+        let config_id = m
+            .metadata
+            .get("config_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(m.id.as_str())
+            .to_string();
+        if !seen.insert((prov.clone(), config_id.clone())) {
+            continue; // same model registered on several wire apis
+        }
+        let entry = Entry {
+            config_id,
+            display: agent::pi_providers::display_name(&m),
+        };
         if let Some(last) = providers.last_mut()
             && last.0 == prov
         {
-            last.1.push(m.clone());
+            last.1.push(entry);
         } else {
-            providers.push((prov, vec![m.clone()]));
+            providers.push((prov, vec![entry]));
         }
     }
 
@@ -801,12 +838,13 @@ fn build_agent_model_cascade(
     }
     for (prov_name, models) in providers {
         let sidebar = sidebar.clone();
+        let prov_for_items = prov_name.clone();
         menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
             let mut submenu = submenu;
             for m in &models {
-                let model_id = m.name().to_string();
-                let model_name = m.name().to_string();
-                let prov = m.provider_name().to_string();
+                let model_id = m.config_id.clone();
+                let model_name = m.display.clone();
+                let prov = prov_for_items.clone();
                 let sidebar = sidebar.clone();
                 submenu = submenu.item(
                     PopupMenuItem::element(move |_window, _cx| {

@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 
 use agent::language_model::{MessageContent, StopReason, TokenUsage};
-use agent::tools::agent::{agent_metrics, agent_sub_messages};
-use agent::{Message, Thread, ThreadEvent, ToolCallStatus, i18n};
+#[cfg(feature = "harness-manox")]
+use harness_manox::tools::agent::{agent_metrics, agent_sub_messages};
+use harness_manox::{Thread, ThreadEvent};
+use agent::{Message, ToolCallStatus, i18n};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, SharedString, Subscription,

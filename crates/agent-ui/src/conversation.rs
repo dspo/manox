@@ -14,7 +14,11 @@ use std::time::Instant;
 use agent::db::{UiNoteKind, UiNoteRecord};
 use agent::language_model::{MessageContent, Role, StopReason};
 use agent::thread::ApprovalMode;
-use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
+#[cfg(feature = "harness-manox")]
+use harness_manox::ThreadEvent;
+#[cfg(not(feature = "harness-manox"))]
+use agent::ThreadEvent;
+use agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
