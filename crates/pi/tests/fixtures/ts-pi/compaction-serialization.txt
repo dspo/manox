@@ -2,6 +2,6 @@
 
 [Assistant]: hi
 
-[Assistant tool calls]: read(path="a.rs")
+[Assistant tool calls]: Read(path="a.rs")
 
 [Tool result]: ok

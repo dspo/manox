@@ -244,7 +244,7 @@ mod tests {
     fn explore_manifest_parses() {
         let def = explore_agent_def();
         assert_eq!(def.name, "Explore");
-        assert_eq!(def.tools, vec!["read", "grep", "find", "ls"]);
+        assert_eq!(def.tools, vec!["Read", "Grep", "Find", "Ls"]);
         assert!(def.system_prompt.contains("read-only codebase"));
         assert!(def.description.to_lowercase().contains("read-only"));
     }
@@ -257,13 +257,13 @@ mod tests {
         let def = AgentDef {
             name: "X".into(),
             description: "d".into(),
-            tools: vec!["read".into()],
+            tools: vec!["Read".into()],
             model: None,
             system_prompt: "p".into(),
         };
         let selected = select_tools(&tools, &def);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name(), "read");
+        assert_eq!(selected[0].name(), "Read");
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
         };
         let selected = select_tools(&tools, &def);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name(), "read");
+        assert_eq!(selected[0].name(), "Read");
     }
 
     #[test]

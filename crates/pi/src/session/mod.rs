@@ -1030,7 +1030,7 @@ mod tests {
                 id: "at".into(),
                 parent_id: Some("a1".into()),
                 timestamp: Utc::now(),
-                active_tool_names: vec!["read".into(), "bash".into()],
+                active_tool_names: vec!["Read".into(), "Bash".into()],
             },
             SessionTreeEntry::ThinkingLevelChange {
                 id: "t2".into(),
@@ -1059,7 +1059,7 @@ mod tests {
         // The latest active_tools_change carries the narrowed subset.
         assert_eq!(
             active_tool_names,
-            Some(vec!["read".to_string(), "bash".to_string()])
+            Some(vec!["Read".to_string(), "Bash".to_string()])
         );
     }
 

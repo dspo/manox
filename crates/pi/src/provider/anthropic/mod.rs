@@ -624,7 +624,7 @@ mod tests {
                 index: 0,
                 content_block: WireContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::Value::Null,
                 },
             },
@@ -645,7 +645,7 @@ mod tests {
                     id, name, input, ..
                 } => {
                     assert_eq!(id, "t1");
-                    assert_eq!(name, "read");
+                    assert_eq!(name, "Read");
                     assert_eq!(*input, serde_json::json!({"path": "x.rs"}));
                 }
                 other => panic!("expected tool_use, got {other:?}"),
@@ -724,7 +724,7 @@ mod tests {
                 index: 0,
                 content_block: WireContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::Value::Null,
                 },
             },

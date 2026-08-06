@@ -17,7 +17,7 @@ pub struct WriteTool;
 #[async_trait::async_trait]
 impl AgentTool for WriteTool {
     fn name(&self) -> &str {
-        "write"
+        "Write"
     }
 
     fn description(&self) -> &str {

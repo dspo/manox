@@ -75,8 +75,8 @@ mod tests {
     fn test_tool_registry() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(read::ReadTool));
-        assert_eq!(registry.names(), vec!["read"]);
-        assert!(registry.get("read").is_some());
+        assert_eq!(registry.names(), vec!["Read"]);
+        assert!(registry.get("Read").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 
@@ -85,13 +85,13 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register_defaults();
         let names = registry.names();
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"write"));
-        assert!(names.contains(&"edit"));
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"find"));
-        assert!(names.contains(&"ls"));
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Find"));
+        assert!(names.contains(&"Ls"));
         assert_eq!(names.len(), 7);
     }
 }

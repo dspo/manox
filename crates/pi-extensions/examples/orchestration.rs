@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             signature: None,
         }]),
         assistant(vec![tool_use(
-            "read",
+            "Read",
             serde_json::json!({ "path": target_str }),
         )]),
     ];

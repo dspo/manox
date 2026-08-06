@@ -774,7 +774,7 @@ mod tests {
             "content": [{
                 "type": "toolCall",
                 "id": "tc_1",
-                "name": "read",
+                "name": "Read",
                 "arguments": {"path": "/etc/hosts"}
             }],
             "model": "claude-opus-4-7",
@@ -805,7 +805,7 @@ mod tests {
                         id, name, input, ..
                     } => {
                         assert_eq!(id, "tc_1");
-                        assert_eq!(name, "read");
+                        assert_eq!(name, "Read");
                         assert_eq!(input, &json!({"path": "/etc/hosts"}));
                     }
                     other => panic!("expected ToolUse block, got {other:?}"),
@@ -833,7 +833,7 @@ mod tests {
         let tool_result = json!({
             "role": "toolResult",
             "toolCallId": "tc_1",
-            "toolName": "read",
+            "toolName": "Read",
             "content": [{"type": "text", "text": "127.0.0.1 localhost"}],
             "isError": false
         });
@@ -846,7 +846,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_call_id, "tc_1");
-                assert_eq!(tool_name, "read");
+                assert_eq!(tool_name, "Read");
                 assert!(!is_error);
             }
             other => panic!("expected ToolResult, got {other:?}"),
@@ -854,7 +854,7 @@ mod tests {
         let tr_reround = serde_json::to_value(&tr).unwrap();
         assert_eq!(tr_reround["role"], "toolResult");
         assert_eq!(tr_reround["toolCallId"], "tc_1");
-        assert_eq!(tr_reround["toolName"], "read");
+        assert_eq!(tr_reround["toolName"], "Read");
         assert_eq!(tr_reround["isError"], false);
     }
 
@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn bash_execution_omits_unset_optional_fields() {
         let msg = AgentMessage::BashExecution {
-            command: "ls".into(),
+            command: "Ls".into(),
             output: String::new(),
             exit_code: None,
             cancelled: true,

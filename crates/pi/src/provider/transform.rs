@@ -248,7 +248,7 @@ mod tests {
     fn tool_result(id: &str) -> AgentMessage {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: "ok".into(),
                 signature: None,
@@ -272,7 +272,7 @@ mod tests {
     fn orphan_at_end_gains_synthetic_error_result() {
         let messages = vec![
             AgentMessage::user("q"),
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
         ];
         let repaired = repair_tool_flow(&messages);
         assert_eq!(repaired.len(), 3);
@@ -285,7 +285,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(tool_call_id, "c1");
-                assert_eq!(tool_name, "read");
+                assert_eq!(tool_name, "Read");
                 assert!(is_error);
                 assert!(
                     matches!(&content[0], ContentBlock::Text { text, .. } if text == NO_RESULT_TEXT)
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn orphan_interrupted_by_user_is_paired_before_it() {
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             AgentMessage::user("next"),
         ];
         let repaired = repair_tool_flow(&messages);
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn orphan_interrupted_by_assistant_is_paired_between() {
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             assistant(vec![ContentBlock::Text {
                 text: "answer".into(),
                 signature: None,
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn only_unresolved_calls_gain_synthetic_results() {
         let messages = vec![
-            assistant(vec![tool_use("c1", "read"), tool_use("c2", "write")]),
+            assistant(vec![tool_use("c1", "Read"), tool_use("c2", "Write")]),
             tool_result("c1"),
             AgentMessage::user("next"),
         ];
@@ -342,7 +342,7 @@ mod tests {
     fn resolved_turns_pass_through_unchanged() {
         let messages = vec![
             AgentMessage::user("q"),
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             tool_result("c1"),
             assistant(vec![ContentBlock::Text {
                 text: "done".into(),
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn unconverted_custom_messages_do_not_close_a_tool_turn() {
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             AgentMessage::Custom {
                 custom_type: "note".into(),
                 content: vec![],
@@ -383,7 +383,7 @@ mod tests {
         // repair runs, so it ends the turn and the synthetic result precedes
         // it rather than following it.
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             AgentMessage::Custom {
                 custom_type: "note".into(),
                 content: vec![],
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn converted_bash_execution_closes_the_tool_turn() {
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             bash("hi", Some(0), false),
         ];
         let prepared = prepare_for_wire(&messages);
@@ -578,7 +578,7 @@ mod tests {
         // prefixes do not shift.
         let messages = vec![
             AgentMessage::user("q"),
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             tool_result("c1"),
             assistant(vec![ContentBlock::Text {
                 text: "done".into(),
@@ -598,7 +598,7 @@ mod tests {
         // vanish — the call is partial and must not be paired or replayed.
         let messages = vec![
             AgentMessage::user("q"),
-            terminal_assistant(vec![tool_use("c1", "read")], StopReason::Aborted),
+            terminal_assistant(vec![tool_use("c1", "Read")], StopReason::Aborted),
             AgentMessage::user("retry"),
         ];
         let repaired = repair_tool_flow(&messages);
@@ -612,7 +612,7 @@ mod tests {
         // A prior normal turn's unresolved call is paired before the terminal
         // assistant is dropped — the dropped turn still ends the prior one.
         let messages = vec![
-            assistant(vec![tool_use("c1", "read")]),
+            assistant(vec![tool_use("c1", "Read")]),
             terminal_assistant(
                 vec![ContentBlock::Text {
                     text: "boom".into(),

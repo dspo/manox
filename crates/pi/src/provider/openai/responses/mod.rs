@@ -974,7 +974,7 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":""}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"Read","arguments":""}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
@@ -983,7 +983,7 @@ mod tests {
         .await
         .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"x\"}"}"#).await.unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"Read","arguments":"{\"path\":\"x\"}"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
@@ -1010,7 +1010,7 @@ mod tests {
         };
         // The block id keeps both halves of the wire identity.
         assert_eq!(id, "call_1|fc_1");
-        assert_eq!(name, "read");
+        assert_eq!(name, "Read");
         assert_eq!(*input, json!({"path": "x"}));
     }
 

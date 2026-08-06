@@ -364,7 +364,7 @@ mod tests {
             Some("a"),
             AgentMessage::ToolResult {
                 tool_call_id: "t1".into(),
-                tool_name: "read".into(),
+                tool_name: "Read".into(),
                 content: vec![ContentBlock::Text {
                     text: "ok".into(),
                     signature: None,
@@ -441,13 +441,13 @@ mod tests {
             message_entry(
                 "a1",
                 Some("u1"),
-                assistant_with_tool_use("write", serde_json::json!({"path": "a.rs"})),
+                assistant_with_tool_use("Write", serde_json::json!({"path": "a.rs"})),
             ),
             message_entry("u2", Some("a1"), make_user("second")),
             message_entry(
                 "a2",
                 Some("u2"),
-                assistant_with_tool_use("read", serde_json::json!({"path": "b.rs"})),
+                assistant_with_tool_use("Read", serde_json::json!({"path": "b.rs"})),
             ),
         ];
         // A budget that admits the newest message but not the pair keeps only
@@ -466,7 +466,7 @@ mod tests {
                 Some("a1"),
                 AgentMessage::ToolResult {
                     tool_call_id: "t1".into(),
-                    tool_name: "write".into(),
+                    tool_name: "Write".into(),
                     content: vec![ContentBlock::Text {
                         text: "ok".into(),
                         signature: None,

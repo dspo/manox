@@ -790,13 +790,13 @@ pub(crate) fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut Fi
                 continue;
             };
             match name.as_str() {
-                "read" => {
+                "Read" => {
                     ops.read.insert(path.to_string());
                 }
-                "write" => {
+                "Write" => {
                     ops.written.insert(path.to_string());
                 }
-                "edit" => {
+                "Edit" => {
                     ops.edited.insert(path.to_string());
                 }
                 _ => {}
@@ -856,8 +856,8 @@ mod tests {
     fn find_cut_point_split_detects_mid_turn_cut() {
         let msgs = vec![
             make_user("do the work"),
-            make_tool_use_assistant("t1", "read", "a.rs"),
-            make_tool_result("t1", "read"),
+            make_tool_use_assistant("t1", "Read", "a.rs"),
+            make_tool_result("t1", "Read"),
             make_assistant("done"),
         ];
         // keep=1 retains only the final assistant: the cut lands at index 3,
@@ -1055,7 +1055,7 @@ mod tests {
                 },
                 ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),                     // 4
+                    name: "Read".into(),                     // 4
                     input: serde_json::json!({"path": "x"}), // 12
                     thought_signature: None,
                 },
@@ -1078,7 +1078,7 @@ mod tests {
         // Tool result counts its text.
         let result = AgentMessage::ToolResult {
             tool_call_id: "t1".into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: "12345678".into(),
                 signature: None,
@@ -1266,10 +1266,10 @@ mod tests {
     fn find_cut_point_never_splits_tool_chain() {
         let msgs = vec![
             make_user("do the work"),
-            make_tool_use_assistant("t1", "read", "a.rs"),
-            make_tool_result("t1", "read"),
-            make_tool_use_assistant("t2", "edit", "b.rs"),
-            make_tool_result("t2", "edit"),
+            make_tool_use_assistant("t1", "Read", "a.rs"),
+            make_tool_result("t1", "Read"),
+            make_tool_use_assistant("t2", "Edit", "b.rs"),
+            make_tool_result("t2", "Edit"),
             make_assistant("done"),
         ];
         // Dense budget sweep — the token estimates are [3,5,1,5,1,1] (sum 16),
@@ -1324,9 +1324,9 @@ mod tests {
         // would orphan the result, so find_safe_cut advances past both the
         // Custom and the result to the trailing user.
         let mid_chain = vec![
-            make_tool_use_assistant("c1", "read", "a.rs"),
+            make_tool_use_assistant("c1", "Read", "a.rs"),
             custom(),
-            make_tool_result("c1", "read"),
+            make_tool_result("c1", "Read"),
             make_user("next"),
         ];
         assert_eq!(find_safe_cut(&mid_chain, 1), 3);
@@ -1388,7 +1388,7 @@ mod tests {
                     },
                     ContentBlock::ToolUse {
                         id: "t1".into(),
-                        name: "read".into(),
+                        name: "Read".into(),
                         input: serde_json::json!({"path": "a.rs", "offset": 3}),
                         thought_signature: None,
                     },
@@ -1407,7 +1407,7 @@ mod tests {
             },
             AgentMessage::ToolResult {
                 tool_call_id: "t1".into(),
-                tool_name: "read".into(),
+                tool_name: "Read".into(),
                 content: vec![ContentBlock::Text {
                     text: long_result.clone(),
                     signature: None,
@@ -1426,7 +1426,7 @@ mod tests {
         assert!(text.contains("[Assistant thinking]: weighing options"));
         assert!(text.contains("[Assistant]: answer"));
         // json! literal order (TS Object.entries insertion order):
-        assert!(text.contains("[Assistant tool calls]: read(path=\"a.rs\", offset=3)"));
+        assert!(text.contains("[Assistant tool calls]: Read(path=\"a.rs\", offset=3)"));
         // Tool results survive, truncated to the budget with a drop marker.
         assert!(text.contains(&format!("[Tool result]: {}", "r".repeat(2000))));
         assert!(text.contains("[... 100 more characters truncated]"));

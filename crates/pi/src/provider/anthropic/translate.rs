@@ -369,7 +369,7 @@ mod tests {
     fn tool_result(id: &str, text: &str) -> AgentMessage {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: text.into(),
                 signature: None,
@@ -386,7 +386,7 @@ mod tests {
         AgentMessage::Assistant {
             content: vec![ContentBlock::ToolUse {
                 id: id.into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: json!({"path": "x"}),
                 thought_signature: None,
             }],
