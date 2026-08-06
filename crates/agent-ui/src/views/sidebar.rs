@@ -517,7 +517,10 @@ impl Render for Sidebar {
         let mut projects: Vec<(String, Vec<agent::ThreadSummary>)> = Vec::new();
         let mut loose: Vec<agent::ThreadSummary> = Vec::new();
         for s in &summaries {
-            if s.project.is_empty() {
+            // Only REGISTERED projects become folder groups; a session cwd
+            // that was never bound as a project (e.g. the default home dir)
+            // stays in the loose Conversations list.
+            if s.project.is_empty() || !known_projects.contains(&s.project) {
                 loose.push(s.clone());
             } else if let Some(entry) = projects.iter_mut().find(|(p, _)| *p == s.project) {
                 entry.1.push(s.clone());
