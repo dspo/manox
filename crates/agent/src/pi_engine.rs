@@ -324,7 +324,12 @@ async fn run_actor(
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
-        let tool_cwd = PathBuf::from(info.cwd.clone());
+        // Sessions created by a GUI launch (process cwd `/`) persisted a
+        // useless cwd; heal them to this launch's default instead.
+        let mut tool_cwd = PathBuf::from(info.cwd.clone());
+        if tool_cwd.as_os_str() == "/" {
+            tool_cwd = cwd.clone();
+        }
         let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, &pi_model);
         match builder.open(info.path).await {
             Ok(s) => {
@@ -472,6 +477,7 @@ async fn run_actor(
                     &sessions_dir,
                     &runtime,
                     &pi_model,
+                    &cwd,
                     &notice_tx,
                 )
                 .await;
@@ -516,6 +522,7 @@ async fn rebuild_session(
     sessions_dir: &Path,
     runtime: &ModelRuntime,
     model: &PiModel,
+    fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
@@ -530,7 +537,14 @@ async fn rebuild_session(
                 .find(|info| info.path == path)
                 .map(|info| PathBuf::from(info.cwd))
         })
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map(|cwd| {
+            if cwd.as_os_str() == "/" {
+                fallback_cwd.to_path_buf()
+            } else {
+                cwd
+            }
+        })
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
     let builder = session_builder(&cwd, sessions_dir, runtime, model);
     match builder.open(path.to_path_buf()).await {
         Ok(s) => *session = s,
@@ -679,7 +693,11 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
         model_id: String::new(),
         provider_id: None,
         approval_mode: 0,
-        project: info.cwd.clone(),
+        project: if info.cwd == "/" {
+            String::new()
+        } else {
+            info.cwd.clone()
+        },
         depth: 0,
         parent_id: info.parent_session_path.clone(),
         archived: false,
