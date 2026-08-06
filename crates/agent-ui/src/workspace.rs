@@ -631,10 +631,10 @@ impl Workspace {
         // A GUI launch (Finder / Dock / `open`) leaves the process cwd at
         // `/` — a meaningless working directory for a workbench. Fall back
         // to the home dir; binding a project via the chip still wins.
-        if cwd.as_os_str() == "/" {
-            if let Some(home) = agent::paths::home_dir() {
-                cwd = home;
-            }
+        if cwd.as_os_str() == "/"
+            && let Some(home) = agent::paths::home_dir()
+        {
+            cwd = home;
         }
         let auto_compact = settings::load().auto_compact;
         let thread = {
