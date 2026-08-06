@@ -1,3 +1,6 @@
+// The manox harness tool implementations (compiled with `cfg(not(harness-pi))`).
+// `requires_approval` gates the approval overlay: write_file / edit_file /
+// ask_user always require it; `bash` requires it on `unsandboxed: true`
 // escalation or when no OS sandbox backend is available (see [`bash`]).
 
 #[cfg(not(feature = "harness-pi"))]

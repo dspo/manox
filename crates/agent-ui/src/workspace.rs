@@ -3374,7 +3374,6 @@ impl Workspace {
     }
 
     #[cfg(feature = "harness-manox")]
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn register_live_subagent(
         &mut self,
         root_thread_id: String,
@@ -3462,7 +3461,6 @@ impl Workspace {
     }
 
     #[cfg(feature = "harness-manox")]
-    #[cfg(feature = "harness-manox")]
     fn rebuild_subagent_observations(
         &mut self,
         snapshots: Vec<SubagentSnapshot>,
@@ -3482,7 +3480,6 @@ impl Workspace {
         self.sync_subagents_to_rail(cx);
     }
 
-    #[cfg(feature = "harness-manox")]
     #[cfg(feature = "harness-manox")]
     fn close_subagent_tabs(&mut self) {
         remove_subagent_tabs(&mut self.right_tabs, &mut self.active_right_tab);

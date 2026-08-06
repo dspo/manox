@@ -146,6 +146,9 @@ impl ThreadEngine for PiEngine {
     }
 
     fn cancel_steer(&self, id: &str) -> bool {
+        // Optimistic: the actor retracts the steer asynchronously. True means
+        // the retraction was queued, not that the message is gone from the
+        // transcript — it may already have been drained into the running turn.
         let _ = self
             .cmd_tx
             .send(SessionCmd::CancelSteer(id.to_string()));

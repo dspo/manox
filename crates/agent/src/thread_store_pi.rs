@@ -127,7 +127,7 @@ impl ThreadStore {
         if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
             s.has_unread = unread;
         }
-        self.write_meta(id, move |meta| meta.unread = unread, cx);
+        self.write_meta(id, move |meta| meta.unread = unread, true, cx);
     }
 
     /// Set the errored flag on a session (persisted in its sidecar).
@@ -140,7 +140,7 @@ impl ThreadStore {
         if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
             s.errored = errored;
         }
-        self.write_meta(id, move |meta| meta.errored = errored, cx);
+        self.write_meta(id, move |meta| meta.errored = errored, true, cx);
     }
 
     /// Re-read the session directory and refresh the summary list. Runs off
@@ -194,13 +194,13 @@ impl ThreadStore {
 
     /// Archive (or unarchive) a session (persisted in its sidecar).
     pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
-        self.write_meta_shared(id, move |meta| meta.archived = archived, cx);
+        self.write_meta(id, move |meta| meta.archived = archived, false, cx);
         self.refresh(cx);
     }
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
     pub fn pin_thread(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
-        self.write_meta_shared(id, move |meta| meta.pinned = pinned, cx);
+        self.write_meta(id, move |meta| meta.pinned = pinned, false, cx);
         self.refresh(cx);
     }
 
@@ -238,10 +238,13 @@ impl ThreadStore {
     }
 
     /// Load the sidecar meta for a session, apply `update`, and write back.
+    /// `refresh_list` emits `SummariesUpdated` for the in-memory flags; the
+    /// archive/pin path refreshes the whole list instead.
     fn write_meta(
         &self,
         id: &str,
         update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + 'static,
+        refresh_list: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(path) = self.session_paths.get(id).cloned() else {
@@ -261,35 +264,10 @@ impl ThreadStore {
                 .ok();
         })
         .detach();
-        cx.emit(ThreadStoreEvent::SummariesUpdated);
-        cx.notify();
-    }
-
-    /// Sidecar write without an in-memory summary update (archive/pin refresh
-    /// the list instead).
-    fn write_meta_shared(
-        &self,
-        id: &str,
-        update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(path) = self.session_paths.get(id).cloned() else {
-            return;
-        };
-        let dir = self.sessions_dir.clone();
-        cx.spawn(async move |_, _| {
-            let handle = crate::runtime::handle();
-            handle
-                .spawn(async move {
-                    if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
-                        update(&mut meta);
-                        let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
-                    }
-                })
-                .await
-                .ok();
-        })
-        .detach();
+        if refresh_list {
+            cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
     }
 }
 

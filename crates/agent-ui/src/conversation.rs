@@ -2483,7 +2483,9 @@ mod tests {
     }
 
     /// A legacy `agent` tool result (plain text, no JSON envelope) must still
-    /// render its final text without panicking.
+    /// render its final text without panicking. The `agent` tool is a manox
+    /// harness tool; the pi build skips this test.
+    #[cfg(not(feature = "harness-pi"))]
     #[test]
     fn agent_final_text_falls_back_for_legacy_content() {
         assert_eq!(
