@@ -23,6 +23,7 @@ pub mod conversation;
 pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
+pub mod vscode_app;
 // TODO(pi-wire): slash commands — backed by the manox command/skill registries.
 #[cfg(feature = "harness-manox")]
 pub mod slash_command;
@@ -33,6 +34,7 @@ pub use views::settings::SettingsView;
 pub use workspace::Workspace;
 
 pub use chatgpt_app::LaunchChatGptApp;
+pub use vscode_app::{LaunchVSCode, LaunchVSCodePlain};
 
 // Open/close the right-side markdown composer, plus the global OpenSettings
 // action that flips the Workspace into the Settings overlay. AskPrev/AskNext

@@ -40,6 +40,7 @@ mod probe;
 mod relay;
 mod session;
 mod stats;
+mod vscode_app;
 mod warp;
 
 /// Programmatic agent launch API (builder + live session handle).
@@ -236,6 +237,7 @@ fn canonicalize_agent_name(input: &str) -> String {
         "codex_app" | "codexapp" | "codex.app" | "chatgpt_app" | "chatgptapp" | "chatgpt.app" => {
             "Codex.app".into()
         }
+        "vscode" | "vs-code" | "vs_code" | "vs code" | "vscode.app" => "VS Code".into(),
         other => other.into(),
     }
 }
@@ -1141,6 +1143,101 @@ pub fn launch_chatgpt_app(provider_name: &str, default_model_id: &str) -> Result
     codex_app::launch_with_injection(&selection, &apikey, &[])
 }
 
+/// 构造 VS Code 启动所需的 `Selection`：选中模型即唯一 BYOK 目标（无模型目录
+/// 注入——Claude Code 直接消费 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL env）。
+fn build_vscode_selection(
+    config: &CxConfig,
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+    model_id: &str,
+) -> Result<Selection> {
+    let agent = find_agent(config, "VS Code").context("配置中缺少 `VS Code` agent")?;
+    let provider = providers_for_agent(config, "VS Code")
+        .into_iter()
+        .find(|p| p.name == provider_name)
+        .with_context(|| format!("`VS Code` 下未找到 provider `{provider_name}`"))?;
+    let model = all_models
+        .iter()
+        .find(|m| {
+            m.provider_name == provider_name
+                && m.id == model_id
+                && resolved_model_supports_agent(m, "VS Code")
+                // 显式确认 Anthropic wire（supports_agent 已隐含，防配置层不变量漂移）
+                && m.model_wire_apis.contains(&WireApi::Anthropic)
+        })
+        .with_context(|| {
+            format!("Provider `{provider_name}` 下未找到 VS Code 可用模型 `{model_id}`")
+        })?
+        .clone();
+    Ok(Selection {
+        agent_id: agent.id,
+        agent_binary: agent.binary,
+        agent_args: agent.args,
+        agent_env: agent.env,
+        selected_wire_api: WireApi::Anthropic,
+        provider,
+        model: Some(model),
+        injected_models: Vec::new(),
+    })
+}
+
+/// VS Code 的 API Key 非交互解析（GUI 嵌入路径）：无 stdin 可补齐，缺失即报错。
+fn resolve_vscode_apikey(provider: &ResolvedProvider) -> Result<String> {
+    let Some(source) = provider.apikey_source.as_deref() else {
+        bail!(
+            "Provider `{}` 需要 API Key 但未配置 apikey_source",
+            provider.name
+        );
+    };
+    let apikey = resolve_apikey(source)
+        .with_context(|| format!("解析 Provider `{}` 的 API Key 失败", provider.name))?;
+    if apikey.is_empty() {
+        bail!("VS Code 注入需要 API Key，但未提供");
+    }
+    Ok(apikey)
+}
+
+/// VS Code 的 API Key 交互解析（CLI 路径）：Keychain 缺失时提示输入并回写。
+fn resolve_vscode_apikey_interactive(provider: &ResolvedProvider) -> Result<String> {
+    let Some(source) = provider.apikey_source.as_deref() else {
+        bail!(
+            "Provider `{}` 需要 API Key 但未配置 apikey_source",
+            provider.name
+        );
+    };
+    let apikey = resolve_apikey_interactive(source)?;
+    if apikey.is_empty() {
+        bail!("VS Code 注入需要 API Key，但未提供");
+    }
+    Ok(apikey)
+}
+
+/// 非交互启动 VS Code 并注入 Claude Code BYOK env：显式指定 provider 与模型，
+/// 无 TUI。供 GUI 嵌入方（manox 系统菜单「工具 → VS Code」级联）调用。
+/// 机制见 `vscode_app` 模块：解析登录 shell env 后以最高优先级叠加 BYOK env，
+/// 带 VSCODE_CLI=1 启动，令扩展宿主 / Claude Code 扩展 / 集成终端继承注入值。
+/// 阻塞调用（shell 解析至多 10s；VS Code 运行中时含确认与退出等待，至多约
+/// 60s+），调用方应在后台线程执行。
+pub fn launch_vscode_app(provider_name: &str, model_id: &str) -> Result<()> {
+    let config = load_config()?;
+    let mut all_models = build_all_models(&config);
+    apply_probe_cache(&mut all_models);
+    let selection = build_vscode_selection(&config, &all_models, provider_name, model_id)?;
+    let apikey = resolve_vscode_apikey(&selection.provider)?;
+    vscode_app::launch(&selection, &apikey)
+}
+
+/// 不注入 BYOK 配置启动 VS Code（等效 Dock 正常打开）。供 manox
+/// 「工具 → VS Code → 打开（不注入 BYOK）」菜单项调用。
+pub fn launch_vscode_plain() -> Result<()> {
+    vscode_app::launch_plain()
+}
+
+/// VS Code 是否已安装（供 manox 菜单禁用决策）。
+pub fn vscode_app_installed() -> bool {
+    vscode_app::is_installed()
+}
+
 // ══════════════════════════════════════════════════
 // CLI definition（clap derive）
 // ══════════════════════════════════════════════════
@@ -1489,6 +1586,20 @@ fn run_launcher(
         let apikey = resolve_codex_app_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
         return codex_app::launch_with_injection(&selection, &apikey, &passthrough_args);
+    }
+
+    // VS Code 走专门的进程 env 注入路径（VSCODE_CLI=1），不经通用
+    // build_launch_spec/launch_agent。GUI detach，不接管终端，--pty/--socket 无意义。
+    if selection.agent_id == "VS Code" {
+        if pty {
+            eprintln!("cx: --pty 对 VS Code 无效（GUI detach，不经 PTY 中继）");
+        }
+        if socket.is_some() {
+            eprintln!("cx: --socket 对 VS Code 无效（GUI detach，无 IPC 注入）");
+        }
+        let apikey = resolve_vscode_apikey_interactive(&selection.provider)?;
+        apply_selected_model_tab_name(&selection)?;
+        return vscode_app::launch(&selection, &apikey);
     }
 
     let spec = build_launch_spec(&selection, &passthrough_args, pty, socket, cwd)?;
@@ -2371,6 +2482,11 @@ fn build_launch_spec(
                 // Codex.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 codex_app::launch_with_injection。
                 // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
                 bail!("Codex.app 应由注入路径启动，不应进入 build_launch_spec");
+            }
+            "VS Code" => {
+                // VS Code 不走通用 LaunchSpec 流程；run_launcher 已分流到 vscode_app::launch。
+                // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
+                bail!("VS Code 应由注入路径启动，不应进入 build_launch_spec");
             }
             _ => {
                 // Generic fallback: just pass through
@@ -4307,6 +4423,82 @@ mod tests {
         assert_eq!(canonicalize_agent_name("chatgpt_app"), "Codex.app");
         assert_eq!(canonicalize_agent_name("Claude"), "claude");
         assert_eq!(canonicalize_agent_name("CODEX+"), "codex+");
+        assert_eq!(canonicalize_agent_name("vscode"), "VS Code");
+        assert_eq!(canonicalize_agent_name("VS Code"), "VS Code");
+        assert_eq!(canonicalize_agent_name("vs-code"), "VS Code");
+        assert_eq!(canonicalize_agent_name("VS_CODE"), "VS Code");
+    }
+
+    #[test]
+    fn build_launch_spec_rejects_vscode_agent() {
+        // VS Code 与 Codex.app 一样是注入型 agent：run_launcher 分流，
+        // build_launch_spec 误入时必须显式报错而非静默 passthrough。
+        let selection = Selection {
+            agent_id: "VS Code".into(),
+            agent_binary: "claude".into(),
+            agent_args: vec!["vscode".into()],
+            agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Anthropic,
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
+            },
+            model: Some(ResolvedModel {
+                id: "qwen3.7-max".into(),
+                desc: String::new(),
+                wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into(), "VS Code".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: BTreeMap::new(),
+                apikey_source: None,
+                max_tokens: None,
+                context: None,
+                supports_tools: true,
+                supports_images: false,
+            }),
+            injected_models: Vec::new(),
+        };
+        let err = build_launch_spec(&selection, &[], false, None, None)
+            .expect_err("VS Code 不应进入 build_launch_spec");
+        assert!(err.to_string().contains("VS Code"));
+    }
+
+    #[test]
+    fn build_vscode_selection_resolves_provider_and_model() {
+        let config: CxConfig = r#"
+providers:
+- name: test
+  apikey_source: literal:k
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com/anthropic
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+"#
+        .parse()
+        .expect("parse");
+        let all_models = config.resolve_all_models();
+        let selection =
+            build_vscode_selection(&config, &all_models, "test", "m1").expect("selection");
+        assert_eq!(selection.agent_id, "VS Code");
+        assert_eq!(selection.selected_wire_api, WireApi::Anthropic);
+        assert_eq!(selection.provider.name, "test");
+        assert_eq!(selection.model.as_ref().unwrap().id, "m1");
+        assert!(selection.injected_models.is_empty());
+
+        // 未知 provider / model 明确报错
+        assert!(build_vscode_selection(&config, &all_models, "nope", "m1").is_err());
+        assert!(build_vscode_selection(&config, &all_models, "test", "nope").is_err());
     }
 
     // ── Launch spec tests ──

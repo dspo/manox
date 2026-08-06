@@ -1,4 +1,4 @@
-//! ChatGPT.app launch action for the macOS `Agent → ChatGPT.app` menu cascade.
+//! ChatGPT.app launch action for the macOS `工具 → ChatGPT.app` menu cascade.
 //! The cascade itself lives in the bin (`build_app_menus`); the App-level menu
 //! handler routes here through `Workspace::launch_chatgpt_app`.
 

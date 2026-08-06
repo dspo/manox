@@ -387,7 +387,7 @@ fn main() {
                 }
             });
         });
-        // ChatGPT.app launch from the `Agent → ChatGPT.app` cascade: same
+        // ChatGPT.app launch from the `工具 → ChatGPT.app` cascade: same
         // deferred App-level dispatch as the other menu actions; the provider +
         // model payload travels inside the action instance.
         cx.on_action(|action: &agent_ui::LaunchChatGptApp, cx: &mut App| {
@@ -403,6 +403,39 @@ fn main() {
                         workspace.update(cx, |ws, cx| {
                             ws.launch_chatgpt_app(provider, model, window, cx)
                         });
+                    });
+                }
+            });
+        });
+
+        // VS Code launch from the `工具 → VS Code` cascade (BYOK env injected;
+        // plain entry opens without injection): same deferred dispatch shape.
+        cx.on_action(|action: &agent_ui::LaunchVSCode, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            let provider = action.provider.clone();
+            let model = action.model.clone();
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| {
+                            ws.launch_vscode_app(provider, model, window, cx)
+                        });
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::LaunchVSCodePlain, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| ws.launch_vscode_plain(window, cx));
                     });
                 }
             });
@@ -508,7 +541,7 @@ fn build_app_menus() -> Vec<Menu> {
                     agent_ui::CloseTerminalTab,
                 ),
             ]),
-            build_agent_menu(),
+            build_tools_menu(),
         ]
     }
     #[cfg(not(target_os = "macos"))]
@@ -536,17 +569,23 @@ fn build_app_menus() -> Vec<Menu> {
     }
 }
 
-/// The `Agent` top-level menu: a single `ChatGPT.app` entry whose submenu
-/// cascades provider → model. Picking a model dispatches `LaunchChatGptApp`,
-/// which starts ChatGPT.app via cx's injection path (the bin's App-level
-/// action handler routes it to the Workspace). Native menu items carry no
-/// images in gpui, so the entry is text-only.
+/// The `工具` (Tools) top-level menu: external-app entries that launch with
+/// provider/model injection from the cx registry. `ChatGPT.app` cascades
+/// provider → model (Responses-capable models); `VS Code` cascades provider →
+/// model (Anthropic-wire models) and injects Claude Code BYOK env. Picking a
+/// model dispatches the matching launch action, routed through the bin's
+/// App-level action handlers to the Workspace. Native menu items carry no
+/// images in gpui, so entries are text-only.
 #[cfg(target_os = "macos")]
-fn build_agent_menu() -> Menu {
+fn build_tools_menu() -> Menu {
     let chatgpt = Menu::new("ChatGPT.app").items(build_chatgpt_menu_items());
-    let empty = chatgpt.items.is_empty();
-    let chatgpt = chatgpt.disabled(empty);
-    Menu::new(agent::i18n::t("menu-agent")).items([MenuItem::submenu(chatgpt)])
+    let chatgpt_empty = chatgpt.items.is_empty();
+    let chatgpt = chatgpt.disabled(chatgpt_empty);
+    let vscode = Menu::new("VS Code").items(build_vscode_menu_items());
+    let vscode_installed = cx::vscode_app_installed();
+    let vscode = vscode.disabled(!vscode_installed);
+    Menu::new(agent::i18n::t("menu-tools"))
+        .items([MenuItem::submenu(chatgpt), MenuItem::submenu(vscode)])
 }
 
 /// Items inside the `ChatGPT.app` submenu: one nested submenu per provider
@@ -586,4 +625,51 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
             )
         })
         .collect()
+}
+
+/// Items inside the `VS Code` submenu: one nested submenu per provider that
+/// exposes models visible to the `VS Code` agent (Anthropic-wire models
+/// usable by the Claude Code extension), one action item per model — same
+/// grouping/order rules as the ChatGPT cascade. A trailing separator +
+/// 「打开（不注入 BYOK）」entry opens VS Code without injection. The submenu
+/// is disabled wholesale when VS Code is not installed.
+#[cfg(target_os = "macos")]
+fn build_vscode_menu_items() -> Vec<MenuItem> {
+    let registry = agent::provider::registry::global();
+    let mut providers: Vec<(String, Vec<String>)> = Vec::new();
+    for model in registry.models() {
+        if !model.visible_agents().iter().any(|a| a == "VS Code") {
+            continue;
+        }
+        let provider = model.provider_name();
+        let model_id = model.name();
+        match providers.iter_mut().find(|(name, _)| *name == provider) {
+            Some((_, models)) => models.push(model_id),
+            None => providers.push((provider, vec![model_id])),
+        }
+    }
+    let mut items: Vec<MenuItem> = providers
+        .into_iter()
+        .map(|(provider, models)| {
+            MenuItem::submenu(
+                Menu::new(provider.clone()).items(models.into_iter().map(|model| {
+                    MenuItem::action(
+                        model.clone(),
+                        agent_ui::LaunchVSCode {
+                            provider: provider.clone(),
+                            model,
+                        },
+                    )
+                })),
+            )
+        })
+        .collect();
+    if !items.is_empty() {
+        items.push(MenuItem::separator());
+    }
+    items.push(MenuItem::action(
+        agent::i18n::t("menu-vscode-plain"),
+        agent_ui::LaunchVSCodePlain,
+    ));
+    items
 }
