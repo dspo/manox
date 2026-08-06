@@ -60,7 +60,10 @@ pub fn resolve_model_ref(
     model_ref: &str,
 ) -> Option<pi::types::Model> {
     let models = registry.models();
-    if let Some(exact) = models.iter().find(|m| m.id == model_ref) {
+    // Exact match is case-insensitive like the alias/probe paths, so
+    // `DeepSeek-V4-Flash` and `deepseek-v4-flash` resolve identically.
+    let wanted = model_ref.to_lowercase();
+    if let Some(exact) = models.iter().find(|m| m.id.to_lowercase() == wanted) {
         return Some(exact.clone());
     }
     let probe = ALIASES
@@ -145,6 +148,37 @@ mod tests {
         let registry2 = pi::ProviderRegistry::new();
         register(&registry2, "claude-sonnet-4-6", None);
         assert!(resolve_model_ref(&registry2, "sonnet").is_none());
+    }
+
+    #[test]
+    fn exact_match_is_case_insensitive() {
+        let registry = pi::ProviderRegistry::new();
+        register(&registry, "deepseek-v4-flash", None);
+        assert_eq!(
+            resolve_model_ref(&registry, "DeepSeek-V4-Flash")
+                .unwrap()
+                .id,
+            "deepseek-v4-flash"
+        );
+    }
+
+    #[test]
+    fn alias_table_covers_claude_and_openai_families() {
+        // Alias lookup is exact equality on the (lowercased) ref, so table
+        // order cannot shadow entries — pin the per-alias probes.
+        let probe = |r: &str| {
+            ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == r.to_lowercase())
+                .map(|(_, p)| *p)
+        };
+        assert_eq!(probe("claude-sonnet"), Some("sonnet"));
+        assert_eq!(probe("claude-opus"), Some("opus"));
+        assert_eq!(probe("claude-haiku"), Some("haiku"));
+        assert_eq!(probe("sonnet"), Some("sonnet"));
+        assert_eq!(probe("o3"), Some("o3"));
+        assert_eq!(probe("gpt-5"), Some("gpt-5"));
+        assert_eq!(probe("unknown-ref"), None);
     }
 
     #[test]

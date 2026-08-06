@@ -558,7 +558,11 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     let stats = match session.session_stats().await {
         Ok(stats) => stats,
         Err(err) => {
-            tracing::warn!("pi session stats failed: {err:#}");
+            // Degrade to the assistant-only walk (the pre-stats mechanism)
+            // so a failing stats read never freezes UI usage at stale
+            // values. Loses tool-result/summary usage for this sync only.
+            tracing::warn!("pi session stats failed; falling back to message walk: {err:#}");
+            sync_usage_from_messages(session, state);
             return;
         }
     };
@@ -567,6 +571,15 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     for entry in &stats.per_model {
         per_model.insert(entry.key.clone(), token_usage_from_totals(&entry.totals));
     }
+    *state.cumulative.lock().unwrap() = cumulative;
+    *state.per_model.lock().unwrap() = per_model;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
+}
+
+/// Per-request attribution for the env card: the assistant usage of the
+/// transcript, attributed to the triggering (most recent) user message.
+/// Presentation-layer accounting, hence host-side.
+fn request_attribution(session: &AgentSession) -> HashMap<String, TokenUsage> {
     let mut request: HashMap<String, TokenUsage> = HashMap::new();
     let key = last_user_id(session);
     for m in session.harness_messages() {
@@ -582,9 +595,31 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
             .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
     }
+    request
+}
+
+/// Fallback aggregation when `session_stats()` is unavailable: assistant
+/// usage only, keyed by model id (the pre-stats mechanism).
+fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
+    let mut cumulative = TokenUsage::default();
+    let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
+    for m in session.harness_messages() {
+        let AgentMessage::Assistant { usage, model, .. } = m else {
+            continue;
+        };
+        let u = to_token_usage(usage);
+        if u.total_tokens() == 0 {
+            continue;
+        }
+        cumulative = cumulative + u;
+        per_model
+            .entry(model.clone())
+            .and_modify(|acc| *acc = *acc + u)
+            .or_insert(u);
+    }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
-    *state.request_usage.lock().unwrap() = request;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
 }
 
 /// Kernel usage totals → the facade's token usage shape.
