@@ -295,16 +295,11 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    // New threads start from the latest provider config (parity with the
-    // manox build's new-thread reload); the previous snapshot is kept on
-    // failure. The blocking keychain/shell work runs off the async workers.
-    match tokio::task::spawn_blocking(crate::pi_providers::reload).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!("pi providers reload failed; keeping previous snapshot: {err:#}")
-        }
-        Err(err) => tracing::warn!("pi providers reload task failed: {err}"),
-    }
+    // Wait for the one-shot background registration from
+    // `pi_providers::init` — the actor never reloads providers itself, so
+    // thread creation no longer pays the keychain/shell cost, and the
+    // first turn never sees an empty registry.
+    crate::pi_providers::wait_ready().await;
     let Some(pi_model) = model else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
@@ -366,6 +361,7 @@ async fn run_actor(
     let _ = notice_tx.send(BackendNotice::Ready { restored });
     if restored {
         sync_history(&session, &state);
+        sync_usage(&session, &state).await;
     }
 
     let mut run_steers: Vec<String> = Vec::new();
@@ -482,6 +478,7 @@ async fn run_actor(
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 sync_history(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd } => {
@@ -492,6 +489,7 @@ async fn run_actor(
                         _subscription = subscribe_session(&session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         sync_history(&session, &state);
+                        sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
                     }
                     Err(err) => {

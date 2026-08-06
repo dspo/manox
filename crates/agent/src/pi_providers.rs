@@ -6,11 +6,17 @@
 //! initializes, reloads, and hands out the shared snapshot — the actor
 //! side resolves models and streams through it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use pi::ProviderRegistry;
 
 static REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
+/// Signalled once the initial background registration completes (success or
+/// soft failure). Actors await this instead of triggering their own reload,
+/// so registration runs exactly once per process.
+static READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static READY_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn build() -> Arc<ProviderRegistry> {
     let registry = Arc::new(ProviderRegistry::new());
@@ -31,17 +37,38 @@ fn build() -> Arc<ProviderRegistry> {
 ///
 /// Registration runs on a background thread: it may hit the OS keychain
 /// (including interactive unlock prompts) or run `$(...)` shell commands,
-/// which must not block the gpui main thread. Early consumers see an empty
-/// snapshot until the build lands; the pi actor reloads before first use,
-/// and the model menu simply lists nothing until then.
+/// which must not block the gpui main thread. Consumers that must not see
+/// an empty snapshot await [`wait_ready`]; the model menu simply lists
+/// nothing until the build lands.
 pub fn init() {
     let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
-    std::thread::spawn(|| {
+    let notify = READY.get_or_init(tokio::sync::Notify::new);
+    std::thread::spawn(move || {
         let fresh = build();
         if let Some(lock) = REGISTRY.get() {
             *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
+        READY_FLAG.store(true, Ordering::Release);
+        notify.notify_waiters();
     });
+}
+
+/// Wait for the one-shot initial registration to finish. Returns at once
+/// when it already completed, or when [`init`] was never called (nothing
+/// to wait for). Pi actors await this once at startup instead of
+/// triggering per-thread provider reloads — registration (and its
+/// keychain/shell cost) happens exactly once per process.
+pub async fn wait_ready() {
+    let Some(notify) = READY.get() else {
+        return;
+    };
+    // Register interest BEFORE re-checking the flag so a completion that
+    // lands in between cannot be missed.
+    let notified = notify.notified();
+    if READY_FLAG.load(Ordering::Acquire) {
+        return;
+    }
+    notified.await;
 }
 
 /// The current registry snapshot. Cheap `Arc` clone; actors hold their
