@@ -60,9 +60,11 @@ pub fn resolve_pi_model_ref(model_ref: &str) -> Option<pi::types::Model> {
     if let Some(exact) = models.iter().find(|m| m.id == model_ref) {
         return Some(exact.clone());
     }
+    // Alias lookup is case-insensitive (parity with the retired manox
+    // `resolve_model_ref`): `Sonnet` / `CLAUDE-SONNET` still map.
     let probe = ALIASES
         .iter()
-        .find(|(alias, _)| *alias == model_ref)
+        .find(|(alias, _)| *alias == model_ref.to_lowercase())
         .map(|(_, probe)| *probe)
         .unwrap_or(model_ref);
     models.into_iter().find(|m| matches_segment(&m.id, probe))

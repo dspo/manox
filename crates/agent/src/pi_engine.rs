@@ -298,7 +298,13 @@ async fn run_actor(
     // New threads start from the latest provider config (parity with the
     // manox build's new-thread reload); the previous snapshot is kept on
     // failure. The blocking keychain/shell work runs off the async workers.
-    let _ = tokio::task::spawn_blocking(crate::pi_providers::reload).await;
+    match tokio::task::spawn_blocking(crate::pi_providers::reload).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("pi providers reload failed; keeping previous snapshot: {err:#}")
+        }
+        Err(err) => tracing::warn!("pi providers reload task failed: {err}"),
+    }
     let Some(pi_model) = model else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
