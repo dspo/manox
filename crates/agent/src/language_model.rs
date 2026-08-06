@@ -391,6 +391,12 @@ use crate::provider::WireApi;
 /// Language model abstraction.
 pub trait LanguageModel: Send + Sync {
     fn id(&self) -> String;
+    /// The wire-facing model id (context-window suffix like `[1m]` and any
+    /// `provider/` display prefix stripped). Defaults to [`Self::id`]; the
+    /// built-in provider models override it with their resolved `api_model_id`.
+    fn api_model_id(&self) -> String {
+        self.id()
+    }
     fn name(&self) -> String;
     fn provider_id(&self) -> String;
     fn provider_name(&self) -> String;

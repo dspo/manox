@@ -12,12 +12,13 @@ path = "src/lib.rs"
 default = ["harness-manox"]
 # The manox self-built harness backend (the polished, feature-complete path).
 # Mutually exclusive with `harness-pi`; the `manox` bin guards both ways.
-harness-manox = []
-# Mount the pi harness backend: the workspace drives a `pi_backend::PiSession`
-# adapter (cfg-gated module) instead of the manox `agent::Thread`. Selected at
-# build time by the `manox` bin (`--no-default-features --features harness-pi`);
-# the default build never compiles the pi dependencies.
-harness-pi = ["dep:pi", "dep:pi-extensions"]
+harness-manox = ["agent/harness-manox"]
+# Mount the pi harness backend: the workspace drives the pi-backed `Thread`
+# facade (agent's `harness-pi` build) instead of the manox self-built harness.
+# Selected at build time by the `manox` bin
+# (`--no-default-features --features harness-pi`); the default build never
+# compiles the pi dependencies.
+harness-pi = ["dep:pi", "dep:pi-extensions", "agent/harness-pi"]
 
 [dependencies]
 anyhow.workspace = true

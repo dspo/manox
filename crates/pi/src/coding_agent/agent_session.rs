@@ -268,14 +268,20 @@ impl AgentSession {
         self.harness.handle()
     }
 
-    /// Queue a steering message.
-    pub fn steer(&self, message: AgentMessage) {
-        self.harness.handle().steer(message);
+    /// Queue a steering message. Returns the queue-local id, which
+    /// [`Self::cancel_steer`] accepts to retract it.
+    pub fn steer(&self, message: AgentMessage) -> String {
+        self.harness.handle().steer(message)
+    }
+
+    /// Retract a queued steer by id before the loop drains it.
+    pub fn cancel_steer(&self, id: &str) -> bool {
+        self.harness.handle().cancel_steer(id)
     }
 
     /// Queue a follow-up message.
-    pub fn follow_up(&self, message: AgentMessage) {
-        self.harness.handle().follow_up(message);
+    pub fn follow_up(&self, message: AgentMessage) -> String {
+        self.harness.handle().follow_up(message)
     }
 
     /// Queue a next-turn message delivered after the next prompt's own

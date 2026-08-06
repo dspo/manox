@@ -95,7 +95,9 @@ impl BackgroundManager {
     pub fn attach(&self, session: &mut AgentSession) {
         let handle = session.handle();
         *self.steerer.lock().expect("steerer lock poisoned") =
-            Some(Arc::new(move |message| handle.steer(message)));
+            Some(Arc::new(move |message| {
+                handle.steer(message);
+            }));
         let registry = Arc::clone(&self.registry);
         let tasks = Arc::clone(&self.tasks);
         let event_tx = self.event_tx.clone();

@@ -1,3 +1,4 @@
+#[cfg(not(feature = "harness-pi"))]
 fn main() {
     match agent::replay::run_bundled() {
         Ok(report) => {
@@ -11,4 +12,9 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(feature = "harness-pi")]
+fn main() {
+    eprintln!("context_replay requires the manox harness");
 }

@@ -5,6 +5,14 @@ version.workspace = true
 publish.workspace = true
 
 [features]
+# The manox self-built harness drives `Thread` directly (the default path).
+# Mutually exclusive with `harness-pi`; the `manox` bin guards both ways.
+default = []
+harness-manox = []
+# The pi harness backs `Thread` through `ThreadEngine` (see pi_engine.rs).
+# Selected by the `manox` bin (`--no-default-features --features harness-pi`);
+# the default build never compiles the pi facade modules.
+harness-pi = []
 # Exposes `thread_store::init_for_test` / `drop_for_test` (and the `TEST_OVERRIDE`
 # slot they mutate) to downstream crates' test suites. Production builds keep
 # these hidden so the global `ThreadStore` path is the only one reachable.

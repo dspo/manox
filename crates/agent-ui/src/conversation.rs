@@ -955,6 +955,10 @@ impl ConversationState {
             // the matching `SteerPending` queue card and pushes the bubble here
             // via `push_user`); the conversation list takes no direct action.
             | ThreadEvent::SteerInjected { .. } => ApplyOutcome::Unchanged,
+            // The pi backend restored an existing session; the workspace
+            // rebuilds the conversation from the authoritative history.
+            #[cfg(feature = "harness-pi")]
+            | ThreadEvent::HistoryRestored => ApplyOutcome::Unchanged,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content. We capture the turn's start instant here so
@@ -2479,7 +2483,9 @@ mod tests {
     }
 
     /// A legacy `agent` tool result (plain text, no JSON envelope) must still
-    /// render its final text without panicking.
+    /// render its final text without panicking. The `agent` tool is a manox
+    /// harness tool; the pi build skips this test.
+    #[cfg(not(feature = "harness-pi"))]
     #[test]
     fn agent_final_text_falls_back_for_legacy_content() {
         assert_eq!(

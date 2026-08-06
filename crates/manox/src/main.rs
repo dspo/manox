@@ -73,22 +73,11 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        agent::init(cx);
+        terminal::init(cx);
+        terminal_ui::init(cx);
         #[cfg(feature = "harness-manox")]
-        {
-            agent::init(cx);
-            terminal::init(cx);
-            terminal_ui::init(cx);
-            agent_ui::slash_command::init(cx);
-        }
-        #[cfg(feature = "harness-pi")]
-        {
-            // Minimal pi init: tokio runtime, i18n bundle, provider registry.
-            // TODO(pi-wire): mcp / thread_store / skill / command / hook /
-            // lsp / hashline / agent_def / terminal registries stay unwired.
-            agent::runtime::init(cx);
-            agent::i18n::init();
-            agent::provider::registry::init(cx);
-        }
+        agent_ui::slash_command::init(cx);
 
         // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and
         // italic cuts: message body inherits Light, markdown bold/headings and

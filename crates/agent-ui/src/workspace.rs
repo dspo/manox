@@ -9,27 +9,25 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use std::rc::Rc;
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use agent::provider::registry;
-#[cfg(feature = "harness-manox")]
 use agent::settings;
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 #[cfg(feature = "harness-manox")]
 use agent::{PermissionDecision, PlanReviewChoice, ReasoningEffort};
-#[cfg(feature = "harness-manox")]
 use agent::{Thread, save_thread};
 use agent::{ThreadEvent, ThreadId, i18n};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
@@ -37,7 +35,7 @@ use gpui::{
     Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
     ease_out_quint, prelude::*, px,
 };
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// Shared across both harnesses: workspace struct fields hold
 /// `Option<Entity<PopupMenu>>` regardless of feature.
@@ -50,7 +48,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, Paste, RopeExt},
     v_flex,
 };
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui_component::{
     StyledExt as _,
     menu::PopupMenuItem,
@@ -60,64 +58,57 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::cockpit::CockpitPhase;
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::external_session::{ExternalSession, SessionKind};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
     slash_source,
 };
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::composer_menu::build_plus_menu;
 use crate::views::composer_menu::{PendingAttachment, load_attachment, render_attachment_chips};
+#[cfg(feature = "harness-manox")]
 use crate::views::member_panel::MemberPanel;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::sidebar::{Sidebar, SidebarEvent};
+#[cfg(feature = "harness-manox")]
 use crate::views::subagent_panel::{SubagentInfo, SubagentPanel};
 #[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::subagent_panel::{
     SubagentSnapshot, snapshots_from_messages, subagent_display_title,
 };
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
     ToggleTurnNavigator,
 };
 use crate::{FocusConversation, OpenSettings};
-#[cfg(feature = "harness-manox")]
+#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
-/// The session entity driving the workspace. manox-harness builds mount the
-/// full `agent::Thread`; pi-harness builds mount the `pi_backend::PiSession`
-/// adapter, which quacks like a thread (same `ThreadEvent` stream, same
-/// `agent::Message` history) so the polished render pipeline is reused.
-#[cfg(feature = "harness-manox")]
+/// The session entity driving the workspace. One type serves both harnesses:
+/// the manox build drives `agent::Thread` directly, the pi build drives the
+/// pi-backed facade — same `ThreadEvent` stream, same `agent::Message`
+/// history — so the polished render pipeline is reused unchanged.
 pub(crate) type ThreadEntity = agent::Thread;
-#[cfg(feature = "harness-pi")]
-pub(crate) type ThreadEntity = crate::pi_backend::PiSession;
 
-/// manox threads persist through the thread store; pi sessions persist
-/// themselves to jsonl, so under `harness-pi` the save call sites compile to
-/// this no-op (one shared name keeps the ~15 call sites untouched).
-#[cfg(feature = "harness-pi")]
-fn save_thread(_thread: Entity<ThreadEntity>, _touch: bool, _cx: &mut App) {
-    // TODO(pi-wire): pi jsonl persistence is automatic; nothing to do here.
-}
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
@@ -134,6 +125,7 @@ enum RightTab {
     PlanPreview,
 }
 
+#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 fn ensure_subagent_tab(tabs: &mut Vec<RightTab>, id: &str) -> usize {
     if let Some(ix) = tabs
         .iter()
@@ -162,14 +154,14 @@ fn remove_subagent_tabs(tabs: &mut Vec<RightTab>, active: &mut usize) {
     }
 }
 
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
+#[cfg(feature = "harness-manox")]
 struct SubagentRecord {
     info: SubagentInfo,
     panel: Entity<SubagentPanel>,
 }
 
+#[cfg(feature = "harness-manox")]
 #[derive(Default)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct SubagentSession {
     records: BTreeMap<String, SubagentRecord>,
     order: Vec<String>,
@@ -310,9 +302,6 @@ pub struct Workspace {
     /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
     /// while parked marks the thread unread for the sidebar red dot.
     background_threads: Vec<BackgroundThread>,
-    // TODO(pi-wire): sidebar/thread list — needs the manox thread store; the
-    // pi stage runs a single fixed session with no sidebar.
-    #[cfg(feature = "harness-manox")]
     pub(crate) sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -349,17 +338,17 @@ pub struct Workspace {
     active_right_tab: usize,
     /// Lazily-built MemberPanel entities, keyed by member name. A member tab
     /// keeps its panel across tab switches; dropped when the tab closes.
+    #[cfg(feature = "harness-manox")]
     member_panels: BTreeMap<String, Entity<MemberPanel>>,
     /// Read-only sub-agent observations keyed by the active root thread id.
     /// Switching main tasks releases the outgoing registry; completed panels
     /// can later be rebuilt recursively from persisted result envelopes.
+    #[cfg(feature = "harness-manox")]
     subagent_sessions: HashMap<String, SubagentSession>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
     /// view via [`manox_webview::webview::WebView`]'s `Drop`.
-    // TODO(pi-wire): browser tabs.
-    #[cfg(feature = "harness-manox")]
     pub(crate) browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
@@ -499,8 +488,6 @@ pub struct Workspace {
     /// plan snapshot, per-cell counter animation state) that used to live
     /// directly on `Workspace`, plus strong handles to the active thread and conversation
     /// it renders against. Writes flow through `self.context_rail.update`.
-    // TODO(pi-wire): context rail — reads manox usage/plan/compact state.
-    #[cfg(feature = "harness-manox")]
     context_rail: Entity<crate::views::context_rail::ContextRail>,
     /// Live external agent CLI sessions (claude / codex / copilot) launched from
     /// the sidebar `+` menu. In-memory only — never persisted. Each owns its
@@ -634,18 +621,10 @@ impl Render for DraggedSidebarDivider {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        #[cfg(feature = "harness-manox")]
         let auto_compact = settings::load().auto_compact;
         let thread = {
             let id = ThreadId(uuid::Uuid::new_v4().to_string());
-            #[cfg(feature = "harness-manox")]
-            {
-                Thread::new(id, cwd.clone(), cx)
-            }
-            #[cfg(feature = "harness-pi")]
-            {
-                crate::pi_backend::PiSession::new(id, cwd.clone(), cx)
-            }
+            Thread::new(id, cwd.clone(), cx)
         };
 
         let input_state = cx.new(|cx| {
@@ -666,10 +645,8 @@ impl Workspace {
                 .placeholder(i18n::t("workspace-composer-placeholder"))
         });
 
-        #[cfg(feature = "harness-manox")]
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
-        #[cfg(feature = "harness-manox")]
         let context_rail = {
             let weak_workspace = cx.weak_entity();
             cx.new(|_| {
@@ -686,7 +663,6 @@ impl Workspace {
             cwd,
             thread,
             background_threads: Vec::new(),
-            #[cfg(feature = "harness-manox")]
             sidebar,
             conversation: conversation.clone(),
             input_state,
@@ -699,9 +675,10 @@ impl Workspace {
             plan_preview_text: None,
             right_tabs: Vec::new(),
             active_right_tab: 0,
-            member_panels: BTreeMap::new(),
-            subagent_sessions: HashMap::new(),
             #[cfg(feature = "harness-manox")]
+            member_panels: BTreeMap::new(),
+            #[cfg(feature = "harness-manox")]
+            subagent_sessions: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -752,7 +729,6 @@ impl Workspace {
             settings_view: None,
             settings_sub: None,
             terminal_view: None,
-            #[cfg(feature = "harness-manox")]
             context_rail,
             external_sessions: Vec::new(),
             active_external: None,
@@ -785,6 +761,7 @@ impl Workspace {
     /// session asynchronously, then asks the workspace to re-render once the
     /// restored history lands.
     #[cfg(feature = "harness-pi")]
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
@@ -1395,7 +1372,6 @@ impl Workspace {
 
     /// Switch to the terminal pane, creating the terminal tab on first focus.
     /// The terminal runs in the workspace's cwd with the user's shell.
-    #[cfg(feature = "harness-manox")]
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1421,7 +1397,6 @@ impl Workspace {
 
     /// Open a fresh terminal tab (cmd-t). If one already exists it is reused
     /// rather than replaced, so an in-flight session isn't killed.
-    #[cfg(feature = "harness-manox")]
     pub fn open_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.focus_terminal(cx);
     }
@@ -1429,7 +1404,6 @@ impl Workspace {
     /// Close the terminal tab and return to the conversation pane. Dropping
     /// the `TerminalView` drops the underlying `Terminal`, whose `PtySource`
     /// kills the child and detaches the reader/waiter threads.
-    #[cfg(feature = "harness-manox")]
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
@@ -1728,7 +1702,6 @@ impl Workspace {
     /// Returns the allocated `BrowserTabId` so callers (the host, tool
     /// surface) can drive the tab afterwards. The webview is built untrusted:
     /// no Tauri command surface, only the notify/inbound bridges.
-    #[cfg(feature = "harness-manox")]
     pub fn open_browser_tab(
         &mut self,
         url: &str,
@@ -1752,7 +1725,6 @@ impl Workspace {
     /// Close and recycle a browser tab by id. Dropping the `BrowserView`
     /// drops the underlying native webview, whose `Drop` hides and detaches
     /// the platform view. No-op if the id is not live.
-    #[cfg(feature = "harness-manox")]
     pub fn close_browser_tab(&mut self, tab_id: BrowserTabId, cx: &mut Context<Self>) {
         if self.browser_views.remove(&tab_id).is_none() {
             return;
@@ -2484,12 +2456,30 @@ impl Workspace {
 
     /// Archive the active thread and navigate to a fresh empty one. Shared
     /// by the `/exit` slash command and the `cmd-;` keybinding.
-    #[cfg(feature = "harness-manox")]
+    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
     pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.archive_active_thread_if_idle(cx) {
-            return;
+        let archived = {
+            #[cfg(feature = "harness-manox")]
+            {
+                self.archive_active_thread_if_idle(cx)
+            }
+            #[cfg(not(feature = "harness-manox"))]
+            {
+                let id = self.thread.read(cx).id.0.clone();
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| {
+                    s.archive_thread(&id, true, cx);
+                });
+                true
+            }
+        };
+        #[cfg(feature = "harness-manox")]
+        {
+            if !archived {
+                return;
+            }
+            self.start_new_thread(None, window, cx);
         }
-        self.start_new_thread(None, window, cx);
     }
 
     /// Archive the active thread if it is idle; `false` when a turn is
@@ -2549,13 +2539,15 @@ impl Workspace {
     /// spam empty threads. `attach_thread` does the actual parking: a running
     /// thread is moved into `background_threads` with a terminal-`Stop`/`Error`
     /// subscription that flips its sidebar row to idle + unread when it lands.
-    #[cfg(feature = "harness-manox")]
-    fn background_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.thread.read(cx).is_running() {
-            return;
+    fn background_current_thread(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(feature = "harness-manox")]
+        {
+            if !self.thread.read(_cx).is_running() {
+                return;
+            }
+            let project = self.thread.read(_cx).project().cloned();
+            self.start_new_thread(project, _window, _cx);
         }
-        let project = self.thread.read(cx).project().cloned();
-        self.start_new_thread(project, window, cx);
     }
 
     #[cfg(feature = "harness-manox")]
@@ -2650,14 +2642,20 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let (text, extra, failed) = cx
                 .background_spawn(async move {
+                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
+                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
                     let mut text = text;
                     let mut extra = Vec::new();
+                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
                     let mut failed = 0usize;
                     for att in &attachments {
                         match att {
-                            PendingAttachment::ClipboardImage(img) => {
+                            PendingAttachment::ClipboardImage(_img) => {
+                                // Image attachments are a manox flow; the pi
+                                // backend prompts are text-only in this stage.
+                                #[cfg(feature = "harness-manox")]
                                 match agent::image::gpui_image_to_message_content(
-                                    std::sync::Arc::new(img.clone()),
+                                    std::sync::Arc::new(_img.clone()),
                                 ) {
                                     Some(content) => extra.push(content),
                                     None => failed += 1,
@@ -3430,6 +3428,7 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn open_subagent_tab_by_id(&mut self, id: &str, cx: &mut Context<Self>) {
         let root_thread_id = self.thread.read(cx).id.0.clone();
         if !self
@@ -3494,6 +3493,7 @@ impl Workspace {
     /// built from the member's `Thread` + role, read off the leader's active
     /// team; no-op if no team or no such member.
     #[cfg_attr(feature = "harness-pi", allow(dead_code))]
+    #[cfg(feature = "harness-manox")]
     fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Some(ix) = self
             .right_tabs
@@ -3539,6 +3539,7 @@ impl Workspace {
             self.close_editor(window, cx);
             return;
         }
+        #[cfg(feature = "harness-manox")]
         if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
             self.right_tabs.remove(ix);
             self.member_panels.remove(&name);
@@ -3583,7 +3584,6 @@ impl Workspace {
     /// Close the active right-pane tab if it is a browser tab. No-op
     /// otherwise (the keybinding is global; it should not close Editor or
     /// Member tabs that happen to be active).
-    #[cfg(feature = "harness-manox")]
     pub fn close_active_browser_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(self.active_right_tab).cloned() {
             self.close_browser_tab(id, cx);
@@ -4431,15 +4431,17 @@ impl Workspace {
         menu
     }
 
-    #[cfg(feature = "harness-manox")]
     /// Title bar "..." trigger + dropdown (conversation menu).
     ///
     /// Closed: a small ghost icon button (horizontal ellipsis) next to the
     /// session title. Open: an absolute-positioned PopupMenu anchored under
     /// the button. Mirrors the model selector pattern: the menu entity and
     /// its dismiss subscription are created lazily on open, dropped on close.
+    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
     fn render_title_menu_trigger(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
+        #[cfg(feature = "harness-manox")]
+        {
+            use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
 
         let open = self.title_menu_open;
         let is_pinned = self.thread.read(cx).is_pinned();
@@ -4587,6 +4589,11 @@ impl Workspace {
                 .with_priority(1),
             )
             .into_any_element()
+        }
+        #[cfg(not(feature = "harness-manox"))]
+        {
+            gpui::div().into_any_element()
+        }
     }
 
     /// Rendered bare — no card border, fill, or rounding — so it shares the
@@ -6128,14 +6135,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(feature = "harness-manox")]
-        {
-            self.render_manox(window, cx)
-        }
-        #[cfg(feature = "harness-pi")]
-        {
-            self.render_pi(window, cx)
-        }
+        self.render_manox(window, cx)
     }
 }
 impl Workspace {
@@ -6143,6 +6143,7 @@ impl Workspace {
     /// composer. Everything not yet wired to the pi backend is absent by
     /// construction; search `TODO(pi-wire)` for the remaining surface.
     #[cfg(feature = "harness-pi")]
+    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_pi(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Settings overlay: provider credentials/models are configured here,
         // so it stays even though the rest of the chrome is reduced.
@@ -6309,9 +6310,8 @@ impl Workspace {
 }
 
 impl Workspace {
-    /// The full manox workspace chrome: sidebar, conversation column, context
-    /// rail, right pane, approval overlays. Untouched by the pi port.
-    #[cfg(feature = "harness-manox")]
+    /// The full workspace chrome: sidebar, conversation column, context rail,
+    /// right pane, approval overlays. Shared by both harness builds.
     fn render_manox(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
@@ -6528,9 +6528,17 @@ impl Workspace {
             && !editor_open
             && self.thread.read(cx).has_interacted()
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
-        let overlay = self
-            .render_inbound_overlay(&theme, cx)
-            .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
+        let inbound = {
+            #[cfg(feature = "harness-manox")]
+            {
+                self.render_inbound_overlay(&theme, cx)
+            }
+            #[cfg(not(feature = "harness-manox"))]
+            {
+                None
+            }
+        };
+        let overlay = inbound.or_else(|| self.render_blank_project_overlay(window, &theme, cx));
         let turn_navigator_overlay =
             self.render_turn_navigator_overlay(window, &theme, right_pane_open, show_rail, cx);
         // The inline composer stays visible while inline AskUserQuestion cards
@@ -6694,6 +6702,7 @@ impl Workspace {
                     RightTab::Member(name) => {
                         Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
                     }
+                    #[cfg(feature = "harness-manox")]
                     RightTab::Subagent(id) => {
                         let root_thread_id = self.thread.read(cx).id.0.clone();
                         let label = self
@@ -6704,6 +6713,8 @@ impl Workspace {
                             .unwrap_or_else(|| i18n::t("subagent-tab-fallback").to_string());
                         Tab::new().label(label)
                     }
+                    #[cfg(not(feature = "harness-manox"))]
+                    RightTab::Subagent(_) => Tab::new(),
                     RightTab::Browser(id) => {
                         let url = self
                             .browser_views
@@ -6842,11 +6853,15 @@ impl Workspace {
                                     .into_any_element()
                             })
                             .into_any_element(),
+                        #[cfg(feature = "harness-manox")]
                         Some(RightTab::Member(name)) => self
                             .member_panels
                             .get(&name)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        #[cfg(not(feature = "harness-manox"))]
+                        Some(RightTab::Member(_)) => gpui::div().into_any_element(),
+                        #[cfg(feature = "harness-manox")]
                         Some(RightTab::Subagent(id)) => {
                             let root_thread_id = self.thread.read(cx).id.0.clone();
                             self.subagent_sessions
@@ -6855,6 +6870,8 @@ impl Workspace {
                                 .map(|record| record.panel.clone().into_any_element())
                                 .unwrap_or_else(|| gpui::div().into_any_element())
                         }
+                        #[cfg(not(feature = "harness-manox"))]
+                        Some(RightTab::Subagent(_)) => gpui::div().into_any_element(),
                         Some(RightTab::Browser(id)) => self
                             .browser_views
                             .get(&id)

@@ -127,6 +127,9 @@ impl AnthropicModel {
 }
 
 impl LanguageModel for AnthropicModel {
+    fn api_model_id(&self) -> String {
+        self.api_model_id.clone()
+    }
     fn id(&self) -> String {
         self.id.clone()
     }

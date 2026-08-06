@@ -36,6 +36,7 @@ use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
+#[cfg(feature = "harness-manox")]
 use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ pub(crate) struct ContextRail {
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
     weak_workspace: WeakEntity<Workspace>,
+    #[cfg(feature = "harness-manox")]
     agents: Vec<SubagentInfo>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
@@ -109,6 +111,7 @@ impl ContextRail {
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
             weak_workspace,
+            #[cfg(feature = "harness-manox")]
             agents: Vec::new(),
             side_calls: Vec::new(),
             main_call: None,
@@ -136,6 +139,7 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.side_calls.clear();
         self.main_call = None;
+        #[cfg(feature = "harness-manox")]
         self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
@@ -201,6 +205,7 @@ impl ContextRail {
         cx.notify();
     }
 
+    #[cfg(feature = "harness-manox")]
     pub(crate) fn set_agents(&mut self, agents: Vec<SubagentInfo>, cx: &mut Context<Self>) {
         self.agents = agents;
         cx.notify();
@@ -240,6 +245,17 @@ impl ContextRail {
             thread.project().cloned()
         };
 
+        let agents_section = {
+            #[cfg(feature = "harness-manox")]
+            {
+                self.render_agents_section(theme, cx)
+            }
+            #[cfg(not(feature = "harness-manox"))]
+            {
+                gpui::div().into_any_element()
+            }
+        };
+
         v_flex()
             .w_full()
             .min_h_0()
@@ -260,7 +276,7 @@ impl ContextRail {
                     .text_color(theme.foreground)
                     .child(i18n::t("context-rail-title")),
             )
-            .child(self.render_agents_section(theme, cx))
+            .child(agents_section)
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx))
             .child(self.render_plan_section(theme, cx))
@@ -596,6 +612,7 @@ impl ContextRail {
         }
     }
 
+    #[cfg(feature = "harness-manox")]
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         fn append_children(
             parent_id: Option<&str>,
