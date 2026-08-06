@@ -24,7 +24,7 @@ use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{AnyLanguageModel, MessageContent, TokenUsage};
+use crate::language_model::{MessageContent, TokenUsage};
 use crate::message::Message;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
@@ -40,7 +40,7 @@ enum SessionCmd {
     /// Abort the running turn.
     Abort,
     /// Hot-swap the model for the next provider request.
-    SetModel(AnyLanguageModel),
+    SetModel(PiModel),
     /// Map the reasoning effort onto pi's thinking level.
     SetThinkingLevel(Option<String>),
     /// Re-point the session at an existing jsonl file.
@@ -61,7 +61,7 @@ struct EngineState {
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
-    model: Mutex<Option<AnyLanguageModel>>,
+    model: Mutex<Option<PiModel>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
 }
@@ -77,7 +77,7 @@ pub struct PiEngine {
 /// given, opens that session file instead of restoring the newest one.
 pub fn spawn_engine(
     cwd: PathBuf,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
 ) -> SpawnedEngine {
@@ -129,7 +129,7 @@ impl ThreadEngine for PiEngine {
         self.state.per_model.lock().unwrap().clone()
     }
 
-    fn model(&self) -> Option<AnyLanguageModel> {
+    fn model(&self) -> Option<PiModel> {
         self.state.model.lock().unwrap().clone()
     }
 
@@ -139,9 +139,10 @@ impl ThreadEngine for PiEngine {
 
     fn steer(&self, text: String) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let _ = self
-            .cmd_tx
-            .send(SessionCmd::Steer { id: id.clone(), text });
+        let _ = self.cmd_tx.send(SessionCmd::Steer {
+            id: id.clone(),
+            text,
+        });
         id
     }
 
@@ -149,9 +150,7 @@ impl ThreadEngine for PiEngine {
         // Optimistic: the actor retracts the steer asynchronously. True means
         // the retraction was queued, not that the message is gone from the
         // transcript — it may already have been drained into the running turn.
-        let _ = self
-            .cmd_tx
-            .send(SessionCmd::CancelSteer(id.to_string()));
+        let _ = self.cmd_tx.send(SessionCmd::CancelSteer(id.to_string()));
         true
     }
 
@@ -159,7 +158,7 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Abort);
     }
 
-    fn set_model(&self, model: AnyLanguageModel) {
+    fn set_model(&self, model: PiModel) {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
@@ -289,49 +288,42 @@ fn session_builder(
 
 async fn run_actor(
     cwd: PathBuf,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    let Some(manox_model) = model else {
+    // New threads start from the latest provider config (parity with the
+    // manox build's new-thread reload); the previous snapshot is kept on
+    // failure. The blocking keychain/shell work runs off the async workers.
+    match tokio::task::spawn_blocking(crate::pi_providers::reload).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!("pi providers reload failed; keeping previous snapshot: {err:#}")
+        }
+        Err(err) => tracing::warn!("pi providers reload task failed: {err}"),
+    }
+    let Some(pi_model) = model else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
         return;
     };
-    let pi_model = match crate::pi_bridge::map_model(&manox_model) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(e)));
-            return;
-        }
-    };
-    let resolver = match crate::pi_bridge::stream_resolver(&manox_model) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(e)));
-            return;
-        }
-    };
-    let runtime = ModelRuntime::new(resolver);
+    let registry = crate::pi_providers::global();
+    let runtime = ModelRuntime::with_provider_registry(registry.clone());
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
     let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
-    let latest = repo
-        .list()
-        .await
-        .ok()
-        .and_then(|list| {
-            if let Some(requested) = &initial_path {
-                return list.into_iter().find(|info| info.path == *requested);
-            }
-            list.into_iter().find(|info| info.message_count > 0)
-        });
+    let latest = repo.list().await.ok().and_then(|list| {
+        if let Some(requested) = &initial_path {
+            return list.into_iter().find(|info| info.path == *requested);
+        }
+        list.into_iter().find(|info| info.message_count > 0)
+    });
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
@@ -425,9 +417,9 @@ async fn run_actor(
 
                 let failed = result.is_err();
                 if let Err(err) = &result {
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::Error(anyhow::anyhow!("{err:#}")),
-                    )));
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!("{err:#}"),
+                    ))));
                 }
                 state.running.store(false, Ordering::Relaxed);
                 sync_history(&session, &state);
@@ -460,16 +452,15 @@ async fn run_actor(
             SessionCmd::Abort => {
                 session.abort();
             }
-            SessionCmd::SetModel(manox_model) => {
-                match crate::pi_bridge::map_model(&manox_model) {
-                    Ok(m) => {
-                        if let Err(err) = session.set_model(m).await {
-                            tracing::warn!("pi set_model failed: {err}");
-                        }
-                    }
-                    Err(e) => tracing::warn!("pi set_model mapping failed: {e}"),
+            SessionCmd::SetModel(pi_model) => {
+                // Streams dispatch by `model.provider` through the shared
+                // registry, so a cross-provider switch reaches the right
+                // endpoint + credential (the old bridge captured the
+                // initial model's credential for every later model).
+                if let Err(err) = session.set_model(pi_model.clone()).await {
+                    tracing::warn!("pi set_model failed: {err}");
                 }
-                *state.model.lock().unwrap() = Some(manox_model);
+                *state.model.lock().unwrap() = Some(pi_model);
             }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level).await {
@@ -477,7 +468,15 @@ async fn run_actor(
                 }
             }
             SessionCmd::Open { path } => {
-                rebuild_session(&mut session, &path, &sessions_dir, &runtime, &pi_model, &notice_tx).await;
+                rebuild_session(
+                    &mut session,
+                    &path,
+                    &sessions_dir,
+                    &runtime,
+                    &pi_model,
+                    &notice_tx,
+                )
+                .await;
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 sync_history(&session, &state);
@@ -609,7 +608,10 @@ fn to_token_usage(u: &pi::types::Usage) -> TokenUsage {
 
 /// Re-read the session directory and mirror the summary list into engine
 /// state (the sidebar's source of truth).
-async fn refresh_session_list(repo: &pi::session::repository::SessionRepository, state: &Arc<EngineState>) {
+async fn refresh_session_list(
+    repo: &pi::session::repository::SessionRepository,
+    state: &Arc<EngineState>,
+) {
     let mut out = Vec::new();
     if let Ok(list) = repo.list().await {
         for info in list {

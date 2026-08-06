@@ -1,0 +1,65 @@
+[package]
+name = "harness-manox"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# The retired manox self-built harness, preserved as a standalone crate.
+# Not wired into the shipped `manox` binary (the pi harness is the only
+# live path) — kept compiling as an archive of the pre-pi architecture.
+
+[dependencies]
+agent.workspace = true
+pi.workspace = true
+pi-extensions.workspace = true
+anyhow.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+libc = { workspace = true }
+brush-core = { workspace = true }
+brush-builtins = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+schemars.workspace = true
+cx-providers.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+zstd.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+globset.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+similar.workspace = true
+base64.workspace = true
+image.workspace = true
+rquickjs.workspace = true
+http_proxy.workspace = true
+
+gpui.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+supervisor.workspace = true
+lsp.workspace = true
+lsp-types.workspace = true
+toml.workspace = true
+http.workspace = true
+fluent.workspace = true
+unic-langid.workspace = true
+tera.workspace = true
+tokio-tungstenite = { workspace = true }
+
+[features]
+test-support = []
+
+[dev-dependencies]
+agent = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+
+[lints.clippy]
+dbg_macro = "deny"

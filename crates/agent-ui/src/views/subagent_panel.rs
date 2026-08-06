@@ -3,8 +3,7 @@
 use std::collections::HashMap;
 
 use agent::language_model::{MessageContent, StopReason, TokenUsage};
-use agent::tools::agent::{agent_metrics, agent_sub_messages};
-use agent::{Message, Thread, ThreadEvent, ToolCallStatus, i18n};
+use agent::{Message, ToolCallStatus, i18n};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, SharedString, Subscription,
@@ -13,6 +12,9 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::tools::agent::{agent_metrics, agent_sub_messages};
+use harness_manox::{Thread, ThreadEvent};
 
 use crate::Workspace;
 use crate::conversation::{ApplyCtx, ConversationState, agent_task_labels};

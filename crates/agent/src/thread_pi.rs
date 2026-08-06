@@ -23,9 +23,8 @@ use crate::background_task::TaskSnapshot;
 use crate::db::UiNoteRecord;
 use crate::goal::ThreadGoal;
 use crate::language::Language;
-use crate::language_model::{
-    AnyLanguageModel, MessageContent, ReasoningEffort, StopReason, TokenUsage,
-};
+use crate::language_model::{MessageContent, ReasoningEffort, StopReason, TokenUsage};
+use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
@@ -241,7 +240,7 @@ pub struct Thread {
     pub id: ThreadId,
     cwd: PathBuf,
     project: Option<PathBuf>,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -282,10 +281,7 @@ impl Thread {
         initial_path: Option<PathBuf>,
         cx: &mut App,
     ) -> Entity<Self> {
-        let model = crate::provider::registry::global()
-            .models()
-            .first()
-            .cloned();
+        let model = crate::pi_providers::default_model();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("pi-sessions");
@@ -483,7 +479,7 @@ impl Thread {
         self.project.as_ref()
     }
 
-    pub fn model(&self) -> Option<&AnyLanguageModel> {
+    pub fn model(&self) -> Option<&PiModel> {
         self.model.as_ref()
     }
 
@@ -643,9 +639,9 @@ impl Thread {
     }
 
 
-    pub fn set_model(&mut self, model: AnyLanguageModel, cx: &mut Context<Self>) {
-        let from = self.model.as_ref().map(|m| m.id());
-        let to = model.id();
+    pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
+        let from = self.model.as_ref().map(|m| m.id.clone());
+        let to = model.id.clone();
         self.model = Some(model.clone());
         self.engine.set_model(model);
         cx.emit(ThreadEvent::ModelChanged { from, to });
@@ -682,7 +678,7 @@ pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> 
 
 /// The model-facing form of one content block. Pi keeps blocks verbatim —
 /// there is no manox envelope/compaction rewriting to undo.
-pub(crate) fn model_facing_content(
+pub fn model_facing_content(
     c: &MessageContent,
     _lang: crate::language::Language,
 ) -> MessageContent {
