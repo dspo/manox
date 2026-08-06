@@ -109,7 +109,6 @@ use terminal_ui::TerminalView;
 /// history — so the polished render pipeline is reused unchanged.
 pub(crate) type ThreadEntity = agent::Thread;
 
-
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
 /// worker's conversation + tasks; `Subagent(id)` is a read-only
@@ -1524,7 +1523,7 @@ impl Workspace {
     }
 
     /// Launch ChatGPT.app through cx's injection path with the provider + model
-    /// picked in the macOS `Agent → ChatGPT.app` menu cascade. The launch blocks
+    /// picked in the macOS `工具 → ChatGPT.app` menu cascade. The launch blocks
     /// (config load, model catalog build, CDP injection — up to ~20s), so it runs
     /// on a background thread and reports the outcome as a notification; the app
     /// itself detaches and keeps running independently of manox.
@@ -1564,6 +1563,84 @@ impl Workspace {
                         Notification::error(format!(
                             "{}: {e}",
                             i18n::t("chatgpt-app-launch-failed")
+                        )),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Launch VS Code with Claude Code BYOK env injected (工具 → VS Code →
+    /// provider → model cascade). Same background-spawn + notification shape
+    /// as `launch_chatgpt_app`; the cx injection path may block on login-shell
+    /// env resolution and — when VS Code is already running — on the restart
+    /// confirmation + graceful quit wait.
+    pub fn launch_vscode_app(
+        &mut self,
+        provider: String,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let launch_provider = provider.clone();
+            let launch_model = model.clone();
+            let result = cx
+                .background_spawn(
+                    async move { cx::launch_vscode_app(&launch_provider, &launch_model) },
+                )
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(i18n::t_str(
+                            "vscode-app-launched",
+                            &[("provider", &provider), ("model", &model)],
+                        )),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        provider = %provider,
+                        model = %model,
+                        "VS Code launch failed"
+                    );
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("vscode-app-launch-failed")
+                        )),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Launch VS Code without BYOK injection (equivalent to a normal Dock open).
+    pub fn launch_vscode_plain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { cx::launch_vscode_plain() })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(()) => {
+                    window.push_notification(
+                        Notification::success(i18n::t("vscode-app-launched-plain")),
+                        cx,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "VS Code plain launch failed");
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("vscode-app-launch-failed")
                         )),
                         cx,
                     );
@@ -2446,7 +2523,7 @@ impl Workspace {
                     this.add_info_message(msg.to_string(), cx);
                 } else {
                     // The registry snapshot swapped in; rebuild the native menus so
-                    // the `Agent → ChatGPT.app` cascade mirrors the new providers.
+                    // the `工具 → ChatGPT.app` / `工具 → VS Code` cascades mirror the new providers.
                     i18n::rebuild_menus(cx);
                 }
             });
@@ -4443,152 +4520,153 @@ impl Workspace {
         {
             use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
 
-        let open = self.title_menu_open;
-        let is_pinned = self.thread.read(cx).is_pinned();
-        let is_archived = self.thread.read(cx).archived();
+            let open = self.title_menu_open;
+            let is_pinned = self.thread.read(cx).is_pinned();
+            let is_archived = self.thread.read(cx).archived();
 
-        let trigger = Button::new("titlebar-trigger")
-            .ghost()
-            .small()
-            .icon(IconName::Ellipsis)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if this.title_menu_open {
-                    this.close_title_menu();
-                    cx.notify();
-                    return;
-                }
-                this.title_menu_open = true;
-                let workspace = cx.entity().downgrade();
-                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
-                    let cb = TitleMenuCallbacks {
-                        on_pin: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
-                            })
-                        },
-                        on_archive: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
-                            })
-                        },
-                        on_copy_id: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let id = this.thread.read(cx).id.0.clone();
-                                    this.title_menu_copy("titlebar-copied-id", id, cx);
-                                });
-                            })
-                        },
-                        on_copy_markdown: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let md = this.thread.read(cx).to_markdown();
-                                    this.title_menu_copy("titlebar-copied-markdown", md, cx);
-                                });
-                            })
-                        },
-                        on_copy_cwd: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let cwd = this.thread.read(cx).cwd().display().to_string();
-                                    this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
-                                });
-                            })
-                        },
-                        on_copy_deeplink: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    let id = this.thread.read(cx).id.0.clone();
-                                    let link = format!("manox://thread/{id}");
-                                    this.title_menu_copy("titlebar-copied-deeplink", link, cx);
-                                });
-                            })
-                        },
-                        on_schedule: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    this.add_info_message(
-                                        i18n::t("titlebar-not-implemented").to_string(),
-                                        cx,
-                                    );
-                                });
-                            })
-                        },
-                        on_new_window: {
-                            let ws = workspace.clone();
-                            Rc::new(move |_, _, cx| {
-                                let _ = ws.update(cx, |this, cx| {
-                                    this.add_info_message(
-                                        i18n::t("titlebar-not-implemented").to_string(),
-                                        cx,
-                                    );
-                                });
-                            })
-                        },
-                        is_pinned,
-                        is_archived,
-                    };
-                    build_title_menu(menu, window, cx, cb)
-                });
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut Workspace,
-                     _menu: Entity<PopupMenu>,
-                     _: &DismissEvent,
-                     cx: &mut Context<Workspace>| {
+            let trigger = Button::new("titlebar-trigger")
+                .ghost()
+                .small()
+                .icon(IconName::Ellipsis)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.title_menu_open {
                         this.close_title_menu();
                         cx.notify();
-                    },
-                );
-                this.title_menu = Some(menu);
-                this.title_menu_sub = Some(sub);
-                cx.notify();
-            }));
+                        return;
+                    }
+                    this.title_menu_open = true;
+                    let workspace = cx.entity().downgrade();
+                    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                        let cb = TitleMenuCallbacks {
+                            on_pin: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ =
+                                        ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                                })
+                            },
+                            on_archive: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
+                                })
+                            },
+                            on_copy_id: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let id = this.thread.read(cx).id.0.clone();
+                                        this.title_menu_copy("titlebar-copied-id", id, cx);
+                                    });
+                                })
+                            },
+                            on_copy_markdown: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let md = this.thread.read(cx).to_markdown();
+                                        this.title_menu_copy("titlebar-copied-markdown", md, cx);
+                                    });
+                                })
+                            },
+                            on_copy_cwd: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let cwd = this.thread.read(cx).cwd().display().to_string();
+                                        this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
+                                    });
+                                })
+                            },
+                            on_copy_deeplink: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        let id = this.thread.read(cx).id.0.clone();
+                                        let link = format!("manox://thread/{id}");
+                                        this.title_menu_copy("titlebar-copied-deeplink", link, cx);
+                                    });
+                                })
+                            },
+                            on_schedule: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.add_info_message(
+                                            i18n::t("titlebar-not-implemented").to_string(),
+                                            cx,
+                                        );
+                                    });
+                                })
+                            },
+                            on_new_window: {
+                                let ws = workspace.clone();
+                                Rc::new(move |_, _, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
+                                        this.add_info_message(
+                                            i18n::t("titlebar-not-implemented").to_string(),
+                                            cx,
+                                        );
+                                    });
+                                })
+                            },
+                            is_pinned,
+                            is_archived,
+                        };
+                        build_title_menu(menu, window, cx, cb)
+                    });
+                    let sub = cx.subscribe(
+                        &menu,
+                        |this: &mut Workspace,
+                         _menu: Entity<PopupMenu>,
+                         _: &DismissEvent,
+                         cx: &mut Context<Workspace>| {
+                            this.close_title_menu();
+                            cx.notify();
+                        },
+                    );
+                    this.title_menu = Some(menu);
+                    this.title_menu_sub = Some(sub);
+                    cx.notify();
+                }));
 
-        // Color the trigger when open so the affordance matches the dropdown's
-        // presence (a clicked "..." otherwise looks identical to a hovered one).
-        let trigger = if open {
-            trigger.text_color(theme.accent_foreground)
-        } else {
-            trigger
-        };
+            // Color the trigger when open so the affordance matches the dropdown's
+            // presence (a clicked "..." otherwise looks identical to a hovered one).
+            let trigger = if open {
+                trigger.text_color(theme.accent_foreground)
+            } else {
+                trigger
+            };
 
-        if !open {
-            return trigger.into_any_element();
-        }
+            if !open {
+                return trigger.into_any_element();
+            }
 
-        let menu = self
-            .title_menu
-            .clone()
-            .expect("title_menu exists when open");
+            let menu = self
+                .title_menu
+                .clone()
+                .expect("title_menu exists when open");
 
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                // `deferred()` + `with_priority(1)` paints the dropdown after
-                // the whole conversation column tree, escaping overflow_hidden
-                // clipping from ancestor containers. `right_0()` keeps the menu
-                // within the viewport when the window sits near the screen edge.
-                deferred(
-                    gpui::div()
-                        .id("titlebar-dropdown")
-                        .absolute()
-                        .top_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    // `deferred()` + `with_priority(1)` paints the dropdown after
+                    // the whole conversation column tree, escaping overflow_hidden
+                    // clipping from ancestor containers. `right_0()` keeps the menu
+                    // within the viewport when the window sits near the screen edge.
+                    deferred(
+                        gpui::div()
+                            .id("titlebar-dropdown")
+                            .absolute()
+                            .top_full()
+                            .right_0()
+                            .occlude()
+                            .child(menu),
+                    )
+                    .with_priority(1),
                 )
-                .with_priority(1),
-            )
-            .into_any_element()
+                .into_any_element()
         }
         #[cfg(not(feature = "harness-manox"))]
         {

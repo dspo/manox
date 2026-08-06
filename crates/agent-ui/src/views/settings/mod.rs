@@ -19,9 +19,9 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::{i18n, settings as user_settings};
 #[cfg(feature = "harness-manox")]
 use agent::mcp;
+use agent::{i18n, settings as user_settings};
 
 use crate::views::management_shell::back_control;
 #[cfg(feature = "harness-manox")]

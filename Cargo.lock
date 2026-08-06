@@ -5288,6 +5288,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "agent-ui",
+ "cx",
  "gpui",
  "gpui-component",
  "gpui-component-assets",

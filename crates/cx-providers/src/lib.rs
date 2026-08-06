@@ -892,7 +892,7 @@ pub fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
 pub fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
     match canonical_agent_id(agent_id) {
         "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        "claude" => vec![WireApi::Anthropic],
+        "claude" | "VS Code" => vec![WireApi::Anthropic],
         "codex" | "Codex.app" => vec![WireApi::Responses],
         // codex+ is a codex fork that additionally supports anthropic / completions.
         // Only entered on explicit `cx codex+`; not written to the default agents list.
@@ -949,6 +949,27 @@ pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 id: "Codex.app".into(),
                 binary: "codex".into(),
                 args: vec!["app".into()],
+                supported_wire_apis,
+                env: agent.env.clone(),
+                hidden: false,
+            });
+        } else if id == "claude" {
+            // claude expands into a CLI entry and a VS Code desktop entry. The
+            // VS Code entry is an injection-type agent (like Codex.app): the cx
+            // launcher starts Visual Studio Code with Claude Code BYOK env
+            // instead of exec-ing the `claude` binary; binary/args are metadata.
+            agents.push(ResolvedAgent {
+                id: "claude".into(),
+                binary: agent.binary.clone(),
+                args: agent.args.clone(),
+                supported_wire_apis: supported_wire_apis.clone(),
+                env: agent.env.clone(),
+                hidden: false,
+            });
+            agents.push(ResolvedAgent {
+                id: "VS Code".into(),
+                binary: agent.binary.clone(),
+                args: vec!["vscode".into()],
                 supported_wire_apis,
                 env: agent.env.clone(),
                 hidden: false,
@@ -1283,6 +1304,73 @@ agents:
             vec!["claude".to_string()],
             "model-level agents: [claude] narrows the effective set to [claude]"
         );
+    }
+
+    /// `claude` expands into a CLI entry plus a `VS Code` desktop entry
+    /// (mirrors `codex` → `codex` + `Codex.app`). `VS Code` is an
+    /// Anthropic-wire agent: models on anthropic endpoints see it unless an
+    /// explicit `agents:` allow-list narrows them away.
+    #[test]
+    fn claude_expands_into_vscode_desktop_agent() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let agents = resolved_agents(&config);
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"claude"), "claude CLI entry kept: {ids:?}");
+        assert!(
+            ids.contains(&"VS Code"),
+            "VS Code desktop entry added: {ids:?}"
+        );
+        let vscode = agents.iter().find(|a| a.id == "VS Code").unwrap();
+        assert_eq!(vscode.supported_wire_apis, vec![WireApi::Anthropic]);
+        assert!(!vscode.hidden);
+
+        // Unfiltered anthropic model is visible to VS Code.
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].visible_agents.contains(&"VS Code".to_string()),
+            "anthropic model must be visible to VS Code: {:?}",
+            resolved[0].visible_agents
+        );
+    }
+
+    /// Explicit model-level `agents: [claude]` keeps VS Code out — the same
+    /// allow-list semantics Codex.app follows.
+    #[test]
+    fn vscode_excluded_by_model_level_agent_filter() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+      agents: [claude]
+  endpoints:
+    anthropic:
+      url: https://example.com
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].visible_agents, vec!["claude".to_string()]);
     }
 
     /// With neither endpoint nor model `agents`, a model supports every

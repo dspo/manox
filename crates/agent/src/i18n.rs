@@ -63,8 +63,8 @@ pub fn set_menu_rebuilder(rebuild: impl Fn(&mut App) + Send + Sync + 'static) {
 }
 
 /// Re-run the registered native-menu rebuilder. The menu tree embeds dynamic
-/// content beyond localized labels (the `Agent → ChatGPT.app` provider/model
-/// cascade mirrors the provider registry), so callers that swap the registry —
+/// content beyond localized labels (the `工具 → ChatGPT.app` / `工具 → VS Code`
+/// provider/model cascades mirror the provider registry), so callers that swap the registry —
 /// or otherwise change what the menus should show — rebuild through this.
 /// No-op before [`set_menu_rebuilder`] registers the closure.
 pub fn rebuild_menus(cx: &mut App) {
