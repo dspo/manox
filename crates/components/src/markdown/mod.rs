@@ -16,7 +16,7 @@
 //! `DocSelection`; the key listener copies it. `RichText` composes `StyledText`
 //! for shaping/glyph-painting and overlays inline-code foreground colors + the
 //! document-selection slice for the block. The base font/color is inherited from
-//! `window.text_style()` (set by the parent `div`'s `.text_sm()`/`.text_color()`/…)
+//! `window.text_style()` (set by the parent `div`'s `.text_base()`/`.text_color()`/…)
 //! at layout time, so the renderer never constructs a `TextStyle`.
 
 pub mod ast;
@@ -246,7 +246,7 @@ impl Render for Markdown {
         let block_count = blocks.len();
         let blocks_owned: Vec<Block> = (*blocks).clone();
 
-        // Root carries `text_sm` so the document is self-contained: every block
+        // Root carries `text_base` so the document is self-contained: every block
         // that does not override the size itself (paragraph, list item bodies)
         // inherits it. The renderer is mounted inside full-width message blocks,
         // so its root must participate in the same shrink-safe width chain.
@@ -256,7 +256,7 @@ impl Render for Markdown {
             .min_w_0()
             .overflow_hidden()
             .gap_2()
-            .text_sm()
+            .text_base()
             // I-beam over the document body: a clickable, selectable text
             // surface signals itself to the pointer.
             .cursor_text()
@@ -486,7 +486,6 @@ fn paragraph(
         .w_full()
         .min_w_0()
         .overflow_hidden()
-        .text_sm()
         .child(
             RichText::new(text, doc_start, selection.clone())
                 .highlights(runs.highlights.clone())
@@ -544,9 +543,9 @@ impl HeadingMode {
     }
 }
 
-/// `Scaled`: H1/H2 stay at base size (16px) and discriminate by weight — H1
-/// gets `Black` (900), H2 gets `Bold` (700). H3 is base + bold; H4+ collapse to
-/// small (14px) + bold. The six-level ladder compresses to three distinguishable
+/// `Scaled`: H1/H2 stay at base size and discriminate by weight — H1 gets
+/// `Black` (900), H2 gets `Bold` (700). H3 is base + bold; H4+ collapse to
+/// small + bold. The six-level ladder compresses to three distinguishable
 /// levels without any line growing taller than the body, matching the app-wide
 /// 3-font-size discipline.
 fn scaled_heading(depth: u8) -> HeadingSpec {
@@ -580,7 +579,7 @@ fn uniform_heading(depth: u8) -> HeadingSpec {
         italic: depth == 1,
         underline: depth == 1,
         space_after: depth <= 3,
-        size: HeadingSize::Sm,
+        size: HeadingSize::Base,
     }
 }
 
@@ -665,7 +664,7 @@ fn code_block(
             div()
                 .py_3()
                 .px_2()
-                .text_xs()
+                .text_sm()
                 .text_color(styles.muted)
                 .whitespace_nowrap()
                 .child(SharedString::from(gutter.to_string())),
@@ -678,7 +677,7 @@ fn code_block(
                 .overflow_x_scroll()
                 .py_3()
                 .px_3()
-                .text_xs()
+                .text_sm()
                 .text_color(styles.foreground)
                 .whitespace_nowrap()
                 .child(
@@ -780,7 +779,7 @@ fn diff_block(
                 .bg(bg)
                 .px_3()
                 .py(px(1.))
-                .text_xs()
+                .text_sm()
                 .text_color(fg)
                 .whitespace_nowrap()
                 .child(
@@ -965,7 +964,7 @@ fn conflict_block(
             .bg(bg)
             .px_3()
             .py(px(1.))
-            .text_xs()
+            .text_sm()
             .text_color(fg)
             .whitespace_nowrap()
             .child(
@@ -1063,7 +1062,7 @@ fn table_block(
                 .min_w(px(140.))
                 .px_3()
                 .py_2()
-                .text_xs()
+                .text_sm()
                 .border_r_1()
                 .border_b_1()
                 .border_color(styles.border)
@@ -1127,7 +1126,7 @@ fn list_block(
                 .child(
                     div()
                         .w(px(16.))
-                        .text_sm()
+                        .text_base()
                         .text_color(match item.checked {
                             Some(true) => styles.diff_add_fg,
                             _ => styles.muted,
@@ -1195,7 +1194,7 @@ mod tests {
         let h1 = HeadingMode::Uniform.spec(1);
         assert_eq!(h1.weight, FontWeight::BLACK);
         assert!(h1.italic && h1.underline && h1.space_after);
-        assert!(matches!(h1.size, HeadingSize::Sm));
+        assert!(matches!(h1.size, HeadingSize::Base));
 
         // H2: black weight, no italic/underline, space-after.
         let h2 = HeadingMode::Uniform.spec(2);
@@ -1212,7 +1211,7 @@ mod tests {
             let h = HeadingMode::Uniform.spec(depth);
             assert_eq!(h.weight, FontWeight::BOLD, "depth {depth}");
             assert!(!h.italic && !h.underline && !h.space_after, "depth {depth}");
-            assert!(matches!(h.size, HeadingSize::Sm), "depth {depth}");
+            assert!(matches!(h.size, HeadingSize::Base), "depth {depth}");
         }
     }
 
@@ -1458,7 +1457,7 @@ suffix line";
             }
         }
 
-        // Mirrors the Markdown root col: a plain `div().text_sm()` whose only
+        // Mirrors the Markdown root col: a plain `div().text_base()` whose only
         // child is the probe, mounted as an `Entity` so the probe's layout runs
         // across the view boundary exactly like a persistent `Entity<Markdown>`.
         struct Host {
@@ -1470,7 +1469,7 @@ suffix line";
                 _window: &mut Window,
                 _cx: &mut gpui::Context<Self>,
             ) -> impl IntoElement {
-                div().text_sm().child(Probe {
+                div().text_base().child(Probe {
                     captured: self.probe.clone(),
                 })
             }
