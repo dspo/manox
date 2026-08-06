@@ -369,8 +369,17 @@ async fn run_actor(
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
+                    // Self-diagnosing failure: name what the registry held at
+                    // build time so startup reports are actionable.
+                    let registered = registry.provider_names();
+                    tracing::error!(
+                        error = %err,
+                        model_provider = %pi_model.provider,
+                        registered = ?registered,
+                        "pi session build failed"
+                    );
                     let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                        "pi session build failed: {err}"
+                        "pi session build failed: {err} (registered providers: {registered:?})"
                     )));
                     return;
                 }
