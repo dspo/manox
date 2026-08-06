@@ -191,9 +191,18 @@ impl TerminalView {
             return;
         }
 
+        // Tab is owned by the SendTab/SendShiftTab actions (Terminal key
+        // context); skip it here so a fallback dispatch can never double-send
+        // it to the PTY on top of the action.
+        if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
+            return;
+        }
+
         // Unbound cmd/super combos produce no PTY input; without this guard the
-        // printable branch would type a raw char for e.g. cmd-x.
-        if k.modifiers.platform {
+        // printable branch would type a raw char for e.g. cmd-x. `platform` is
+        // cmd/super/win (never ctrl, see gpui `Modifiers`), and the extra
+        // `!control` keeps ctrl-combos flowing to the control-char branch.
+        if k.modifiers.platform && !k.modifiers.control {
             return;
         }
 
