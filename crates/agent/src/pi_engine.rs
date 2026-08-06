@@ -207,7 +207,11 @@ fn system_prompt(cwd: &Path) -> String {
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
-fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<dyn PiAgentTool>> {
+fn build_tools(
+    cwd: &Path,
+    runtime: &ModelRuntime,
+    model: Option<&PiModel>,
+) -> Vec<Arc<dyn PiAgentTool>> {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let bash = BashTool::new(
@@ -216,21 +220,7 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
     )
     .with_manager(Arc::clone(&manager));
 
-    let mut registry = AgentRegistry::new();
-    register_defaults(&mut registry);
-    let subagent = SubagentTool::new(
-        Arc::new(registry),
-        vec![
-            Arc::new(pi::tools::read::ReadTool),
-            Arc::new(pi::tools::grep::GrepTool),
-            Arc::new(pi::tools::find::FindTool),
-            Arc::new(pi::tools::ls::LsTool),
-        ],
-    )
-    .with_model_runtime(runtime.clone())
-    .with_model(model.clone());
-
-    vec![
+    let mut tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
         Arc::new(pi::tools::write::WriteTool),
         Arc::new(pi::tools::edit::EditTool),
@@ -240,8 +230,26 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background)),
-        Arc::new(subagent),
-    ]
+    ];
+    // The sub-agent tool needs a concrete model; a session assembled before
+    // registration landed (first seconds after launch) skips it.
+    if let Some(model) = model {
+        let mut registry = AgentRegistry::new();
+        register_defaults(&mut registry);
+        let subagent = SubagentTool::new(
+            Arc::new(registry),
+            vec![
+                Arc::new(pi::tools::read::ReadTool),
+                Arc::new(pi::tools::grep::GrepTool),
+                Arc::new(pi::tools::find::FindTool),
+                Arc::new(pi::tools::ls::LsTool),
+            ],
+        )
+        .with_model_runtime(runtime.clone())
+        .with_model(model.clone());
+        tools.push(Arc::new(subagent));
+    }
+    tools
 }
 
 fn steer_message(text: String) -> AgentMessage {
@@ -277,15 +285,18 @@ fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: &PiModel,
+    model: Option<&PiModel>,
 ) -> pi::coding_agent::AgentSessionBuilder {
-    create_agent_session()
+    let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_model(model.clone())
         .with_system_prompt(system_prompt(cwd))
-        .with_tools(build_tools(cwd, runtime, model))
+        .with_tools(build_tools(cwd, runtime, model));
+    if let Some(model) = model {
+        builder = builder.with_model(model.clone());
+    }
+    builder
 }
 
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
@@ -299,21 +310,14 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    // Wait for the one-shot background registration from
-    // `pi_providers::init` — the actor never reloads providers itself, so
-    // thread creation no longer pays the keychain/shell cost, and the
-    // first turn never sees an empty registry.
-    crate::pi_providers::wait_ready().await;
-    let Some(pi_model) = model else {
-        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-            "no model configured — add a provider in Settings"
-        )));
-        return;
-    };
+    // Session creation does not need a model — registration runs in the
+    // background and the model resolves lazily below, so the sidebar sees
+    // the new session immediately instead of after the keychain round.
     let registry = crate::pi_providers::global();
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
+    let mut pi_model = model.or_else(crate::pi_providers::default_model);
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
@@ -340,7 +344,7 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
-        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, &pi_model);
+        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, pi_model.as_ref());
         match builder.open(info.path).await {
             Ok(s) => {
                 restored = true;
@@ -351,10 +355,12 @@ async fn run_actor(
             }
         }
     }
+    let mut built_without_model = false;
     let mut session = match session {
         Some(s) => s,
         None => {
-            let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+            built_without_model = pi_model.is_none();
+            let builder = session_builder(&cwd, &sessions_dir, &runtime, pi_model.as_ref());
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
@@ -367,13 +373,33 @@ async fn run_actor(
         }
     };
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+    // The sidebar item appears now — registration latency no longer gates it.
     refresh_session_list(&repo, &state).await;
+
+    // Resolve the model once registration has had time to land; wait only
+    // when it is still unknown (first seconds after launch).
+    if pi_model.is_none() {
+        crate::pi_providers::wait_ready().await;
+        pi_model = crate::pi_providers::default_model();
+    }
+    let Some(pi_model) = pi_model else {
+        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
+            "no model configured — add a provider in Settings"
+        )));
+        return;
+    };
+    if built_without_model {
+        let _ = session.set_model(pi_model.clone()).await;
+    }
 
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
 
-    let _ = notice_tx.send(BackendNotice::Ready { restored });
+    let _ = notice_tx.send(BackendNotice::Ready {
+        restored,
+        model: Some(pi_model.clone()),
+    });
     if restored {
         sync_history(&session, &state);
         sync_usage(&session, &state).await;
@@ -498,7 +524,7 @@ async fn run_actor(
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd } => {
-                let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+                let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
                 match builder.build().await {
                     Ok(s) => {
                         session = s;
@@ -555,7 +581,7 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
-    let builder = session_builder(&cwd, sessions_dir, runtime, model);
+    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model));
     match builder.open(path.to_path_buf()).await {
         Ok(s) => *session = s,
         Err(err) => {

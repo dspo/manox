@@ -86,7 +86,13 @@ pub enum BackendNotice {
     /// A run event already adapted into a `ThreadEvent`.
     Event(Box<crate::thread::ThreadEvent>),
     /// The session finished building/restoring.
-    Ready { restored: bool },
+    Ready {
+        restored: bool,
+        /// The model the actor resolved for this thread (registration may
+        /// have landed after construction); the facade mirrors it so the
+        /// selector shows the default instead of "no model".
+        model: Option<pi::types::Model>,
+    },
     /// The turn loop unwound and released the running slot.
     Settled {
         cancelled: bool,

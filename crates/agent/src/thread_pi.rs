@@ -316,8 +316,11 @@ impl Thread {
                             BackendNotice::Event(event) => {
                                 cx.emit(*event);
                             }
-                            BackendNotice::Ready { restored } => {
+                            BackendNotice::Ready { restored, model } => {
                                 t.restored = restored;
+                                if let Some(m) = model {
+                                    t.model = Some(m);
+                                }
                                 if restored {
                                     t.refresh_history(cx);
                                     cx.emit(ThreadEvent::HistoryRestored);
