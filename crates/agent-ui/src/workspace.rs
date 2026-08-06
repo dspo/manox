@@ -627,6 +627,7 @@ impl Render for DraggedSidebarDivider {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        #[allow(unused_mut)] // mutated only under harness-pi
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // An unbound conversation must not inherit the launch terminal's
         // cwd as its working directory — that is an arbitrary project dir
