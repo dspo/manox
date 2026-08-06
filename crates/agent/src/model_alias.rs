@@ -18,14 +18,11 @@
 //! Falls back to `None` when nothing matches, in which case the caller inherits
 //! the parent thread's model — the same behavior as an unset `model` field.
 
-use crate::language_model::AnyLanguageModel;
-use crate::provider::registry::global;
-
 /// `(alias, segment_probe)` pairs. The probe must be the first hyphen/dot/
 /// underscore-delimited token of a live model id segment (case-insensitive),
 /// so `o3` matches `o3-mini` but not `proto3-server`, and `sonnet` matches
 /// `sonnet-4` but not `crimsonsonnet-x`.
-const ALIASES: &[(&str, &str)] = &[
+pub const ALIASES: &[(&str, &str)] = &[
     ("claude-sonnet", "sonnet"),
     ("claude-opus", "opus"),
     ("claude-haiku", "haiku"),
@@ -42,7 +39,7 @@ const ALIASES: &[(&str, &str)] = &[
 /// substring containment — so `o3` matches `anthropic/o3-mini` (token `o3`)
 /// but not `proto3-server` (token `proto3`), and `sonnet` matches `sonnet-4`
 /// but not `crimsonsonnet-x`.
-fn matches_segment(id: &str, probe: &str) -> bool {
+pub fn matches_segment(id: &str, probe: &str) -> bool {
     let probe = probe.to_lowercase();
     id.to_lowercase()
         .split(['/', ':'])
@@ -50,63 +47,25 @@ fn matches_segment(id: &str, probe: &str) -> bool {
 }
 
 /// The leading sub-token of a model segment, splitting on `-`, `.`, and `_`.
-fn segment_first_token(seg: &str) -> &str {
+pub fn segment_first_token(seg: &str) -> &str {
     seg.split(['-', '.', '_']).next().unwrap_or("")
 }
 
-/// Resolve a model reference (a manox id or a Claude/OpenAI alias) to a live
-/// model. Returns `None` when no model matches, leaving the caller to inherit.
-pub fn resolve_model_ref(model_ref: &str) -> Option<AnyLanguageModel> {
-    let reg = global();
-    if let Some(m) = reg.get_model(model_ref) {
-        return Some(m);
+/// Resolve a model reference against the pi provider registry — the pi
+/// harness's selection source. Mirrors [`resolve_model_ref`]: an exact
+/// model id wins outright, then the alias table maps to a segment probe,
+/// and the ref itself probes as a last resort.
+pub fn resolve_pi_model_ref(model_ref: &str) -> Option<pi::types::Model> {
+    let models = crate::pi_providers::global().models();
+    if let Some(exact) = models.iter().find(|m| m.id == model_ref) {
+        return Some(exact.clone());
     }
-    let lower = model_ref.to_lowercase();
-    if let Some((_, probe)) = ALIASES.iter().find(|(k, _)| *k == lower)
-        && let Some(m) = reg
-            .models()
-            .iter()
-            .find(|m| matches_segment(&m.id(), probe))
-    {
-        return Some(m.clone());
-    }
-    reg.models()
+    // Alias lookup is case-insensitive (parity with the retired manox
+    // `resolve_model_ref`): `Sonnet` / `CLAUDE-SONNET` still map.
+    let probe = ALIASES
         .iter()
-        .find(|m| matches_segment(&m.id(), &lower))
-        .cloned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alias_table_has_claude_aliases() {
-        let keys: Vec<&str> = ALIASES.iter().map(|(k, _)| *k).collect();
-        assert!(keys.contains(&"sonnet"));
-        assert!(keys.contains(&"opus"));
-        assert!(keys.contains(&"haiku"));
-    }
-
-    #[test]
-    fn longer_alias_listed_first() {
-        // `claude-sonnet` must precede `sonnet` so the specific match wins.
-        let sonnet_idx = ALIASES.iter().position(|(k, _)| *k == "sonnet").unwrap();
-        let claude_sonnet_idx = ALIASES
-            .iter()
-            .position(|(k, _)| *k == "claude-sonnet")
-            .unwrap();
-        assert!(claude_sonnet_idx < sonnet_idx);
-    }
-
-    #[test]
-    fn segment_match_rejects_substring_false_positives() {
-        // `o3` as a segment must not match `proto3-server` (no `o3` segment).
-        assert!(!matches_segment("provider/proto3-server", "o3"));
-        // It must match a real `o3` segment.
-        assert!(matches_segment("provider/o3-mini", "o3"));
-        // `sonnet` must not match `crimsonsonnet-x`.
-        assert!(!matches_segment("provider/crimsonsonnet-x", "sonnet"));
-        assert!(matches_segment("provider/sonnet-4", "sonnet"));
-    }
+        .find(|(alias, _)| *alias == model_ref.to_lowercase())
+        .map(|(_, probe)| *probe)
+        .unwrap_or(model_ref);
+    models.into_iter().find(|m| matches_segment(&m.id, probe))
 }

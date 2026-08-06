@@ -35,11 +35,14 @@ use async_channel::{Receiver, Sender};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
+#[cfg(not(feature = "harness-manox"))]
 use agent::thread::{Thread, ThreadEvent};
 use agent::webview_host::{
     BrowserHost, BrowserInboundWrite as AgentInboundWrite,
     BrowserNotification as AgentNotification, BrowserTabId,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::thread::{Thread, ThreadEvent};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;

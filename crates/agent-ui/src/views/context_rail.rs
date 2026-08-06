@@ -19,8 +19,9 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
-use agent::provider::registry;
-use agent::{Thread, ThreadEvent, i18n};
+use agent::i18n;
+#[cfg(not(feature = "harness-manox"))]
+use agent::{Thread, ThreadEvent};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -29,6 +30,10 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::provider::registry;
+#[cfg(feature = "harness-manox")]
+use harness_manox::{Thread, ThreadEvent};
 use std::path::PathBuf;
 
 use crate::Workspace;
@@ -389,10 +394,9 @@ impl ContextRail {
 
                 // Context budget row — first tree child, only when the model is
                 // registered (so its window size is resolvable).
-                let model = registry::global().get_model_by_name(model_name);
-                let budget = model
-                    .as_ref()
-                    .and_then(|m| context_budget_pct(m.max_token_count(), effective_tokens));
+                let window_tokens = model_window_tokens(model_name);
+                let budget =
+                    window_tokens.and_then(|cap| context_budget_pct(cap, effective_tokens));
                 if let Some(budget) = budget {
                     let used = crate::cockpit::format_tokens_pi(budget.active_tokens);
                     let cap = crate::cockpit::format_tokens_pi(budget.cap_tokens);
@@ -1036,4 +1040,30 @@ fn env_row_clickable(
         )
         .children(trailing)
         .into_any_element()
+}
+
+/// Context window for a model name on the usage rail: the pi build probes
+/// the shared pi provider registry (by wire id, then display name); the
+/// retired manox build probes its own registry.
+fn model_window_tokens(model_name: &str) -> Option<u64> {
+    #[cfg(feature = "harness-manox")]
+    {
+        return registry::global()
+            .get_model_by_name(model_name)
+            .map(|m| m.max_token_count());
+    }
+    #[cfg(not(feature = "harness-manox"))]
+    {
+        agent::pi_providers::global()
+            .models()
+            .iter()
+            .find(|m| {
+                m.id == model_name
+                    || m.metadata
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| name == model_name)
+            })
+            .map(|m| m.context_window as u64)
+    }
 }

@@ -62,7 +62,7 @@ pub struct PlanSnapshot {
 /// snapshot it emits).
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UpdatePlanInput {
+pub struct UpdatePlanInput {
     /// Optional one-line note about what changed in this update.
     #[serde(default)]
     pub explanation: Option<String>,

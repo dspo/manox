@@ -29,7 +29,7 @@ use gpui_component::{
 
 use agent::i18n;
 #[cfg(feature = "harness-manox")]
-use agent::mcp;
+use harness_manox::mcp;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
 

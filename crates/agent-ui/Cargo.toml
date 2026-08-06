@@ -9,16 +9,13 @@ name = "agent_ui"
 path = "src/lib.rs"
 
 [features]
-default = ["harness-manox"]
-# The manox self-built harness backend (the polished, feature-complete path).
-# Mutually exclusive with `harness-pi`; the `manox` bin guards both ways.
-harness-manox = ["agent/harness-manox"]
-# Mount the pi harness backend: the workspace drives the pi-backed `Thread`
-# facade (agent's `harness-pi` build) instead of the manox self-built harness.
-# Selected at build time by the `manox` bin
-# (`--no-default-features --features harness-pi`); the default build never
-# compiles the pi dependencies.
-harness-pi = ["dep:pi", "dep:pi-extensions", "agent/harness-pi"]
+default = ["harness-pi"]
+# The retired manox harness UI variant: kept compiling behind this feature
+# (no binary enables it) so the archived chrome survives alongside the
+# `harness-manox` crate.
+harness-manox = ["dep:harness-manox"]
+# The pi harness backend: the workspace drives the pi-backed `Thread` facade.
+harness-pi = ["dep:pi", "dep:pi-extensions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -51,6 +48,9 @@ cx.workspace = true
 # pi harness backend — only compiled for the `harness-pi` feature.
 pi = { workspace = true, optional = true }
 pi-extensions = { workspace = true, optional = true }
+
+# Retired manox harness — only compiled for the dead `harness-manox` feature.
+harness-manox = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent = { workspace = true, features = ["test-support"] }
