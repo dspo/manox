@@ -66,7 +66,7 @@ impl IntoElement for TurnFrame {
             shell = shell.group(group);
         }
 
-        let mut header_row = h_flex().w_full().min_w_0().items_center().gap_2().text_xs();
+        let mut header_row = h_flex().w_full().min_w_0().items_center().gap_2().text_sm();
         if let Some(header) = self.header {
             header_row = header_row.child(gpui::div().flex_1().min_w_0().truncate().child(header));
         } else {

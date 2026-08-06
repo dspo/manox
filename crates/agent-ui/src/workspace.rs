@@ -6908,13 +6908,7 @@ impl Workspace {
                                     .min_h_0()
                                     .overflow_y_scroll()
                                     .track_scroll(&scroll)
-                                    .child(
-                                        gpui::div()
-                                            .w_full()
-                                            .p_4()
-                                            .text_sm()
-                                            .child(md.into_any_element()),
-                                    )
+                                    .child(gpui::div().w_full().p_4().child(md.into_any_element()))
                                     .into_any_element()
                             } else {
                                 gpui::div()
@@ -6980,7 +6974,7 @@ impl Workspace {
                                         .overflow_y_scroll()
                                         .track_scroll(&scroll)
                                         .child(
-                                            gpui::div().w_full().p_4().text_sm().child(
+                                            gpui::div().w_full().p_4().child(
                                                 cx.new(|_cx| {
                                                     Markdown::new("plan-preview", text)
                                                         .theme(&theme)

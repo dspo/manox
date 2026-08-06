@@ -778,7 +778,7 @@ fn render_user(
                 .py_0p5()
                 .rounded(theme.radius)
                 .bg(accent.opacity(0.15))
-                .text_xs()
+                .text_sm()
                 .text_color(theme.accent_foreground)
                 .child(i18n::t("message-steer-pending-badge")),
         )
@@ -789,7 +789,7 @@ fn render_user(
                 .py_0p5()
                 .rounded(theme.radius)
                 .bg(accent.opacity(0.15))
-                .text_xs()
+                .text_sm()
                 .text_color(theme.accent_foreground)
                 .child(i18n::t("message-steered-badge"))
         })
@@ -824,7 +824,7 @@ fn render_user(
                 .min_w_0()
                 .overflow_hidden()
                 .gap_2()
-                .text_sm()
+                .text_base()
                 .text_color(theme.foreground)
                 .children(images.iter().map(|ui| {
                     gpui::img(ui.0.clone())
@@ -885,7 +885,7 @@ pub fn render_assistant(
     // row with just the model name.
     let summary_child = activity_summary.and_then(activity_summary_text).map(|t| {
         gpui::div()
-            .text_xs()
+            .text_sm()
             .text_color(theme.muted_foreground)
             .child(t)
     });
@@ -902,7 +902,7 @@ pub fn render_assistant(
                 .items_center()
                 .child(
                     gpui::div()
-                        .text_xs()
+                        .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(role.to_string()),
                 )
@@ -962,7 +962,7 @@ fn render_banner(
         .overflow_x_hidden()
         .items_center()
         .gap_1()
-        .text_xs()
+        .text_sm()
         .text_color(accent);
     if let Some(c) = &collapsible {
         let chevron = if c.collapsed {
@@ -1018,7 +1018,7 @@ fn render_banner(
             gpui::div()
                 .w_full()
                 .min_w_0()
-                .text_sm()
+                .text_base()
                 .text_color(theme.foreground)
                 .child(body),
         );
@@ -1441,7 +1441,7 @@ fn render_reasoning_entry(
                     .flex_1()
                     .min_w_0()
                     .overflow_x_hidden()
-                    .text_xs()
+                    .text_sm()
                     .text_color(theme.muted_foreground)
                     .child(truncate(&label, 80)),
             ),
@@ -1462,7 +1462,6 @@ fn render_reasoning_entry(
                 .min_w_0()
                 .pl_6()
                 .py_1()
-                .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(body),
         );
@@ -1578,7 +1577,7 @@ fn render_tool_entry(
                         .flex_1()
                         .min_w_0()
                         .overflow_x_hidden()
-                        .text_xs()
+                        .text_sm()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
                         .child(truncate(&title, 80)),
@@ -1884,7 +1883,7 @@ fn render_plan_review_card(
             gpui::div()
                 .flex_1()
                 .min_w_0()
-                .text_sm()
+                .text_base()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(accent)
                 .child(i18n::t("plan-card-title")),
@@ -2027,7 +2026,7 @@ fn render_ask_user_card(
                 .flex_1()
                 .min_w_0()
                 .overflow_x_hidden()
-                .text_sm()
+                .text_base()
                 .text_color(theme.foreground)
                 .child(title),
         )
@@ -2049,7 +2048,7 @@ fn render_ask_user_card(
                     gpui::div()
                         .min_w(px(44.))
                         .text_center()
-                        .text_xs()
+                        .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(format!("{} of {total}", step + 1)),
                 )
@@ -2086,7 +2085,7 @@ fn render_ask_user_card(
     let question_row = gpui::div()
         .w_full()
         .min_w_0()
-        .text_sm()
+        .text_base()
         .text_color(theme.foreground)
         .child(snapshot.question.question.clone());
 
@@ -2166,7 +2165,7 @@ fn render_ask_user_card(
                             .child(
                                 gpui::div()
                                     .flex_shrink_0()
-                                    .text_sm()
+                                    .text_base()
                                     .text_color(theme.foreground)
                                     .child(format!("{}.", oi + 1)),
                             )
@@ -2174,7 +2173,7 @@ fn render_ask_user_card(
                                 gpui::div()
                                     .min_w_0()
                                     .overflow_x_hidden()
-                                    .text_sm()
+                                    .text_base()
                                     .text_color(theme.foreground)
                                     .child(opt.label.clone()),
                             )
@@ -2191,7 +2190,7 @@ fn render_ask_user_card(
                         col.child(
                             gpui::div()
                                 .mt_0p5()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(theme.muted_foreground)
                                 .child(opt.description.clone()),
                         )
@@ -2330,7 +2329,7 @@ pub fn render_tool_call(
                         .flex_1()
                         .min_w_0()
                         .overflow_x_hidden()
-                        .text_xs()
+                        .text_sm()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
                         .child(truncate(&title, 80)),
@@ -2343,7 +2342,7 @@ pub fn render_tool_call(
                 ))
                 .child(
                     gpui::div()
-                        .text_xs()
+                        .text_sm()
                         .text_color(status_color)
                         .child(status_label),
                 ),
@@ -2463,7 +2462,6 @@ fn render_tool_output(
         .py_2()
         .border_t_1()
         .border_color(theme.border)
-        .text_xs()
         .text_color(theme.muted_foreground);
     container
         .child(markdown_tv(
@@ -2582,7 +2580,7 @@ pub fn render_agent_task(
                 .min_w_0()
                 .truncate()
                 .whitespace_nowrap()
-                .text_xs()
+                .text_sm()
                 .font_family(theme.mono_font_family.clone())
                 .text_color(theme.muted_foreground)
                 .child(display_title),
@@ -2701,7 +2699,7 @@ fn render_background_task(
                         .min_w_0()
                         .truncate()
                         .whitespace_nowrap()
-                        .text_xs()
+                        .text_sm()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.foreground)
                         .child(title)
@@ -2717,7 +2715,7 @@ fn render_background_task(
                         .min_w_0()
                         .truncate()
                         .whitespace_nowrap()
-                        .text_xs()
+                        .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(status_text),
                 )
@@ -2730,7 +2728,7 @@ fn render_background_task(
                             .debug_selector(move || format!("message-overflow-bg-task-detail-{ix}"))
                             .w_full()
                             .min_w_0()
-                            .text_xs()
+                            .text_sm()
                             .text_color(theme.muted_foreground)
                             .child(detail),
                     )
@@ -2778,7 +2776,7 @@ fn render_cache_miss(
     let rule = "\u{2500}".repeat(rule_width);
     let line = format!("{rule} {label}");
     gpui::div()
-        .text_xs()
+        .text_sm()
         .text_color(theme.muted_foreground)
         .child(line)
         .into_any_element()
