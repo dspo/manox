@@ -582,6 +582,8 @@ fn build_tools_menu() -> Menu {
     let chatgpt_empty = chatgpt.items.is_empty();
     let chatgpt = chatgpt.disabled(chatgpt_empty);
     let vscode = Menu::new("VS Code").items(build_vscode_menu_items());
+    // VS Code 未安装时整个子菜单禁用——含「打开（不注入 BYOK）」项，
+    // 因为此时没有任何 VS Code 实例可打开/注入。
     let vscode_installed = cx::vscode_app_installed();
     let vscode = vscode.disabled(!vscode_installed);
     Menu::new(agent::i18n::t("menu-tools"))

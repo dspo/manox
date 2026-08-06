@@ -4433,9 +4433,10 @@ mod tests {
     fn build_launch_spec_rejects_vscode_agent() {
         // VS Code 与 Codex.app 一样是注入型 agent：run_launcher 分流，
         // build_launch_spec 误入时必须显式报错而非静默 passthrough。
+        let fake_binary = create_fake_binary("claude");
         let selection = Selection {
             agent_id: "VS Code".into(),
-            agent_binary: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
             agent_args: vec!["vscode".into()],
             agent_env: BTreeMap::new(),
             selected_wire_api: WireApi::Anthropic,
@@ -4466,6 +4467,7 @@ mod tests {
         let err = build_launch_spec(&selection, &[], false, None, None)
             .expect_err("VS Code 不应进入 build_launch_spec");
         assert!(err.to_string().contains("VS Code"));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     #[test]

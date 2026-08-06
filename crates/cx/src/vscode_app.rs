@@ -37,12 +37,17 @@ const QUIT_WAIT_TIMEOUT_SECS: u64 = 60;
 const SHELL_ENV_RESOLVE_TIMEOUT_SECS: u64 = 10;
 
 /// BYOK 注入必须先剥除的继承变量（如 ~/.zshrc 的导出值），再写入本次选中值。
+/// 两个 ANTHROPIC_DEFAULT_* 别名也在其中：注入后 BASE_URL 已指向选中网关，
+/// 别名若保留 shell 旧值（多指向官方模型），后台任务会拿着网关 base url
+/// 请求官方模型 id，破坏 BYOK 意图——因此别名随本次选中值整体重置。
 const BYOK_OVERRIDE_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 ];
 
 /// VS Code 是否已安装（供菜单禁用决策）。
@@ -92,14 +97,18 @@ pub fn launch_plain() -> Result<()> {
 /// VS Code 正在运行时：确认 → 优雅退出 → 等待退出。用户拒绝或超时则中止注入。
 fn restart_running_instance_if_any(provider_name: &str, model_id: &str) -> Result<()> {
     let binary = resolve_vscode_binary()?;
-    if !is_app_running(&binary) {
+    // bundle id 解析一次，供检测与退出复用——检测范围与 quit 范围严格一致
+    //（同 bundle 同实例），不会把 Insiders 等其他 VS Code 变体误判进来。
+    let bundle_id = app_bundle_path(&binary)
+        .and_then(|app| plist_value(&app.join("Contents/Info.plist"), "CFBundleIdentifier").ok());
+    if !is_app_running(&binary, bundle_id.as_deref()) {
         return Ok(());
     }
     if !confirm_restart(provider_name, model_id)? {
         bail!("用户取消了 VS Code 重启，未注入 BYOK 配置");
     }
     quit_app(&binary)?;
-    wait_for_exit(&binary)?;
+    wait_for_exit(&binary, bundle_id.as_deref())?;
     Ok(())
 }
 
@@ -182,15 +191,23 @@ fn apply_byok_env(selection: &Selection, apikey: &str, env: &mut BTreeMap<String
     // Claude Code 对未识别模型名按内置窗口假设上下文；经 ANTHROPIC_BASE_URL
     // 路由第三方模型时需显式声明，否则 [1m] 模型会被按默认窗口截断。
     if let Some(tokens) = ctx_hint {
-        env.entry("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into())
-            .or_insert(tokens.to_string());
+        // 选中模型带上下文后缀时窗口声明以本次注入为准，剥除 shell 残留旧值
+        //（无后缀模型不设置该变量，保留 shell 原值）。
+        env.remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+        env.insert("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), tokens.to_string());
     }
-    // 别名 env 未配置时补为选中模型：否则后台任务（haiku 别名）等会尝试请求
-    // 网关上不存在的官方模型。
-    env.entry("ANTHROPIC_DEFAULT_SONNET_MODEL".into())
-        .or_insert_with(|| api_model_id.to_string());
-    env.entry("ANTHROPIC_DEFAULT_HAIKU_MODEL".into())
-        .or_insert_with(|| api_model_id.to_string());
+    // 别名一律重置为选中模型（shell 旧值已在 BYOK_OVERRIDE_KEYS 剥除）：
+    // 否则后台任务（haiku 别名）等会尝试请求网关上不存在的官方模型。
+    // ANTHROPIC_SMALL_FAST_MODEL 已废弃（由 ANTHROPIC_DEFAULT_HAIKU_MODEL
+    // 取代），仅剥除残留值、不再写回。
+    env.insert(
+        "ANTHROPIC_DEFAULT_SONNET_MODEL".into(),
+        api_model_id.to_string(),
+    );
+    env.insert(
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL".into(),
+        api_model_id.to_string(),
+    );
     // Provider + Model 级自定义环境变量（ResolvedModel.env 已合并 provider +
     // model env，model 优先），覆盖以上默认注入。
     for (key, value) in &model.env {
@@ -254,13 +271,44 @@ fn app_bundle_path(binary: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn is_app_running(binary: &Path) -> bool {
+/// 检测 VS Code 是否在运行：优先按 bundle id 统计实例数（System Events），
+/// 失败回落 pgrep 二进制路径匹配。
+fn is_app_running(binary: &Path, bundle_id: Option<&str>) -> bool {
+    if let Some(count) = bundle_id.and_then(count_running_instances) {
+        return count > 0;
+    }
     Command::new("pgrep")
         .args(["-f", &binary.to_string_lossy()])
         .stdout(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// System Events 进程列表中统计指定 bundle id 的实例数；失败返回 None
+///（调用方回落 pgrep）。
+fn count_running_instances(bundle_id: &str) -> Option<usize> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get bundle identifier of every process")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let list = String::from_utf8_lossy(&output.stdout);
+    Some(parse_instance_count(&list, bundle_id))
+}
+
+/// 解析 System Events 进程列表（逗号分隔，含 `missing value` 项），统计
+/// 指定 bundle id 的出现次数。
+fn parse_instance_count(list_output: &str, bundle_id: &str) -> usize {
+    list_output
+        .split(',')
+        .filter(|item| item.trim() == bundle_id)
+        .count()
 }
 
 fn confirm_restart(provider_name: &str, model_id: &str) -> Result<bool> {
@@ -302,10 +350,10 @@ fn quit_app(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_exit(binary: &Path) -> Result<()> {
+fn wait_for_exit(binary: &Path, bundle_id: Option<&str>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(QUIT_WAIT_TIMEOUT_SECS);
     while Instant::now() < deadline {
-        if !is_app_running(binary) {
+        if !is_app_running(binary, bundle_id) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -435,7 +483,7 @@ mod tests {
                 .map(String::as_str),
             Some("1000000")
         );
-        // 别名 env 自动补齐为选中模型
+        // 别名 env 一律重置为选中模型（含 shell 已有旧值）；废弃变量仅剥除
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
                 .map(String::as_str),
@@ -445,6 +493,7 @@ mod tests {
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str),
             Some("glm-5.2")
         );
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
     }
 
     /// provider/model 级 env（ResolvedModel.env）优先于自动注入的默认值。
@@ -473,6 +522,18 @@ mod tests {
                 .map(String::as_str),
             Some("qwen3.7-max")
         );
+    }
+
+    #[test]
+    fn parse_instance_count_counts_only_exact_bundle_matches() {
+        let list = "com.apple.finder, com.microsoft.VSCode, missing value, \
+                    com.microsoft.VSCodeInsiders, com.microsoft.VSCode";
+        assert_eq!(parse_instance_count(list, "com.microsoft.VSCode"), 2);
+        assert_eq!(
+            parse_instance_count(list, "com.microsoft.VSCodeInsiders"),
+            1
+        );
+        assert_eq!(parse_instance_count("", "com.microsoft.VSCode"), 0);
     }
 
     #[test]
