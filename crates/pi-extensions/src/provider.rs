@@ -498,7 +498,7 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
     for agent in &config.agents {
         let Some(raw_id) = &agent.id else { continue };
         let id = canonical_agent_id(raw_id).to_string();
-        if !ids.contains(&id) {
+        if ids.contains(&id) {
             continue;
         }
         if id == "codex" {
