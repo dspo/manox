@@ -310,14 +310,25 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    // Session creation does not need a model — registration runs in the
-    // background and the model resolves lazily below, so the sidebar sees
-    // the new session immediately instead of after the keychain round.
     let registry = crate::pi_providers::global();
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
     let mut pi_model = model.or_else(crate::pi_providers::default_model);
+    // Session assembly preflights the model against the registry, so an
+    // unresolvable model cannot build. Right after launch the background
+    // registration (parallelized per provider) may still be in flight;
+    // wait for it only when no model is resolvable yet.
+    if pi_model.is_none() {
+        crate::pi_providers::wait_ready().await;
+        pi_model = crate::pi_providers::default_model();
+    }
+    let Some(pi_model) = pi_model else {
+        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
+            "no model configured — add a provider in Settings"
+        )));
+        return;
+    };
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
@@ -344,7 +355,7 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
-        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, pi_model.as_ref());
+        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, Some(&pi_model));
         match builder.open(info.path).await {
             Ok(s) => {
                 restored = true;
@@ -355,12 +366,10 @@ async fn run_actor(
             }
         }
     }
-    let mut built_without_model = false;
     let mut session = match session {
         Some(s) => s,
         None => {
-            built_without_model = pi_model.is_none();
-            let builder = session_builder(&cwd, &sessions_dir, &runtime, pi_model.as_ref());
+            let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
@@ -373,24 +382,7 @@ async fn run_actor(
         }
     };
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
-    // The sidebar item appears now — registration latency no longer gates it.
     refresh_session_list(&repo, &state).await;
-
-    // Resolve the model once registration has had time to land; wait only
-    // when it is still unknown (first seconds after launch).
-    if pi_model.is_none() {
-        crate::pi_providers::wait_ready().await;
-        pi_model = crate::pi_providers::default_model();
-    }
-    let Some(pi_model) = pi_model else {
-        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-            "no model configured — add a provider in Settings"
-        )));
-        return;
-    };
-    if built_without_model {
-        let _ = session.set_model(pi_model.clone()).await;
-    }
 
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
