@@ -87,6 +87,7 @@ impl OscTap {
                     0x1b => self.state = State::OscEsc,
                     _ => {
                         if self.buf.len() >= MAX_OSC_LEN {
+                            tracing::debug!("OSC tap: sequence over {MAX_OSC_LEN} bytes, dropped");
                             self.buf.clear();
                             self.state = State::Ground;
                         } else {
