@@ -275,6 +275,14 @@ impl Terminal {
         self.pty.write(bytes)
     }
 
+    /// Name of the process owning the foreground process group, when it is
+    /// not the shell itself. The view polls this on a slow timer for its
+    /// foreground-process chip; `None` hides the chip (idle prompt, or the
+    /// source cannot tell).
+    pub fn foreground_process_name(&self) -> Option<String> {
+        self.pty.foreground_process_name()
+    }
+
     /// Resize both the PTY and the Term. No-op if unchanged.
     pub fn resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
         if cols == self.cols && rows == self.rows {

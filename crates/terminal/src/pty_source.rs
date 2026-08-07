@@ -50,4 +50,12 @@ pub trait PtySource: Send + 'static {
     fn ready_nonce(&self) -> Option<&str> {
         None
     }
+
+    /// Name of the process currently owning the terminal's foreground
+    /// process group, when the source can determine it (the local shell
+    /// answers via tcgetpgrp + sysinfo). Powers the foreground-process
+    /// indicator; `None` hides it.
+    fn foreground_process_name(&self) -> Option<String> {
+        None
+    }
 }

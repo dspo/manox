@@ -16,8 +16,8 @@ use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, UTF16Selection,
-    Window, div, px, rgba,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, Task,
+    UTF16Selection, Window, div, px, rgba,
 };
 use gpui_component::ActiveTheme as _;
 use terminal::Terminal;
@@ -73,6 +73,12 @@ pub struct TerminalView {
     /// Parsed `commands_to_skip_shell`: keys that skip the terminal and keep
     /// workbench precedence while it is focused.
     skip_shell: Vec<Keystroke>,
+    /// Name of the process owning the foreground process group, refreshed by
+    /// a 1s poll. `None` while the shell itself owns the foreground — the
+    /// chip is hidden at an idle prompt.
+    foreground_process: Option<String>,
+    /// Keeps the foreground-process poll alive; dropping the view cancels it.
+    _fg_task: Option<Task<()>>,
 }
 
 impl TerminalView {
@@ -104,6 +110,8 @@ impl TerminalView {
             bell_flash: false,
             key_interceptor: None,
             skip_shell,
+            foreground_process: None,
+            _fg_task: None,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
@@ -151,6 +159,7 @@ impl TerminalView {
             })
         };
         view.update(cx, |v, _| v.key_interceptor = Some(interceptor));
+        view.update(cx, |v, cx| v.start_foreground_poll(cx));
         view
     }
 
@@ -571,11 +580,50 @@ impl Render for TerminalView {
                     .bg(rgba(0xffffffff)),
             );
         }
+        // Foreground-process chip: the running program's name at the bottom
+        // right while something other than the shell owns the foreground.
+        if let Some(name) = &self.foreground_process {
+            content = content.child(
+                div().absolute().bottom_0().right_0().px_2().py_1().child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(name.clone()),
+                ),
+            );
+        }
         content
     }
 }
 
 impl TerminalView {
+    /// Poll the foreground process once a second and keep
+    /// `foreground_process` current, notifying only on change. The stored
+    /// task is cancelled when the view drops; the loop also self-terminates
+    /// if either side of the update channel is gone.
+    fn start_foreground_poll(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.clone();
+        self._fg_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let name = terminal.read_with(cx, |t, _| t.foreground_process_name());
+                if this
+                    .update(cx, |v, cx| {
+                        if v.foreground_process != name {
+                            v.foreground_process = name;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
     /// React to a terminal bell per the configured `bell` mode: `Visual`
     /// flashes a brief overlay, `System` is silent here (no audio bridge yet),
     /// `Off` does nothing.

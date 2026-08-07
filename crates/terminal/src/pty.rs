@@ -51,10 +51,20 @@ impl Deref for MasterHolder {
 pub struct PtyHandle {
     master: MasterHolder,
     writer: Mutex<Box<dyn Write + Send>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Moved into the teardown thread by `Drop`; `Option` so the move is
+    /// possible out of `&mut self`.
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     /// Readiness-marker nonce the shell was wrapped with; `None` for
     /// unwrapped spawns (heuristic readiness).
     ready_nonce: Option<String>,
+    /// Shell pid captured at spawn — the child handle moves into the waiter
+    /// thread at `start`, so `Drop` cannot ask it. Teardown target root.
+    #[cfg(unix)]
+    child_pid: Option<libc::pid_t>,
+    /// Basename of the spawned program; the foreground indicator hides itself
+    /// while the shell itself owns the foreground.
+    #[cfg(unix)]
+    shell_name: String,
     // Moved into the reader / waiter threads by `PtySource::start`. Held until
     // then so `Drop` can reap a handle that was never started.
     reader: Option<Box<dyn Read + Send>>,
@@ -139,13 +149,29 @@ pub fn open(
     Ok(PtyHandle {
         master,
         writer: Mutex::new(writer),
-        killer,
+        killer: Some(killer),
         ready_nonce,
+        #[cfg(unix)]
+        child_pid: child.process_id().map(|p| p as libc::pid_t),
+        #[cfg(unix)]
+        shell_name: Path::new(&program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&program)
+            .to_string(),
         reader: Some(reader),
         child: Some(child),
         reader_thread: None,
         wait_thread: None,
     })
+}
+
+impl PtyHandle {
+    /// Shell pid captured at spawn — tests snapshot the tree before drop.
+    #[cfg(all(unix, test))]
+    pub(crate) fn child_pid(&self) -> Option<libc::pid_t> {
+        self.child_pid
+    }
 }
 
 /// Build a `Box<dyn PtySource>` for the user's shell in `cwd`, sized for the
@@ -224,26 +250,140 @@ impl PtySource for PtyHandle {
     fn ready_nonce(&self) -> Option<&str> {
         self.ready_nonce.as_deref()
     }
+
+    /// The foreground process-group leader's comm name, unless it is the
+    /// shell itself (an idle prompt shows no indicator). Cheap enough for a
+    /// 1s poll: one tcgetpgrp + a targeted sysinfo refresh.
+    #[cfg(unix)]
+    fn foreground_process_name(&self) -> Option<String> {
+        let pid = self.master.process_group_leader()?;
+        let name = crate::proctree::process_name(pid)?;
+        if name.trim_start_matches('-') == self.shell_name {
+            None
+        } else {
+            Some(name)
+        }
+    }
 }
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        // Kill the child so the waiter (if started) reaps it and the reader
-        // hits EOF; both threads then exit on their own. They are detached
-        // rather than joined: joining would hang if the gpui-side receiver —
-        // dropped just after this handle in the same `Terminal` destructor —
-        // were not being polled, leaving a thread blocked in `send_blocking`
-        // with no drainer. The threads own their reader fd / child handle and
-        // channel-sender clones, so they are safe to outlive this handle.
-        let _ = self.killer.kill();
-        // If `start` was never called the child is still here — reap it
-        // directly so it isn't orphaned. After `start` the child was moved
-        // into the waiter thread and this is `None`.
-        if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
+        // Teardown must not block the gpui thread: the killer / child /
+        // captured pids move onto a detached thread that SIGTERMs the shell's
+        // whole tree (plus the foreground process group), grants a short
+        // grace, and SIGKILLs survivors. The reader / waiter threads exit on
+        // their own once the child dies (EOF / reap) — they own their reader
+        // fd / child handle and channel-sender clones, so they are safe to
+        // outlive this handle.
+        #[cfg(unix)]
+        {
+            let fg_pgid = self.master.process_group_leader();
+            let killer = self.killer.take();
+            let child = self.child.take();
+            let shell_pid = self.child_pid;
+            let _ = thread::Builder::new()
+                .name("manox-pty-teardown".into())
+                .spawn(move || {
+                    crate::proctree::terminate(shell_pid, fg_pgid, killer, child);
+                });
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(killer) = &self.killer {
+                let _ = killer.kill();
+            }
+            // If `start` was never called the child is still here — reap it
+            // directly so it isn't orphaned. After `start` the child was
+            // moved into the waiter thread and this is `None`.
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
         }
         // Drop the join handles to detach the threads.
         self.reader_thread.take();
         self.wait_thread.take();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Spawn a wrapped `/bin/sh`, run `setup` in it, and return the live
+    /// handle plus its shell pid.
+    fn spawn_shell(
+        setup: &[u8],
+    ) -> (
+        PtyHandle,
+        libc::pid_t,
+        async_channel::Receiver<TerminalEvent>,
+    ) {
+        let (event_tx, event_rx) = async_channel::bounded::<TerminalEvent>(256);
+        let mut pty = open(&PathBuf::from("/tmp"), 80, 24, Some("/bin/sh"), &[]).expect("open pty");
+        let shell_pid = pty.child_pid().expect("shell pid captured at spawn");
+        pty.start(event_tx);
+        std::thread::sleep(Duration::from_millis(150));
+        pty.write(setup).expect("write setup input");
+        (pty, shell_pid, event_rx)
+    }
+
+    /// Snapshot the shell's descendant tree, retrying until the setup command
+    /// had time to spawn its children.
+    fn snapshot_tree(shell_pid: libc::pid_t) -> Vec<libc::pid_t> {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let tree = crate::proctree::descendant_pids(shell_pid);
+            if !tree.is_empty() {
+                return tree;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child process never appeared in the shell's tree"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// After drop, every pid in the snapshot (and the shell itself) must be
+    /// gone — kill(pid, 0) liveness, generous deadline for launchd reaping.
+    fn assert_tree_gone(shell_pid: libc::pid_t, tree: &[libc::pid_t]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let survivors: Vec<_> = std::iter::once(shell_pid)
+                .chain(tree.iter().copied())
+                .filter(|&p| crate::proctree::alive(p))
+                .collect();
+            if survivors.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tree survived teardown: {survivors:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The shell's whole tree dies with the handle — a background job living
+    /// in its own process group is not leaked when the terminal closes.
+    #[test]
+    fn teardown_kills_process_tree() {
+        let (pty, shell_pid, _rx) = spawn_shell(b"sleep 300 &\r");
+        let tree = snapshot_tree(shell_pid);
+        drop(pty);
+        assert_tree_gone(shell_pid, &tree);
+    }
+
+    /// A tree member that ignores SIGTERM still dies: teardown escalates to
+    /// SIGKILL after the grace window. (Ignored dispositions survive exec, so
+    /// the sleep below has SIGTERM ignored.)
+    #[test]
+    fn teardown_escalates_to_sigkill() {
+        let (pty, shell_pid, _rx) = spawn_shell(b"sh -c 'trap \"\" TERM; exec sleep 301' &\r");
+        let tree = snapshot_tree(shell_pid);
+        drop(pty);
+        assert_tree_gone(shell_pid, &tree);
     }
 }

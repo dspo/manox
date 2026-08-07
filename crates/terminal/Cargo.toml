@@ -16,6 +16,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
+sysinfo = { workspace = true }
 
 # Terminal data-structure layer: alacritty_terminal's Term/Grid/Selection/vi
 # modules. Its EventLoop/mio/tty are unused — manox drives the PTY via

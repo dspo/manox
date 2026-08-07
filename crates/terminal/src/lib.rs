@@ -14,6 +14,8 @@
 pub mod cx_session;
 pub mod event;
 pub mod mappings;
+#[cfg(unix)]
+pub mod proctree;
 pub mod pty;
 pub mod pty_source;
 pub mod readiness;
