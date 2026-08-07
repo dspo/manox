@@ -29,7 +29,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
-    tab::{Tab, TabBar},
     v_flex,
 };
 
@@ -146,6 +145,8 @@ pub struct ModelsPanelState {
     expanded: HashSet<usize>,
     /// Provider form ids whose header is in double-click rename mode.
     renaming: HashSet<usize>,
+    /// Delete button armed for two-step confirmation (element id key).
+    pending_delete: Option<String>,
     /// Module currently rendered in the expanded provider card.
     module: ModuleTab,
     /// Monotonic id source so GPUI element ids stay unique across
@@ -229,6 +230,7 @@ impl ModelsPanelState {
             selected: None,
             expanded: HashSet::new(),
             renaming: HashSet::new(),
+            pending_delete: None,
             module: ModuleTab::Basic,
             next_form_id: 1,
             save_generation: 0,
@@ -244,6 +246,7 @@ impl ModelsPanelState {
         self.providers.clear();
         self.expanded.clear();
         self.renaming.clear();
+        self.pending_delete = None;
         self.selected = None;
         self.load_error = None;
 
@@ -797,7 +800,7 @@ impl ProviderForm {
         let id = take_id();
         // Blur on the name input leaves double-click rename mode.
         cx.subscribe(&name, move |this, _state, event, cx| {
-            if matches!(event, InputEvent::Blur) {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                 this.models_panel.renaming.remove(&id);
                 cx.notify();
             }
@@ -1057,14 +1060,17 @@ fn render_module_form(
         return hint();
     };
     let agent_options = panel.agent_options.clone();
+    let pending = panel.pending_delete.clone();
     let module = panel.module;
     let body = match module {
         ModuleTab::Basic => render_basic_module(theme, entity.clone(), pid, p),
-        ModuleTab::Env => render_env_block(theme, entity.clone(), pid, None, &p.env),
+        ModuleTab::Env => render_env_block(theme, entity.clone(), pid, None, &p.env, &pending),
         ModuleTab::Endpoints => {
-            render_endpoints_module(theme, entity.clone(), pid, p, &agent_options)
+            render_endpoints_module(theme, entity.clone(), pid, p, &agent_options, &pending)
         }
-        ModuleTab::Models => render_models_module(theme, entity.clone(), pid, p, &agent_options),
+        ModuleTab::Models => {
+            render_models_module(theme, entity.clone(), pid, p, &agent_options, &pending)
+        }
     };
     div()
         .w_full()
@@ -1130,8 +1136,21 @@ fn render_provider_node(
             .small()
             .text_color(muted),
         );
+    let out_entity = entity.clone();
     let toggle = if renaming {
-        toggle.child(div().flex_1().min_w_0().child(Input::new(&p.name)))
+        toggle.child(
+            div()
+                .id(format!("models-p{pid}-rename"))
+                .flex_1()
+                .min_w_0()
+                .on_mouse_down_out(move |_ev, _window, cx| {
+                    out_entity.update(cx, |this, cx| {
+                        this.models_panel.renaming.remove(&pid);
+                        cx.notify();
+                    });
+                })
+                .child(Input::new(&p.name)),
+        )
     } else {
         let name_value = p.name.read(cx).value();
         let header_label: SharedString = if name_value.trim().is_empty() {
@@ -1142,7 +1161,7 @@ fn render_provider_node(
         let label = div().text_sm().truncate().child(header_label);
         let label = if selected {
             label
-                .text_color(theme.accent)
+                .text_color(theme.info)
                 .font_weight(gpui::FontWeight::MEDIUM)
         } else {
             label.font_weight(gpui::FontWeight::MEDIUM)
@@ -1155,14 +1174,20 @@ fn render_provider_node(
         .items_center()
         .gap_2()
         .child(toggle)
-        .child(remove_button(
-            format!("models-p{pid}-remove"),
-            entity.clone(),
-            Arc::new(move |this, cx| {
-                this.models_panel.remove_provider(pid);
-                this.models_panel.touch(cx);
-            }),
-        ))
+        .child({
+            let key = format!("models-p{pid}-remove");
+            let pending = panel.pending_delete.as_deref() == Some(key.as_str());
+            remove_button(
+                theme,
+                key,
+                pending,
+                entity.clone(),
+                Arc::new(move |this, cx| {
+                    this.models_panel.remove_provider(pid);
+                    this.models_panel.touch(cx);
+                }),
+            )
+        })
         .into_any_element();
 
     let mut children: Vec<AnyElement> = vec![header_row];
@@ -1179,7 +1204,7 @@ fn render_provider_node(
                 .cursor_pointer()
                 .text_sm();
             let row = if active {
-                row.text_color(theme.accent)
+                row.text_color(theme.info)
                     .font_weight(gpui::FontWeight::MEDIUM)
             } else {
                 row.hover(|s| s.bg(theme.accent.opacity(0.06)))
@@ -1201,7 +1226,7 @@ fn render_provider_node(
                         .child(if active {
                             Icon::new(IconName::ChevronRight)
                                 .small()
-                                .text_color(theme.accent)
+                                .text_color(theme.info)
                                 .into_any_element()
                         } else {
                             div().into_any_element()
@@ -1269,6 +1294,7 @@ fn render_env_block(
     pid: usize,
     mid: Option<usize>,
     rows: &[KvForm],
+    pending: &Option<String>,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = vec![h_flex()
         .px_3()
@@ -1322,15 +1348,20 @@ fn render_env_block(
                         .child(Input::new(&kv.key)),
                 )
                 .child(div().flex_1().min_w_0().child(Input::new(&kv.value)))
-                .child(icon_button(
-                    format!("models-kv{kid}-remove"),
-                    IconName::Minus,
-                    entity.clone(),
-                    Arc::new(move |this, _window, cx| {
-                        this.models_panel.remove_env_row(pid, mid, kid);
-                        this.models_panel.touch(cx);
-                    }),
-                ))
+                .child({
+                    let key = format!("models-kv{kid}-remove");
+                    let is_pending = pending.as_deref() == Some(key.as_str());
+                    remove_button(
+                        theme,
+                        key,
+                        is_pending,
+                        entity.clone(),
+                        Arc::new(move |this, cx| {
+                            this.models_panel.remove_env_row(pid, mid, kid);
+                            this.models_panel.touch(cx);
+                        }),
+                    )
+                })
                 .child(icon_button(
                     format!("models-kv{kid}-add-below"),
                     IconName::Plus,
@@ -1354,6 +1385,7 @@ fn render_endpoints_module(
     pid: usize,
     p: &ProviderForm,
     agent_options: &[String],
+    pending: &Option<String>,
 ) -> AnyElement {
     let used: HashSet<String> = p
         .endpoints
@@ -1363,7 +1395,7 @@ fn render_endpoints_module(
 
     let mut children: Vec<AnyElement> = Vec::new();
     for e in &p.endpoints {
-        children.push(render_endpoint(theme, entity.clone(), pid, &used, agent_options, e));
+        children.push(render_endpoint(theme, entity.clone(), pid, &used, agent_options, e, pending));
     }
     if used.len() < WIRE_APIS.len() {
         children.push(dashed_add_button(
@@ -1387,6 +1419,7 @@ fn render_endpoint(
     used: &HashSet<String>,
     agent_options: &[String],
     e: &EndpointForm,
+    pending: &Option<String>,
 ) -> AnyElement {
     let eid = e.id;
     let current = e.wire_api.to_string();
@@ -1425,14 +1458,20 @@ fn render_endpoint(
                 }
             }),
         ))
-        .child(remove_button(
-            format!("models-e{eid}-remove"),
-            entity.clone(),
-            Arc::new(move |this, cx| {
-                this.models_panel.remove_endpoint(pid, eid);
-                this.models_panel.touch(cx);
-            }),
-        ))
+        .child({
+            let key = format!("models-e{eid}-remove");
+            let is_pending = pending.as_deref() == Some(key.as_str());
+            remove_button(
+                theme,
+                key,
+                is_pending,
+                entity.clone(),
+                Arc::new(move |this, cx| {
+                    this.models_panel.remove_endpoint(pid, eid);
+                    this.models_panel.touch(cx);
+                }),
+            )
+        })
         .into_any_element();
 
     plain_card(
@@ -1488,8 +1527,9 @@ fn render_models_module(
     pid: usize,
     p: &ProviderForm,
     agent_options: &[String],
+    pending: &Option<String>,
 ) -> AnyElement {
-    let mut children: Vec<AnyElement> = vec![render_mode_tabs(entity.clone(), pid, p)];
+    let mut children: Vec<AnyElement> = vec![render_mode_tabs(theme, entity.clone(), pid, p)];
     if p.remote_models {
         children.push(field_row(
             theme,
@@ -1510,7 +1550,7 @@ fn render_models_module(
             );
         }
         for m in &p.models {
-            children.push(render_model(theme, entity.clone(), pid, m, agent_options));
+            children.push(render_model(theme, entity.clone(), pid, m, agent_options, pending));
         }
         children.push(dashed_add_button(
             theme,
@@ -1526,33 +1566,55 @@ fn render_models_module(
     v_flex().w_full().gap_2().children(children).into_any_element()
 }
 
-/// Two-choice tab replacing the old 内联定义 / 远程 URL button pair.
-fn render_mode_tabs(entity: Entity<SettingsView>, pid: usize, p: &ProviderForm) -> AnyElement {
-    let tab_entity = entity.clone();
-    h_flex()
-        .px_3()
-        .py_1()
-        .child(
-            TabBar::new(format!("models-p{pid}-mode"))
-                .selected_index(if p.remote_models { 1 } else { 0 })
-                .on_click(move |ix, _window, cx| {
-                    let remote = *ix == 1;
-                    tab_entity.update(cx, |this, cx| {
-                        if let Some(p) = this
-                            .models_panel
-                            .provider_mut(pid)
-                            .filter(|p| p.remote_models != remote)
-                        {
-                            p.remote_models = remote;
-                            this.models_panel.touch(cx);
-                        }
-                        cx.notify();
-                    });
-                })
-                .child(Tab::new().label(i18n::t("settings-models-mode-inline")))
-                .child(Tab::new().label(i18n::t("settings-models-mode-remote"))),
-        )
-        .into_any_element()
+/// Two-choice tab replacing the old 内联定义 / 远程 URL button pair; the
+/// active tab is underlined and tinted with `theme.info` so it reads clearly.
+fn render_mode_tabs(theme: &Theme, entity: Entity<SettingsView>, pid: usize, p: &ProviderForm) -> AnyElement {
+    let muted = theme.muted_foreground;
+    let mut tabs = Vec::new();
+    for (ix, (active, label_key)) in [
+        (!p.remote_models, "settings-models-mode-inline"),
+        (p.remote_models, "settings-models-mode-remote"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tab_entity = entity.clone();
+        let remote = ix == 1;
+        let tab = div()
+            .id(format!("models-p{pid}-mode-{ix}"))
+            .px_2()
+            .py_1()
+            .border_b_2()
+            .cursor_pointer()
+            .text_sm();
+        let tab = if active {
+            tab.text_color(theme.info)
+                .border_color(theme.info)
+                .font_weight(gpui::FontWeight::MEDIUM)
+        } else {
+            tab.text_color(muted)
+                .border_color(gpui::transparent_black())
+                .hover(|s| s.text_color(theme.foreground))
+        };
+        tabs.push(
+            tab.on_click(move |_ev, _window, cx| {
+                tab_entity.update(cx, |this, cx| {
+                    if let Some(p) = this
+                        .models_panel
+                        .provider_mut(pid)
+                        .filter(|p| p.remote_models != remote)
+                    {
+                        p.remote_models = remote;
+                        this.models_panel.touch(cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .child(i18n::t(label_key))
+            .into_any_element(),
+        );
+    }
+    h_flex().px_3().py_1().gap_2().children(tabs).into_any_element()
 }
 
 fn render_model(
@@ -1561,6 +1623,7 @@ fn render_model(
     pid: usize,
     m: &ModelForm,
     agent_options: &[String],
+    pending: &Option<String>,
 ) -> AnyElement {
     let mid = m.id;
 
@@ -1570,20 +1633,7 @@ fn render_model(
             field_row(
                 theme,
                 i18n::t("settings-models-row-model-id"),
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&m.model_id)))
-                    .child(remove_button(
-                        format!("models-m{mid}-remove"),
-                        entity.clone(),
-                        Arc::new(move |this, cx| {
-                            this.models_panel.remove_model(pid, mid);
-                            this.models_panel.touch(cx);
-                        }),
-                    ))
-                    .into_any_element(),
+                input_field(&m.model_id),
             ),
             field_row(
                 theme,
@@ -1678,7 +1728,27 @@ fn render_model(
                     }),
                 ),
             ),
-            render_env_block(theme, entity.clone(), pid, Some(mid), &m.env),
+            render_env_block(theme, entity.clone(), pid, Some(mid), &m.env, pending),
+            h_flex()
+                .w_full()
+                .justify_end()
+                .px_3()
+                .pb_1()
+                .child({
+                    let key = format!("models-m{mid}-remove");
+                    let is_pending = pending.as_deref() == Some(key.as_str());
+                    remove_button(
+                        theme,
+                        key,
+                        is_pending,
+                        entity.clone(),
+                        Arc::new(move |this, cx| {
+                            this.models_panel.remove_model(pid, mid);
+                            this.models_panel.touch(cx);
+                        }),
+                    )
+                })
+                .into_any_element(),
         ],
     )
 }
@@ -1691,7 +1761,8 @@ fn plain_card(theme: &Theme, children: Vec<AnyElement>) -> AnyElement {
         .p_2()
         .gap_0()
         .rounded(px(10.))
-        .bg(theme.secondary.opacity(0.45))
+        .border_1()
+        .border_color(theme.border.opacity(0.5))
         .children(children)
         .into_any_element()
 }
@@ -1966,17 +2037,37 @@ fn dashed_add_button(
         .into_any_element()
 }
 
+/// Uniform 「-」 remove control with two-step confirmation: the first click
+/// arms it (danger tint), the second executes the deletion.
 fn remove_button(
-    id: impl Into<gpui::ElementId>,
+    theme: &Theme,
+    id: String,
+    pending: bool,
     entity: Entity<SettingsView>,
     apply: MutApply,
 ) -> AnyElement {
-    Button::new(id)
-        .icon(Icon::new(IconName::Delete))
-        .ghost()
+    let key = id.clone();
+    let icon = Icon::new(IconName::Minus);
+    let icon = if pending {
+        icon.text_color(theme.danger)
+    } else {
+        icon.text_color(theme.muted_foreground)
+    };
+    let button = Button::new(id).icon(icon).ghost();
+    let button = if pending {
+        button.bg(theme.danger.opacity(0.12))
+    } else {
+        button
+    };
+    button
         .on_click(move |_ev, _window, cx| {
             entity.update(cx, |this, cx| {
-                apply(this, cx);
+                if this.models_panel.pending_delete.as_deref() == Some(key.as_str()) {
+                    this.models_panel.pending_delete = None;
+                    apply(this, cx);
+                } else {
+                    this.models_panel.pending_delete = Some(key.clone());
+                }
                 cx.notify();
             });
         })
