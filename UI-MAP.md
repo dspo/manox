@@ -39,7 +39,8 @@ harness）与 `harness-pi`（crates/pi + pi-extensions）。pi 侧不新建 UI�
 | 图片附件 / Plus 菜单 | ⏳ 未接线 | pi prompt 当前仅文本 |
 | 模型选择器 | ✅ 已接线 | 经 `AgentSession::set_model` 热切换（同 provider） |
 | Project / Goal / Team chips | ⏳ 未接线 | 依赖 manox 项目与目标体系 |
-| 后台线程 / 归档 / 外部会话（Codex/Claude CLI） | ⏳ 未接线 | manox 多会话编排 |
+| 后台线程（ctrl-b 置底） | ⏳ 未接线 | manox 多会话编排；归档已接线 |
+| 外部会话（Claude Code / Codex / GitHub Copilot CLI）+ VS Code 注入启动 | ✅ 已接线 | 侧边栏新建会话菜单 provider→model 级联；CLI 走 cx AgentBuilder，VS Code 走 vscode_app BYOK 注入并打开项目目录 |
 | TurnNavigator | ⏳ 未接线 | 代码保留，overlay 未在 pi 布局挂载 |
 
 约束：crates/pi 只做 TS Pi 对齐与扩展点（`AgentSession::subscribe` 是唯一
@@ -236,7 +237,7 @@ Bottom section: loose (non-project) threads. The header's `+` button opens the `
 
 #### SidebarNewSessionMenu
 
-`PopupMenu` anchored below the "Conversations" header `+`. One flat row (Manox → `NewThread`) plus one `submenu_with_icon` per external agent kind (Claude Code / Codex / GitHub Copilot). All four top-level rows use the menu component's native icon slot with a monochrome brand SVG, keeping their icon and label columns aligned. Each agent submenu is a provider→model cascade: models from `registry::global().models()` filtered by the agent's `visible_agents()`, grouped by `provider_name()` into provider submenus, each listing its supported models. Picking a model emits `SpawnExternalSession(kind, provider, model)`. An agent with no supporting model renders a muted "no model configured" label row instead of provider submenus.
+`PopupMenu` anchored below the "Conversations" header `+` or a project folder's `+` button (the latter carries the project path, scoping the spawned session / opened directory to that project). One flat row (Manox → `NewThread` / `NewThreadWithProject`), one `submenu_with_icon` per external agent kind (Claude Code / Codex / GitHub Copilot), and a VS Code entry. All top-level rows use the menu component's native icon slot with a monochrome brand SVG, keeping their icon and label columns aligned. Each agent submenu is a provider→model cascade built by the shared `build_model_cascade`: models from `agent::pi_providers::global()` filtered by registration metadata `agents` containing the agent id (`claude` / `codex` / `copilot` / `VS Code`), grouped by provider display name into provider submenus, each listing its models; the emitted model id is the raw cx config key. Picking a model in a CLI-agent cascade emits `SpawnExternalSession(kind, provider, model, project)`; in the VS Code cascade it emits `LaunchVSCode(provider, model, project)` — the workspace then launches VS Code through `cx::launch_vscode_app` with Claude Code BYOK env injected, opening the project directory (workspace cwd when launched from the Conversations header). An agent with no supporting model renders a muted "no model configured" label row instead of provider submenus. The VS Code entry renders as a disabled submenu when VS Code is not installed (parity with 工具 → VS Code).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 

@@ -56,7 +56,9 @@ pub fn is_installed() -> bool {
 }
 
 /// 带 BYOK env 注入启动 VS Code（GUI detach）。VS Code 正在运行时先请求重启。
-pub fn launch(selection: &Selection, apikey: &str) -> Result<()> {
+/// `folder` 为 `Some` 时以位置参数传给 VS Code 二进制，新实例直接打开该目录
+/// （等效 `code <folder>`）；`None` 则不带目录启动（系统菜单路径）。
+pub fn launch(selection: &Selection, apikey: &str, folder: Option<&Path>) -> Result<()> {
     let model = selection.model.as_ref().context("VS Code 未选中模型")?;
 
     restart_running_instance_if_any(&selection.provider.name, &model.id)?;
@@ -68,12 +70,16 @@ pub fn launch(selection: &Selection, apikey: &str) -> Result<()> {
     env.insert("VSCODE_CLI".into(), "1".into());
 
     let binary = resolve_vscode_binary()?;
-    spawn_detached(&binary, &env)?;
+    spawn_detached(&binary, &env, folder)?;
 
     println!();
     println!(
-        "启动 VS Code | Provider: {} | Model: {}（BYOK env 注入，VSCODE_CLI=1）",
-        selection.provider.name, model.id
+        "启动 VS Code | Provider: {} | Model: {}{}（BYOK env 注入，VSCODE_CLI=1）",
+        selection.provider.name,
+        model.id,
+        folder
+            .map(|f| format!(" | Folder: {}", f.display()))
+            .unwrap_or_default()
     );
     println!();
     Ok(())
@@ -363,8 +369,16 @@ fn wait_for_exit(binary: &Path, bundle_id: Option<&str>) -> Result<()> {
     )
 }
 
-fn spawn_detached(binary: &Path, env: &BTreeMap<String, String>) -> Result<()> {
+fn spawn_detached(
+    binary: &Path,
+    env: &BTreeMap<String, String>,
+    folder: Option<&Path>,
+) -> Result<()> {
     let mut command = Command::new(binary);
+    // 目录位置参数：新实例直接打开该目录（等效 `code <folder>`）。
+    if let Some(folder) = folder {
+        command.arg(folder);
+    }
     // env 全量显式传入（登录 shell 解析结果 + BYOK 叠加），不继承 manox/cx 自身环境
     command.env_clear();
     for (key, value) in env {

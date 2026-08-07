@@ -12,7 +12,6 @@ sidebar-section-conversations = 对话
 sidebar-section-external = 外部
 sidebar-new-session-label = 新建会话
 sidebar-new-session-manox = Manox
-sidebar-new-session-pi = 新对话
 sidebar-close-external = 关闭会话
 sidebar-archive = 归档
 external-wizard-no-model = 尚无模型支持该 agent

@@ -119,6 +119,11 @@ pub enum SidebarEvent {
         String,
         Option<PathBuf>,
     ),
+    /// Launch VS Code with Claude Code BYOK env injected for the picked
+    /// provider + model (the VS Code cascade's terminal action). The optional
+    /// PathBuf is the project path the menu was opened from — VS Code opens
+    /// that directory (falls back to the workspace cwd in the handler).
+    LaunchVSCode(String, String, Option<PathBuf>),
     /// Switch the main area to an already-running external session.
     OpenExternalSession(String),
     /// Archive an external session from the sidebar row's hover action (the
@@ -239,15 +244,9 @@ impl Sidebar {
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
-            // The manox build keeps its brand label; the pi build uses the
-            // neutral "new conversation" label.
-            #[cfg(feature = "harness-manox")]
-            let new_session_label = i18n::t("sidebar-new-session-manox");
-            #[cfg(not(feature = "harness-manox"))]
-            let new_session_label = i18n::t("sidebar-new-session-pi");
             let sidebar_manox = sidebar.clone();
             menu = menu.item(
-                PopupMenuItem::new(new_session_label)
+                PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
                     .icon(
                         Icon::default()
                             .path("icons/manox.svg")
@@ -267,9 +266,6 @@ impl Sidebar {
                         });
                     }),
             );
-            // External-CLI session entries belong to the retired manox
-            // harness; the pi build offers only the new-conversation item.
-            #[cfg(feature = "harness-manox")]
             for kind in [
                 crate::external_session::SessionKind::ClaudeCode,
                 crate::external_session::SessionKind::Codex,
@@ -293,6 +289,36 @@ impl Sidebar {
                         build_agent_model_cascade(submenu, kind, agent_id, &sidebar, window, cx)
                     },
                 );
+            }
+            // VS Code: same provider→model cascade shape, but the terminal
+            // action launches the VS Code desktop app with Claude Code BYOK
+            // env injected, opening the project directory the menu was opened
+            // from. Disabled outright when VS Code is not installed (parity
+            // with the 工具 → VS Code system menu).
+            {
+                let sidebar = sidebar.clone();
+                let icon = Icon::default()
+                    .path("icons/vscode.svg")
+                    .small()
+                    .text_color(theme.muted_foreground);
+                if cx::vscode_app_installed() {
+                    menu = menu.submenu_with_icon(
+                        Some(icon),
+                        "VS Code",
+                        window,
+                        cx,
+                        move |submenu, window, cx| {
+                            build_vscode_model_cascade(submenu, &sidebar, window, cx)
+                        },
+                    );
+                } else {
+                    let submenu = PopupMenu::build(window, cx, |menu, _window, _cx| menu);
+                    menu = menu.item(
+                        PopupMenuItem::submenu("VS Code", submenu)
+                            .icon(icon)
+                            .disabled(true),
+                    );
+                }
             }
             menu
         });
@@ -787,23 +813,24 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
     row.into_any_element()
 }
 
-#[cfg(feature = "harness-manox")]
-/// Build the provider→model cascade inside an external-agent submenu. Models
-/// are drawn from the shared pi provider registry, filtered by the agent's id
-/// (registration metadata `agents`, empty = visible to all); they are grouped
-/// by provider display name, each provider a nested submenu. Picking a model
-/// emits `SpawnExternalSession(kind, provider, model, project)` to the
-/// sidebar — the project path (if any) is read from the sidebar's
-/// `new_session_project` field so the workspace can set the CWD for external
-/// CLI sessions. The emitted model id is the raw cx config key
+/// Build the provider→model cascade shared by every agent submenu in the
+/// new-session menu. Models are drawn from the shared pi provider registry,
+/// filtered by the agent id (registration metadata `agents`, empty = visible
+/// to all); they are grouped by provider display name, each provider a nested
+/// submenu. Picking a model invokes `emit` with (provider, model id, project)
+/// — the project path (if any) is read from the sidebar's
+/// `new_session_project` field so the handler can set the CWD / open
+/// directory. The emitted model id is the raw cx config key
 /// (`metadata["config_id"]`), which cx matches verbatim.
-fn build_agent_model_cascade(
+fn build_model_cascade(
     menu: PopupMenu,
-    kind: crate::external_session::SessionKind,
     agent_id: &'static str,
     sidebar: &WeakEntity<Sidebar>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
+    emit: impl Fn(&mut Sidebar, &mut Context<Sidebar>, String, String, Option<PathBuf>)
+    + Clone
+    + 'static,
 ) -> PopupMenu {
     /// One cascade entry: the raw cx config key plus its display name.
     struct Entry {
@@ -858,6 +885,7 @@ fn build_agent_model_cascade(
     for (prov_name, models) in providers {
         let sidebar = sidebar.clone();
         let prov_for_items = prov_name.clone();
+        let emit = emit.clone();
         menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
             let mut submenu = submenu;
             for m in &models {
@@ -865,6 +893,7 @@ fn build_agent_model_cascade(
                 let model_name = m.display.clone();
                 let prov = prov_for_items.clone();
                 let sidebar = sidebar.clone();
+                let emit = emit.clone();
                 submenu = submenu.item(
                     PopupMenuItem::element(move |_window, _cx| {
                         gpui::div()
@@ -875,12 +904,7 @@ fn build_agent_model_cascade(
                     .on_click(move |_, _, cx: &mut App| {
                         let _ = sidebar.update(cx, |this, cx| {
                             let project = this.new_session_project.clone();
-                            cx.emit(SidebarEvent::SpawnExternalSession(
-                                kind,
-                                prov.clone(),
-                                model_id.clone(),
-                                project,
-                            ));
+                            emit(this, cx, prov.clone(), model_id.clone(), project);
                             cx.notify();
                         });
                     }),
@@ -890,6 +914,55 @@ fn build_agent_model_cascade(
         });
     }
     menu
+}
+
+/// Cascade for the external-agent CLI submenus (Claude Code / Codex / GitHub
+/// Copilot): picking a model emits `SpawnExternalSession(kind, provider,
+/// model, project)` — the workspace spawns the agent CLI in the project's
+/// directory and mounts its TUI in the main area.
+fn build_agent_model_cascade(
+    menu: PopupMenu,
+    kind: crate::external_session::SessionKind,
+    agent_id: &'static str,
+    sidebar: &WeakEntity<Sidebar>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    build_model_cascade(
+        menu,
+        agent_id,
+        sidebar,
+        window,
+        cx,
+        move |_this, cx, provider, model, project| {
+            cx.emit(SidebarEvent::SpawnExternalSession(
+                kind, provider, model, project,
+            ));
+        },
+    )
+}
+
+/// Cascade for the VS Code submenu: models visible to the `VS Code` agent
+/// (Anthropic-wire models usable by the Claude Code extension). Picking a
+/// model emits `LaunchVSCode(provider, model, project)` — the workspace
+/// launches VS Code with Claude Code BYOK env injected, opening the project
+/// directory.
+fn build_vscode_model_cascade(
+    menu: PopupMenu,
+    sidebar: &WeakEntity<Sidebar>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    build_model_cascade(
+        menu,
+        "VS Code",
+        sidebar,
+        window,
+        cx,
+        |_this, cx, provider, model, project| {
+            cx.emit(SidebarEvent::LaunchVSCode(provider, model, project));
+        },
+    )
 }
 
 /// Leading icon for a unified sidebar row. Manox threads carry the brand
