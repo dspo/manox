@@ -380,6 +380,14 @@ fn main() {
                         cx.set_quit_mode(QuitMode::Explicit);
                         tray::spawn_pump(cx);
                     }
+                    // The fallback sentence is platform-true: macOS keeps a
+                    // window-less app alive by default (dock icon reopens),
+                    // other platforms quit on last window close.
+                    #[cfg(target_os = "macos")]
+                    Err(e) => tracing::warn!(
+                        "system tray unavailable: {e:#}; a closed window parks                          manox in the dock with no tray — click the dock icon to reopen"
+                    ),
+                    #[cfg(not(target_os = "macos"))]
                     Err(e) => tracing::warn!(
                         "system tray unavailable: {e:#}; closing the last window quits"
                     ),
@@ -428,7 +436,7 @@ fn main() {
 /// background threads, drafts, sidebar selection — and keeps running threads
 /// alive across a window close: their engine actors live off the `Thread`
 /// entities the workspace holds, so a fresh workspace would orphan them.
-fn open_main_window(cx: &mut App) -> Option<WindowHandle<Root>> {
+fn open_main_window(cx: &mut App) -> anyhow::Result<WindowHandle<Root>> {
     let reused = agent_ui::dispatch::workspace_global().is_some();
     let window_options = WindowOptions {
         titlebar: Some(TitleBar::title_bar_options()),
@@ -454,7 +462,7 @@ fn open_main_window(cx: &mut App) -> Option<WindowHandle<Root>> {
             };
             cx.new(|cx| Root::new(view, window, cx))
         })
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("failed to open the main window: {e}"))?;
     agent_ui::dispatch::set_window(handle);
 
     // A re-opened window starts unfocused; restore keyboard focus to the
@@ -470,7 +478,7 @@ fn open_main_window(cx: &mut App) -> Option<WindowHandle<Root>> {
             workspace.update(cx, |ws, cx| ws.focus_conversation(cx));
         });
     }
-    Some(handle)
+    Ok(handle)
 }
 
 /// Tray / dock "open" entry point: focus the live main window when one
@@ -484,7 +492,9 @@ pub(crate) fn open_or_focus_main_window(cx: &mut App) {
         cx.activate(true);
         return;
     }
-    open_main_window(cx);
+    if let Err(e) = open_main_window(cx) {
+        tracing::error!("failed to re-open the main window: {e:#}");
+    }
 }
 
 fn build_app_menus() -> Vec<Menu> {

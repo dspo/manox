@@ -54,19 +54,30 @@ pub fn rebuild_menus() {
 }
 
 /// Spawn the foreground pump that drains tray events into app actions. Call
-/// once, after a successful [`install`].
+/// once, after a successful [`install`]; a second call panics (double pumps
+/// would double-dispatch every menu click).
 pub fn spawn_pump(cx: &mut App) {
+    static PUMP_SPAWNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PUMP_SPAWNED
+        .set(())
+        .expect("tray::spawn_pump called more than once");
     cx.spawn(async move |cx| {
         let mut cmds: Vec<TrayCmd> = Vec::new();
         loop {
             cx.background_executor().timer(POLL).await;
             cmds.clear();
             backend::drain(&mut cmds);
+            let mut quit = false;
             for cmd in cmds.drain(..) {
+                quit |= matches!(cmd, TrayCmd::Quit);
                 cx.update(|cx| match cmd {
                     TrayCmd::Open => crate::open_or_focus_main_window(cx),
                     TrayCmd::Quit => cx.quit(),
                 });
+            }
+            // The app is tearing down; stop polling.
+            if quit {
+                break;
             }
         }
     })
@@ -224,13 +235,14 @@ mod backend {
             vec![self.icon.clone()]
         }
 
-        // Icon (primary) activation — the "open the app" gesture.
         fn activate(&mut self, _x: i32, _y: i32) {
             self.send(TrayCmd::Open);
         }
 
         // Re-read on every menu popup and after `Handle::update`, so labels
-        // always resolve through the current UI locale.
+        // always resolve through the current UI locale. `t()` runs on the
+        // ksni service thread here; i18n keeps a thread-local bundle per
+        // thread, rebuilt lazily against the process-global locale.
         fn menu(&self) -> Vec<MenuItem<Self>> {
             vec![
                 StandardItem {
@@ -285,10 +297,44 @@ mod backend {
     }
 
     pub fn drain(cmds: &mut Vec<TrayCmd>) {
+        static POISON_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let Some(slot) = CMDS.get() else { return };
-        let Ok(rx) = slot.lock() else { return };
+        let rx = match slot.lock() {
+            Ok(rx) => rx,
+            Err(poisoned) => {
+                // Warn once (this runs every poll) but keep draining — the
+                // channel itself is intact, a poisoned lock must not silently
+                // kill the tray's only input path.
+                if !POISON_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!("tray command channel lock poisoned, recovering");
+                }
+                poisoned.into_inner()
+            }
+        };
         while let Ok(cmd) = rx.try_recv() {
             cmds.push(cmd);
         }
     }
+}
+
+/// Fallback for targets with no tray backend (e.g. wasm): installation fails
+/// cleanly so the app keeps the platform-default quit behavior instead of
+/// stranding, and the pump drains nothing.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd"
+)))]
+mod backend {
+    use super::TrayCmd;
+
+    pub fn install() -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("no system tray backend for this platform"))
+    }
+
+    pub fn rebuild_menus() {}
+
+    pub fn drain(_cmds: &mut Vec<TrayCmd>) {}
 }

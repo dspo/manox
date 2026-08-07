@@ -44,8 +44,13 @@ pub fn set_workspace(workspace: Entity<Workspace>) {
 /// Register the main window's typed `WindowHandle<Root>`. Replaces any
 /// previous handle — called each time the main window is (re-)opened, so the
 /// handle always tracks the live window even across a close/re-open cycle.
+/// A poisoned lock is recovered rather than propagated: the slot only ever
+/// holds a `Copy` handle, so no invariant can have been broken mid-update,
+/// and a panic here would take down every later window open/menu dispatch.
 pub fn set_window(window: WindowHandle<Root>) {
-    let mut slot = WINDOW.write().expect("dispatch WINDOW lock poisoned");
+    let mut slot = WINDOW
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(window);
 }
 
@@ -57,7 +62,15 @@ pub fn workspace_global() -> Option<Entity<Workspace>> {
 
 /// Returns the main window's typed handle, or `None` if no main window is
 /// currently open. The handle may refer to a window that has since been
-/// closed; callers treat a failed `update` as "no window".
+/// closed; callers treat a failed `update` as "no window". A poisoned lock is
+/// recovered (see `set_window`) — this path runs on every App-level menu
+/// dispatch, so it must never panic.
 pub fn window_global() -> Option<WindowHandle<Root>> {
-    *WINDOW.read().expect("dispatch WINDOW lock poisoned")
+    match WINDOW.read() {
+        Ok(slot) => *slot,
+        Err(poisoned) => {
+            tracing::error!("dispatch WINDOW lock poisoned, recovering");
+            *poisoned.into_inner()
+        }
+    }
 }
