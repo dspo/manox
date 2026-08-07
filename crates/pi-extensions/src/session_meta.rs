@@ -19,6 +19,12 @@ pub struct SessionMeta {
     /// sessions — the session cwd is a working directory, not a project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The approval gate policy the session runs under (`"autopilot"` or
+    /// `"danger"`), as chosen in the access chip. Absent = the harness
+    /// default. Stored as the mode's wire string; the harness parses it
+    /// leniently and falls back to its default on unknown values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]

@@ -15,6 +15,7 @@ test-support = []
 pi.workspace = true
 pi-extensions.workspace = true
 anyhow.workspace = true
+async-trait = "0.1"
 async-channel.workspace = true
 futures.workspace = true
 tokio = { workspace = true }
@@ -58,6 +59,7 @@ tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
 
 [lints.clippy]
 dbg_macro = "deny"

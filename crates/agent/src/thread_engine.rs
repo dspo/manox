@@ -15,6 +15,8 @@ use std::sync::Arc;
 use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
 use crate::message::Message;
+use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
+use crate::thread::ApprovalMode;
 use pi::types::Model as PiModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
@@ -79,6 +81,20 @@ pub trait ThreadEngine: Send + Sync {
     /// Ask the backend to wind down (close its session, stop its runtime).
     /// Default is a no-op for backends that need no explicit shutdown.
     fn shutdown(&self) {}
+
+    /// Switch the approval policy gating the backend's tool executions.
+    /// Backends without an approval gate ignore this.
+    fn set_approval_mode(&self, _mode: ApprovalMode) {}
+
+    /// Deliver the user's verdict for a pending tool-call authorization.
+    /// Unknown ids are silently ignored (the call already settled).
+    fn respond_tool_authorization(&self, _id: &str, _response: ToolAuthorizationResponse) {}
+
+    /// Pending authorizations with their card metadata, so the workspace can
+    /// re-surface a card after switching back to a parked thread.
+    fn pending_auth_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        Vec::new()
+    }
 }
 
 /// Notices the backend sends back to the facade's gpui drainer.
@@ -92,6 +108,10 @@ pub enum BackendNotice {
         /// have landed after construction); the facade mirrors it so the
         /// selector shows the default instead of "no model".
         model: Option<pi::types::Model>,
+        /// The approval mode persisted in the session sidecar (fresh
+        /// sessions default to AutoPilot); the facade mirrors it for the
+        /// access chip.
+        approval_mode: crate::thread::ApprovalMode,
     },
     /// The turn loop unwound and released the running slot.
     Settled {

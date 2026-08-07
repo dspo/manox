@@ -26,7 +26,9 @@ use tokio::sync::mpsc;
 use crate::db::ThreadSummary;
 use crate::language_model::{MessageContent, TokenUsage};
 use crate::message::Message;
-use crate::thread::ThreadEvent;
+use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
+use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
+use crate::thread::{ApprovalMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
 /// Commands the gpui side sends to the pi actor.
@@ -43,6 +45,8 @@ enum SessionCmd {
     SetModel(PiModel),
     /// Map the reasoning effort onto pi's thinking level.
     SetThinkingLevel(Option<String>),
+    /// Switch the approval policy and persist it in the session sidecar.
+    SetApprovalMode(ApprovalMode),
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
     /// Create a fresh session in the given directory, optionally bound to a
@@ -65,9 +69,14 @@ struct EngineState {
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
-    model: Mutex<Option<PiModel>>,
+    /// Shared with the approval gate so `SetModel` is visible to the
+    /// reviewer without a second synchronization point.
+    model: Arc<Mutex<Option<PiModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
+    /// The host approval gate wrapping every tool (mode, always-allow
+    /// cache, pending UI round trips).
+    gate: Arc<ApprovalGate>,
 }
 
 /// The pi harness backend behind the `Thread` facade.
@@ -89,15 +98,21 @@ pub fn spawn_engine(
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+    let model_slot = Arc::new(Mutex::new(model.clone()));
+    let gate = Arc::new(ApprovalGate::new(
+        notice_tx.clone(),
+        Arc::clone(&model_slot),
+    ));
     let state = Arc::new(EngineState {
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
         request_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
-        model: Mutex::new(model.clone()),
+        model: model_slot,
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
+        gate,
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -170,6 +185,18 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
+    fn set_approval_mode(&self, mode: ApprovalMode) {
+        let _ = self.cmd_tx.send(SessionCmd::SetApprovalMode(mode));
+    }
+
+    fn respond_tool_authorization(&self, id: &str, response: ToolAuthorizationResponse) {
+        self.state.gate.respond(id, response);
+    }
+
+    fn pending_auth_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        self.state.gate.pending_entries()
+    }
+
     fn set_thinking_level(&self, level: Option<String>) {
         let _ = self.cmd_tx.send(SessionCmd::SetThinkingLevel(level));
     }
@@ -213,10 +240,14 @@ fn system_prompt(cwd: &Path) -> String {
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
+/// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
+/// no gate — approval policy is a harness concern); `AskUserQuestion` joins
+/// ungated because asking the user is itself the interaction.
 fn build_tools(
     cwd: &Path,
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
+    gate: &Arc<ApprovalGate>,
 ) -> Vec<Arc<dyn PiAgentTool>> {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
@@ -226,7 +257,7 @@ fn build_tools(
     )
     .with_manager(Arc::clone(&manager));
 
-    let mut tools: Vec<Arc<dyn PiAgentTool>> = vec![
+    let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
         Arc::new(pi::tools::write::WriteTool),
         Arc::new(pi::tools::edit::EditTool),
@@ -237,6 +268,13 @@ fn build_tools(
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background)),
     ];
+    let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
+        .into_iter()
+        .map(|tool| {
+            Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn PiAgentTool>
+        })
+        .collect();
+    tools.push(Arc::new(PiAskUserQuestionTool::new(Arc::clone(gate))));
     // The sub-agent tool needs a concrete model; a session assembled before
     // registration landed (first seconds after launch) skips it.
     if let Some(model) = model {
@@ -300,13 +338,14 @@ fn session_builder(
     sessions_dir: &Path,
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
+    gate: &Arc<ApprovalGate>,
 ) -> pi::coding_agent::AgentSessionBuilder {
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
         .with_system_prompt(system_prompt(cwd))
-        .with_tools(build_tools(cwd, runtime, model));
+        .with_tools(build_tools(cwd, runtime, model, gate));
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
@@ -335,6 +374,8 @@ async fn run_actor(
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
+    // Reviewer side calls resolve their stream through this runtime.
+    state.gate.set_runtime(runtime.clone());
     let Some(mut pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
@@ -367,7 +408,13 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
-        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, Some(&pi_model));
+        let builder = session_builder(
+            &tool_cwd,
+            &sessions_dir,
+            &runtime,
+            Some(&pi_model),
+            &state.gate,
+        );
         match builder.open(info.path).await {
             Ok(s) => {
                 restored = true;
@@ -381,7 +428,8 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
+            let builder =
+                session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
@@ -412,9 +460,14 @@ async fn run_actor(
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
 
+    // The approval mode rides the session sidecar: restore it so a
+    // reopened Danger session doesn't silently gate (or vice versa).
+    let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
+    state.gate.set_mode(approval_mode);
     let _ = notice_tx.send(BackendNotice::Ready {
         restored,
         model: Some(pi_model.clone()),
+        approval_mode,
     });
     if restored {
         sync_history(&session, &state);
@@ -520,6 +573,14 @@ async fn run_actor(
                 pi_model = new_model.clone();
                 *state.model.lock().unwrap() = Some(new_model);
             }
+            SessionCmd::SetApprovalMode(mode) => {
+                state.gate.set_mode(mode);
+                if let Err(err) =
+                    write_approval_mode_sidecar(&sessions_dir, session.path(), mode).await
+                {
+                    tracing::warn!(error = %err, "failed to persist approval mode");
+                }
+            }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level).await {
                     tracing::warn!("pi set_thinking_level failed: {err}");
@@ -534,16 +595,19 @@ async fn run_actor(
                     &pi_model,
                     &cwd,
                     &notice_tx,
+                    &state.gate,
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
+                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 sync_history(&session, &state);
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd, project } => {
-                let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
+                let builder =
+                    session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
                 match builder.build().await {
                     Ok(s) => {
                         session = s;
@@ -552,6 +616,7 @@ async fn run_actor(
                         if let Some(project) = &project {
                             write_project_sidecar(&sessions_dir, session.path(), project).await;
                         }
+                        resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                         sync_history(&session, &state);
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -574,6 +639,7 @@ async fn run_actor(
 /// Close the current session and open the given jsonl file in its place. The
 /// project dir comes from the session's own record so tools re-pin to the
 /// project the session was started in.
+#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 async fn rebuild_session(
     session: &mut AgentSession,
     path: &Path,
@@ -582,6 +648,7 @@ async fn rebuild_session(
     model: &PiModel,
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    gate: &Arc<ApprovalGate>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -603,7 +670,7 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
-    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model));
+    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model), gate);
     match builder.open(path.to_path_buf()).await {
         Ok(s) => *session = s,
         Err(err) => {
@@ -612,6 +679,52 @@ async fn rebuild_session(
             )));
         }
     }
+}
+
+/// The approval mode persisted in a session's sidecar; fresh sessions
+/// (missing sidecar or field) default to AutoPilot.
+async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> ApprovalMode {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => meta
+            .approval_mode
+            .as_deref()
+            .and_then(|raw| serde_json::from_value(serde_json::Value::String(raw.to_string())).ok())
+            .unwrap_or_default(),
+        Err(_) => ApprovalMode::default(),
+    }
+}
+
+/// Persist the approval mode in the session sidecar so the session reopens
+/// with the same gate policy.
+async fn write_approval_mode_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    mode: ApprovalMode,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    let raw = serde_json::to_value(mode)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "autopilot".to_string());
+    meta.approval_mode = Some(raw);
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// Re-read the session's persisted approval mode after a session switch and
+/// align the gate + the facade's chip with it.
+async fn resync_approval_mode(
+    session: &AgentSession,
+    sessions_dir: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let mode = load_approval_mode(sessions_dir, session.path()).await;
+    state.gate.set_mode(mode);
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::ApprovalModeChanged { mode },
+    )));
 }
 
 /// Mirror the session's authoritative transcript into engine state.
@@ -800,9 +913,10 @@ pub(crate) mod adapt {
     /// Map one pi `AgentEvent` onto the `ThreadEvent`s the workspace renders.
     ///
     /// Events with no UI counterpart (run/turn lifecycle handled by the facade,
-    /// message boundaries, block start/end markers) map to nothing. The
-    /// manox-only variants (`ToolCallAuthorization`, `Plan*`, sub-agent events)
-    /// are never produced — approval and plan flows are not wired in this stage.
+    /// message boundaries, block start/end markers) map to nothing.
+    /// `ToolCallAuthorization` never comes from this mapping — the approval
+    /// gate (`pi_approval`) emits it directly while parked on a verdict.
+    /// `Plan*` and sub-agent events remain manox-only and are never produced.
     pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
         match event {
             AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } => Vec::new(),
@@ -1092,5 +1206,81 @@ pub(crate) mod adapt {
             },
             _ => name.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approval_mode_sidecar_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-1.jsonl");
+
+        // Fresh session: no sidecar -> default.
+        assert_eq!(
+            load_approval_mode(dir.path(), &session).await,
+            ApprovalMode::AutoPilot
+        );
+
+        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::Danger)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_approval_mode(dir.path(), &session).await,
+            ApprovalMode::Danger
+        );
+
+        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::AutoPilot)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_approval_mode(dir.path(), &session).await,
+            ApprovalMode::AutoPilot
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_mode_sidecar_tolerates_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-2.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            approval_mode: Some("yolo".to_string()),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_approval_mode(dir.path(), &session).await,
+            ApprovalMode::AutoPilot,
+            "unknown persisted modes fall back to the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_mode_write_preserves_other_sidecar_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-3.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            title: Some("my thread".to_string()),
+            project: Some("/tmp/proj".to_string()),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+
+        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::Danger)
+            .await
+            .unwrap();
+
+        let loaded = pi_extensions::session_meta::load(dir.path(), &session)
+            .await
+            .unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("my thread"));
+        assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
+        assert_eq!(loaded.approval_mode.as_deref(), Some("danger"));
     }
 }

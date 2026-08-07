@@ -287,11 +287,7 @@ pub enum ThreadEvent {
 /// UI metadata for a pending tool-call authorization. Stored alongside the
 /// oneshot sender so the workspace can re-emit `ToolCallAuthorization` when
 /// the user switches back to a thread parked on an approval prompt.
-pub struct PendingAuthMeta {
-    pub tool_name: String,
-    pub summary: String,
-    pub input: serde_json::Value,
-}
+pub use agent::permission::PendingAuthMeta;
 
 /// A tool call the AutoPilot reviewer refused, escalated for the user's
 /// manual verdict. The reviewer's reason rides the question card and, when

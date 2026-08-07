@@ -14,13 +14,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent::PermissionDecision;
 #[cfg(feature = "harness-manox")]
 use agent::ReasoningEffort;
 use agent::i18n;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::settings;
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 #[cfg(not(feature = "harness-manox"))]
@@ -57,9 +57,9 @@ use gpui_component::{
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
 #[cfg(feature = "harness-manox")]
-use harness_manox::provider::registry;
+use harness_manox::PlanReviewChoice;
 #[cfg(feature = "harness-manox")]
-use harness_manox::{PermissionDecision, PlanReviewChoice};
+use harness_manox::provider::registry;
 #[cfg(feature = "harness-manox")]
 use harness_manox::{Thread, ThreadEvent, ThreadId, save_thread};
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
@@ -807,8 +807,6 @@ impl Workspace {
         let thread = self.thread.clone();
         cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
             match ev {
-                // TODO(pi-wire): approval UI — pi tools run ungated in this stage.
-                #[cfg(feature = "harness-manox")]
                 ThreadEvent::ToolCallAuthorization { id, input, .. } => {
                     // Every authorization — interactive tools, bubbled
                     // sub-agent auth, AutoPilot escalations — surfaces as the
@@ -2034,7 +2032,6 @@ impl Workspace {
     }
 
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_access_menu(&mut self) {
         self.access_open = false;
     }
@@ -2429,7 +2426,6 @@ impl Workspace {
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
-        #[cfg(feature = "harness-manox")]
         self.resurface_pending_auths(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
@@ -2524,7 +2520,6 @@ impl Workspace {
     /// emitted while the thread was in the background (no subscription). Called
     /// after switching threads so the question card appears without requiring
     /// the user to wait for the next event.
-    #[cfg(feature = "harness-manox")]
     fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
         // Query the thread for any pending authorization metadata that was
         // stored when the auth event was originally emitted. If the thread was
@@ -2710,8 +2705,6 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
-        // TODO(pi-wire): AskUserQuestion resolution — approval UI.
-        #[cfg(feature = "harness-manox")]
         if self.pending_ask.is_some() {
             self.pending_attachments = attachments;
             if !text.trim().is_empty() || self.pending_ask_has_selection() {
@@ -3981,7 +3974,6 @@ impl Workspace {
         self.send_user_turn(prompt, Vec::new(), cx);
     }
 
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
         // An AskUserQuestion card's "Cancel" button calls this; the card is
         // the only pending surface, so resolve its id directly.
@@ -3995,7 +3987,7 @@ impl Workspace {
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
-                harness_manox::ToolAuthorizationResponse::Decision(decision),
+                agent::ToolAuthorizationResponse::Decision(decision),
                 cx,
             );
         });
@@ -4067,7 +4059,6 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_mut()
             && let Some(sel) = ask.selections.get_mut(qi)
@@ -4094,7 +4085,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn ask_prev(&mut self, cx: &mut Context<Self>) {
         if self.ask_step > 0 {
             self.ask_step -= 1;
@@ -4102,7 +4092,6 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn ask_next(&mut self, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_ref()
             && self.ask_step < ask.questions.len() - 1
@@ -4114,7 +4103,6 @@ impl Workspace {
 
     /// Submit the ask drawer: gather selected options plus an optional global
     /// supplemental note from the composer.
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn resolve_ask_with_response(
         &mut self,
         response_override: Option<String>,
@@ -4149,7 +4137,7 @@ impl Workspace {
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
-                harness_manox::ToolAuthorizationResponse::AskUserQuestion { answers, response },
+                agent::ToolAuthorizationResponse::AskUserQuestion { answers, response },
                 cx,
             );
         });
@@ -5002,10 +4990,7 @@ impl Workspace {
         let team_chip = self.render_team_chip(theme, cx);
         #[cfg(feature = "harness-pi")]
         let team_chip: Option<AnyElement> = None;
-        #[cfg(feature = "harness-manox")]
         let access = self.render_access_placeholder(theme, cx);
-        #[cfg(feature = "harness-pi")]
-        let access: AnyElement = gpui::div().into_any_element();
         #[cfg(feature = "harness-manox")]
         let model = self.render_model_selector(theme, cx);
         #[cfg(feature = "harness-pi")]
@@ -5718,7 +5703,6 @@ impl Workspace {
     /// The popover is `max_w(360)` to fit the longest bilingual subtitle
     /// ("Unrestricted access to the internet and any file on your computer")
     /// without wrapping.
-    #[cfg(feature = "harness-manox")]
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
@@ -7834,7 +7818,6 @@ fn thread_cwd(thread: &Entity<ThreadEntity>, cx: &App) -> Option<SharedString> {
     }
 }
 
-#[cfg(feature = "harness-manox")]
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
     // Out-of-range counts violate the tool contract. No card is shown for
@@ -7899,7 +7882,6 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
     })
 }
 
-#[cfg(feature = "harness-manox")]
 fn strip_recommended_suffix(label: String) -> (String, bool) {
     let lower = label.to_lowercase();
     for suffix in [" (Recommended)", "（推荐）", " (推荐)", "（Recommended）"] {
@@ -7918,7 +7900,6 @@ fn strip_recommended_suffix(label: String) -> (String, bool) {
 /// active theme (light/dark) without bespoke palettes per mode. The
 /// AutoPilot accent uses `info` (green) as a "this is the safe default"
 /// signal — staying gray would be visually identical to a disabled state.
-#[cfg(feature = "harness-manox")]
 fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
     match mode {
         ApprovalMode::AutoPilot => (
@@ -7995,7 +7976,6 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
 /// for the opaque card chrome — that path doesn't go through `PopupMenu`
 /// at all, sidestepping the per-`ElementItem` `flex_1`/`min_h(26)` wrapper
 /// that was producing both the height-leak bug and the clip-to-26 bug.
-#[cfg(feature = "harness-manox")]
 fn build_approval_content(
     workspace: WeakEntity<Workspace>,
     current: ApprovalMode,
@@ -8102,7 +8082,6 @@ impl Workspace {
     /// Switch the thread's `ApprovalMode`, post a localized notice, and close
     /// the popover. Centralized so slash command, chip click, and the
     /// future settings-panel wiring all funnel through one path.
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
         let mode_key = match mode {
             ApprovalMode::AutoPilot => "autopilot",

@@ -390,6 +390,7 @@ workspace-escalation-always-allow = 始终允许
 workspace-escalation-always-allow-desc = 本次会话内始终允许该工具。
 workspace-escalation-deny = 拒绝
 workspace-escalation-deny-desc = 拒绝执行；原因将返回给模型。
+workspace-escalation-no-verdict-reason = 安全审查器未对此次调用运行。
 workspace-queued = （队列中还有 {$count} 个待审批）
 workspace-inbound-title = 内置浏览器请求操作 Manox
 workspace-inbound-intent = 请求：{$intent}

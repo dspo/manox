@@ -8,9 +8,10 @@
 // path (`ConversationState::rebuild_from_messages`) is reused as-is.
 //
 // The public surface mirrors the manox `Thread`'s — the workspace compiles
-// against one shape. manox-only affordances (pin/archive/notes/approval
-// mode/goal/team/worktree) are inert here; capabilities that need real
-// wiring carry a stub with the reason.
+// against one shape. manox-only affordances (pin/archive/notes/goal/team/
+// worktree) are inert here; capabilities that need real wiring carry a stub
+// with the reason. Approval mode is live: the facade records it, the
+// engine's gate enforces it, and the sidecar persists it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -54,8 +55,10 @@ pub struct SideCallMetric {
     pub latency_ms: u64,
 }
 
-/// User-facing approval policy. The pi toolset runs ungated in this stage —
-/// the mode is recorded for the chip but gates nothing.
+/// User-facing approval policy. `AutoPilot` routes approval-required tool
+/// calls through the safety reviewer with user escalation; `Danger` runs
+/// everything without prompting. Enforced by the engine's approval gate
+/// (`pi_approval`); persisted in the session sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
@@ -139,8 +142,10 @@ pub enum ThreadEvent {
         latest_activity: Option<String>,
         status: ToolCallStatus,
     },
-    /// Request user authorization for a tool call. Not produced — the pi
-    /// toolset runs ungated in this stage.
+    /// Request user authorization for a tool call: approval-gated tools
+    /// escalate here, and `AskUserQuestion` rides the same channel. The
+    /// workspace renders the question card and answers through
+    /// [`Thread::respond_authorization`].
     ToolCallAuthorization {
         id: String,
         tool_name: String,
@@ -241,6 +246,7 @@ pub struct Thread {
     cwd: PathBuf,
     project: Option<PathBuf>,
     model: Option<PiModel>,
+    approval_mode: ApprovalMode,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -315,13 +321,23 @@ impl Thread {
                     let ok = this
                         .update(cx, |t: &mut Thread, cx| match notice {
                             BackendNotice::Event(event) => {
+                                // Mirror the gate policy before the chip
+                                // hears about the change.
+                                if let ThreadEvent::ApprovalModeChanged { mode } = *event {
+                                    t.approval_mode = mode;
+                                }
                                 cx.emit(*event);
                             }
-                            BackendNotice::Ready { restored, model } => {
+                            BackendNotice::Ready {
+                                restored,
+                                model,
+                                approval_mode,
+                            } => {
                                 t.restored = restored;
                                 if let Some(m) = model {
                                     t.model = Some(m);
                                 }
+                                t.approval_mode = approval_mode;
                                 if restored {
                                     t.refresh_history(cx);
                                     cx.emit(ThreadEvent::HistoryRestored);
@@ -367,6 +383,7 @@ impl Thread {
                 cwd,
                 project,
                 model,
+                approval_mode: ApprovalMode::default(),
                 messages: Vec::new(),
                 reasoning_effort: ReasoningEffort::default(),
                 pinned: false,
@@ -538,7 +555,7 @@ impl Thread {
     }
 
     pub fn approval_mode(&self) -> ApprovalMode {
-        ApprovalMode::default()
+        self.approval_mode
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -656,10 +673,33 @@ impl Thread {
         cx.notify();
     }
 
-    pub fn set_approval_mode(&mut self, _mode: ApprovalMode, cx: &mut Context<Self>) {
-        // The pi toolset runs ungated in this stage; the mode is recorded for
-        // the chip but gates nothing.
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+        if self.approval_mode == mode {
+            return;
+        }
+        self.approval_mode = mode;
+        // The engine applies the mode to its gate and persists it in the
+        // session sidecar; the chip reflects the change immediately.
+        self.engine.set_approval_mode(mode);
+        cx.emit(ThreadEvent::ApprovalModeChanged { mode });
         cx.notify();
+    }
+
+    /// Deliver the user's verdict for a pending tool-call authorization
+    /// (approval card or `AskUserQuestion`). Unknown ids are ignored.
+    pub fn respond_authorization(
+        &mut self,
+        id: &str,
+        response: crate::permission::ToolAuthorizationResponse,
+        _cx: &mut Context<Self>,
+    ) {
+        self.engine.respond_tool_authorization(id, response);
+    }
+
+    /// Pending authorizations with their card metadata, so the workspace can
+    /// re-surface a card after switching back to this thread.
+    pub fn pending_auth_entries(&self) -> Vec<(String, crate::permission::PendingAuthMeta)> {
+        self.engine.pending_auth_entries()
     }
 
     pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
