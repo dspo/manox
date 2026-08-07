@@ -50,7 +50,7 @@ impl StreamFn for FakeProvider {
             Ok(assistant(
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::json!({ "path": "README.md" }),
                     thought_signature: None,
                 }],
@@ -114,6 +114,10 @@ async fn main() {
     tokio::fs::write(cwd.join("CLAUDE.md"), "Keep changes minimal.")
         .await
         .unwrap();
+    // The file the mock's `Read` call targets during the tool turn.
+    tokio::fs::write(cwd.join("README.md"), "# smoke fixture\n")
+        .await
+        .unwrap();
     tokio::fs::create_dir_all(cwd.join(".pi/skills"))
         .await
         .unwrap();
@@ -163,10 +167,17 @@ async fn main() {
 
     // Tool turn.
     let messages = session.prompt("read README.md").await.expect("prompt");
+    // Regression guard (#430): the mounted `Read` tool must actually execute —
+    // a silent "Tool not found" would defeat this example's purpose.
     assert!(
-        messages
-            .iter()
-            .any(|m| matches!(m, AgentMessage::ToolResult { .. }))
+        messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult {
+                is_error: false,
+                ..
+            }
+        )),
+        "the Read tool must execute without error"
     );
     println!("tool turn produced {} messages", messages.len());
 

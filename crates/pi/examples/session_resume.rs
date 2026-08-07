@@ -55,7 +55,7 @@ impl StreamFn for ToolLoopMock {
             assistant(
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::json!({ "path": "hello.txt" }),
                     thought_signature: None,
                 }],
@@ -89,6 +89,9 @@ fn mock_model() -> Model {
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
+    // The file the mock's `Read` call targets; tools run against the
+    // tempdir via `with_tool_cwd` below.
+    std::fs::write(dir.path().join("hello.txt"), "hello from disk\n").expect("write hello.txt");
     let meta = JsonlSessionMetadata {
         id: uuid::Uuid::new_v4().to_string(),
         cwd: std::env::current_dir()
@@ -112,11 +115,25 @@ async fn main() {
             step: AtomicU32::new(0),
         }),
     )
-    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]));
+    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]))
+    .with_tool_cwd(dir.path().to_path_buf());
 
     let messages = harness.prompt("read hello.txt").await.expect("prompt");
     let turn_messages = messages.len();
     println!("turn produced {turn_messages} messages (user, tool-use, tool result, reply)");
+
+    // Regression guard (#430): the mounted `Read` tool must actually execute —
+    // a silent "Tool not found" would defeat this example's purpose.
+    assert!(
+        messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult {
+                is_error: false,
+                ..
+            }
+        )),
+        "the Read tool must execute without error"
+    );
 
     // Drop the harness without any further writes — a simulated crash. The
     // JSONL file already holds every completed message.
@@ -145,7 +162,8 @@ async fn main() {
             step: AtomicU32::new(10),
         }),
     )
-    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]));
+    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]))
+    .with_tool_cwd(dir.path().to_path_buf());
     restored.restore().await.expect("restore");
     let transcript_len = restored.agent().state().messages.len();
     println!("restored transcript: {transcript_len} messages");

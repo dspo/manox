@@ -1,6 +1,6 @@
 // Local end-to-end check of the agent loop with a built-in tool.
 //
-// A mock StreamFn plays the model: turn 1 emits a `read` tool call, the loop
+// A mock StreamFn plays the model: turn 1 emits a `Read` tool call, the loop
 // executes it through the real `LocalToolContext` (no panic — #364), and
 // turn 2 emits a final answer derived from the tool result. No API key is
 // needed; the point is to prove tools are injected into the context (#363)
@@ -21,7 +21,7 @@ use pi::tools::read::ReadTool;
 use pi::types::{AgentEvent, ContentBlock, Model, StopReason, ThinkingKind, Usage};
 use pi::{Agent, AgentContext, AgentMessage, StreamFn};
 
-/// A fake model that calls `read` once and then summarizes the result.
+/// A fake model that calls `Read` once and then summarizes the result.
 struct ToolLoopMock {
     step: AtomicU32,
     file_path: String,
@@ -56,7 +56,7 @@ impl StreamFn for ToolLoopMock {
             0 => Ok(assistant(
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::json!({ "path": self.file_path }),
                     thought_signature: None,
                 }],
@@ -94,7 +94,7 @@ impl StreamFn for ToolLoopMock {
 
 #[tokio::main]
 async fn main() {
-    // Write a tempfile the `read` tool will open.
+    // Write a tempfile the `Read` tool will open.
     let dir = tempfile::tempdir().expect("tempdir");
     let file_path = dir.path().join("hello.txt");
     std::fs::write(&file_path, "hello from disk\n").expect("write");
@@ -158,4 +158,17 @@ async fn main() {
             _ => println!("  other"),
         }
     }
+
+    // Regression guard (#430): the mounted `Read` tool must actually execute —
+    // a silent "Tool not found" would defeat this example's purpose.
+    assert!(
+        messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult {
+                is_error: false,
+                ..
+            }
+        )),
+        "the Read tool must execute without error"
+    );
 }
