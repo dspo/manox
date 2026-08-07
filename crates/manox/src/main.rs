@@ -336,6 +336,16 @@ fn main() {
 
         cx.set_menus(build_app_menus());
 
+        // The initial provider registration runs on a background thread
+        // (keychain / shell resolution), so the menus built above start
+        // empty. Rebuild once registration lands so the 工具 cascades
+        // populate without waiting for a settings save / manual reload.
+        cx.spawn(async move |cx| {
+            agent::pi_providers::wait_ready().await;
+            cx.update(agent::i18n::rebuild_menus);
+        })
+        .detach();
+
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
@@ -439,7 +449,7 @@ fn build_tools_menu() -> Menu {
     let chatgpt_empty = chatgpt.items.is_empty();
     let chatgpt = chatgpt.disabled(chatgpt_empty);
     let vscode = Menu::new("VS Code").items(build_vscode_menu_items());
-    // VS Code 未安装时整个子菜单禁用——含「打开（不注入 BYOK）」项，
+    // VS Code 未安装时整个子菜单禁用——含「打开」项，
     // 因为此时没有任何 VS Code 实例可打开/注入。
     let vscode_installed = cx::vscode_app_installed();
     let vscode = vscode.disabled(!vscode_installed);
@@ -504,7 +514,7 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
 /// exposes models visible to the `VS Code` agent (Anthropic-wire models
 /// usable by the Claude Code extension), one action item per model — same
 /// grouping/order rules as the ChatGPT cascade. A trailing separator +
-/// 「打开（不注入 BYOK）」entry opens VS Code without injection. The submenu
+/// 「打开」entry opens VS Code without injection. The submenu
 /// is disabled wholesale when VS Code is not installed.
 #[cfg(target_os = "macos")]
 fn build_vscode_menu_items() -> Vec<MenuItem> {

@@ -490,7 +490,7 @@ menu-new-terminal = 新建终端标签页
 menu-close-terminal = 关闭终端标签页
 menu-about = 关于 Manox
 menu-tools = 工具
-menu-vscode-plain = 打开（不注入 BYOK）
+menu-vscode-plain = 打开
 
 ## ChatGPT.app 启动通知（工具 → ChatGPT.app 菜单级联）
 chatgpt-app-launched = 已启动 ChatGPT.app · { $provider } · { $model }
@@ -498,7 +498,7 @@ chatgpt-app-launch-failed = 启动 ChatGPT.app 失败
 
 ## VS Code 启动通知（工具 → VS Code 菜单级联）
 vscode-app-launched = 已启动 VS Code · { $provider } · { $model }
-vscode-app-launched-plain = 已启动 VS Code（未注入 BYOK 配置）
+vscode-app-launched-plain = 已启动 VS Code
 vscode-app-launch-failed = 启动 VS Code 失败
 
 ### terminal-ui (overlay status / search)

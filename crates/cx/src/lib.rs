@@ -1227,8 +1227,8 @@ pub fn launch_vscode_app(provider_name: &str, model_id: &str) -> Result<()> {
     vscode_app::launch(&selection, &apikey)
 }
 
-/// 不注入 BYOK 配置启动 VS Code（等效 Dock 正常打开）。供 manox
-/// 「工具 → VS Code → 打开（不注入 BYOK）」菜单项调用。
+/// 普通启动 VS Code（等效 Dock 正常打开）。供 manox
+/// 「工具 → VS Code → 打开」菜单项调用。
 pub fn launch_vscode_plain() -> Result<()> {
     vscode_app::launch_plain()
 }

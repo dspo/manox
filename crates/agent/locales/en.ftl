@@ -542,7 +542,7 @@ menu-new-terminal = New Terminal Tab
 menu-close-terminal = Close Terminal Tab
 menu-about = About Manox
 menu-tools = Tools
-menu-vscode-plain = Open Without BYOK
+menu-vscode-plain = Open
 
 ## ChatGPT.app launch notifications (Tools → ChatGPT.app menu cascade)
 chatgpt-app-launched = Launched ChatGPT.app · { $provider } · { $model }
@@ -550,7 +550,7 @@ chatgpt-app-launch-failed = Failed to launch ChatGPT.app
 
 ## VS Code launch notifications (Tools → VS Code menu cascade)
 vscode-app-launched = Launched VS Code · { $provider } · { $model }
-vscode-app-launched-plain = Launched VS Code (no BYOK injection)
+vscode-app-launched-plain = Launched VS Code
 vscode-app-launch-failed = Failed to launch VS Code
 
 ### terminal-ui (overlay status / search)
