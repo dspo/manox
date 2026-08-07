@@ -131,6 +131,9 @@ rmcp = { version = "1.8", default-features = false }
 lsp-types = "0.97"
 toml = "0.8"
 http = "1"
+# sysinfo — process-tree enumeration for terminal teardown (descendant kill)
+# and the foreground-process indicator.
+sysinfo = "0.39"
 
 # wry stack — native webview embedded as a child of a gpui window. raw-window-handle
 # is already pulled transitively by gpui (0.6.x); pinned here so the webview crate

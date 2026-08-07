@@ -10,25 +10,33 @@
 //! written to the PTY and the in-flight marked text is painted inline at the
 //! cursor.
 
+use std::cell::{Cell as SharedCell, RefCell};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, UTF16Selection,
-    Window, div, px, rgba,
+    Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Styled, Subscription, Task,
+    UTF16Selection, Window, div, point, px, rgba, size,
 };
 use gpui_component::ActiveTheme as _;
-use terminal::Terminal;
+use terminal::alacritty_terminal::selection::SelectionType;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
 use terminal::mappings::mouse::{self, MouseAction};
-use terminal::settings::BellMode;
+use terminal::settings::{BellMode, CursorBlinkSetting};
+use terminal::{HoverKind, HoverTarget, Rgb, Terminal};
 
+use crate::blink::CursorBlink;
 use crate::element::TerminalElement;
-use crate::theme::TerminalTheme;
+use crate::layout_cache::LineShapeCache;
+use crate::theme::{TerminalTheme, color_for_request, hsla_to_rgb};
 
 /// In-flight `/pattern` search state — the pattern, the grid-coordinate match
 /// ranges, and the index of the active (highlighted) match.
@@ -73,6 +81,33 @@ pub struct TerminalView {
     /// Parsed `commands_to_skip_shell`: keys that skip the terminal and keep
     /// workbench precedence while it is focused.
     skip_shell: Vec<Keystroke>,
+    /// Name of the process owning the foreground process group, refreshed by
+    /// a 1s poll. `None` while the shell itself owns the foreground — the
+    /// chip is hidden at an idle prompt.
+    foreground_process: Option<String>,
+    /// Keeps the foreground-process poll alive; dropping the view cancels it.
+    _fg_task: Option<Task<()>>,
+    /// Cursor blink phase state; ticked by `_blink_task`.
+    cursor_blink: CursorBlink,
+    /// Keeps the 530ms blink timer alive; dropping the view cancels it.
+    _blink_task: Option<Task<()>>,
+    /// Last user input time; the cursor is pinned visible for 500ms after
+    /// input so typing never lands on an invisible phase.
+    last_input_at: Option<Instant>,
+    /// The hoverable target under the mouse (OSC 8 link / URL / path).
+    /// `None` while selecting or while the TUI captures the mouse.
+    hover: Option<HoverTarget>,
+    /// Per-line shaped-run cache shared with the element (rebuilt per render,
+    /// so the cache lives here). Cleared on theme change.
+    shape_cache: Rc<RefCell<LineShapeCache<ShapedLine>>>,
+    /// The theme the shaped-run cache was built against; a switch clears it.
+    cache_theme: Option<TerminalTheme>,
+    /// Scrollbar track bounds in window space, written by the element each
+    /// prepaint (`None` without scrollback); mouse input is hit-tested
+    /// against it.
+    scrollbar_track: Rc<SharedCell<Option<Bounds<Pixels>>>>,
+    /// True while the scrollbar thumb is being dragged.
+    scrollbar_dragging: bool,
 }
 
 impl TerminalView {
@@ -104,12 +139,33 @@ impl TerminalView {
             bell_flash: false,
             key_interceptor: None,
             skip_shell,
+            foreground_process: None,
+            _fg_task: None,
+            cursor_blink: CursorBlink::new(s.cursor_blink),
+            _blink_task: None,
+            last_input_at: None,
+            hover: None,
+            shape_cache: Rc::new(RefCell::new(LineShapeCache::new())),
+            cache_theme: None,
+            scrollbar_track: Rc::new(SharedCell::new(None)),
+            scrollbar_dragging: false,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
             move |_t, ev: &terminal::event::TerminalEvent, cx| match ev {
                 terminal::event::TerminalEvent::Bell => {
                     view.update(cx, |v, cx| v.ring_bell(cx));
+                }
+                terminal::event::TerminalEvent::ColorRequest(idx, fmt) => {
+                    view.update(cx, |v, cx| v.answer_color_request(*idx, fmt.clone(), cx));
+                }
+                terminal::event::TerminalEvent::CursorBlinkingChange => {
+                    // The program flipped its blink flag: restart the phase
+                    // visible so the cursor never vanishes on the toggle.
+                    view.update(cx, |v, cx| {
+                        v.cursor_blink.reset();
+                        cx.notify();
+                    });
                 }
                 _ => {
                     view.update(cx, |_, cx| cx.notify());
@@ -151,6 +207,10 @@ impl TerminalView {
             })
         };
         view.update(cx, |v, _| v.key_interceptor = Some(interceptor));
+        view.update(cx, |v, cx| {
+            v.start_foreground_poll(cx);
+            v.start_cursor_blink(cx);
+        });
         view
     }
 
@@ -250,6 +310,7 @@ impl TerminalView {
                 self.terminal.read_with(cx, |t, _| {
                     let _ = t.paste(&text);
                 });
+                self.note_input(cx);
             }
             return true;
         }
@@ -307,6 +368,7 @@ impl TerminalView {
 
         if let Some(s) = keys::to_esc_str(k, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
+            self.note_input(cx);
             return true;
         }
 
@@ -341,16 +403,38 @@ impl TerminalView {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let (row, col) = self.px_to_grid(ev.position, window);
-
-        // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
-        if (ev.modifiers.platform || ev.modifiers.control)
-            && let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col))
-        {
-            let _ = std::process::Command::new("open").arg(url).spawn();
-            return;
+        // Scrollbar hit area: the 2px track plus 3px on each side. A press
+        // jumps the display to the clicked fraction and starts a drag.
+        if let Some(track) = self.scrollbar_track.get() {
+            let hit = Bounds::new(
+                point(track.origin.x - px(3.), track.origin.y),
+                size(track.size.width + px(6.), track.size.height),
+            );
+            if hit.contains(&ev.position) {
+                self.scrollbar_dragging = true;
+                self.scroll_to_track_y(ev.position.y, cx);
+                return;
+            }
         }
 
+        let (row, col) = self.px_to_grid(ev.position, window);
+
+        // cmd/ctrl+click opens the target under the cursor: an OSC 8
+        // hyperlink first, then a hovered URL, then a hovered path.
+        if ev.modifiers.platform || ev.modifiers.control {
+            let target = self.terminal.read_with(cx, |t, _| {
+                t.hyperlink_at(row, col)
+                    .map(|url| (url, HoverKind::Url))
+                    .or_else(|| t.hover_target(row, col).map(|h| (h.text, h.kind)))
+                    .map(|(text, kind)| (text, kind, t.cwd.clone()))
+            });
+            if let Some((text, kind, cwd)) = target {
+                open_target(&text, kind, &cwd);
+                return;
+            }
+        }
+
+        let ty = selection_type_for(ev.click_count);
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
 
         if mode.intersects(TermMode::MOUSE_MODE) {
@@ -359,8 +443,9 @@ impl TerminalView {
                 // user can select text even when the TUI has captured the
                 // mouse.
                 self.terminal
-                    .update(cx, |t, cx| t.start_selection(row, col, cx));
+                    .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
                 self.selecting = true;
+                self.hover = None;
                 return;
             }
             // Forward the click to the TUI app as an xterm mouse report.
@@ -378,11 +463,16 @@ impl TerminalView {
             return;
         }
         self.terminal
-            .update(cx, |t, cx| t.start_selection(row, col, cx));
+            .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
         self.selecting = true;
+        self.hover = None;
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_dragging {
+            self.scroll_to_track_y(ev.position.y, cx);
+            return;
+        }
         if self.selecting {
             let (row, col) = self.px_to_grid(ev.position, window);
             self.terminal
@@ -405,9 +495,29 @@ impl TerminalView {
                 let _ = self.terminal.update(cx, |t, _| t.input(&report));
             }
         }
+        // Track the hoverable target under the mouse while the TUI does not
+        // capture it; the element underlines the span and the view shows the
+        // tooltip / cmd+click opens it.
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            if self.hover.is_some() {
+                self.hover = None;
+                cx.notify();
+            }
+        } else {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            let target = self.terminal.read_with(cx, |t, _| t.hover_target(row, col));
+            if target != self.hover {
+                self.hover = target;
+                cx.notify();
+            }
+        }
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_dragging {
+            self.scrollbar_dragging = false;
+            return;
+        }
         if self.selecting {
             self.finalize_selection(cx);
             return;
@@ -454,6 +564,14 @@ impl TerminalView {
             });
             return;
         }
+        if mode.intersects(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+            // Alt screen without mouse capture (less, git log): the wheel
+            // becomes arrow-key presses (xterm alternateScroll). With the
+            // mode off the wheel stays dead here — local scrollback is a
+            // no-op on the alt screen anyway.
+            self.terminal.update(cx, |t, _| t.alternate_scroll(lines));
+            return;
+        }
         self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
     }
 
@@ -487,7 +605,7 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (search_matches, active_match, pattern, count) = self
             .search
             .as_ref()
@@ -523,6 +641,14 @@ impl Render for TerminalView {
             None
         };
 
+        // A theme switch invalidates every cached shaped line (run colors are
+        // baked at shape time).
+        let theme = TerminalTheme::from_app_theme(cx.theme());
+        if self.cache_theme.as_ref() != Some(&theme) {
+            self.shape_cache.borrow_mut().clear();
+            self.cache_theme = Some(theme.clone());
+        }
+
         let mut content = div()
             .flex_1()
             .w_full()
@@ -538,16 +664,32 @@ impl Render for TerminalView {
                 terminal: self.terminal.clone(),
                 view: cx.entity(),
                 focus_handle: self.focus_handle.clone(),
-                theme: TerminalTheme::from_app_theme(cx.theme()),
+                theme,
                 font: self.font.clone(),
                 font_size: self.font_size,
                 line_height: self.line_height,
                 marked_text: SharedString::from(self.marked_text.clone()),
                 search_matches,
                 active_match,
+                hover: self.hover.clone(),
+                cursor_visible: self.cursor_visible(cx),
+                shape_cache: self.shape_cache.clone(),
+                scrollbar_track: self.scrollbar_track.clone(),
             });
         if let Some(o) = overlay {
             content = content.child(o);
+        }
+        // Starting indicator: shown until the shell / agent TUI reports ready
+        // (marker tap, quiet window, or fallback — see `Terminal::is_ready`).
+        if !self.terminal.read_with(cx, |t, _| t.is_ready()) {
+            content = content.child(
+                div().absolute().top_0().right_0().px_2().py_1().child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(agent::i18n::t("terminal-starting")),
+                ),
+            );
         }
         if self.bell_flash {
             content = content.child(
@@ -559,11 +701,93 @@ impl Render for TerminalView {
                     .bg(rgba(0xffffffff)),
             );
         }
+        // Foreground-process chip: the running program's name at the bottom
+        // right while something other than the shell owns the foreground.
+        if let Some(name) = &self.foreground_process {
+            content = content.child(
+                div().absolute().bottom_0().right_0().px_2().py_1().child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(name.clone()),
+                ),
+            );
+        }
+        // Hover tooltip: the target text, anchored under the hovered span.
+        if let Some(hover) = &self.hover {
+            let origin = self.last_bounds.map(|b| b.origin).unwrap_or_default();
+            let cell_w = self.cell_width(window);
+            let line_h = px(f32::from(self.font_size) * self.line_height);
+            let x = origin.x + hover.start_col as f32 * cell_w;
+            let y = origin.y + (hover.row + 1) as f32 * line_h;
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .px_2()
+                    .py_1()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().popover_foreground)
+                            .child(hover.text.clone()),
+                    ),
+            );
+        }
         content
     }
 }
 
 impl TerminalView {
+    /// Answer an OSC 10/11/12 color query from the active theme. Indices past
+    /// the cursor slot are not ours and go unanswered.
+    fn answer_color_request(
+        &mut self,
+        idx: usize,
+        fmt: Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = TerminalTheme::from_app_theme(cx.theme());
+        let Some(color) = color_for_request(&theme, idx) else {
+            return;
+        };
+        let response = fmt(hsla_to_rgb(color));
+        let _ = self
+            .terminal
+            .read_with(cx, |t, _| t.input(response.as_bytes()));
+    }
+
+    /// Poll the foreground process once a second and keep
+    /// `foreground_process` current, notifying only on change. The stored
+    /// task is cancelled when the view drops; the loop also self-terminates
+    /// if either side of the update channel is gone.
+    fn start_foreground_poll(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.clone();
+        self._fg_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let name = terminal.read_with(cx, |t, _| t.foreground_process_name());
+                if this
+                    .update(cx, |v, cx| {
+                        if v.foreground_process != name {
+                            v.foreground_process = name;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
     /// React to a terminal bell per the configured `bell` mode: `Visual`
     /// flashes a brief overlay, `System` is silent here (no audio bridge yet),
     /// `Off` does nothing.
@@ -605,6 +829,60 @@ impl TerminalView {
             return;
         }
         let _ = self.terminal.update(cx, |t, _| t.input(text.as_bytes()));
+        self.note_input(cx);
+    }
+
+    /// Record user input: pins the cursor visible for 500ms and resets the
+    /// blink phase so typing never lands on an invisible cursor.
+    fn note_input(&mut self, cx: &mut Context<Self>) {
+        self.last_input_at = Some(Instant::now());
+        self.cursor_blink.reset();
+        cx.notify();
+    }
+
+    /// Whether the cursor paints this frame: the blink phase combined with
+    /// the program's blink flag, pinned visible while selecting, composing
+    /// IME text, or within 500ms of the last input.
+    fn cursor_visible(&self, cx: &App) -> bool {
+        let term_blinking = self.terminal.read_with(cx, |t, _| t.cursor_blinking());
+        let force = self.selecting
+            || !self.marked_text.is_empty()
+            || self
+                .last_input_at
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+        self.cursor_blink.visible(term_blinking, force)
+    }
+
+    /// Tick the blink phase every 530ms. A phase flip only repaints when the
+    /// blink is live (mode `On`, or `Terminal` while the program's blink flag
+    /// is set); the stored task dies with the view.
+    fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.clone();
+        self._blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                if this
+                    .update(cx, |v, cx| {
+                        v.cursor_blink.tick();
+                        let live = match v.cursor_blink.mode() {
+                            CursorBlinkSetting::Off => false,
+                            CursorBlinkSetting::On => true,
+                            CursorBlinkSetting::Terminal => {
+                                terminal.read_with(cx, |t, _| t.cursor_blinking())
+                            }
+                        };
+                        if live {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Select-to-copy: mirror the in-flight selection into the clipboard on
@@ -620,6 +898,32 @@ impl TerminalView {
     /// to decide whether to register the window-level mouse-up listener.
     pub(crate) fn is_selecting(&self) -> bool {
         self.selecting
+    }
+
+    /// Whether a scrollbar drag is in flight; like `is_selecting`, the element
+    /// reads it to register the window-level mouse-up listener.
+    pub(crate) fn is_scrollbar_dragging(&self) -> bool {
+        self.scrollbar_dragging
+    }
+
+    /// End a scrollbar drag. Idempotent: the div's `on_mouse_up` and the
+    /// window-level listener both route here.
+    pub(crate) fn end_scrollbar_drag(&mut self) {
+        self.scrollbar_dragging = false;
+    }
+
+    /// Map a window-space y onto the scrollbar track fraction and scroll the
+    /// display to the matching offset.
+    fn scroll_to_track_y(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(track) = self.scrollbar_track.get() else {
+            return;
+        };
+        if track.size.height <= px(0.) {
+            return;
+        }
+        let fraction = ((y - track.origin.y) / track.size.height).clamp(0., 1.);
+        self.terminal
+            .update(cx, |t, cx| t.scroll_to_fraction(fraction, cx));
     }
 
     /// Record the element's window-space bounds (written back by the element
@@ -770,6 +1074,46 @@ fn grid_from_px(
     (row, col)
 }
 
+/// Selection granularity by click count: 1 = char, 2 = word (semantic),
+/// 3 = line. Counts past 3 fall back to char selection.
+fn selection_type_for(click_count: usize) -> SelectionType {
+    match click_count {
+        2 => SelectionType::Semantic,
+        3 => SelectionType::Lines,
+        _ => SelectionType::Simple,
+    }
+}
+
+/// Open a cmd/ctrl+click target: URLs in the browser; paths revealed in the
+/// file manager (directories opened directly). A leading `~/` expands to the
+/// home directory; relative paths resolve against the terminal's cwd.
+fn open_target(text: &str, kind: HoverKind, cwd: &Path) {
+    let mut cmd = std::process::Command::new("open");
+    match kind {
+        HoverKind::Url => {
+            cmd.arg(text);
+        }
+        HoverKind::Path => {
+            let path = match text.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(rest))
+                    .unwrap_or_else(|| PathBuf::from(text)),
+                None => PathBuf::from(text),
+            };
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if !path.is_dir() {
+                cmd.arg("-R");
+            }
+            cmd.arg(path);
+        }
+    }
+    let _ = cmd.spawn();
+}
+
 /// Map a gpui `MouseButton` to an xterm button code (left=0, middle=1,
 /// right=2). Unrecognised buttons map to 0 (left) so the click is still
 /// forwarded rather than silently dropped.
@@ -841,5 +1185,13 @@ mod tests {
     fn grid_from_px_without_origin() {
         let (row, col) = grid_from_px(point(px(16.), px(32.)), Point::default(), px(8.), px(16.));
         assert_eq!((row, col), (2, 2));
+    }
+
+    #[test]
+    fn click_count_maps_to_selection_granularity() {
+        assert_eq!(selection_type_for(1), SelectionType::Simple);
+        assert_eq!(selection_type_for(2), SelectionType::Semantic);
+        assert_eq!(selection_type_for(3), SelectionType::Lines);
+        assert_eq!(selection_type_for(4), SelectionType::Simple);
     }
 }

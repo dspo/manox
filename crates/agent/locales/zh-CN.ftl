@@ -452,6 +452,7 @@ vscode-app-launch-failed = 启动 VS Code 失败
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = 终端运行中… 输入以交互
+terminal-starting = 正在启动…
 terminal-exited = 终端已退出，退出码 { $code }
 terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）
 

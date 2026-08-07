@@ -12,16 +12,24 @@
 //! No `InteractiveElement`/hitbox here — mouse and keyboard are routed by
 //! `TerminalView`'s wrapping `div`, keeping this element paint-only.
 
-use gpui::{
-    App, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures,
-    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseUpEvent, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
-    TextAlign, TextRun, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
-};
-use terminal::alacritty_terminal::selection::SelectionRange;
-use terminal::{Cell, Flags, Terminal};
+use std::cell::{Cell as SharedCell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
-use crate::grid_renderer::{BackgroundRegion, GridPlan, layout_grid};
+use gpui::{
+    App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font,
+    FontFeatures, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseUpEvent, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle,
+    Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative, rgba,
+    size,
+};
+use terminal::alacritty_terminal::grid::Dimensions as _;
+use terminal::alacritty_terminal::selection::SelectionRange;
+use terminal::alacritty_terminal::vte::ansi::CursorShape;
+use terminal::{Cell, Flags, HoverTarget, Terminal};
+
+use crate::grid_renderer::{BackgroundRegion, BatchedTextRun, GridPlan, layout_grid};
+use crate::layout_cache::{LineShapeCache, line_fingerprint};
 use crate::terminal_view::{TerminalInputHandler, TerminalView};
 use crate::theme::TerminalTheme;
 
@@ -40,6 +48,17 @@ pub struct TerminalElement {
     pub search_matches: Vec<(terminal::Point, terminal::Point)>,
     /// Index of the active match (highlighted distinctly).
     pub active_match: Option<usize>,
+    /// The hovered link/URL/path span, underlined in paint.
+    pub hover: Option<HoverTarget>,
+    /// The view's blink verdict for this frame; an invisible phase skips the
+    /// cursor quad (but not IME preedit or the input-handler registration).
+    pub cursor_visible: bool,
+    /// Per-line shaped-run cache shared with the view (the element is rebuilt
+    /// every render, so the cache lives there).
+    pub shape_cache: Rc<RefCell<LineShapeCache<ShapedLine>>>,
+    /// Written each prepaint: the scrollbar track bounds in window space,
+    /// `None` without scrollback. The view hit-tests mouse input against it.
+    pub scrollbar_track: Rc<SharedCell<Option<Bounds<Pixels>>>>,
 }
 
 /// Computed during prepaint, consumed during paint.
@@ -61,12 +80,34 @@ pub struct PrepaintState {
     /// Cursor block, plus a pre-shaped preedit line when IME marked text is
     /// active. `None` when the terminal reports no cursor.
     cursor: Option<CursorPrepaint>,
+    /// Scrollbar track + thumb rects; `None` without scrollback.
+    scrollbar_track: Option<Bounds<Pixels>>,
+    scrollbar_thumb: Option<Bounds<Pixels>>,
 }
 
-/// Cursor paint data: the block bounds, and a pre-shaped preedit line when
-/// IME marked text is non-empty (`None` paints a plain cursor block).
+/// Everything prepaint needs from the locked Term, produced in a single
+/// `read_with` pass (cell references cannot escape the lock).
+struct TermSnapshot {
+    background: Vec<BackgroundRegion>,
+    runs: Vec<BatchedTextRun>,
+    /// Content fingerprint per display line; keys the shaped-line cache.
+    line_fps: HashMap<i32, u64>,
+    /// Cursor position in display coordinates (line, column).
+    cursor_grid: (i32, i32),
+    cursor_shape: CursorShape,
+    display_offset: i32,
+    /// Scrollback line count; the scrollbar shows only when this is nonzero.
+    history: usize,
+    term_rows: i32,
+    selection: Option<SelectionRange>,
+}
+
+/// Cursor paint data: the cell bounds, the glyph shape the program last
+/// asked for (DECSCUSR / settings default), and a pre-shaped preedit line
+/// when IME marked text is non-empty (`None` paints the plain cursor glyph).
 pub struct CursorPrepaint {
     bounds: Bounds<Pixels>,
+    shape: CursorShape,
     marked: Option<MarkedPrepaint>,
 }
 
@@ -99,17 +140,22 @@ impl TerminalElement {
             marked_text: SharedString::default(),
             search_matches: Vec::new(),
             active_match: None,
+            hover: None,
+            cursor_visible: true,
+            shape_cache: Rc::new(RefCell::new(LineShapeCache::new())),
+            scrollbar_track: Rc::new(SharedCell::new(None)),
         }
     }
 
-    /// Map alacritty's display iterator to `(display_line, column, &Cell)`,
-    /// assigning a 0-based display line by detecting line changes (the raw
-    /// `point.line` is a grid coordinate that does not start at 0). Consumes
-    /// the `RenderableContent` (GridIterator is not Clone).
+    /// Map alacritty's display iterator to `(display_line, grid_line, col,
+    /// &Cell)`, assigning a 0-based display line by detecting line changes.
+    /// The grid line (alacritty's scroll-stable coordinate) keys the
+    /// shaped-line cache. Consumes the `RenderableContent` (GridIterator is
+    /// not Clone).
     fn display_cells<'a>(
         mut content: terminal::RenderableContent<'a>,
-    ) -> Vec<(i32, usize, &'a Cell)> {
-        let mut out: Vec<(i32, usize, &Cell)> = Vec::new();
+    ) -> Vec<(i32, i32, usize, &'a Cell)> {
+        let mut out: Vec<(i32, i32, usize, &Cell)> = Vec::new();
         let mut display_line = -1i32;
         let mut prev: Option<i32> = None;
         for idx in content.display_iter.by_ref() {
@@ -118,7 +164,7 @@ impl TerminalElement {
                 display_line += 1;
                 prev = Some(line);
             }
-            out.push((display_line, idx.point.column.0, idx.cell));
+            out.push((display_line, line, idx.point.column.0, idx.cell));
         }
         out
     }
@@ -276,81 +322,161 @@ impl Element for TerminalElement {
         // Build the paint plan from the terminal's renderable snapshot, then
         // shape every text run here so paint stays allocation-free.
         let origin = bounds.origin;
-        let (background, runs, cursor_grid, offset, term_rows, selection) =
-            self.terminal.read_with(cx, |t, _cx| {
-                t.with_term(|term| {
-                    let content = term.renderable_content();
-                    let selection = content.selection;
-                    let cursor_pt = content.cursor.point;
-                    let offset = term.grid().display_offset() as i32;
-                    let cells = Self::display_cells(content);
-                    let GridPlan { background, runs } = layout_grid(cells.into_iter(), &self.theme);
-                    let cursor_display_line = cursor_pt.line.0 + offset;
-                    (
-                        background,
-                        runs,
-                        Some((cursor_display_line, cursor_pt.column.0 as i32)),
-                        offset,
-                        t.rows as i32,
-                        selection,
-                    )
-                })
-            });
+        let snapshot = self.terminal.read_with(cx, |t, _cx| {
+            t.with_term(|term| {
+                let content = term.renderable_content();
+                let selection = content.selection;
+                let cursor_pt = content.cursor.point;
+                let cursor_shape = content.cursor.shape;
+                let offset = term.grid().display_offset() as i32;
+                let history = term.grid().history_size();
+                let cells = Self::display_cells(content);
+                // Content fingerprint per display line — the shaped-line
+                // cache key. Cells are line-major, so equal display lines
+                // are contiguous.
+                let mut line_fps: HashMap<i32, u64> = HashMap::new();
+                let mut s = 0;
+                while s < cells.len() {
+                    let mut e = s + 1;
+                    while e < cells.len() && cells[e].0 == cells[s].0 {
+                        e += 1;
+                    }
+                    line_fps.insert(
+                        cells[s].0,
+                        line_fingerprint(cells[s..e].iter().map(|c| c.3)),
+                    );
+                    s = e;
+                }
+                let GridPlan { background, runs } = layout_grid(
+                    cells.iter().map(|(d, _g, c, cell)| (*d, *c, *cell)),
+                    &self.theme,
+                );
+                TermSnapshot {
+                    background,
+                    runs,
+                    line_fps,
+                    cursor_grid: (cursor_pt.line.0 + offset, cursor_pt.column.0 as i32),
+                    cursor_shape,
+                    display_offset: offset,
+                    history,
+                    term_rows: t.rows as i32,
+                    selection,
+                }
+            })
+        });
 
         let selection_rects = Self::selection_rects(
-            selection,
-            offset,
-            term_rows,
+            snapshot.selection,
+            snapshot.display_offset,
+            snapshot.term_rows,
             cols as i32,
             bounds,
             cell_width,
             line_height_px,
         );
 
-        let mut shaped_runs: Vec<(Point<Pixels>, ShapedLine)> = Vec::with_capacity(runs.len());
-        for run in &runs {
-            let pos = point(
-                origin.x + run.start_col as f32 * cell_width,
-                origin.y + run.start_line as f32 * line_height_px,
-            );
-            let text_run = TextRun {
-                len: run.text.len(),
-                font: self.font.clone(),
-                color: run.fg,
-                background_color: None,
-                underline: run
-                    .flags
-                    .contains(Flags::UNDERLINE)
-                    .then(UnderlineStyle::default),
-                strikethrough: run
-                    .flags
-                    .contains(Flags::STRIKEOUT)
-                    .then(StrikethroughStyle::default),
-            };
-            let shaped = window.text_system().shape_line(
-                SharedString::from(run.text.as_str()),
-                self.font_size,
-                std::slice::from_ref(&text_run),
-                Some(cell_width),
-            );
-            shaped_runs.push((pos, shaped));
+        // Shape text runs line by line, reusing the cache when a line's
+        // fingerprint is unchanged; paint positions are recomputed per frame
+        // so scrolled content keeps its shaped glyphs.
+        let mut cache = self.shape_cache.borrow_mut();
+        let mut shaped_runs: Vec<(Point<Pixels>, ShapedLine)> =
+            Vec::with_capacity(snapshot.runs.len());
+        let runs = &snapshot.runs;
+        let mut i = 0;
+        while i < runs.len() {
+            let line = runs[i].start_line;
+            let mut j = i + 1;
+            while j < runs.len() && runs[j].start_line == line {
+                j += 1;
+            }
+            let grid_line = line - snapshot.display_offset;
+            let fp = snapshot.line_fps.get(&line).copied().unwrap_or(0);
+            if let Some(cached) = cache.get(grid_line, fp) {
+                for (start_col, shaped) in cached {
+                    let pos = point(
+                        origin.x + start_col as f32 * cell_width,
+                        origin.y + line as f32 * line_height_px,
+                    );
+                    shaped_runs.push((pos, shaped));
+                }
+            } else {
+                let mut fresh: Vec<(i32, ShapedLine)> = Vec::with_capacity(j - i);
+                for run in &runs[i..j] {
+                    let pos = point(
+                        origin.x + run.start_col as f32 * cell_width,
+                        origin.y + run.start_line as f32 * line_height_px,
+                    );
+                    let text_run = TextRun {
+                        len: run.text.len(),
+                        font: self.font.clone(),
+                        color: run.fg,
+                        background_color: None,
+                        underline: run
+                            .flags
+                            .contains(Flags::UNDERLINE)
+                            .then(UnderlineStyle::default),
+                        strikethrough: run
+                            .flags
+                            .contains(Flags::STRIKEOUT)
+                            .then(StrikethroughStyle::default),
+                    };
+                    let shaped = window.text_system().shape_line(
+                        SharedString::from(run.text.as_str()),
+                        self.font_size,
+                        std::slice::from_ref(&text_run),
+                        Some(cell_width),
+                    );
+                    shaped_runs.push((pos, shaped.clone()));
+                    fresh.push((run.start_col, shaped));
+                }
+                cache.insert(grid_line, fp, fresh);
+            }
+            i = j;
         }
+        // Drop lines nothing touched this frame — the cache stays bounded by
+        // the visible window as content scrolls.
+        cache.sweep();
+        drop(cache);
 
         let search_rects = Self::match_rects(
             &self.search_matches,
             self.active_match,
-            offset,
-            term_rows,
+            snapshot.display_offset,
+            snapshot.term_rows,
             bounds,
             cell_width,
             line_height_px,
         );
 
+        // Scrollbar geometry, plus the track write-back the view hit-tests
+        // against. No scrollback → no scrollbar.
+        let (scrollbar_track, scrollbar_thumb) = if snapshot.history > 0 {
+            let track = Bounds::new(
+                point(
+                    bounds.origin.x + bounds.size.width - px(2.),
+                    bounds.origin.y,
+                ),
+                size(px(2.), bounds.size.height),
+            );
+            self.scrollbar_track.set(Some(track));
+            let thumb = scrollbar_thumb(
+                track,
+                snapshot.history,
+                snapshot.term_rows.max(0) as usize,
+                snapshot.display_offset.max(0) as usize,
+            );
+            (Some(track), Some(thumb))
+        } else {
+            self.scrollbar_track.set(None);
+            (None, None)
+        };
+
         // Shape the IME preedit line here too; paint only emits the quads.
-        let cursor = cursor_grid.map(|(line, col)| {
+        let (cursor_line, cursor_col) = snapshot.cursor_grid;
+        let cursor = {
             let pos = point(
-                origin.x + col as f32 * cell_width,
-                origin.y + line as f32 * line_height_px,
+                origin.x + cursor_col as f32 * cell_width,
+                origin.y + cursor_line as f32 * line_height_px,
             );
             let block = size(cell_width, line_height_px);
             let bounds = Bounds::new(pos, block);
@@ -376,18 +502,24 @@ impl Element for TerminalElement {
             } else {
                 None
             };
-            CursorPrepaint { bounds, marked }
-        });
+            CursorPrepaint {
+                bounds,
+                shape: snapshot.cursor_shape,
+                marked,
+            }
+        };
 
         PrepaintState {
             bounds,
             cell_width,
             line_height_px,
-            background,
+            background: snapshot.background,
             selection_rects,
             search_rects,
             shaped_runs,
-            cursor,
+            cursor: Some(cursor),
+            scrollbar_track,
+            scrollbar_thumb,
         }
     }
 
@@ -434,12 +566,32 @@ impl Element for TerminalElement {
             window.paint_quad(fill(*rect, color));
         }
 
+        // Hover target underline (OSC 8 link / URL / path), at the span's
+        // bottom edge.
+        if let Some(hover) = &self.hover {
+            let x = origin.x + hover.start_col as f32 * cell_w;
+            let y = origin.y + (hover.row + 1) as f32 * lh - px(2.);
+            let w = (hover.end_col - hover.start_col + 1) as f32 * cell_w;
+            window.paint_quad(fill(
+                Bounds::new(point(x, y), size(w, px(2.))),
+                rgba(0x3366ffcc),
+            ));
+        }
+
         // Pre-shaped text runs — paint only, no shaping or allocation here.
         for (pos, shaped) in &prepaint.shaped_runs {
             let _ = shaped.paint(*pos, lh, TextAlign::Left, None, window, cx);
         }
 
-        // Cursor block + inline IME marked (preedit) text.
+        // Scrollbar over the right edge: faint track + proportional thumb.
+        if let (Some(track), Some(thumb)) = (prepaint.scrollbar_track, prepaint.scrollbar_thumb) {
+            window.paint_quad(fill(track, rgba(0x80808026)));
+            window.paint_quad(fill(thumb, rgba(0x80808073)));
+        }
+
+        // Cursor glyph + inline IME marked (preedit) text. The preedit paints
+        // regardless of the blink phase; a blinked-out phase only skips the
+        // cursor glyph, not the input-handler registration below.
         if let Some(cursor) = &prepaint.cursor {
             if let Some(marked) = &cursor.marked {
                 // Paint the preedit highlight bg, then the shaped preedit line.
@@ -455,8 +607,34 @@ impl Element for TerminalElement {
                     window,
                     cx,
                 );
-            } else {
-                window.paint_quad(fill(cursor.bounds, self.theme.cursor));
+            } else if self.cursor_visible {
+                match cursor.shape {
+                    CursorShape::Hidden => {}
+                    CursorShape::Block => {
+                        window.paint_quad(fill(cursor.bounds, self.theme.cursor));
+                    }
+                    CursorShape::Underline => {
+                        let bar = Bounds::new(
+                            point(cursor.bounds.origin.x, cursor.bounds.origin.y + lh - px(2.)),
+                            size(cursor.bounds.size.width, px(2.)),
+                        );
+                        window.paint_quad(fill(bar, self.theme.cursor));
+                    }
+                    CursorShape::Beam => {
+                        let bar = Bounds::new(
+                            cursor.bounds.origin,
+                            size(px(2.), cursor.bounds.size.height),
+                        );
+                        window.paint_quad(fill(bar, self.theme.cursor));
+                    }
+                    CursorShape::HollowBlock => {
+                        window.paint_quad(outline(
+                            cursor.bounds,
+                            self.theme.cursor,
+                            BorderStyle::Solid,
+                        ));
+                    }
+                }
             }
 
             // Register the IME input handler for this frame so the platform
@@ -472,24 +650,89 @@ impl Element for TerminalElement {
             );
         }
 
-        // While a selection is in flight, finalize (select-to-copy) on mouse-up
-        // anywhere in the window: releases outside the terminal div never reach
-        // the div's own `on_mouse_up`.
-        if self.view.read_with(cx, |v, _| v.is_selecting()) {
+        // While a selection or scrollbar drag is in flight, finalize on
+        // mouse-up anywhere in the window: releases outside the terminal div
+        // never reach the div's own `on_mouse_up`.
+        if self
+            .view
+            .read_with(cx, |v, _| v.is_selecting() || v.is_scrollbar_dragging())
+        {
             let view = self.view.clone();
             window.on_mouse_event(move |_: &MouseUpEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                view.update(cx, |v, cx| v.finalize_selection(cx));
+                view.update(cx, |v, cx| {
+                    v.finalize_selection(cx);
+                    v.end_scrollbar_drag();
+                });
             });
         }
     }
+}
+
+/// Scrollbar thumb rect within `track` for a buffer of `history` + `rows`
+/// lines with the display scrolled `offset` lines up from the live edge.
+/// Thumb height is the visible fraction of the buffer (minimum 20px);
+/// `offset == history` puts the thumb at the track top, `offset == 0` at the
+/// bottom.
+fn scrollbar_thumb(
+    track: Bounds<Pixels>,
+    history: usize,
+    rows: usize,
+    offset: usize,
+) -> Bounds<Pixels> {
+    let track_h = f32::from(track.size.height);
+    let total = (history + rows).max(1) as f32;
+    let thumb_h = (track_h * rows as f32 / total).max(20.).min(track_h);
+    let max_top = (track_h - thumb_h).max(0.);
+    let frac = if history == 0 {
+        0.
+    } else {
+        1. - offset.min(history) as f32 / history as f32
+    };
+    Bounds::new(
+        point(track.origin.x, track.origin.y + px(max_top * frac)),
+        size(track.size.width, px(thumb_h)),
+    )
 }
 
 impl IntoElement for TerminalElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollbar_thumb_maps_offset_extremes() {
+        let track = Bounds::new(point(px(100.), px(10.)), size(px(2.), px(200.)));
+        // history 100 + rows 100 → the thumb covers half the track.
+        let at_live = scrollbar_thumb(track, 100, 100, 0);
+        assert_eq!(at_live.size.height, px(100.));
+        assert_eq!(at_live.origin.y, px(110.));
+        let at_oldest = scrollbar_thumb(track, 100, 100, 100);
+        assert_eq!(at_oldest.origin.y, px(10.));
+    }
+
+    #[test]
+    fn scrollbar_thumb_has_minimum_height() {
+        let track = Bounds::new(point(px(0.), px(0.)), size(px(2.), px(100.)));
+        // 10_000 lines of history with 50 visible → natural thumb ≈ 0.5px.
+        let thumb = scrollbar_thumb(track, 10_000, 50, 0);
+        assert_eq!(thumb.size.height, px(20.));
+        assert_eq!(thumb.origin.y, px(80.));
+    }
+
+    #[test]
+    fn scrollbar_thumb_fills_track_without_history() {
+        let track = Bounds::new(point(px(0.), px(0.)), size(px(2.), px(100.)));
+        let thumb = scrollbar_thumb(track, 0, 50, 0);
+        assert_eq!(thumb.size.height, px(100.));
+        assert_eq!(thumb.origin.y, px(0.));
     }
 }

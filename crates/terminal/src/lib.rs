@@ -14,10 +14,15 @@
 pub mod cx_session;
 pub mod event;
 pub mod mappings;
+#[cfg(unix)]
+pub mod proctree;
 pub mod pty;
 pub mod pty_source;
+pub mod readiness;
 pub mod settings;
+pub mod shell_kind;
 pub mod store;
+pub mod tap;
 pub mod term;
 
 use gpui::App;
@@ -31,7 +36,7 @@ pub use alacritty_terminal::index::{Column, Line, Point};
 pub use alacritty_terminal::term::cell::{Cell, Flags};
 pub use alacritty_terminal::term::{RenderableContent, Term};
 pub use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
-pub use term::Terminal;
+pub use term::{HoverKind, HoverTarget, Terminal};
 
 /// Register the `TerminalStore` against the shared `ThreadsDatabase`.
 /// Call at App startup, after `agent::init`.
