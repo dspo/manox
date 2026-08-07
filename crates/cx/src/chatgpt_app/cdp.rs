@@ -1,6 +1,6 @@
 //! 最小 CDP（Chrome DevTools Protocol）客户端。
 //!
-//! 仅实现 cx 注入 Codex.app renderer 所需的子集：
+//! 仅实现 cx 注入 ChatGPT.app renderer 所需的子集：
 //! 1. 选取一个空闲的远程调试端口；
 //! 2. 轮询 CDP HTTP 端点，拿到 page target 的 `webSocketDebuggerUrl`；
 //! 3. 连接 WebSocket，发送 `Page.addScriptToEvaluateOnNewDocument` 与 `Runtime.evaluate`。
@@ -35,7 +35,7 @@ pub fn pick_debug_port() -> Result<u16> {
 
 /// 轮询 CDP HTTP 端点，返回第一个 `type == "page"` 的 target 的 `webSocketDebuggerUrl`。
 ///
-/// Codex.app 启动后 renderer 需要一点时间才注册到 CDP；在 `timeout` 内重试。
+/// ChatGPT.app 启动后 renderer 需要一点时间才注册到 CDP；在 `timeout` 内重试。
 pub async fn wait_for_page_target(debug_port: u16, timeout: Duration) -> Result<String> {
     let list_url = format!("http://127.0.0.1:{debug_port}/json");
     let client = reqwest::Client::builder()

@@ -932,7 +932,7 @@ impl ResolvedAgent {
 
 /// Built-in visible agent ids cx can launch without user config entries.
 pub fn builtin_visible_agent_ids() -> [&'static str; 5] {
-    ["claude", "VS Code", "codex", "Codex.app", "copilot"]
+    ["claude", "VS Code", "codex", "ChatGPT.app", "copilot"]
 }
 
 /// Candidate agent ids for UI pickers: built-in visible ids plus
@@ -948,12 +948,16 @@ pub fn known_agent_ids(config: &CxConfig) -> Vec<String> {
     ids
 }
 
-/// Canonicalize a config/registry agent id. The only remap is the legacy
-/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`).
+/// Canonicalize a config/registry agent id. Remaps legacy entries only:
+/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`) and
+/// `Codex.app` → `ChatGPT.app` (the desktop app was renamed; old config
+/// `agents:` allow-lists keep working).
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
         "codex-app" => "codex",
+        // Backward-compat: the desktop agent was renamed Codex.app → ChatGPT.app.
+        "Codex.app" => "ChatGPT.app",
         _ => agent_id,
     }
 }
@@ -977,7 +981,7 @@ pub fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
     match canonical_agent_id(agent_id) {
         "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         "claude" | "VS Code" => vec![WireApi::Anthropic],
-        "codex" | "Codex.app" => vec![WireApi::Responses],
+        "codex" | "ChatGPT.app" => vec![WireApi::Responses],
         // codex+ is a codex fork that additionally supports anthropic / completions.
         // Only entered on explicit `cx codex+`; not written to the default agents list.
         "codex+" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
@@ -1005,7 +1009,7 @@ pub fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
 }
 
 /// All resolved agents: user-configured agents (with `codex` expanded into `codex`
-/// CLI + `Codex.app` desktop entries) plus built-in hidden agents appended
+/// CLI + `ChatGPT.app` desktop entries) plus built-in hidden agents appended
 /// unconditionally (skipped if the user already defined a same-named entry).
 pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
     let mut agents = Vec::new();
@@ -1020,7 +1024,7 @@ pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
         let supported_wire_apis = resolve_agent_wire_apis(&id, &agent.wire_apis);
 
         if id == "codex" {
-            // codex expands into a CLI entry and a Desktop App entry.
+            // codex expands into a CLI entry and a ChatGPT.app desktop entry.
             agents.push(ResolvedAgent {
                 id: "codex".into(),
                 binary: "codex".into(),
@@ -1030,7 +1034,7 @@ pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 hidden: false,
             });
             agents.push(ResolvedAgent {
-                id: "Codex.app".into(),
+                id: "ChatGPT.app".into(),
                 binary: "codex".into(),
                 args: vec!["app".into()],
                 supported_wire_apis,
@@ -1039,7 +1043,7 @@ pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
             });
         } else if id == "claude" {
             // claude expands into a CLI entry and a VS Code desktop entry. The
-            // VS Code entry is an injection-type agent (like Codex.app): the cx
+            // VS Code entry is an injection-type agent (like ChatGPT.app): the cx
             // launcher starts Visual Studio Code with Claude Code BYOK env
             // instead of exec-ing the `claude` binary; binary/args are metadata.
             agents.push(ResolvedAgent {
@@ -1548,7 +1552,7 @@ agents:
     }
 
     /// `claude` expands into a CLI entry plus a `VS Code` desktop entry
-    /// (mirrors `codex` → `codex` + `Codex.app`). `VS Code` is an
+    /// (mirrors `codex` → `codex` + `ChatGPT.app`). `VS Code` is an
     /// Anthropic-wire agent: models on anthropic endpoints see it unless an
     /// explicit `agents:` allow-list narrows them away.
     #[test]
@@ -1589,8 +1593,75 @@ agents:
         );
     }
 
+    /// `codex` expands into a CLI entry and a `ChatGPT.app` desktop entry
+    /// (renamed from `Codex.app`); the desktop entry is Responses-only.
+    #[test]
+    fn codex_expands_into_chatgpt_desktop_agent() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [responses]
+  endpoints:
+    responses:
+      url: https://example.com
+agents:
+- id: codex
+  binary: codex
+  wire_apis: [responses]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let agents = resolved_agents(&config);
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"codex"), "codex CLI entry kept: {ids:?}");
+        assert!(
+            ids.contains(&"ChatGPT.app"),
+            "ChatGPT.app desktop entry added: {ids:?}"
+        );
+        let app = agents.iter().find(|a| a.id == "ChatGPT.app").unwrap();
+        assert_eq!(app.supported_wire_apis, vec![WireApi::Responses]);
+        assert!(!app.hidden);
+
+        // Unfiltered responses model is visible to ChatGPT.app.
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0]
+                .visible_agents
+                .contains(&"ChatGPT.app".to_string()),
+            "responses model must be visible to ChatGPT.app: {:?}",
+            resolved[0].visible_agents
+        );
+    }
+
+    /// Legacy `agents: [Codex.app]` allow-lists written before the rename
+    /// still match the renamed `ChatGPT.app` agent.
+    #[test]
+    fn legacy_codex_app_filter_matches_chatgpt_app() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [responses]
+      agents: [Codex.app]
+  endpoints:
+    responses:
+      url: https://example.com
+agents:
+- id: codex
+  binary: codex
+  wire_apis: [responses]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].visible_agents, vec!["ChatGPT.app".to_string()]);
+    }
+
     /// Explicit model-level `agents: [claude]` keeps VS Code out — the same
-    /// allow-list semantics Codex.app follows.
+    /// allow-list semantics ChatGPT.app follows.
     #[test]
     fn vscode_excluded_by_model_level_agent_filter() {
         let yaml = r#"

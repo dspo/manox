@@ -26,7 +26,7 @@ use crate::{
     build_launch_spec, find_agent, load_config, providers_for_agent, resolved_model_supports_agent,
 };
 
-/// The agent binary to launch. Codex.app is intentionally absent: it is a GUI
+/// The agent binary to launch. ChatGPT.app is intentionally absent: it is a GUI
 /// detach that does not fit the PTY/handle model this API exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
@@ -146,8 +146,8 @@ impl AgentBuilder {
             .id();
         let agent =
             find_agent(&config, agent_name).ok_or_else(|| anyhow!("未知 agent: {agent_name}"))?;
-        if agent.id == "Codex.app" {
-            bail!("Codex.app/ChatGPT.app 不支持 library API（GUI detach，无 PTY 句柄）");
+        if agent.id == "ChatGPT.app" {
+            bail!("ChatGPT.app 不支持 library API（GUI detach，无 PTY 句柄）");
         }
 
         let provider_name = self

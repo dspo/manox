@@ -1,13 +1,13 @@
-//! Codex.app 启动 + renderer 注入编排。
+//! ChatGPT.app 启动 + renderer 注入编排。
 //!
-//! 入口 [`launch_with_injection`]：在 `run_launcher` 中对 `Codex.app` 分流调用。
+//! 入口 [`launch_with_injection`]：在 `run_launcher` 中对 `ChatGPT.app` 分流调用。
 //!
 //! 设计要点：
-//! - **直接启动 Electron 二进制**（`Codex.app/Contents/MacOS/<CFBundleExecutable>`）作为子进程，
+//! - **直接启动 Electron 二进制**（`ChatGPT.app/Contents/MacOS/<CFBundleExecutable>`）作为子进程，
 //!   而非 `open -a`。这样子进程继承 cx 的 env，`CODEX_HOME`/`<env_key>=<apikey>` 直接生效，
 //!   无需 `launchctl setenv` 污染全局登录会话（避免密钥泄漏 + 残留）。
 //! - **spawn → CDP 注入 → detach**：先 spawn（stdio→null、独立进程组）拿到运行中的进程，
-//!   经 CDP 注入模型列表脚本后**立即 detach 返回**——Codex.app 是 GUI 应用（独立窗口），
+//!   经 CDP 注入模型列表脚本后**立即 detach 返回**——ChatGPT.app 是 GUI 应用（独立窗口），
 //!   不应阻塞终端，cx 注入完成即让出终端，App 在后台继续运行。
 //! - `model_reasoning_effort` 与注入脚本的默认 effort 共用，保持下拉默认值与后端一致。
 
@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::CodexAppPrepared;
+use crate::ChatGptAppPrepared;
 use crate::Selection;
-use crate::prepare_codex_launch_home_for_app;
+use crate::prepare_chatgpt_launch_home_for_app;
 use crate::probe::runtime;
 use crate::warp;
 
@@ -53,13 +53,13 @@ pub fn launch_with_injection(
     }
 
     // 1. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
-    let prepared = prepare_codex_launch_home_for_app(
+    let prepared = prepare_chatgpt_launch_home_for_app(
         default_model,
         provider,
         selection.selected_wire_api,
         &selection.injected_models,
     )?;
-    let CodexAppPrepared {
+    let ChatGptAppPrepared {
         codex_home,
         env_key,
         reasoning_effort,
@@ -72,7 +72,7 @@ pub fn launch_with_injection(
     let binary = resolve_codex_binary()?;
 
     // 4. Warp 集成：在启动前发出 session_start，并把 session ID 传给子进程
-    let warp_session = warp::maybe_emit_session_start("Codex.app", Some(&default_model.id));
+    let warp_session = warp::maybe_emit_session_start("ChatGPT.app", Some(&default_model.id));
 
     // 5. 构造启动命令：直接启动二进制 + 远程调试端口。env 直接设到子进程（继承），不污染全局。
     //    GUI app detach 运行：stdio 重定向到 null + 独立进程组，使 cx 退出后 App 仍存活、终端不被占。
@@ -136,14 +136,14 @@ pub fn launch_with_injection(
         Result::<()>::Ok(())
     });
 
-    // 注入失败时主动杀掉刚启动的子进程，避免留下一个无注入的 Codex.app 残留窗口。
+    // 注入失败时主动杀掉刚启动的子进程，避免留下一个无注入的 ChatGPT.app 残留窗口。
     if let Err(err) = inject_result {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err).context("CDP 注入失败，已终止 ChatGPT.app");
     }
 
-    // 8. Codex.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：
+    // 8. ChatGPT.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：
     //    spawn 时已设独立进程组 + stdio→null，此处不 wait，drop(child) 不会杀子进程，
     //    cx 立即返回让出终端，App 在后台继续运行。
     //    （不同于 claude/codex-cli 那类终端内 agent——它们才需要 spawn+wait+退出摘要。）

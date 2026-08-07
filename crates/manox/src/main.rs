@@ -459,7 +459,7 @@ fn build_tools_menu() -> Menu {
 }
 
 /// Items inside the `ChatGPT.app` submenu: one nested submenu per provider
-/// that exposes models visible to the `Codex.app` agent (i.e. Responses-capable
+/// that exposes models visible to the `ChatGPT.app` agent (i.e. Responses-capable
 /// models), one action item per model. Mirrors the provider registry snapshot
 /// at build time — `agent::i18n::rebuild_menus` re-runs menu construction after
 /// a registry reload. Provider submenus keep the registry's first-appearance
@@ -473,7 +473,7 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
             .metadata
             .get("agents")
             .and_then(|v| v.as_array())
-            .map(|list| list.iter().any(|a| a.as_str() == Some("Codex.app")))
+            .map(|list| list.iter().any(|a| a.as_str() == Some("ChatGPT.app")))
             .unwrap_or(true);
         if !visible {
             continue;

@@ -542,10 +542,12 @@ fn build_model_config(
 
 // ── visible agents (port of cx_providers::effective_agents_for_model) ──
 
-/// Canonicalize a config agent id (legacy `codex-app` → `codex`).
+/// Canonicalize a config agent id (legacy `codex-app` → `codex`,
+/// `Codex.app` → `ChatGPT.app`).
 fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         "codex-app" => "codex",
+        "Codex.app" => "ChatGPT.app",
         _ => agent_id,
     }
 }
@@ -568,7 +570,7 @@ fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
     match canonical_agent_id(agent_id) {
         "copilot" => &["anthropic", "responses", "completions"],
         "claude" | "VS Code" => &["anthropic"],
-        "codex" | "Codex.app" => &["responses"],
+        "codex" | "ChatGPT.app" => &["responses"],
         // codex+ is a codex fork that additionally speaks anthropic/completions.
         "codex+" => &["anthropic", "responses", "completions"],
         _ => &[],
@@ -576,7 +578,7 @@ fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
 }
 
 /// The resolved agent id universe: user agents (canonical, deduped, `codex`
-/// expanded into `codex` + `Codex.app`, `claude` into `claude` + `VS Code`)
+/// expanded into `codex` + `ChatGPT.app`, `claude` into `claude` + `VS Code`)
 /// plus the hidden built-in `codex+` unless the user defined it.
 fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
@@ -588,7 +590,7 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
         }
         if id == "codex" {
             ids.push("codex".to_string());
-            ids.push("Codex.app".to_string());
+            ids.push("ChatGPT.app".to_string());
         } else if id == "claude" {
             // claude expands into a CLI entry and a VS Code desktop entry
             // (injection-type agent, parity with cx-providers).
@@ -873,15 +875,15 @@ providers:
     fn effective_agents_parity_with_cx_providers_rules() {
         let config: CxConfig = serde_yaml::from_str(FIXTURE).unwrap();
         // anthropic endpoint, no filters: claude + VS Code + codex+
-        // (codex/Codex.app are responses-only; copilot unconfigured).
+        // (codex/ChatGPT.app are responses-only; copilot unconfigured).
         assert_eq!(
             effective_agents(&config, "anthropic", &[], &[]),
             vec!["claude", "VS Code", "codex+"]
         );
-        // responses endpoint: codex expands to codex + Codex.app, plus codex+.
+        // responses endpoint: codex expands to codex + ChatGPT.app, plus codex+.
         assert_eq!(
             effective_agents(&config, "responses", &[], &[]),
-            vec!["codex", "Codex.app", "codex+"]
+            vec!["codex", "ChatGPT.app", "codex+"]
         );
         // Model allow-list narrows.
         assert_eq!(
