@@ -1277,11 +1277,18 @@ fn render_basic_module(
 
     v_flex()
         .w_full()
-        .child(field_row(
-            theme,
-            i18n::t("settings-models-row-apikey"),
-            kind_control,
-        ))
+        .child(
+            h_flex()
+                .px_3()
+                .py_1p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(i18n::t("settings-models-row-apikey")),
+                ),
+        )
+        .child(h_flex().w_full().px_3().py_1p5().child(kind_control))
         .into_any_element()
 }
 
@@ -1310,8 +1317,7 @@ fn render_env_block(
     if rows.is_empty() {
         children.push(
             h_flex()
-                .pr_3()
-                .pl(px(36.))
+                .px_3()
                 .py_1()
                 .items_center()
                 .gap_2()
@@ -1336,8 +1342,7 @@ fn render_env_block(
         let kid = kv.id;
         children.push(
             h_flex()
-                .pr_3()
-                .pl(px(36.))
+                .px_3()
                 .py_1()
                 .items_center()
                 .gap_2()
@@ -1442,39 +1447,20 @@ fn render_endpoint(
         ),
     ];
 
-    let wire_control = h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(token_dropdown(
-            format!("models-e{eid}-wire"),
-            e.wire_api.clone(),
-            wire_options,
-            entity.clone(),
-            Arc::new(move |this, v, cx| {
-                if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
-                    e.wire_api = v;
-                    this.models_panel.touch(cx);
-                }
-            }),
-        ))
-        .child({
-            let key = format!("models-e{eid}-remove");
-            let is_pending = pending.as_deref() == Some(key.as_str());
-            remove_button(
-                theme,
-                key,
-                is_pending,
-                entity.clone(),
-                Arc::new(move |this, cx| {
-                    this.models_panel.remove_endpoint(pid, eid);
-                    this.models_panel.touch(cx);
-                }),
-            )
-        })
-        .into_any_element();
+    let wire_control = token_dropdown(
+        format!("models-e{eid}-wire"),
+        e.wire_api.clone(),
+        wire_options,
+        entity.clone(),
+        Arc::new(move |this, v, cx| {
+            if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
+                e.wire_api = v;
+                this.models_panel.touch(cx);
+            }
+        }),
+    );
 
-    plain_card(
+    let card = plain_card(
         theme,
         vec![
             field_row(theme, i18n::t("settings-models-row-wire-apis"), wire_control),
@@ -1516,7 +1502,25 @@ fn render_endpoint(
                 ),
             ),
         ],
-    )
+    );
+    let key = format!("models-e{eid}-remove");
+    let is_pending = pending.as_deref() == Some(key.as_str());
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(div().flex_1().min_w_0().child(card))
+        .child(remove_button(
+            theme,
+            key,
+            is_pending,
+            entity.clone(),
+            Arc::new(move |this, cx| {
+                this.models_panel.remove_endpoint(pid, eid);
+                this.models_panel.touch(cx);
+            }),
+        ))
+        .into_any_element()
 }
 
 /// 模型列表 module: 手动配置 / 自动获取 tab; manual mode renders one card per
@@ -1627,7 +1631,7 @@ fn render_model(
 ) -> AnyElement {
     let mid = m.id;
 
-    plain_card(
+    let card = plain_card(
         theme,
         vec![
             field_row(
@@ -1729,28 +1733,26 @@ fn render_model(
                 ),
             ),
             render_env_block(theme, entity.clone(), pid, Some(mid), &m.env, pending),
-            h_flex()
-                .w_full()
-                .justify_end()
-                .px_3()
-                .pb_1()
-                .child({
-                    let key = format!("models-m{mid}-remove");
-                    let is_pending = pending.as_deref() == Some(key.as_str());
-                    remove_button(
-                        theme,
-                        key,
-                        is_pending,
-                        entity.clone(),
-                        Arc::new(move |this, cx| {
-                            this.models_panel.remove_model(pid, mid);
-                            this.models_panel.touch(cx);
-                        }),
-                    )
-                })
-                .into_any_element(),
         ],
-    )
+    );
+    let key = format!("models-m{mid}-remove");
+    let is_pending = pending.as_deref() == Some(key.as_str());
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(div().flex_1().min_w_0().child(card))
+        .child(remove_button(
+            theme,
+            key,
+            is_pending,
+            entity.clone(),
+            Arc::new(move |this, cx| {
+                this.models_panel.remove_model(pid, mid);
+                this.models_panel.touch(cx);
+            }),
+        ))
+        .into_any_element()
 }
 
 // --- Element builders -----------------------------------------------------
