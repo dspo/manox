@@ -1048,9 +1048,9 @@ fn env_row_clickable(
 fn model_window_tokens(model_name: &str) -> Option<u64> {
     #[cfg(feature = "harness-manox")]
     {
-        return registry::global()
+        registry::global()
             .get_model_by_name(model_name)
-            .map(|m| m.max_token_count());
+            .map(|m| m.max_token_count())
     }
     #[cfg(not(feature = "harness-manox"))]
     {

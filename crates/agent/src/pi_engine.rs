@@ -45,8 +45,12 @@ enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Create a fresh session in the given directory.
-    NewSession { cwd: PathBuf },
+    /// Create a fresh session in the given directory, optionally bound to a
+    /// project (persisted in the session sidecar).
+    NewSession {
+        cwd: PathBuf,
+        project: Option<PathBuf>,
+    },
     /// Close the session and stop the actor.
     Shutdown,
 }
@@ -80,6 +84,8 @@ pub fn spawn_engine(
     model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
+    project: Option<PathBuf>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -98,6 +104,8 @@ pub fn spawn_engine(
         model,
         sessions_dir,
         initial_path,
+        fresh,
+        project,
         cmd_rx,
         notice_tx,
         Arc::clone(&state),
@@ -170,8 +178,8 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Open { path });
     }
 
-    fn new_session(&self, cwd: PathBuf) {
-        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd });
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
+        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -205,7 +213,11 @@ fn system_prompt(cwd: &Path) -> String {
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
-fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<dyn PiAgentTool>> {
+fn build_tools(
+    cwd: &Path,
+    runtime: &ModelRuntime,
+    model: Option<&PiModel>,
+) -> Vec<Arc<dyn PiAgentTool>> {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let bash = BashTool::new(
@@ -214,21 +226,7 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
     )
     .with_manager(Arc::clone(&manager));
 
-    let mut registry = AgentRegistry::new();
-    register_defaults(&mut registry);
-    let subagent = SubagentTool::new(
-        Arc::new(registry),
-        vec![
-            Arc::new(pi::tools::read::ReadTool),
-            Arc::new(pi::tools::grep::GrepTool),
-            Arc::new(pi::tools::find::FindTool),
-            Arc::new(pi::tools::ls::LsTool),
-        ],
-    )
-    .with_model_runtime(runtime.clone())
-    .with_model(model.clone());
-
-    vec![
+    let mut tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
         Arc::new(pi::tools::write::WriteTool),
         Arc::new(pi::tools::edit::EditTool),
@@ -238,8 +236,26 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background)),
-        Arc::new(subagent),
-    ]
+    ];
+    // The sub-agent tool needs a concrete model; a session assembled before
+    // registration landed (first seconds after launch) skips it.
+    if let Some(model) = model {
+        let mut registry = AgentRegistry::new();
+        register_defaults(&mut registry);
+        let subagent = SubagentTool::new(
+            Arc::new(registry),
+            vec![
+                Arc::new(pi::tools::read::ReadTool),
+                Arc::new(pi::tools::grep::GrepTool),
+                Arc::new(pi::tools::find::FindTool),
+                Arc::new(pi::tools::ls::LsTool),
+            ],
+        )
+        .with_model_runtime(runtime.clone())
+        .with_model(model.clone());
+        tools.push(Arc::new(subagent));
+    }
+    tools
 }
 
 fn steer_message(text: String) -> AgentMessage {
@@ -262,6 +278,14 @@ fn subscribe_session(
     session.subscribe(Arc::new(move |event, _cancel| {
         let tx = event_tx.clone();
         Box::pin(async move {
+            // The user entry lands in the transcript right after the first
+            // TurnStart; its MessageEnd is the earliest reliable "the
+            // conversation now exists" signal for the sidebar.
+            if let AgentEvent::MessageEnd { message } = &event
+                && matches!(**message, AgentMessage::User { .. })
+            {
+                let _ = tx.send(BackendNotice::SessionListDirty);
+            }
             for te in adapt::agent_event_to_thread_events(&event) {
                 let _ = tx.send(BackendNotice::Event(Box::new(te)));
             }
@@ -275,57 +299,75 @@ fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: &PiModel,
+    model: Option<&PiModel>,
 ) -> pi::coding_agent::AgentSessionBuilder {
-    create_agent_session()
+    let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_model(model.clone())
         .with_system_prompt(system_prompt(cwd))
-        .with_tools(build_tools(cwd, runtime, model))
+        .with_tools(build_tools(cwd, runtime, model));
+    if let Some(model) = model {
+        builder = builder.with_model(model.clone());
+    }
+    builder
 }
 
+#[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
     model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
+    project: Option<PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    // Wait for the one-shot background registration from
-    // `pi_providers::init` — the actor never reloads providers itself, so
-    // thread creation no longer pays the keychain/shell cost, and the
-    // first turn never sees an empty registry.
+    // Session assembly preflights the model against the registry, so resolve
+    // only after the one-shot background registration (parallelized per
+    // provider, sub-second) has landed. The snapshot must be fetched AFTER
+    // the wait: `global()` clones the current Arc, and the init thread
+    // swaps it once registration completes — an early handle stays empty.
     crate::pi_providers::wait_ready().await;
-    let Some(pi_model) = model else {
+    let registry = crate::pi_providers::global();
+    let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
+        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
+    ));
+    let Some(pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
         return;
     };
-    let registry = crate::pi_providers::global();
-    let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
-        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
-    ));
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
     let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
-    let latest = repo.list().await.ok().and_then(|list| {
-        if let Some(requested) = &initial_path {
-            return list.into_iter().find(|info| info.path == *requested);
-        }
-        list.into_iter().find(|info| info.message_count > 0)
-    });
+    // `fresh` threads (sidebar new-conversation, project-bound creation)
+    // never inherit the previous session; startup and explicit opens do.
+    let latest = if fresh {
+        None
+    } else {
+        repo.list().await.ok().and_then(|list| {
+            if let Some(requested) = &initial_path {
+                return list.into_iter().find(|info| info.path == *requested);
+            }
+            list.into_iter().find(|info| info.message_count > 0)
+        })
+    };
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
-        let tool_cwd = PathBuf::from(info.cwd.clone());
-        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, &pi_model);
+        // Sessions created by a GUI launch (process cwd `/`) persisted a
+        // useless cwd; heal them to this launch's default instead.
+        let mut tool_cwd = PathBuf::from(info.cwd.clone());
+        if tool_cwd.as_os_str() == "/" {
+            tool_cwd = cwd.clone();
+        }
+        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, Some(&pi_model));
         match builder.open(info.path).await {
             Ok(s) => {
                 restored = true;
@@ -339,12 +381,21 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+            let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
+                    // Self-diagnosing failure: name what the registry held at
+                    // build time so startup reports are actionable.
+                    let registered = registry.provider_names();
+                    tracing::error!(
+                        error = %err,
+                        model_provider = %pi_model.provider,
+                        registered = ?registered,
+                        "pi session build failed"
+                    );
                     let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                        "pi session build failed: {err}"
+                        "pi session build failed: {err} (registered providers: {registered:?})"
                     )));
                     return;
                 }
@@ -352,13 +403,19 @@ async fn run_actor(
         }
     };
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+    if let Some(project) = &project {
+        write_project_sidecar(&sessions_dir, session.path(), project).await;
+    }
     refresh_session_list(&repo, &state).await;
 
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
 
-    let _ = notice_tx.send(BackendNotice::Ready { restored });
+    let _ = notice_tx.send(BackendNotice::Ready {
+        restored,
+        model: Some(pi_model.clone()),
+    });
     if restored {
         sync_history(&session, &state);
         sync_usage(&session, &state).await;
@@ -472,6 +529,7 @@ async fn run_actor(
                     &sessions_dir,
                     &runtime,
                     &pi_model,
+                    &cwd,
                     &notice_tx,
                 )
                 .await;
@@ -481,13 +539,16 @@ async fn run_actor(
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
-            SessionCmd::NewSession { cwd } => {
-                let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+            SessionCmd::NewSession { cwd, project } => {
+                let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
                 match builder.build().await {
                     Ok(s) => {
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+                        if let Some(project) = &project {
+                            write_project_sidecar(&sessions_dir, session.path(), project).await;
+                        }
                         sync_history(&session, &state);
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -516,6 +577,7 @@ async fn rebuild_session(
     sessions_dir: &Path,
     runtime: &ModelRuntime,
     model: &PiModel,
+    fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
@@ -530,8 +592,15 @@ async fn rebuild_session(
                 .find(|info| info.path == path)
                 .map(|info| PathBuf::from(info.cwd))
         })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let builder = session_builder(&cwd, sessions_dir, runtime, model);
+        .map(|cwd| {
+            if cwd.as_os_str() == "/" {
+                fallback_cwd.to_path_buf()
+            } else {
+                cwd
+            }
+        })
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model));
     match builder.open(path.to_path_buf()).await {
         Ok(s) => *session = s,
         Err(err) => {
@@ -546,6 +615,18 @@ async fn rebuild_session(
 fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     let mapped = adapt::harness_messages_to_messages(session.harness_messages());
     *state.history.lock().unwrap() = mapped;
+}
+
+/// Persist the bound project in the session sidecar so the sidebar groups
+/// the session under its project folder across restarts.
+async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.project = Some(project.to_string_lossy().to_string());
+    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+        tracing::warn!(error = %err, "failed to persist session project");
+    }
 }
 
 /// Mirror session usage into the engine state. Cumulative and per-model
@@ -679,7 +760,11 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
         model_id: String::new(),
         provider_id: None,
         approval_mode: 0,
-        project: info.cwd.clone(),
+        project: if info.cwd == "/" {
+            String::new()
+        } else {
+            info.cwd.clone()
+        },
         depth: 0,
         parent_id: info.parent_session_path.clone(),
         archived: false,

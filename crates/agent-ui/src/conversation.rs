@@ -2493,14 +2493,14 @@ mod tests {
     #[test]
     fn agent_final_text_falls_back_for_legacy_content() {
         assert_eq!(
-            agent::tools::agent::agent_final_text("just a plain summary"),
+            harness_manox::tools::agent::agent_final_text("just a plain summary"),
             "just a plain summary"
         );
         assert_eq!(
-            agent::tools::agent::agent_final_text("not json { at all"),
+            harness_manox::tools::agent::agent_final_text("not json { at all"),
             "not json { at all"
         );
-        assert!(agent::tools::agent::agent_sub_messages("plain text").is_none());
+        assert!(harness_manox::tools::agent::agent_sub_messages("plain text").is_none());
     }
 
     /// Multiple ToolUse blocks in one assistant response (a parallel batch)
