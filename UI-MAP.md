@@ -875,7 +875,7 @@ A specific settings panel rendered in the right pane. Panels: General, Appearanc
 
 #### SettingsModelsPanel
 
-Settings → General → Models: form editor for the cx provider config (`~/.config/cx/cx.providers.config.yaml`). Parses the file into per-provider cards on open (name / apikey_source / endpoints / env / models, including the inline-vs-remote-URL models mode), validates and atomically writes the whole config back on Save (top-level `agents:` preserved verbatim), then reloads the provider registry off the main thread. Reload re-reads the file; Save is disabled while the file fails to parse.
+Settings → General → Models: two-column form editor for the cx provider config (`~/.config/cx/cx.providers.config.yaml`). Left column lists provider cards (selected card gets an accent border); an expanded card embeds the 基本信息 (name + API Key kind dropdown/value pair), 环境变量 and 端点 modules in order. Right column shows the selected provider's 模型 module with a 手动配置 / 自动获取 tab (inline definitions vs remote URL). Every edit debounces into an autosave: validate, atomically write the whole config back (top-level `agents:` preserved verbatim), then reload the provider registry off the main thread. Autosave is disabled while the file fails to parse. Endpoints are unique per Wire API and displayed as Anthropic Messages / OpenAI Responses / OpenAI Completions; `agents:` filters are clickable tag pickers (empty selection = all agents); supports_tools / supports_images echo their effective defaults instead of an unset state.
 
 > Source: `agent-ui/src/views/settings/models.rs`
 

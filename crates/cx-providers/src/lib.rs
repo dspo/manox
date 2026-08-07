@@ -142,6 +142,23 @@ impl ApiKeySourceKind {
     }
 }
 
+/// Split a stored `apikey_source` string back into `(kind, raw value)` for the
+/// settings form. Unrecognized formats fall back to `(Literal, source)` so
+/// echoing never loses data.
+pub fn split_apikey_source(source: &str) -> (ApiKeySourceKind, String) {
+    if let Some(rest) = source.strip_prefix("keychain:") {
+        (ApiKeySourceKind::Keychain, rest.to_string())
+    } else if let Some(rest) = source.strip_prefix("env:") {
+        (ApiKeySourceKind::Env, rest.to_string())
+    } else if let Some(rest) = source.strip_prefix("literal:") {
+        (ApiKeySourceKind::Literal, rest.to_string())
+    } else if let Some(rest) = source.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
+        (ApiKeySourceKind::Shell, rest.to_string())
+    } else {
+        (ApiKeySourceKind::Literal, source.to_string())
+    }
+}
+
 // ═══════════════════════════════════════════════════
 // Deserialization structs (mirror the YAML schema)
 // ═══════════════════════════════════════════════════
@@ -913,6 +930,24 @@ impl ResolvedAgent {
     }
 }
 
+/// Built-in visible agent ids cx can launch without user config entries.
+pub fn builtin_visible_agent_ids() -> [&'static str; 5] {
+    ["claude", "VS Code", "codex", "Codex.app", "copilot"]
+}
+
+/// Candidate agent ids for UI pickers: built-in visible ids plus
+/// user-configured agents (canonicalized), deduped preserving order.
+pub fn known_agent_ids(config: &CxConfig) -> Vec<String> {
+    let mut ids: Vec<String> = builtin_visible_agent_ids().map(str::to_string).to_vec();
+    for agent in &config.agents {
+        let canonical = canonical_agent_id(&agent.id).to_string();
+        if !ids.iter().any(|existing| existing == &canonical) {
+            ids.push(canonical);
+        }
+    }
+    ids
+}
+
 /// Canonicalize a config/registry agent id. The only remap is the legacy
 /// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`).
 pub fn canonical_agent_id(agent_id: &str) -> &str {
@@ -1103,6 +1138,49 @@ pub fn effective_agents_for_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_apikey_source_round_trips() {
+        assert_eq!(
+            split_apikey_source("keychain:SVC"),
+            (ApiKeySourceKind::Keychain, "SVC".to_string())
+        );
+        assert_eq!(
+            split_apikey_source("env:VAR"),
+            (ApiKeySourceKind::Env, "VAR".to_string())
+        );
+        assert_eq!(
+            split_apikey_source("literal:tok en"),
+            (ApiKeySourceKind::Literal, "tok en".to_string())
+        );
+        assert_eq!(
+            split_apikey_source("$(op read x)"),
+            (ApiKeySourceKind::Shell, "op read x".to_string())
+        );
+        // Unrecognized formats echo back as literal without data loss.
+        assert_eq!(
+            split_apikey_source("bare-token"),
+            (ApiKeySourceKind::Literal, "bare-token".to_string())
+        );
+    }
+
+    #[test]
+    fn known_agent_ids_merges_builtin_and_config() {
+        let yaml = r#"
+agents:
+- id: codex-app
+  bin: codex
+- id: my-agent
+  bin: my-agent
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let ids = known_agent_ids(&config);
+        // Legacy `codex-app` canonicalizes to `codex` and dedupes with builtin.
+        assert_eq!(ids.iter().filter(|id| id.as_str() == "codex").count(), 1);
+        assert!(ids.contains(&"my-agent".to_string()));
+        assert!(ids.contains(&"VS Code".to_string()));
+        assert!(ids.contains(&"copilot".to_string()));
+    }
 
     #[test]
     fn parse_sample_config() {
