@@ -9,6 +9,7 @@
 
 use gpui::App;
 
+mod blink;
 pub mod element;
 pub mod grid_renderer;
 pub mod terminal_view;

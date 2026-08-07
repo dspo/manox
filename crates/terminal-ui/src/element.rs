@@ -13,13 +13,15 @@
 //! `TerminalView`'s wrapping `div`, keeping this element paint-only.
 
 use gpui::{
-    App, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures,
-    FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseUpEvent, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
-    TextAlign, TextRun, UnderlineStyle, Window, fill, point, px, relative, rgba, size,
+    App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font,
+    FontFeatures, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseUpEvent, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle,
+    Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative, rgba,
+    size,
 };
 use terminal::alacritty_terminal::selection::SelectionRange;
-use terminal::{Cell, Flags, Terminal};
+use terminal::alacritty_terminal::vte::ansi::CursorShape;
+use terminal::{Cell, Flags, HoverTarget, Terminal};
 
 use crate::grid_renderer::{BackgroundRegion, GridPlan, layout_grid};
 use crate::terminal_view::{TerminalInputHandler, TerminalView};
@@ -40,6 +42,11 @@ pub struct TerminalElement {
     pub search_matches: Vec<(terminal::Point, terminal::Point)>,
     /// Index of the active match (highlighted distinctly).
     pub active_match: Option<usize>,
+    /// The hovered link/URL/path span, underlined in paint.
+    pub hover: Option<HoverTarget>,
+    /// The view's blink verdict for this frame; an invisible phase skips the
+    /// cursor quad (but not IME preedit or the input-handler registration).
+    pub cursor_visible: bool,
 }
 
 /// Computed during prepaint, consumed during paint.
@@ -63,10 +70,12 @@ pub struct PrepaintState {
     cursor: Option<CursorPrepaint>,
 }
 
-/// Cursor paint data: the block bounds, and a pre-shaped preedit line when
-/// IME marked text is non-empty (`None` paints a plain cursor block).
+/// Cursor paint data: the cell bounds, the glyph shape the program last
+/// asked for (DECSCUSR / settings default), and a pre-shaped preedit line
+/// when IME marked text is non-empty (`None` paints the plain cursor glyph).
 pub struct CursorPrepaint {
     bounds: Bounds<Pixels>,
+    shape: CursorShape,
     marked: Option<MarkedPrepaint>,
 }
 
@@ -99,6 +108,8 @@ impl TerminalElement {
             marked_text: SharedString::default(),
             search_matches: Vec::new(),
             active_match: None,
+            hover: None,
+            cursor_visible: true,
         }
     }
 
@@ -276,12 +287,13 @@ impl Element for TerminalElement {
         // Build the paint plan from the terminal's renderable snapshot, then
         // shape every text run here so paint stays allocation-free.
         let origin = bounds.origin;
-        let (background, runs, cursor_grid, offset, term_rows, selection) =
+        let (background, runs, cursor_grid, cursor_shape, offset, term_rows, selection) =
             self.terminal.read_with(cx, |t, _cx| {
                 t.with_term(|term| {
                     let content = term.renderable_content();
                     let selection = content.selection;
                     let cursor_pt = content.cursor.point;
+                    let cursor_shape = content.cursor.shape;
                     let offset = term.grid().display_offset() as i32;
                     let cells = Self::display_cells(content);
                     let GridPlan { background, runs } = layout_grid(cells.into_iter(), &self.theme);
@@ -290,6 +302,7 @@ impl Element for TerminalElement {
                         background,
                         runs,
                         Some((cursor_display_line, cursor_pt.column.0 as i32)),
+                        cursor_shape,
                         offset,
                         t.rows as i32,
                         selection,
@@ -376,7 +389,11 @@ impl Element for TerminalElement {
             } else {
                 None
             };
-            CursorPrepaint { bounds, marked }
+            CursorPrepaint {
+                bounds,
+                shape: cursor_shape,
+                marked,
+            }
         });
 
         PrepaintState {
@@ -434,12 +451,26 @@ impl Element for TerminalElement {
             window.paint_quad(fill(*rect, color));
         }
 
+        // Hover target underline (OSC 8 link / URL / path), at the span's
+        // bottom edge.
+        if let Some(hover) = &self.hover {
+            let x = origin.x + hover.start_col as f32 * cell_w;
+            let y = origin.y + (hover.row + 1) as f32 * lh - px(2.);
+            let w = (hover.end_col - hover.start_col + 1) as f32 * cell_w;
+            window.paint_quad(fill(
+                Bounds::new(point(x, y), size(w, px(2.))),
+                rgba(0x3366ffcc),
+            ));
+        }
+
         // Pre-shaped text runs — paint only, no shaping or allocation here.
         for (pos, shaped) in &prepaint.shaped_runs {
             let _ = shaped.paint(*pos, lh, TextAlign::Left, None, window, cx);
         }
 
-        // Cursor block + inline IME marked (preedit) text.
+        // Cursor glyph + inline IME marked (preedit) text. The preedit paints
+        // regardless of the blink phase; a blinked-out phase only skips the
+        // cursor glyph, not the input-handler registration below.
         if let Some(cursor) = &prepaint.cursor {
             if let Some(marked) = &cursor.marked {
                 // Paint the preedit highlight bg, then the shaped preedit line.
@@ -455,8 +486,34 @@ impl Element for TerminalElement {
                     window,
                     cx,
                 );
-            } else {
-                window.paint_quad(fill(cursor.bounds, self.theme.cursor));
+            } else if self.cursor_visible {
+                match cursor.shape {
+                    CursorShape::Hidden => {}
+                    CursorShape::Block => {
+                        window.paint_quad(fill(cursor.bounds, self.theme.cursor));
+                    }
+                    CursorShape::Underline => {
+                        let bar = Bounds::new(
+                            point(cursor.bounds.origin.x, cursor.bounds.origin.y + lh - px(2.)),
+                            size(cursor.bounds.size.width, px(2.)),
+                        );
+                        window.paint_quad(fill(bar, self.theme.cursor));
+                    }
+                    CursorShape::Beam => {
+                        let bar = Bounds::new(
+                            cursor.bounds.origin,
+                            size(px(2.), cursor.bounds.size.height),
+                        );
+                        window.paint_quad(fill(bar, self.theme.cursor));
+                    }
+                    CursorShape::HollowBlock => {
+                        window.paint_quad(outline(
+                            cursor.bounds,
+                            self.theme.cursor,
+                            BorderStyle::Solid,
+                        ));
+                    }
+                }
             }
 
             // Register the IME input handler for this frame so the platform

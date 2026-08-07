@@ -33,6 +33,19 @@ pub enum BellMode {
     Visual,
 }
 
+/// Cursor blink policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorBlinkSetting {
+    /// Never blink, whatever the program asks.
+    Off,
+    /// Always blink.
+    On,
+    /// Blink only while the program asks for it (DECSET 12 / DECSCUSR).
+    #[default]
+    Terminal,
+}
+
 /// OSC 52 (clipboard) access policy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -76,6 +89,8 @@ pub struct TerminalSettings {
     pub scrolling_history: usize,
     #[serde(default, skip_serializing_if = "is_default_cursor")]
     pub cursor_shape: CursorShapeSetting,
+    #[serde(default, skip_serializing_if = "is_default_cursor_blink")]
+    pub cursor_blink: CursorBlinkSetting,
     #[serde(default, skip_serializing_if = "is_default_bell")]
     pub bell: BellMode,
     #[serde(default, skip_serializing_if = "is_default_osc52")]
@@ -107,6 +122,7 @@ impl Default for TerminalSettings {
             line_height: default_line_height(),
             scrolling_history: default_scrolling_history(),
             cursor_shape: CursorShapeSetting::Block,
+            cursor_blink: CursorBlinkSetting::Terminal,
             bell: BellMode::System,
             osc52_access: Osc52Access::Allow,
             env: Vec::new(),
@@ -141,6 +157,9 @@ fn is_default_scrolling_history(n: &usize) -> bool {
 }
 fn is_default_cursor(c: &CursorShapeSetting) -> bool {
     matches!(c, CursorShapeSetting::Block)
+}
+fn is_default_cursor_blink(c: &CursorBlinkSetting) -> bool {
+    matches!(c, CursorBlinkSetting::Terminal)
 }
 fn is_default_bell(b: &BellMode) -> bool {
     matches!(b, BellMode::System)
@@ -256,6 +275,7 @@ mod tests {
         assert_eq!(s.line_height, 1.2);
         assert_eq!(s.scrolling_history, 10_000);
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Block));
+        assert!(matches!(s.cursor_blink, CursorBlinkSetting::Terminal));
         assert!(matches!(s.bell, BellMode::System));
         assert!(matches!(s.osc52_access, Osc52Access::Allow));
         assert!(s.env.is_empty());
@@ -273,6 +293,7 @@ font_family = "JetBrains Mono"
 font_size = 13.0
 scrolling_history = 5000
 cursor_shape = "beam"
+cursor_blink = "off"
 bell = "visual"
 osc52_access = "deny"
 commands_to_skip_shell = ["ctrl-g"]
@@ -283,6 +304,7 @@ commands_to_skip_shell = ["ctrl-g"]
         assert_eq!(s.font_size, 13.0);
         assert_eq!(s.scrolling_history, 5000);
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Beam));
+        assert!(matches!(s.cursor_blink, CursorBlinkSetting::Off));
         assert!(matches!(s.bell, BellMode::Visual));
         assert!(matches!(s.osc52_access, Osc52Access::Deny));
         assert_eq!(s.commands_to_skip_shell, vec!["ctrl-g".to_string()]);

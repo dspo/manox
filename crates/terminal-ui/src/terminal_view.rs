@@ -11,7 +11,9 @@
 //! cursor.
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
@@ -21,14 +23,15 @@ use gpui::{
     UTF16Selection, Window, div, px, rgba,
 };
 use gpui_component::ActiveTheme as _;
-use terminal::Rgb;
-use terminal::Terminal;
+use terminal::alacritty_terminal::selection::SelectionType;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
 use terminal::mappings::mouse::{self, MouseAction};
-use terminal::settings::BellMode;
+use terminal::settings::{BellMode, CursorBlinkSetting};
+use terminal::{HoverKind, HoverTarget, Rgb, Terminal};
 
+use crate::blink::CursorBlink;
 use crate::element::TerminalElement;
 use crate::theme::{TerminalTheme, color_for_request, hsla_to_rgb};
 
@@ -81,6 +84,16 @@ pub struct TerminalView {
     foreground_process: Option<String>,
     /// Keeps the foreground-process poll alive; dropping the view cancels it.
     _fg_task: Option<Task<()>>,
+    /// Cursor blink phase state; ticked by `_blink_task`.
+    cursor_blink: CursorBlink,
+    /// Keeps the 530ms blink timer alive; dropping the view cancels it.
+    _blink_task: Option<Task<()>>,
+    /// Last user input time; the cursor is pinned visible for 500ms after
+    /// input so typing never lands on an invisible phase.
+    last_input_at: Option<Instant>,
+    /// The hoverable target under the mouse (OSC 8 link / URL / path).
+    /// `None` while selecting or while the TUI captures the mouse.
+    hover: Option<HoverTarget>,
 }
 
 impl TerminalView {
@@ -114,6 +127,10 @@ impl TerminalView {
             skip_shell,
             foreground_process: None,
             _fg_task: None,
+            cursor_blink: CursorBlink::new(s.cursor_blink),
+            _blink_task: None,
+            last_input_at: None,
+            hover: None,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
@@ -123,6 +140,14 @@ impl TerminalView {
                 }
                 terminal::event::TerminalEvent::ColorRequest(idx, fmt) => {
                     view.update(cx, |v, cx| v.answer_color_request(*idx, fmt.clone(), cx));
+                }
+                terminal::event::TerminalEvent::CursorBlinkingChange => {
+                    // The program flipped its blink flag: restart the phase
+                    // visible so the cursor never vanishes on the toggle.
+                    view.update(cx, |v, cx| {
+                        v.cursor_blink.reset();
+                        cx.notify();
+                    });
                 }
                 _ => {
                     view.update(cx, |_, cx| cx.notify());
@@ -164,7 +189,10 @@ impl TerminalView {
             })
         };
         view.update(cx, |v, _| v.key_interceptor = Some(interceptor));
-        view.update(cx, |v, cx| v.start_foreground_poll(cx));
+        view.update(cx, |v, cx| {
+            v.start_foreground_poll(cx);
+            v.start_cursor_blink(cx);
+        });
         view
     }
 
@@ -264,6 +292,7 @@ impl TerminalView {
                 self.terminal.read_with(cx, |t, _| {
                     let _ = t.paste(&text);
                 });
+                self.note_input(cx);
             }
             return true;
         }
@@ -321,6 +350,7 @@ impl TerminalView {
 
         if let Some(s) = keys::to_esc_str(k, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
+            self.note_input(cx);
             return true;
         }
 
@@ -357,14 +387,22 @@ impl TerminalView {
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let (row, col) = self.px_to_grid(ev.position, window);
 
-        // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
-        if (ev.modifiers.platform || ev.modifiers.control)
-            && let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col))
-        {
-            let _ = std::process::Command::new("open").arg(url).spawn();
-            return;
+        // cmd/ctrl+click opens the target under the cursor: an OSC 8
+        // hyperlink first, then a hovered URL, then a hovered path.
+        if ev.modifiers.platform || ev.modifiers.control {
+            let target = self.terminal.read_with(cx, |t, _| {
+                t.hyperlink_at(row, col)
+                    .map(|url| (url, HoverKind::Url))
+                    .or_else(|| t.hover_target(row, col).map(|h| (h.text, h.kind)))
+                    .map(|(text, kind)| (text, kind, t.cwd.clone()))
+            });
+            if let Some((text, kind, cwd)) = target {
+                open_target(&text, kind, &cwd);
+                return;
+            }
         }
 
+        let ty = selection_type_for(ev.click_count);
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
 
         if mode.intersects(TermMode::MOUSE_MODE) {
@@ -373,8 +411,9 @@ impl TerminalView {
                 // user can select text even when the TUI has captured the
                 // mouse.
                 self.terminal
-                    .update(cx, |t, cx| t.start_selection(row, col, cx));
+                    .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
                 self.selecting = true;
+                self.hover = None;
                 return;
             }
             // Forward the click to the TUI app as an xterm mouse report.
@@ -392,8 +431,9 @@ impl TerminalView {
             return;
         }
         self.terminal
-            .update(cx, |t, cx| t.start_selection(row, col, cx));
+            .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
         self.selecting = true;
+        self.hover = None;
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -417,6 +457,22 @@ impl TerminalView {
                 mouse::encode(button, MouseAction::Motion, col as u32, row as u32, mode)
             {
                 let _ = self.terminal.update(cx, |t, _| t.input(&report));
+            }
+        }
+        // Track the hoverable target under the mouse while the TUI does not
+        // capture it; the element underlines the span and the view shows the
+        // tooltip / cmd+click opens it.
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            if self.hover.is_some() {
+                self.hover = None;
+                cx.notify();
+            }
+        } else {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            let target = self.terminal.read_with(cx, |t, _| t.hover_target(row, col));
+            if target != self.hover {
+                self.hover = target;
+                cx.notify();
             }
         }
     }
@@ -509,7 +565,7 @@ impl TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (search_matches, active_match, pattern, count) = self
             .search
             .as_ref()
@@ -567,6 +623,8 @@ impl Render for TerminalView {
                 marked_text: SharedString::from(self.marked_text.clone()),
                 search_matches,
                 active_match,
+                hover: self.hover.clone(),
+                cursor_visible: self.cursor_visible(cx),
             });
         if let Some(o) = overlay {
             content = content.child(o);
@@ -603,6 +661,31 @@ impl Render for TerminalView {
                         .text_color(cx.theme().muted_foreground)
                         .child(name.clone()),
                 ),
+            );
+        }
+        // Hover tooltip: the target text, anchored under the hovered span.
+        if let Some(hover) = &self.hover {
+            let origin = self.last_bounds.map(|b| b.origin).unwrap_or_default();
+            let cell_w = self.cell_width(window);
+            let line_h = px(f32::from(self.font_size) * self.line_height);
+            let x = origin.x + hover.start_col as f32 * cell_w;
+            let y = origin.y + (hover.row + 1) as f32 * line_h;
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .px_2()
+                    .py_1()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().popover_foreground)
+                            .child(hover.text.clone()),
+                    ),
             );
         }
         content
@@ -696,6 +779,60 @@ impl TerminalView {
             return;
         }
         let _ = self.terminal.update(cx, |t, _| t.input(text.as_bytes()));
+        self.note_input(cx);
+    }
+
+    /// Record user input: pins the cursor visible for 500ms and resets the
+    /// blink phase so typing never lands on an invisible cursor.
+    fn note_input(&mut self, cx: &mut Context<Self>) {
+        self.last_input_at = Some(Instant::now());
+        self.cursor_blink.reset();
+        cx.notify();
+    }
+
+    /// Whether the cursor paints this frame: the blink phase combined with
+    /// the program's blink flag, pinned visible while selecting, composing
+    /// IME text, or within 500ms of the last input.
+    fn cursor_visible(&self, cx: &App) -> bool {
+        let term_blinking = self.terminal.read_with(cx, |t, _| t.cursor_blinking());
+        let force = self.selecting
+            || !self.marked_text.is_empty()
+            || self
+                .last_input_at
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+        self.cursor_blink.visible(term_blinking, force)
+    }
+
+    /// Tick the blink phase every 530ms. A phase flip only repaints when the
+    /// blink is live (mode `On`, or `Terminal` while the program's blink flag
+    /// is set); the stored task dies with the view.
+    fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        let terminal = self.terminal.clone();
+        self._blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                if this
+                    .update(cx, |v, cx| {
+                        v.cursor_blink.tick();
+                        let live = match v.cursor_blink.mode() {
+                            CursorBlinkSetting::Off => false,
+                            CursorBlinkSetting::On => true,
+                            CursorBlinkSetting::Terminal => {
+                                terminal.read_with(cx, |t, _| t.cursor_blinking())
+                            }
+                        };
+                        if live {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Select-to-copy: mirror the in-flight selection into the clipboard on
@@ -861,6 +998,46 @@ fn grid_from_px(
     (row, col)
 }
 
+/// Selection granularity by click count: 1 = char, 2 = word (semantic),
+/// 3 = line. Counts past 3 fall back to char selection.
+fn selection_type_for(click_count: usize) -> SelectionType {
+    match click_count {
+        2 => SelectionType::Semantic,
+        3 => SelectionType::Lines,
+        _ => SelectionType::Simple,
+    }
+}
+
+/// Open a cmd/ctrl+click target: URLs in the browser; paths revealed in the
+/// file manager (directories opened directly). A leading `~/` expands to the
+/// home directory; relative paths resolve against the terminal's cwd.
+fn open_target(text: &str, kind: HoverKind, cwd: &Path) {
+    let mut cmd = std::process::Command::new("open");
+    match kind {
+        HoverKind::Url => {
+            cmd.arg(text);
+        }
+        HoverKind::Path => {
+            let path = match text.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(rest))
+                    .unwrap_or_else(|| PathBuf::from(text)),
+                None => PathBuf::from(text),
+            };
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if !path.is_dir() {
+                cmd.arg("-R");
+            }
+            cmd.arg(path);
+        }
+    }
+    let _ = cmd.spawn();
+}
+
 /// Map a gpui `MouseButton` to an xterm button code (left=0, middle=1,
 /// right=2). Unrecognised buttons map to 0 (left) so the click is still
 /// forwarded rather than silently dropped.
@@ -932,5 +1109,13 @@ mod tests {
     fn grid_from_px_without_origin() {
         let (row, col) = grid_from_px(point(px(16.), px(32.)), Point::default(), px(8.), px(16.));
         assert_eq!((row, col), (2, 2));
+    }
+
+    #[test]
+    fn click_count_maps_to_selection_granularity() {
+        assert_eq!(selection_type_for(1), SelectionType::Simple);
+        assert_eq!(selection_type_for(2), SelectionType::Semantic);
+        assert_eq!(selection_type_for(3), SelectionType::Lines);
+        assert_eq!(selection_type_for(4), SelectionType::Simple);
     }
 }

@@ -26,11 +26,33 @@ use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, Event
 use crate::event::{ManoxListener, TerminalEvent};
 use crate::pty_source::PtySource;
 use crate::readiness::{ReadinessMode, ReadinessTracker};
-use crate::settings::{BellMode, CursorShapeSetting, Osc52Access, TerminalSettings};
+use crate::settings::{
+    BellMode, CursorBlinkSetting, CursorShapeSetting, Osc52Access, TerminalSettings,
+};
 use crate::tap::{OscTap, TapEvent};
 
 pub(crate) type ManoxTerm = Term<ManoxListener>;
 pub(crate) type ManoxTermLock = FairMutex<ManoxTerm>;
+
+/// A hoverable target on a single visible row: the text, its display row and
+/// column span (inclusive), and how to open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverTarget {
+    pub text: String,
+    /// Visible display row (0 = topmost visible line) — paint coordinates.
+    pub row: usize,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub kind: HoverKind,
+}
+
+/// How a hovered span opens: URLs in the browser, paths revealed in the
+/// file manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoverKind {
+    Url,
+    Path,
+}
 
 /// Grid dimensions supplied to `Term::new` / `Term::resize`.
 #[derive(Copy, Clone)]
@@ -57,13 +79,19 @@ impl Dimensions for TermSize {
 fn build_config(settings: &TerminalSettings) -> Config {
     Config {
         scrolling_history: settings.scrolling_history,
-        default_cursor_style: map_cursor(settings.cursor_shape),
+        default_cursor_style: map_cursor(settings.cursor_shape, settings.cursor_blink),
         osc52: map_osc52(settings.osc52_access),
+        // Drop `:` from the default separator set so URLs and `host:port`
+        // text stay one semantic word (double-click select, hover target).
+        semantic_escape_chars: ",│`\"' ()[]{}<>\t".into(),
         ..Config::default()
     }
 }
 
-fn map_cursor(s: CursorShapeSetting) -> CursorStyle {
+/// The default style only seeds the Term — programs override shape and blink
+/// via DECSCUSR / DECSET 12. It blinks under `cursor_blink = "on"`;
+/// `"terminal"` leaves the flag to the program.
+fn map_cursor(s: CursorShapeSetting, blink: CursorBlinkSetting) -> CursorStyle {
     let shape = match s {
         CursorShapeSetting::Block => CursorShape::Block,
         CursorShapeSetting::Underline => CursorShape::Underline,
@@ -71,7 +99,7 @@ fn map_cursor(s: CursorShapeSetting) -> CursorStyle {
     };
     CursorStyle {
         shape,
-        blinking: false,
+        blinking: matches!(blink, CursorBlinkSetting::On),
     }
 }
 
@@ -389,12 +417,20 @@ impl Terminal {
         self.with_term_mut(|t| t.selection = None);
     }
 
-    /// Begin a simple (char-granularity) selection at `(row, col)` in visible
-    /// display coordinates. `row` 0 is the visible top line.
-    pub fn start_selection(&self, row: usize, col: usize, cx: &mut Context<Self>) {
+    /// Begin a selection of granularity `ty` at `(row, col)` in visible
+    /// display coordinates (click count 1/2/3 → Simple/Semantic/Lines).
+    /// `row` 0 is the visible top line. Semantic/Lines expansion happens in
+    /// alacritty's `Selection::to_range`, so drags keep the granularity.
+    pub fn start_selection(
+        &self,
+        ty: SelectionType,
+        row: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) {
         self.with_term_mut(|t| {
             let point = self.display_point(t, row, col);
-            t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+            t.selection = Some(Selection::new(ty, point, Side::Left));
         });
         cx.notify();
     }
@@ -469,6 +505,30 @@ impl Terminal {
         })
     }
 
+    /// Whether the program currently wants the cursor blinking (DECSET 12 /
+    /// DECSCUSR). The view's blink manager reads this under
+    /// `cursor_blink = "terminal"`.
+    pub fn cursor_blinking(&self) -> bool {
+        self.with_term(|t| t.cursor_style().blinking)
+    }
+
+    /// The hoverable target at visible `(row, col)`: an OSC 8 hyperlink
+    /// first, else the semantic word when it classifies as a URL or a path.
+    /// `None` outside the visible grid or on plain text.
+    pub fn hover_target(&self, row: usize, col: usize) -> Option<HoverTarget> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        self.with_term(|t| {
+            let point = self.display_point(t, row, col);
+            hyperlink_span(t, point).or_else(|| word_target(t, point))
+        })
+        .map(|mut h| {
+            h.row = row;
+            h
+        })
+    }
+
     /// All regex matches in the visible+scrollback grid, as `(start, end)`
     /// grid points. The UI overlays highlight from these.
     pub fn search_matches(&self, pattern: &str) -> Result<Vec<(Point, Point)>, String> {
@@ -535,6 +595,71 @@ fn alternate_scroll_bytes(mode: TermMode, delta_lines: i32) -> Vec<u8> {
         out.extend_from_slice(seq);
     }
     out
+}
+
+/// The OSC 8 hyperlink span covering `point`, if the cell carries one. The
+/// span walks outward while adjacent cells carry the same URI; the hovered
+/// text shown in the tooltip is the URI itself.
+fn hyperlink_span(term: &ManoxTerm, point: Point) -> Option<HoverTarget> {
+    let grid = term.grid();
+    let row = &grid[point.line];
+    let uri = row[point.column].hyperlink()?.uri().to_owned();
+    let same = |c: Column| row[c].hyperlink().is_some_and(|h| h.uri() == uri);
+    let mut start = point.column.0;
+    while start > 0 && same(Column(start - 1)) {
+        start -= 1;
+    }
+    let mut end = point.column.0;
+    while end + 1 < grid.columns() && same(Column(end + 1)) {
+        end += 1;
+    }
+    Some(HoverTarget {
+        text: uri,
+        // Stamped with the display row by `hover_target`.
+        row: 0,
+        start_col: start,
+        end_col: end,
+        kind: HoverKind::Url,
+    })
+}
+
+/// The semantic word at `point` when it looks like a URL or a path.
+/// Multi-line spans (wrapped words) are not hoverable.
+fn word_target(term: &ManoxTerm, point: Point) -> Option<HoverTarget> {
+    let start = term.semantic_search_left(point);
+    let end = term.semantic_search_right(point);
+    if start.line != point.line || end.line != point.line {
+        return None;
+    }
+    let grid = term.grid();
+    let row = &grid[point.line];
+    let mut text = String::new();
+    for c in start.column.0..=end.column.0 {
+        text.push(row[Column(c)].c);
+    }
+    // Trailing padding / wide-char spacers are not part of the word.
+    let text = text.trim_end().to_owned();
+    let kind = classify_word(&text)?;
+    Some(HoverTarget {
+        start_col: start.column.0,
+        end_col: start.column.0 + text.len().saturating_sub(1),
+        // Stamped with the display row by `hover_target`.
+        row: 0,
+        text,
+        kind,
+    })
+}
+
+/// Classify a semantic word as an openable target: `http(s)://` → URL;
+/// anything containing a path separator → path.
+fn classify_word(text: &str) -> Option<HoverKind> {
+    if text.starts_with("http://") || text.starts_with("https://") {
+        return Some(HoverKind::Url);
+    }
+    if text.contains('/') {
+        return Some(HoverKind::Path);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -715,5 +840,56 @@ mod tests {
             }
         }
         assert_eq!(got, Some(256));
+    }
+
+    /// A standalone Term fed with `text` — hover/word tests without a PTY.
+    fn term_with(text: &str) -> ManoxTerm {
+        let (event_tx, _rx) = async_channel::bounded::<TerminalEvent>(256);
+        let listener = ManoxListener::new(event_tx);
+        let cfg = build_config(&TerminalSettings::default());
+        let size = TermSize { cols: 80, rows: 24 };
+        let mut term = Term::new(cfg, &size, listener);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        for &b in text.as_bytes() {
+            processor.advance(&mut term, b);
+        }
+        term
+    }
+
+    #[test]
+    fn classify_word_rules() {
+        assert_eq!(classify_word("https://a.b/c"), Some(HoverKind::Url));
+        assert_eq!(classify_word("http://a.b"), Some(HoverKind::Url));
+        assert_eq!(classify_word("/tmp/x"), Some(HoverKind::Path));
+        assert_eq!(classify_word("src/main.rs"), Some(HoverKind::Path));
+        assert_eq!(classify_word("hello"), None);
+    }
+
+    #[test]
+    fn word_target_classifies_url_and_path() {
+        // "open https://example.com/x then /tmp/foo.txt": url cols 5..=25,
+        // path cols 32..=43 — `:` stays inside the word per build_config's
+        // separator set.
+        let term = term_with("open https://example.com/x then /tmp/foo.txt\r\n");
+        let url = word_target(&term, Point::new(Line(0), Column(8))).expect("url word");
+        assert_eq!(url.text, "https://example.com/x");
+        assert_eq!(url.kind, HoverKind::Url);
+        assert_eq!((url.start_col, url.end_col), (5, 25));
+        let path = word_target(&term, Point::new(Line(0), Column(37))).expect("path word");
+        assert_eq!(path.text, "/tmp/foo.txt");
+        assert_eq!(path.kind, HoverKind::Path);
+        assert_eq!((path.start_col, path.end_col), (32, 43));
+        assert!(word_target(&term, Point::new(Line(0), Column(1))).is_none());
+    }
+
+    #[test]
+    fn hyperlink_span_covers_whole_link() {
+        // OSC 8: "a " + linked "LINK-text" (cols 2..=10) + " z".
+        let term = term_with("a \x1b]8;;https://example.com\x07LINK-text\x1b]8;;\x07 z");
+        let target = hyperlink_span(&term, Point::new(Line(0), Column(4))).expect("hyperlink");
+        assert_eq!(target.text, "https://example.com");
+        assert_eq!((target.start_col, target.end_col), (2, 10));
+        assert_eq!(target.kind, HoverKind::Url);
+        assert!(hyperlink_span(&term, Point::new(Line(0), Column(0))).is_none());
     }
 }
