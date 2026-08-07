@@ -317,6 +317,7 @@ settings-models-ph-context = Tokens, e.g. 1000000
 settings-models-row-max-tokens = Max output tokens
 settings-models-ph-max-tokens = Tokens, e.g. 131072
 settings-models-row-wire-apis = Wire API
+# intentionally non-translated: the user asked to keep the zh string verbatim.
 settings-models-row-agents = 启用的 Agents
 settings-models-row-supports-tools = Tool calling
 settings-models-row-supports-images = Image input

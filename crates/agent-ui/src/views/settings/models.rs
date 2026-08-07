@@ -212,8 +212,12 @@ struct ModelForm {
 type MutApply = Arc<dyn Fn(&mut SettingsView, &mut Context<SettingsView>) + Send + Sync + 'static>;
 type WindowApply =
     Arc<dyn Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + Send + Sync + 'static>;
-type TokenApply =
-    Arc<dyn Fn(&mut SettingsView, SharedString, &mut Context<SettingsView>) + Send + Sync + 'static>;
+type TokenApply = Arc<
+    dyn Fn(&mut SettingsView, SharedString, &mut Window, &mut Context<SettingsView>)
+        + Send
+        + Sync
+        + 'static,
+>;
 type TagsApply =
     Arc<dyn Fn(&mut SettingsView, Vec<String>, &mut Context<SettingsView>) + Send + Sync + 'static>;
 
@@ -1265,9 +1269,12 @@ fn render_basic_module(
             SharedString::from(kind_token(p.apikey_kind)),
             kind_options,
             entity.clone(),
-            Arc::new(move |this, v, cx| {
+            Arc::new(move |this, v, window, cx| {
                 if let Some(p) = this.models_panel.provider_mut(pid) {
                     p.apikey_kind = kind_from_token(&v);
+                    let placeholder = kind_placeholder(p.apikey_kind);
+                    p.apikey_value
+                        .update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
                     this.models_panel.touch(cx);
                 }
             }),
@@ -1452,7 +1459,7 @@ fn render_endpoint(
         e.wire_api.clone(),
         wire_options,
         entity.clone(),
-        Arc::new(move |this, v, cx| {
+        Arc::new(move |this, v, _window, cx| {
             if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
                 e.wire_api = v;
                 this.models_panel.touch(cx);
@@ -1493,7 +1500,7 @@ fn render_endpoint(
                     e.copilot_auth.clone(),
                     copilot_options,
                     entity.clone(),
-                    Arc::new(move |this, v, cx| {
+                    Arc::new(move |this, v, _window, cx| {
                         if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
                             e.copilot_auth = v;
                             this.models_panel.touch(cx);
@@ -1709,7 +1716,7 @@ fn render_model(
                     format!("models-m{mid}-tools"),
                     m.supports_tools,
                     entity.clone(),
-                    Arc::new(move |this, v, cx| {
+                    Arc::new(move |this, v, _window, cx| {
                         if let Some(m) = this.models_panel.model_mut(pid, mid) {
                             m.supports_tools = v == "true";
                             this.models_panel.touch(cx);
@@ -1724,7 +1731,7 @@ fn render_model(
                     format!("models-m{mid}-images"),
                     m.supports_images,
                     entity.clone(),
-                    Arc::new(move |this, v, cx| {
+                    Arc::new(move |this, v, _window, cx| {
                         if let Some(m) = this.models_panel.model_mut(pid, mid) {
                             m.supports_images = v == "true";
                             this.models_panel.touch(cx);
@@ -1817,9 +1824,9 @@ fn token_dropdown(
                 let token = token.clone();
                 let entity = entity.clone();
                 let apply = apply.clone();
-                menu.item(PopupMenuItem::new(display.clone()).on_click(move |_ev, _window, cx| {
+                menu.item(PopupMenuItem::new(display.clone()).on_click(move |_ev, window, cx| {
                     entity.update(cx, |this, cx| {
-                        apply(this, token.clone(), cx);
+                        apply(this, token.clone(), window, cx);
                         cx.notify();
                     });
                 }))
