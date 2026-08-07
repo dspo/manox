@@ -231,6 +231,9 @@ struct Accumulator {
     tool_calls: Vec<ToolCallAcc>,
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
+    /// Rate card captured from the turn model at construction; priced
+    /// onto every usage snapshot in `current()`.
+    cost_rates: Option<crate::types::Cost>,
     started: bool,
 }
 
@@ -256,6 +259,7 @@ impl Accumulator {
             tool_calls: Vec::new(),
             stop_reason: None,
             usage: Box::new(Usage::default()),
+            cost_rates: crate::provider::model_cost_rates(&context.model),
             started: false,
         }
     }
@@ -286,7 +290,13 @@ impl Accumulator {
             diagnostics: None,
             stop_reason: self.stop_reason,
             raw_stop_reason: self.raw_finish_reason.clone(),
-            usage: self.usage.clone(),
+            usage: {
+                let mut usage = self.usage.clone();
+                if let Some(rates) = &self.cost_rates {
+                    usage.cost = Some(crate::provider::price_usage(rates, &usage));
+                }
+                usage
+            },
             error_message,
             timestamp: chrono::Utc::now(),
         }
@@ -828,14 +838,14 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         acc.apply(
-            chunk(tool_delta(0, Some("c1"), Some("read"), Some("{\"pa")), None),
+            chunk(tool_delta(0, Some("c1"), Some("Read"), Some("{\"pa")), None),
             &tx,
         )
         .await
         .unwrap();
         acc.apply(
             chunk(
-                tool_delta(1, Some("c2"), Some("bash"), Some("{\"cmd\":\"ls\"}")),
+                tool_delta(1, Some("c2"), Some("Bash"), Some("{\"cmd\":\"ls\"}")),
                 None,
             ),
             &tx,
@@ -868,7 +878,7 @@ mod tests {
                 id, name, input, ..
             } => {
                 assert_eq!(id, "c1");
-                assert_eq!(name, "read");
+                assert_eq!(name, "Read");
                 assert_eq!(*input, serde_json::json!({"path": "x"}));
             }
             other => panic!("expected tool_use, got {other:?}"),
@@ -878,7 +888,7 @@ mod tests {
                 id, name, input, ..
             } => {
                 assert_eq!(id, "c2");
-                assert_eq!(name, "bash");
+                assert_eq!(name, "Bash");
                 assert_eq!(*input, serde_json::json!({"cmd": "ls"}));
             }
             other => panic!("expected tool_use, got {other:?}"),
@@ -913,7 +923,7 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
         acc.apply(
             chunk(
-                tool_delta(0, Some("c1"), Some("read"), Some("{not json")),
+                tool_delta(0, Some("c1"), Some("Read"), Some("{not json")),
                 Some("tool_calls"),
             ),
             &tx,

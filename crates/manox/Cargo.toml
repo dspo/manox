@@ -9,11 +9,7 @@ name = "manox"
 path = "src/main.rs"
 
 [features]
-default = ["harness-manox"]
-# The two harnesses are mutually exclusive; the bin mounts exactly one
-# workspace backend (see the compile_error! guards in src/main.rs).
-harness-manox = ["agent-ui/harness-manox"]
-harness-pi = ["agent-ui/harness-pi"]
+default = []
 
 [dependencies]
 gpui.workspace = true
@@ -37,7 +33,7 @@ name = "Manox"
 icon = ["resources/app-icon.icns", "resources/app-icon@2x.png", "resources/app-icon.png"]
 osx_minimum_system_version = "10.15.7"
 
-# Per-harness bundle identity so `--harness pi` and `--harness manox` builds
+# Bundle identity for the pi harness build
 # can coexist in /Applications. script/bundle-mac reads the matching table.
 [package.metadata.bundle.harness.pi]
 name = "Manox Pi"

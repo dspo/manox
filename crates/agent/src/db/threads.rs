@@ -513,7 +513,7 @@ impl ThreadsDatabase {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ThreadRecord {
     /// Minimal record for tests: empty metadata, zeroed timestamps, no tokens.
     pub fn for_test(id: &str, cwd: &str, messages: Vec<Message>) -> Self {

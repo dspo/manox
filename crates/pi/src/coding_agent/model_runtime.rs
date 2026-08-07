@@ -71,6 +71,21 @@ impl ModelRuntime {
         self
     }
 
+    /// A runtime backed by a provider registry — the Rust counterpart of
+    /// the TS `registerProvider` seam. Streams resolve through the
+    /// registry (registered provider → optional fallback), and the
+    /// registry's model index serves as the restore catalog.
+    pub fn with_provider_registry(
+        registry: Arc<crate::provider_registry::ProviderRegistry>,
+    ) -> Self {
+        let resolver = registry.stream_resolver();
+        ModelRuntime {
+            resolver,
+            env_backed: false,
+            catalog: Some(registry.catalog()),
+        }
+    }
+
     /// The default registry: credentials from the environment. Fails with a
     /// typed [`MissingCredential`] when any of the three wired protocols has
     /// no API key — a placeholder key is never shipped to the API.

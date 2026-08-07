@@ -28,6 +28,7 @@ members = [
     "crates/webview-macros",
     "crates/cx",
     "crates/cx-providers",
+    "crates/harness-manox",
 ]
 resolver = "2"
 
@@ -40,10 +41,8 @@ publish = false
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 agent = { path = "crates/agent" }
-# default-features = false so the app bin picks exactly one harness
-# feature (harness-manox / harness-pi); direct `cargo check -p agent-ui`
-# still falls back to agent-ui's own default (harness-manox).
-agent-ui = { path = "crates/agent-ui", default-features = false }
+harness-manox = { path = "crates/harness-manox" }
+agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }

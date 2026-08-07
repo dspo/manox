@@ -1926,7 +1926,11 @@ fn render_plan_review_card(
         .label(i18n::t("plan-drawer-clear"))
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_clear.update(cx, |w, cx| {
-                w.respond_plan_review(agent::PlanReviewChoice::ImplementClearContext, window, cx);
+                w.respond_plan_review(
+                    harness_manox::PlanReviewChoice::ImplementClearContext,
+                    window,
+                    cx,
+                );
             });
         });
 
@@ -1937,7 +1941,7 @@ fn render_plan_review_card(
         .label(i18n::t("plan-drawer-implement"))
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_impl.update(cx, |w, cx| {
-                w.respond_plan_review(agent::PlanReviewChoice::Implement, window, cx);
+                w.respond_plan_review(harness_manox::PlanReviewChoice::Implement, window, cx);
             });
         });
 
@@ -2076,7 +2080,7 @@ fn render_ask_user_card(
                         .icon(IconName::Close)
                         .on_click(move |_, _, cx: &mut App| {
                             let _ = weak_cancel.update(cx, |w, cx| {
-                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
+                                w.resolve_auth(harness_manox::PermissionDecision::Deny, cx);
                             });
                         }),
                 ),

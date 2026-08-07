@@ -20,6 +20,7 @@ pub mod harness;
 pub mod hashline;
 pub mod output_guard;
 pub mod provider;
+pub mod provider_registry;
 pub mod session;
 pub mod settings;
 pub mod system_prompt;
@@ -45,6 +46,9 @@ pub use provider::ProviderError;
 pub use provider::anthropic::AnthropicStreamFn;
 pub use provider::openai::completions::CompletionsStreamFn;
 pub use provider::openai::responses::ResponsesStreamFn;
+pub use provider_registry::{
+    Api, Cost, InputModality, ProviderConfig, ProviderModelConfig, ProviderRegistry,
+};
 pub use tool::{
     AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext, ToolState,
 };

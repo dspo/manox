@@ -19,12 +19,11 @@ use gpui_component::{
     v_flex,
 };
 
-#[cfg(feature = "harness-manox")]
-use agent::mcp;
 use agent::{i18n, settings as user_settings};
+#[cfg(feature = "harness-manox")]
+use harness_manox::mcp;
 
 use crate::views::management_shell::back_control;
-#[cfg(feature = "harness-manox")]
 #[cfg(feature = "harness-manox")]
 use crate::views::plugin_manager::PluginManagerView;
 

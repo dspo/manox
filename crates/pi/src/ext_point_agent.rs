@@ -149,12 +149,12 @@ mod tests {
     #[test]
     fn parse_md_extracts_frontmatter_and_body() {
         let manifest = "---\nname: Explore\ndescription: Read-only search\n\
-                        tools:\n  - read\n  - grep\n  - find\n  - ls\n---\n\
+                        tools:\n  - Read\n  - Grep\n  - Find\n  - Ls\n---\n\
                         You are the Explore agent.\n\nSearch carefully.\n";
         let def = AgentDef::parse_md(manifest).unwrap();
         assert_eq!(def.name, "Explore");
         assert_eq!(def.description, "Read-only search");
-        assert_eq!(def.tools, vec!["read", "grep", "find", "ls"]);
+        assert_eq!(def.tools, vec!["Read", "Grep", "Find", "Ls"]);
         assert!(def.model.is_none());
         assert_eq!(
             def.system_prompt,
@@ -209,7 +209,7 @@ mod tests {
         registry.register(AgentDef {
             name: "A".into(),
             description: "two".into(),
-            tools: vec!["read".into()],
+            tools: vec!["Read".into()],
             model: None,
             system_prompt: "p2".into(),
         });

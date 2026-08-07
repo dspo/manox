@@ -46,7 +46,7 @@ SWAP 37.=48:\n\
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
-        "edit"
+        "Edit"
     }
 
     fn description(&self) -> &str {

@@ -371,7 +371,7 @@ mod tests {
     fn tool_result(id: &str, content: Vec<ContentBlock>, is_error: bool) -> AgentMessage {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content,
             is_error,
             details: None,
@@ -508,7 +508,7 @@ mod tests {
             },
             ContentBlock::ToolUse {
                 id: "t1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: json!({"path": "x"}),
                 thought_signature: None,
             },
@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(m["content"], "checking");
         assert_eq!(m["tool_calls"][0]["type"], "function");
         assert_eq!(m["tool_calls"][0]["id"], "t1");
-        assert_eq!(m["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(m["tool_calls"][0]["function"]["name"], "Read");
         assert_eq!(
             m["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"x\"}"
@@ -558,7 +558,7 @@ mod tests {
     fn orphaned_tool_call_gains_synthetic_error_result() {
         let orphan = assistant(vec![ContentBlock::ToolUse {
             id: "t1".into(),
-            name: "read".into(),
+            name: "Read".into(),
             input: json!({"path": "x"}),
             thought_signature: None,
         }]);

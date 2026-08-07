@@ -205,6 +205,9 @@ struct Accumulator {
     open_json: std::collections::HashMap<usize, String>,
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
+    /// Rate card captured from the turn model at construction; priced
+    /// onto every usage snapshot in `current()`.
+    cost_rates: Option<crate::types::Cost>,
     started: bool,
     /// Whether the protocol's terminal `message_stop` event arrived. A
     /// stream that began but never reached it was cut short.
@@ -224,6 +227,7 @@ impl Accumulator {
             open_json: std::collections::HashMap::new(),
             stop_reason: None,
             usage: Box::new(Usage::default()),
+            cost_rates: crate::provider::model_cost_rates(&context.model),
             started: false,
             message_stop_seen: false,
         }
@@ -273,7 +277,13 @@ impl Accumulator {
             diagnostics: None,
             stop_reason: self.stop_reason,
             raw_stop_reason: self.raw_stop_reason.clone(),
-            usage: self.usage.clone(),
+            usage: {
+                let mut usage = self.usage.clone();
+                if let Some(rates) = &self.cost_rates {
+                    usage.cost = Some(crate::provider::price_usage(rates, &usage));
+                }
+                usage
+            },
             error_message,
             timestamp: chrono::Utc::now(),
         }
@@ -614,7 +624,7 @@ mod tests {
                 index: 0,
                 content_block: WireContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::Value::Null,
                 },
             },
@@ -635,7 +645,7 @@ mod tests {
                     id, name, input, ..
                 } => {
                     assert_eq!(id, "t1");
-                    assert_eq!(name, "read");
+                    assert_eq!(name, "Read");
                     assert_eq!(*input, serde_json::json!({"path": "x.rs"}));
                 }
                 other => panic!("expected tool_use, got {other:?}"),
@@ -714,7 +724,7 @@ mod tests {
                 index: 0,
                 content_block: WireContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::Value::Null,
                 },
             },

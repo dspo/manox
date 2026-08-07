@@ -215,7 +215,7 @@ fn format_summary(id: &pi::TaskId, status: &TaskStatusInfo) -> String {
         format!("\n\nRecent output:\n{}", status.output_tail.trim_end())
     };
     format!(
-        "Background task `{id}` completed ({code}).{tail}\n\nUse `bash_output` (shell_id: \"{id}\") for the full output."
+        "Background task `{id}` completed ({code}).{tail}\n\nUse `BashOutput` (shell_id: \"{id}\") for the full output."
     )
 }
 
@@ -253,7 +253,7 @@ mod tests {
         assert!(summary.contains("bg_1"));
         assert!(summary.contains("exit code 3"));
         assert!(summary.contains("Recent output:\nboom"));
-        assert!(summary.contains("bash_output"));
+        assert!(summary.contains("BashOutput"));
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
         });
         let summary = summary.expect("steered a completion message");
         assert!(summary.contains(&id.0), "summary names the task: {summary}");
-        assert!(summary.contains("bash_output"));
+        assert!(summary.contains("BashOutput"));
     }
 
     #[tokio::test]

@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{AnyLanguageModel, TokenUsage};
+use crate::language_model::TokenUsage;
 use crate::message::Message;
+use pi::types::Model as PiModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
 /// authoritative state the facade mirrors after a settled run.
@@ -40,7 +41,7 @@ pub trait ThreadEngine: Send + Sync {
     }
 
     /// The model the backend currently runs, if any.
-    fn model(&self) -> Option<AnyLanguageModel>;
+    fn model(&self) -> Option<PiModel>;
 
     /// Start a turn with the given user text. Events flow back through the
     /// engine's event channel (spawned with the engine); settlement lands in
@@ -58,7 +59,7 @@ pub trait ThreadEngine: Send + Sync {
     fn abort(&self);
 
     /// Hot-swap the model for the next provider request.
-    fn set_model(&self, model: AnyLanguageModel);
+    fn set_model(&self, model: PiModel);
 
     /// Map the reasoning effort onto the backend's thinking level.
     fn set_thinking_level(&self, level: Option<String>);
@@ -67,7 +68,7 @@ pub trait ThreadEngine: Send + Sync {
     fn open_session(&self, path: PathBuf);
 
     /// Create a fresh session in the given directory.
-    fn new_session(&self, cwd: PathBuf);
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>);
 
     /// The session file the backend currently drives, if any.
     fn active_session_path(&self) -> Option<PathBuf>;
@@ -85,7 +86,13 @@ pub enum BackendNotice {
     /// A run event already adapted into a `ThreadEvent`.
     Event(Box<crate::thread::ThreadEvent>),
     /// The session finished building/restoring.
-    Ready { restored: bool },
+    Ready {
+        restored: bool,
+        /// The model the actor resolved for this thread (registration may
+        /// have landed after construction); the facade mirrors it so the
+        /// selector shows the default instead of "no model".
+        model: Option<pi::types::Model>,
+    },
     /// The turn loop unwound and released the running slot.
     Settled {
         cancelled: bool,
@@ -97,6 +104,10 @@ pub enum BackendNotice {
     },
     /// The session could not be built at all.
     Fatal(anyhow::Error),
+    /// A user message landed in the session transcript; the sidebar list
+    /// should refresh so the conversation appears at send time, not at
+    /// turn end.
+    SessionListDirty,
 }
 
 /// An owned engine handle plus its notice channel receiver. Spawning the

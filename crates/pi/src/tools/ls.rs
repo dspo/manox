@@ -20,7 +20,7 @@ impl LsTool {
 #[async_trait::async_trait]
 impl AgentTool for LsTool {
     fn name(&self) -> &str {
-        "ls"
+        "Ls"
     }
 
     fn description(&self) -> &str {

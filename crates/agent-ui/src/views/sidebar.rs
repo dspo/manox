@@ -13,8 +13,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::provider::registry;
-use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
+use agent::i18n;
+use agent::thread::ApprovalMode;
+#[cfg(not(feature = "harness-manox"))]
+use agent::{ThreadStore, ThreadStoreEvent};
+#[cfg_attr(not(feature = "harness-manox"), allow(unused_imports))]
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
@@ -28,6 +31,8 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
+#[cfg(feature = "harness-manox")]
+use harness_manox::{ThreadStore, ThreadStoreEvent};
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so
@@ -160,6 +165,9 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
+        #[cfg(feature = "harness-manox")]
+        let store = harness_manox::thread_store_global();
+        #[cfg(not(feature = "harness-manox"))]
         let store = agent::thread_store_global();
         let sub = cx.subscribe(
             &store,
@@ -224,13 +232,22 @@ impl Sidebar {
         self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
+        // Under the pi build the external-agent entries are compiled out,
+        // leaving the closure's window/cx unused.
+        #[cfg_attr(not(feature = "harness-manox"), allow(unused_variables))]
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
+            // The manox build keeps its brand label; the pi build uses the
+            // neutral "new conversation" label.
+            #[cfg(feature = "harness-manox")]
+            let new_session_label = i18n::t("sidebar-new-session-manox");
+            #[cfg(not(feature = "harness-manox"))]
+            let new_session_label = i18n::t("sidebar-new-session-pi");
             let sidebar_manox = sidebar.clone();
             menu = menu.item(
-                PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
+                PopupMenuItem::new(new_session_label)
                     .icon(
                         Icon::default()
                             .path("icons/manox.svg")
@@ -250,6 +267,9 @@ impl Sidebar {
                         });
                     }),
             );
+            // External-CLI session entries belong to the retired manox
+            // harness; the pi build offers only the new-conversation item.
+            #[cfg(feature = "harness-manox")]
             for kind in [
                 crate::external_session::SessionKind::ClaudeCode,
                 crate::external_session::SessionKind::Codex,
@@ -497,7 +517,10 @@ impl Render for Sidebar {
         let mut projects: Vec<(String, Vec<agent::ThreadSummary>)> = Vec::new();
         let mut loose: Vec<agent::ThreadSummary> = Vec::new();
         for s in &summaries {
-            if s.project.is_empty() {
+            // Only REGISTERED projects become folder groups; a session cwd
+            // that was never bound as a project (e.g. the default home dir)
+            // stays in the loose Conversations list.
+            if s.project.is_empty() || !known_projects.contains(&s.project) {
                 loose.push(s.clone());
             } else if let Some(entry) = projects.iter_mut().find(|(p, _)| *p == s.project) {
                 entry.1.push(s.clone());
@@ -764,13 +787,16 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
     row.into_any_element()
 }
 
+#[cfg(feature = "harness-manox")]
 /// Build the provider→model cascade inside an external-agent submenu. Models
-/// are drawn from `registry::global().models()` filtered by the agent's id
-/// (`visible_agents`); they are grouped by provider, each provider a nested
-/// submenu. Picking a model emits `SpawnExternalSession(kind, provider, model,
-/// project)` to the sidebar — the project path (if any) is read from the
-/// sidebar's `new_session_project` field so the workspace can set the CWD for
-/// external CLI sessions.
+/// are drawn from the shared pi provider registry, filtered by the agent's id
+/// (registration metadata `agents`, empty = visible to all); they are grouped
+/// by provider display name, each provider a nested submenu. Picking a model
+/// emits `SpawnExternalSession(kind, provider, model, project)` to the
+/// sidebar — the project path (if any) is read from the sidebar's
+/// `new_session_project` field so the workspace can set the CWD for external
+/// CLI sessions. The emitted model id is the raw cx config key
+/// (`metadata["config_id"]`), which cx matches verbatim.
 fn build_agent_model_cascade(
     menu: PopupMenu,
     kind: crate::external_session::SessionKind,
@@ -779,18 +805,48 @@ fn build_agent_model_cascade(
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
-    for m in registry::global().models() {
-        if !m.visible_agents().iter().any(|a| a == agent_id) {
+    /// One cascade entry: the raw cx config key plus its display name.
+    struct Entry {
+        config_id: String,
+        display: String,
+    }
+    let mut providers: Vec<(String, Vec<Entry>)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for m in agent::pi_providers::global().models() {
+        // Missing metadata = non-cx registration (visible); otherwise the
+        // effective agent list must contain the cascade's agent (parity
+        // with the retired manox `visible_agents` filter).
+        let visible = m
+            .metadata
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .any(|a| a.as_str().is_some_and(|a| a == agent_id))
+            })
+            .unwrap_or(true);
+        if !visible {
             continue;
         }
-        let prov = m.provider_name().to_string();
-        if let Some(last) = providers.last_mut()
-            && last.0 == prov
-        {
-            last.1.push(m.clone());
-        } else {
-            providers.push((prov, vec![m.clone()]));
+        let prov = agent::pi_providers::display_provider_name(&m);
+        let config_id = m
+            .metadata
+            .get("config_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(m.id.as_str())
+            .to_string();
+        if !seen.insert((prov.clone(), config_id.clone())) {
+            continue; // same model registered on several wire apis
+        }
+        let entry = Entry {
+            config_id,
+            display: agent::pi_providers::display_name(&m),
+        };
+        // Lookup-based grouping (not adjacency): the registry is sorted by
+        // registration name, so equal display names must still merge.
+        match providers.iter_mut().find(|(name, _)| *name == prov) {
+            Some((_, entries)) => entries.push(entry),
+            None => providers.push((prov, vec![entry])),
         }
     }
 
@@ -801,12 +857,13 @@ fn build_agent_model_cascade(
     }
     for (prov_name, models) in providers {
         let sidebar = sidebar.clone();
+        let prov_for_items = prov_name.clone();
         menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
             let mut submenu = submenu;
             for m in &models {
-                let model_id = m.name().to_string();
-                let model_name = m.name().to_string();
-                let prov = m.provider_name().to_string();
+                let model_id = m.config_id.clone();
+                let model_name = m.display.clone();
+                let prov = prov_for_items.clone();
                 let sidebar = sidebar.clone();
                 submenu = submenu.item(
                     PopupMenuItem::element(move |_window, _cx| {

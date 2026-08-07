@@ -23,9 +23,8 @@ use crate::background_task::TaskSnapshot;
 use crate::db::UiNoteRecord;
 use crate::goal::ThreadGoal;
 use crate::language::Language;
-use crate::language_model::{
-    AnyLanguageModel, MessageContent, ReasoningEffort, StopReason, TokenUsage,
-};
+use crate::language_model::{MessageContent, ReasoningEffort, StopReason, TokenUsage};
+use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
@@ -241,7 +240,7 @@ pub struct Thread {
     pub id: ThreadId,
     cwd: PathBuf,
     project: Option<PathBuf>,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -264,28 +263,38 @@ pub struct Thread {
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Construct a new pi-backed thread: spawn the actor (build-or-restore the
-    /// newest session) and the gpui drainer that turns backend notices into
-    /// `ThreadEvent`s.
+    /// Startup constructor: restores the newest session when one exists.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, cx)
+        Self::open(id, cwd, None, None, false, cx)
+    }
+
+    /// A genuinely empty thread (sidebar new-conversation): never restores
+    /// the previous session.
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::open(id, cwd, None, None, true, cx)
+    }
+
+    /// Construct a thread bound to a project directory: a fresh session with
+    /// the project as its cwd in one step (no recreate, no restore), so the
+    /// sidebar never sees an orphaned pre-project session file.
+    pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
+        Self::open(id, project.clone(), None, Some(project), true, cx)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
     pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, Some(path), cx)
+        Self::open(id, cwd, Some(path), None, false, cx)
     }
 
     fn open(
         id: ThreadId,
         cwd: PathBuf,
         initial_path: Option<PathBuf>,
+        project: Option<PathBuf>,
+        fresh: bool,
         cx: &mut App,
     ) -> Entity<Self> {
-        let model = crate::provider::registry::global()
-            .models()
-            .first()
-            .cloned();
+        let model = crate::pi_providers::default_model();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("pi-sessions");
@@ -294,6 +303,8 @@ impl Thread {
             model.clone(),
             sessions_dir.clone(),
             initial_path,
+            fresh,
+            project.clone(),
         );
 
         cx.new(|cx| {
@@ -306,8 +317,11 @@ impl Thread {
                             BackendNotice::Event(event) => {
                                 cx.emit(*event);
                             }
-                            BackendNotice::Ready { restored } => {
+                            BackendNotice::Ready { restored, model } => {
                                 t.restored = restored;
+                                if let Some(m) = model {
+                                    t.model = Some(m);
+                                }
                                 if restored {
                                     t.refresh_history(cx);
                                     cx.emit(ThreadEvent::HistoryRestored);
@@ -335,6 +349,10 @@ impl Thread {
                                 t.running = false;
                                 cx.emit(ThreadEvent::Error(err));
                             }
+                            BackendNotice::SessionListDirty => {
+                                let store = crate::thread_store::global();
+                                store.update(cx, |s, cx| s.refresh(cx));
+                            }
                         })
                         .is_ok();
                     if !ok {
@@ -347,7 +365,7 @@ impl Thread {
             Self {
                 id,
                 cwd,
-                project: None,
+                project,
                 model,
                 messages: Vec::new(),
                 reasoning_effort: ReasoningEffort::default(),
@@ -363,6 +381,13 @@ impl Thread {
                 engine,
             }
         })
+    }
+
+    /// Restore the bound project from a reopened session's sidecar without
+    /// recreating the session (used by the store on load).
+    pub fn restore_project(&mut self, dir: PathBuf) {
+        self.cwd = dir.clone();
+        self.project = Some(dir);
     }
 
     /// Replace the mirrored history with the engine's authoritative transcript
@@ -483,7 +508,7 @@ impl Thread {
         self.project.as_ref()
     }
 
-    pub fn model(&self) -> Option<&AnyLanguageModel> {
+    pub fn model(&self) -> Option<&PiModel> {
         self.model.as_ref()
     }
 
@@ -627,7 +652,7 @@ impl Thread {
         }
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
-        self.engine.new_session(dir);
+        self.engine.new_session(dir.clone(), Some(dir));
         cx.notify();
     }
 
@@ -643,9 +668,9 @@ impl Thread {
     }
 
 
-    pub fn set_model(&mut self, model: AnyLanguageModel, cx: &mut Context<Self>) {
-        let from = self.model.as_ref().map(|m| m.id());
-        let to = model.id();
+    pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
+        let from = self.model.as_ref().map(|m| m.id.clone());
+        let to = model.id.clone();
         self.model = Some(model.clone());
         self.engine.set_model(model);
         cx.emit(ThreadEvent::ModelChanged { from, to });
@@ -682,7 +707,7 @@ pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> 
 
 /// The model-facing form of one content block. Pi keeps blocks verbatim —
 /// there is no manox envelope/compaction rewriting to undo.
-pub(crate) fn model_facing_content(
+pub fn model_facing_content(
     c: &MessageContent,
     _lang: crate::language::Language,
 ) -> MessageContent {

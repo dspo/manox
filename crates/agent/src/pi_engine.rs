@@ -24,7 +24,7 @@ use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{AnyLanguageModel, MessageContent, TokenUsage};
+use crate::language_model::{MessageContent, TokenUsage};
 use crate::message::Message;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
@@ -40,13 +40,17 @@ enum SessionCmd {
     /// Abort the running turn.
     Abort,
     /// Hot-swap the model for the next provider request.
-    SetModel(AnyLanguageModel),
+    SetModel(PiModel),
     /// Map the reasoning effort onto pi's thinking level.
     SetThinkingLevel(Option<String>),
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Create a fresh session in the given directory.
-    NewSession { cwd: PathBuf },
+    /// Create a fresh session in the given directory, optionally bound to a
+    /// project (persisted in the session sidecar).
+    NewSession {
+        cwd: PathBuf,
+        project: Option<PathBuf>,
+    },
     /// Close the session and stop the actor.
     Shutdown,
 }
@@ -61,7 +65,7 @@ struct EngineState {
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
-    model: Mutex<Option<AnyLanguageModel>>,
+    model: Mutex<Option<PiModel>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
 }
@@ -77,9 +81,11 @@ pub struct PiEngine {
 /// given, opens that session file instead of restoring the newest one.
 pub fn spawn_engine(
     cwd: PathBuf,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
+    project: Option<PathBuf>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -98,6 +104,8 @@ pub fn spawn_engine(
         model,
         sessions_dir,
         initial_path,
+        fresh,
+        project,
         cmd_rx,
         notice_tx,
         Arc::clone(&state),
@@ -129,7 +137,7 @@ impl ThreadEngine for PiEngine {
         self.state.per_model.lock().unwrap().clone()
     }
 
-    fn model(&self) -> Option<AnyLanguageModel> {
+    fn model(&self) -> Option<PiModel> {
         self.state.model.lock().unwrap().clone()
     }
 
@@ -158,7 +166,7 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Abort);
     }
 
-    fn set_model(&self, model: AnyLanguageModel) {
+    fn set_model(&self, model: PiModel) {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
@@ -170,8 +178,8 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Open { path });
     }
 
-    fn new_session(&self, cwd: PathBuf) {
-        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd });
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
+        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -205,7 +213,11 @@ fn system_prompt(cwd: &Path) -> String {
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
-fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<dyn PiAgentTool>> {
+fn build_tools(
+    cwd: &Path,
+    runtime: &ModelRuntime,
+    model: Option<&PiModel>,
+) -> Vec<Arc<dyn PiAgentTool>> {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let bash = BashTool::new(
@@ -214,21 +226,7 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
     )
     .with_manager(Arc::clone(&manager));
 
-    let mut registry = AgentRegistry::new();
-    register_defaults(&mut registry);
-    let subagent = SubagentTool::new(
-        Arc::new(registry),
-        vec![
-            Arc::new(pi::tools::read::ReadTool),
-            Arc::new(pi::tools::grep::GrepTool),
-            Arc::new(pi::tools::find::FindTool),
-            Arc::new(pi::tools::ls::LsTool),
-        ],
-    )
-    .with_model_runtime(runtime.clone())
-    .with_model(model.clone());
-
-    vec![
+    let mut tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
         Arc::new(pi::tools::write::WriteTool),
         Arc::new(pi::tools::edit::EditTool),
@@ -238,8 +236,26 @@ fn build_tools(cwd: &Path, runtime: &ModelRuntime, model: &PiModel) -> Vec<Arc<d
         Arc::new(bash),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background)),
-        Arc::new(subagent),
-    ]
+    ];
+    // The sub-agent tool needs a concrete model; a session assembled before
+    // registration landed (first seconds after launch) skips it.
+    if let Some(model) = model {
+        let mut registry = AgentRegistry::new();
+        register_defaults(&mut registry);
+        let subagent = SubagentTool::new(
+            Arc::new(registry),
+            vec![
+                Arc::new(pi::tools::read::ReadTool),
+                Arc::new(pi::tools::grep::GrepTool),
+                Arc::new(pi::tools::find::FindTool),
+                Arc::new(pi::tools::ls::LsTool),
+            ],
+        )
+        .with_model_runtime(runtime.clone())
+        .with_model(model.clone());
+        tools.push(Arc::new(subagent));
+    }
+    tools
 }
 
 fn steer_message(text: String) -> AgentMessage {
@@ -262,6 +278,14 @@ fn subscribe_session(
     session.subscribe(Arc::new(move |event, _cancel| {
         let tx = event_tx.clone();
         Box::pin(async move {
+            // The user entry lands in the transcript right after the first
+            // TurnStart; its MessageEnd is the earliest reliable "the
+            // conversation now exists" signal for the sidebar.
+            if let AgentEvent::MessageEnd { message } = &event
+                && matches!(**message, AgentMessage::User { .. })
+            {
+                let _ = tx.send(BackendNotice::SessionListDirty);
+            }
             for te in adapt::agent_event_to_thread_events(&event) {
                 let _ = tx.send(BackendNotice::Event(Box::new(te)));
             }
@@ -275,63 +299,75 @@ fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: &PiModel,
+    model: Option<&PiModel>,
 ) -> pi::coding_agent::AgentSessionBuilder {
-    create_agent_session()
+    let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_model(model.clone())
         .with_system_prompt(system_prompt(cwd))
-        .with_tools(build_tools(cwd, runtime, model))
+        .with_tools(build_tools(cwd, runtime, model));
+    if let Some(model) = model {
+        builder = builder.with_model(model.clone());
+    }
+    builder
 }
 
+#[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
-    model: Option<AnyLanguageModel>,
+    model: Option<PiModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
+    fresh: bool,
+    project: Option<PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
 ) {
-    let Some(manox_model) = model else {
+    // Session assembly preflights the model against the registry, so resolve
+    // only after the one-shot background registration (parallelized per
+    // provider, sub-second) has landed. The snapshot must be fetched AFTER
+    // the wait: `global()` clones the current Arc, and the init thread
+    // swaps it once registration completes — an early handle stays empty.
+    crate::pi_providers::wait_ready().await;
+    let registry = crate::pi_providers::global();
+    let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
+        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
+    ));
+    let Some(mut pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
         return;
     };
-    let pi_model = match crate::pi_bridge::map_model(&manox_model) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(e)));
-            return;
-        }
-    };
-    let resolver = match crate::pi_bridge::stream_resolver(&manox_model) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(e)));
-            return;
-        }
-    };
-    let runtime = ModelRuntime::new(resolver);
 
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
     let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
-    let latest = repo.list().await.ok().and_then(|list| {
-        if let Some(requested) = &initial_path {
-            return list.into_iter().find(|info| info.path == *requested);
-        }
-        list.into_iter().find(|info| info.message_count > 0)
-    });
+    // `fresh` threads (sidebar new-conversation, project-bound creation)
+    // never inherit the previous session; startup and explicit opens do.
+    let latest = if fresh {
+        None
+    } else {
+        repo.list().await.ok().and_then(|list| {
+            if let Some(requested) = &initial_path {
+                return list.into_iter().find(|info| info.path == *requested);
+            }
+            list.into_iter().find(|info| info.message_count > 0)
+        })
+    };
     let mut restored = false;
     let mut session = None;
     if let Some(info) = latest {
-        let tool_cwd = PathBuf::from(info.cwd.clone());
-        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, &pi_model);
+        // Sessions created by a GUI launch (process cwd `/`) persisted a
+        // useless cwd; heal them to this launch's default instead.
+        let mut tool_cwd = PathBuf::from(info.cwd.clone());
+        if tool_cwd.as_os_str() == "/" {
+            tool_cwd = cwd.clone();
+        }
+        let builder = session_builder(&tool_cwd, &sessions_dir, &runtime, Some(&pi_model));
         match builder.open(info.path).await {
             Ok(s) => {
                 restored = true;
@@ -345,12 +381,21 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+            let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
             match builder.build().await {
                 Ok(s) => s,
                 Err(err) => {
+                    // Self-diagnosing failure: name what the registry held at
+                    // build time so startup reports are actionable.
+                    let registered = registry.provider_names();
+                    tracing::error!(
+                        error = %err,
+                        model_provider = %pi_model.provider,
+                        registered = ?registered,
+                        "pi session build failed"
+                    );
                     let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                        "pi session build failed: {err}"
+                        "pi session build failed: {err} (registered providers: {registered:?})"
                     )));
                     return;
                 }
@@ -358,15 +403,22 @@ async fn run_actor(
         }
     };
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+    if let Some(project) = &project {
+        write_project_sidecar(&sessions_dir, session.path(), project).await;
+    }
     refresh_session_list(&repo, &state).await;
 
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
 
-    let _ = notice_tx.send(BackendNotice::Ready { restored });
+    let _ = notice_tx.send(BackendNotice::Ready {
+        restored,
+        model: Some(pi_model.clone()),
+    });
     if restored {
         sync_history(&session, &state);
+        sync_usage(&session, &state).await;
     }
 
     let mut run_steers: Vec<String> = Vec::new();
@@ -426,7 +478,7 @@ async fn run_actor(
                 }
                 state.running.store(false, Ordering::Relaxed);
                 sync_history(&session, &state);
-                sync_usage(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
                 let (steered, stranded) = if abort_requested || failed {
                     (Vec::new(), std::mem::take(&mut run_steers))
@@ -455,16 +507,18 @@ async fn run_actor(
             SessionCmd::Abort => {
                 session.abort();
             }
-            SessionCmd::SetModel(manox_model) => {
-                match crate::pi_bridge::map_model(&manox_model) {
-                    Ok(m) => {
-                        if let Err(err) = session.set_model(m).await {
-                            tracing::warn!("pi set_model failed: {err}");
-                        }
-                    }
-                    Err(e) => tracing::warn!("pi set_model mapping failed: {e}"),
+            SessionCmd::SetModel(new_model) => {
+                // Streams dispatch by `model.provider` through the shared
+                // registry, so a cross-provider switch reaches the right
+                // endpoint + credential (the old bridge captured the
+                // initial model's credential for every later model).
+                if let Err(err) = session.set_model(new_model.clone()).await {
+                    tracing::warn!("pi set_model failed: {err}");
                 }
-                *state.model.lock().unwrap() = Some(manox_model);
+                // Keep the actor's working model in sync: Open/NewSession
+                // below build sessions with it.
+                pi_model = new_model.clone();
+                *state.model.lock().unwrap() = Some(new_model);
             }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level).await {
@@ -478,22 +532,28 @@ async fn run_actor(
                     &sessions_dir,
                     &runtime,
                     &pi_model,
+                    &cwd,
                     &notice_tx,
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 sync_history(&session, &state);
+                sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
-            SessionCmd::NewSession { cwd } => {
-                let builder = session_builder(&cwd, &sessions_dir, &runtime, &pi_model);
+            SessionCmd::NewSession { cwd, project } => {
+                let builder = session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model));
                 match builder.build().await {
                     Ok(s) => {
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
+                        if let Some(project) = &project {
+                            write_project_sidecar(&sessions_dir, session.path(), project).await;
+                        }
                         sync_history(&session, &state);
+                        sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
                     }
                     Err(err) => {
@@ -520,6 +580,7 @@ async fn rebuild_session(
     sessions_dir: &Path,
     runtime: &ModelRuntime,
     model: &PiModel,
+    fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
@@ -534,8 +595,15 @@ async fn rebuild_session(
                 .find(|info| info.path == path)
                 .map(|info| PathBuf::from(info.cwd))
         })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let builder = session_builder(&cwd, sessions_dir, runtime, model);
+        .map(|cwd| {
+            if cwd.as_os_str() == "/" {
+                fallback_cwd.to_path_buf()
+            } else {
+                cwd
+            }
+        })
+        .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model));
     match builder.open(path.to_path_buf()).await {
         Ok(s) => *session = s,
         Err(err) => {
@@ -552,11 +620,73 @@ fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     *state.history.lock().unwrap() = mapped;
 }
 
-/// Accumulate the latest turn's usage into the engine state.
-fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
-    let mut cumulative = *state.cumulative.lock().unwrap();
-    let mut per_model = state.per_model.lock().unwrap().clone();
-    let mut request = state.request_usage.lock().unwrap().clone();
+/// Persist the bound project in the session sidecar so the sidebar groups
+/// the session under its project folder across restarts.
+async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.project = Some(project.to_string_lossy().to_string());
+    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+        tracing::warn!(error = %err, "failed to persist session project");
+    }
+}
+
+/// Mirror session usage into the engine state. Cumulative and per-model
+/// totals come from the kernel's stats over the full active branch —
+/// compacted history, tool results, and summarization usage included (TS
+/// `getSessionStats` semantics: totals reflect what was actually billed).
+/// Only the per-request attribution for the env card stays a thin
+/// presentation walk here.
+async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
+    let stats = match session.session_stats().await {
+        Ok(stats) => stats,
+        Err(err) => {
+            // Degrade to the assistant-only walk (the pre-stats mechanism)
+            // so a failing stats read never freezes UI usage at stale
+            // values. Loses tool-result/summary usage for this sync only.
+            tracing::warn!("pi session stats failed; falling back to message walk: {err:#}");
+            sync_usage_from_messages(session, state);
+            return;
+        }
+    };
+    let cumulative = token_usage_from_totals(&stats.tokens);
+    let mut per_model = HashMap::new();
+    for entry in &stats.per_model {
+        per_model.insert(entry.key.clone(), token_usage_from_totals(&entry.totals));
+    }
+    *state.cumulative.lock().unwrap() = cumulative;
+    *state.per_model.lock().unwrap() = per_model;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
+}
+
+/// Per-request attribution for the env card: the assistant usage of the
+/// transcript, attributed to the triggering (most recent) user message.
+/// Presentation-layer accounting, hence host-side.
+fn request_attribution(session: &AgentSession) -> HashMap<String, TokenUsage> {
+    let mut request: HashMap<String, TokenUsage> = HashMap::new();
+    let key = last_user_id(session);
+    for m in session.harness_messages() {
+        let AgentMessage::Assistant { usage, .. } = m else {
+            continue;
+        };
+        let u = to_token_usage(usage);
+        if u.total_tokens() == 0 {
+            continue;
+        }
+        request
+            .entry(key.clone())
+            .and_modify(|acc| *acc = *acc + u)
+            .or_insert(u);
+    }
+    request
+}
+
+/// Fallback aggregation when `session_stats()` is unavailable: assistant
+/// usage only, keyed by model id (the pre-stats mechanism).
+fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
+    let mut cumulative = TokenUsage::default();
+    let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
     for m in session.harness_messages() {
         let AgentMessage::Assistant { usage, model, .. } = m else {
             continue;
@@ -570,22 +700,20 @@ fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
             .entry(model.clone())
             .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
-        if let Some(last_user) = session
-            .harness_messages()
-            .iter()
-            .rev()
-            .find(|m| matches!(m, AgentMessage::User { .. }))
-        {
-            let _ = last_user;
-        }
-        request
-            .entry(last_user_id(session))
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
     }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
-    *state.request_usage.lock().unwrap() = request;
+    *state.request_usage.lock().unwrap() = request_attribution(session);
+}
+
+/// Kernel usage totals → the facade's token usage shape.
+fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsage {
+    TokenUsage {
+        input_tokens: t.input,
+        output_tokens: t.output,
+        cache_creation_input_tokens: t.cache_write,
+        cache_read_input_tokens: t.cache_read,
+    }
 }
 
 /// The message id of the most recent user message, as the facade's history
@@ -635,7 +763,11 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
         model_id: String::new(),
         provider_id: None,
         approval_mode: 0,
-        project: info.cwd.clone(),
+        project: if info.cwd == "/" {
+            String::new()
+        } else {
+            info.cwd.clone()
+        },
         depth: 0,
         parent_id: info.parent_session_path.clone(),
         archived: false,
@@ -931,32 +1063,32 @@ pub(crate) mod adapt {
                 .map(str::to_string)
         };
         match name {
-            "read" | "write" | "ls" => match arg("path") {
+            "Read" | "Write" | "Ls" => match arg("path") {
                 Some(path) => format!("{name} {path}"),
                 None => name.to_string(),
             },
-            "edit" | "edit_diff" => match arg("path") {
-                Some(path) => format!("edit {path}"),
-                None => "edit".to_string(),
+            "Edit" | "EditDiff" => match arg("path") {
+                Some(path) => format!("Edit {path}"),
+                None => "Edit".to_string(),
             },
-            "grep" => match (arg("pattern"), arg("path")) {
-                (Some(pattern), Some(path)) => format!("grep {pattern} {path}"),
-                (Some(pattern), None) => format!("grep {pattern}"),
-                _ => "grep".to_string(),
+            "Grep" => match (arg("pattern"), arg("path")) {
+                (Some(pattern), Some(path)) => format!("Grep {pattern} {path}"),
+                (Some(pattern), None) => format!("Grep {pattern}"),
+                _ => "Grep".to_string(),
             },
-            "find" => match arg("pattern") {
-                Some(pattern) => format!("find {pattern}"),
-                None => "find".to_string(),
+            "Find" => match arg("pattern") {
+                Some(pattern) => format!("Find {pattern}"),
+                None => "Find".to_string(),
             },
-            "bash" => match arg("command") {
+            "Bash" => match arg("command") {
                 Some(command) => format!("$ {command}"),
-                None => "bash".to_string(),
+                None => "Bash".to_string(),
             },
-            "bash_output" => "bash output".to_string(),
-            "task_stop" => "stop task".to_string(),
-            "agent" => match arg("subagent_type") {
-                Some(kind) => format!("agent {kind}"),
-                None => "agent".to_string(),
+            "BashOutput" => "BashOutput".to_string(),
+            "TaskStop" => "TaskStop".to_string(),
+            "Agent" => match arg("subagent_type") {
+                Some(kind) => format!("Agent {kind}"),
+                None => "Agent".to_string(),
             },
             _ => name.to_string(),
         }

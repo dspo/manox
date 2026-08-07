@@ -240,6 +240,9 @@ struct Accumulator {
     reasoning_blocks: HashMap<String, usize>,
     stop_reason: Option<crate::types::StopReason>,
     usage: Box<Usage>,
+    /// Rate card captured from the turn model at construction; priced
+    /// onto every usage snapshot in `current()`.
+    cost_rates: Option<crate::types::Cost>,
     started: bool,
     /// A `response.completed` / `response.incomplete` / `response.failed`
     /// event arrived. A stream that ends without one is a protocol
@@ -259,6 +262,7 @@ impl Accumulator {
             reasoning_blocks: HashMap::new(),
             stop_reason: None,
             usage: Box::new(Usage::default()),
+            cost_rates: crate::provider::model_cost_rates(&context.model),
             started: false,
             terminal_seen: false,
         }
@@ -278,7 +282,13 @@ impl Accumulator {
             diagnostics: None,
             raw_stop_reason: None,
             stop_reason: self.stop_reason,
-            usage: self.usage.clone(),
+            usage: {
+                let mut usage = self.usage.clone();
+                if let Some(rates) = &self.cost_rates {
+                    usage.cost = Some(crate::provider::price_usage(rates, &usage));
+                }
+                usage
+            },
             error_message: None,
             timestamp: chrono::Utc::now(),
         }
@@ -964,7 +974,7 @@ mod tests {
         let (tx, _rx) = chan();
         let mut acc = Accumulator::new(&ctx());
 
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":""}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"Read","arguments":""}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
@@ -973,7 +983,7 @@ mod tests {
         .await
         .unwrap();
         feed(&mut acc, &tx, r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"x\"}"}"#).await.unwrap();
-        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).await.unwrap();
+        feed(&mut acc, &tx, r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","id":"fc_1","name":"Read","arguments":"{\"path\":\"x\"}"}}"#).await.unwrap();
         feed(
             &mut acc,
             &tx,
@@ -1000,7 +1010,7 @@ mod tests {
         };
         // The block id keeps both halves of the wire identity.
         assert_eq!(id, "call_1|fc_1");
-        assert_eq!(name, "read");
+        assert_eq!(name, "Read");
         assert_eq!(*input, json!({"path": "x"}));
     }
 
