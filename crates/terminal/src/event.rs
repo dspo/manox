@@ -7,9 +7,11 @@
 //! callback; the gpui task loads the system clipboard, invokes it, and writes
 //! the returned string back to the PTY.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::vte::ansi::Rgb;
 
 /// Events crossing the gpui boundary. `PtyOutput` is internal (fed back into
 /// the Term by the gpui task); the rest are re-emitted via `EventEmitter` so
@@ -23,6 +25,17 @@ pub enum TerminalEvent {
     PtyOutput(Vec<u8>),
     /// Generic redraw nudge.
     Wakeup,
+    /// Cursor blink state changed (DECSET 12, DECSCUSR). Split out of
+    /// `Wakeup` so the view's blink manager can reset its phase instead of
+    /// treating it as a plain redraw.
+    CursorBlinkingChange,
+    /// OSC 10/11/12 color query: index 0-255 palette, 256 default fg, 257
+    /// default bg, 258 cursor. The view resolves the color from its theme,
+    /// invokes the formatter, and writes the returned string to the PTY.
+    ColorRequest(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>),
+    /// OSC 7: the shell reported its working directory (via the byte tap,
+    /// not the alacritty listener — vte does not dispatch OSC 7).
+    CwdChanged(PathBuf),
     /// Window title changed; `None` resets to the default.
     Title(Option<String>),
     /// Terminal bell.
@@ -60,9 +73,9 @@ impl ManoxListener {
 impl EventListener for ManoxListener {
     fn send_event(&self, event: Event) {
         let mapped = match event {
-            Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                Some(TerminalEvent::Wakeup)
-            }
+            Event::Wakeup | Event::MouseCursorDirty => Some(TerminalEvent::Wakeup),
+            Event::CursorBlinkingChange => Some(TerminalEvent::CursorBlinkingChange),
+            Event::ColorRequest(idx, fmt) => Some(TerminalEvent::ColorRequest(idx, fmt)),
             Event::Title(t) => Some(TerminalEvent::Title(Some(t))),
             Event::ResetTitle => Some(TerminalEvent::Title(None)),
             Event::Bell => Some(TerminalEvent::Bell),
@@ -71,8 +84,8 @@ impl EventListener for ManoxListener {
             Event::ClipboardStore(_ty, text) => Some(TerminalEvent::ClipboardStore(text)),
             Event::ClipboardLoad(_ty, cb) => Some(TerminalEvent::ClipboardLoad(cb)),
             Event::PtyWrite(text) => Some(TerminalEvent::PtyWrite(text)),
-            // ColorRequest / TextAreaSizeRequest are niche (theme introspection
-            // used by some TUIs); left unhandled until a real caller appears.
+            // TextAreaSizeRequest is niche; left unhandled until a real
+            // caller appears.
             _ => None,
         };
         if let Some(ev) = mapped {
@@ -90,5 +103,38 @@ impl EventListener for ManoxListener {
                 Err(async_channel::TrySendError::Closed(_)) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_blinking_change_is_not_folded_into_wakeup() {
+        let (tx, rx) = async_channel::bounded(8);
+        let listener = ManoxListener::new(tx);
+        listener.send_event(Event::CursorBlinkingChange);
+        listener.send_event(Event::Wakeup);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TerminalEvent::CursorBlinkingChange)
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TerminalEvent::Wakeup)));
+    }
+
+    #[test]
+    fn color_request_carries_index_and_formatter() {
+        let (tx, rx) = async_channel::bounded(8);
+        let listener = ManoxListener::new(tx);
+        listener.send_event(Event::ColorRequest(
+            256,
+            Arc::new(|rgb| format!("rgb:{:02x}", rgb.r)),
+        ));
+        let Ok(TerminalEvent::ColorRequest(idx, fmt)) = rx.try_recv() else {
+            panic!("expected a ColorRequest");
+        };
+        assert_eq!(idx, 256);
+        assert_eq!(fmt(Rgb { r: 255, g: 0, b: 0 }), "rgb:ff");
     }
 }

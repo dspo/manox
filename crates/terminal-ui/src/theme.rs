@@ -124,6 +124,30 @@ pub fn is_default_background(color: &Color) -> bool {
     matches!(color, Color::Named(NamedColor::Background))
 }
 
+/// Resolve an OSC color-query index to a theme color: 0-255 palette, 256
+/// default fg, 257 default bg, 258 cursor. Anything else is not ours to
+/// answer.
+pub fn color_for_request(theme: &TerminalTheme, idx: usize) -> Option<Hsla> {
+    match idx {
+        0..=255 => Some(indexed(idx as u8, theme)),
+        256 => Some(theme.default_fg),
+        257 => Some(theme.default_bg),
+        258 => Some(theme.cursor),
+        _ => None,
+    }
+}
+
+/// Lossy `Hsla` → 8-bit RGB for wire answers (OSC color responses).
+pub fn hsla_to_rgb(color: Hsla) -> Rgb {
+    let rgba = gpui::Rgba::from(color);
+    let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Rgb {
+        r: ch(rgba.r),
+        g: ch(rgba.g),
+        b: ch(rgba.b),
+    }
+}
+
 /// 256-color palette lookup: 0..15 ANSI, 16..231 6×6×6 cube, 232..255 grayscale.
 fn indexed(idx: u8, theme: &TerminalTheme) -> Hsla {
     match idx {
@@ -210,5 +234,25 @@ mod tests {
         assert!(!is_default_background(&Color::Named(
             NamedColor::Foreground
         )));
+    }
+
+    #[test]
+    fn color_request_indices_map_to_theme_slots() {
+        let theme = TerminalTheme::default();
+        assert_eq!(color_for_request(&theme, 0), Some(theme.ansi[0]));
+        assert_eq!(color_for_request(&theme, 256), Some(theme.default_fg));
+        assert_eq!(color_for_request(&theme, 257), Some(theme.default_bg));
+        assert_eq!(color_for_request(&theme, 258), Some(theme.cursor));
+        assert_eq!(color_for_request(&theme, 259), None);
+    }
+
+    #[test]
+    fn hsla_to_rgb_roundtrips_pure_red() {
+        let red = convert(
+            &Color::Spec(Rgb { r: 255, g: 0, b: 0 }),
+            &TerminalTheme::default(),
+        );
+        let rgb = hsla_to_rgb(red);
+        assert_eq!((rgb.r, rgb.g, rgb.b), (255, 0, 0));
     }
 }

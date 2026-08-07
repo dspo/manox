@@ -244,7 +244,12 @@ impl Terminal {
                         self.emit_ready(cx);
                     }
                 }
-                TapEvent::Cwd(path) => self.cwd = path,
+                TapEvent::Cwd(path) => {
+                    if self.cwd != path {
+                        self.cwd = path.clone();
+                        cx.emit(TerminalEvent::CwdChanged(path));
+                    }
+                }
             }
         }
         self.readiness.on_output(Instant::now());
@@ -355,6 +360,24 @@ impl Terminal {
         for _ in 0..count {
             let _ = self.pty.write(&report);
         }
+    }
+
+    /// xterm alternateScroll: with the alt screen active but no mouse capture
+    /// (less, git log), wheel deltas become arrow-key presses so the program
+    /// scrolls its own content. No-op when the program disabled the mode via
+    /// DECRST 1007. `delta_lines` shares the wheel sign convention (negative
+    /// = up); capped per event like mouse reports.
+    pub fn alternate_scroll(&self, delta_lines: i32) {
+        if delta_lines == 0 {
+            return;
+        }
+        let mode = self.mode();
+        if !mode.intersects(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+            || mode.intersects(TermMode::MOUSE_MODE)
+        {
+            return;
+        }
+        let _ = self.pty.write(&alternate_scroll_bytes(mode, delta_lines));
     }
 
     /// Selected text as a plain string, if a selection is active.
@@ -497,6 +520,23 @@ fn mouse_report_bytes(mode: TermMode, button: u8, row: usize, col: usize) -> Vec
     }
 }
 
+/// One alternateScroll wheel event as arrow-key bytes: up for negative
+/// deltas, SS3 (`\x1bOA`/`\x1bOB`) under APP_CURSOR, CSI otherwise. One
+/// press per line, capped at 6 like mouse wheel reports.
+fn alternate_scroll_bytes(mode: TermMode, delta_lines: i32) -> Vec<u8> {
+    let seq: &[u8] = match (mode.contains(TermMode::APP_CURSOR), delta_lines < 0) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    let mut out = Vec::with_capacity(seq.len() * 6);
+    for _ in 0..delta_lines.unsigned_abs().min(6) {
+        out.extend_from_slice(seq);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +677,43 @@ mod tests {
         // wheel up = button 64 at row 0, col 0 → payload 96 (0x60), 33 ('!'), 33.
         let b = mouse_report_bytes(TermMode::MOUSE_REPORT_CLICK, 64, 0, 0);
         assert_eq!(b, b"\x1b[M\x60!!");
+    }
+
+    #[test]
+    fn alternate_scroll_csi_and_ss3() {
+        // Plain mode: CSI arrows, one press per line; APP_CURSOR: SS3.
+        assert_eq!(
+            alternate_scroll_bytes(TermMode::empty(), 2),
+            b"\x1b[B\x1b[B"
+        );
+        assert_eq!(alternate_scroll_bytes(TermMode::APP_CURSOR, -1), b"\x1bOA");
+    }
+
+    #[test]
+    fn alternate_scroll_caps_at_six() {
+        assert_eq!(alternate_scroll_bytes(TermMode::empty(), 100).len(), 6 * 3);
+        assert!(alternate_scroll_bytes(TermMode::empty(), 0).is_empty());
+    }
+
+    /// OSC 10;? makes the Term raise a ColorRequest for the default
+    /// foreground (index 256) through the listener.
+    #[test]
+    fn osc_color_query_raises_color_request() {
+        let (event_tx, event_rx) = async_channel::bounded::<TerminalEvent>(256);
+        let listener = ManoxListener::new(event_tx);
+        let cfg = Config::default();
+        let size = TermSize { cols: 80, rows: 24 };
+        let mut term = Term::new(cfg, &size, listener);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        for &b in b"\x1b]10;?\x07" {
+            processor.advance(&mut term, b);
+        }
+        let mut got = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let TerminalEvent::ColorRequest(idx, _) = ev {
+                got = Some(idx);
+            }
+        }
+        assert_eq!(got, Some(256));
     }
 }

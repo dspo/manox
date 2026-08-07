@@ -11,6 +11,7 @@
 //! cursor.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
@@ -20,6 +21,7 @@ use gpui::{
     UTF16Selection, Window, div, px, rgba,
 };
 use gpui_component::ActiveTheme as _;
+use terminal::Rgb;
 use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
@@ -28,7 +30,7 @@ use terminal::mappings::mouse::{self, MouseAction};
 use terminal::settings::BellMode;
 
 use crate::element::TerminalElement;
-use crate::theme::TerminalTheme;
+use crate::theme::{TerminalTheme, color_for_request, hsla_to_rgb};
 
 /// In-flight `/pattern` search state — the pattern, the grid-coordinate match
 /// ranges, and the index of the active (highlighted) match.
@@ -118,6 +120,9 @@ impl TerminalView {
             move |_t, ev: &terminal::event::TerminalEvent, cx| match ev {
                 terminal::event::TerminalEvent::Bell => {
                     view.update(cx, |v, cx| v.ring_bell(cx));
+                }
+                terminal::event::TerminalEvent::ColorRequest(idx, fmt) => {
+                    view.update(cx, |v, cx| v.answer_color_request(*idx, fmt.clone(), cx));
                 }
                 _ => {
                     view.update(cx, |_, cx| cx.notify());
@@ -463,6 +468,14 @@ impl TerminalView {
             });
             return;
         }
+        if mode.intersects(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+            // Alt screen without mouse capture (less, git log): the wheel
+            // becomes arrow-key presses (xterm alternateScroll). With the
+            // mode off the wheel stays dead here — local scrollback is a
+            // no-op on the alt screen anyway.
+            self.terminal.update(cx, |t, _| t.alternate_scroll(lines));
+            return;
+        }
         self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
     }
 
@@ -597,6 +610,24 @@ impl Render for TerminalView {
 }
 
 impl TerminalView {
+    /// Answer an OSC 10/11/12 color query from the active theme. Indices past
+    /// the cursor slot are not ours and go unanswered.
+    fn answer_color_request(
+        &mut self,
+        idx: usize,
+        fmt: Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = TerminalTheme::from_app_theme(cx.theme());
+        let Some(color) = color_for_request(&theme, idx) else {
+            return;
+        };
+        let response = fmt(hsla_to_rgb(color));
+        let _ = self
+            .terminal
+            .read_with(cx, |t, _| t.input(response.as_bytes()));
+    }
+
     /// Poll the foreground process once a second and keep
     /// `foreground_process` current, notifying only on change. The stored
     /// task is cancelled when the view drops; the loop also self-terminates
