@@ -121,8 +121,10 @@ image = "0.25"
 tray-icon = "0.24"
 # ksni —— Linux system tray via the freedesktop StatusNotifierItem D-Bus spec.
 # Pure Rust (zbus), no GTK main loop required, so it coexists with gpui's own
-# X11/Wayland event loop. Runs on the forgotten tokio runtime.
-ksni = "0.3"
+# X11/Wayland event loop. The `blocking` feature gives the synchronous
+# spawn/update API used from the gpui main thread (the service loop moves to
+# its own thread after registration).
+ksni = { version = "0.3", features = ["blocking"] }
 # rust-embed — embed SVG icons into the binary at compile time so manox stays a
 # single-binary deliverable; the ExtrasAssetSource overlays custom agent icons
 # (claude/codex/copilot) on top of gpui-component-assets.
