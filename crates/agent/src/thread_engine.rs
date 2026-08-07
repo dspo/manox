@@ -86,6 +86,11 @@ pub trait ThreadEngine: Send + Sync {
     /// Backends without an approval gate ignore this.
     fn set_approval_mode(&self, _mode: ApprovalMode) {}
 
+    /// Run a manual context-compaction pass (`/compact`). Backends without
+    /// kernel compaction ignore this; backends that require an idle
+    /// transcript no-op while a turn is in flight.
+    fn compact(&self, _custom_instructions: Option<String>) {}
+
     /// Deliver the user's verdict for a pending tool-call authorization.
     /// Unknown ids are silently ignored (the call already settled).
     fn respond_tool_authorization(&self, _id: &str, _response: ToolAuthorizationResponse) {}

@@ -15,8 +15,6 @@ use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 #[cfg(feature = "harness-manox")]
 use harness_manox::{agent_def, skill};
 
-// TODO(pi-wire): slash commands — backed by the manox command/skill registries.
-#[cfg(feature = "harness-manox")]
 use crate::slash_command::SlashCommandRegistry;
 use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
 
@@ -103,13 +101,6 @@ pub fn detect(value: &str, cursor: usize) -> Option<Detection> {
 /// `slash_command::init` surface here with `CompletionKind::Skill` via each
 /// adapter's `kind()`, so `/git` lists `gitwork:deliver` with the skill icon.
 pub fn slash_source(query: &str) -> Vec<CompletionItem> {
-    // TODO(pi-wire): slash commands — manox registry.
-    #[cfg(feature = "harness-pi")]
-    {
-        let _ = query;
-        Vec::new()
-    }
-    #[cfg(feature = "harness-manox")]
     {
         let Some(reg) = SlashCommandRegistry::global() else {
             return Vec::new();

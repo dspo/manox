@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod provider;
 pub mod runtime;
 pub mod settings;
+pub mod title;
 pub mod tools;
 pub mod version;
 pub mod webview_host;

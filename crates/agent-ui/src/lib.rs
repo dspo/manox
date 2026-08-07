@@ -24,11 +24,9 @@ pub mod conversation;
 pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
-pub mod vscode_app;
-// TODO(pi-wire): slash commands — backed by the manox command/skill registries.
-#[cfg(feature = "harness-manox")]
 pub mod slash_command;
 pub mod views;
+pub mod vscode_app;
 pub mod workspace;
 
 pub use views::settings::SettingsView;

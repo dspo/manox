@@ -226,6 +226,19 @@ enum PendingMutation {
 /// Events a harness emits outside the agent run, mirroring the TS harness
 /// `queue_update` / `settled` / `model_update` surface. Listeners are sync
 /// callbacks fired in registration order at the moment the state changes.
+/// Why a compaction ran. Wire values mirror the TS session events
+/// (`compaction_start` / `compaction_end` carry the same strings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    /// The user invoked `/compact` (TS `"manual"`).
+    Manual,
+    /// Post-run maintenance crossed the compaction threshold (TS `"threshold"`).
+    Threshold,
+    /// Context-overflow recovery compacted to make room (TS `"overflow"`).
+    Overflow,
+}
+
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
     /// A queue changed: steering, follow-up, and next-turn counts. Fired on
@@ -255,6 +268,21 @@ pub enum HarnessEvent {
     Abort {
         cleared_steer: Vec<AgentMessage>,
         cleared_follow_up: Vec<AgentMessage>,
+    },
+    /// A compaction attempt started (TS `compaction_start`). Fired after the
+    /// cut analysis accepts the transcript — a `NothingToCompact` refusal
+    /// never emits.
+    CompactionStart { reason: CompactionReason },
+    /// A compaction attempt finished (TS `compaction_end`). `result` is
+    /// `Some` on success; failures carry `error_message`, aborts set
+    /// `aborted`, and `will_retry` marks the overflow path that re-runs the
+    /// failed turn after compacting.
+    CompactionEnd {
+        reason: CompactionReason,
+        result: Option<CompactionResult>,
+        aborted: bool,
+        will_retry: bool,
+        error_message: Option<String>,
     },
 }
 
@@ -2091,7 +2119,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         if !self.needs_compaction() {
             return Ok(Vec::new());
         }
-        match self.compact(None).await {
+        match self
+            .compact_internal(None, CompactionReason::Threshold, false)
+            .await
+        {
             Ok(_) => {}
             Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => {}
             Err(e) => {
@@ -2216,7 +2247,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             // for the next turn. The turn itself cannot be retried — the
             // transcript ends on its assistant reply, which `continue_`
             // refuses.
-            return match self.compact(None).await {
+            return match self
+                .compact_internal(None, CompactionReason::Overflow, false)
+                .await
+            {
                 Ok(_) => Ok(None),
                 Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => Ok(None),
                 Err(e) => Err(e),
@@ -2239,7 +2273,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.agent.replace_transcript(messages);
         self.message_entry_ids.pop();
 
-        match self.compact(None).await {
+        match self
+            .compact_internal(None, CompactionReason::Overflow, true)
+            .await
+        {
             Ok(_) => {}
             Err(e) if e.downcast_ref::<compaction::NothingToCompact>().is_some() => {
                 return Ok(None);
@@ -2802,6 +2839,21 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         &mut self,
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, anyhow::Error> {
+        self.compact_internal(custom_instructions, CompactionReason::Manual, false)
+            .await
+    }
+
+    /// `compact` with the TS event plumbing: emits `CompactionStart` once the
+    /// cut analysis accepts the transcript (a `NothingToCompact` refusal stays
+    /// silent, matching TS where `prepareCompaction` returning `undefined`
+    /// ends the attempt before any event) and `CompactionEnd` on every
+    /// outcome after that.
+    async fn compact_internal(
+        &mut self,
+        custom_instructions: Option<&str>,
+        reason: CompactionReason,
+        will_retry: bool,
+    ) -> Result<CompactionResult, anyhow::Error> {
         self.ensure_running()?;
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot compact while harness is in {:?} phase", self.phase);
@@ -2845,6 +2897,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             None => return Err(compaction::NothingToCompact.into()),
         };
 
+        self.control
+            .emit_harness(HarnessEvent::CompactionStart { reason });
         self.phase = AgentHarnessPhase::Compaction;
 
         // The hook fires after the cut analysis — mirroring TS, which prepares
@@ -2866,7 +2920,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         );
         if hook_ctx.cancel_compaction {
             self.phase = AgentHarnessPhase::Idle;
-            anyhow::bail!("compaction cancelled by before-compact hook");
+            let err = anyhow::anyhow!("compaction cancelled by before-compact hook");
+            self.emit_compaction_failure(reason, will_retry, &err);
+            return Err(err);
         }
 
         // Resolve the compaction result. A hook override supplies a full
@@ -2889,7 +2945,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             Some(o) => {
                 if o.summary.trim().is_empty() {
                     self.phase = AgentHarnessPhase::Idle;
-                    anyhow::bail!("before-compact hook supplied an empty summary");
+                    let err = anyhow::anyhow!("before-compact hook supplied an empty summary");
+                    self.emit_compaction_failure(reason, will_retry, &err);
+                    return Err(err);
                 }
                 let retained_tail = o.retained_tail;
                 (
@@ -2903,9 +2961,17 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 )
             }
             None => {
-                let (summary, usage, details) = self
+                let (summary, usage, details) = match self
                     .summarize_via_model(&preparation, custom_instructions)
-                    .await?;
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        self.phase = AgentHarnessPhase::Idle;
+                        self.emit_compaction_failure(reason, will_retry, &e);
+                        return Err(e);
+                    }
+                };
                 (
                     summary,
                     first_kept_entry_id,
@@ -2942,6 +3008,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             Ok((_id, timestamp)) => timestamp,
             Err(e) => {
                 self.phase = AgentHarnessPhase::Idle;
+                self.emit_compaction_failure(reason, will_retry, &e);
                 return Err(e);
             }
         };
@@ -3005,7 +3072,34 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         );
 
         self.phase = AgentHarnessPhase::Idle;
+        self.control.emit_harness(HarnessEvent::CompactionEnd {
+            reason,
+            result: Some(result.clone()),
+            aborted: false,
+            will_retry,
+            error_message: None,
+        });
         Ok(result)
+    }
+
+    /// Emit a failed `CompactionEnd`. `aborted` reflects the operation
+    /// cancel token (a user abort), mirroring TS where `abortCompaction`
+    /// flips the end event's `aborted` flag; every other failure carries the
+    /// message instead.
+    fn emit_compaction_failure(
+        &self,
+        reason: CompactionReason,
+        will_retry: bool,
+        error: &anyhow::Error,
+    ) {
+        let aborted = self.control.operation_cancel.lock().unwrap().is_cancelled();
+        self.control.emit_harness(HarnessEvent::CompactionEnd {
+            reason,
+            result: None,
+            aborted,
+            will_retry,
+            error_message: Some(format!("{error:#}")),
+        });
     }
 
     /// Summarize the compacted prefix via the harness stream function.
@@ -4086,6 +4180,151 @@ pub(crate) mod tests {
             .unwrap()
             .expect("cursor must advance to the compaction");
         assert_eq!(leaf, compaction_id);
+    }
+
+    /// A manual compaction emits the TS-shaped start/end pair: start once
+    /// the cut analysis accepts the transcript, end with the result.
+    #[tokio::test]
+    async fn test_compact_emits_start_and_end_events() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness
+            .agent_mut()
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
+
+        let events: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let _subscription = harness.subscribe_harness(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        }));
+
+        harness.compact(None).await.unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2, "expected exactly start + end");
+        assert!(matches!(
+            events[0],
+            HarnessEvent::CompactionStart {
+                reason: CompactionReason::Manual
+            }
+        ));
+        match &events[1] {
+            HarnessEvent::CompactionEnd {
+                reason,
+                result,
+                aborted,
+                will_retry,
+                error_message,
+            } => {
+                assert_eq!(*reason, CompactionReason::Manual);
+                assert!(result.is_some(), "success carries the result");
+                assert!(!aborted);
+                assert!(!will_retry);
+                assert!(error_message.is_none());
+            }
+            other => panic!("expected CompactionEnd, got {other:?}"),
+        }
+    }
+
+    /// A transcript that fits entirely in the keep-recent window refuses
+    /// with `NothingToCompact` before any event — the TS attempt ends at
+    /// `prepareCompaction` returning `undefined`, likewise silently.
+    #[tokio::test]
+    async fn test_compact_nothing_to_compact_emits_nothing() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        // One small message: nothing escapes the keep-recent window.
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("hello")]);
+        harness.set_compaction_settings(compact_test_settings());
+
+        let events: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let _subscription = harness.subscribe_harness(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        }));
+
+        let err = harness.compact(None).await.unwrap_err();
+        assert!(err.downcast_ref::<compaction::NothingToCompact>().is_some());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    /// The post-run maintenance path reports the `threshold` reason (TS
+    /// `compaction_start { reason: "threshold" }`).
+    #[tokio::test]
+    async fn test_threshold_compaction_emits_threshold_reason() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness
+            .agent_mut()
+            .replace_transcript(compactable_transcript());
+        harness.set_compaction_settings(compact_test_settings());
+        assert!(harness.needs_compaction());
+
+        let events: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let _subscription = harness.subscribe_harness(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        }));
+
+        harness.run_threshold_compaction().await.unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            HarnessEvent::CompactionStart {
+                reason: CompactionReason::Threshold
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            HarnessEvent::CompactionEnd {
+                reason: CompactionReason::Threshold,
+                result: Some(_),
+                aborted: false,
+                will_retry: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn compaction_reason_serde_round_trip() {
+        for (reason, wire) in [
+            (CompactionReason::Manual, "manual"),
+            (CompactionReason::Threshold, "threshold"),
+            (CompactionReason::Overflow, "overflow"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<CompactionReason>(serde_json::json!(wire)).unwrap(),
+                reason
+            );
+        }
     }
 
     /// Compaction swaps the transcript but never the queues: steering and
