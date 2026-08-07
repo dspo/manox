@@ -10,13 +10,19 @@
 //! App's window map has not registered yet, surfacing as `Err(window not
 //! found)`).
 //!
-//! Both slots are populated exactly once for the single main window the
-//! process opens. If a future change ever supports multiple windows, the
-//! `OnceLock` registration will need to be replaced with a slot map keyed
-//! by `WindowId` and the App-level handler will need to pick the target
-//! window (e.g. from `cx.active_window()` after the deferred dispatch).
+//! The process keeps a single main window, but that window may be closed and
+//! re-opened (the system-tray "open" path): `WORKSPACE` is populated exactly
+//! once and held for the process lifetime — the strong `Entity` reference is
+//! what keeps the foreground `Thread` and any parked background threads alive
+//! while no window exists — while `WINDOW` is replaced each time a new window
+//! is opened over the same `Workspace`. A stale `WindowHandle` read between
+//! close and re-open simply fails its `update`, which App-level handlers
+//! already tolerate. If a future change ever supports multiple windows, these
+//! slots will need to become a map keyed by `WindowId` and the App-level
+//! handlers will need to pick the target window (e.g. from `cx.active_window()`
+//! after the deferred dispatch).
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use gpui::{Entity, WindowHandle};
 
@@ -24,18 +30,23 @@ use crate::workspace::Workspace;
 use gpui_component::Root;
 
 static WORKSPACE: OnceLock<Entity<Workspace>> = OnceLock::new();
-static WINDOW: OnceLock<WindowHandle<Root>> = OnceLock::new();
+static WINDOW: RwLock<Option<WindowHandle<Root>>> = RwLock::new(None);
 
 /// Register the single main `Workspace` entity. Call once, from inside
 /// `cx.open_window`'s build-root callback after `cx.new(|cx| Workspace::new(...))`.
+/// Later windows are re-opened over this same entity; the registration is
+/// deliberately process-lifetime so the workspace (and the threads it holds)
+/// survives the window being closed.
 pub fn set_workspace(workspace: Entity<Workspace>) {
     let _ = WORKSPACE.set(workspace);
 }
 
-/// Register the main window's typed `WindowHandle<Root>`. Call once, with the
-/// value returned by `cx.open_window(...)`.
+/// Register the main window's typed `WindowHandle<Root>`. Replaces any
+/// previous handle — called each time the main window is (re-)opened, so the
+/// handle always tracks the live window even across a close/re-open cycle.
 pub fn set_window(window: WindowHandle<Root>) {
-    let _ = WINDOW.set(window);
+    let mut slot = WINDOW.write().expect("dispatch WINDOW lock poisoned");
+    *slot = Some(window);
 }
 
 /// Returns the global `Workspace` entity, or `None` if the main window has
@@ -44,8 +55,9 @@ pub fn workspace_global() -> Option<Entity<Workspace>> {
     WORKSPACE.get().cloned()
 }
 
-/// Returns the main window's typed handle, or `None` if it has not been
-/// opened yet.
+/// Returns the main window's typed handle, or `None` if no main window is
+/// currently open. The handle may refer to a window that has since been
+/// closed; callers treat a failed `update` as "no window".
 pub fn window_global() -> Option<WindowHandle<Root>> {
-    WINDOW.get().cloned()
+    *WINDOW.read().expect("dispatch WINDOW lock poisoned")
 }

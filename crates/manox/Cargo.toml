@@ -24,8 +24,22 @@ terminal.workspace = true
 terminal-ui.workspace = true
 supervisor.workspace = true
 
+anyhow.workspace = true
+
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# image —— resize the embedded app icon down to tray-icon size at startup.
+image.workspace = true
+
+# System tray backends. macOS/Windows use tray-icon (status item + native menu,
+# events drained on the gpui main loop); Linux uses ksni (StatusNotifierItem over
+# D-Bus, no GTK main-loop requirement so it coexists with gpui's event loop).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tray-icon.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ksni.workspace = true
 
 [package.metadata.bundle]
 identifier = "dev.dspo.manox"

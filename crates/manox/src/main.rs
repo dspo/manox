@@ -3,12 +3,13 @@
 //! Only handles window, theme, and tracing init, and mounts `agent_ui::Workspace` in the window.
 //! Agent logic lives in the `agent` crate; UI lives in the `agent-ui` crate.
 
-use gpui::{App, AppContext as _, Menu, MenuItem, actions, px, size};
+use gpui::{App, AppContext as _, Menu, MenuItem, QuitMode, WindowHandle, actions, px, size};
 use gpui::{WindowBounds, WindowOptions};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use std::borrow::Cow;
 
 mod about;
+mod tray;
 
 // The harness backend is selected at build time; exactly one must be active.
 
@@ -64,6 +65,11 @@ fn main() {
         .init();
 
     let app = gpui_platform::application().with_assets(agent_ui::assets::ExtrasAssetSource::new());
+
+    // Re-open the main window when the app is activated with no open window
+    // (macOS dock-icon click); the platform only fires this when no window
+    // exists, which is exactly the tray-parked state.
+    app.on_reopen(open_or_focus_main_window);
 
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -333,7 +339,10 @@ fn main() {
         // re-resolve every menu label via the new locale (the bin owns
         // `build_app_menus` — `Quit` and `Menu`/`MenuItem` live here, not in
         // `agent` or `agent-ui`, so the rebuild closure stays in this crate).
-        agent::i18n::set_menu_rebuilder(|cx| cx.set_menus(build_app_menus()));
+        agent::i18n::set_menu_rebuilder(|cx| {
+            cx.set_menus(build_app_menus());
+            tray::rebuild_menus();
+        });
 
         cx.set_menus(build_app_menus());
 
@@ -347,28 +356,35 @@ fn main() {
         })
         .detach();
 
-        let window_options = WindowOptions {
-            titlebar: Some(TitleBar::title_bar_options()),
-            window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
-            // Floor below which the window can no longer shrink. Shared with
-            // Settings so both views respect one minimum width.
-            window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
-            ..Default::default()
-        };
-
         cx.spawn(async move |cx| {
-            let handle = cx
-                .open_window(window_options, |window, cx| {
-                    window.activate_window();
-                    window.set_window_title("Manox Pi");
-                    Theme::change(ThemeMode::Light, Some(window), cx);
+            cx.update(|cx| {
+                open_main_window(cx).expect("failed to open window");
 
-                    let view = cx.new(|cx| agent_ui::Workspace::new(window, cx));
-                    agent_ui::dispatch::set_workspace(view.clone());
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .expect("failed to open window");
-            agent_ui::dispatch::set_window(handle);
+                // System tray: the lifeline for reaching a window-less manox,
+                // installed only AFTER the main window opened. The status item
+                // creates its own NSStatusBarWindow; on a system whose
+                // window-server resources are exhausted (e.g. the IOSurface
+                // client cap) AppKit aborts inside window creation, and with
+                // the window first that abort can only occur where manox could
+                // never have shown UI anyway — the tray adds no new startup
+                // death mode. With a tray, closing the main window parks the
+                // app instead of quitting it — `QuitMode::Explicit` makes only
+                // `cx.quit()` (menu Quit / tray 退出) terminate — and the
+                // process-lifetime `Workspace` entity in `agent_ui::dispatch`
+                // keeps the foreground thread and any parked background
+                // threads running through the close. Install failure keeps the
+                // platform default (macOS parks anyway; other platforms quit
+                // on last window close) so the app never strands invisibly.
+                match tray::install() {
+                    Ok(()) => {
+                        cx.set_quit_mode(QuitMode::Explicit);
+                        tray::spawn_pump(cx);
+                    }
+                    Err(e) => tracing::warn!(
+                        "system tray unavailable: {e:#}; closing the last window quits"
+                    ),
+                }
+            });
 
             // Wire the process-wide browser host: bind it to the main
             // Workspace, register it in both the agent trait registry (so the
@@ -404,6 +420,71 @@ fn main() {
             supervisor::global().terminate_all();
         }
     }
+}
+
+/// Open the main window over the process-lifetime `Workspace`, creating the
+/// workspace on first open and reusing it on every re-open (the tray "open"
+/// path). Reuse preserves all in-memory state — the foreground thread, parked
+/// background threads, drafts, sidebar selection — and keeps running threads
+/// alive across a window close: their engine actors live off the `Thread`
+/// entities the workspace holds, so a fresh workspace would orphan them.
+fn open_main_window(cx: &mut App) -> Option<WindowHandle<Root>> {
+    let reused = agent_ui::dispatch::workspace_global().is_some();
+    let window_options = WindowOptions {
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
+        // Floor below which the window can no longer shrink. Shared with
+        // Settings so both views respect one minimum width.
+        window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
+        ..Default::default()
+    };
+    let handle = cx
+        .open_window(window_options, |window, cx| {
+            window.activate_window();
+            window.set_window_title("Manox Pi");
+            Theme::change(ThemeMode::Light, Some(window), cx);
+
+            let view = match agent_ui::dispatch::workspace_global() {
+                Some(view) => view,
+                None => {
+                    let view = cx.new(|cx| agent_ui::Workspace::new(window, cx));
+                    agent_ui::dispatch::set_workspace(view.clone());
+                    view
+                }
+            };
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .ok()?;
+    agent_ui::dispatch::set_window(handle);
+
+    // A re-opened window starts unfocused; restore keyboard focus to the
+    // conversation pane. The first open already focuses the composer inside
+    // `Workspace::new`.
+    if reused
+        && let (Some(workspace), Some(handle)) = (
+            agent_ui::dispatch::workspace_global(),
+            agent_ui::dispatch::window_global(),
+        )
+    {
+        let _ = handle.update(cx, |_, _window, cx| {
+            workspace.update(cx, |ws, cx| ws.focus_conversation(cx));
+        });
+    }
+    Some(handle)
+}
+
+/// Tray / dock "open" entry point: focus the live main window when one
+/// exists, otherwise re-open it over the surviving workspace.
+pub(crate) fn open_or_focus_main_window(cx: &mut App) {
+    if let Some(handle) = agent_ui::dispatch::window_global()
+        && handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        cx.activate(true);
+        return;
+    }
+    open_main_window(cx);
 }
 
 fn build_app_menus() -> Vec<Menu> {
