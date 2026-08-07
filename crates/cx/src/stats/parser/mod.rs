@@ -71,10 +71,12 @@ pub(super) enum SourceKind {
     OmpSession,
     /// Mimo CLI session SQLite（~/.local/share/mimocode/mimocode.db）。
     MimoSession,
-    /// Manox agent SQLite（~/.config/cx/manox/threads.db）。
+    /// Manox agent SQLite（~/.config/cx/manox/threads.db）——pi 化之前的历史数据源。
     ManoxSession,
-    /// pi coding-agent session jsonl（~/.pi/agent/sessions/）。
-    PiSession,
+    /// pi 家族 coding-agent session jsonl，携带 agent 标识：
+    /// pi 原生 session（~/.pi/agent/sessions/）标记为 `pi`；
+    /// manox pi 化后的 session（~/.config/cx/manox/pi-sessions/）标记为 `manox`。
+    PiSession(&'static str),
 }
 
 pub(super) struct ParseResult {
@@ -87,7 +89,7 @@ impl SourceKind {
     pub(super) fn supports_append_scan(self) -> bool {
         matches!(
             self,
-            SourceKind::Claude | SourceKind::OmpSession | SourceKind::PiSession
+            SourceKind::Claude | SourceKind::OmpSession | SourceKind::PiSession(_)
         )
     }
 }
@@ -151,7 +153,7 @@ fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawE
         }
         SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
         SourceKind::OmpSession => omp_session::parse(content),
-        SourceKind::PiSession => pi::parse(content),
+        SourceKind::PiSession(agent) => pi::parse_with_agent(content, agent),
         SourceKind::MimoSession | SourceKind::ManoxSession => unreachable!(),
     }
 }
@@ -248,7 +250,8 @@ mod tests {
     fn append_scan_is_enabled_only_for_self_contained_jsonl_sources() {
         assert!(SourceKind::Claude.supports_append_scan());
         assert!(SourceKind::OmpSession.supports_append_scan());
-        assert!(SourceKind::PiSession.supports_append_scan());
+        assert!(SourceKind::PiSession("pi").supports_append_scan());
+        assert!(SourceKind::PiSession("manox").supports_append_scan());
         assert!(!SourceKind::CodexLike("codex").supports_append_scan());
         assert!(!SourceKind::Copilot("copilot").supports_append_scan());
         assert!(!SourceKind::MimoSession.supports_append_scan());

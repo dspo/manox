@@ -207,12 +207,18 @@ fn log_sources() -> Vec<LogSource> {
         LogSource {
             root: home.join(".pi/agent/sessions"),
             extra_file: None,
-            kind: SourceKind::PiSession,
+            kind: SourceKind::PiSession(AGENT_PI),
         },
         LogSource {
             root: home.join(".config/cx/manox"),
             extra_file: None,
             kind: SourceKind::ManoxSession,
+        },
+        // manox pi 化后的 session jsonl（新数据源，与上方 SQLite 历史源并存）。
+        LogSource {
+            root: home.join(".config/cx/manox/pi-sessions"),
+            extra_file: None,
+            kind: SourceKind::PiSession(AGENT_MANOX),
         },
     ]
 }
@@ -311,7 +317,9 @@ pub(crate) fn count_recent_session_tokens(
         "copilot" => {
             matches!(s.kind, SourceKind::Copilot(a) if a == AGENT_COPILOT)
         }
-        "pi" => matches!(s.kind, SourceKind::PiSession),
+        "pi" => {
+            matches!(s.kind, SourceKind::PiSession(a) if a == AGENT_PI)
+        }
         _ => false,
     })?;
 
