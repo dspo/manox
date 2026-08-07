@@ -1,5 +1,5 @@
 //! VS Code 桌面端启动注入：macOS「工具 → VS Code → provider → model」级联的落点。
-//! 入口 [`launch`]（BYOK 注入）与 [`launch_plain`]`（不注入，普通打开）。
+//! 入口 [`launch`]（BYOK 注入）与 [`launch_plain`]（普通打开）。
 //!
 //! 注入机制：先解析用户登录 shell 环境（`$SHELL -i -l` env dump），把 Claude Code
 //! BYOK env 以最高优先级叠加其上，再带 `VSCODE_CLI=1` 直接启动 VS Code 二进制。
@@ -79,7 +79,7 @@ pub fn launch(selection: &Selection, apikey: &str) -> Result<()> {
     Ok(())
 }
 
-/// 不注入 BYOK 配置启动 VS Code：等效 Dock 正常打开（已运行时仅激活窗口）。
+/// 以普通方式启动 VS Code：等效 Dock 正常打开（已运行时仅激活窗口）。
 pub fn launch_plain() -> Result<()> {
     let binary = resolve_vscode_binary()?;
     let app = app_bundle_path(&binary).context("无法从二进制路径定位 VS Code .app bundle")?;
@@ -105,7 +105,7 @@ fn restart_running_instance_if_any(provider_name: &str, model_id: &str) -> Resul
         return Ok(());
     }
     if !confirm_restart(provider_name, model_id)? {
-        bail!("用户取消了 VS Code 重启，未注入 BYOK 配置");
+        bail!("用户取消了 VS Code 重启");
     }
     quit_app(&binary)?;
     wait_for_exit(&binary, bundle_id.as_deref())?;

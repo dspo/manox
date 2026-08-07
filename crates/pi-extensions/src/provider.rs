@@ -567,7 +567,7 @@ fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
 fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
     match canonical_agent_id(agent_id) {
         "copilot" => &["anthropic", "responses", "completions"],
-        "claude" => &["anthropic"],
+        "claude" | "VS Code" => &["anthropic"],
         "codex" | "Codex.app" => &["responses"],
         // codex+ is a codex fork that additionally speaks anthropic/completions.
         "codex+" => &["anthropic", "responses", "completions"],
@@ -576,8 +576,8 @@ fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
 }
 
 /// The resolved agent id universe: user agents (canonical, deduped, `codex`
-/// expanded into `codex` + `Codex.app`) plus the hidden built-in `codex+`
-/// unless the user defined it.
+/// expanded into `codex` + `Codex.app`, `claude` into `claude` + `VS Code`)
+/// plus the hidden built-in `codex+` unless the user defined it.
 fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for agent in &config.agents {
@@ -589,6 +589,11 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
         if id == "codex" {
             ids.push("codex".to_string());
             ids.push("Codex.app".to_string());
+        } else if id == "claude" {
+            // claude expands into a CLI entry and a VS Code desktop entry
+            // (injection-type agent, parity with cx-providers).
+            ids.push("claude".to_string());
+            ids.push("VS Code".to_string());
         } else {
             ids.push(id);
         }
@@ -867,11 +872,11 @@ providers:
     #[test]
     fn effective_agents_parity_with_cx_providers_rules() {
         let config: CxConfig = serde_yaml::from_str(FIXTURE).unwrap();
-        // anthropic endpoint, no filters: claude + codex+ (codex/Codex.app
-        // are responses-only; copilot unconfigured).
+        // anthropic endpoint, no filters: claude + VS Code + codex+
+        // (codex/Codex.app are responses-only; copilot unconfigured).
         assert_eq!(
             effective_agents(&config, "anthropic", &[], &[]),
-            vec!["claude", "codex+"]
+            vec!["claude", "VS Code", "codex+"]
         );
         // responses endpoint: codex expands to codex + Codex.app, plus codex+.
         assert_eq!(
@@ -926,7 +931,7 @@ providers:
             .unwrap();
         assert_eq!(
             model.metadata.get("agents").unwrap(),
-            &serde_json::json!(["claude", "codex+"])
+            &serde_json::json!(["claude", "VS Code", "codex+"])
         );
         assert_eq!(
             model.metadata.get("provider_display_name").unwrap(),
