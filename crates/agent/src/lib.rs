@@ -5,6 +5,7 @@
 //! `~/.config/cx/cx.providers.config.yaml`.
 
 pub mod approval;
+pub mod approval_review;
 pub mod background_task;
 pub mod compact;
 pub mod db;
@@ -14,6 +15,7 @@ pub mod language;
 pub mod language_model;
 pub mod message;
 pub mod paths;
+pub mod permission;
 pub mod pi_providers;
 pub mod plan;
 pub mod plugin;
@@ -29,12 +31,16 @@ pub mod thread;
 pub mod thread_engine;
 pub mod thread_store;
 
+pub mod pi_approval;
 pub mod pi_engine;
 use gpui::App;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use message::{Message, MessageProvenance, MessageUiMetadata};
+pub use permission::{
+    PendingAuthMeta, PermissionCache, PermissionDecision, ToolAuthorizationResponse,
+};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{SideCallMetric, Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};

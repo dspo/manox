@@ -134,6 +134,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
+ "async-trait",
  "base64",
  "brush-builtins",
  "brush-core",
@@ -164,6 +165,7 @@ dependencies = [
  "serde_yaml",
  "similar",
  "supervisor",
+ "tempfile",
  "tera",
  "tokio",
  "tokio-tungstenite",

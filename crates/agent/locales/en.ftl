@@ -443,6 +443,7 @@ workspace-escalation-always-allow = Always allow
 workspace-escalation-always-allow-desc = Allow this tool for the rest of the session.
 workspace-escalation-deny = Deny
 workspace-escalation-deny-desc = Refuse; the reason is returned to the model.
+workspace-escalation-no-verdict-reason = The safety reviewer did not run for this call.
 workspace-queued = ({$count} more queued for approval)
 workspace-inbound-title = Built-in browser wants to act on Manox
 workspace-inbound-intent = Request: {$intent}

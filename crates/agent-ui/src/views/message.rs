@@ -19,7 +19,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(feature = "harness-manox")]
 use std::time::Duration;
 use std::time::Instant;
 
@@ -33,7 +32,6 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-#[cfg(feature = "harness-manox")]
 use gpui::{Animation, AnimationExt as _, CursorStyle, ease_out_quint};
 use gpui::{App, ClipboardItem, Entity, Render, SharedString, WeakEntity, px};
 use gpui_component::{
@@ -43,7 +41,6 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
-#[cfg(feature = "harness-manox")]
 use gpui_component::{
     Disableable as _,
     tag::{Tag, TagVariant},
@@ -75,8 +72,6 @@ pub struct AgentTaskCtx {
 #[derive(Clone)]
 pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
-    // TODO(pi-wire): AskUserQuestion cards are manox-harness only for now.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) ask: Option<AskCardSnapshot>,
 }
 
@@ -638,8 +633,6 @@ pub fn render_item(
         } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
-            // TODO(pi-wire): AskUserQuestion card — approval UI.
-            #[cfg(feature = "harness-manox")]
             if t.name == agent::tools::ASK_USER_QUESTION {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
@@ -649,8 +642,6 @@ pub fn render_item(
                 // defensive orphan — render it as a plain card.
                 render_tool_call(t, ix, theme, tool_ctx, cx)
             }
-            #[cfg(feature = "harness-pi")]
-            render_tool_call(t, ix, theme, tool_ctx, cx)
         }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
         ConvItem::Error(msg) => render_error(msg, ix, theme, body, cx),
@@ -1986,7 +1977,6 @@ fn render_plan_review_card(
         .into_any_element()
 }
 
-#[cfg(feature = "harness-manox")]
 fn render_ask_user_card(
     item: &ToolCallItem,
     ix: usize,
@@ -2080,7 +2070,7 @@ fn render_ask_user_card(
                         .icon(IconName::Close)
                         .on_click(move |_, _, cx: &mut App| {
                             let _ = weak_cancel.update(cx, |w, cx| {
-                                w.resolve_auth(harness_manox::PermissionDecision::Deny, cx);
+                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
                             });
                         }),
                 ),
