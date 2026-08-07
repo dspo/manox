@@ -305,8 +305,9 @@ impl ModelsPanelState {
             cx.background_executor()
                 .timer(Duration::from_millis(AUTOSAVE_DEBOUNCE_MS))
                 .await;
-            let stale =
-                entity.read_with(cx, |this, _| this.models_panel.save_generation != generation);
+            let stale = entity.read_with(cx, |this, _| {
+                this.models_panel.save_generation != generation
+            });
             if stale {
                 return;
             }
@@ -437,13 +438,7 @@ impl ModelsPanelState {
     fn env_rows_mut(&mut self, pid: usize, mid: Option<usize>) -> Option<&mut Vec<KvForm>> {
         let provider = self.provider_mut(pid)?;
         match mid {
-            Some(mid) => Some(
-                &mut provider
-                    .models
-                    .iter_mut()
-                    .find(|m| m.id == mid)?
-                    .env,
-            ),
+            Some(mid) => Some(&mut provider.models.iter_mut().find(|m| m.id == mid)?.env),
             None => Some(&mut provider.env),
         }
     }
@@ -761,8 +756,12 @@ impl ProviderForm {
             ProviderModels::RemoteUrl(url) => url.clone(),
             ProviderModels::Inline(_) => String::new(),
         };
-        let remote_url =
-            new_input(window, cx, &remote_url, Some(i18n::t("settings-models-ph-remote-url")));
+        let remote_url = new_input(
+            window,
+            cx,
+            &remote_url,
+            Some(i18n::t("settings-models-ph-remote-url")),
+        );
         let models = match config.models {
             ProviderModels::Inline(map) => map
                 .into_iter()
@@ -1028,16 +1027,18 @@ fn render_load_error(theme: &Theme, error: String) -> AnyElement {
 fn render_empty(theme: &Theme) -> AnyElement {
     section_card(
         theme,
-        vec![v_flex()
-            .w_full()
-            .items_center()
-            .px_3()
-            .py_6()
-            .child(muted_text(
-                i18n::t("settings-models-empty"),
-                theme.muted_foreground,
-            ))
-            .into_any_element()],
+        vec![
+            v_flex()
+                .w_full()
+                .items_center()
+                .px_3()
+                .py_6()
+                .child(muted_text(
+                    i18n::t("settings-models-empty"),
+                    theme.muted_foreground,
+                ))
+                .into_any_element(),
+        ],
     )
 }
 
@@ -1273,8 +1274,9 @@ fn render_basic_module(
                 if let Some(p) = this.models_panel.provider_mut(pid) {
                     p.apikey_kind = kind_from_token(&v);
                     let placeholder = kind_placeholder(p.apikey_kind);
-                    p.apikey_value
-                        .update(cx, |state, cx| state.set_placeholder(placeholder, window, cx));
+                    p.apikey_value.update(cx, |state, cx| {
+                        state.set_placeholder(placeholder, window, cx)
+                    });
                     this.models_panel.touch(cx);
                 }
             }),
@@ -1285,15 +1287,12 @@ fn render_basic_module(
     v_flex()
         .w_full()
         .child(
-            h_flex()
-                .px_3()
-                .py_1p5()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(i18n::t("settings-models-row-apikey")),
-                ),
+            h_flex().px_3().py_1p5().child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(i18n::t("settings-models-row-apikey")),
+            ),
         )
         .child(h_flex().w_full().px_3().py_1p5().child(kind_control))
         .into_any_element()
@@ -1310,16 +1309,18 @@ fn render_env_block(
     rows: &[KvForm],
     pending: &Option<String>,
 ) -> AnyElement {
-    let mut children: Vec<AnyElement> = vec![h_flex()
-        .px_3()
-        .py_1p5()
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(i18n::t("settings-models-section-env")),
-        )
-        .into_any_element()];
+    let mut children: Vec<AnyElement> = vec![
+        h_flex()
+            .px_3()
+            .py_1p5()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(i18n::t("settings-models-section-env")),
+            )
+            .into_any_element(),
+    ];
 
     if rows.is_empty() {
         children.push(
@@ -1379,7 +1380,8 @@ fn render_env_block(
                     IconName::Plus,
                     entity.clone(),
                     Arc::new(move |this, window, cx| {
-                        this.models_panel.add_env_row(window, cx, pid, mid, Some(ix));
+                        this.models_panel
+                            .add_env_row(window, cx, pid, mid, Some(ix));
                         this.models_panel.touch(cx);
                     }),
                 ))
@@ -1399,15 +1401,19 @@ fn render_endpoints_module(
     agent_options: &[String],
     pending: &Option<String>,
 ) -> AnyElement {
-    let used: HashSet<String> = p
-        .endpoints
-        .iter()
-        .map(|e| e.wire_api.to_string())
-        .collect();
+    let used: HashSet<String> = p.endpoints.iter().map(|e| e.wire_api.to_string()).collect();
 
     let mut children: Vec<AnyElement> = Vec::new();
     for e in &p.endpoints {
-        children.push(render_endpoint(theme, entity.clone(), pid, &used, agent_options, e, pending));
+        children.push(render_endpoint(
+            theme,
+            entity.clone(),
+            pid,
+            &used,
+            agent_options,
+            e,
+            pending,
+        ));
     }
     if used.len() < WIRE_APIS.len() {
         children.push(dashed_add_button(
@@ -1421,7 +1427,11 @@ fn render_endpoints_module(
             }),
         ));
     }
-    v_flex().w_full().gap_2().children(children).into_any_element()
+    v_flex()
+        .w_full()
+        .gap_2()
+        .children(children)
+        .into_any_element()
 }
 
 fn render_endpoint(
@@ -1470,7 +1480,11 @@ fn render_endpoint(
     let card = plain_card(
         theme,
         vec![
-            field_row(theme, i18n::t("settings-models-row-wire-apis"), wire_control),
+            field_row(
+                theme,
+                i18n::t("settings-models-row-wire-apis"),
+                wire_control,
+            ),
             field_row(
                 theme,
                 i18n::t("settings-models-row-url"),
@@ -1561,7 +1575,14 @@ fn render_models_module(
             );
         }
         for m in &p.models {
-            children.push(render_model(theme, entity.clone(), pid, m, agent_options, pending));
+            children.push(render_model(
+                theme,
+                entity.clone(),
+                pid,
+                m,
+                agent_options,
+                pending,
+            ));
         }
         children.push(dashed_add_button(
             theme,
@@ -1574,12 +1595,21 @@ fn render_models_module(
             }),
         ));
     }
-    v_flex().w_full().gap_2().children(children).into_any_element()
+    v_flex()
+        .w_full()
+        .gap_2()
+        .children(children)
+        .into_any_element()
 }
 
 /// Two-choice tab replacing the old 内联定义 / 远程 URL button pair; the
 /// active tab is underlined and tinted with `theme.info` so it reads clearly.
-fn render_mode_tabs(theme: &Theme, entity: Entity<SettingsView>, pid: usize, p: &ProviderForm) -> AnyElement {
+fn render_mode_tabs(
+    theme: &Theme,
+    entity: Entity<SettingsView>,
+    pid: usize,
+    p: &ProviderForm,
+) -> AnyElement {
     let muted = theme.muted_foreground;
     let mut tabs = Vec::new();
     for (ix, (active, label_key)) in [
@@ -1625,7 +1655,12 @@ fn render_mode_tabs(theme: &Theme, entity: Entity<SettingsView>, pid: usize, p: 
             .into_any_element(),
         );
     }
-    h_flex().px_3().py_1().gap_2().children(tabs).into_any_element()
+    h_flex()
+        .px_3()
+        .py_1()
+        .gap_2()
+        .children(tabs)
+        .into_any_element()
 }
 
 fn render_model(
@@ -1824,12 +1859,14 @@ fn token_dropdown(
                 let token = token.clone();
                 let entity = entity.clone();
                 let apply = apply.clone();
-                menu.item(PopupMenuItem::new(display.clone()).on_click(move |_ev, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        apply(this, token.clone(), window, cx);
-                        cx.notify();
-                    });
-                }))
+                menu.item(
+                    PopupMenuItem::new(display.clone()).on_click(move |_ev, window, cx| {
+                        entity.update(cx, |this, cx| {
+                            apply(this, token.clone(), window, cx);
+                            cx.notify();
+                        });
+                    }),
+                )
             })
         })
         .into_any_element()
@@ -1958,16 +1995,18 @@ fn agent_badges(
                     let entity = entity.clone();
                     let apply = apply.clone();
                     let selected_vec = selected_vec.clone();
-                    menu.item(PopupMenuItem::new(SharedString::from(tag.clone())).on_click(
-                        move |_ev, _window, cx| {
-                            let mut next = selected_vec.clone();
-                            next.push(tag.clone());
-                            entity.update(cx, |this, cx| {
-                                apply(this, next.clone(), cx);
-                                cx.notify();
-                            });
-                        },
-                    ))
+                    menu.item(
+                        PopupMenuItem::new(SharedString::from(tag.clone())).on_click(
+                            move |_ev, _window, cx| {
+                                let mut next = selected_vec.clone();
+                                next.push(tag.clone());
+                                entity.update(cx, |this, cx| {
+                                    apply(this, next.clone(), cx);
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    )
                 })
             })
             .into_any_element(),
