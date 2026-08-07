@@ -809,8 +809,11 @@ impl AgentSession {
     }
 
     /// Compact the conversation.
-    pub async fn compact(&mut self) -> Result<(), anyhow::Error> {
-        self.harness.compact(None).await?;
+    pub async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        self.harness.compact(custom_instructions).await?;
         Ok(())
     }
 
@@ -1824,7 +1827,7 @@ mod tests {
         let before = session.context_usage().await.unwrap().unwrap();
         assert!(before.tokens.is_some(), "plain turns report their usage");
 
-        session.compact().await.unwrap();
+        session.compact(None).await.unwrap();
         let after = session.context_usage().await.unwrap().unwrap();
         // The newest assistant usage describes the pre-compaction context, so
         // reporting it would count history that no longer exists.
