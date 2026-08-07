@@ -186,6 +186,7 @@ dependencies = [
  "base64",
  "chrono",
  "cx",
+ "cx-providers",
  "futures",
  "gpui",
  "gpui-component",

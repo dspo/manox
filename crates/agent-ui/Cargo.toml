@@ -45,6 +45,10 @@ manox-webview.workspace = true
 # (claude/codex/copilot) and hold the PTY handle for an `ExternalSession`.
 cx.workspace = true
 
+# cx provider config schema —— the Settings → Models panel edits
+# `cx.providers.config.yaml` through these structs.
+cx-providers.workspace = true
+
 # pi harness backend — only compiled for the `harness-pi` feature.
 pi = { workspace = true, optional = true }
 pi-extensions = { workspace = true, optional = true }

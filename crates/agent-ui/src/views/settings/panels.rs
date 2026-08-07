@@ -38,7 +38,7 @@ use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
 /// Wraps the panel content in a vertical scroll container that fills the
 /// right pane. The scrollbar appears automatically; we don't need to track
 /// the scroll position across re-renders for a settings overlay.
-fn panel_scroll(content: impl IntoElement) -> AnyElement {
+pub(super) fn panel_scroll(content: impl IntoElement) -> AnyElement {
     v_flex()
         .flex_1()
         .h_full()
@@ -93,7 +93,7 @@ fn row_with_control(
 }
 
 /// A row used as a section header: title only, no control, smaller type.
-fn section_header(label: &'static str) -> AnyElement {
+pub(super) fn section_header(label: &'static str) -> AnyElement {
     div()
         .px_3()
         .pt_3()
@@ -105,7 +105,7 @@ fn section_header(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-fn hairline(divider: Hsla) -> AnyElement {
+pub(super) fn hairline(divider: Hsla) -> AnyElement {
     div()
         .h(px(1.))
         .w_full()
@@ -117,7 +117,7 @@ fn hairline(divider: Hsla) -> AnyElement {
 /// Section card: rounded rectangle with a secondary background that hosts a
 /// list of pre-built rows. A single hairline divider is injected between
 /// adjacent rows (not after the last one) so the card reads as a list.
-fn section_card(theme: &Theme, children: Vec<AnyElement>) -> AnyElement {
+pub(super) fn section_card(theme: &Theme, children: Vec<AnyElement>) -> AnyElement {
     let bg = theme.secondary.opacity(0.45);
     let divider = theme.border.opacity(0.6);
     let muted = theme.muted_foreground;
@@ -143,7 +143,7 @@ fn section_card(theme: &Theme, children: Vec<AnyElement>) -> AnyElement {
     col.into_any_element()
 }
 
-fn muted_text(label: SharedString, muted: Hsla) -> AnyElement {
+pub(super) fn muted_text(label: SharedString, muted: Hsla) -> AnyElement {
     div()
         .text_xs()
         .text_color(muted)

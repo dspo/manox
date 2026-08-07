@@ -109,7 +109,7 @@ TODO(pi-wire) 清零属后续对齐阶段。
 
 ### Settings
 
-- [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
+- [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsModelsPanel](#settingsmodelspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
 
 ### PluginManager
 
@@ -869,9 +869,15 @@ Right content area, dispatches to panel renderers (and to the [PluginManagerView
 
 #### SettingsPanel
 
-A specific settings panel rendered in the right pane. Panels: General, Appearance, Config, Personalization, MCP, Environment, Keyboard, Snapshots, Browser, Computer, Hooks, Connections, Git, Worktrees, Archived, Chat Settings.
+A specific settings panel rendered in the right pane. Panels: General, Appearance, Config, Models, Personalization, MCP, Environment, Keyboard, Snapshots, Browser, Computer, Hooks, Connections, Git, Worktrees, Archived, Chat Settings.
 
 > Source: `agent-ui/src/views/settings/panels.rs`
+
+#### SettingsModelsPanel
+
+Settings → General → Models: form editor for the cx provider config (`~/.config/cx/cx.providers.config.yaml`). Parses the file into per-provider cards on open (name / apikey_source / endpoints / env / models, including the inline-vs-remote-URL models mode), validates and atomically writes the whole config back on Save (top-level `agents:` preserved verbatim), then reloads the provider registry off the main thread. Reload re-reads the file; Save is disabled while the file fails to parse.
+
+> Source: `agent-ui/src/views/settings/models.rs`
 
 #### SettingsSectionCard
 

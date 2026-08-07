@@ -27,6 +27,7 @@ use crate::views::management_shell::back_control;
 #[cfg(feature = "harness-manox")]
 use crate::views::plugin_manager::PluginManagerView;
 
+mod models;
 mod panels;
 
 const SIDEBAR_W: f32 = 260.;
@@ -55,6 +56,7 @@ const GROUPS: &[SettingsGroup] = &[
             SettingsItem::new(IconName::Settings, "settings-item-general", None),
             SettingsItem::new(IconName::Sun, "settings-item-appearance", None),
             SettingsItem::new(IconName::Cpu, "settings-item-config", None),
+            SettingsItem::new(IconName::MemoryStick, "settings-item-models", None),
             SettingsItem::new(IconName::Star, "settings-item-personalization", None),
             SettingsItem::new(IconName::Heart, "settings-item-pets", None),
             SettingsItem::new(IconName::Frame, "settings-item-keyboard", None),
@@ -187,6 +189,11 @@ pub struct SettingsView {
     config_sandbox: SharedString,
     config_builtin_deps: bool,
 
+    // --- Models panel state ---
+    /// Form state for editing `cx.providers.config.yaml`, seeded from the
+    /// file when the Settings view is created.
+    models_panel: models::ModelsPanelState,
+
     // --- Personalization panel state ---
     personality: SharedString,
     memory_enabled: bool,
@@ -258,6 +265,7 @@ impl SettingsView {
             config_approval_policy: i18n::t("settings-value-on-request"),
             config_sandbox: i18n::t("settings-value-read-only"),
             config_builtin_deps: true,
+            models_panel: models::ModelsPanelState::load(window, cx),
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
@@ -539,6 +547,7 @@ impl SettingsView {
         match key {
             Some("settings-item-general") => panels::render_general(self, cx).into_any_element(),
             Some("settings-item-config") => panels::render_config(self, cx).into_any_element(),
+            Some("settings-item-models") => models::render_models(self, cx).into_any_element(),
             Some("settings-item-personalization") => {
                 panels::render_personalization(self, cx).into_any_element()
             }

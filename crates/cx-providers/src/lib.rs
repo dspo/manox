@@ -779,6 +779,55 @@ pub fn read_config_file(path: &Path) -> Result<CxConfig> {
     serde_yaml::from_str(&content).with_context(|| format!("解析配置文件失败: {}", path.display()))
 }
 
+/// Serialize `config` to YAML and write it to `path` atomically (temp file
+/// in the same directory + rename over the target). Parent directories are
+/// created on demand. The rename keeps readers from ever observing a
+/// partially written config.
+pub fn write_config_file(path: &Path, config: &CxConfig) -> Result<()> {
+    let yaml = serde_yaml::to_string(config).context("序列化配置失败")?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(PROVIDER_CONFIG_FILE_NAME);
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        suffix
+    ));
+    std::fs::write(&tmp_path, yaml)
+        .with_context(|| format!("写入临时配置文件失败: {}", tmp_path.display()))?;
+
+    // The config may embed `literal:` API keys; keep the temp file (and the
+    // renamed target) private instead of inheriting a permissive umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "替换配置文件失败: {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════
 // apikey_source resolution
 // ═══════════════════════════════════════════════════
@@ -1149,6 +1198,39 @@ providers:
     }
 
     #[test]
+    fn real_config_round_trips_through_write() {
+        let path = match default_config_path() {
+            Ok(p) if p.exists() => p,
+            _ => return, // Skip when no cx config is present on this machine.
+        };
+        let config = read_config_file(&path).expect("read real config");
+
+        // The settings Models panel saves through `write_config_file`; the
+        // rewritten file must re-parse with the same shape.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join(PROVIDER_CONFIG_FILE_NAME);
+        write_config_file(&out, &config).expect("write");
+        let read_back = read_config_file(&out).expect("re-read");
+
+        assert_eq!(read_back.providers.len(), config.providers.len());
+        assert_eq!(read_back.agents.len(), config.agents.len());
+        for (original, echoed) in config.providers.iter().zip(read_back.providers.iter()) {
+            assert_eq!(echoed.name, original.name);
+            assert_eq!(echoed.endpoints.len(), original.endpoints.len());
+            assert_eq!(echoed.env, original.env);
+            assert_eq!(echoed.is_remote_models(), original.is_remote_models());
+            if let (Some(models), Some(echoed_models)) =
+                (original.models_map(), echoed.models_map())
+            {
+                assert_eq!(
+                    echoed_models.keys().collect::<Vec<_>>(),
+                    models.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parse_context_window_cases() {
         // Accepted (decimal radix, pure sum).
         assert_eq!(parse_context_window("1m"), Some(1_000_000));
@@ -1243,6 +1325,87 @@ providers:
         let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
         assert!(!migrated);
         assert!(legacy_path.exists());
+    }
+
+    #[test]
+    fn write_config_file_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join(PROVIDER_CONFIG_FILE_NAME);
+
+        let mut models = std::collections::BTreeMap::new();
+        models.insert(
+            "test-model[1m]".to_string(),
+            ProviderModelConfig {
+                desc: Some("test".into()),
+                wire_apis: vec!["anthropic".into()],
+                context: Some(1_000_000),
+                ..ProviderModelConfig::default()
+            },
+        );
+        let mut endpoints = std::collections::BTreeMap::new();
+        endpoints.insert(
+            "anthropic".to_string(),
+            ProviderEndpointSpec::Detailed(ProviderEndpointDetail {
+                url: "https://example.com/anthropic".into(),
+                agents: vec!["claude".into()],
+                copilot_auth: Some("bearer_token".into()),
+            }),
+        );
+        let config = CxConfig {
+            providers: vec![ProviderConfig {
+                name: "Test".into(),
+                apikey_source: Some("literal:sk-test".into()),
+                models: ProviderModels::Inline(models),
+                endpoints,
+                env: [("MANOX_PROMPT_CACHING".into(), "full".into())]
+                    .into_iter()
+                    .collect(),
+            }],
+            agents: vec![AgentConfig {
+                id: "claude".into(),
+                binary: "claude".into(),
+                args: Vec::new(),
+                wire_apis: vec!["anthropic".into()],
+                env: std::collections::BTreeMap::new(),
+            }],
+        };
+
+        write_config_file(&path, &config).unwrap();
+        // No stray temp files survive the atomic rename.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let read_back = read_config_file(&path).unwrap();
+        assert_eq!(read_back.providers.len(), 1);
+        let provider = &read_back.providers[0];
+        assert_eq!(provider.name, "Test");
+        assert_eq!(provider.apikey_source.as_deref(), Some("literal:sk-test"));
+        assert_eq!(
+            provider.env.get("MANOX_PROMPT_CACHING").map(String::as_str),
+            Some("full")
+        );
+        match provider.endpoints.get("anthropic").unwrap() {
+            ProviderEndpointSpec::Detailed(detail) => {
+                assert_eq!(detail.url, "https://example.com/anthropic");
+                assert_eq!(detail.agents, vec!["claude".to_string()]);
+                assert_eq!(detail.copilot_auth.as_deref(), Some("bearer_token"));
+            }
+            ProviderEndpointSpec::Url(_) => panic!("endpoint detail lost in round trip"),
+        }
+        let model = provider
+            .models_map()
+            .unwrap()
+            .get("test-model[1m]")
+            .unwrap();
+        assert_eq!(model.context, Some(1_000_000));
+        assert_eq!(model.wire_apis, vec!["anthropic".to_string()]);
+        assert_eq!(read_back.agents.len(), 1);
+        assert_eq!(read_back.agents[0].binary, "claude");
     }
 
     #[test]
