@@ -16,8 +16,11 @@ pub mod event;
 pub mod mappings;
 pub mod pty;
 pub mod pty_source;
+pub mod readiness;
 pub mod settings;
+pub mod shell_kind;
 pub mod store;
+pub mod tap;
 pub mod term;
 
 use gpui::App;

@@ -549,6 +549,18 @@ impl Render for TerminalView {
         if let Some(o) = overlay {
             content = content.child(o);
         }
+        // Starting indicator: shown until the shell / agent TUI reports ready
+        // (marker tap, quiet window, or fallback — see `Terminal::is_ready`).
+        if !self.terminal.read_with(cx, |t, _| t.is_ready()) {
+            content = content.child(
+                div().absolute().top_0().right_0().px_2().py_1().child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(agent::i18n::t("terminal-starting")),
+                ),
+            );
+        }
         if self.bell_flash {
             content = content.child(
                 div()

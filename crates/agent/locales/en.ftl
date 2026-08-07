@@ -504,6 +504,7 @@ vscode-app-launch-failed = Failed to launch VS Code
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = Terminal running… type to interact
+terminal-starting = Starting…
 terminal-exited = Terminal exited with code { $code }
 terminal-search-status = search: { $pattern }  ({ $count ->
     [one] 1 match

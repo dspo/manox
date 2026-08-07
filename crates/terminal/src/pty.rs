@@ -33,6 +33,7 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 
 use crate::event::TerminalEvent;
 use crate::pty_source::PtySource;
+use crate::shell_kind::{ShellKind, resolve_shell_program};
 
 /// Owns the PTY master. `Box<dyn MasterPty + Send>` cannot be unsized into an
 /// `Arc<dyn MasterPty>`, so this newtype holds the box and derefs to the trait
@@ -51,6 +52,9 @@ pub struct PtyHandle {
     master: MasterHolder,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Readiness-marker nonce the shell was wrapped with; `None` for
+    /// unwrapped spawns (heuristic readiness).
+    ready_nonce: Option<String>,
     // Moved into the reader / waiter threads by `PtySource::start`. Held until
     // then so `Drop` can reap a handle that was never started.
     reader: Option<Box<dyn Read + Send>>,
@@ -63,6 +67,12 @@ pub struct PtyHandle {
 /// killer. The reader fd and child handle stay on the `PtyHandle` until
 /// `PtySource::start` moves them into its threads. `shell` overrides the
 /// default user program when `Some`.
+///
+/// Known shells spawn through a marker wrapper (see `shell_kind`): the
+/// wrapper prints the readiness OSC and `exec`s the shell, preserving the
+/// PID and login behavior (default program → login shell; explicit override
+/// → non-login). Unknown shells spawn bare — via portable-pty's default prog
+/// when `shell` is `None` — and readiness uses the heuristic path.
 pub fn open(
     cwd: &Path,
     cols: u16,
@@ -80,18 +90,40 @@ pub fn open(
         })
         .context("openpty")?;
 
-    let mut cmd = match shell {
-        Some(prog) => {
-            let mut c = CommandBuilder::new(prog);
-            c.cwd(cwd);
-            c
+    let program = resolve_shell_program(shell);
+    let login = shell.is_none();
+    let wrapped = ShellKind::detect(&program).and_then(|kind| {
+        let nonce = uuid::Uuid::new_v4().to_string();
+        kind.marker_command(&program, &nonce, login)
+            .map(|argv| (argv, nonce))
+    });
+    let (mut cmd, ready_nonce) = match wrapped {
+        Some((argv, nonce)) => {
+            let mut c = CommandBuilder::new(&argv[0]);
+            c.args(&argv[1..]);
+            (c, Some(nonce))
         }
         None => {
-            let mut c = CommandBuilder::new_default_prog();
-            c.cwd(cwd);
-            c
+            let c = match shell {
+                Some(prog) => CommandBuilder::new(prog),
+                None => CommandBuilder::new_default_prog(),
+            };
+            (c, None)
         }
     };
+    cmd.cwd(cwd);
+
+    // manox is the host terminal regardless of what launched it; TERM and
+    // COLORTERM only fill gaps in sparse GUI-launch environments. User
+    // `[terminal].env` applies last and wins.
+    cmd.env("TERM_PROGRAM", "manox");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    if std::env::var_os("TERM").is_none() {
+        cmd.env("TERM", "xterm-256color");
+    }
+    if std::env::var_os("COLORTERM").is_none() {
+        cmd.env("COLORTERM", "truecolor");
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -108,6 +140,7 @@ pub fn open(
         master,
         writer: Mutex::new(writer),
         killer,
+        ready_nonce,
         reader: Some(reader),
         child: Some(child),
         reader_thread: None,
@@ -186,6 +219,10 @@ impl PtySource for PtyHandle {
                 pixel_height: 0,
             })
             .map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    fn ready_nonce(&self) -> Option<&str> {
+        self.ready_nonce.as_deref()
     }
 }
 

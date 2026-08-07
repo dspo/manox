@@ -42,4 +42,12 @@ pub trait PtySource: Send + 'static {
     fn socket_path(&self) -> Option<&Path> {
         None
     }
+
+    /// Nonce of the readiness marker this source was spawned with, if any.
+    /// The local shell gets one when its kind supports the wrapper; sources
+    /// that cannot inject a marker (agent-backed) return `None` and readiness
+    /// falls back to the output-timing heuristic.
+    fn ready_nonce(&self) -> Option<&str> {
+        None
+    }
 }

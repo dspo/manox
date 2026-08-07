@@ -38,6 +38,9 @@ pub enum TerminalEvent {
     ClipboardLoad(Arc<dyn Fn(&str) -> String + Send + Sync + 'static>),
     /// Raw bytes the TUI asked the terminal to emit on its own behalf.
     PtyWrite(String),
+    /// The shell finished init and accepts input (readiness marker tap or
+    /// output-timing heuristic). Emitted at most once per terminal.
+    Ready,
 }
 
 /// Forwards alacritty `Event`s onto an `async_channel` as `TerminalEvent`s.

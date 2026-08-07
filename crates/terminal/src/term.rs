@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
@@ -24,7 +25,9 @@ use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, Event
 
 use crate::event::{ManoxListener, TerminalEvent};
 use crate::pty_source::PtySource;
+use crate::readiness::{ReadinessMode, ReadinessTracker};
 use crate::settings::{BellMode, CursorShapeSetting, Osc52Access, TerminalSettings};
+use crate::tap::{OscTap, TapEvent};
 
 pub(crate) type ManoxTerm = Term<ManoxListener>;
 pub(crate) type ManoxTermLock = FairMutex<ManoxTerm>;
@@ -87,11 +90,16 @@ pub struct Terminal {
     term: Arc<ManoxTermLock>,
     pty: Box<dyn PtySource>,
     output_processor: Processor<StdSyncHandler>,
+    /// Byte tap observing the PTY stream for the readiness marker and OSC 7
+    /// cwd reports, parallel to the vte processor.
+    tap: OscTap,
+    readiness: ReadinessTracker,
     pub child_exited: Option<i32>,
     pub title: Option<String>,
     /// Bell policy — the view reads this to decide whether to flash / beep.
     pub bell: BellMode,
     _task: Option<Task<()>>,
+    _readiness_task: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for Terminal {}
@@ -117,6 +125,13 @@ impl Terminal {
         let size = TermSize { cols, rows };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
         let bell = settings.bell;
+
+        let ready_nonce = pty.ready_nonce().map(str::to_owned);
+        let readiness_mode = if ready_nonce.is_some() {
+            ReadinessMode::Marker
+        } else {
+            ReadinessMode::Heuristic
+        };
 
         // Move the reader fd / child handle into the source's reader / waiter
         // threads before the gpui task drains the channel.
@@ -180,6 +195,25 @@ impl Terminal {
                     }
                 }
             });
+            let readiness_task = cx.spawn(async move |this, cx: &mut AsyncApp| {
+                // Fallback / heuristic transitions need a clock even when no
+                // output arrives; marker hits transition in write_pty_output.
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(100))
+                        .await;
+                    let ready = this.update(cx, |t: &mut Terminal, cx| {
+                        if t.readiness.poll(Instant::now()) {
+                            t.emit_ready(cx);
+                        }
+                        t.readiness.is_ready()
+                    });
+                    match ready {
+                        Ok(true) | Err(_) => break,
+                        Ok(false) => {}
+                    }
+                }
+            });
             Self {
                 id,
                 cwd,
@@ -188,10 +222,13 @@ impl Terminal {
                 term,
                 pty,
                 output_processor: Processor::<StdSyncHandler>::new(),
+                tap: OscTap::new(ready_nonce),
+                readiness: ReadinessTracker::new(readiness_mode, Instant::now()),
                 child_exited: None,
                 title: None,
                 bell,
                 _task: Some(task),
+                _readiness_task: Some(readiness_task),
             }
         });
         Ok(entity)
@@ -200,11 +237,36 @@ impl Terminal {
     /// Feed PTY output through the vte processor into the Term, then nudge the
     /// view to repaint. Called only from the gpui task.
     fn write_pty_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        for ev in self.tap.feed(bytes) {
+            match ev {
+                TapEvent::ReadyMarker => {
+                    if self.readiness.on_marker() {
+                        self.emit_ready(cx);
+                    }
+                }
+                TapEvent::Cwd(path) => self.cwd = path,
+            }
+        }
+        self.readiness.on_output(Instant::now());
         let mut term = self.term.lock();
         for &b in bytes {
             self.output_processor.advance(&mut *term, b);
         }
         drop(term);
+        cx.notify();
+    }
+
+    /// Whether the shell finished init and accepts input — marker tap, quiet
+    /// window, or fallback timeout, whichever came first. Drives the view's
+    /// starting indicator.
+    pub fn is_ready(&self) -> bool {
+        self.readiness.is_ready()
+    }
+
+    /// Broadcast the readiness transition. Callers guard on the tracker, so
+    /// this fires at most once per terminal.
+    fn emit_ready(&mut self, cx: &mut Context<Self>) {
+        cx.emit(TerminalEvent::Ready);
         cx.notify();
     }
 
@@ -487,6 +549,71 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         // Drop kills the child and detaches both threads.
+        drop(pty);
+    }
+
+    /// End-to-end readiness handshake: spawn `/bin/sh` through the marker
+    /// wrapper and assert the tap sees the marker within 8s. Also asserts the
+    /// env injection identifies manox as the host terminal.
+    #[test]
+    fn readiness_marker_and_env_roundtrip() {
+        let (event_tx, event_rx) = async_channel::bounded::<TerminalEvent>(256);
+        let listener = ManoxListener::new(event_tx.clone());
+        let cfg = Config::default();
+        let size = TermSize { cols: 80, rows: 24 };
+        let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
+        let mut pty = crate::pty::open(&PathBuf::from("/tmp"), 80, 24, Some("/bin/sh"), &[])
+            .expect("open pty");
+        let nonce = pty.ready_nonce().map(str::to_owned);
+        assert!(nonce.is_some(), "/bin/sh must spawn marker-wrapped");
+        let mut tap = OscTap::new(nonce);
+        pty.start(event_tx.clone());
+
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let start = Instant::now();
+        let mut marker_seen = false;
+        while !marker_seen {
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!("timeout waiting for readiness marker");
+            }
+            while let Ok(ev) = event_rx.try_recv() {
+                if let TerminalEvent::PtyOutput(bytes) = ev {
+                    if tap.feed(&bytes).contains(&TapEvent::ReadyMarker) {
+                        marker_seen = true;
+                    }
+                    let mut t = term.lock();
+                    for &b in &bytes {
+                        processor.advance(&mut *t, b);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The wrapper exec'd the real shell; env injection identifies manox.
+        pty.write(b"echo TERM_IS=$TERM_PROGRAM\r")
+            .expect("write input");
+        let start = Instant::now();
+        loop {
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "timeout waiting for echo output; grid:\n{}",
+                    grid_text(&term.lock(), 24, 80)
+                );
+            }
+            while let Ok(ev) = event_rx.try_recv() {
+                if let TerminalEvent::PtyOutput(bytes) = ev {
+                    let mut t = term.lock();
+                    for &b in &bytes {
+                        processor.advance(&mut *t, b);
+                    }
+                }
+            }
+            if grid_text(&term.lock(), 24, 80).contains("TERM_IS=manox") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         drop(pty);
     }
 
