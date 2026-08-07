@@ -45,7 +45,7 @@ use super::panels::{muted_text, section_card, section_header};
 
 const LABEL_W: f32 = 150.;
 const KEY_W: f32 = 220.;
-const NAV_COL_W: f32 = 200.;
+const NAV_COL_W: f32 = 230.;
 const AUTOSAVE_DEBOUNCE_MS: u64 = 600;
 const WIRE_APIS: [&str; 3] = ["anthropic", "responses", "completions"];
 
@@ -929,7 +929,15 @@ pub fn render_models(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
     let theme = cx.theme().clone();
     let entity = cx.entity();
 
-    let mut left: Vec<AnyElement> = vec![add_button(
+    // Left column: provider tree (provider nodes with module children) plus
+    // the dashed add-provider button at the list end.
+    let mut left: Vec<AnyElement> = Vec::new();
+    let provider_ids: Vec<usize> = view.models_panel.providers.iter().map(|p| p.id).collect();
+    for pid in provider_ids {
+        left.push(render_provider_node(view, &theme, entity.clone(), pid, cx));
+    }
+    left.push(dashed_add_button(
+        &theme,
         "models-add-provider",
         "settings-models-add-provider",
         entity.clone(),
@@ -937,18 +945,15 @@ pub fn render_models(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
             this.models_panel.add_provider(window, cx);
             this.models_panel.touch(cx);
         }),
-    )];
-    if let Some(err) = view.models_panel.load_error.clone() {
-        left.push(render_load_error(&theme, err));
-    } else if view.models_panel.providers.is_empty() {
-        left.push(render_empty(&theme));
-    }
-    let provider_ids: Vec<usize> = view.models_panel.providers.iter().map(|p| p.id).collect();
-    for pid in provider_ids {
-        left.push(render_provider(view, &theme, entity.clone(), pid, cx));
-    }
+    ));
 
-    let nav = render_module_nav(view, &theme, entity.clone(), cx);
+    let right = if let Some(err) = view.models_panel.load_error.clone() {
+        render_load_error(&theme, err)
+    } else if view.models_panel.providers.is_empty() {
+        render_empty(&theme)
+    } else {
+        render_module_form(view, &theme, entity.clone(), cx)
+    };
 
     v_flex()
         .w_full()
@@ -971,24 +976,24 @@ pub fn render_models(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
                 .child(
                     div()
                         .id("settings-models-left")
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .pr_1()
-                        .child(v_flex().w_full().gap_3().children(left)),
-                )
-                .child(
-                    div()
-                        .id("settings-models-nav")
                         .w(px(NAV_COL_W))
                         .flex_shrink_0()
                         .h_full()
                         .min_h_0()
                         .overflow_y_scroll()
                         .pr_1()
-                        .child(nav),
+                        .child(v_flex().w_full().gap_1().children(left)),
+                )
+                .child(
+                    div()
+                        .id("settings-models-right")
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .pr_1()
+                        .child(right),
                 ),
         )
         .into_any_element()
@@ -1029,76 +1034,52 @@ fn render_empty(theme: &Theme) -> AnyElement {
     )
 }
 
-/// Right column: selected provider name (makes the left→right cascade
-/// visible) plus the four module names; selecting one swaps the form rendered
-/// inside the expanded provider card.
-fn render_module_nav(
+/// Right column: the form of the module selected in the left tree, wrapped in
+/// a bordered panel.
+fn render_module_form(
     view: &mut SettingsView,
     theme: &Theme,
     entity: Entity<SettingsView>,
-    cx: &mut Context<SettingsView>,
+    _cx: &mut Context<SettingsView>,
 ) -> AnyElement {
     let muted = theme.muted_foreground;
-    let panel = &view.models_panel;
-    let header: SharedString = match panel.selected.and_then(|pid| {
-        panel.providers.iter().find(|p| p.id == pid)
-    }) {
-        Some(p) => {
-            let name = p.name.read(cx).value();
-            if name.trim().is_empty() {
-                i18n::t("settings-models-unnamed")
-            } else {
-                name
-            }
-        }
-        None => SharedString::default(),
+    let hint = || {
+        v_flex()
+            .w_full()
+            .child(muted_text(i18n::t("settings-models-no-selection"), muted))
+            .into_any_element()
     };
-
-    let mut children: Vec<AnyElement> = vec![div()
-        .px_2()
-        .pb_1()
-        .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(muted)
-        .truncate()
-        .child(header)
-        .into_any_element()];
-
-    for module in MODULE_TABS {
-        let active = panel.module == module;
-        let nav_entity = entity.clone();
-        let label = module_label(module);
-        let row = div()
-            .id(format!("models-nav-{module:?}"))
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .text_sm();
-        let row = if active {
-            row.bg(theme.accent.opacity(0.14))
-                .text_color(theme.accent)
-                .font_weight(gpui::FontWeight::MEDIUM)
-        } else {
-            row.hover(|s| s.bg(theme.accent.opacity(0.06)))
-        };
-        children.push(
-            row.on_click(move |_ev, _window, cx| {
-                nav_entity.update(cx, |this, cx| {
-                    this.models_panel.module = module;
-                    cx.notify();
-                });
-            })
-            .child(label)
-            .into_any_element(),
-        );
-    }
-    v_flex().w_full().gap_1().children(children).into_any_element()
+    let panel = &view.models_panel;
+    let Some(pid) = panel.selected else {
+        return hint();
+    };
+    let Some(p) = panel.providers.iter().find(|p| p.id == pid) else {
+        return hint();
+    };
+    let agent_options = panel.agent_options.clone();
+    let module = panel.module;
+    let body = match module {
+        ModuleTab::Basic => render_basic_module(theme, entity.clone(), pid, p),
+        ModuleTab::Env => render_env_block(theme, entity.clone(), pid, None, &p.env),
+        ModuleTab::Endpoints => {
+            render_endpoints_module(theme, entity.clone(), pid, p, &agent_options)
+        }
+        ModuleTab::Models => render_models_module(theme, entity.clone(), pid, p, &agent_options),
+    };
+    div()
+        .w_full()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border.opacity(0.6))
+        .p_3()
+        .child(body)
+        .into_any_element()
 }
 
-/// Left-column provider card: header (double-click to rename) plus, when
-/// expanded, the form of the module selected in the right nav.
-fn render_provider(
+/// Left-column tree node: provider header (double-click renames inline) with
+/// the four module names as indented children when expanded; clicking a
+/// module child selects (provider, module) for the right-column form.
+fn render_provider_node(
     view: &mut SettingsView,
     theme: &Theme,
     entity: Entity<SettingsView>,
@@ -1113,7 +1094,6 @@ fn render_provider(
     let expanded = panel.expanded.contains(&pid);
     let selected = panel.selected == Some(pid);
     let renaming = panel.renaming.contains(&pid);
-    let module = panel.module;
 
     let toggle_entity = entity.clone();
     let rename_entity = entity.clone();
@@ -1123,8 +1103,8 @@ fn render_provider(
         .min_w_0()
         .items_center()
         .gap_2()
-        .px_3()
-        .py_2()
+        .px_2()
+        .py_1()
         .rounded(theme.radius)
         .cursor_pointer()
         .hover(|s| s.bg(theme.accent.opacity(0.06)))
@@ -1159,13 +1139,15 @@ fn render_provider(
         } else {
             name_value
         };
-        toggle.child(
-            div()
-                .text_sm()
+        let label = div().text_sm().truncate().child(header_label);
+        let label = if selected {
+            label
+                .text_color(theme.accent)
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .truncate()
-                .child(header_label),
-        )
+        } else {
+            label.font_weight(gpui::FontWeight::MEDIUM)
+        };
+        toggle.child(label)
     };
 
     let header_row = h_flex()
@@ -1185,44 +1167,51 @@ fn render_provider(
 
     let mut children: Vec<AnyElement> = vec![header_row];
     if expanded {
-        let agent_options = view.models_panel.agent_options.clone();
-        children.push(match module {
-            ModuleTab::Basic => render_basic_module(theme, entity.clone(), pid, p),
-            ModuleTab::Env => render_env_block(theme, entity.clone(), pid, None, &p.env),
-            ModuleTab::Endpoints => {
-                render_endpoints_module(theme, entity.clone(), pid, p, &agent_options)
-            }
-            ModuleTab::Models => {
-                render_models_module(theme, entity.clone(), pid, p, &agent_options)
-            }
-        });
+        for module in MODULE_TABS {
+            let active = selected && panel.module == module;
+            let nav_entity = entity.clone();
+            let row = div()
+                .id(format!("models-p{pid}-nav-{module:?}"))
+                .pl_6()
+                .pr_2()
+                .py_1()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .text_sm();
+            let row = if active {
+                row.text_color(theme.accent)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+            } else {
+                row.hover(|s| s.bg(theme.accent.opacity(0.06)))
+            };
+            children.push(
+                row.on_click(move |_ev, _window, cx| {
+                    nav_entity.update(cx, |this, cx| {
+                        this.models_panel.selected = Some(pid);
+                        this.models_panel.module = module;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(module_label(module))
+                        .child(if active {
+                            Icon::new(IconName::ChevronRight)
+                                .small()
+                                .text_color(theme.accent)
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }),
+                )
+                .into_any_element(),
+            );
+        }
     }
-    provider_card(theme, selected, children)
-}
-
-/// Rounded card for a provider; the selected one gets an accent border and a
-/// subtle accent tint so the selection reads at a glance.
-fn provider_card(theme: &Theme, selected: bool, children: Vec<AnyElement>) -> AnyElement {
-    let border = if selected {
-        theme.accent.opacity(0.65)
-    } else {
-        theme.border.opacity(0.35)
-    };
-    let bg = if selected {
-        theme.accent.opacity(0.05)
-    } else {
-        theme.secondary.opacity(0.45)
-    };
-    v_flex()
-        .w_full()
-        .p_2()
-        .gap_0()
-        .rounded(px(10.))
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .children(children)
-        .into_any_element()
+    v_flex().w_full().children(children).into_any_element()
 }
 
 /// 基本信息 module: the API Key kind dropdown + value input pair (the name
@@ -1373,25 +1362,20 @@ fn render_endpoints_module(
         .collect();
 
     let mut children: Vec<AnyElement> = Vec::new();
-    if used.len() < WIRE_APIS.len() {
-        children.push(
-            h_flex()
-                .px_3()
-                .py_1()
-                .child(add_button(
-                    format!("models-p{pid}-add-endpoint"),
-                    "settings-models-add-endpoint",
-                    entity.clone(),
-                    Arc::new(move |this, window, cx| {
-                        this.models_panel.add_endpoint(window, cx, pid);
-                        this.models_panel.touch(cx);
-                    }),
-                ))
-                .into_any_element(),
-        );
-    }
     for e in &p.endpoints {
         children.push(render_endpoint(theme, entity.clone(), pid, &used, agent_options, e));
+    }
+    if used.len() < WIRE_APIS.len() {
+        children.push(dashed_add_button(
+            theme,
+            format!("models-p{pid}-add-endpoint"),
+            "settings-models-add-endpoint",
+            entity.clone(),
+            Arc::new(move |this, window, cx| {
+                this.models_panel.add_endpoint(window, cx, pid);
+                this.models_panel.touch(cx);
+            }),
+        ));
     }
     v_flex().w_full().gap_2().children(children).into_any_element()
 }
@@ -1513,21 +1497,6 @@ fn render_models_module(
             input_field(&p.remote_url),
         ));
     } else {
-        children.push(
-            h_flex()
-                .px_3()
-                .py_1()
-                .child(add_button(
-                    format!("models-p{pid}-add-model"),
-                    "settings-models-add-model",
-                    entity.clone(),
-                    Arc::new(move |this, window, cx| {
-                        this.models_panel.add_model(window, cx, pid);
-                        this.models_panel.touch(cx);
-                    }),
-                ))
-                .into_any_element(),
-        );
         if p.models.is_empty() {
             children.push(
                 h_flex()
@@ -1543,6 +1512,16 @@ fn render_models_module(
         for m in &p.models {
             children.push(render_model(theme, entity.clone(), pid, m, agent_options));
         }
+        children.push(dashed_add_button(
+            theme,
+            format!("models-p{pid}-add-model"),
+            "settings-models-add-model",
+            entity.clone(),
+            Arc::new(move |this, window, cx| {
+                this.models_panel.add_model(window, cx, pid);
+                this.models_panel.touch(cx);
+            }),
+        ));
     }
     v_flex().w_full().gap_2().children(children).into_any_element()
 }
@@ -1947,23 +1926,43 @@ fn icon_button(
         .into_any_element()
 }
 
-fn add_button(
+fn dashed_add_button(
+    theme: &Theme,
     id: impl Into<gpui::ElementId>,
     label_key: &'static str,
     entity: Entity<SettingsView>,
     apply: WindowApply,
 ) -> AnyElement {
-    Button::new(id)
-        .label(i18n::t(label_key))
-        .small()
-        .outline()
-        .icon(Icon::new(IconName::Plus))
+    let border = theme.border.opacity(0.9);
+    let muted = theme.muted_foreground;
+    let accent = theme.accent;
+    div()
+        .id(id)
+        .w_full()
+        .py_2()
+        .rounded(px(8.))
+        .border_1()
+        .border_dashed()
+        .border_color(border)
+        .cursor_pointer()
+        .hover(move |s| s.border_color(accent).text_color(accent))
         .on_click(move |_ev, window, cx| {
             entity.update(cx, |this, cx| {
                 apply(this, window, cx);
                 cx.notify();
             });
         })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .text_sm()
+                .text_color(muted)
+                .child(Icon::new(IconName::Plus).small())
+                .child(i18n::t(label_key)),
+        )
         .into_any_element()
 }
 
