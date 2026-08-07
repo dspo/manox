@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The explicitly bound project directory. Absent for unbound
+    /// sessions — the session cwd is a working directory, not a project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -77,6 +81,7 @@ mod tests {
         let session = dir.path().join("abc.jsonl");
         let meta = SessionMeta {
             title: Some("fix the widget".into()),
+            project: Some("/p/a".into()),
             pinned: true,
             unread: true,
             ..Default::default()
@@ -84,6 +89,7 @@ mod tests {
         save(dir.path(), &session, &meta).await.unwrap();
         let loaded = load(dir.path(), &session).await.unwrap();
         assert_eq!(loaded.title.as_deref(), Some("fix the widget"));
+        assert_eq!(loaded.project.as_deref(), Some("/p/a"));
         assert!(loaded.pinned && loaded.unread && !loaded.archived && !loaded.errored);
     }
 

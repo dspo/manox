@@ -28,6 +28,9 @@ pub struct ThreadStore {
     /// Session file path per summary id, for sidecar writes and reopen.
     session_paths: HashMap<String, PathBuf>,
     known_projects: Vec<String>,
+    /// Host db handle persisting `known_projects` (shared threads.db,
+    /// `projects` table only — thread rows remain the manox store's domain).
+    db: std::sync::Arc<crate::db::ThreadsDatabase>,
     running: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, WeakEntity<Thread>>,
@@ -52,13 +55,20 @@ pub(crate) fn sessions_dir() -> PathBuf {
 /// `Entity`. Call at App startup.
 pub fn init(cx: &mut App) {
     let dir = sessions_dir();
+    let db_path = crate::db::default_db_path().expect("Failed to resolve threads.db path");
+    let db = std::sync::Arc::new(
+        crate::db::ThreadsDatabase::open(&db_path)
+            .unwrap_or_else(|e| panic!("Failed to open threads db ({}): {e}", db_path.display())),
+    );
+    let known_projects = db.list_projects().unwrap_or_default();
     let entity = cx.new(|_| ThreadStore {
         summaries: Vec::new(),
         session_paths: HashMap::new(),
-        known_projects: Vec::new(),
+        known_projects,
         running: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
+        db,
     });
     entity.update(cx, |s, cx| s.refresh(cx));
     let _ = GLOBAL.set(entity);
@@ -87,12 +97,17 @@ impl ThreadStore {
         &self.known_projects
     }
 
-    /// Register a project path in the in-memory list.
+    /// Register a project path: in-memory list + persisted to the db
+    /// `projects` table so sidebar folders survive restarts even when all
+    /// their threads are archived.
     pub fn register_project(&mut self, path: String, cx: &mut Context<Self>) {
         if path.is_empty() || self.known_projects.contains(&path) {
             return;
         }
-        self.known_projects.push(path);
+        self.known_projects.push(path.clone());
+        if let Err(e) = self.db.register_project(&path) {
+            tracing::warn!(error = %e, "failed to persist project registration");
+        }
         cx.emit(ThreadStoreEvent::SummariesUpdated);
         cx.notify();
     }
@@ -180,6 +195,13 @@ impl ThreadStore {
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
         let entity = Thread::open_existing(ThreadId(id.to_string()), cwd, path, cx);
+        // Re-surface the bound project from the sidecar so the chip shows it.
+        if let Some(sum) = self.summaries.iter().find(|s| s.id == id)
+            && !sum.project.is_empty()
+        {
+            let dir = PathBuf::from(&sum.project);
+            entity.update(cx, |t, _| t.restore_project(dir));
+        }
         self.live_threads.insert(id.to_string(), entity.downgrade());
         Some(entity)
     }
@@ -331,12 +353,12 @@ fn session_info_to_summary(
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut App) {
-    let _ = db;
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
     let entity = cx.new(|_| ThreadStore {
         summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects: Vec::new(),
+        db: db.clone(),
         running: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
@@ -348,3 +370,74 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
 pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (std::sync::Arc<crate::db::ThreadsDatabase>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "pi-store-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&path).expect("open temp threads db"),
+        );
+        (db, path)
+    }
+
+    fn store_entity(
+        cx: &mut gpui::TestAppContext,
+        db: std::sync::Arc<crate::db::ThreadsDatabase>,
+    ) -> gpui::Entity<ThreadStore> {
+        let known_projects = db.list_projects().unwrap_or_default();
+        cx.update(|cx| {
+            cx.new(|_| ThreadStore {
+                summaries: Vec::new(),
+                session_paths: HashMap::new(),
+                known_projects,
+                db,
+                running: HashSet::new(),
+                live_threads: HashMap::new(),
+                sessions_dir: std::env::temp_dir(),
+            })
+        })
+    }
+
+    #[test]
+    fn register_project_persists_and_survives_reopen() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.register_project("/p/a".into(), cx));
+        });
+        // Persisted to the db...
+        assert!(db.list_projects().unwrap().contains(&"/p/a".to_string()));
+        // ...and a freshly initialized store (simulated restart) sees it.
+        let reopened = store_entity(&mut cx, db.clone());
+        let known = cx.update(|cx| reopened.read(cx).known_projects().to_vec());
+        assert_eq!(known, vec!["/p/a".to_string()]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn register_project_dedupes() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.register_project("/p/a".into(), cx);
+                s.register_project("/p/a".into(), cx);
+                s.register_project(String::new(), cx);
+            });
+        });
+        let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
+        assert_eq!(known, vec!["/p/a".to_string()]);
+        assert_eq!(db.list_projects().unwrap().len(), 1);
+        std::fs::remove_file(path).ok();
+    }
+
+}
+

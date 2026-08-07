@@ -68,7 +68,7 @@ pub trait ThreadEngine: Send + Sync {
     fn open_session(&self, path: PathBuf);
 
     /// Create a fresh session in the given directory.
-    fn new_session(&self, cwd: PathBuf);
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>);
 
     /// The session file the backend currently drives, if any.
     fn active_session_path(&self) -> Option<PathBuf>;
@@ -86,7 +86,13 @@ pub enum BackendNotice {
     /// A run event already adapted into a `ThreadEvent`.
     Event(Box<crate::thread::ThreadEvent>),
     /// The session finished building/restoring.
-    Ready { restored: bool },
+    Ready {
+        restored: bool,
+        /// The model the actor resolved for this thread (registration may
+        /// have landed after construction); the facade mirrors it so the
+        /// selector shows the default instead of "no model".
+        model: Option<pi::types::Model>,
+    },
     /// The turn loop unwound and released the running slot.
     Settled {
         cancelled: bool,
@@ -98,6 +104,10 @@ pub enum BackendNotice {
     },
     /// The session could not be built at all.
     Fatal(anyhow::Error),
+    /// A user message landed in the session transcript; the sidebar list
+    /// should refresh so the conversation appears at send time, not at
+    /// turn end.
+    SessionListDirty,
 }
 
 /// An owned engine handle plus its notice channel receiver. Spawning the
