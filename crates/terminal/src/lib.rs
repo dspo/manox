@@ -24,6 +24,7 @@ pub mod shell_kind;
 pub mod store;
 pub mod tap;
 pub mod term;
+pub mod theme;
 
 use gpui::App;
 

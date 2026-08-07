@@ -82,6 +82,11 @@ pub struct TerminalSettings {
         skip_serializing_if = "is_default_line_height"
     )]
     pub line_height: f32,
+    /// Color theme: a `.ottytheme` name under `~/.config/cx/manox/themes/`
+    /// (or a path to a theme file). `None` derives the palette from the app
+    /// theme instead — see `terminal::theme::resolve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
     #[serde(
         default = "default_scrolling_history",
         skip_serializing_if = "is_default_scrolling_history"
@@ -120,6 +125,7 @@ impl Default for TerminalSettings {
             font_family: default_font_family(),
             font_size: default_font_size(),
             line_height: default_line_height(),
+            theme: None,
             scrolling_history: default_scrolling_history(),
             cursor_shape: CursorShapeSetting::Block,
             cursor_blink: CursorBlinkSetting::Terminal,
@@ -273,6 +279,7 @@ mod tests {
         assert_eq!(s.font_family, "Menlo");
         assert_eq!(s.font_size, 14.0);
         assert_eq!(s.line_height, 1.2);
+        assert!(s.theme.is_none());
         assert_eq!(s.scrolling_history, 10_000);
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Block));
         assert!(matches!(s.cursor_blink, CursorBlinkSetting::Terminal));
@@ -291,6 +298,7 @@ language = "zh-CN"
 [terminal]
 font_family = "JetBrains Mono"
 font_size = 13.0
+theme = "paper"
 scrolling_history = 5000
 cursor_shape = "beam"
 cursor_blink = "off"
@@ -302,6 +310,7 @@ commands_to_skip_shell = ["ctrl-g"]
         let s = root.terminal;
         assert_eq!(s.font_family, "JetBrains Mono");
         assert_eq!(s.font_size, 13.0);
+        assert_eq!(s.theme.as_deref(), Some("paper"));
         assert_eq!(s.scrolling_history, 5000);
         assert!(matches!(s.cursor_shape, CursorShapeSetting::Beam));
         assert!(matches!(s.cursor_blink, CursorBlinkSetting::Off));
