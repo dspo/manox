@@ -838,14 +838,14 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
 
         acc.apply(
-            chunk(tool_delta(0, Some("c1"), Some("read"), Some("{\"pa")), None),
+            chunk(tool_delta(0, Some("c1"), Some("Read"), Some("{\"pa")), None),
             &tx,
         )
         .await
         .unwrap();
         acc.apply(
             chunk(
-                tool_delta(1, Some("c2"), Some("bash"), Some("{\"cmd\":\"ls\"}")),
+                tool_delta(1, Some("c2"), Some("Bash"), Some("{\"cmd\":\"ls\"}")),
                 None,
             ),
             &tx,
@@ -878,7 +878,7 @@ mod tests {
                 id, name, input, ..
             } => {
                 assert_eq!(id, "c1");
-                assert_eq!(name, "read");
+                assert_eq!(name, "Read");
                 assert_eq!(*input, serde_json::json!({"path": "x"}));
             }
             other => panic!("expected tool_use, got {other:?}"),
@@ -888,7 +888,7 @@ mod tests {
                 id, name, input, ..
             } => {
                 assert_eq!(id, "c2");
-                assert_eq!(name, "bash");
+                assert_eq!(name, "Bash");
                 assert_eq!(*input, serde_json::json!({"cmd": "ls"}));
             }
             other => panic!("expected tool_use, got {other:?}"),
@@ -923,7 +923,7 @@ mod tests {
         let mut acc = Accumulator::new(&ctx());
         acc.apply(
             chunk(
-                tool_delta(0, Some("c1"), Some("read"), Some("{not json")),
+                tool_delta(0, Some("c1"), Some("Read"), Some("{not json")),
                 Some("tool_calls"),
             ),
             &tx,

@@ -6,9 +6,9 @@ conversation:
 
 [Assistant]: hi
 
-[Assistant tool calls]: write(path="a.rs")
+[Assistant tool calls]: Write(path="a.rs")
 
-[Assistant tool calls]: read(path="b.rs")
+[Assistant tool calls]: Read(path="b.rs")
 
 [User]: custom note
 

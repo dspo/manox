@@ -26,7 +26,7 @@ impl ReadTool {
 #[async_trait::async_trait]
 impl AgentTool for ReadTool {
     fn name(&self) -> &str {
-        "read"
+        "Read"
     }
 
     fn description(&self) -> &str {

@@ -554,7 +554,7 @@ mod tests {
     fn tool_result(id: &str, content: Vec<ContentBlock>, is_error: bool) -> AgentMessage {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content,
             is_error,
             details: None,
@@ -855,7 +855,7 @@ mod tests {
     fn same_model_tool_call_keeps_fc_item_id() {
         let msg = assistant(vec![ContentBlock::ToolUse {
             id: "call_1|fc_item1".into(),
-            name: "read".into(),
+            name: "Read".into(),
             input: json!({"path": "x"}),
             thought_signature: None,
         }]);
@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(item["type"], "function_call");
         assert_eq!(item["call_id"], "call_1");
         assert_eq!(item["id"], "fc_item1");
-        assert_eq!(item["name"], "read");
+        assert_eq!(item["name"], "Read");
         assert_eq!(item["arguments"], "{\"path\":\"x\"}");
     }
 
@@ -873,7 +873,7 @@ mod tests {
         let msg = assistant_from(
             vec![ContentBlock::ToolUse {
                 id: "call_1|fc_item1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: json!({}),
                 thought_signature: None,
             }],
@@ -906,7 +906,7 @@ mod tests {
         let msg = assistant_from(
             vec![ContentBlock::ToolUse {
                 id: "call_1|fc_item1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: json!({}),
                 thought_signature: None,
             }],
@@ -926,7 +926,7 @@ mod tests {
         let msg = assistant_from(
             vec![ContentBlock::ToolUse {
                 id: "toolu_01AbC".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: json!({}),
                 thought_signature: None,
             }],
@@ -1002,7 +1002,7 @@ mod tests {
     fn orphaned_tool_call_gains_synthetic_error_output() {
         let msg = assistant(vec![ContentBlock::ToolUse {
             id: "call_1|fc_1".into(),
-            name: "read".into(),
+            name: "Read".into(),
             input: json!({}),
             thought_signature: None,
         }]);

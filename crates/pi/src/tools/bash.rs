@@ -83,7 +83,7 @@ impl BashTool {
 #[async_trait::async_trait]
 impl AgentTool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        "Bash"
     }
 
     fn description(&self) -> &str {

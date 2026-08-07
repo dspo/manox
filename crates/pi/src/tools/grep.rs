@@ -30,7 +30,7 @@ impl GrepTool {
 #[async_trait::async_trait]
 impl AgentTool for GrepTool {
     fn name(&self) -> &str {
-        "grep"
+        "Grep"
     }
 
     fn description(&self) -> &str {

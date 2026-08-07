@@ -28,7 +28,7 @@ fn conversation() -> Vec<AgentMessage> {
         AgentMessage::Assistant {
             content: vec![ContentBlock::ToolUse {
                 id: "t1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: serde_json::json!({"path": "a.rs"}),
                 thought_signature: None,
             }],
@@ -46,7 +46,7 @@ fn conversation() -> Vec<AgentMessage> {
         },
         AgentMessage::ToolResult {
             tool_call_id: "t1".into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: "ok".into(),
                 signature: None,
@@ -220,7 +220,7 @@ fn fixture_branch_entries() -> Vec<pi::session::SessionTreeEntry> {
         timestamp: chrono::Utc::now(),
         message: pi::AgentMessage::ToolResult {
             tool_call_id: "t1".into(),
-            tool_name: "write".into(),
+            tool_name: "Write".into(),
             content: vec![ContentBlock::Text {
                 text: "ok".into(),
                 signature: None,
@@ -293,8 +293,8 @@ fn fixture_branch_entries() -> Vec<pi::session::SessionTreeEntry> {
                 timestamp: chrono::Utc::now(),
             },
         },
-        assistant_tool("a2", "a1", "write", "a.rs"),
-        assistant_tool("a3", "a2", "read", "b.rs"),
+        assistant_tool("a2", "a1", "Write", "a.rs"),
+        assistant_tool("a3", "a2", "Read", "b.rs"),
         tool_result,
         custom,
         branch_summary,

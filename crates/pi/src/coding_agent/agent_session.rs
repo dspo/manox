@@ -1249,10 +1249,10 @@ impl AgentSessionBuilder {
         // when a reopened path carries no `active_tools_change` entry.
         let facade_initial_active: Option<Vec<String>> = if self.tools.is_empty() {
             Some(vec![
-                "read".into(),
-                "bash".into(),
-                "edit".into(),
-                "write".into(),
+                "Read".into(),
+                "Bash".into(),
+                "Edit".into(),
+                "Write".into(),
             ])
         } else {
             None
@@ -1777,7 +1777,7 @@ mod tests {
             .agent()
             .tools()
             .iter()
-            .find(|t| t.name() == "read")
+            .find(|t| t.name() == "Read")
             .expect("read mounted")
             .clone();
         let ctx = Arc::clone(session.harness.agent().tool_context());
@@ -2130,7 +2130,7 @@ mod tests {
             .agent()
             .tools()
             .iter()
-            .find(|t| t.name() == "read")
+            .find(|t| t.name() == "Read")
             .unwrap()
             .clone();
         let ctx = Arc::clone(resumed.harness.agent().tool_context());
@@ -2345,7 +2345,7 @@ mod tests {
         );
 
         // Disable read: the skill index must disappear from the prompt.
-        session.set_active_tools(vec!["bash".into()]).await.unwrap();
+        session.set_active_tools(vec!["Bash".into()]).await.unwrap();
         let system_prompt = session.harness.agent().state().system_prompt.clone();
         assert!(!system_prompt.contains("<skill"), "{system_prompt}");
     }
@@ -2402,12 +2402,12 @@ mod tests {
         assert_eq!(registry.len(), 7, "{registry:?}");
         assert_eq!(
             session.active_tool_names().unwrap(),
-            vec!["read", "bash", "edit", "write"]
+            vec!["Read", "Bash", "Edit", "Write"]
         );
         // The system prompt advertises the four, not the seven.
         let prompt = session.harness.agent().state().system_prompt.clone();
-        assert!(prompt.contains("- read: Read a file"));
-        assert!(!prompt.contains("- grep:"), "{prompt}");
+        assert!(prompt.contains("- Read: Read a file"));
+        assert!(!prompt.contains("- Grep:"), "{prompt}");
         session.prompt("hi").await.unwrap();
         let path = session.close().await.unwrap();
 
@@ -2419,18 +2419,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             resumed.active_tool_names().unwrap(),
-            vec!["read", "bash", "edit", "write"],
+            vec!["Read", "Bash", "Edit", "Write"],
             "reopen keeps the default four"
         );
         let prompt = resumed.harness.agent().state().system_prompt.clone();
-        assert!(!prompt.contains("- grep:"), "{prompt}");
+        assert!(!prompt.contains("- Grep:"), "{prompt}");
 
         // grep stays enableable after the fact.
         let mut resumed = resumed;
-        resumed.set_active_tools(vec!["grep".into()]).await.unwrap();
-        assert_eq!(resumed.active_tool_names().unwrap(), vec!["grep"]);
+        resumed.set_active_tools(vec!["Grep".into()]).await.unwrap();
+        assert_eq!(resumed.active_tool_names().unwrap(), vec!["Grep"]);
         let prompt = resumed.harness.agent().state().system_prompt.clone();
-        assert!(prompt.contains("- grep: Search file contents"), "{prompt}");
+        assert!(prompt.contains("- Grep: Search file contents"), "{prompt}");
     }
 
     /// The first turn's thinking level equals a reopen's (both clamped and
@@ -2573,12 +2573,12 @@ mod tests {
             .unwrap();
         // Narrow the fork's tools; the prompt must rebuild (no grep).
         forked
-            .set_active_tools(vec!["read".into(), "edit".into()])
+            .set_active_tools(vec!["Read".into(), "Edit".into()])
             .await
             .unwrap();
         let prompt = forked.harness.agent().state().system_prompt.clone();
-        assert!(prompt.contains("- read: Read a file"));
-        assert!(!prompt.contains("- grep:"), "{prompt}");
+        assert!(prompt.contains("- Read: Read a file"));
+        assert!(!prompt.contains("- Grep:"), "{prompt}");
     }
 
     /// Facade shutdown clears its pending next-turn queue and refuses more.
@@ -3532,7 +3532,7 @@ mod tests {
             .await
             .unwrap();
         let names = session.tools();
-        assert!(names.iter().any(|n| n == "bash"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Bash"), "{names:?}");
         let skill_names: Vec<&str> = session
             .resources()
             .skills

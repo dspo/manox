@@ -6835,10 +6835,10 @@ pub(crate) mod tests {
         let long = "x".repeat(4096);
         let assistant = AgentMessage::Assistant {
             content: vec![
-                tool_use("1", "read", "a.rs"),
-                tool_use("2", "read", "c.rs"),
-                tool_use("3", "edit", "a.rs"),
-                tool_use("4", "write", "b.rs"),
+                tool_use("1", "Read", "a.rs"),
+                tool_use("2", "Read", "c.rs"),
+                tool_use("3", "Edit", "a.rs"),
+                tool_use("4", "Write", "b.rs"),
             ],
             model: "test".into(),
             provider: "test".into(),
@@ -7871,7 +7871,7 @@ pub(crate) mod tests {
         let tool_use = AgentMessage::Assistant {
             content: vec![ContentBlock::ToolUse {
                 id: "t1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: serde_json::json!({ "path": "x".repeat(500) }),
                 thought_signature: None,
             }],
@@ -7892,7 +7892,7 @@ pub(crate) mod tests {
         };
         let tool_result = AgentMessage::ToolResult {
             tool_call_id: "t1".into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: "y".repeat(500),
                 signature: None,

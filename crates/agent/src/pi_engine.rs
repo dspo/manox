@@ -1060,32 +1060,32 @@ pub(crate) mod adapt {
                 .map(str::to_string)
         };
         match name {
-            "read" | "write" | "ls" => match arg("path") {
+            "Read" | "Write" | "Ls" => match arg("path") {
                 Some(path) => format!("{name} {path}"),
                 None => name.to_string(),
             },
-            "edit" | "edit_diff" => match arg("path") {
-                Some(path) => format!("edit {path}"),
-                None => "edit".to_string(),
+            "Edit" | "EditDiff" => match arg("path") {
+                Some(path) => format!("Edit {path}"),
+                None => "Edit".to_string(),
             },
-            "grep" => match (arg("pattern"), arg("path")) {
-                (Some(pattern), Some(path)) => format!("grep {pattern} {path}"),
-                (Some(pattern), None) => format!("grep {pattern}"),
-                _ => "grep".to_string(),
+            "Grep" => match (arg("pattern"), arg("path")) {
+                (Some(pattern), Some(path)) => format!("Grep {pattern} {path}"),
+                (Some(pattern), None) => format!("Grep {pattern}"),
+                _ => "Grep".to_string(),
             },
-            "find" => match arg("pattern") {
-                Some(pattern) => format!("find {pattern}"),
-                None => "find".to_string(),
+            "Find" => match arg("pattern") {
+                Some(pattern) => format!("Find {pattern}"),
+                None => "Find".to_string(),
             },
-            "bash" => match arg("command") {
+            "Bash" => match arg("command") {
                 Some(command) => format!("$ {command}"),
-                None => "bash".to_string(),
+                None => "Bash".to_string(),
             },
-            "bash_output" => "bash output".to_string(),
-            "task_stop" => "stop task".to_string(),
-            "agent" => match arg("subagent_type") {
-                Some(kind) => format!("agent {kind}"),
-                None => "agent".to_string(),
+            "BashOutput" => "BashOutput".to_string(),
+            "TaskStop" => "TaskStop".to_string(),
+            "Agent" => match arg("subagent_type") {
+                Some(kind) => format!("Agent {kind}"),
+                None => "Agent".to_string(),
             },
             _ => name.to_string(),
         }

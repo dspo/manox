@@ -22,13 +22,13 @@ pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operat
 
 /// One-line tool snippets for the Available tools list (TS `toolSnippets`).
 const TOOL_SNIPPETS: &[(&str, &str)] = &[
-    ("read", "Read a file from the filesystem"),
-    ("bash", "Run a shell command"),
-    ("edit", "Edit a file with a patch"),
-    ("write", "Write a file"),
-    ("grep", "Search file contents"),
-    ("find", "Locate files"),
-    ("ls", "List directory contents"),
+    ("Read", "Read a file from the filesystem"),
+    ("Bash", "Run a shell command"),
+    ("Edit", "Edit a file with a patch"),
+    ("Write", "Write a file"),
+    ("Grep", "Search file contents"),
+    ("Find", "Locate files"),
+    ("Ls", "List directory contents"),
 ];
 
 pub fn build_harness_prompt(
@@ -61,8 +61,8 @@ pub fn build_harness_prompt(
             }
         }
         // TS dynamic guideline: with bash but no grep/find/ls.
-        if active_tools.contains(&"bash".to_string())
-            && !["grep", "find", "ls"]
+        if active_tools.contains(&"Bash".to_string())
+            && !["Grep", "Find", "Ls"]
                 .iter()
                 .any(|t| active_tools.contains(&t.to_string()))
         {
@@ -80,7 +80,7 @@ pub fn build_harness_prompt(
         }
         prompt.push_str("</project_context>\n");
     }
-    let has_read = active_tools.iter().any(|t| t == "read");
+    let has_read = active_tools.iter().any(|t| t == "Read");
     if has_read && !skills.is_empty() {
         prompt.push_str(
             "\nSkills are markdown files you can read for detailed instructions; \
@@ -128,7 +128,7 @@ mod tests {
             location: "/proj/.pi/skills/review.md".into(),
             content: "Check the diff.".into(),
         }];
-        let tools = vec!["read".to_string(), "bash".to_string()];
+        let tools = vec!["Read".to_string(), "Bash".to_string()];
         let prompt = build_harness_prompt(
             DEFAULT_BASE_PROMPT,
             std::path::Path::new("/proj"),
@@ -138,8 +138,8 @@ mod tests {
             false,
         );
         assert!(prompt.contains("Current working directory: /proj"));
-        assert!(prompt.contains("- read: Read a file from the filesystem"));
-        assert!(prompt.contains("- bash: Run a shell command"));
+        assert!(prompt.contains("- Read: Read a file from the filesystem"));
+        assert!(prompt.contains("- Bash: Run a shell command"));
         assert!(prompt.contains(
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
         ));

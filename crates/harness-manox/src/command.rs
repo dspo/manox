@@ -215,7 +215,7 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         "edit" | "edit_file" | "multiedit" => crate::tools::EDIT.to_string(),
         "list" | "list_directory" | "ls" => crate::tools::LIST.to_string(),
         "bash" => crate::tools::BASH.to_string(),
-        "bashoutput" | "bash_output" => crate::tools::BASH_OUTPUT.to_string(),
+        "bashoutput" | "BashOutput" => crate::tools::BASH_OUTPUT.to_string(),
         "grep" => crate::tools::GREP.to_string(),
         "glob" => crate::tools::GLOB.to_string(),
         "askuserquestion" | "ask_user" => crate::tools::ASK_USER_QUESTION.to_string(),

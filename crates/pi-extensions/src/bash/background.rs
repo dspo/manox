@@ -343,7 +343,7 @@ impl BashOutputTool {
 #[async_trait::async_trait]
 impl AgentTool for BashOutputTool {
     fn name(&self) -> &str {
-        "bash_output"
+        "BashOutput"
     }
 
     fn description(&self) -> &str {
@@ -401,7 +401,7 @@ impl TaskStopTool {
 #[async_trait::async_trait]
 impl AgentTool for TaskStopTool {
     fn name(&self) -> &str {
-        "task_stop"
+        "TaskStop"
     }
 
     fn description(&self) -> &str {

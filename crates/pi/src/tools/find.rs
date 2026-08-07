@@ -27,7 +27,7 @@ impl FindTool {
 #[async_trait::async_trait]
 impl AgentTool for FindTool {
     fn name(&self) -> &str {
-        "find"
+        "Find"
     }
 
     fn description(&self) -> &str {
