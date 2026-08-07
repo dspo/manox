@@ -102,6 +102,9 @@ pub struct TerminalView {
     shape_cache: Rc<RefCell<LineShapeCache<ShapedLine>>>,
     /// The theme the shaped-run cache was built against; a switch clears it.
     cache_theme: Option<TerminalTheme>,
+    /// Palette loaded from `[terminal].theme` (`.ottytheme`); `None` derives
+    /// the palette from the app theme on every render instead.
+    theme_override: Option<TerminalTheme>,
     /// Scrollbar track bounds in window space, written by the element each
     /// prepaint (`None` without scrollback); mouse input is hit-tested
     /// against it.
@@ -119,6 +122,20 @@ impl TerminalView {
             .iter()
             .filter_map(|k| gpui::Keystroke::parse(k).ok())
             .collect();
+        let theme_override =
+            s.theme
+                .as_deref()
+                .and_then(|spec| match terminal::theme::resolve(spec) {
+                    Ok(file) => Some(TerminalTheme::from_theme_file(&file)),
+                    Err(e) => {
+                        tracing::warn!(
+                            theme = %spec,
+                            error = %e,
+                            "terminal theme load failed; falling back to app theme"
+                        );
+                        None
+                    }
+                });
         let view = cx.new(move |cx| Self {
             terminal: terminal_for_view,
             focus_handle: cx.focus_handle(),
@@ -147,6 +164,7 @@ impl TerminalView {
             hover: None,
             shape_cache: Rc::new(RefCell::new(LineShapeCache::new())),
             cache_theme: None,
+            theme_override,
             scrollbar_track: Rc::new(SharedCell::new(None)),
             scrollbar_dragging: false,
         });
@@ -643,7 +661,7 @@ impl Render for TerminalView {
 
         // A theme switch invalidates every cached shaped line (run colors are
         // baked at shape time).
-        let theme = TerminalTheme::from_app_theme(cx.theme());
+        let theme = self.active_theme(cx);
         if self.cache_theme.as_ref() != Some(&theme) {
             self.shape_cache.borrow_mut().clear();
             self.cache_theme = Some(theme.clone());
@@ -743,6 +761,14 @@ impl Render for TerminalView {
 }
 
 impl TerminalView {
+    /// The palette to render: the configured `.ottytheme` override when one
+    /// loaded, else a palette derived from the app theme.
+    fn active_theme(&self, cx: &App) -> TerminalTheme {
+        self.theme_override
+            .clone()
+            .unwrap_or_else(|| TerminalTheme::from_app_theme(cx.theme()))
+    }
+
     /// Answer an OSC 10/11/12 color query from the active theme. Indices past
     /// the cursor slot are not ours and go unanswered.
     fn answer_color_request(
@@ -751,7 +777,7 @@ impl TerminalView {
         fmt: Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>,
         cx: &mut Context<Self>,
     ) {
-        let theme = TerminalTheme::from_app_theme(cx.theme());
+        let theme = self.active_theme(cx);
         let Some(color) = color_for_request(&theme, idx) else {
             return;
         };
