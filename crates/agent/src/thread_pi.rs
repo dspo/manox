@@ -673,6 +673,16 @@ impl Thread {
         cx.notify();
     }
 
+    /// Manual compaction (`/compact`): no-op while a turn is in flight (the
+    /// kernel compacts an idle transcript only); the recap card lands via the
+    /// engine's harness-event adaptation.
+    pub fn compact(&mut self, custom_instructions: Option<String>, _cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        self.engine.compact(custom_instructions);
+    }
+
     pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
         if self.approval_mode == mode {
             return;

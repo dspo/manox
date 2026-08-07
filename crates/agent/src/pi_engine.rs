@@ -47,6 +47,8 @@ enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Switch the approval policy and persist it in the session sidecar.
     SetApprovalMode(ApprovalMode),
+    /// Manual compaction (`/compact`), optionally steering the summary.
+    Compact { custom_instructions: Option<String> },
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
     /// Create a fresh session in the given directory, optionally bound to a
@@ -187,6 +189,12 @@ impl ThreadEngine for PiEngine {
 
     fn set_approval_mode(&self, mode: ApprovalMode) {
         let _ = self.cmd_tx.send(SessionCmd::SetApprovalMode(mode));
+    }
+
+    fn compact(&self, custom_instructions: Option<String>) {
+        let _ = self.cmd_tx.send(SessionCmd::Compact {
+            custom_instructions,
+        });
     }
 
     fn respond_tool_authorization(&self, id: &str, response: ToolAuthorizationResponse) {
@@ -331,6 +339,37 @@ fn subscribe_session(
     }))
 }
 
+/// Adapt harness lifecycle events onto the notice channel. Carries the
+/// compaction visibility pair (TS `compaction_start` / `compaction_end`):
+/// start flips the UI into its summarizing state, a successful end lands the
+/// Recap card. The end event's token counts ride the result; the UI chrome
+/// consumes only the summary.
+fn subscribe_harness_events(
+    session: &mut AgentSession,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) -> pi::harness::HarnessSubscription {
+    let tx = notice_tx.clone();
+    session.subscribe_harness(Arc::new(move |event| match event {
+        pi::harness::HarnessEvent::CompactionStart { .. } => {
+            let _ = tx.send(BackendNotice::Event(Box::new(
+                ThreadEvent::CompactionStarted { tokens_before: 0 },
+            )));
+        }
+        pi::harness::HarnessEvent::CompactionEnd {
+            result: Some(result),
+            aborted: false,
+            ..
+        } => {
+            let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
+                summary: result.summary,
+                messages_compacted: 0,
+                tokens_before: result.tokens_before,
+            })));
+        }
+        _ => {}
+    }))
+}
+
 /// Build the session builder against the given project dir, using the shared
 /// runtime and model.
 fn session_builder(
@@ -459,11 +498,13 @@ async fn run_actor(
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
+    let mut _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
 
     // The approval mode rides the session sidecar: restore it so a
     // reopened Danger session doesn't silently gate (or vice versa).
     let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
     state.gate.set_mode(approval_mode);
+    let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
     let _ = notice_tx.send(BackendNotice::Ready {
         restored,
         model: Some(pi_model.clone()),
@@ -538,6 +579,18 @@ async fn run_actor(
                 } else {
                     (std::mem::take(&mut run_steers), Vec::new())
                 };
+                // A natural terminal turn may earn (or re-earn) the LLM
+                // title; cancelled/failed turns keep the interim summary.
+                if !abort_requested && !failed {
+                    maybe_generate_title(
+                        &title_state,
+                        &runtime,
+                        &pi_model,
+                        &session,
+                        &sessions_dir,
+                        &notice_tx,
+                    );
+                }
                 let _ = notice_tx.send(BackendNotice::Settled {
                     cancelled: abort_requested,
                     failed,
@@ -581,6 +634,34 @@ async fn run_actor(
                     tracing::warn!(error = %err, "failed to persist approval mode");
                 }
             }
+            SessionCmd::Compact {
+                custom_instructions,
+            } => {
+                // The kernel compacts an idle transcript only; the facade
+                // already drops `/compact` while a turn runs, so a queued
+                // command arriving here settles first by construction.
+                match session.compact(custom_instructions.as_deref()).await {
+                    Ok(_) => {
+                        // The transcript was rebuilt and the summarization
+                        // call consumed tokens — re-mirror both, and the
+                        // session list (the summary row may have changed).
+                        sync_history(&session, &state);
+                        sync_usage(&session, &state).await;
+                        refresh_session_list(&repo, &state).await;
+                    }
+                    Err(err)
+                        if err
+                            .downcast_ref::<pi::compaction::NothingToCompact>()
+                            .is_some() =>
+                    {
+                        tracing::debug!("pi compact: nothing to compact");
+                    }
+                    Err(err) => {
+                        let _ =
+                            notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(err))));
+                    }
+                }
+            }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level).await {
                     tracing::warn!("pi set_thinking_level failed: {err}");
@@ -599,8 +680,10 @@ async fn run_actor(
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
+                _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                title_state = load_title_state(&sessions_dir, session.path(), &session).await;
                 sync_history(&session, &state);
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
@@ -612,11 +695,13 @@ async fn run_actor(
                     Ok(s) => {
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
+                        _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         if let Some(project) = &project {
                             write_project_sidecar(&sessions_dir, session.path(), project).await;
                         }
                         resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                        title_state = Arc::new(Mutex::new(TitleState::default()));
                         sync_history(&session, &state);
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -679,6 +764,129 @@ async fn rebuild_session(
             )));
         }
     }
+}
+
+/// Actor-local title-generation state (manox `TitleState` parity): the
+/// LLM title, the cadence anchor (user count at last evaluation), and the
+/// in-flight lock. Shared with the spawned title task via `Arc<Mutex<_>>`.
+#[derive(Default)]
+struct TitleState {
+    title: Option<String>,
+    last_eval_user_count: Option<usize>,
+    in_flight: bool,
+}
+
+/// Restore the title state from the session sidecar. `last_eval_user_count`
+/// is derived from whether a title already exists, so a reloaded session
+/// continues the cadence without re-evaluating immediately (manox parity).
+async fn load_title_state(
+    sessions_dir: &Path,
+    session_path: &Path,
+    session: &AgentSession,
+) -> Arc<Mutex<TitleState>> {
+    let meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .ok();
+    let title = meta.and_then(|m| m.title).filter(|t| !t.trim().is_empty());
+    let last_eval_user_count = title
+        .is_some()
+        .then(|| crate::title::count_user_messages(session.harness_messages()));
+    Arc::new(Mutex::new(TitleState {
+        title,
+        last_eval_user_count,
+        in_flight: false,
+    }))
+}
+
+/// Maybe kick off an LLM title stream after a settled turn (manox
+/// `maybe_generate_title` semantics): first title as soon as an assistant
+/// reply exists, topic-shift re-eval on the cadence thereafter. The stream
+/// runs in a spawned task (runtime resolver + `StreamFn`, reviewer-style)
+/// and persists a landed title to the session sidecar.
+fn maybe_generate_title(
+    title_state: &Arc<Mutex<TitleState>>,
+    runtime: &ModelRuntime,
+    model: &PiModel,
+    session: &AgentSession,
+    sessions_dir: &Path,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    if !crate::settings::side_calls().title_policy().enabled {
+        return;
+    }
+    let lang = crate::settings::load().resolve().agent;
+    let (convo, user_count) = {
+        let state = title_state.lock().unwrap();
+        if state.in_flight {
+            return;
+        }
+        let messages = session.harness_messages();
+        let user_count = crate::title::count_user_messages(messages);
+        if state.last_eval_user_count == Some(user_count) {
+            return;
+        }
+        if state.title.is_some() && !crate::title::should_retitle(user_count) {
+            return;
+        }
+        let Some(convo) =
+            crate::title::build_title_messages(messages, state.title.as_deref(), lang)
+        else {
+            return;
+        };
+        (convo, user_count)
+    };
+    {
+        let mut state = title_state.lock().unwrap();
+        state.in_flight = true;
+        state.last_eval_user_count = Some(user_count);
+    }
+    let runtime = runtime.clone();
+    let model = model.clone();
+    let sessions_dir = sessions_dir.to_path_buf();
+    let session_path = session.path().to_path_buf();
+    let tx = notice_tx.clone();
+    let state = Arc::clone(title_state);
+    crate::runtime::handle().spawn(async move {
+        let result = crate::title::stream_title(&runtime, &model, convo).await;
+        // Surface every outcome (manox parity): failures used to vanish into
+        // a swallowed `if let Ok`, leaving the mechanical fallback with no
+        // trace in the logs.
+        match &result {
+            Ok(title) if title.is_empty() => {
+                tracing::warn!("title generation produced no usable text")
+            }
+            Ok(title) if crate::title::is_unchanged(title) => {
+                tracing::debug!("title unchanged by model")
+            }
+            Ok(title) => tracing::debug!(title = %title, "title updated"),
+            Err(e) => tracing::warn!(error = %format!("{e:?}"), "title generation stream failed"),
+        }
+        // Resolve the adoption under the lock, then persist outside it —
+        // the guard must not span the sidecar awaits.
+        let adopted = {
+            let mut state = state.lock().unwrap();
+            state.in_flight = false;
+            let adopted = matches!(&result, Ok(title)
+                if !title.is_empty() && !crate::title::is_unchanged(title));
+            if adopted {
+                state.title = result.as_ref().ok().cloned();
+            }
+            adopted
+        };
+        if adopted {
+            let title = result.unwrap_or_default();
+            let mut meta = pi_extensions::session_meta::load(&sessions_dir, &session_path)
+                .await
+                .unwrap_or_default();
+            meta.title = Some(title);
+            if let Err(err) =
+                pi_extensions::session_meta::save(&sessions_dir, &session_path, &meta).await
+            {
+                tracing::warn!(error = %err, "failed to persist session title");
+            }
+            let _ = tx.send(BackendNotice::SessionListDirty);
+        }
+    });
 }
 
 /// The approval mode persisted in a session's sidecar; fresh sessions

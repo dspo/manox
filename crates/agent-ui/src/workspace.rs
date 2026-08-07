@@ -2586,38 +2586,19 @@ impl Workspace {
     }
 
     /// Archive the active thread and navigate to a fresh empty one. Shared
-    /// by the `/exit` slash command and the `cmd-;` keybinding.
-    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
+    /// by the `/exit` slash command and the `cmd-;` keybinding. No-op while
+    /// a turn is running (a parked thread would strand pending verdicts).
     pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let archived = {
-            #[cfg(feature = "harness-manox")]
-            {
-                self.archive_active_thread_if_idle(cx)
-            }
-            #[cfg(not(feature = "harness-manox"))]
-            {
-                let id = self.thread.read(cx).id.0.clone();
-                let store = agent::thread_store_global();
-                store.update(cx, |s, cx| {
-                    s.archive_thread(&id, true, cx);
-                });
-                true
-            }
-        };
-        #[cfg(feature = "harness-manox")]
-        {
-            if !archived {
-                return;
-            }
-            self.start_new_thread(None, window, cx);
+        if !self.archive_active_thread_if_idle(cx) {
+            return;
         }
+        self.start_new_thread(None, window, cx);
     }
 
     /// Archive the active thread if it is idle; `false` when a turn is
     /// running (attaching would park the thread and clear `pending_ask`,
     /// stranding a user verdict). Marks the thread archived and persists via
     /// the store, which refreshes the sidebar list.
-    #[cfg(feature = "harness-manox")]
     fn archive_active_thread_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
         if self.thread.read(cx).is_running() {
             return false;
@@ -2634,7 +2615,6 @@ impl Workspace {
     /// `/new` starts a clean conversation without dropping the working
     /// context. No-op while a turn is running (see
     /// `archive_active_thread_if_idle`).
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn archive_current_thread_inheriting(
         &mut self,
         window: &mut Window,
@@ -2746,8 +2726,6 @@ impl Workspace {
         // while a turn is running is parked in the follow-up queue as raw text
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
-        // TODO(pi-wire): slash commands — manox registry feature.
-        #[cfg(feature = "harness-manox")]
         if !self.thread.read(cx).is_running()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
