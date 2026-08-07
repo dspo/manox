@@ -188,7 +188,7 @@ async fn main() {
         keep_recent_tokens: 10,
         ..Default::default()
     });
-    session.compact().await.expect("compact");
+    session.compact(None).await.expect("compact");
     session.prompt("continue the work").await.expect("prompt 2");
 
     let stats = session.stats().await.expect("stats");
