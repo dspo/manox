@@ -571,15 +571,12 @@ fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
         "copilot" => &["anthropic", "responses", "completions"],
         "claude" | "VS Code" => &["anthropic"],
         "codex" | "ChatGPT.app" => &["responses"],
-        // codex+ is a codex fork that additionally speaks anthropic/completions.
-        "codex+" => &["anthropic", "responses", "completions"],
         _ => &[],
     }
 }
 
 /// The resolved agent id universe: user agents (canonical, deduped, `codex`
-/// expanded into `codex` + `ChatGPT.app`, `claude` into `claude` + `VS Code`)
-/// plus the hidden built-in `codex+` unless the user defined it.
+/// expanded into `codex` + `ChatGPT.app`, `claude` into `claude` + `VS Code`).
 fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for agent in &config.agents {
@@ -599,9 +596,6 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
         } else {
             ids.push(id);
         }
-    }
-    if !ids.iter().any(|existing| existing == "codex+") {
-        ids.push("codex+".to_string());
     }
     ids
 }
@@ -874,16 +868,16 @@ providers:
     #[test]
     fn effective_agents_parity_with_cx_providers_rules() {
         let config: CxConfig = serde_yaml::from_str(FIXTURE).unwrap();
-        // anthropic endpoint, no filters: claude + VS Code + codex+
+        // anthropic endpoint, no filters: claude + VS Code
         // (codex/ChatGPT.app are responses-only; copilot unconfigured).
         assert_eq!(
             effective_agents(&config, "anthropic", &[], &[]),
-            vec!["claude", "VS Code", "codex+"]
+            vec!["claude", "VS Code"]
         );
-        // responses endpoint: codex expands to codex + ChatGPT.app, plus codex+.
+        // responses endpoint: codex expands to codex + ChatGPT.app.
         assert_eq!(
             effective_agents(&config, "responses", &[], &[]),
-            vec!["codex", "ChatGPT.app", "codex+"]
+            vec!["codex", "ChatGPT.app"]
         );
         // Model allow-list narrows.
         assert_eq!(
@@ -895,10 +889,10 @@ providers:
             effective_agents(
                 &config,
                 "anthropic",
-                &["claude".into(), "codex+".into()],
-                &["codex+".into()]
+                &["claude".into(), "VS Code".into()],
+                &["VS Code".into()]
             ),
-            vec!["codex+"]
+            vec!["VS Code"]
         );
         // Allow-list naming an absent agent yields empty.
         assert_eq!(
@@ -933,7 +927,7 @@ providers:
             .unwrap();
         assert_eq!(
             model.metadata.get("agents").unwrap(),
-            &serde_json::json!(["claude", "VS Code", "codex+"])
+            &serde_json::json!(["claude", "VS Code"])
         );
         assert_eq!(
             model.metadata.get("provider_display_name").unwrap(),

@@ -229,7 +229,7 @@ fn model_header_row() -> Line<'static> {
 /// Normalize a CLI-supplied agent name: case-insensitive, with alias collapsing.
 ///
 /// `CoDex.App` / `codexapp` / `codex_app` / `ChatGPT.App` / `chatgptapp` all resolve
-/// to the `ChatGPT.app` agent; the remaining ids (`claude`, `codex`, `copilot`, `codex+`)
+/// to the `ChatGPT.app` agent; the remaining ids (`claude`, `codex`, `copilot`)
 /// are lowercased verbatim. This only touches user-facing input — internal config/registry
 /// ids are already canonical.
 fn canonicalize_agent_name(input: &str) -> String {
@@ -625,7 +625,7 @@ fn extract_reasoning_effort(existing: Option<&str>) -> Option<String> {
 }
 
 /// 把 `WireApi` 映射成 codex 家族 config.toml 的 `wire_api` 词汇。
-/// codex / codex+ 读取的规范值为 `responses` / `chat_completions` / `anthropic_messages`，
+/// codex（ChatGPT.app 引擎）读取的规范值为 `responses` / `chat_completions` / `anthropic_messages`，
 /// 与 cx 内部 `WireApi::launch_value()`（供 copilot 的 `COPILOT_PROVIDER_WIRE_API` 使用，
 /// 值为 `responses` / `completions` / `anthropic`）不同，故单独提供。
 fn codex_wire_api_str(wire_api: WireApi) -> Result<&'static str> {
@@ -2384,7 +2384,7 @@ fn build_launch_spec(
                 }
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" | "codex+" => {
+            "codex" => {
                 if let Some(value) = provider
                     .apikey_source
                     .as_ref()
@@ -2469,7 +2469,7 @@ fn build_launch_spec(
                 args.push(api_model_id.to_string());
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" | "codex+" => {
+            "codex" => {
                 prepare_codex_launch_home(
                     model,
                     provider,
@@ -3689,7 +3689,7 @@ impl AppState {
         resolved_agents(&self.config)
     }
 
-    /// 用户可见的 agent 列表（过滤掉内置隐藏 agent 如 codex+）。
+    /// 用户可见的 agent 列表（过滤掉 hidden agent）。
     fn visible_agents(&self) -> Vec<ResolvedAgent> {
         self.resolved_agents()
             .into_iter()
@@ -4422,7 +4422,6 @@ mod tests {
         assert_eq!(canonicalize_agent_name("chatgpt.app"), "ChatGPT.app");
         assert_eq!(canonicalize_agent_name("CHATGPTAPP"), "ChatGPT.app");
         assert_eq!(canonicalize_agent_name("chatgpt_app"), "ChatGPT.app");
-        assert_eq!(canonicalize_agent_name("CODEX+"), "codex+");
         assert_eq!(canonicalize_agent_name("Claude"), "claude");
         assert_eq!(canonicalize_agent_name("vscode"), "VS Code");
         assert_eq!(canonicalize_agent_name("VS Code"), "VS Code");
@@ -5719,7 +5718,7 @@ trust_level = "trusted"
 
     #[test]
     fn codex_wire_api_str_maps_to_codex_family_vocabulary() {
-        // codex / codex+ 的 config.toml 使用 responses / chat_completions / anthropic_messages，
+        // ChatGPT.app 引擎的 config.toml 使用 responses / chat_completions / anthropic_messages，
         // 而非 cx 内部 copilot 用的 completions / anthropic。
         assert_eq!(codex_wire_api_str(WireApi::Responses).unwrap(), "responses");
         assert_eq!(
@@ -5734,8 +5733,8 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn merge_codex_config_writes_codex_family_wire_api_for_codex_plus() {
-        // codex+ 支持 3 种 wire api；config.toml 必须写出 codex 家族词汇。
+    fn merge_codex_config_writes_codex_family_wire_api() {
+        // config.toml 必须写出 codex 家族词汇（responses / chat_completions / anthropic_messages）。
         let merged = merge_codex_config(
             None,
             &test_resolved_model(
@@ -5928,56 +5927,6 @@ trust_level = "trusted"
             parse_model_context_suffix("model[1m123k]"),
             ("model", Some(1_123_000))
         );
-    }
-
-    #[test]
-    fn codex_plus_is_builtin_hidden_and_resolvable() {
-        // 不在默认 agent 配置里（不写入用户 YAML）。
-        assert!(default_agent_configs().iter().all(|a| a.id != "codex+"));
-
-        let config = CxConfig {
-            providers: vec![],
-            agents: default_agent_configs(),
-        };
-        let agents = resolved_agents(&config);
-
-        // codex+ 由 resolved_agents 追加，且标记为 hidden。
-        let codex_plus = agents.iter().find(|a| a.id == "codex+");
-        assert!(codex_plus.is_some(), "codex+ 应由 resolved_agents 内置追加");
-        assert!(codex_plus.unwrap().hidden, "codex+ 应标记为 hidden");
-        assert_eq!(
-            codex_plus.unwrap().supported_wire_apis,
-            vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions]
-        );
-        assert_eq!(codex_plus.unwrap().binary, "codex+");
-
-        // 用户可见列表与 add 向导均过滤掉 codex+。
-        assert!(
-            available_agents_for_add(&config)
-                .iter()
-                .all(|a| a.id != "codex+")
-        );
-
-        // find_agent 仍能命中 codex+（显式 `cx codex+` 可进入）。
-        assert!(find_agent(&config, "codex+").is_some());
-    }
-
-    #[test]
-    fn codex_plus_can_see_models_via_supports_agent() {
-        // 回归：visible_agents 字段同时供 supports_agent 做模型过滤，
-        // 不能因「隐藏」而把 codex+ 从中剔除，否则 `cx codex+` 进任何 provider 都看不到模型。
-        let config = multi_wire_api_test_config();
-        let models = build_all_models(&config);
-        assert!(!models.is_empty(), "测试配置应产出模型");
-        // codex+ 支持 anthropic / responses / completions，该 provider 下所有模型都应可见。
-        for model in &models {
-            assert!(
-                resolved_model_supports_agent(model, "codex+"),
-                "codex+ 应能看到模型 {} (wire_api={:?})",
-                model.id,
-                model.wire_api
-            );
-        }
     }
 
     #[test]

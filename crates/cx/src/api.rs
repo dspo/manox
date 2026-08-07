@@ -33,7 +33,6 @@ pub enum Agent {
     Claude,
     Codex,
     Copilot,
-    CodexPlus,
 }
 
 impl Agent {
@@ -43,7 +42,6 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Copilot => "copilot",
-            Agent::CodexPlus => "codex+",
         }
     }
 }

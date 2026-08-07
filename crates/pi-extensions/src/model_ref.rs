@@ -196,7 +196,7 @@ mod tests {
         let registry = pi::ProviderRegistry::new();
         register(&registry, "open-model", None);
         register(&registry, "claude-only", Some(json!(["claude"])));
-        register(&registry, "codex-only", Some(json!(["codex+"])));
+        register(&registry, "codex-only", Some(json!(["codex"])));
         register(&registry, "hidden", Some(json!([])));
         let model = |id: &str| registry.models().into_iter().find(|m| m.id == id).unwrap();
         // Missing metadata (no visibility notes) is visible to everyone.

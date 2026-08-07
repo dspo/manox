@@ -907,8 +907,9 @@ fn keychain_secret(service: &str) -> Result<String> {
 // ═══════════════════════════════════════════════════
 
 /// A fully resolved, launchable agent. Built from `AgentConfig` (user YAML) plus
-/// built-in hidden agents (e.g. `codex+`) that `resolved_agents` appends
-/// unconditionally. `cx` consumes this for TUI selection + launch wiring; the
+/// expansion performed by `resolved_agents` (`codex` → CLI + `ChatGPT.app`,
+/// `claude` → CLI + `VS Code`). `cx` consumes this for TUI selection + launch
+/// wiring; the
 /// `visible_agents` field of `ResolvedModel` is derived from it via
 /// `effective_agents_for_model`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -918,9 +919,8 @@ pub struct ResolvedAgent {
     pub args: Vec<String>,
     pub supported_wire_apis: Vec<WireApi>,
     pub env: BTreeMap<String, String>,
-    /// Built-in hidden agent (e.g. `codex+`): not shown in the default agent list,
-    /// surfaced only on explicit `cx <id>`. Appended by `resolved_agents`, never
-    /// written to user config.
+    /// Hidden agent: not shown in the default agent list / add wizard.
+    /// No built-in currently sets this; the mechanism is kept for future use.
     pub hidden: bool,
 }
 
@@ -982,9 +982,6 @@ pub fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
         "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         "claude" | "VS Code" => vec![WireApi::Anthropic],
         "codex" | "ChatGPT.app" => vec![WireApi::Responses],
-        // codex+ is a codex fork that additionally supports anthropic / completions.
-        // Only entered on explicit `cx codex+`; not written to the default agents list.
-        "codex+" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         _ => Vec::new(),
     }
 }
@@ -995,22 +992,8 @@ pub fn resolve_agent_wire_apis(agent_id: &str, _configured: &[String]) -> Vec<Wi
     default_wire_apis_for_agent(agent_id)
 }
 
-/// Built-in hidden agents: not written to user YAML, appended unconditionally by
-/// `resolved_agents` (unless the user already defined a same-named entry, which
-/// takes precedence and un-hides it).
-pub fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
-    vec![AgentConfig {
-        id: "codex+".into(),
-        binary: "codex+".into(),
-        args: Vec::new(),
-        wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
-        env: BTreeMap::new(),
-    }]
-}
-
 /// All resolved agents: user-configured agents (with `codex` expanded into `codex`
-/// CLI + `ChatGPT.app` desktop entries) plus built-in hidden agents appended
-/// unconditionally (skipped if the user already defined a same-named entry).
+/// CLI + `ChatGPT.app` desktop entries, `claude` into `claude` + `VS Code`).
 pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
     let mut agents = Vec::new();
     for agent in &config.agents {
@@ -1072,26 +1055,6 @@ pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 hidden: false,
             });
         }
-    }
-
-    // Append built-in hidden agents (not in user YAML). Skip if the user already
-    // defined a same-named entry, to respect their explicit config (which un-hides it).
-    for builtin in builtin_hidden_agent_configs() {
-        let id = canonical_agent_id(&builtin.id).to_string();
-        if agents
-            .iter()
-            .any(|existing: &ResolvedAgent| existing.id == id)
-        {
-            continue;
-        }
-        agents.push(ResolvedAgent {
-            id: id.clone(),
-            binary: builtin.binary.clone(),
-            args: builtin.args.clone(),
-            supported_wire_apis: default_wire_apis_for_agent(&id),
-            env: builtin.env.clone(),
-            hidden: true,
-        });
     }
 
     agents
@@ -1714,7 +1677,6 @@ agents:
         let resolved = config.resolve_all_models();
         assert_eq!(resolved.len(), 1);
         // claude + copilot support the anthropic wire; codex (responses-only) does not.
-        // codex+ (builtin hidden) also supports anthropic, so it appears too.
         assert!(
             resolved[0].visible_agents.contains(&"claude".to_string()),
             "empty filters must not zero out visible_agents; got {:?}",
