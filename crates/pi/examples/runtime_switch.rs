@@ -59,7 +59,7 @@ impl StreamFn for ProviderA {
             assistant(
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
-                    name: "read".into(),
+                    name: "Read".into(),
                     input: serde_json::json!({ "path": "hello.txt" }),
                     thought_signature: None,
                 }],
@@ -152,6 +152,9 @@ fn build_resolver(
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.jsonl");
+    // The file the mock's `Read` call targets; tools run against the
+    // tempdir via `with_tool_cwd` below.
+    std::fs::write(dir.path().join("hello.txt"), "hello from disk\n").expect("write hello.txt");
     let meta = JsonlSessionMetadata {
         id: uuid::Uuid::new_v4().to_string(),
         cwd: std::env::current_dir()
@@ -185,7 +188,8 @@ async fn main() {
         Arc::clone(&provider_a),
     )
     .with_stream_resolver(resolver)
-    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]));
+    .with_tools(Arc::from(vec![Arc::new(ReadTool) as Arc<dyn AgentTool>]))
+    .with_tool_cwd(dir.path().to_path_buf());
 
     // Mid-run switch to provider B on the first TurnEnd.
     let handle = harness.handle();
@@ -218,6 +222,18 @@ async fn main() {
             ..
         } if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "provider B done"))
     )));
+    // Regression guard (#430): the mounted `Read` tool must actually execute —
+    // a silent "Tool not found" would defeat this example's purpose.
+    assert!(
+        messages.iter().any(|m| matches!(
+            m,
+            AgentMessage::ToolResult {
+                is_error: false,
+                ..
+            }
+        )),
+        "the Read tool must execute without error"
+    );
     drop(harness);
     drop(_sub);
 

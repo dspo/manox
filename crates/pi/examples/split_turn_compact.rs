@@ -111,7 +111,7 @@ async fn main() {
         AgentMessage::Assistant {
             content: vec![ContentBlock::ToolUse {
                 id: "t1".into(),
-                name: "read".into(),
+                name: "Read".into(),
                 input: serde_json::json!({ "path": "x".repeat(500) }),
                 thought_signature: None,
             }],
@@ -132,7 +132,7 @@ async fn main() {
         },
         AgentMessage::ToolResult {
             tool_call_id: "t1".into(),
-            tool_name: "read".into(),
+            tool_name: "Read".into(),
             content: vec![ContentBlock::Text {
                 text: "y".repeat(500),
                 signature: None,
