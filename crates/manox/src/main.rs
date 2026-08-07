@@ -308,7 +308,7 @@ fn main() {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, window, cx| {
                         workspace.update(cx, |ws, cx| {
-                            ws.launch_vscode_app(provider, model, window, cx)
+                            ws.launch_vscode_app(provider, model, None, window, cx)
                         });
                     });
                 }

@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use std::rc::Rc;
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,7 +71,6 @@ use crate::cockpit::CockpitPhase;
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::external_session::{ExternalSession, SessionKind};
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::browser_view::BrowserView;
@@ -520,7 +518,6 @@ pub struct Workspace {
 /// of the conversation. Future overlays can extend this enum rather than
 /// carrying parallel `bool` flags.
 #[derive(Default)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 enum ViewMode {
     #[default]
     Workspace,
@@ -1294,10 +1291,6 @@ impl Workspace {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
-                // The external-CLI session subsystem stays with the retired
-                // manox harness; the pi build hides its entries and ignores
-                // the events.
-                #[cfg(feature = "harness-manox")]
                 SidebarEvent::SpawnExternalSession(kind, provider, model, project) => {
                     this.spawn_external_session(
                         *kind,
@@ -1308,17 +1301,23 @@ impl Workspace {
                         cx,
                     );
                 }
-                // The external-CLI session subsystem stays with the retired
-                // manox harness; the pi build hides its entries and ignores
-                // the events.
-                #[cfg(feature = "harness-manox")]
+                SidebarEvent::LaunchVSCode(provider, model, project) => {
+                    // VS Code opens the project directory the menu was launched
+                    // from; from the Conversations header (no project) it
+                    // falls back to the workspace cwd — the same directory a
+                    // fresh session runs in.
+                    let folder = project.clone().unwrap_or_else(|| this.cwd.clone());
+                    this.launch_vscode_app(
+                        provider.clone(),
+                        model.clone(),
+                        Some(folder),
+                        window,
+                        cx,
+                    );
+                }
                 SidebarEvent::OpenExternalSession(id) => {
                     this.attach_external_session(id, window, cx);
                 }
-                // The external-CLI session subsystem stays with the retired
-                // manox harness; the pi build hides its entries and ignores
-                // the events.
-                #[cfg(feature = "harness-manox")]
                 SidebarEvent::ArchiveExternalSession(id) => {
                     this.close_external_session(id, cx);
                 }
@@ -1339,15 +1338,6 @@ impl Workspace {
                         this.start_new_thread(None, window, cx);
                     }
                 }
-                // Explicit no-ops (not a wildcard) so a future SidebarEvent
-                // variant fails compilation in both builds instead of being
-                // silently swallowed in one.
-                #[cfg(not(feature = "harness-manox"))]
-                SidebarEvent::SpawnExternalSession { .. } => {}
-                #[cfg(not(feature = "harness-manox"))]
-                SidebarEvent::OpenExternalSession(_) => {}
-                #[cfg(not(feature = "harness-manox"))]
-                SidebarEvent::ArchiveExternalSession(_) => {}
             },
         )
     }
@@ -1486,7 +1476,6 @@ impl Workspace {
     /// `project_cwd` is `Some(path)` when launched from a project folder's `+`
     /// button — the CLI runs in that project's directory. `None` uses the
     /// workspace's default cwd.
-    #[cfg(feature = "harness-manox")]
     pub fn spawn_external_session(
         &mut self,
         kind: SessionKind,
@@ -1639,8 +1628,11 @@ impl Workspace {
         .detach();
     }
 
-    /// Launch VS Code with Claude Code BYOK env injected (工具 → VS Code →
-    /// provider → model cascade). Same background-spawn + notification shape
+    /// Launch VS Code with Claude Code BYOK env injected (工具 → VS Code
+    /// cascade and the sidebar new-session menu's VS Code entry). `folder`
+    /// is `Some` when the launch should open a directory (the sidebar passes
+    /// the project path or the workspace cwd); the 工具 menu passes `None`
+    /// for a folder-less launch. Same background-spawn + notification shape
     /// as `launch_chatgpt_app`; the cx injection path may block on login-shell
     /// env resolution and — when VS Code is already running — on the restart
     /// confirmation + graceful quit wait.
@@ -1648,6 +1640,7 @@ impl Workspace {
         &mut self,
         provider: String,
         model: String,
+        folder: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1655,9 +1648,9 @@ impl Workspace {
             let launch_provider = provider.clone();
             let launch_model = model.clone();
             let result = cx
-                .background_spawn(
-                    async move { cx::launch_vscode_app(&launch_provider, &launch_model) },
-                )
+                .background_spawn(async move {
+                    cx::launch_vscode_app(&launch_provider, &launch_model, folder.as_deref())
+                })
                 .await;
             let _ = this.update_in(cx, |_, window, cx| match result {
                 Ok(()) => {
@@ -1723,7 +1716,6 @@ impl Workspace {
     /// because the `ExternalSession` owns the live `TerminalView` + handle.
     /// Focuses the terminal view on the next frame so the user can type
     /// immediately without clicking into the TUI.
-    #[cfg(feature = "harness-manox")]
     pub fn attach_external_session(
         &mut self,
         id: &str,
@@ -1752,7 +1744,6 @@ impl Workspace {
     /// the `TerminalView` element is mounted (the view-mode flip schedules a
     /// re-render) before the focus is set — GPUI can't focus an element that
     /// hasn't rendered its `track_focus` yet.
-    #[cfg(feature = "harness-manox")]
     fn focus_external_view(
         &self,
         view: Entity<terminal_ui::TerminalView>,
@@ -1769,7 +1760,6 @@ impl Workspace {
     /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
     /// the titlebar when the active session's title changed. No-op when the
     /// session was already removed (a spurious title after close).
-    #[cfg(feature = "harness-manox")]
     fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
         let active = self.active_external.as_deref() == Some(id);
         let new = title.as_deref().filter(|t| !t.is_empty());
@@ -1784,7 +1774,6 @@ impl Workspace {
             true
         });
         if changed {
-            #[cfg(feature = "harness-manox")]
             self.sync_sidebar_external(cx);
             if active {
                 cx.notify();
@@ -1798,7 +1787,6 @@ impl Workspace {
     /// already-dead child is best-effort (warn-logged). Removal itself —
     /// including sidebar sync + fallback-to-conversation — is shared with the
     /// natural-exit path in [`remove_external_session`].
-    #[cfg(feature = "harness-manox")]
     pub fn close_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let kill_handle = self
             .external_sessions
@@ -1820,7 +1808,6 @@ impl Workspace {
     /// drops, and cx's `SessionHandle::Drop` does best-effort reap + socket
     /// cleanup. If the removed session was the active one, fall back to the
     /// conversation pane.
-    #[cfg(feature = "harness-manox")]
     fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.active_external.as_deref() == Some(id);
         self.external_sessions.retain(|s| s.id != id);
@@ -1834,7 +1821,6 @@ impl Workspace {
     /// Push a fresh projection of the live external sessions to the sidebar so
     /// its "External" section reflects spawns / closes without owning the
     /// PTY-bearing structs.
-    #[cfg(feature = "harness-manox")]
     fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
         let summaries: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
         self.sidebar

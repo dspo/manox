@@ -13,7 +13,6 @@ sidebar-section-conversations = Conversations
 sidebar-section-external = External
 sidebar-new-session-label = New session
 sidebar-new-session-manox = Manox
-sidebar-new-session-pi = New Conversation
 sidebar-close-external = Close session
 sidebar-archive = Archive
 external-wizard-no-model = No model configured for this agent

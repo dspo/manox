@@ -1213,18 +1213,20 @@ fn resolve_vscode_apikey_interactive(provider: &ResolvedProvider) -> Result<Stri
 }
 
 /// 非交互启动 VS Code 并注入 Claude Code BYOK env：显式指定 provider 与模型，
-/// 无 TUI。供 GUI 嵌入方（manox 系统菜单「工具 → VS Code」级联）调用。
+/// 无 TUI。供 GUI 嵌入方（manox 系统菜单「工具 → VS Code」级联、侧边栏
+/// 新建会话菜单的 VS Code 项）调用。`folder` 为 `Some` 时新实例直接打开该
+/// 目录（侧边栏项目路径）；系统菜单路径传 `None`。
 /// 机制见 `vscode_app` 模块：解析登录 shell env 后以最高优先级叠加 BYOK env，
 /// 带 VSCODE_CLI=1 启动，令扩展宿主 / Claude Code 扩展 / 集成终端继承注入值。
 /// 阻塞调用（shell 解析至多 10s；VS Code 运行中时含确认与退出等待，至多约
 /// 60s+），调用方应在后台线程执行。
-pub fn launch_vscode_app(provider_name: &str, model_id: &str) -> Result<()> {
+pub fn launch_vscode_app(provider_name: &str, model_id: &str, folder: Option<&Path>) -> Result<()> {
     let config = load_config()?;
     let mut all_models = build_all_models(&config);
     apply_probe_cache(&mut all_models);
     let selection = build_vscode_selection(&config, &all_models, provider_name, model_id)?;
     let apikey = resolve_vscode_apikey(&selection.provider)?;
-    vscode_app::launch(&selection, &apikey)
+    vscode_app::launch(&selection, &apikey, folder)
 }
 
 /// 普通启动 VS Code（等效 Dock 正常打开）。供 manox
@@ -1599,7 +1601,7 @@ fn run_launcher(
         }
         let apikey = resolve_vscode_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
-        return vscode_app::launch(&selection, &apikey);
+        return vscode_app::launch(&selection, &apikey, None);
     }
 
     let spec = build_launch_spec(&selection, &passthrough_args, pty, socket, cwd)?;
