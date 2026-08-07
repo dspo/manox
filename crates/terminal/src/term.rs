@@ -355,6 +355,19 @@ impl Terminal {
         cx.notify();
     }
 
+    /// Scroll the display to the offset implied by a scrollbar drag at
+    /// `fraction` down the track (0 = top / oldest scrollback, 1 = bottom /
+    /// live edge). alacritty clamps the resulting offset to the history.
+    pub fn scroll_to_fraction(&self, fraction: f32, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| {
+            let history = t.grid().history_size();
+            let target = ((1. - fraction.clamp(0., 1.)) * history as f32).round() as i32;
+            let current = t.grid().display_offset() as i32;
+            t.scroll_display(Scroll::Delta(target - current));
+        });
+        cx.notify();
+    }
+
     /// Forward a mouse-wheel scroll to the PTY as xterm mouse reports, so a TUI
     /// app that captures the mouse (claude code / vim / htop) scrolls its own
     /// viewport instead of the (no-op, alt-screen) local scrollback. `delta_lines`

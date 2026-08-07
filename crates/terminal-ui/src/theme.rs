@@ -8,7 +8,9 @@ use gpui::Hsla;
 use gpui_component::Theme;
 use terminal::{Color, NamedColor, Rgb};
 
-/// Resolved terminal palette used by the renderer.
+/// Resolved terminal palette used by the renderer. Compared by the view to
+/// bust the shaped-line cache on a theme switch.
+#[derive(Clone, PartialEq)]
 pub struct TerminalTheme {
     pub default_fg: Hsla,
     pub default_bg: Hsla,

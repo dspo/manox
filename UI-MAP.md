@@ -989,7 +989,7 @@ Full-window terminal emulator.
 
 #### TerminalView
 
-Root view, `size_full`. Owns the focus handle; `focus(&self, window, cx)` is called after spawning/attaching/switching an external-agent session so the TUI receives keystrokes immediately. The focused root intercepts `tab` / `shift-tab` (when no search overlay is open) and forwards them to the PTY as `\t` / `\x1b[Z` with `stop_propagation`, so tab never escapes into GPUI focus traversal. Mouse-wheel events are forwarded to the PTY as xterm mouse reports when a TUI app captures the mouse (e.g. claude code / vim / htop), so its own viewport scrolls; otherwise the local scrollback scrolls.
+Root view, `size_full`. Owns the focus handle; `focus(&self, window, cx)` is called after spawning/attaching/switching an external-agent session so the TUI receives keystrokes immediately. The focused root intercepts `tab` / `shift-tab` (when no search overlay is open) and forwards them to the PTY as `\t` / `\x1b[Z` with `stop_propagation`, so tab never escapes into GPUI focus traversal. Mouse-wheel events are forwarded to the PTY as xterm mouse reports when a TUI app captures the mouse (e.g. claude code / vim / htop), so its own viewport scrolls; on the alt screen without mouse capture the wheel becomes arrow-key presses (xterm alternateScroll, DECRST 1007 permitting); otherwise the local scrollback scrolls. Click count picks selection granularity (1 = char, 2 = semantic word, 3 = line). Hovering text tracks a target — OSC 8 hyperlink span first, else a semantic word that looks like a URL or a path (`:` is not a word separator, so URLs hover whole): the grid underlines the span, a tooltip anchored under the span shows the target text, and cmd/ctrl+click opens it (URLs in the browser; paths revealed in the file manager — directories open, `~` expands, relative paths resolve against the terminal cwd). Overlay chips: a starting indicator at the top right until the shell/agent TUI reports ready (OSC 6973 marker tap, output-quiet window, or fallback timeout), and the foreground process name at the bottom right while something other than the shell owns the foreground process group (1s poll). OSC 10/11/12 color queries are answered from the active theme. The cursor blinks per the `cursor_blink` setting (`off` / `on` / `terminal` = follow the program's DECSET 12/DECSCUSR flag) on a 530ms phase timer; selection, IME preedit, and input within the last 500ms pin it visible. A 2px scrollbar (8px hit area) shows at the right edge while scrollback exists; click/drag maps the y fraction onto the display offset, sharing `display_offset` with wheel/vi scrolling.
 
 > Source: `terminal-ui/src/terminal_view.rs`
 
@@ -1001,7 +1001,7 @@ Tab bar for multiple terminal tabs.
 
 #### TerminalGrid
 
-Monospace grid renderer, `flex_1`.
+Monospace grid renderer, `flex_1`. Shapes text runs per line through a content-fingerprint cache (`layout_cache::LineShapeCache`, keyed by alacritty grid line + FNV-1a over each line's cells) so frames that repaint unchanged lines skip `shape_line`; a theme switch clears the cache and a per-frame sweep bounds it to the visible window. The cursor glyph honors the program's DECSCUSR shape (block / underline / beam / hollow-block / hidden) and is skipped on blinked-out phases. The scrollbar track/thumb quads paint here; the element writes the track bounds back to the view for hit-testing.
 
 > Source: `terminal-ui/src/terminal_view.rs`
 

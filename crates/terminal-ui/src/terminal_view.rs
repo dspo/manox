@@ -10,8 +10,10 @@
 //! written to the PTY and the in-flight marked text is painted inline at the
 //! cursor.
 
+use std::cell::{Cell as SharedCell, RefCell};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,8 +21,8 @@ use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Subscription, Task,
-    UTF16Selection, Window, div, px, rgba,
+    Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Styled, Subscription, Task,
+    UTF16Selection, Window, div, point, px, rgba, size,
 };
 use gpui_component::ActiveTheme as _;
 use terminal::alacritty_terminal::selection::SelectionType;
@@ -33,6 +35,7 @@ use terminal::{HoverKind, HoverTarget, Rgb, Terminal};
 
 use crate::blink::CursorBlink;
 use crate::element::TerminalElement;
+use crate::layout_cache::LineShapeCache;
 use crate::theme::{TerminalTheme, color_for_request, hsla_to_rgb};
 
 /// In-flight `/pattern` search state — the pattern, the grid-coordinate match
@@ -94,6 +97,17 @@ pub struct TerminalView {
     /// The hoverable target under the mouse (OSC 8 link / URL / path).
     /// `None` while selecting or while the TUI captures the mouse.
     hover: Option<HoverTarget>,
+    /// Per-line shaped-run cache shared with the element (rebuilt per render,
+    /// so the cache lives here). Cleared on theme change.
+    shape_cache: Rc<RefCell<LineShapeCache<ShapedLine>>>,
+    /// The theme the shaped-run cache was built against; a switch clears it.
+    cache_theme: Option<TerminalTheme>,
+    /// Scrollbar track bounds in window space, written by the element each
+    /// prepaint (`None` without scrollback); mouse input is hit-tested
+    /// against it.
+    scrollbar_track: Rc<SharedCell<Option<Bounds<Pixels>>>>,
+    /// True while the scrollbar thumb is being dragged.
+    scrollbar_dragging: bool,
 }
 
 impl TerminalView {
@@ -131,6 +145,10 @@ impl TerminalView {
             _blink_task: None,
             last_input_at: None,
             hover: None,
+            shape_cache: Rc::new(RefCell::new(LineShapeCache::new())),
+            cache_theme: None,
+            scrollbar_track: Rc::new(SharedCell::new(None)),
+            scrollbar_dragging: false,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
@@ -385,6 +403,20 @@ impl TerminalView {
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Scrollbar hit area: the 2px track plus 3px on each side. A press
+        // jumps the display to the clicked fraction and starts a drag.
+        if let Some(track) = self.scrollbar_track.get() {
+            let hit = Bounds::new(
+                point(track.origin.x - px(3.), track.origin.y),
+                size(track.size.width + px(6.), track.size.height),
+            );
+            if hit.contains(&ev.position) {
+                self.scrollbar_dragging = true;
+                self.scroll_to_track_y(ev.position.y, cx);
+                return;
+            }
+        }
+
         let (row, col) = self.px_to_grid(ev.position, window);
 
         // cmd/ctrl+click opens the target under the cursor: an OSC 8
@@ -437,6 +469,10 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_dragging {
+            self.scroll_to_track_y(ev.position.y, cx);
+            return;
+        }
         if self.selecting {
             let (row, col) = self.px_to_grid(ev.position, window);
             self.terminal
@@ -478,6 +514,10 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_dragging {
+            self.scrollbar_dragging = false;
+            return;
+        }
         if self.selecting {
             self.finalize_selection(cx);
             return;
@@ -601,6 +641,14 @@ impl Render for TerminalView {
             None
         };
 
+        // A theme switch invalidates every cached shaped line (run colors are
+        // baked at shape time).
+        let theme = TerminalTheme::from_app_theme(cx.theme());
+        if self.cache_theme.as_ref() != Some(&theme) {
+            self.shape_cache.borrow_mut().clear();
+            self.cache_theme = Some(theme.clone());
+        }
+
         let mut content = div()
             .flex_1()
             .w_full()
@@ -616,7 +664,7 @@ impl Render for TerminalView {
                 terminal: self.terminal.clone(),
                 view: cx.entity(),
                 focus_handle: self.focus_handle.clone(),
-                theme: TerminalTheme::from_app_theme(cx.theme()),
+                theme,
                 font: self.font.clone(),
                 font_size: self.font_size,
                 line_height: self.line_height,
@@ -625,6 +673,8 @@ impl Render for TerminalView {
                 active_match,
                 hover: self.hover.clone(),
                 cursor_visible: self.cursor_visible(cx),
+                shape_cache: self.shape_cache.clone(),
+                scrollbar_track: self.scrollbar_track.clone(),
             });
         if let Some(o) = overlay {
             content = content.child(o);
@@ -848,6 +898,32 @@ impl TerminalView {
     /// to decide whether to register the window-level mouse-up listener.
     pub(crate) fn is_selecting(&self) -> bool {
         self.selecting
+    }
+
+    /// Whether a scrollbar drag is in flight; like `is_selecting`, the element
+    /// reads it to register the window-level mouse-up listener.
+    pub(crate) fn is_scrollbar_dragging(&self) -> bool {
+        self.scrollbar_dragging
+    }
+
+    /// End a scrollbar drag. Idempotent: the div's `on_mouse_up` and the
+    /// window-level listener both route here.
+    pub(crate) fn end_scrollbar_drag(&mut self) {
+        self.scrollbar_dragging = false;
+    }
+
+    /// Map a window-space y onto the scrollbar track fraction and scroll the
+    /// display to the matching offset.
+    fn scroll_to_track_y(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(track) = self.scrollbar_track.get() else {
+            return;
+        };
+        if track.size.height <= px(0.) {
+            return;
+        }
+        let fraction = ((y - track.origin.y) / track.size.height).clamp(0., 1.);
+        self.terminal
+            .update(cx, |t, cx| t.scroll_to_fraction(fraction, cx));
     }
 
     /// Record the element's window-space bounds (written back by the element
