@@ -1060,26 +1060,26 @@ pub(crate) mod adapt {
                 .map(str::to_string)
         };
         match name {
-            "read" | "write" | "ls" => match arg("path") {
+            "Read" | "Write" | "Ls" => match arg("path") {
                 Some(path) => format!("{name} {path}"),
                 None => name.to_string(),
             },
-            "edit" | "edit_diff" => match arg("path") {
+            "Edit" | "edit_diff" => match arg("path") {
                 Some(path) => format!("edit {path}"),
                 None => "edit".to_string(),
             },
-            "grep" => match (arg("pattern"), arg("path")) {
+            "Grep" => match (arg("pattern"), arg("path")) {
                 (Some(pattern), Some(path)) => format!("grep {pattern} {path}"),
                 (Some(pattern), None) => format!("grep {pattern}"),
-                _ => "grep".to_string(),
+                _ => "Grep".to_string(),
             },
-            "find" => match arg("pattern") {
+            "Find" => match arg("pattern") {
                 Some(pattern) => format!("find {pattern}"),
-                None => "find".to_string(),
+                None => "Find".to_string(),
             },
-            "bash" => match arg("command") {
+            "Bash" => match arg("command") {
                 Some(command) => format!("$ {command}"),
-                None => "bash".to_string(),
+                None => "Bash".to_string(),
             },
             "bash_output" => "bash output".to_string(),
             "task_stop" => "stop task".to_string(),

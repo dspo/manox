@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn bash_execution_omits_unset_optional_fields() {
         let msg = AgentMessage::BashExecution {
-            command: "Ls".into(),
+            command: "ls".into(),
             output: String::new(),
             exit_code: None,
             cancelled: true,
