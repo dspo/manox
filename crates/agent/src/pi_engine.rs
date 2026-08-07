@@ -1064,7 +1064,7 @@ pub(crate) mod adapt {
                 Some(path) => format!("{name} {path}"),
                 None => name.to_string(),
             },
-            "Edit" | "edit_diff" => match arg("path") {
+            "Edit" | "EditDiff" => match arg("path") {
                 Some(path) => format!("edit {path}"),
                 None => "edit".to_string(),
             },
@@ -1081,9 +1081,9 @@ pub(crate) mod adapt {
                 Some(command) => format!("$ {command}"),
                 None => "Bash".to_string(),
             },
-            "bash_output" => "bash output".to_string(),
-            "task_stop" => "stop task".to_string(),
-            "agent" => match arg("subagent_type") {
+            "BashOutput" => "bash output".to_string(),
+            "TaskStop" => "stop task".to_string(),
+            "Agent" => match arg("subagent_type") {
                 Some(kind) => format!("agent {kind}"),
                 None => "agent".to_string(),
             },
