@@ -1054,7 +1054,15 @@ fn model_window_tokens(model_name: &str) -> Option<u64> {
     }
     #[cfg(not(feature = "harness-manox"))]
     {
-        agent::pi_providers::global()
+        let registry = agent::pi_providers::global();
+        // per_model keys are composite "{provider}/{model_id}"; resolve O(1).
+        // Bare ids (legacy keys) fall through to the scan below.
+        if let Some((provider, id)) = model_name.split_once('/')
+            && let Some(m) = registry.resolve_model(provider, id)
+        {
+            return Some(m.context_window as u64);
+        }
+        registry
             .models()
             .iter()
             .find(|m| {
