@@ -335,7 +335,7 @@ async fn run_actor(
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
-    let Some(pi_model) = model.or_else(crate::pi_providers::default_model) else {
+    let Some(mut pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
@@ -507,15 +507,18 @@ async fn run_actor(
             SessionCmd::Abort => {
                 session.abort();
             }
-            SessionCmd::SetModel(pi_model) => {
+            SessionCmd::SetModel(new_model) => {
                 // Streams dispatch by `model.provider` through the shared
                 // registry, so a cross-provider switch reaches the right
                 // endpoint + credential (the old bridge captured the
                 // initial model's credential for every later model).
-                if let Err(err) = session.set_model(pi_model.clone()).await {
+                if let Err(err) = session.set_model(new_model.clone()).await {
                     tracing::warn!("pi set_model failed: {err}");
                 }
-                *state.model.lock().unwrap() = Some(pi_model);
+                // Keep the actor's working model in sync: Open/NewSession
+                // below build sessions with it.
+                pi_model = new_model.clone();
+                *state.model.lock().unwrap() = Some(new_model);
             }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level).await {

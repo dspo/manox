@@ -1339,8 +1339,15 @@ impl Workspace {
                         this.start_new_thread(None, window, cx);
                     }
                 }
+                // Explicit no-ops (not a wildcard) so a future SidebarEvent
+                // variant fails compilation in both builds instead of being
+                // silently swallowed in one.
                 #[cfg(not(feature = "harness-manox"))]
-                _ => {}
+                SidebarEvent::SpawnExternalSession { .. } => {}
+                #[cfg(not(feature = "harness-manox"))]
+                SidebarEvent::OpenExternalSession(_) => {}
+                #[cfg(not(feature = "harness-manox"))]
+                SidebarEvent::ArchiveExternalSession(_) => {}
             },
         )
     }
