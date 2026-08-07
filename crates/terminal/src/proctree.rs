@@ -10,8 +10,10 @@
 //! parent-chain walk — interactive shells give each job its own process
 //! group, so a single group-kill misses background jobs), and the PTY's
 //! current foreground process group (tcgetpgrp, captured by the caller).
-//! Processes that escaped the session (setsid / nohup) are deliberately left
-//! alone.
+//! The scan is the teardown's first action, before any signal or master
+//! close — the caller moves the master onto the teardown thread so nothing
+//! of ours can disturb the tree before it is recorded. Processes that
+//! escaped the session (setsid / nohup) are deliberately left alone.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -119,12 +121,30 @@ fn signal_group(pgid: libc::pid_t, sig: libc::c_int) {
 }
 
 /// kill(pid, 0) liveness: EPERM still means alive, ESRCH means gone. A
-/// negative pid probes a whole process group.
+/// negative pid probes a whole process group. A zombie counts as gone — it
+/// holds no resources and init reaps it; kill(pid, 0) would report it alive.
 pub(crate) fn alive(pid: libc::pid_t) -> bool {
     if unsafe { libc::kill(pid, 0) } == 0 {
+        #[cfg(target_os = "linux")]
+        if is_zombie(pid) {
+            return false;
+        }
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// /proc/<pid>/stat state field. The comm in parentheses may itself contain
+/// spaces or parens, so the state is the byte after the last ") ".
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.as_bytes().first().copied())
+        })
+        == Some(b'Z')
 }
 
 fn all_gone(pids: &[libc::pid_t], fg_pgid: Option<libc::pid_t>) -> bool {

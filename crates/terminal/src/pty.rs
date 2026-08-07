@@ -37,8 +37,8 @@ use crate::shell_kind::{ShellKind, resolve_shell_program};
 
 /// Owns the PTY master. `Box<dyn MasterPty + Send>` cannot be unsized into an
 /// `Arc<dyn MasterPty>`, so this newtype holds the box and derefs to the trait
-/// object. Not shared across threads — only the gpui side calls `resize`, so
-/// no `Arc`/`Sync` is needed.
+/// object. Never shared — the gpui side uses it while the handle lives, then
+/// `Drop` moves it onto the teardown thread.
 struct MasterHolder(Box<dyn MasterPty + Send>);
 
 impl Deref for MasterHolder {
@@ -49,8 +49,13 @@ impl Deref for MasterHolder {
 }
 
 pub struct PtyHandle {
-    master: MasterHolder,
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// Moved into the teardown thread by `Drop` (its close is the last
+    /// teardown action, never before the tree scan). `Option` so the move
+    /// is possible out of `&mut self`.
+    master: Option<MasterHolder>,
+    /// Taken into the teardown thread by `Drop`: it dups the master fd, so
+    /// no master-side fd of this handle may close before the tree scan.
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     /// Moved into the teardown thread by `Drop`; `Option` so the move is
     /// possible out of `&mut self`.
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
@@ -147,8 +152,8 @@ pub fn open(
     let master = MasterHolder(pair.master);
 
     Ok(PtyHandle {
-        master,
-        writer: Mutex::new(writer),
+        master: Some(master),
+        writer: Mutex::new(Some(writer)),
         killer: Some(killer),
         ready_nonce,
         #[cfg(unix)]
@@ -233,11 +238,17 @@ impl PtySource for PtyHandle {
     }
 
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.lock().write_all(bytes)
+        let mut guard = self.writer.lock();
+        guard
+            .as_mut()
+            .expect("writer lives until Drop")
+            .write_all(bytes)
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         self.master
+            .as_ref()
+            .expect("master lives until Drop")
             .resize(PtySize {
                 rows,
                 cols,
@@ -256,7 +267,7 @@ impl PtySource for PtyHandle {
     /// 1s poll: one tcgetpgrp + a targeted sysinfo refresh.
     #[cfg(unix)]
     fn foreground_process_name(&self) -> Option<String> {
-        let pid = self.master.process_group_leader()?;
+        let pid = self.master.as_ref()?.process_group_leader()?;
         let name = crate::proctree::process_name(pid)?;
         if name.trim_start_matches('-') == self.shell_name {
             None
@@ -269,22 +280,28 @@ impl PtySource for PtyHandle {
 impl Drop for PtyHandle {
     fn drop(&mut self) {
         // Teardown must not block the gpui thread: the killer / child /
-        // captured pids move onto a detached thread that SIGTERMs the shell's
-        // whole tree (plus the foreground process group), grants a short
-        // grace, and SIGKILLs survivors. The reader / waiter threads exit on
-        // their own once the child dies (EOF / reap) — they own their reader
-        // fd / child handle and channel-sender clones, so they are safe to
-        // outlive this handle.
+        // master / writer move onto a detached thread that scans the tree,
+        // SIGTERMs it (plus the foreground process group), grants a short
+        // grace, and SIGKILLs survivors. Every master-side fd this handle
+        // owns travels with the thread, so the struct's own field drops
+        // close nothing that could disturb the tree before the scan. The
+        // reader / waiter threads exit on their own once the child dies
+        // (EOF / reap) — they own their reader fd / child handle and
+        // channel-sender clones, so they are safe to outlive this handle.
         #[cfg(unix)]
         {
-            let fg_pgid = self.master.process_group_leader();
+            let fg_pgid = self.master.as_ref().and_then(|m| m.process_group_leader());
             let killer = self.killer.take();
             let child = self.child.take();
             let shell_pid = self.child_pid;
+            let master = self.master.take();
+            let writer = self.writer.get_mut().take();
             let _ = thread::Builder::new()
                 .name("manox-pty-teardown".into())
                 .spawn(move || {
                     crate::proctree::terminate(shell_pid, fg_pgid, killer, child);
+                    drop(master);
+                    drop(writer);
                 });
         }
         #[cfg(not(unix))]
@@ -360,10 +377,31 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "tree survived teardown: {survivors:?}"
+                "tree survived teardown: {}",
+                describe_survivors(&survivors)
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Survivor pids plus their /proc stat on Linux, so a CI failure shows
+    /// state (zombie/running) and parent without a reproducer.
+    #[cfg(target_os = "linux")]
+    fn describe_survivors(survivors: &[libc::pid_t]) -> String {
+        survivors
+            .iter()
+            .map(|p| {
+                let stat = std::fs::read_to_string(format!("/proc/{p}/stat"))
+                    .unwrap_or_else(|_| "<gone>".into());
+                format!("{p}: {stat}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn describe_survivors(survivors: &[libc::pid_t]) -> String {
+        format!("{survivors:?}")
     }
 
     /// The shell's whole tree dies with the handle — a background job living
