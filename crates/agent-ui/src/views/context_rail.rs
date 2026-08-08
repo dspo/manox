@@ -41,8 +41,7 @@ use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
-#[cfg(feature = "harness-manox")]
-use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
+use crate::views::subagents::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
@@ -87,7 +86,6 @@ pub(crate) struct ContextRail {
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
     weak_workspace: WeakEntity<Workspace>,
-    #[cfg(feature = "harness-manox")]
     agents: Vec<SubagentInfo>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
@@ -116,7 +114,6 @@ impl ContextRail {
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
             weak_workspace,
-            #[cfg(feature = "harness-manox")]
             agents: Vec::new(),
             side_calls: Vec::new(),
             main_call: None,
@@ -144,7 +141,6 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.side_calls.clear();
         self.main_call = None;
-        #[cfg(feature = "harness-manox")]
         self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
@@ -210,9 +206,43 @@ impl ContextRail {
         cx.notify();
     }
 
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn set_agents(&mut self, agents: Vec<SubagentInfo>, cx: &mut Context<Self>) {
         self.agents = agents;
+        cx.notify();
+    }
+
+    /// Upsert one sub-agent observation row from a `SubagentProgress` event
+    /// (the pi harness emits these around its ephemeral nested sessions;
+    /// the retired manox harness maintains its list from child threads
+    /// instead).
+    #[cfg(not(feature = "harness-manox"))]
+    pub(crate) fn apply_subagent_progress(
+        &mut self,
+        id: &str,
+        subagent_type: &str,
+        description: Option<&str>,
+        status: agent::ToolCallStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(info) = self.agents.iter_mut().find(|info| info.id == id) {
+            info.status = status;
+            if !subagent_type.is_empty() {
+                info.subagent_type = subagent_type.to_string();
+            }
+            if let Some(description) = description
+                && info.description.is_empty()
+            {
+                info.description = description.to_string();
+            }
+        } else {
+            self.agents.push(SubagentInfo {
+                id: id.to_string(),
+                parent_id: None,
+                subagent_type: subagent_type.to_string(),
+                description: description.unwrap_or_default().to_string(),
+                status,
+            });
+        }
         cx.notify();
     }
 
@@ -250,16 +280,7 @@ impl ContextRail {
             thread.project().cloned()
         };
 
-        let agents_section = {
-            #[cfg(feature = "harness-manox")]
-            {
-                self.render_agents_section(theme, cx)
-            }
-            #[cfg(not(feature = "harness-manox"))]
-            {
-                gpui::div().into_any_element()
-            }
-        };
+        let agents_section = self.render_agents_section(theme, cx);
 
         v_flex()
             .w_full()
@@ -616,7 +637,6 @@ impl ContextRail {
         }
     }
 
-    #[cfg(feature = "harness-manox")]
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         fn append_children(
             parent_id: Option<&str>,
@@ -631,40 +651,43 @@ impl ContextRail {
             {
                 let title = subagent_display_title(info);
                 let tooltip_text = title.clone();
+                #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                 let id = info.id.clone();
+                #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
                 let weak = weak_workspace.clone();
-                rows.push(
-                    h_flex()
-                        .id(SharedString::from(format!("context-agent-{}", info.id)))
-                        .w_full()
-                        .min_w_0()
-                        .py_0p5()
-                        .pl(px(12.))
-                        .gap_1p5()
-                        .items_center()
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.secondary.opacity(0.5)))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(tooltip_text.clone()).build(window, cx)
-                        })
-                        .on_click(move |_, _window, cx: &mut App| {
-                            let _ = weak.update(cx, |workspace, cx| {
-                                workspace.open_subagent_tab_by_id(&id, cx);
-                            });
-                        })
-                        .child(status_indicator(info.status, theme))
-                        .child(
-                            gpui::div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.foreground)
-                                .child(title),
-                        )
-                        .into_any_element(),
-                );
+                let row = h_flex()
+                    .id(SharedString::from(format!("context-agent-{}", info.id)))
+                    .w_full()
+                    .min_w_0()
+                    .py_0p5()
+                    .pl(px(12.))
+                    .gap_1p5()
+                    .items_center()
+                    .rounded(px(4.))
+                    .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+                    .child(status_indicator(info.status, theme))
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.foreground)
+                            .child(title),
+                    );
+                // Drilling into a sub-agent tab needs a child thread entity;
+                // the pi harness runs sub-agents as ephemeral nested
+                // sessions, so its rows observe without clicking.
+                #[cfg(feature = "harness-manox")]
+                let row = row
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.secondary.opacity(0.5)))
+                    .on_click(move |_, _window, cx: &mut App| {
+                        let _ = weak.update(cx, |workspace, cx| {
+                            workspace.open_subagent_tab_by_id(&id, cx);
+                        });
+                    });
+                rows.push(row.into_any_element());
                 append_children(Some(&info.id), agents, weak_workspace, theme, rows);
             }
         }

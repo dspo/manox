@@ -9,64 +9,20 @@ use gpui::{
     AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, SharedString, Subscription,
     WeakEntity, Window, px,
 };
-use gpui_component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex,
-};
+use gpui_component::{ActiveTheme as _, ElementExt as _, Theme, h_flex, v_flex};
 #[cfg(feature = "harness-manox")]
 use harness_manox::tools::agent::{agent_metrics, agent_sub_messages};
 use harness_manox::{Thread, ThreadEvent};
 
 use crate::Workspace;
 use crate::conversation::{ApplyCtx, ConversationState, agent_task_labels};
-use crate::views::braille_spinner::BrailleSpinner;
-
-#[derive(Clone, Debug)]
-pub(crate) struct SubagentInfo {
-    pub id: String,
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))] // TODO(pi-wire)
-    pub parent_id: Option<String>,
-    pub subagent_type: String,
-    pub description: String,
-    pub status: ToolCallStatus,
-}
+pub(crate) use crate::views::subagents::{SubagentInfo, status_indicator, subagent_display_title};
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct SubagentSnapshot {
     pub info: SubagentInfo,
     pub messages: Vec<Message>,
-}
-
-pub(crate) fn subagent_display_title(info: &SubagentInfo) -> String {
-    if info.description.is_empty() {
-        info.subagent_type.clone()
-    } else if info.subagent_type.is_empty() {
-        info.description.clone()
-    } else {
-        format!("{} · {}", info.subagent_type, info.description)
-    }
-}
-
-pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElement {
-    match status {
-        ToolCallStatus::PendingApproval | ToolCallStatus::Running => BrailleSpinner::new()
-            .xsmall()
-            .color(theme.accent_foreground)
-            .into_any_element(),
-        ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()
-            .path("icons/circle-check-big.svg")
-            .xsmall()
-            .text_color(theme.success)
-            .into_any_element(),
-        ToolCallStatus::Error | ToolCallStatus::Denied => Icon::new(IconName::CircleX)
-            .xsmall()
-            .text_color(theme.danger)
-            .into_any_element(),
-        ToolCallStatus::Cancelled => Icon::new(IconName::Minus)
-            .xsmall()
-            .text_color(theme.muted_foreground)
-            .into_any_element(),
-    }
 }
 
 /// Recursively recover sub-agent navigation entries from persisted Agent tool

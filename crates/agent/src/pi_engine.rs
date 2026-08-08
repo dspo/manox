@@ -1163,13 +1163,45 @@ pub(crate) mod adapt {
                 tool_call_id,
                 tool_name,
                 arguments,
-            } => vec![ThreadEvent::ToolCall {
-                id: tool_call_id.clone(),
-                name: tool_name.clone(),
-                title: tool_title(tool_name, arguments),
-                status: ToolCallStatus::Running,
-                input: Some(arguments.clone()),
-            }],
+            } => {
+                let mut events = vec![ThreadEvent::ToolCall {
+                    id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    title: tool_title(tool_name, arguments),
+                    status: ToolCallStatus::Running,
+                    input: Some(arguments.clone()),
+                }];
+                // A spawned sub-agent also lands as a rail observation row
+                // (the conversation shows the Agent tool call card; the rail
+                // tracks the nested session's lifecycle).
+                if tool_name == crate::tools::AGENT {
+                    events.push(ThreadEvent::SubagentProgress {
+                        id: tool_call_id.clone(),
+                        subagent_type: arguments
+                            .get("subagent_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        tool_uses: 0,
+                        token_usage: crate::language_model::TokenUsage::default(),
+                        latest_activity: arguments.get("prompt").and_then(|v| v.as_str()).map(
+                            |prompt| {
+                                let flat: String =
+                                    prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+                                let mut chars = flat.chars();
+                                let head: String = chars.by_ref().take(60).collect();
+                                if chars.next().is_some() {
+                                    format!("{head}…")
+                                } else {
+                                    head
+                                }
+                            },
+                        ),
+                        status: ToolCallStatus::Running,
+                    });
+                }
+                events
+            }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
                 partial_result,
@@ -1191,24 +1223,41 @@ pub(crate) mod adapt {
                 tool_name,
                 result,
                 is_error,
-            } => vec![
-                ThreadEvent::ToolCall {
-                    id: tool_call_id.clone(),
-                    name: tool_name.clone(),
-                    title: tool_name.clone(),
-                    status: if *is_error {
-                        ToolCallStatus::Error
-                    } else {
-                        ToolCallStatus::Success
+            } => {
+                let status = if *is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                };
+                let mut events = vec![
+                    ThreadEvent::ToolCall {
+                        id: tool_call_id.clone(),
+                        name: tool_name.clone(),
+                        title: tool_name.clone(),
+                        status,
+                        input: None,
                     },
-                    input: None,
-                },
-                ThreadEvent::ToolResult {
-                    id: tool_call_id.clone(),
-                    output: tool_result_text(result),
-                    is_error: *is_error,
-                },
-            ],
+                    ThreadEvent::ToolResult {
+                        id: tool_call_id.clone(),
+                        output: tool_result_text(result),
+                        is_error: *is_error,
+                    },
+                ];
+                // Close the sub-agent's rail observation row (the row itself
+                // was created by the start event; empty type here is fine —
+                // the upsert keeps the existing entry's fields).
+                if tool_name == crate::tools::AGENT {
+                    events.push(ThreadEvent::SubagentProgress {
+                        id: tool_call_id.clone(),
+                        subagent_type: String::new(),
+                        tool_uses: 0,
+                        token_usage: crate::language_model::TokenUsage::default(),
+                        latest_activity: None,
+                        status,
+                    });
+                }
+                events
+            }
             AgentEvent::Retry {
                 attempt,
                 max_attempts,
@@ -1490,5 +1539,67 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
         assert_eq!(loaded.approval_mode.as_deref(), Some("danger"));
+    }
+
+    #[test]
+    fn agent_tool_start_maps_to_subagent_progress_row() {
+        let events =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionStart {
+                tool_call_id: "call-1".into(),
+                tool_name: crate::tools::AGENT.into(),
+                arguments: serde_json::json!({
+                    "subagent_type": "Explore",
+                    "prompt": "find the auth module and summarize its structure",
+                }),
+            });
+        assert_eq!(events.len(), 2, "tool card + rail observation row");
+        match &events[1] {
+            crate::thread::ThreadEvent::SubagentProgress {
+                id,
+                subagent_type,
+                latest_activity,
+                status,
+                ..
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(subagent_type, "Explore");
+                assert_eq!(
+                    latest_activity.as_deref(),
+                    Some("find the auth module and summarize its structure")
+                );
+                assert_eq!(*status, crate::thread::ToolCallStatus::Running);
+            }
+            other => panic!("expected SubagentProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_tool_end_closes_subagent_progress_row() {
+        let events =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionEnd {
+                tool_call_id: "call-1".into(),
+                tool_name: crate::tools::AGENT.into(),
+                result: pi::tool::AgentToolResult::text("done"),
+                is_error: false,
+            });
+        assert_eq!(events.len(), 3, "tool card + result + rail row");
+        match &events[2] {
+            crate::thread::ThreadEvent::SubagentProgress { id, status, .. } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(*status, crate::thread::ToolCallStatus::Success);
+            }
+            other => panic!("expected SubagentProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_agent_tools_emit_no_subagent_progress() {
+        let events =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionStart {
+                tool_call_id: "call-2".into(),
+                tool_name: "Read".into(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            });
+        assert_eq!(events.len(), 1, "plain tools keep a single tool card");
     }
 }
