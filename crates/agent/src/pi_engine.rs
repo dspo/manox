@@ -57,6 +57,17 @@ enum SessionCmd {
     SetApprovalMode(ApprovalMode),
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
+    /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
+    SetPlanMode { enabled: bool },
+    /// Persist whether a plan review card is pending (restore re-surfaces it).
+    SetPlanReviewPending(bool),
+    /// Execute an approved plan: exit plan mode, optionally compact the
+    /// planning context toward the plan file, then run the seed turn.
+    ApprovePlan {
+        compact: bool,
+        compact_instructions: Option<String>,
+        seed_text: String,
+    },
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
     /// Create a fresh session in the given directory, optionally bound to a
@@ -88,6 +99,9 @@ struct EngineState {
     model: Arc<Mutex<Option<PiModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
+    /// Plan-mode state shared by the actor, the hooks, the gate, and the
+    /// `ProposePlan` tool.
+    plan: Arc<crate::plan_mode::PlanSessionState>,
     /// The host approval gate wrapping every tool (mode, always-allow
     /// cache, pending UI round trips).
     gate: Arc<ApprovalGate>,
@@ -129,6 +143,7 @@ pub fn spawn_engine(
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
         gate,
+        plan: crate::plan_mode::PlanSessionState::new(),
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -280,6 +295,22 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::SetApprovalMode(mode));
     }
 
+    fn set_plan_mode(&self, enabled: bool) {
+        let _ = self.cmd_tx.send(SessionCmd::SetPlanMode { enabled });
+    }
+
+    fn set_plan_review_pending(&self, pending: bool) {
+        let _ = self.cmd_tx.send(SessionCmd::SetPlanReviewPending(pending));
+    }
+
+    fn approve_plan(&self, compact: bool, compact_instructions: Option<String>, seed_text: String) {
+        let _ = self.cmd_tx.send(SessionCmd::ApprovePlan {
+            compact,
+            compact_instructions,
+            seed_text,
+        });
+    }
+
     fn compact(&self, custom_instructions: Option<String>) {
         let _ = self.cmd_tx.send(SessionCmd::Compact {
             custom_instructions,
@@ -363,6 +394,8 @@ fn build_tools(
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
+    plan: &Arc<crate::plan_mode::PlanSessionState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
@@ -385,13 +418,36 @@ fn build_tools(
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
     ];
+    // Plan-mode gate exemption: plan-file writes stay approval-free while
+    // plan mode is active (the `ToolCall` hook blocks everything else).
+    let plan_policy = Arc::new(crate::plan_mode::PlanGatePolicy {
+        state: Arc::clone(plan),
+        plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
+        cwd: cwd.to_path_buf(),
+    });
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
-            Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn PiAgentTool>
+            Arc::new(
+                ApprovalGatedTool::new(tool, Arc::clone(gate))
+                    .with_plan_policy(Arc::clone(&plan_policy)),
+            ) as Arc<dyn PiAgentTool>
         })
         .collect();
     tools.push(Arc::new(PiAskUserQuestionTool::new(Arc::clone(gate))));
+    // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
+    // the verdict request itself, not a side effect.
+    tools.push(Arc::new(crate::plan_mode::ProposePlanTool::new(
+        notice_tx.clone(),
+        Arc::clone(plan),
+        plan_policy.plans_dir.clone(),
+    )));
+    // Execution progress: the model publishes its task list; the snapshot
+    // rides PlanUpdated to the context rail. Ungated (mutates nothing on
+    // disk); plan mode's ToolCall hook blocks it while planning.
+    tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
+        notice_tx.clone(),
+    )));
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
@@ -645,8 +701,10 @@ fn session_builder(
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
+    plan: &Arc<crate::plan_mode::PlanSessionState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
-    let (tools, orchestrators) = build_tools(cwd, runtime, model, gate);
+    let (tools, orchestrators) = build_tools(cwd, runtime, model, gate, plan, notice_tx);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
@@ -657,6 +715,26 @@ fn session_builder(
         builder = builder.with_model(model.clone());
     }
     (builder, orchestrators)
+}
+
+/// Register plan-mode extension hooks on a freshly built/restored session:
+/// `BeforeAgentStart` injects the rendered plan-mode instructions every turn
+/// while active; `ToolCall` enforces the read-only guarantee (plan-file
+/// writes excepted). Both read through the shared [`PlanSessionState`].
+fn attach_plan_hooks(
+    session: &mut AgentSession,
+    plan: &Arc<crate::plan_mode::PlanSessionState>,
+    cwd: &Path,
+) {
+    session.on(
+        pi::harness::HookPoint::BeforeAgentStart,
+        crate::plan_mode::injection_handler(Arc::clone(plan)),
+    );
+    let plans_dir = crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans"));
+    session.on(
+        pi::harness::HookPoint::ToolCall,
+        crate::plan_mode::gate_handler(Arc::clone(plan), plans_dir, cwd.to_path_buf()),
+    );
 }
 
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
@@ -721,10 +799,13 @@ async fn run_actor(
             &runtime,
             Some(&pi_model),
             &state.gate,
+            &state.plan,
+            &notice_tx,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
+                attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
                 restored = true;
                 session = Some(s);
             }
@@ -736,11 +817,19 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, orchestrators) =
-                session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
+            let (builder, orchestrators) = session_builder(
+                &cwd,
+                &sessions_dir,
+                &runtime,
+                Some(&pi_model),
+                &state.gate,
+                &state.plan,
+                &notice_tx,
+            );
             match builder.build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
+                    attach_plan_hooks(&mut s, &state.plan, &cwd);
                     s
                 }
                 Err(err) => {
@@ -780,6 +869,18 @@ async fn run_actor(
     // reopened Danger session doesn't silently gate (or vice versa).
     let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
     state.gate.set_mode(approval_mode);
+    // Plan mode rides the same sidecar: restore the flag so a reopened
+    // planning session keeps its read-only gate; the facade re-renders and
+    // re-sends the instructions once it sees `Ready`.
+    let (plan_mode_restored, plan_file_restored) =
+        load_plan_state(&sessions_dir, session.path()).await;
+    if plan_mode_restored {
+        state.plan.set(true, plan_file_restored.clone());
+        state
+            .plan
+            .set_active_instructions(render_plan_instructions());
+    }
+    let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
@@ -796,6 +897,9 @@ async fn run_actor(
         restored,
         model: Some(pi_model.clone()),
         approval_mode,
+        plan_mode: plan_mode_restored,
+        plan_file: plan_file_restored,
+        plan_review_pending,
     });
 
     let mut run_steers: Vec<String> = Vec::new();
@@ -915,6 +1019,88 @@ async fn run_actor(
                     tracing::warn!(error = %err, "failed to persist approval mode");
                 }
             }
+            SessionCmd::SetPlanMode { enabled } => {
+                let plan_file = state.plan.plan_file();
+                state.plan.set(enabled, plan_file);
+                state
+                    .plan
+                    .set_active_instructions(enabled.then(render_plan_instructions).flatten());
+                if let Err(err) =
+                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                {
+                    tracing::warn!(error = %err, "failed to persist plan mode");
+                }
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::PlanModeChanged { enabled },
+                )));
+            }
+            SessionCmd::SetPlanReviewPending(pending) => {
+                if let Err(err) =
+                    write_plan_review_pending_sidecar(&sessions_dir, session.path(), pending).await
+                {
+                    tracing::warn!(error = %err, "failed to persist plan review pending flag");
+                }
+            }
+            SessionCmd::ApprovePlan {
+                compact,
+                compact_instructions,
+                seed_text,
+            } => {
+                // Exit plan mode first: the execution turn runs with full
+                // tool access (the hook + gate read the shared state).
+                let plan_file = state.plan.plan_file();
+                state.plan.set(false, plan_file);
+                state.plan.set_active_instructions(None);
+                if let Err(err) =
+                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                {
+                    tracing::warn!(error = %err, "failed to persist plan-mode exit");
+                }
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::PlanModeChanged { enabled: false },
+                )));
+                if compact {
+                    match session.compact(compact_instructions.as_deref()).await {
+                        Ok(_) => {
+                            sync_history(&session, &state);
+                            sync_usage(&session, &state).await;
+                            refresh_session_list(&repo, &state).await;
+                        }
+                        Err(err) => {
+                            // Execute anyway — approval intent stands; the
+                            // context simply keeps the planning discussion.
+                            tracing::warn!(
+                                error = %err,
+                                "plan-approval compaction failed; executing without compaction"
+                            );
+                        }
+                    }
+                }
+                state.running.store(true, Ordering::Relaxed);
+                let handle = session.handle();
+                let (result, abort_requested) = drive_run(
+                    session.prompt(&seed_text),
+                    &handle,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                )
+                .await;
+                settle_run(
+                    &result,
+                    abort_requested,
+                    &session,
+                    &state,
+                    &repo,
+                    &title_state,
+                    &runtime,
+                    &pi_model,
+                    &sessions_dir,
+                    &notice_tx,
+                    &mut run_steers,
+                )
+                .await;
+            }
             SessionCmd::Compact {
                 custom_instructions,
             } => {
@@ -958,11 +1144,13 @@ async fn run_actor(
                     &cwd,
                     &notice_tx,
                     &state.gate,
+                    &state.plan,
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
                 _harness_subscription =
                     subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
+                resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
@@ -971,11 +1159,23 @@ async fn run_actor(
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd, project } => {
-                let (builder, orchestrators) =
-                    session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
+                let (builder, orchestrators) = session_builder(
+                    &cwd,
+                    &sessions_dir,
+                    &runtime,
+                    Some(&pi_model),
+                    &state.gate,
+                    &state.plan,
+                    &notice_tx,
+                );
                 match builder.build().await {
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
+                        attach_plan_hooks(&mut s, &state.plan, &cwd);
+                        // A fresh session never inherits plan mode — clear
+                        // any state left over from the previous session.
+                        state.plan.set(false, None);
+                        state.plan.set_active_instructions(None);
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
                         _harness_subscription =
@@ -1018,6 +1218,7 @@ async fn rebuild_session(
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     gate: &Arc<ApprovalGate>,
+    plan: &Arc<crate::plan_mode::PlanSessionState>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -1039,10 +1240,19 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
-    let (builder, orchestrators) = session_builder(&cwd, sessions_dir, runtime, Some(model), gate);
+    let (builder, orchestrators) = session_builder(
+        &cwd,
+        sessions_dir,
+        runtime,
+        Some(model),
+        gate,
+        plan,
+        notice_tx,
+    );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
+            attach_plan_hooks(&mut s, plan, &cwd);
             *session = s;
         }
         Err(err) => {
@@ -1191,6 +1401,83 @@ async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> Approva
 
 /// Persist the approval mode in the session sidecar so the session reopens
 /// with the same gate policy.
+/// Render the plan-mode-active instructions for the configured agent
+/// language (the actor renders them itself — language comes from settings,
+/// so no facade round-trip is needed on restore or session switches).
+fn render_plan_instructions() -> Option<String> {
+    let plans_dir = crate::paths::plans_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".manox/plans".to_string());
+    let lang = crate::settings::load().resolve().agent;
+    match crate::collaboration_mode::render_plan_mode_active(lang, &plans_dir) {
+        Ok(text) => Some(text),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to render plan-mode instructions");
+            None
+        }
+    }
+}
+
+async fn load_plan_state(sessions_dir: &Path, session_path: &Path) -> (bool, Option<String>) {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => (meta.plan_mode.unwrap_or(false), meta.plan_file),
+        Err(_) => (false, None),
+    }
+}
+
+/// Persist plan mode + last plan file from the shared state into the session
+/// sidecar (`plan_mode` stored only while on; `plan_file` kept across exits
+/// for the execution handoff).
+async fn write_plan_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    plan: &crate::plan_mode::PlanSessionState,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.plan_mode = plan.enabled().then_some(true);
+    meta.plan_file = plan.plan_file();
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> bool {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => meta.plan_review_pending.unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+async fn write_plan_review_pending_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    pending: bool,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.plan_review_pending = pending.then_some(true);
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// Re-sync plan mode after a session switch: the flag follows the opened
+/// session's sidecar. Emits `PlanModeChanged` so the facade chip tracks the
+/// session it now mirrors; instructions re-render when the target session
+/// plans.
+async fn resync_plan_state(
+    sessions_dir: &Path,
+    session_path: &Path,
+    plan: &Arc<crate::plan_mode::PlanSessionState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let (enabled, plan_file) = load_plan_state(sessions_dir, session_path).await;
+    plan.set(enabled, plan_file);
+    plan.set_active_instructions(enabled.then(render_plan_instructions).flatten());
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::PlanModeChanged { enabled },
+    )));
+}
+
 async fn write_approval_mode_sidecar(
     sessions_dir: &Path,
     session_path: &Path,
@@ -1597,6 +1884,14 @@ pub(crate) mod adapt {
                         .iter()
                         .map(content_block_to_message_content)
                         .collect();
+                    // Plan blocks surface through the PlanReady review flow;
+                    // strip them from the displayed transcript (the session
+                    // jsonl keeps the raw text, manox parity).
+                    for block in blocks.iter_mut() {
+                        if let MessageContent::Text(text) = block {
+                            *text = crate::proposed_plan::strip_proposed_plan_blocks(text);
+                        }
+                    }
                     if matches!(stop_reason, Some(PiStopReason::Error)) {
                         blocks.push(MessageContent::Text(format!(
                             "[turn failed: {}]",
@@ -1919,5 +2214,45 @@ mod tests {
                 arguments: serde_json::json!({"path": "src/main.rs"}),
             });
         assert_eq!(events.len(), 1, "plain tools keep a single tool card");
+    }
+
+    #[test]
+    fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
+        let plan = "## Steps\n- do the thing";
+        let messages = vec![pi::types::AgentMessage::Assistant {
+            content: vec![pi::types::ContentBlock::Text {
+                text: format!(
+                    "Here is my plan.\n\n<proposed_plan>\n{plan}\n</proposed_plan>\n\nShall we?"
+                ),
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(pi::types::StopReason::Stop),
+            raw_stop_reason: None,
+            usage: Box::new(pi::types::Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let mapped = adapt::harness_messages_to_messages(&messages);
+        assert_eq!(mapped.len(), 1);
+        let text = mapped[0]
+            .content
+            .iter()
+            .find_map(|c| match c {
+                crate::language_model::MessageContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !text.contains("<proposed_plan>"),
+            "plan block must not render"
+        );
+        assert!(text.contains("Here is my plan."));
+        assert!(text.contains("Shall we?"));
     }
 }

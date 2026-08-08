@@ -97,6 +97,21 @@ pub fn themes_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("themes"))
 }
 
+/// Global plan-file directory (`~/.manox/plans`). Plan mode writes one
+/// `<slug>-plan.md` per planned task here — session-local planning artifacts
+/// that stay out of every working tree (and its git status), readable by any
+/// thread so an approved plan survives a fresh-context execution handoff.
+pub fn plans_dir() -> Result<PathBuf> {
+    Ok(dirs().join(".manox").join("plans"))
+}
+
+/// Ensure the plans directory exists, creating it (and parents) as needed.
+pub fn ensure_plans_dir() -> Result<PathBuf> {
+    let dir = plans_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 fn dirs() -> PathBuf {
     if let Some(p) = home_dir() {
         return p;

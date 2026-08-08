@@ -52,6 +52,17 @@ status-cancelled = 已取消
 ### views/message.rs — Thinking 状态行
 context-agents-title = 智能体
 context-agents-captain = 船长
+plan-card-title = 计划
+plan-card-download = 下载计划
+plan-card-copy = 复制计划
+plan-verdict-execute-fresh = 批准并新上下文执行
+plan-verdict-execute-compact = 批准并压缩上下文执行
+plan-verdict-execute-keep = 批准并保留上下文执行
+plan-verdict-refine = 修订计划
+plan-refine-notice = Plan 模式保持开启——输入你的修改意见，模型将更新 plan 文件并重新提交。
+plan-chip-label = Plan 模式
+plan-mode-on-notice = Plan 模式已开启：工作树只读；模型调研、写 plan 文件，并通过 ProposePlan 提交给你批准。
+plan-mode-off-notice = Plan 模式已关闭：完整写权限恢复。
 thinking-tool-result = 工具结果
 thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件
@@ -307,6 +318,7 @@ settings-tag-saas = saas
 settings-tag-dspo = dspo
 
 ### workspace.rs
+slash-plan-desc = 切换 plan 模式（只读调研、plan 文件、结构化批准）；`/plan <提示>` 进入 plan 模式并开始规划该提示
 workspace-input-placeholder = 输入消息，点击发送以开始使用
 workspace-composer-placeholder = 编写 markdown…（Cmd-Enter 发送）
 workspace-unknown-command = 未知命令：/{$name}（用 `/` 菜单查看已安装命令）

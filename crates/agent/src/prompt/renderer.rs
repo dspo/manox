@@ -108,6 +108,13 @@ const TPL_TITLE_TOPIC_SHIFT_EN: &str = include_str!("templates/en/title/topic_sh
 const TPL_TITLE_TOPIC_SHIFT_ZH_CN: &str = include_str!("templates/zh-CN/title/topic_shift.tera.md");
 const TPL_SKILL_BODY_EN: &str = include_str!("templates/en/wrapper/skill_body.tera.md");
 const TPL_SKILL_BODY_ZH_CN: &str = include_str!("templates/zh-CN/wrapper/skill_body.tera.md");
+const TPL_PLAN_MODE_ACTIVE_EN: &str = include_str!("templates/en/mode/plan_mode_active.tera.md");
+const TPL_PLAN_MODE_ACTIVE_ZH_CN: &str =
+    include_str!("templates/zh-CN/mode/plan_mode_active.tera.md");
+const TPL_PLAN_MODE_APPROVED_EN: &str =
+    include_str!("templates/en/mode/plan_mode_approved.tera.md");
+const TPL_PLAN_MODE_APPROVED_ZH_CN: &str =
+    include_str!("templates/zh-CN/mode/plan_mode_approved.tera.md");
 const TPL_AGENT_TOOL_EN: &str = include_str!("templates/en/tools/agent_tool.tera.md");
 const TPL_AGENT_TOOL_ZH_CN: &str = include_str!("templates/zh-CN/tools/agent_tool.tera.md");
 
@@ -224,6 +231,16 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::SkillBody,
         TPL_SKILL_BODY_EN,
         TPL_SKILL_BODY_ZH_CN,
+    ),
+    (
+        PromptTemplate::ModePlanActive,
+        TPL_PLAN_MODE_ACTIVE_EN,
+        TPL_PLAN_MODE_ACTIVE_ZH_CN,
+    ),
+    (
+        PromptTemplate::ModePlanApproved,
+        TPL_PLAN_MODE_APPROVED_EN,
+        TPL_PLAN_MODE_APPROVED_ZH_CN,
     ),
     (
         PromptTemplate::AgentToolDescription,
@@ -459,8 +476,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 23);
-        assert_eq!(REGISTRATIONS.len(), 23);
+        assert_eq!(template::ALL.len(), 25);
+        assert_eq!(REGISTRATIONS.len(), 25);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -471,9 +488,7 @@ mod tests {
     #[test]
     fn en_and_zh_template_dirs_are_symmetric() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/prompt/templates");
-        // `mode` templates were removed with the retired manox harness
-        // (`collaboration_mode`); the remaining subdirs must stay symmetric.
-        for sub in ["side_call", "system", "title", "tools", "wrapper"] {
+        for sub in ["mode", "side_call", "system", "title", "tools", "wrapper"] {
             let en = list_md(&format!("{root}/en/{sub}"));
             let zh = list_md(&format!("{root}/zh-CN/{sub}"));
             assert_eq!(

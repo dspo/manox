@@ -99,6 +99,22 @@ pub trait ThreadEngine: Send + Sync {
     /// Backends without an approval gate ignore this.
     fn set_approval_mode(&self, _mode: ApprovalMode) {}
 
+    /// Toggle plan mode (persisted sidecar + hooks + instructions).
+    fn set_plan_mode(&self, _enabled: bool) {}
+
+    /// Persist whether a plan review card is pending (restore re-surfaces it).
+    fn set_plan_review_pending(&self, _pending: bool) {}
+
+    /// Execute an approved plan: optional compaction toward the plan file,
+    /// then the execution seed turn.
+    fn approve_plan(
+        &self,
+        _compact: bool,
+        _compact_instructions: Option<String>,
+        _seed_text: String,
+    ) {
+    }
+
     /// Run a manual context-compaction pass (`/compact`). Backends without
     /// kernel compaction ignore this; backends that require an idle
     /// transcript no-op while a turn is in flight.
@@ -130,6 +146,14 @@ pub enum BackendNotice {
         /// sessions default to AutoPilot); the facade mirrors it for the
         /// access chip.
         approval_mode: crate::thread::ApprovalMode,
+        /// Plan mode restored from the session sidecar (fresh sessions
+        /// default to off); the facade re-syncs rendered instructions.
+        plan_mode: bool,
+        /// Last plan file recorded in the sidecar, if any.
+        plan_file: Option<String>,
+        /// A plan review card was pending when the session last settled;
+        /// the facade re-emits `PlanReady` so the card re-surfaces.
+        plan_review_pending: bool,
     },
     /// The turn loop unwound and released the running slot.
     Settled {

@@ -65,6 +65,17 @@ status-cancelled = Cancelled
 ### views/message.rs — Thinking status row
 context-agents-title = Agents
 context-agents-captain = Captain
+plan-card-title = Plan
+plan-card-download = Download plan
+plan-card-copy = Copy plan
+plan-verdict-execute-fresh = Approve and execute
+plan-verdict-execute-compact = Approve and compact context
+plan-verdict-execute-keep = Approve and keep context
+plan-verdict-refine = Refine plan
+plan-refine-notice = Plan mode stays on — type your feedback; the model updates the plan file and proposes again.
+plan-chip-label = Plan mode
+plan-mode-on-notice = Plan mode on: the working tree is read-only; the model researches, writes the plan file, and submits it for your approval via ProposePlan.
+plan-mode-off-notice = Plan mode off: full write access restored.
 thinking-tool-result = tool result
 thinking-reading = { $count ->
     [one] reading {$count} file
@@ -357,6 +368,7 @@ settings-tag-saas = saas
 settings-tag-dspo = dspo
 
 ### workspace.rs
+slash-plan-desc = Toggle plan mode (read-only research, plan file, structured approval); `/plan <prompt>` enters plan mode and starts planning the prompt
 workspace-input-placeholder = Type a message, then send to begin
 workspace-composer-placeholder = Write markdown… (Cmd-Enter to send)
 workspace-unknown-command = Unknown command: /{$name} (open the `/` menu to see installed commands)
