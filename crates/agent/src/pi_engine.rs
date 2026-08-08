@@ -283,6 +283,22 @@ fn build_tools(
         })
         .collect();
     tools.push(Arc::new(PiAskUserQuestionTool::new(Arc::clone(gate))));
+    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    // behind the same approval gate as built-ins (remote calls are mutating
+    // by default). A registry that never initialized (pre-`agent::init`
+    // tests) contributes nothing.
+    if let Some(registry) = crate::mcp::try_global() {
+        for server in registry.servers() {
+            for tool in &server.tools {
+                let mcp_tool = Arc::new(crate::mcp::pi_tool::PiMcpTool::new(
+                    server.name.clone(),
+                    tool.clone(),
+                    Arc::clone(&server.client),
+                ));
+                tools.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate))));
+            }
+        }
+    }
     // The sub-agent tool needs a concrete model; a session assembled before
     // registration landed (first seconds after launch) skips it.
     if let Some(model) = model {

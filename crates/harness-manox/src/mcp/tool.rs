@@ -1,22 +1,17 @@
-//! `AgentTool` adapter wrapping a remote MCP tool.
+//! `AgentTool` adapter wrapping a remote MCP tool (retired manox bridge).
 //!
 //! Each `McpTool` holds the server name, the rmcp `Tool` definition, and a
-//! clonable handle to the running rmcp client service. `run()` calls
-//! `tools/call` on the tokio runtime and flattens the returned text content
-//! into a single string.
-
-use std::sync::Arc;
+//! clonable handle to the running rmcp client service (the connection core
+//! lives in `agent::mcp`). `run()` calls `tools/call` on the tokio runtime
+//! and flattens the returned text content into a single string.
 
 use gpui::{App, Task};
-use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent};
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::AgentTool;
 
-/// Clonable handle to a running rmcp client. `RunningService` is cheaply
-/// clonable (it wraps an `Arc`), so every tool from one server shares it.
-pub type McpClientHandle = Arc<RunningService<RoleClient, rmcp::model::ClientInfo>>;
+pub use agent::mcp::McpClientHandle;
 
 pub struct McpTool {
     /// Cached `mcp_<server>_<tool>` id; returned by `name()` without leaking.
@@ -106,63 +101,18 @@ impl AgentTool for McpTool {
                 }
                 _ = cancel.cancelled() => return Err(anyhow::anyhow!("cancelled")),
             };
-            let out = flatten_call_tool_result(&result);
+            let out = agent::mcp::flatten_call_tool_result(&result);
             if out.is_error {
                 Err(anyhow::anyhow!("{}", out.text))
             } else {
-                Ok(out)
+                Ok(out.text)
             }
         })
     }
 }
 
-/// Concatenated text content from a tool result. `Display` yields the text.
-struct ToolOutput {
-    text: String,
-    is_error: bool,
-}
-
-impl std::fmt::Display for ToolOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.text)
-    }
-}
-
-/// Concatenate all text content blocks into a single string. Non-text blocks
-/// (image/audio/resource) are skipped with a warn.
-fn flatten_call_tool_result(result: &CallToolResult) -> ToolOutput {
-    let mut text = String::new();
-    for content in &result.content {
-        let raw: &RawContent = &content.raw;
-        match raw {
-            RawContent::Text(t) => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&t.text);
-            }
-            RawContent::Image(_) => {
-                tracing::warn!("skipping MCP image content block in tool result");
-            }
-            RawContent::Audio(_) => {
-                tracing::warn!("skipping MCP audio content block in tool result");
-            }
-            RawContent::Resource(_) | RawContent::ResourceLink(_) => {
-                tracing::warn!("skipping MCP resource content block in tool result");
-            }
-        }
-    }
-    ToolOutput {
-        text,
-        is_error: result.is_error.unwrap_or(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rmcp::model::{CallToolResult, Content, RawContent, RawTextContent};
-
     #[test]
     fn tool_id_format() {
         assert_eq!(
@@ -173,42 +123,5 @@ mod tests {
             format!("mcp_{}_{}", "my-server", "create_issue"),
             "mcp_my-server_create_issue"
         );
-    }
-
-    #[test]
-    fn flatten_text_blocks() {
-        let result = CallToolResult::success(vec![
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "hello".into(),
-                    meta: None,
-                }),
-                None,
-            ),
-            Content::new(
-                RawContent::Text(RawTextContent {
-                    text: "world".into(),
-                    meta: None,
-                }),
-                None,
-            ),
-        ]);
-        let out = flatten_call_tool_result(&result);
-        assert_eq!(out.text, "hello\nworld");
-        assert!(!out.is_error);
-    }
-
-    #[test]
-    fn flatten_error_result() {
-        let result = CallToolResult::error(vec![Content::new(
-            RawContent::Text(RawTextContent {
-                text: "boom".into(),
-                meta: None,
-            }),
-            None,
-        )]);
-        let out = flatten_call_tool_result(&result);
-        assert!(out.is_error);
-        assert_eq!(out.text, "boom");
     }
 }
