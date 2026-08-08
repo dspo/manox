@@ -3329,6 +3329,17 @@ impl Thread {
     /// flight (the turn owns the message list), when there is no model, or when
     /// there is nothing to summarize. Runs the side LLM call in a spawned task
     /// so the call site returns immediately.
+    /// Duck-type for the shared context rail: the retired harness has no
+    /// rate-card pricing, so cost always reports zero.
+    pub fn cumulative_cost(&self) -> f64 {
+        0.0
+    }
+
+    /// Duck-type for the shared context rail (see [`Self::cumulative_cost`]).
+    pub fn per_model_cost(&self) -> std::collections::HashMap<String, f64> {
+        std::collections::HashMap::new()
+    }
+
     pub fn compact(&mut self, _custom_instructions: Option<String>, cx: &mut Context<Self>) {
         if self.running_turn.is_some()
             || !crate::settings_ext::side_calls()

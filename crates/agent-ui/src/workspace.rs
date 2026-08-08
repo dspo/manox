@@ -999,7 +999,6 @@ impl Workspace {
                     });
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                    #[cfg(feature = "harness-manox")]
                     this.spawn_git_status_refresh(cx);
                     // Dispatch last: `run_turn` emits `TurnStarted`
                     // synchronously, so no terminal bookkeeping above may run
@@ -1158,8 +1157,6 @@ impl Workspace {
                     // flips back to Streaming; a `Running` tool call caches its
                     // title and flips RunningTool; other tool statuses return to
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
-                    // TODO(pi-wire): context rail cockpit phase.
-                    #[cfg(feature = "harness-manox")]
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
                     // TODO(pi-wire): member/sub-agent observation panels.
@@ -2435,7 +2432,6 @@ impl Workspace {
         store.update(cx, |s, cx| s.set_unread(&id, false, cx));
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
-        #[cfg(feature = "harness-manox")]
         self.spawn_git_status_refresh(cx);
         // Returning to a thread leaves the external-session view: without this
         // the render still takes the ExternalSession branch and the swapped-in
@@ -2481,7 +2477,6 @@ impl Workspace {
     ///
     /// Uses `cx.background_executor().timer()` — never `tokio::time` on the
     /// gpui foreground (that panics: no current tokio runtime).
-    #[cfg(feature = "harness-manox")]
     fn spawn_git_status_refresh(&mut self, cx: &mut Context<Self>) {
         self.git_status_gen = self.git_status_gen.wrapping_add(1);
         let entity = cx.entity().clone();

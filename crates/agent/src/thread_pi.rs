@@ -604,6 +604,14 @@ impl Thread {
         self.engine.per_model_token_usage()
     }
 
+    pub fn cumulative_cost(&self) -> f64 {
+        self.engine.cumulative_cost()
+    }
+
+    pub fn per_model_cost(&self) -> HashMap<String, f64> {
+        self.engine.per_model_cost()
+    }
+
     pub fn ui_notes(&self) -> &[UiNoteRecord] {
         &self.ui_notes
     }
