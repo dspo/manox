@@ -591,6 +591,9 @@ async fn run_actor(
                         &notice_tx,
                     );
                 }
+                if !abort_requested && !failed {
+                    emit_proposed_plan(&session, &notice_tx);
+                }
                 let _ = notice_tx.send(BackendNotice::Settled {
                     cancelled: abort_requested,
                     failed,
@@ -935,6 +938,30 @@ async fn resync_approval_mode(
     )));
 }
 
+/// Surface a `<proposed_plan>` block the turn ended on as a plan-review
+/// prompt (manox Plan-mode parity). The block itself never renders in the
+/// transcript — `adapt` strips it; the review drawer is the surface.
+fn emit_proposed_plan(session: &AgentSession, notice_tx: &mpsc::UnboundedSender<BackendNotice>) {
+    let Some(plan_text) = session.harness_messages().iter().rev().find_map(|m| {
+        let AgentMessage::Assistant { content, .. } = m else {
+            return None;
+        };
+        let text: String = content
+            .iter()
+            .filter_map(|block| match block {
+                pi::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        crate::proposed_plan::extract_proposed_plan_text(&text)
+    }) else {
+        return;
+    };
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+        plan_text,
+    })));
+}
+
 /// Mirror the session's authoritative transcript into engine state.
 fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
     let mapped = adapt::harness_messages_to_messages(session.harness_messages());
@@ -1253,6 +1280,14 @@ pub(crate) mod adapt {
                         .iter()
                         .map(content_block_to_message_content)
                         .collect();
+                    // Plan blocks surface through the PlanReady review flow;
+                    // strip them from the displayed transcript (the session
+                    // jsonl keeps the raw text, manox parity).
+                    for block in blocks.iter_mut() {
+                        if let MessageContent::Text(text) = block {
+                            *text = crate::proposed_plan::strip_proposed_plan_blocks(text);
+                        }
+                    }
                     if matches!(stop_reason, Some(PiStopReason::Error)) {
                         blocks.push(MessageContent::Text(format!(
                             "[turn failed: {}]",
@@ -1490,5 +1525,45 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
         assert_eq!(loaded.approval_mode.as_deref(), Some("danger"));
+    }
+
+    #[test]
+    fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
+        let plan = "## Steps\n- do the thing";
+        let messages = vec![pi::types::AgentMessage::Assistant {
+            content: vec![pi::types::ContentBlock::Text {
+                text: format!(
+                    "Here is my plan.\n\n<proposed_plan>\n{plan}\n</proposed_plan>\n\nShall we?"
+                ),
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(pi::types::StopReason::Stop),
+            raw_stop_reason: None,
+            usage: Box::new(pi::types::Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        let mapped = adapt::harness_messages_to_messages(&messages);
+        assert_eq!(mapped.len(), 1);
+        let text = mapped[0]
+            .content
+            .iter()
+            .find_map(|c| match c {
+                crate::language_model::MessageContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            !text.contains("<proposed_plan>"),
+            "plan block must not render"
+        );
+        assert!(text.contains("Here is my plan."));
+        assert!(text.contains("Shall we?"));
     }
 }

@@ -649,13 +649,9 @@ pub fn render_item(
         ConvItem::TeamMessage { from, content } => {
             render_team_message(from, content, ix, theme, body, cx)
         }
-        // TODO(pi-wire): plan review — plan mode is a manox flow.
-        #[cfg(feature = "harness-manox")]
         ConvItem::PlanReview { plan_text, active } => {
             render_plan_review_card(plan_text, *active, ix, theme, tool_ctx, body, cx)
         }
-        #[cfg(feature = "harness-pi")]
-        ConvItem::PlanReview { .. } => gpui::div().into_any_element(),
         ConvItem::Recap {
             summary,
             collapsed,
@@ -1793,7 +1789,6 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
 /// [PlanPreviewTab] — and the footer carries the three verdicts that delegate to
 /// `Workspace::respond_plan_review`. The composer below stays live so the user
 /// can discuss or refine the plan instead of picking a verdict.
-#[cfg(feature = "harness-manox")]
 fn render_plan_review_card(
     plan_text: &str,
     active: bool,
@@ -1918,7 +1913,7 @@ fn render_plan_review_card(
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_clear.update(cx, |w, cx| {
                 w.respond_plan_review(
-                    harness_manox::PlanReviewChoice::ImplementClearContext,
+                    agent::collaboration_mode::PlanReviewChoice::ImplementClearContext,
                     window,
                     cx,
                 );
@@ -1932,7 +1927,11 @@ fn render_plan_review_card(
         .label(i18n::t("plan-drawer-implement"))
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_impl.update(cx, |w, cx| {
-                w.respond_plan_review(harness_manox::PlanReviewChoice::Implement, window, cx);
+                w.respond_plan_review(
+                    agent::collaboration_mode::PlanReviewChoice::Implement,
+                    window,
+                    cx,
+                );
             });
         });
 
