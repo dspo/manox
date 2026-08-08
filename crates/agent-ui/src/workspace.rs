@@ -187,6 +187,14 @@ struct QueuedFollowUp {
     state: FollowUpState,
 }
 
+/// Which shared registry backs a registry slash turn — a markdown
+/// prompt-macro (`agent::command`) or a skill (`agent::skill`).
+#[derive(Clone, Copy)]
+enum RegistryTurnKind {
+    Command,
+    Skill,
+}
+
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<ThreadEntity>,
@@ -2347,6 +2355,64 @@ impl Workspace {
     fn handle_pasted_image(&mut self, image: gpui::Image, cx: &mut Context<Self>) {
         self.pending_attachments
             .push(PendingAttachment::ClipboardImage(image));
+        cx.notify();
+    }
+
+    /// Run a markdown prompt-macro slash turn (`/gitwork:deliver args`).
+    pub(crate) fn run_command_turn(&mut self, name: &str, args: &str, cx: &mut Context<Self>) {
+        self.run_registry_turn(RegistryTurnKind::Command, name, args, cx);
+    }
+
+    /// Run a skill slash turn (`/plugin:skill args` or bare `/skill`).
+    pub(crate) fn run_skill_turn(&mut self, key: &str, args: &str, cx: &mut Context<Self>) {
+        self.run_registry_turn(RegistryTurnKind::Skill, key, args, cx);
+    }
+
+    /// Shared dispatch for registry-backed slash turns: push the compact
+    /// `/key args` display bubble, then hand the expanded body to the thread
+    /// (`submit_command` / `submit_skill` render the registry content and run
+    /// the turn). A registry miss surfaces as a thread error event. The
+    /// transcript stores the expanded body, so a reloaded thread shows the
+    /// body rather than the compact bubble (parity with the retired manox
+    /// harness).
+    fn run_registry_turn(
+        &mut self,
+        kind: RegistryTurnKind,
+        key: &str,
+        args: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let display_text = if args.is_empty() {
+            format!("/{key}")
+        } else {
+            format!("/{key} {args}")
+        };
+        let meta = self.user_turn_meta(cx);
+        let weak = cx.weak_entity();
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(display_text, Vec::new(), meta, weak, cx)
+        });
+        self.sync_list_count(cx);
+        // Re-engage tail-follow so the streaming reply stays in view.
+        self.follow_message_tail();
+        let hit = self.thread.update(cx, |thread, cx| match kind {
+            RegistryTurnKind::Command => thread.submit_command(key, args, cx),
+            RegistryTurnKind::Skill => thread.submit_skill(key, args, cx),
+        });
+        if !hit {
+            let i18n_key = match kind {
+                RegistryTurnKind::Command => "workspace-unknown-command",
+                RegistryTurnKind::Skill => "workspace-unknown-skill",
+            };
+            self.thread.update(cx, |_, cx| {
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                    "{}",
+                    i18n::t_str(i18n_key, &[("name", key)])
+                )));
+            });
+        }
+        // Persist on submit so the sidebar shows the new entry immediately.
+        save_thread(self.thread.clone(), true, cx);
         cx.notify();
     }
 
