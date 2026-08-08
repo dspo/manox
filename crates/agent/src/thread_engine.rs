@@ -42,6 +42,17 @@ pub trait ThreadEngine: Send + Sync {
         HashMap::new()
     }
 
+    /// Cumulative USD cost of the thread (rate-card pricing at the wire
+    /// boundary); backends without pricing report 0.
+    fn cumulative_cost(&self) -> f64 {
+        0.0
+    }
+
+    /// Per-model cumulative USD cost keyed like `per_model_token_usage`.
+    fn per_model_cost(&self) -> HashMap<String, f64> {
+        HashMap::new()
+    }
+
     /// The model the backend currently runs, if any.
     fn model(&self) -> Option<PiModel>;
 

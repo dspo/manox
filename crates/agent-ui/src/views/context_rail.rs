@@ -319,6 +319,14 @@ impl ContextRail {
         let total = crate::cockpit::format_tokens(
             self.thread.read(cx).cumulative_token_usage().total_tokens(),
         );
+        // Rate-card cost (#418 wire-boundary pricing); backends/sessions
+        // without pricing keep the tokens-only header.
+        let cumulative_cost = self.thread.read(cx).cumulative_cost();
+        let total = if cumulative_cost > 0.0 {
+            SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
+        } else {
+            SharedString::from(total)
+        };
         let main_call = self.main_call.clone();
         let side_calls = self.side_calls.clone();
         let theme_clone = theme.clone();
@@ -339,7 +347,7 @@ impl ContextRail {
                 gpui::div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(total)),
+                    .child(total),
             );
         let header: AnyElement = if has_tooltip {
             header
@@ -361,6 +369,7 @@ impl ContextRail {
         // Per-model token breakdown tree with context budget integrated.
         let thread = self.thread.read(cx);
         let per_model = thread.per_model_token_usage();
+        let per_model_cost = thread.per_model_cost();
         let effective_tokens = agent::compact::effective_context_tokens(
             thread.messages(),
             thread.request_token_usage(),
@@ -416,18 +425,27 @@ impl ContextRail {
 
                 // Token line: ↑input ↓output Rcache_read CHcache_hit_rate. `--`
                 // (the tooltip convention) when there is no input to measure.
+                // With a priced model the cost row follows as the last child.
                 let cache_hit = crate::cockpit::cache_read_ratio(**usage)
                     .map(|r| format!("{:.1}", r * 100.0))
                     .unwrap_or_else(|| "--".into());
+                let cost = per_model_cost.get(*model_name).copied().unwrap_or(0.0);
+                let token_branch = if cost > 0.0 { "├─" } else { "└─" };
                 section = section.child(gpui::div().text_xs().text_color(muted).truncate().child(
                     SharedString::from(format!(
-                        "{indent}└─ ↑{} ↓{} R{} CH{}",
+                        "{indent}{token_branch} ↑{} ↓{} R{} CH{}",
                         crate::cockpit::format_tokens_pi(usage.input_tokens),
                         crate::cockpit::format_tokens_pi(usage.output_tokens),
                         crate::cockpit::format_tokens_pi(usage.cache_read_input_tokens),
                         cache_hit,
                     )),
                 ));
+                if cost > 0.0 {
+                    section =
+                        section.child(gpui::div().text_xs().text_color(muted).truncate().child(
+                            SharedString::from(format!("{indent}└─ {}", format_cost(cost))),
+                        ));
+                }
             }
         }
         section.into_any_element()
@@ -1042,6 +1060,19 @@ fn env_row_clickable(
         .into_any_element()
 }
 
+/// USD cost for the rail: `$1.23` at a dollar and above, three decimals for
+/// cents, four below a cent — rate cards price per 1M tokens, so sub-cent
+/// totals are the common case early in a session.
+fn format_cost(cost: f64) -> String {
+    if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else if cost >= 0.01 {
+        format!("${cost:.3}")
+    } else {
+        format!("${cost:.4}")
+    }
+}
+
 /// Context window for a model name on the usage rail: the pi build probes
 /// the shared pi provider registry (by wire id, then display name); the
 /// retired manox build probes its own registry.
@@ -1073,5 +1104,19 @@ fn model_window_tokens(model_name: &str) -> Option<u64> {
                         .is_some_and(|name| name == model_name)
             })
             .map(|m| m.context_window as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_cost;
+
+    #[test]
+    fn format_cost_tiers() {
+        assert_eq!(format_cost(1.2345), "$1.23");
+        assert_eq!(format_cost(0.0234), "$0.023");
+        assert_eq!(format_cost(0.000123), "$0.0001");
+        assert_eq!(format_cost(12.0), "$12.00");
+        assert_eq!(format_cost(0.01), "$0.010");
     }
 }
