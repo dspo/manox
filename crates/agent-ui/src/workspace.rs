@@ -2051,7 +2051,6 @@ impl Workspace {
             || self.blank_project_parent.is_some()
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.turn_navigator.is_some() {
             self.close_turn_navigator(window, cx);
@@ -2160,7 +2159,6 @@ impl Workspace {
     /// anchored, so it is a single atomic state change — no frame protection
     /// needed against a stale `scroll_to_bottom` (there is no such flag on a
     /// `ListState`).
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Normal);
         self.list_state.scroll_to(ListOffset {
@@ -2170,7 +2168,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.turn_navigator.take().is_none() {
             return;
@@ -2182,7 +2179,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn drop_turn_navigator(&mut self, cx: &mut Context<Self>) {
         if self.turn_navigator.take().is_some() {
             self.turn_navigator_sub = None;
@@ -2191,7 +2187,6 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_turn_navigator_overlay(
         &self,
         window: &mut Window,
