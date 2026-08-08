@@ -35,6 +35,7 @@ use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
+use crate::views::subagents::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ pub(crate) struct ContextRail {
     /// per-frame file read in the context-budget render.
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
+    agents: Vec<SubagentInfo>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
@@ -103,6 +105,7 @@ impl ContextRail {
             plan_seen: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
+            agents: Vec::new(),
             side_calls: Vec::new(),
             main_call: None,
             git_change_stats: None,
@@ -129,6 +132,7 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.side_calls.clear();
         self.main_call = None;
+        self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
         } else {
@@ -193,6 +197,39 @@ impl ContextRail {
         cx.notify();
     }
 
+    /// Upsert one sub-agent observation row from a `SubagentProgress` event
+    /// (the pi harness emits these around its ephemeral nested sessions;
+    /// the retired manox harness maintains its list from child threads
+    /// instead).
+    pub(crate) fn apply_subagent_progress(
+        &mut self,
+        id: &str,
+        subagent_type: &str,
+        description: Option<&str>,
+        status: agent::ToolCallStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(info) = self.agents.iter_mut().find(|info| info.id == id) {
+            info.status = status;
+            if !subagent_type.is_empty() {
+                info.subagent_type = subagent_type.to_string();
+            }
+            if let Some(description) = description
+                && info.description.is_empty()
+            {
+                info.description = description.to_string();
+            }
+        } else {
+            self.agents.push(SubagentInfo {
+                id: id.to_string(),
+                subagent_type: subagent_type.to_string(),
+                description: description.unwrap_or_default().to_string(),
+                status,
+            });
+        }
+        cx.notify();
+    }
+
     /// Threshold above which a freshly-seen plan auto-collapses so a long list
     /// does not dominate the rail. At or below this, the plan starts expanded.
     const PLAN_AUTOCOLLAPSE_ABOVE: usize = 5;
@@ -227,6 +264,8 @@ impl ContextRail {
             thread.project().cloned()
         };
 
+        let agents_section = self.render_agents_section(theme, cx);
+
         v_flex()
             .w_full()
             .min_h_0()
@@ -247,6 +286,7 @@ impl ContextRail {
                     .text_color(theme.foreground)
                     .child(i18n::t("context-rail-title")),
             )
+            .child(agents_section)
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx))
             .child(self.render_plan_section(theme, cx))
@@ -571,6 +611,113 @@ impl ContextRail {
         block.into_any_element()
     }
 
+    /// Status indicator for the Captain (main agent) row.
+    /// The Captain uses `ship-wheel` for the completed state, distinguishing it
+    /// from sub-agents that use `circle-check-big`.
+    fn captain_status_indicator(status: agent::ToolCallStatus, theme: &Theme) -> AnyElement {
+        use agent::ToolCallStatus;
+        match status {
+            ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
+                crate::views::braille_spinner::BrailleSpinner::new()
+                    .xsmall()
+                    .color(theme.accent_foreground)
+                    .into_any_element()
+            }
+            ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()
+                .path("icons/ship-wheel.svg")
+                .xsmall()
+                .text_color(theme.success)
+                .into_any_element(),
+            ToolCallStatus::Error | ToolCallStatus::Denied => Icon::new(IconName::CircleX)
+                .xsmall()
+                .text_color(theme.danger)
+                .into_any_element(),
+            ToolCallStatus::Cancelled => Icon::new(IconName::Minus)
+                .xsmall()
+                .text_color(theme.muted_foreground)
+                .into_any_element(),
+        }
+    }
+
+    /// Agents observation section: Captain (main thread) row plus one row per
+    /// sub-agent the pi harness reported via `SubagentProgress`. Rows are
+    /// observe-only — the retired manox harness drilled into per-child panels,
+    /// but pi sub-agents are ephemeral nested sessions with no child-thread
+    /// entity to open.
+    fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let main_status = if self.cockpit_phase == CockpitPhase::Failed {
+            agent::ToolCallStatus::Error
+        } else if self.thread.read(cx).is_running() {
+            agent::ToolCallStatus::Running
+        } else {
+            agent::ToolCallStatus::Success
+        };
+        let mut rows = vec![
+            h_flex()
+                .w_full()
+                .py_0p5()
+                .gap_1p5()
+                .items_center()
+                .child(Self::captain_status_indicator(main_status, theme))
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(i18n::t("context-agents-captain")),
+                )
+                .into_any_element(),
+        ];
+        // Flat list: pi sub-agents are ephemeral nested sessions that never
+        // nest deeper than one level, so no tree recursion is needed.
+        for info in &self.agents {
+            let title = subagent_display_title(info);
+            let tooltip_text = title.clone();
+            let row = h_flex()
+                .id(SharedString::from(format!("context-agent-{}", info.id)))
+                .w_full()
+                .min_w_0()
+                .py_0p5()
+                .pl(px(12.))
+                .gap_1p5()
+                .items_center()
+                .rounded(px(4.))
+                .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+                .child(status_indicator(info.status, theme))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(title),
+                );
+            rows.push(row.into_any_element());
+        }
+
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Bot)
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(i18n::t("context-agents-title")),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
+    }
     /// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
     /// Within each priority group the original chronological order is preserved
     /// by `sort_by_key`'s stable sort.
