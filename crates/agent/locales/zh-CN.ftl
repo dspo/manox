@@ -486,7 +486,8 @@ goal-status-complete = 目标已完成
 
 ### main.rs (system menus)
 menu-settings = Settings…
-menu-quit = Quit
+menu-quit = 退出
+menu-open-manox = 打开 Manox
 menu-file = File
 menu-terminal = 终端
 menu-new-terminal = 新建终端标签页

@@ -540,6 +540,7 @@ goal-status-complete = Goal complete
 ### main.rs (system menus)
 menu-settings = Settings…
 menu-quit = Quit
+menu-open-manox = Open Manox
 menu-file = File
 menu-terminal = Terminal
 menu-new-terminal = New Terminal Tab
