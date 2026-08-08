@@ -89,12 +89,13 @@ use crate::views::settings::{SettingsEvent, SettingsView};
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 #[cfg(feature = "harness-manox")]
-use crate::views::subagent_panel::{SubagentInfo, SubagentPanel};
+use crate::views::subagent_panel::SubagentPanel;
 #[cfg(feature = "harness-manox")]
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use crate::views::subagent_panel::{
-    SubagentSnapshot, snapshots_from_messages, subagent_display_title,
-};
+use crate::views::subagent_panel::{SubagentSnapshot, snapshots_from_messages};
+#[cfg(feature = "harness-manox")]
+use crate::views::subagents::SubagentInfo;
+#[cfg(feature = "harness-manox")]
+use crate::views::subagents::subagent_display_title;
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
 #[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::{
@@ -1162,7 +1163,32 @@ impl Workspace {
                     #[cfg(feature = "harness-manox")]
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
-                    // TODO(pi-wire): member/sub-agent observation panels.
+                    // Sub-agent observation: the retired manox harness tracks
+                    // child threads (panel tabs below); the pi harness observes
+                    // its ephemeral nested sessions through progress events on
+                    // the rail.
+                    #[cfg(not(feature = "harness-manox"))]
+                    if let ThreadEvent::SubagentProgress {
+                        id,
+                        subagent_type,
+                        latest_activity,
+                        status,
+                        ..
+                    } = ev
+                    {
+                        let id = id.clone();
+                        let subagent_type = subagent_type.clone();
+                        let latest_activity = latest_activity.clone();
+                        this.context_rail.update(cx, |r, cx| {
+                            r.apply_subagent_progress(
+                                &id,
+                                &subagent_type,
+                                latest_activity.as_deref(),
+                                *status,
+                                cx,
+                            );
+                        });
+                    }
                     #[cfg(feature = "harness-manox")]
                     {
                         let root_thread_id = this.thread.read(cx).id.0.clone();

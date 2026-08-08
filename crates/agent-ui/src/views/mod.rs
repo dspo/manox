@@ -19,6 +19,7 @@ pub mod settings;
 pub mod sidebar;
 #[cfg(feature = "harness-manox")]
 pub mod subagent_panel;
+pub mod subagents;
 pub mod title_menu;
 // TODO(pi-wire): turn navigator is unwired chrome under harness-pi.
 #[cfg_attr(feature = "harness-pi", allow(dead_code))]
