@@ -13,6 +13,7 @@ pub mod goal;
 pub mod i18n;
 pub mod language;
 pub mod language_model;
+pub mod mcp;
 pub mod message;
 pub mod paths;
 pub mod permission;
@@ -56,6 +57,9 @@ pub fn init(cx: &mut App) {
     i18n::init();
     settings::init_optimization();
     pi_providers::init();
+    // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
+    // connections settle (per-server timeout); failures are isolated.
+    mcp::init();
     // LSP PATH detection (no spawn — servers start lazily on first code-intel
     // call). Runs after MCP so the registry is settled before the first
     // `main_registry` build picks up LSP tools.

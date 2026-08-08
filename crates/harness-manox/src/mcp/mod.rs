@@ -1,9 +1,9 @@
-//! MCP (Model Context Protocol) client integration.
+//! MCP (Model Context Protocol) client integration — retired manox layer.
 //!
-//! Reads `~/.config/cx/manox/mcp.toml`, connects each configured server (stdio
-//! or streamable HTTP) via the `rmcp` SDK, lists its tools, and exposes them
-//! as `AgentTool`s that route `tools/call` back through the rmcp client. No UI
-//! — configuration is file-only.
+//! The connection core and config moved to `agent::mcp` (shared with the pi
+//! harness, initialized by `agent::init`). This module keeps the manox
+//! `AgentTool` bridge ([`tool::McpTool`]) and the manox-shaped registry that
+//! `tools::main_registry` consumes.
 
 pub mod config;
 pub mod registry;
