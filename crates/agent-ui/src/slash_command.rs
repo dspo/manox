@@ -16,15 +16,19 @@
 //! [`ExitCommand`]), and `/new` (aliases `/clear`, `/archive`; archive the
 //! current thread and start a fresh one that keeps the project, approval
 //! mode, and model, see [`NewCommand`]). The retired manox harness
-//! additionally had `/danger`, `/plan`, `/goal`, markdown prompt-macro, and
-//! skill adapters — see git history (`origin/Manox` backup branch) for those
-//! flows.
+//! additionally had `/danger`, `/plan`, `/goal` (see git history /
+//! `origin/Manox` backup branch); markdown prompt-macros and skills are
+//! mirrored into the registry at startup from the shared `agent::command` /
+//! `agent::skill` registries ([`MarkdownSlashCommand`] /
+//! [`SkillSlashCommand`]).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, SharedString, Window};
 
+use agent::command::CommandDefinition;
 use agent::i18n;
+use agent::skill::SkillDefinition;
 
 use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
@@ -121,11 +125,59 @@ impl SlashCommandRegistry {
 /// Register the built-in slash commands. Call once during app startup, before
 /// any workspace is created. Idempotent via `OnceLock::set`.
 pub fn init(_cx: &mut App) {
-    let commands: Vec<Box<dyn SlashCommand>> = vec![
+    let mut commands: Vec<Box<dyn SlashCommand>> = vec![
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
     ];
+    // Names already claimed by built-ins and (below) markdown macros, so a
+    // skill sharing one is skipped — keeps one popover row per name and routes
+    // dispatch to the higher-priority command/built-in.
+    let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
+        "compact".to_string(),
+        "exit".to_string(),
+        "new".to_string(),
+    ]);
+    // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
+    // the registry so `parse` recognizes them and the `⁄` popover lists them.
+    // The adapter delegates to `Workspace::run_command_turn` →
+    // `Thread::submit_command`, which substitutes `$ARGUMENTS` into the body
+    // (the retired manox harness additionally applied the macro's
+    // `allowed-tools` turn filter).
+    // `agent::command::try_global` is `None` only before `agent::init` (which
+    // `main` calls before us); fall back to no macros rather than panicking.
+    for (key, def) in agent::command::try_global()
+        .map(|r| r.entries())
+        .unwrap_or_default()
+    {
+        // A macro sharing a built-in name (e.g. `commands/danger.md`) is skipped —
+        // the built-in wins, mirroring the skill-skip rule below, so the popover
+        // never shows two rows for the same name.
+        if command_keys.contains(key.as_str()) {
+            continue;
+        }
+        command_keys.insert(key.clone());
+        commands.push(
+            Box::new(MarkdownSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>,
+        );
+    }
+    // Mirror every loaded skill (`/gitwork:deliver`, bare `/skill`, etc.) the
+    // same way. Skills dispatch to `Workspace::run_skill_turn` →
+    // `Thread::submit_skill`, which injects the skill body as the turn's user
+    // message. A command and a skill may share a key (`gitwork:deliver`); the
+    // command wins — skip a skill whose key an already-registered command owns,
+    // so the popover shows one row and `parse`/`dispatch` hit the command path.
+    for (key, def) in agent::skill::try_global()
+        .map(|r| r.entries())
+        .unwrap_or_default()
+    {
+        if command_keys.contains(key.as_str()) {
+            continue;
+        }
+        commands.push(
+            Box::new(SkillSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>
+        );
+    }
     let _ = REGISTRY.set(SlashCommandRegistry::new(commands));
 }
 
@@ -178,6 +230,82 @@ pub fn dispatch(
 }
 
 // ─── built-in commands ─────────────────────────────────────────────────────
+
+/// Adapter wrapping a markdown prompt-macro `CommandDefinition` as a
+/// `SlashCommand`. The `key` is the full registry key (`gitwork:deliver`), not
+/// the bare filename stem, so `parse` matches what the user actually types.
+/// `execute` delegates to `Workspace::run_command_turn`, which pushes the
+/// display bubble, substitutes `$ARGUMENTS` into the body, and applies the
+/// command's `allowed-tools` whitelist for the turn.
+struct MarkdownSlashCommand {
+    key: String,
+    def: Arc<CommandDefinition>,
+}
+
+impl MarkdownSlashCommand {
+    fn new(key: String, def: Arc<CommandDefinition>) -> Self {
+        Self { key, def }
+    }
+}
+
+impl SlashCommand for MarkdownSlashCommand {
+    fn name(&self) -> &str {
+        &self.key
+    }
+    fn description(&self) -> SharedString {
+        SharedString::from(self.def.description.clone())
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.run_command_turn(&self.key, args, cx);
+        SlashResult::Handled
+    }
+}
+
+/// Adapter wrapping a `SkillDefinition` as a `SlashCommand`, so a plugin skill
+/// (`/gitwork:deliver`) or user-authored skill (`/myskill`) is slash-invocable
+/// the way it is in Claude Code. The `key` is the full registry lookup name
+/// (`plugin:skill` or bare `skill`), matching what the user types and what
+/// `parse` looks up. `execute` delegates to `Workspace::run_skill_turn`, which
+/// pushes the display bubble and injects the skill body as the turn's user
+/// message via `Thread::submit_skill`.
+struct SkillSlashCommand {
+    key: String,
+    def: Arc<SkillDefinition>,
+}
+
+impl SkillSlashCommand {
+    fn new(key: String, def: Arc<SkillDefinition>) -> Self {
+        Self { key, def }
+    }
+}
+
+impl SlashCommand for SkillSlashCommand {
+    fn name(&self) -> &str {
+        &self.key
+    }
+    fn description(&self) -> SharedString {
+        SharedString::from(self.def.description.clone())
+    }
+    fn kind(&self) -> CompletionKind {
+        CompletionKind::Skill
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.run_skill_turn(&self.key, args, cx);
+        SlashResult::Handled
+    }
+}
 
 /// `/compact` — manually trigger a context-compaction pass on the current
 /// thread. Summarizes older history into a handoff message, keeping a recent

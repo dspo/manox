@@ -21,7 +21,6 @@ use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
 pub enum CompletionKind {
     Command,
     Skill,
-    Agent,
 }
 
 impl CompletionKind {
@@ -29,7 +28,6 @@ impl CompletionKind {
         match self {
             Self::Command => IconName::SquareTerminal,
             Self::Skill => IconName::BookOpen,
-            Self::Agent => IconName::Bot,
         }
     }
 
@@ -37,7 +35,6 @@ impl CompletionKind {
         match self {
             Self::Command => "completion-tag-command",
             Self::Skill => "completion-tag-skill",
-            Self::Agent => "completion-tag-agent",
         }
     }
 }
@@ -115,11 +112,19 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
     }
 }
 
-/// Skills + subagents, filtered + sorted by `query`.
+/// Skills + subagents, filtered + sorted by `query`. Skills are shared
+/// across harnesses (`agent::skill`); subagent definitions are a retired
+/// manox registry (the pi harness assembles its subagents in
+/// `pi_extensions::agents`).
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
-    let items = Vec::new();
-    // TODO(pi-wire): skill/subagent mentions — no registry is wired in the
-    // pi path yet.
+    let mut items = Vec::new();
+    for def in agent::skill::global().list() {
+        items.push(CompletionItem {
+            name: def.name.clone().into(),
+            description: def.description.clone().into(),
+            kind: CompletionKind::Skill,
+        });
+    }
     filter_sort(items, query)
 }
 

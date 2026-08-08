@@ -306,6 +306,7 @@ settings-tag-dspo = dspo
 workspace-input-placeholder = 输入消息，点击发送以开始使用
 workspace-composer-placeholder = 编写 markdown…（Cmd-Enter 发送）
 workspace-unknown-command = 未知命令：/{$name}（用 `/` 菜单查看已安装命令）
+workspace-unknown-skill = 未知技能：/{$name}（用 `/` 菜单查看已安装技能）
 workspace-no-model = 未配置模型
 workspace-approval-title = 工具调用审批
 workspace-escalation-allow-once = 允许一次
@@ -350,7 +351,6 @@ composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
 completion-tag-command = 命令
 completion-tag-skill = 技能
-completion-tag-agent = Agent
 
 ### 用户消息导航
 turn-navigator-search-placeholder = 搜索用户消息…
