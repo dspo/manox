@@ -117,7 +117,9 @@ fn parse_one(v: &Value, agent: &str, session_id: Option<&str>) -> Option<RawEntr
     })
 }
 
-/// pi 入口：使用 AGENT_PI 标识。
+/// pi 入口：使用 AGENT_PI 标识。生产路径经 `SourceKind::PiSession(agent)`
+/// 直接调用 [`parse_with_agent`]；此包装仅测试使用。
+#[cfg(test)]
 pub(super) fn parse(content: &str) -> Vec<RawEntry> {
     parse_with_agent(content, super::super::AGENT_PI)
 }
@@ -233,5 +235,40 @@ mod tests {
 
         let entries_other = parse_with_agent(line, "test-agent");
         assert_eq!(entries_other[0].agent, "test-agent");
+    }
+
+    #[test]
+    fn parses_manox_pi_session_shapes() {
+        // manox pi 化后的真实 session 形态：pi v3 header + model_change +
+        // assistant 消息；model 为新注册表的裸 id，provider 为
+        // "{name}-{wire_api}" 复合键。
+        let content = r#"{"type":"session","version":3,"id":"42f102b0-58fc-4295-aa9f-83caee614427","timestamp":"2026-08-06T15:42:37.007535Z","cwd":"/Users/test/manox"}
+{"type":"model_change","id":"ca36fbee","parentId":null,"timestamp":"2026-08-06T15:42:37.008284Z","provider":"DeepSeek-anthropic","modelId":"deepseek-v4-flash"}
+{"type":"message","id":"166b8fae","parentId":"8b0286e9","timestamp":"2026-08-06T15:42:48.839341Z","message":{"role":"assistant","content":[],"model":"deepseek-v4-flash","provider":"DeepSeek-anthropic","api":"anthropic","stopReason":"stop","usage":{"input":85,"output":65,"cacheRead":4224,"cacheWrite":0,"totalTokens":4374}}}"#;
+        let entries = parse_with_agent(content, "manox");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "manox");
+        assert_eq!(entries[0].model, "deepseek-v4-flash");
+        assert_eq!(entries[0].input_tokens, 85);
+        assert_eq!(entries[0].output_tokens, 65);
+        assert_eq!(entries[0].cache_read_input_tokens, 4224);
+        assert_eq!(entries[0].date, "2026-08-06");
+        assert_eq!(
+            entries[0].session_id,
+            Some("42f102b0-58fc-4295-aa9f-83caee614427".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_manox_legacy_model_id_shape() {
+        // pi 化过渡期旧注册表写入的 model 串：{provider}/{model}[Nm]/{wire_api}，
+        // 归一化（strip_wire_api_suffix → 去 provider 前缀 → 去 [1m]）由上层
+        // normalize_model_name 负责，解析层原样保留。
+        let line = r#"{"type":"message","id":"e605cfea","parentId":"29384878","timestamp":"2026-08-06T01:53:20.880451Z","message":{"role":"assistant","content":[],"model":"DeepSeek/deepseek-v4-flash[1m]/anthropic","provider":"anthropic:DeepSeek","api":"anthropic","stopReason":"stop","usage":{"input":2114,"output":235,"cacheRead":0,"cacheWrite":0,"totalTokens":2349}}}"#;
+        let entries = parse_with_agent(line, "manox");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "DeepSeek/deepseek-v4-flash[1m]/anthropic");
+        assert_eq!(entries[0].input_tokens, 2114);
+        assert_eq!(entries[0].output_tokens, 235);
     }
 }

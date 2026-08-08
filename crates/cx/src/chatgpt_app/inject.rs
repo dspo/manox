@@ -1,6 +1,6 @@
-//! Codex.app renderer 注入脚本生成器（React fiber state 注入路线）。
+//! ChatGPT.app renderer 注入脚本生成器（React fiber state 注入路线）。
 //!
-//! ⚠️ 机制由 cx 自行通过 CDP（Chrome DevTools Protocol）逆向 Codex.app（149.x）renderer 得出：
+//! ⚠️ 机制由 cx 自行通过 CDP（Chrome DevTools Protocol）逆向 ChatGPT.app（149.x）renderer 得出：
 //! 模型选择器**不是独立按钮**，而是 reasoning effort 下拉里的一个子菜单项；
 //! 模型列表由 React 组件的 props/state 持有（含 `model` 字段的对象数组），下拉打开时才挂载到 DOM。
 //! 此 App 为 ESM 打包（无 webpack），无 `sendRequest`/`list-models-for-host` 协议。
@@ -336,7 +336,7 @@ mod tests {
             model_wire_apis: vec![WireApi::Responses],
             provider_name: "DashScope".into(),
             endpoint_url: "https://example.com/v1".into(),
-            visible_agents: vec!["Codex.app".into()],
+            visible_agents: vec!["ChatGPT.app".into()],
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
             apikey_source: None,

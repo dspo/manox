@@ -33,9 +33,15 @@ pub(super) fn timestamp_secs_from_iso(s: &str) -> Option<u64> {
     })
 }
 
-/// Unix seconds → `"YYYY-MM-DD"` (UTC).
+/// Unix seconds → `"YYYY-MM-DD"`（本地时区）。
+///
+/// 与 ISO 时间戳源（`date_field`，claude/codex/copilot/pi 等）保持同一口径：
+/// 同一本地日的用量归入同一日期桶。manox/mimo 的 SQLite 源此前按 UTC 归日，
+/// 与 pi-sessions JSONL 源（本地日）在午夜附近互相错位，故统一为本地时区。
 pub(super) fn date_from_unix_secs(secs: i64) -> String {
-    unix_to_date(secs)
+    DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
 }
 
 /// Howard Hinnant date algorithm: unix seconds → "YYYY-MM-DD" (UTC).
@@ -120,8 +126,19 @@ mod tests {
 
     #[test]
     fn date_from_unix_secs_converts_to_ymd() {
-        assert_eq!(date_from_unix_secs(0), "1970-01-01");
-        assert_eq!(date_from_unix_secs(1_779_772_684), "2026-05-26");
+        // 期望值按本地时区计算（CI 为 UTC，开发机多为 UTC+8，均自洽）。
+        let expect_local = |secs: i64| {
+            DateTime::from_timestamp(secs, 0)
+                .unwrap()
+                .with_timezone(&Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        assert_eq!(date_from_unix_secs(0), expect_local(0));
+        assert_eq!(
+            date_from_unix_secs(1_779_772_684),
+            expect_local(1_779_772_684)
+        );
     }
 
     #[test]

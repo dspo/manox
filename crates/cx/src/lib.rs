@@ -35,7 +35,7 @@ use cx_providers::{
     read_config_file, resolve_apikey, resolved_agents,
 };
 
-mod codex_app;
+mod chatgpt_app;
 mod probe;
 mod relay;
 mod session;
@@ -229,13 +229,13 @@ fn model_header_row() -> Line<'static> {
 /// Normalize a CLI-supplied agent name: case-insensitive, with alias collapsing.
 ///
 /// `CoDex.App` / `codexapp` / `codex_app` / `ChatGPT.App` / `chatgptapp` all resolve
-/// to the `Codex.app` agent; the remaining ids (`claude`, `codex`, `copilot`, `codex+`)
+/// to the `ChatGPT.app` agent; the remaining ids (`claude`, `codex`, `copilot`)
 /// are lowercased verbatim. This only touches user-facing input — internal config/registry
 /// ids are already canonical.
 fn canonicalize_agent_name(input: &str) -> String {
     match input.to_lowercase().as_str() {
         "codex_app" | "codexapp" | "codex.app" | "chatgpt_app" | "chatgptapp" | "chatgpt.app" => {
-            "Codex.app".into()
+            "ChatGPT.app".into()
         }
         "vscode" | "vs-code" | "vs_code" | "vs code" | "vscode.app" => "VS Code".into(),
         other => other.into(),
@@ -296,9 +296,9 @@ struct Selection {
     selected_wire_api: WireApi,
     provider: ResolvedProvider,
     model: Option<ResolvedModel>,
-    /// 仅 Codex.app 等注入型 agent 使用：注入给桌面端的完整模型列表。
+    /// 仅 ChatGPT.app 等注入型 agent 使用：注入给桌面端的完整模型列表。
     /// 首个元素为默认模型（写入 config.toml 的 `model =`，并在注入脚本里标记 `isDefault`）。
-    /// 非 Codex.app agent 始终为空 Vec。
+    /// 非 ChatGPT.app agent 始终为空 Vec。
     injected_models: Vec<ResolvedModel>,
 }
 
@@ -406,7 +406,7 @@ fn write_private_file(path: &Path, content: &str) -> Result<()> {
 ///
 /// 需处理的两种残留：
 /// - 上次创建的**符号链接**（持久目录二次启动）；
-/// - Codex.app 用 atomic-rename 写状态文件时，把我们的符号链接**替换成的普通文件**
+/// - ChatGPT.app 用 atomic-rename 写状态文件时，把我们的符号链接**替换成的普通文件**
 ///   （`rename(tmp, target)` 会覆盖符号链接，产生真实文件，如 `.codex-global-state.json.bak`、
 ///   `logs_2.sqlite-wal`）。此时 `real` 目录里有真实数据源，重新符号链接到 `real` 即可，不丢数据。
 ///
@@ -625,7 +625,7 @@ fn extract_reasoning_effort(existing: Option<&str>) -> Option<String> {
 }
 
 /// 把 `WireApi` 映射成 codex 家族 config.toml 的 `wire_api` 词汇。
-/// codex / codex+ 读取的规范值为 `responses` / `chat_completions` / `anthropic_messages`，
+/// codex（ChatGPT.app 引擎）读取的规范值为 `responses` / `chat_completions` / `anthropic_messages`，
 /// 与 cx 内部 `WireApi::launch_value()`（供 copilot 的 `COPILOT_PROVIDER_WIRE_API` 使用，
 /// 值为 `responses` / `completions` / `anthropic`）不同，故单独提供。
 fn codex_wire_api_str(wire_api: WireApi) -> Result<&'static str> {
@@ -797,15 +797,15 @@ fn prepare_codex_launch_home(
 /// 使用固定目录 ~/.config/cx/.codex/，Symlink 真实 ~/.codex/ 内容（config.toml 除外），
 /// 写入我们注入的 config.toml（动态 provider key / env_key）。Codex Desktop 读 CODEX_HOME 指向此目录。
 ///
-/// 返回 `CodexAppPrepared`：codex_home 供调用方在启动子进程时设 `CODEX_HOME` 环境变量，
+/// 返回 `ChatGptAppPrepared`：codex_home 供调用方在启动子进程时设 `CODEX_HOME` 环境变量，
 /// env_key 是 config.toml 里 Codex 运行时读取 API Key 的环境变量名，
 /// reasoning_effort 是解析出的（或默认 "high"）推理强度，供注入脚本与下拉默认值保持一致。
-fn prepare_codex_launch_home_for_app(
+fn prepare_chatgpt_launch_home_for_app(
     model: &ResolvedModel,
     provider: &ResolvedProvider,
     wire_api: WireApi,
     injected_models: &[ResolvedModel],
-) -> Result<CodexAppPrepared> {
+) -> Result<ChatGptAppPrepared> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let codex_dir = cx_state_dir()?.join(".codex");
     let real_codex_dir = real_home.join(".codex");
@@ -828,7 +828,7 @@ fn prepare_codex_launch_home_for_app(
     // 生成本地模型目录（收录带上下文后缀的模型），让引擎跳过 fallback 对上下文窗口的钳制。
     // 无后缀模型时目录为空（引擎拒绝空目录），此时不写 model_catalog_json，保持现状。
     let catalog_path = codex_dir.join("model-catalog.json");
-    let catalog = codex_app::catalog::build_model_catalog(injected_models);
+    let catalog = chatgpt_app::catalog::build_model_catalog(injected_models);
     let has_catalog_entries = catalog["models"]
         .as_array()
         .map(|models| !models.is_empty())
@@ -864,15 +864,15 @@ fn prepare_codex_launch_home_for_app(
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
 
-    Ok(CodexAppPrepared {
+    Ok(ChatGptAppPrepared {
         codex_home: codex_dir,
         env_key,
         reasoning_effort,
     })
 }
 
-/// `prepare_codex_launch_home_for_app` 的产物，供 codex_app 启动编排使用。
-struct CodexAppPrepared {
+/// `prepare_chatgpt_launch_home_for_app` 的产物，供 chatgpt_app 启动编排使用。
+struct ChatGptAppPrepared {
     codex_home: PathBuf,
     env_key: String,
     reasoning_effort: String,
@@ -1034,10 +1034,10 @@ fn model_options_for_provider(
         .collect()
 }
 
-/// 收集某 provider 下所有支持 Codex.app（即 wire 含 Responses）的模型，作为注入桌面端的完整列表。
+/// 收集某 provider 下所有支持 ChatGPT.app（即 wire 含 Responses）的模型，作为注入桌面端的完整列表。
 ///
 /// 同一 model id 仅保留一条，按 model id 升序排序。首个元素即默认模型。
-fn injected_models_for_codex_app(
+fn injected_models_for_chatgpt_app(
     all_models: &[ResolvedModel],
     provider_name: &str,
 ) -> Vec<ResolvedModel> {
@@ -1045,9 +1045,9 @@ fn injected_models_for_codex_app(
         .iter()
         .filter(|m| {
             m.provider_name == provider_name
-                && resolved_model_supports_agent(m, "Codex.app")
+                && resolved_model_supports_agent(m, "ChatGPT.app")
                 // 显式确认模型支持 Responses wire api。supports_agent 已隐含这点
-                // （Codex.app agent 仅兼容 Responses endpoint），但这里再过滤一次，
+                // （ChatGPT.app agent 仅兼容 Responses endpoint），但这里再过滤一次，
                 // 防止配置层不变量将来变动时把非 Responses 模型注入、生成错误的 wire_api。
                 && m.model_wire_apis.contains(&WireApi::Responses)
         })
@@ -1068,12 +1068,12 @@ fn build_chatgpt_selection(
     provider_name: &str,
     default_model_id: &str,
 ) -> Result<Selection> {
-    let agent = find_agent(config, "Codex.app").context("配置中缺少 `Codex.app` agent")?;
-    let provider = providers_for_agent(config, "Codex.app")
+    let agent = find_agent(config, "ChatGPT.app").context("配置中缺少 `ChatGPT.app` agent")?;
+    let provider = providers_for_agent(config, "ChatGPT.app")
         .into_iter()
         .find(|p| p.name == provider_name)
-        .with_context(|| format!("`Codex.app` 下未找到 provider `{provider_name}`"))?;
-    let mut injected = injected_models_for_codex_app(all_models, &provider.name);
+        .with_context(|| format!("`ChatGPT.app` 下未找到 provider `{provider_name}`"))?;
+    let mut injected = injected_models_for_chatgpt_app(all_models, &provider.name);
     if injected.is_empty() {
         bail!(
             "Provider `{provider_name}` 下没有支持 Responses wire api 的模型，无法注入 ChatGPT.app"
@@ -1100,7 +1100,7 @@ fn build_chatgpt_selection(
 }
 
 /// ChatGPT.app 的 API Key 非交互解析（GUI 嵌入路径）：无 stdin 可补齐，缺失即报错。
-fn resolve_codex_app_apikey(provider: &ResolvedProvider) -> Result<String> {
+fn resolve_chatgpt_app_apikey(provider: &ResolvedProvider) -> Result<String> {
     let Some(source) = provider.apikey_source.as_deref() else {
         bail!(
             "Provider `{}` 需要 API Key 但未配置 apikey_source",
@@ -1116,7 +1116,7 @@ fn resolve_codex_app_apikey(provider: &ResolvedProvider) -> Result<String> {
 }
 
 /// ChatGPT.app 的 API Key 交互解析（CLI 路径）：Keychain 缺失时提示输入并回写。
-fn resolve_codex_app_apikey_interactive(provider: &ResolvedProvider) -> Result<String> {
+fn resolve_chatgpt_app_apikey_interactive(provider: &ResolvedProvider) -> Result<String> {
     let Some(source) = provider.apikey_source.as_deref() else {
         bail!(
             "Provider `{}` 需要 API Key 但未配置 apikey_source",
@@ -1139,8 +1139,8 @@ pub fn launch_chatgpt_app(provider_name: &str, default_model_id: &str) -> Result
     let mut all_models = build_all_models(&config);
     apply_probe_cache(&mut all_models);
     let selection = build_chatgpt_selection(&config, &all_models, provider_name, default_model_id)?;
-    let apikey = resolve_codex_app_apikey(&selection.provider)?;
-    codex_app::launch_with_injection(&selection, &apikey, &[])
+    let apikey = resolve_chatgpt_app_apikey(&selection.provider)?;
+    chatgpt_app::launch_with_injection(&selection, &apikey, &[])
 }
 
 /// 构造 VS Code 启动所需的 `Selection`：选中模型即唯一 BYOK 目标（无模型目录
@@ -1258,8 +1258,7 @@ pub fn vscode_app_installed() -> bool {
   cx --pty -- claude --dangerously-skip-permissions   跳过 agent 选择，透传该 flag
   cx --pty -- --dangerously-skip-permissions          进 TUI 选 agent，选定后透传该 flag
   cx --pty -S /tmp/cx.sock -- claude                 自定义 IPC socket 路径
-  cx -- Codex.App          大小写不敏感，等价 `cx -- codex.app`
-  cx -- ChatGPT.App         ChatGPT.app 桌面端（同 Codex.app）"
+  cx -- ChatGPT.App        ChatGPT.app 桌面端（大小写不敏感，等价 `cx -- chatgpt.app`；旧名 `Codex.app` 仍兼容）"
 )]
 struct Cli {
     /// 经 PTY 中继启动（cx 持 master，终端 IO 透传，并暴露外部 IPC 注入入口）；默认直连。
@@ -1576,18 +1575,18 @@ fn run_launcher(
         return Ok(());
     }
 
-    // Codex.app 走专门的启动 + renderer 注入路径，不经通用 build_launch_spec/launch_agent。
+    // ChatGPT.app 走专门的启动 + renderer 注入路径，不经通用 build_launch_spec/launch_agent。
     // 它是 GUI detach，不接管终端，--pty/--socket 对它无意义。
-    if selection.agent_id == "Codex.app" {
+    if selection.agent_id == "ChatGPT.app" {
         if pty {
-            eprintln!("cx: --pty 对 Codex.app 无效（GUI detach，不经 PTY 中继）");
+            eprintln!("cx: --pty 对 ChatGPT.app 无效（GUI detach，不经 PTY 中继）");
         }
         if socket.is_some() {
-            eprintln!("cx: --socket 对 Codex.app 无效（GUI detach，无 IPC 注入）");
+            eprintln!("cx: --socket 对 ChatGPT.app 无效（GUI detach，无 IPC 注入）");
         }
-        let apikey = resolve_codex_app_apikey_interactive(&selection.provider)?;
+        let apikey = resolve_chatgpt_app_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
-        return codex_app::launch_with_injection(&selection, &apikey, &passthrough_args);
+        return chatgpt_app::launch_with_injection(&selection, &apikey, &passthrough_args);
     }
 
     // VS Code 走专门的进程 env 注入路径（VSCODE_CLI=1），不经通用
@@ -2128,7 +2127,7 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
 }
 
 /// 子进程退出后的统一收尾：提取 token 用量、打印退出摘要、发出 Warp stop 事件、
-/// 按子进程退出码退出 cx。供 `launch_agent`（同步 spawn+wait）与 `codex_app` 注入路径
+/// 按子进程退出码退出 cx。供 `launch_agent`（同步 spawn+wait）与 `chatgpt_app` 注入路径
 /// （spawn → CDP 注入 → wait）共用，避免 Warp 集成与退出摘要逻辑分叉。
 #[allow(clippy::too_many_arguments)]
 fn finalize_agent_exit(
@@ -2208,7 +2207,7 @@ pub(crate) fn finalize_exit_common(
     std::process::exit(exit_code);
 }
 
-/// `format_exit_summary` 的字段版本，供不持有完整 `LaunchSpec` 的调用方（codex_app 注入路径）复用。
+/// `format_exit_summary` 的字段版本，供不持有完整 `LaunchSpec` 的调用方（chatgpt_app 注入路径）复用。
 fn format_exit_summary_inline(
     agent_id: &str,
     provider_name: &str,
@@ -2385,7 +2384,7 @@ fn build_launch_spec(
                 }
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" | "codex+" => {
+            "codex" => {
                 if let Some(value) = provider
                     .apikey_source
                     .as_ref()
@@ -2470,7 +2469,7 @@ fn build_launch_spec(
                 args.push(api_model_id.to_string());
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" | "codex+" => {
+            "codex" => {
                 prepare_codex_launch_home(
                     model,
                     provider,
@@ -2480,10 +2479,10 @@ fn build_launch_spec(
                 )?;
                 args.extend(passthrough_args.iter().cloned());
             }
-            "Codex.app" => {
-                // Codex.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 codex_app::launch_with_injection。
+            "ChatGPT.app" => {
+                // ChatGPT.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 chatgpt_app::launch_with_injection。
                 // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
-                bail!("Codex.app 应由注入路径启动，不应进入 build_launch_spec");
+                bail!("ChatGPT.app 应由注入路径启动，不应进入 build_launch_spec");
             }
             "VS Code" => {
                 // VS Code 不走通用 LaunchSpec 流程；run_launcher 已分流到 vscode_app::launch。
@@ -3690,7 +3689,7 @@ impl AppState {
         resolved_agents(&self.config)
     }
 
-    /// 用户可见的 agent 列表（过滤掉内置隐藏 agent 如 codex+）。
+    /// 用户可见的 agent 列表（过滤掉 hidden agent）。
     fn visible_agents(&self) -> Vec<ResolvedAgent> {
         self.resolved_agents()
             .into_iter()
@@ -3832,10 +3831,10 @@ impl AppState {
             Step::Provider => {
                 let providers = providers_for_agent(&self.config, &self.selected_agent_id);
                 let provider = providers[self.provider_index].clone();
-                // Codex.app/ChatGPT.app 跳过 Model 选择步：直接把该 provider 下所有 Responses 模型
+                // ChatGPT.app 跳过 Model 选择步：直接把该 provider 下所有 Responses 模型
                 // 作为完整列表注入桌面端，由 cx 在启动时经 CDP 注入 renderer。
-                if self.selected_agent_id == "Codex.app" {
-                    let injected = injected_models_for_codex_app(models, &provider.name);
+                if self.selected_agent_id == "ChatGPT.app" {
+                    let injected = injected_models_for_chatgpt_app(models, &provider.name);
                     let agent = find_agent(&self.config, &self.selected_agent_id).unwrap();
                     return Some(Selection {
                         agent_id: agent.id.clone(),
@@ -4415,16 +4414,15 @@ mod tests {
 
     #[test]
     fn canonicalize_agent_name_is_case_insensitive_with_aliases() {
-        assert_eq!(canonicalize_agent_name("CoDex.App"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("codex.app"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("CODEXAPP"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("codex_app"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("ChatGPT.App"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("chatgpt.app"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("CHATGPTAPP"), "Codex.app");
-        assert_eq!(canonicalize_agent_name("chatgpt_app"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("CoDex.App"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("codex.app"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("CODEXAPP"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("codex_app"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("ChatGPT.App"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("chatgpt.app"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("CHATGPTAPP"), "ChatGPT.app");
+        assert_eq!(canonicalize_agent_name("chatgpt_app"), "ChatGPT.app");
         assert_eq!(canonicalize_agent_name("Claude"), "claude");
-        assert_eq!(canonicalize_agent_name("CODEX+"), "codex+");
         assert_eq!(canonicalize_agent_name("vscode"), "VS Code");
         assert_eq!(canonicalize_agent_name("VS Code"), "VS Code");
         assert_eq!(canonicalize_agent_name("vs-code"), "VS Code");
@@ -4433,7 +4431,7 @@ mod tests {
 
     #[test]
     fn build_launch_spec_rejects_vscode_agent() {
-        // VS Code 与 Codex.app 一样是注入型 agent：run_launcher 分流，
+        // VS Code 与 ChatGPT.app 一样是注入型 agent：run_launcher 分流，
         // build_launch_spec 误入时必须显式报错而非静默 passthrough。
         let fake_binary = create_fake_binary("claude");
         let selection = Selection {
@@ -4898,7 +4896,7 @@ agents:
                 model_wire_apis: vec![WireApi::Responses],
                 provider_name: provider_name.into(),
                 endpoint_url: "https://example.com".into(),
-                visible_agents: vec!["Codex.app".into()],
+                visible_agents: vec!["ChatGPT.app".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
                 apikey_source: None,
@@ -4915,7 +4913,7 @@ agents:
         let config = chatgpt_test_config();
         let models = chatgpt_test_models("TestProv");
         let selection = build_chatgpt_selection(&config, &models, "TestProv", "model-b").unwrap();
-        assert_eq!(selection.agent_id, "Codex.app");
+        assert_eq!(selection.agent_id, "ChatGPT.app");
         assert_eq!(selection.selected_wire_api, WireApi::Responses);
         assert_eq!(selection.model.as_ref().unwrap().id, "model-b");
         let ids: Vec<&str> = selection
@@ -5720,7 +5718,7 @@ trust_level = "trusted"
 
     #[test]
     fn codex_wire_api_str_maps_to_codex_family_vocabulary() {
-        // codex / codex+ 的 config.toml 使用 responses / chat_completions / anthropic_messages，
+        // ChatGPT.app 引擎的 config.toml 使用 responses / chat_completions / anthropic_messages，
         // 而非 cx 内部 copilot 用的 completions / anthropic。
         assert_eq!(codex_wire_api_str(WireApi::Responses).unwrap(), "responses");
         assert_eq!(
@@ -5735,8 +5733,8 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn merge_codex_config_writes_codex_family_wire_api_for_codex_plus() {
-        // codex+ 支持 3 种 wire api；config.toml 必须写出 codex 家族词汇。
+    fn merge_codex_config_writes_codex_family_wire_api() {
+        // config.toml 必须写出 codex 家族词汇（responses / chat_completions / anthropic_messages）。
         let merged = merge_codex_config(
             None,
             &test_resolved_model(
@@ -5932,56 +5930,6 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn codex_plus_is_builtin_hidden_and_resolvable() {
-        // 不在默认 agent 配置里（不写入用户 YAML）。
-        assert!(default_agent_configs().iter().all(|a| a.id != "codex+"));
-
-        let config = CxConfig {
-            providers: vec![],
-            agents: default_agent_configs(),
-        };
-        let agents = resolved_agents(&config);
-
-        // codex+ 由 resolved_agents 追加，且标记为 hidden。
-        let codex_plus = agents.iter().find(|a| a.id == "codex+");
-        assert!(codex_plus.is_some(), "codex+ 应由 resolved_agents 内置追加");
-        assert!(codex_plus.unwrap().hidden, "codex+ 应标记为 hidden");
-        assert_eq!(
-            codex_plus.unwrap().supported_wire_apis,
-            vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions]
-        );
-        assert_eq!(codex_plus.unwrap().binary, "codex+");
-
-        // 用户可见列表与 add 向导均过滤掉 codex+。
-        assert!(
-            available_agents_for_add(&config)
-                .iter()
-                .all(|a| a.id != "codex+")
-        );
-
-        // find_agent 仍能命中 codex+（显式 `cx codex+` 可进入）。
-        assert!(find_agent(&config, "codex+").is_some());
-    }
-
-    #[test]
-    fn codex_plus_can_see_models_via_supports_agent() {
-        // 回归：visible_agents 字段同时供 supports_agent 做模型过滤，
-        // 不能因「隐藏」而把 codex+ 从中剔除，否则 `cx codex+` 进任何 provider 都看不到模型。
-        let config = multi_wire_api_test_config();
-        let models = build_all_models(&config);
-        assert!(!models.is_empty(), "测试配置应产出模型");
-        // codex+ 支持 anthropic / responses / completions，该 provider 下所有模型都应可见。
-        for model in &models {
-            assert!(
-                resolved_model_supports_agent(model, "codex+"),
-                "codex+ 应能看到模型 {} (wire_api={:?})",
-                model.id,
-                model.wire_api
-            );
-        }
-    }
-
-    #[test]
     fn merge_codex_config_preserves_user_reasoning_effort() {
         // 用户偏好 low，cx 重写时应保留而非硬编码 high。
         let existing = "model_reasoning_effort = \"low\"\n";
@@ -6105,7 +6053,7 @@ trust_level = "trusted"
 
     #[test]
     fn materialize_passthrough_dir_replaces_file_left_by_atomic_rename() {
-        // Codex.app 用 atomic-rename 写状态文件时会把我们的符号链接替换成普通文件
+        // ChatGPT.app 用 atomic-rename 写状态文件时会把我们的符号链接替换成普通文件
         // （如 .codex-global-state.json.bak）。real 目录里有真实数据源，重新符号链接即可。
         let root = temp_test_dir("passthrough-atomic-rename");
         let real = root.join("real");

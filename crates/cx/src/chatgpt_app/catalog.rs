@@ -72,7 +72,7 @@ mod tests {
             model_wire_apis: vec![WireApi::Responses],
             provider_name: "DashScope".into(),
             endpoint_url: "https://example.com/v1".into(),
-            visible_agents: vec!["Codex.app".into()],
+            visible_agents: vec!["ChatGPT.app".into()],
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
             apikey_source: None,

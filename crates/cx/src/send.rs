@@ -25,16 +25,12 @@ pub const CLEAR_INPUT_BYTE: u8 = 0x15;
 pub(crate) const CLEAR_INPUT: &str = "\u{15}";
 
 /// How a caller picks the target session. The CLI parses its `--session` string
-/// into this; library callers construct it directly for type safety and to reach
-/// `Agent::CodexPlus` (which the CLI keyword `codex` does not expose).
+/// into this; library callers construct it directly for type safety.
 #[derive(Debug, Clone)]
 pub enum SendSelector {
     /// Most recently started live session, any agent.
     Latest,
     /// Most recently started live session of a specific agent.
-    ///
-    /// `Agent::Codex` matches the codex family (`codex` and `codex+`);
-    /// `Agent::CodexPlus` matches only `codex+`.
     Agent(Agent),
     /// Exact cx session id (the 32-hex from `<id>.json`).
     Id(String),
@@ -97,14 +93,8 @@ pub(crate) fn resolve_session<'a>(
         SendSelector::Agent(Agent::Claude) => {
             latest_of(alive.iter().filter(|r| r.agent == "claude").collect())
         }
-        SendSelector::Agent(Agent::Codex) => latest_of(
-            alive
-                .iter()
-                .filter(|r| matches!(r.agent.as_str(), "codex" | "codex+"))
-                .collect(),
-        ),
-        SendSelector::Agent(Agent::CodexPlus) => {
-            latest_of(alive.iter().filter(|r| r.agent == "codex+").collect())
+        SendSelector::Agent(Agent::Codex) => {
+            latest_of(alive.iter().filter(|r| r.agent == "codex").collect())
         }
         SendSelector::Agent(Agent::Copilot) => {
             latest_of(alive.iter().filter(|r| r.agent == "copilot").collect())
@@ -190,24 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_codex_matches_family() {
+    fn resolve_codex_matches_codex_sessions() {
         let alive = [
             reg("a", "codex", "2026-07-14T10:00:00Z"),
-            reg("b", "codex+", "2026-07-14T12:00:00Z"),
+            reg("b", "codex", "2026-07-14T12:00:00Z"),
             reg("c", "claude", "2026-07-14T13:00:00Z"),
         ];
         let got = resolve_session(&alive, &SendSelector::Agent(Agent::Codex)).unwrap();
-        assert_eq!(got.id, "b"); // most recent of codex ∪ codex+
-    }
-
-    #[test]
-    fn resolve_codexplus_matches_only_plus() {
-        let alive = [
-            reg("a", "codex", "2026-07-14T12:00:00Z"),
-            reg("b", "codex+", "2026-07-14T10:00:00Z"),
-        ];
-        let got = resolve_session(&alive, &SendSelector::Agent(Agent::CodexPlus)).unwrap();
-        assert_eq!(got.id, "b");
+        assert_eq!(got.id, "b"); // most recent codex session
     }
 
     #[test]

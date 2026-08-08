@@ -207,12 +207,18 @@ fn log_sources() -> Vec<LogSource> {
         LogSource {
             root: home.join(".pi/agent/sessions"),
             extra_file: None,
-            kind: SourceKind::PiSession,
+            kind: SourceKind::PiSession(AGENT_PI),
         },
         LogSource {
             root: home.join(".config/cx/manox"),
             extra_file: None,
             kind: SourceKind::ManoxSession,
+        },
+        // manox pi 化后的 session jsonl（新数据源，与上方 SQLite 历史源并存）。
+        LogSource {
+            root: home.join(".config/cx/manox/pi-sessions"),
+            extra_file: None,
+            kind: SourceKind::PiSession(AGENT_MANOX),
         },
     ]
 }
@@ -305,13 +311,16 @@ pub(crate) fn count_recent_session_tokens(
 
     let source = log_sources().into_iter().find(|s| match agent_id {
         "claude" => matches!(s.kind, SourceKind::Claude),
-        "codex" | "Codex.app" => {
+        // `Codex.app` 为更名前的旧 ID，保留别名防止旧调用方漏计。
+        "codex" | "ChatGPT.app" | "Codex.app" => {
             matches!(s.kind, SourceKind::CodexLike(a) if a == AGENT_CODEX)
         }
         "copilot" => {
             matches!(s.kind, SourceKind::Copilot(a) if a == AGENT_COPILOT)
         }
-        "pi" => matches!(s.kind, SourceKind::PiSession),
+        "pi" => {
+            matches!(s.kind, SourceKind::PiSession(a) if a == AGENT_PI)
+        }
         _ => false,
     })?;
 
