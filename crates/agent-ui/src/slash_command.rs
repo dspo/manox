@@ -149,6 +149,7 @@ pub fn init(_cx: &mut App) {
     ];
     #[cfg(not(feature = "harness-manox"))]
     let commands: Vec<Box<dyn SlashCommand>> = vec![
+        Box::new(PlanCommand),
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
@@ -379,10 +380,8 @@ impl SlashCommand for SkillSlashCommand {
 /// own prompt. No mode toggle — the model autonomously decides whether to
 /// plan based on task semantics, and `/plan` simply makes that bias
 /// explicit for this turn.
-#[cfg(feature = "harness-manox")]
 struct PlanCommand;
 
-#[cfg(feature = "harness-manox")]
 impl SlashCommand for PlanCommand {
     fn name(&self) -> &str {
         "plan"

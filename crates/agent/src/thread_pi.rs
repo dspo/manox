@@ -663,6 +663,31 @@ impl Thread {
 
     // ── Thread duck-type: setters ──────────────────────────────────────────
 
+    /// Seed the approved plan as the next user message without running it
+    /// (the clear-context verdict inserts on a fresh thread, then the
+    /// workspace launches the turn).
+    pub fn seed_approved_plan(
+        &mut self,
+        plan_text: String,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
+        self.insert_user_message_with_ui_metadata(text, ui, cx);
+    }
+
+    /// Seed the approved plan and run the implementation turn on this
+    /// thread (the non-clear `Implement` verdict).
+    pub fn implement_approved_plan(
+        &mut self,
+        plan_text: String,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        self.seed_approved_plan(plan_text, ui, cx);
+        self.run_turn(cx);
+    }
+
     pub fn set_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         if self.has_interacted() {
             return;

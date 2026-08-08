@@ -7,6 +7,7 @@
 pub mod approval;
 pub mod approval_review;
 pub mod background_task;
+pub mod collaboration_mode;
 pub mod compact;
 pub mod db;
 pub mod goal;
@@ -20,6 +21,7 @@ pub mod pi_providers;
 pub mod plan;
 pub mod plugin;
 pub mod prompt;
+pub mod proposed_plan;
 pub mod provider;
 pub mod runtime;
 pub mod settings;

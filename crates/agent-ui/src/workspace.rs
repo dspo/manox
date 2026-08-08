@@ -17,6 +17,7 @@ use std::time::Duration;
 use agent::PermissionDecision;
 #[cfg(feature = "harness-manox")]
 use agent::ReasoningEffort;
+use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
@@ -56,8 +57,6 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
-#[cfg(feature = "harness-manox")]
-use harness_manox::PlanReviewChoice;
 #[cfg(feature = "harness-manox")]
 use harness_manox::provider::registry;
 #[cfg(feature = "harness-manox")]
@@ -821,15 +820,12 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                // TODO(pi-wire): plan preview — plan mode is a manox flow.
-                #[cfg(feature = "harness-manox")]
                 ThreadEvent::PlanDelta { .. } => {
                     // Live plan text streaming in; the finalized plan surfaces
                     // as a PlanReady review prompt at turn end. Deltas only
                     // refresh so a future real-time preview can hook here.
                     cx.notify();
                 }
-                #[cfg(feature = "harness-manox")]
                 ThreadEvent::PlanReady { plan_text } => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -4136,7 +4132,6 @@ impl Workspace {
     /// seed; the rail's plan overview seeds later from the model's first
     /// `UpdatePlan` call. Staying in Plan mode is not a verdict — the user
     /// simply keeps typing.
-    #[cfg(feature = "harness-manox")]
     pub(crate) fn respond_plan_review(
         &mut self,
         choice: PlanReviewChoice,
@@ -4152,7 +4147,7 @@ impl Workspace {
         // (never persisted) is retired in its place.
         let meta = self.user_turn_meta(cx);
         let ui = Self::message_ui_metadata(&meta);
-        let text = harness_manox::implement_plan_user_message(&review.plan_text);
+        let text = agent::collaboration_mode::implement_plan_user_message(&review.plan_text);
         let plan_text = review.plan_text.clone();
         if matches!(choice, PlanReviewChoice::ImplementClearContext) {
             // Clear context = archive this thread and continue on a fresh one
