@@ -258,6 +258,9 @@ pub struct Thread {
     /// Text of user messages inserted since the last run, drained by
     /// `run_turn` into one prompt.
     pending_prompts: Vec<String>,
+    /// Image blocks attached to the pending prompts, drained by `run_turn`
+    /// onto the engine (kernel `ContentBlock::Image`).
+    pending_images: Vec<pi::types::ContentBlock>,
     /// Steer message ids handed to the engine this run, awaiting settlement.
     pending_steers: VecDeque<String>,
     /// UI metadata of the most recently inserted user turn, re-attached to
@@ -393,6 +396,7 @@ impl Thread {
                 ui_notes: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
+                pending_images: Vec::new(),
                 pending_steers: VecDeque::new(),
                 last_user_ui: None,
                 engine,
@@ -446,12 +450,21 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
-        // Image attachments are not wired yet — pi prompts are text-only in
-        // this stage; image blocks are dropped from the prompt text.
+        // Text blocks join the prompt text; image blocks ride the next
+        // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
+        // parity).
+        let mut images = Vec::new();
         let text: String = content
             .iter()
             .filter_map(|c| match c {
                 MessageContent::Text(t) => Some(t.as_str()),
+                MessageContent::Image { data, mime_type } => {
+                    images.push(pi::types::ContentBlock::Image {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    });
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -461,6 +474,9 @@ impl Thread {
         self.messages.push(message);
         if !text.trim().is_empty() {
             self.pending_prompts.push(text);
+        }
+        if !images.is_empty() {
+            self.pending_images.extend(images);
         }
         self.last_user_ui = ui;
         cx.notify();
@@ -493,13 +509,14 @@ impl Thread {
     }
 
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
-        if self.running || self.pending_prompts.is_empty() {
+        if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
         }
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
+        let images = std::mem::take(&mut self.pending_images);
         self.running = true;
         cx.emit(ThreadEvent::TurnStarted);
-        self.engine.run(prompt);
+        self.engine.run(prompt, images);
         cx.notify();
     }
 

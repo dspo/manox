@@ -33,8 +33,11 @@ use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
 /// Commands the gpui side sends to the pi actor.
 enum SessionCmd {
-    /// Start a turn with the given user text.
-    Prompt(String),
+    /// Start a turn with the given user text and attached images.
+    Prompt {
+        text: String,
+        images: Vec<pi::types::ContentBlock>,
+    },
     /// Inject a steer into the running turn.
     Steer { id: String, text: String },
     /// Retract a queued steer.
@@ -158,8 +161,11 @@ impl ThreadEngine for PiEngine {
         self.state.model.lock().unwrap().clone()
     }
 
-    fn run(&self, prompt: String) {
-        let _ = self.cmd_tx.send(SessionCmd::Prompt(prompt));
+    fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>) {
+        let _ = self.cmd_tx.send(SessionCmd::Prompt {
+            text: prompt,
+            images,
+        });
     }
 
     fn steer(&self, text: String) -> String {
@@ -520,7 +526,7 @@ async fn run_actor(
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            SessionCmd::Prompt(text) => {
+            SessionCmd::Prompt { text, images } => {
                 state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
                 let mut abort_requested = false;
@@ -528,7 +534,7 @@ async fn run_actor(
                 // Drive the run while still servicing mid-run commands
                 // (abort/steer) through the session handle.
                 let result = {
-                    let prompt = session.prompt(&text);
+                    let prompt = session.prompt_with_images(&text, images);
                     tokio::pin!(prompt);
                     loop {
                         if !channel_open {
