@@ -7,8 +7,10 @@
 pub mod approval;
 pub mod approval_review;
 pub mod background_task;
+pub mod command;
 pub mod compact;
 pub mod db;
+pub mod frontmatter;
 pub mod goal;
 pub mod i18n;
 pub mod language;
@@ -23,6 +25,7 @@ pub mod prompt;
 pub mod provider;
 pub mod runtime;
 pub mod settings;
+pub mod skill;
 pub mod title;
 pub mod tools;
 pub mod version;
@@ -56,6 +59,11 @@ pub fn init(cx: &mut App) {
     i18n::init();
     settings::init_optimization();
     pi_providers::init();
+    // Skill/command definition registries (markdown files from plugins and
+    // the user config dir) — consumed by the slash-command dispatch and the
+    // composer mention surface under both harnesses.
+    skill::init();
+    command::init();
     // LSP PATH detection (no spawn — servers start lazily on first code-intel
     // call). Runs after MCP so the registry is settled before the first
     // `main_registry` build picks up LSP tools.

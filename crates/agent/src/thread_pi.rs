@@ -783,14 +783,41 @@ impl Thread {
         self.ui_notes.push(note);
     }
 
-    pub fn submit_command(&mut self, _name: &str, _args: &str, _cx: &mut Context<Self>) -> bool {
-        // Slash commands are a manox registry feature.
-        false
+    /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
+    /// command body with `$ARGUMENTS` substituted and send it as a user turn.
+    /// The retired manox harness additionally applies the macro's
+    /// `allowed-tools` filter for the turn; the pi harness runs its full
+    /// toolset.
+    pub fn submit_command(&mut self, name: &str, args: &str, cx: &mut Context<Self>) -> bool {
+        let Some(cmd) = crate::command::global().get(name).cloned() else {
+            return false;
+        };
+        let rendered = cmd.render(args);
+        self.insert_user_message_with_ui_metadata(rendered, None, cx);
+        self.run_turn(cx);
+        true
     }
 
-    pub fn submit_skill(&mut self, _key: &str, _args: &str, _cx: &mut Context<Self>) -> bool {
-        // Skills are a manox registry feature.
-        false
+    /// Run a skill turn: inject the named skill's body (description + body,
+    /// the user's args appended) as the user message, mirroring the retired
+    /// manox harness's `submit_skill`.
+    pub fn submit_skill(&mut self, key: &str, args: &str, cx: &mut Context<Self>) -> bool {
+        let Some(skill) = crate::skill::global().get(key).cloned() else {
+            return false;
+        };
+        let rendered = crate::prompt::render(
+            crate::prompt::PromptTemplate::SkillBody,
+            self.agent_language(),
+            &crate::prompt::SkillBodyData {
+                description: (!skill.description.is_empty()).then(|| skill.description.clone()),
+                body: skill.body.clone(),
+                arguments: (!args.is_empty()).then(|| args.to_string()),
+            },
+        )
+        .expect("skill body render");
+        self.insert_user_message_with_ui_metadata(rendered, None, cx);
+        self.run_turn(cx);
+        true
     }
 
     /// Whether the pi backend restored an existing session at startup.

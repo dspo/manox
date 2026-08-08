@@ -13,7 +13,8 @@ use agent::i18n;
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 #[cfg(feature = "harness-manox")]
-use harness_manox::{agent_def, skill};
+#[cfg(feature = "harness-manox")]
+use harness_manox::agent_def;
 
 use crate::slash_command::SlashCommandRegistry;
 use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
@@ -117,13 +118,13 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
     }
 }
 
-/// Skills + subagents, filtered + sorted by `query`.
+/// Skills + subagents, filtered + sorted by `query`. Skills are shared
+/// across harnesses (`agent::skill`); subagent definitions are a retired
+/// manox registry (the pi harness assembles its subagents in
+/// `pi_extensions::agents`).
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
-    #[cfg_attr(feature = "harness-pi", allow(unused_mut))] // TODO(pi-wire): registries offline
     let mut items = Vec::new();
-    // TODO(pi-wire): skill/subagent mentions — manox registries.
-    #[cfg(feature = "harness-manox")]
-    for def in skill::global().list() {
+    for def in agent::skill::global().list() {
         items.push(CompletionItem {
             name: def.name.clone().into(),
             description: def.description.clone().into(),

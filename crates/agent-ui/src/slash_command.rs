@@ -23,17 +23,13 @@
 //! [`SkillSlashCommand`] adapter — so `/<plugin>:<skill>` is slash-invocable
 //! the way it is in Claude Code.
 
-#[cfg(feature = "harness-manox")]
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, SharedString, Window};
 
+use agent::command::CommandDefinition;
 use agent::i18n;
-#[cfg(feature = "harness-manox")]
-use harness_manox::command::CommandDefinition;
-#[cfg(feature = "harness-manox")]
-use harness_manox::skill::SkillDefinition;
+use agent::skill::SkillDefinition;
 
 use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
@@ -148,7 +144,7 @@ pub fn init(_cx: &mut App) {
         Box::new(NewCommand),
     ];
     #[cfg(not(feature = "harness-manox"))]
-    let commands: Vec<Box<dyn SlashCommand>> = vec![
+    let mut commands: Vec<Box<dyn SlashCommand>> = vec![
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
@@ -156,7 +152,6 @@ pub fn init(_cx: &mut App) {
     // Names already claimed by built-ins and (below) markdown macros, so a
     // skill sharing one is skipped — keeps one popover row per name and routes
     // dispatch to the higher-priority command/built-in.
-    #[cfg(feature = "harness-manox")]
     let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
         "danger".to_string(),
         "plan".to_string(),
@@ -168,11 +163,11 @@ pub fn init(_cx: &mut App) {
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
     // The adapter delegates to `Workspace::run_command_turn`, which substitutes
-    // `$ARGUMENTS` and applies `allowed-tools` via `Thread::submit_command`.
-    // `harness_manox::command::try_global` is `None` only before `agent::init` (which
+    // `$ARGUMENTS` via `Thread::submit_command` (the retired manox harness
+    // additionally applies the macro's `allowed-tools` turn filter).
+    // `agent::command::try_global` is `None` only before `agent::init` (which
     // `main` calls before us); fall back to no macros rather than panicking.
-    #[cfg(feature = "harness-manox")]
-    for (key, def) in harness_manox::command::try_global()
+    for (key, def) in agent::command::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -193,8 +188,7 @@ pub fn init(_cx: &mut App) {
     // message. A command and a skill may share a key (`gitwork:deliver`); the
     // command wins — skip a skill whose key an already-registered command owns,
     // so the popover shows one row and `parse`/`dispatch` hit the command path.
-    #[cfg(feature = "harness-manox")]
-    for (key, def) in harness_manox::skill::try_global()
+    for (key, def) in agent::skill::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -297,20 +291,17 @@ impl SlashCommand for DangerCommand {
 /// `execute` delegates to `Workspace::run_command_turn`, which pushes the
 /// display bubble, substitutes `$ARGUMENTS` into the body, and applies the
 /// command's `allowed-tools` whitelist for the turn.
-#[cfg(feature = "harness-manox")]
 struct MarkdownSlashCommand {
     key: String,
     def: Arc<CommandDefinition>,
 }
 
-#[cfg(feature = "harness-manox")]
 impl MarkdownSlashCommand {
     fn new(key: String, def: Arc<CommandDefinition>) -> Self {
         Self { key, def }
     }
 }
 
-#[cfg(feature = "harness-manox")]
 impl SlashCommand for MarkdownSlashCommand {
     fn name(&self) -> &str {
         &self.key
@@ -337,20 +328,17 @@ impl SlashCommand for MarkdownSlashCommand {
 /// `parse` looks up. `execute` delegates to `Workspace::run_skill_turn`, which
 /// pushes the display bubble and injects the skill body as the turn's user
 /// message via `Thread::submit_skill`.
-#[cfg(feature = "harness-manox")]
 struct SkillSlashCommand {
     key: String,
     def: Arc<SkillDefinition>,
 }
 
-#[cfg(feature = "harness-manox")]
 impl SkillSlashCommand {
     fn new(key: String, def: Arc<SkillDefinition>) -> Self {
         Self { key, def }
     }
 }
 
-#[cfg(feature = "harness-manox")]
 impl SlashCommand for SkillSlashCommand {
     fn name(&self) -> &str {
         &self.key
