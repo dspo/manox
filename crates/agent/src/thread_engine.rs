@@ -56,10 +56,11 @@ pub trait ThreadEngine: Send + Sync {
     /// The model the backend currently runs, if any.
     fn model(&self) -> Option<PiModel>;
 
-    /// Start a turn with the given user text. Events flow back through the
-    /// engine's event channel (spawned with the engine); settlement lands in
-    /// `history`.
-    fn run(&self, prompt: String);
+    /// Start a turn with the given user text and attached images (base64
+    /// blocks per the kernel's `ContentBlock::Image`). Events flow back
+    /// through the engine's event channel (spawned with the engine);
+    /// settlement lands in `history`.
+    fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>);
 
     /// Inject a steer into the running turn. Returns the steer id, which
     /// `cancel_steer` accepts to retract it before the loop drains it.

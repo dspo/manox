@@ -2310,12 +2310,16 @@ impl Workspace {
                 .background_spawn(async move {
                     let mut text = text;
                     let mut extra = Vec::new();
-                    let failed = 0usize;
+                    let mut failed = 0usize;
                     for att in &attachments {
                         match att {
-                            PendingAttachment::ClipboardImage(_img) => {
-                                // Image attachments are a manox flow; the pi
-                                // backend prompts are text-only in this stage.
+                            PendingAttachment::ClipboardImage(img) => {
+                                match agent::image::gpui_image_to_message_content(
+                                    std::sync::Arc::new(img.clone()),
+                                ) {
+                                    Some(content) => extra.push(content),
+                                    None => failed += 1,
+                                }
                             }
                             PendingAttachment::File { .. } => {
                                 if let Some(content) = load_attachment(att, &mut text) {

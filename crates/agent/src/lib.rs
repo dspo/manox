@@ -11,6 +11,7 @@ pub mod compact;
 pub mod db;
 pub mod goal;
 pub mod i18n;
+pub mod image;
 pub mod language;
 pub mod language_model;
 pub mod message;
