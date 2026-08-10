@@ -9,6 +9,11 @@ pi.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
 tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+futures.workspace = true
+http = "1"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

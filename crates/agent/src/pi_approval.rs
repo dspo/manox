@@ -1104,4 +1104,71 @@ mod tests {
             ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce),
         );
     }
+
+    fn gated_monitor(gate: Arc<ApprovalGate>) -> ApprovalGatedTool {
+        let manager = Arc::new(pi_extensions::monitor::MonitorManager::new(Arc::new(
+            pi_extensions::BackgroundRegistry::new(),
+        )));
+        ApprovalGatedTool::new(
+            Arc::new(pi_extensions::monitor::MonitorTool::new(manager)),
+            gate,
+        )
+    }
+
+    /// Gate-level proof that the `Monitor` command half rides the same gate
+    /// as Bash: the gated execute parks on a user authorization before the
+    /// tool body can spawn anything, and a denial prevents the spawn.
+    #[tokio::test]
+    async fn monitor_command_half_parks_on_gate() {
+        let (gate, mut rx) = gate_with_events();
+        let monitor = gated_monitor(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let run = tokio::spawn(async move {
+            monitor
+                .execute(
+                    "c1",
+                    serde_json::json!({"description": "d", "command": "sleep 5"}),
+                    CancellationToken::new(),
+                    &ctx,
+                )
+                .await
+        });
+        let (id, _input) = drain_until_authorization(&mut rx).await;
+        assert_eq!(id, "c1");
+        gate.respond(
+            &id,
+            ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        );
+        let result = run.await.unwrap().unwrap();
+        assert!(result.is_error, "a denied command monitor must not start");
+    }
+
+    /// Gate-level proof that the `Monitor` ws half is exempt: the gated
+    /// execute delegates straight through with no authorization notice. The
+    /// URL uses an unsupported scheme so the tool body fails fast on its own
+    /// validation — the assertion is that the gate never parked the call.
+    #[tokio::test]
+    async fn monitor_ws_half_delegates_without_gate() {
+        let (gate, mut rx) = gate_with_events();
+        let monitor = gated_monitor(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let err = monitor
+            .execute(
+                "c1",
+                serde_json::json!({"description": "d", "ws": {"url": "http://example.com"}}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported scheme"),
+            "the tool body itself ran and rejected the scheme: {err}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no authorization notice for the ws half"
+        );
+        assert!(gate.pending_entries().is_empty());
+    }
 }
