@@ -26,6 +26,7 @@ use crate::Selection;
 use crate::prepare_chatgpt_launch_home_for_app;
 use crate::probe::runtime;
 use crate::warp;
+use cx_providers::{ChatGptAppSettings, ModelInjection};
 
 const DEFAULT_APP_PATH: &str = "/Applications/ChatGPT.app";
 /// 等待 ChatGPT.app renderer 注册到 CDP 的最长时长。
@@ -38,6 +39,7 @@ pub fn launch_with_injection(
     selection: &Selection,
     apikey: &str,
     _passthrough_args: &[String],
+    chatgpt_settings: &ChatGptAppSettings,
 ) -> Result<()> {
     let provider = &selection.provider;
     let default_model = selection
@@ -58,15 +60,24 @@ pub fn launch_with_injection(
         provider,
         selection.selected_wire_api,
         &selection.injected_models,
+        chatgpt_settings,
     )?;
     let ChatGptAppPrepared {
         codex_home,
         env_key,
         reasoning_effort,
+        custom_env,
     } = prepared;
 
-    // 2. 选取 CDP 端口（在 spawn 前确定，作为启动参数传入）
-    let debug_port = cdp::pick_debug_port()?;
+    // 注入模式：List 走完整 CDP 注入；Single 仅 config.toml（官方机制），不开调试端口。
+    let inject_list = chatgpt_settings.model_injection == ModelInjection::List;
+
+    // 2. 选取 CDP 端口（在 spawn 前确定，作为启动参数传入）。Single 模式不需要。
+    let debug_port = if inject_list {
+        Some(cdp::pick_debug_port()?)
+    } else {
+        None
+    };
 
     // 3. 定位 App 并解析内部可执行二进制路径
     let binary = resolve_codex_binary()?;
@@ -74,15 +85,18 @@ pub fn launch_with_injection(
     // 4. Warp 集成：在启动前发出 session_start，并把 session ID 传给子进程
     let warp_session = warp::maybe_emit_session_start("ChatGPT.app", Some(&default_model.id));
 
-    // 5. 构造启动命令：直接启动二进制 + 远程调试端口。env 直接设到子进程（继承），不污染全局。
+    // 5. 构造启动命令：直接启动二进制；List 模式附加远程调试端口。env 直接设到子进程
+    //    （继承），不污染全局。
     //    GUI app detach 运行：stdio 重定向到 null + 独立进程组，使 cx 退出后 App 仍存活、终端不被占。
-    let origin = format!("http://127.0.0.1:{debug_port}");
     let mut command = Command::new(&binary);
-    command
-        .args([
-            &format!("--remote-debugging-port={debug_port}"),
+    if let Some(port) = debug_port {
+        let origin = format!("http://127.0.0.1:{port}");
+        command.args([
+            &format!("--remote-debugging-port={port}"),
             &format!("--remote-allow-origins={origin}"),
-        ])
+        ]);
+    }
+    command
         .env("CODEX_HOME", &codex_home)
         .env(&env_key, apikey)
         .env("CX_MODEL", default_model.api_model_id())
@@ -103,44 +117,66 @@ pub fn launch_with_injection(
         command.env(k, v);
     }
 
+    // Settings → 外部工具 的自定义环境变量。cx 保留键（CODEX_HOME / CX_MODEL /
+    // CX_WARP_SESSION_ID / env_key）忽略并告警，防止设置面板破坏注入机制。
+    let reserved = crate::chatgpt_reserved_env_keys(&env_key);
+    for (k, v) in &custom_env {
+        if reserved.contains(k) {
+            println!("[cx] 忽略自定义环境变量 {k}: 保留键");
+            continue;
+        }
+        command.env(k, v);
+    }
+
     // 打印启动摘要
     println!();
-    println!(
-        "启动 ChatGPT.app | Provider: {} | Model: {} | 注入 {} 个模型（CDP 端口 {debug_port}）",
-        provider.name,
-        default_model.id,
-        injected.len()
-    );
+    match debug_port {
+        Some(port) => println!(
+            "启动 ChatGPT.app | Provider: {} | Model: {} | 注入 {} 个模型（CDP 端口 {port}）",
+            provider.name,
+            default_model.id,
+            injected.len()
+        ),
+        None => println!(
+            "启动 ChatGPT.app | Provider: {} | Model: {} | 单模型模式（config.toml 官方机制，无 CDP）",
+            provider.name, default_model.id
+        ),
+    }
     println!();
 
-    // 6. spawn（不等待），随后经 CDP 注入脚本
+    // 6. spawn（不等待）；List 模式随后经 CDP 注入脚本。
     let mut child = command
         .spawn()
         .with_context(|| format!("启动 ChatGPT.app 二进制失败: {}", binary.display()))?;
 
-    // 7. 等待 CDP 就绪并注入脚本（async，复用 probe 的 tokio runtime）
-    let injected_clone = injected.clone();
-    let reasoning_effort_clone = reasoning_effort.clone();
-    let inject_result = runtime().block_on(async {
-        let ws_url =
-            cdp::wait_for_page_target(debug_port, Duration::from_secs(CDP_READY_TIMEOUT_SECS))
-                .await?;
-        let script = inject::build_injection_script(&injected_clone, &reasoning_effort_clone);
-        cdp::inject_script(&ws_url, &script).await?;
-        println!(
-            "[cx] 已注入 {} 个模型（默认 {}，effort {}）",
-            injected_clone.len(),
-            injected_clone.first().map(|m| m.id.as_str()).unwrap_or(""),
-            reasoning_effort_clone
-        );
-        Result::<()>::Ok(())
-    });
+    if inject_list {
+        // 7. 等待 CDP 就绪并注入脚本（async，复用 probe 的 tokio runtime）
+        let port = debug_port.expect("inject_list 时 debug_port 必为 Some");
+        let injected_clone = injected.clone();
+        let reasoning_effort_clone = reasoning_effort.clone();
+        let inject_result = runtime().block_on(async {
+            let ws_url =
+                cdp::wait_for_page_target(port, Duration::from_secs(CDP_READY_TIMEOUT_SECS))
+                    .await?;
+            let script = inject::build_injection_script(&injected_clone, &reasoning_effort_clone);
+            cdp::inject_script(&ws_url, &script).await?;
+            println!(
+                "[cx] 已注入 {} 个模型（默认 {}，effort {}）",
+                injected_clone.len(),
+                injected_clone.first().map(|m| m.id.as_str()).unwrap_or(""),
+                reasoning_effort_clone
+            );
+            Result::<()>::Ok(())
+        });
 
-    // 注入失败时主动杀掉刚启动的子进程，避免留下一个无注入的 ChatGPT.app 残留窗口。
-    if let Err(err) = inject_result {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err).context("CDP 注入失败，已终止 ChatGPT.app");
+        // 注入失败时主动杀掉刚启动的子进程，避免留下一个无注入的 ChatGPT.app 残留窗口。
+        if let Err(err) = inject_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err).context("CDP 注入失败，已终止 ChatGPT.app");
+        }
+    } else {
+        println!("[cx] 单模型模式：跳过 CDP 注入（模型由 config.toml 官方机制提供）");
     }
 
     // 8. ChatGPT.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：

@@ -1,9 +1,10 @@
 //! Settings overlay — a single-window alternative to opening a separate
 //! preferences window. Mounts inline over the Workspace via
 //! `Workspace::view_mode`; clicks on sidebar items update a local
-//! `selected` highlight and the right pane dispatches to one of five
-//! panels (General / Config / Personalization / MCP /
-//! Environment). Items with no matching panel fall back to a "Coming soon…"
+//! `selected` highlight and the right pane dispatches to one of the shipped
+//! panels (General / Config / Models / Personalization / MCP /
+//! Environment / External Tools → ChatGPT.app). Items with no matching panel
+//! fall back to a "Coming soon…"
 //! placeholder, matching the pre-panels behavior.
 
 use gpui::{
@@ -20,6 +21,7 @@ use agent::{i18n, settings as user_settings};
 
 use crate::views::management_shell::back_control;
 
+mod chatgpt;
 mod models;
 mod panels;
 
@@ -33,6 +35,10 @@ const CLICK_FLASH_MS: u64 = 280;
 #[derive(Clone)]
 struct SettingsItem {
     icon: IconName,
+    /// Brand SVG asset path (e.g. `"icons/chatgpt.svg"`). When set, rendered
+    /// via `Icon::default().path(...)` in preference to `icon` (same mechanism
+    /// as the sidebar's external-session rows).
+    brand_icon: Option<&'static str>,
     label: &'static str,
     trailing: Option<IconName>,
 }
@@ -75,6 +81,13 @@ const GROUPS: &[SettingsGroup] = &[
         ],
     },
     SettingsGroup {
+        title: "settings-group-external-tools",
+        items: &[
+            SettingsItem::new(IconName::Bot, "settings-item-chatgpt-app", None)
+                .with_brand_icon("icons/chatgpt.svg"),
+        ],
+    },
+    SettingsGroup {
         title: "settings-group-archived",
         items: &[
             SettingsItem::new(IconName::Inbox, "settings-item-archived", None),
@@ -91,9 +104,16 @@ impl SettingsItem {
     const fn new(icon: IconName, label: &'static str, trailing: Option<IconName>) -> Self {
         Self {
             icon,
+            brand_icon: None,
             label,
             trailing,
         }
+    }
+
+    /// Set a brand SVG asset path, rendered in preference to `icon`.
+    const fn with_brand_icon(mut self, path: &'static str) -> Self {
+        self.brand_icon = Some(path);
+        self
     }
 }
 
@@ -179,6 +199,11 @@ pub struct SettingsView {
     /// file when the Settings view is created.
     models_panel: models::ModelsPanelState,
 
+    // --- External tools → ChatGPT.app panel state ---
+    /// Form state for the `chatgpt_app:` section of `cx.providers.config.yaml`,
+    /// seeded from the file when the Settings view is created.
+    chatgpt_panel: chatgpt::ChatGptPanelState,
+
     // --- Personalization panel state ---
     personality: SharedString,
     memory_enabled: bool,
@@ -232,6 +257,7 @@ impl SettingsView {
             config_sandbox: i18n::t("settings-value-read-only"),
             config_builtin_deps: true,
             models_panel: models::ModelsPanelState::load(window, cx),
+            chatgpt_panel: chatgpt::ChatGptPanelState::load(window, cx),
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
@@ -363,7 +389,13 @@ impl Render for SettingsView {
                     .active(|s| s.bg(theme.accent.opacity(0.24)))
                     .cursor_pointer()
                     .on_click(on_click)
-                    .child(Icon::new(icon).small().text_color(theme.muted_foreground))
+                    .child(match it.brand_icon {
+                        Some(path) => Icon::default()
+                            .path(path)
+                            .small()
+                            .text_color(theme.muted_foreground),
+                        None => Icon::new(icon).small().text_color(theme.muted_foreground),
+                    })
                     .child(gpui::div().flex_1().min_w_0().child(label_str.clone()));
                 if let Some(t) = trailing {
                     row = row.child(Icon::new(t).small().text_color(theme.muted_foreground));
@@ -393,13 +425,6 @@ impl Render for SettingsView {
             px(28.)
         } else {
             px(8.)
-        };
-
-        // Right-column TitleBar shows the currently-selected item's label,
-        // falling back to the generic settings title when nothing is selected.
-        let section_title: SharedString = match selected.as_deref() {
-            Some(label) => i18n::t(label),
-            None => i18n::t("settings-title"),
         };
 
         h_flex()
@@ -452,8 +477,9 @@ impl Render for SettingsView {
                     ),
             )
             // Main column: same overlay scaffold as the conversation column —
-            // content sits below TITLE_BAR_HEIGHT, TitleBar floats absolute
-            // on top carrying only the section title (no back button).
+            // content sits below TITLE_BAR_HEIGHT; the TitleBar floats absolute
+            // on top as a drag region only (no text — the page's big heading
+            // carries the section identity, mirroring ChatGPT.app Settings).
             .child(
                 v_flex()
                     .flex_1()
@@ -476,22 +502,7 @@ impl Render for SettingsView {
                             .left_0()
                             .right_0()
                             .h(TITLE_BAR_HEIGHT)
-                            .child(
-                                TitleBar::new()
-                                    .child(
-                                        h_flex().flex_1().min_w_0().items_center().gap_2().child(
-                                            gpui::div()
-                                                .text_base()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(theme.foreground)
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(section_title),
-                                        ),
-                                    )
-                                    .child(h_flex()),
-                            ),
+                            .child(TitleBar::new().child(h_flex())),
                     ),
             )
     }
@@ -517,6 +528,9 @@ impl SettingsView {
             }
             Some("settings-item-environment") => {
                 panels::render_environment(self, cx).into_any_element()
+            }
+            Some("settings-item-chatgpt-app") => {
+                chatgpt::render_chatgpt_app(self, cx).into_any_element()
             }
             _ => {
                 let coming_label: SharedString = match key {

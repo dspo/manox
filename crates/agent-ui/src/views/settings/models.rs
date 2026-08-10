@@ -644,6 +644,9 @@ impl ModelsPanelState {
         Ok(CxConfig {
             providers,
             agents: self.agents.clone(),
+            // Carried over from a fresh disk read in `save()`; this form does
+            // not model the section (owned by the ChatGPT.app panel).
+            chatgpt_app: None,
         })
     }
 
@@ -661,7 +664,7 @@ impl ModelsPanelState {
             );
             return;
         };
-        let config = match self.collect(cx) {
+        let mut config = match self.collect(cx) {
             Ok(config) => config,
             Err(msg) => {
                 window.push_notification(
@@ -671,6 +674,24 @@ impl ModelsPanelState {
                 return;
             }
         };
+        // The `chatgpt_app:` section is owned by the External Tools → ChatGPT.app
+        // panel, which may save after this panel took its open-time snapshot.
+        // Carry it over from a fresh disk read so this form never clobbers it.
+        // A failed re-read must abort the save (not silently drop the section):
+        // writing with `chatgpt_app: None` would erase the ChatGPT panel's data,
+        // the exact clobber this carry-over exists to prevent. Mirror the
+        // ChatGPT panel's `?` propagation with a toast.
+        match read_config_file(&path) {
+            Ok(fresh) => config.chatgpt_app = fresh.chatgpt_app,
+            Err(e) => {
+                tracing::warn!(error = %e, "re-read of provider config failed; aborting Models save to preserve chatgpt_app");
+                window.push_notification(
+                    Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
+                    cx,
+                );
+                return;
+            }
+        }
         if let Err(e) = write_config_file(&path, &config) {
             tracing::warn!(error = %e, "failed to write cx providers config");
             window.push_notification(
