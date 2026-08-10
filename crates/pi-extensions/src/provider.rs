@@ -543,11 +543,13 @@ fn build_model_config(
 // ── visible agents (port of cx_providers::effective_agents_for_model) ──
 
 /// Canonicalize a config agent id (legacy `codex-app` → `codex`,
-/// `Codex.app` → `ChatGPT.app`).
+/// `Codex.app` → `ChatGPT.app`, `codex+` → `codex` — parity with
+/// cx-providers).
 fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         "codex-app" => "codex",
         "Codex.app" => "ChatGPT.app",
+        "codex+" => "codex",
         _ => agent_id,
     }
 }
@@ -898,6 +900,26 @@ providers:
         assert_eq!(
             effective_agents(&config, "anthropic", &[], &["copilot".into()]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn codex_plus_legacy_id_canonicalizes_to_codex() {
+        assert_eq!(canonical_agent_id("codex+"), "codex");
+        let yaml = r#"
+agents:
+- id: codex
+  binary: codex
+- id: codex+
+  binary: codex+
+"#;
+        let config: CxConfig = serde_yaml::from_str(yaml).unwrap();
+        // The stale legacy entry dedupes onto codex (plus its ChatGPT.app expansion).
+        assert_eq!(resolved_agent_ids(&config), vec!["codex", "ChatGPT.app"]);
+        // Filters written with the legacy id match the canonical agent.
+        assert_eq!(
+            effective_agents(&config, "responses", &[], &["codex+".into()]),
+            vec!["codex"]
         );
     }
 

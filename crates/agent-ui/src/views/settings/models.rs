@@ -36,7 +36,8 @@ use agent::i18n;
 use cx_providers::{
     AgentConfig, ApiKeySourceKind, CxConfig, ProviderConfig, ProviderEndpointDetail,
     ProviderEndpointSpec, ProviderModelConfig, ProviderModels, active_provider_config_path,
-    known_agent_ids, read_config_file, split_apikey_source, write_config_file,
+    agent_display_name, canonical_agent_id, known_agent_ids, normalize_agent_configs,
+    read_config_file, split_apikey_source, write_config_file,
 };
 
 use super::SettingsView;
@@ -57,6 +58,12 @@ fn wire_display(wire: &str) -> &str {
         "completions" => "OpenAI Completions",
         other => other,
     }
+}
+
+/// The copilot auth row applies only when the endpoint's agents allow-list
+/// covers GitHub Copilot (an empty list means all agents).
+fn agents_include_copilot(agents: &[String]) -> bool {
+    agents.is_empty() || agents.iter().any(|a| canonical_agent_id(a) == "copilot")
 }
 
 /// The four modules the right-hand nav offers; the expanded provider card on
@@ -279,7 +286,9 @@ impl ModelsPanelState {
         config: CxConfig,
     ) {
         self.agent_options = known_agent_ids(&config);
-        self.agents = config.agents;
+        // Canonicalize + dedupe the preserved `agents:` section so removed
+        // legacy ids (codex+) never round-trip back into the config on save.
+        self.agents = normalize_agent_configs(config.agents);
         self.providers = config
             .providers
             .into_iter()
@@ -541,7 +550,11 @@ impl ModelsPanelState {
                         &[("wire", &wire)],
                     ));
                 }
-                let copilot_auth = optional_text(&e.copilot_auth);
+                let copilot_auth = if agents_include_copilot(&e.agents) {
+                    optional_text(&e.copilot_auth)
+                } else {
+                    None
+                };
                 let spec = if e.agents.is_empty() && copilot_auth.is_none() {
                     ProviderEndpointSpec::Url(url)
                 } else {
@@ -967,12 +980,6 @@ pub fn render_models(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
         .min_h_0()
         .gap_3()
         .p_4()
-        .child(
-            div()
-                .text_base()
-                .font_weight(gpui::FontWeight::BLACK)
-                .child(i18n::t("settings-panel-models")),
-        )
         .child(
             h_flex()
                 .flex_1()
@@ -1477,53 +1484,53 @@ fn render_endpoint(
         }),
     );
 
-    let card = plain_card(
-        theme,
-        vec![
-            field_row(
-                theme,
-                i18n::t("settings-models-row-wire-apis"),
-                wire_control,
+    let mut rows = vec![
+        field_row(
+            theme,
+            i18n::t("settings-models-row-wire-apis"),
+            wire_control,
+        ),
+        field_row(
+            theme,
+            i18n::t("settings-models-row-url"),
+            input_field(&e.url),
+        ),
+        field_row(
+            theme,
+            i18n::t("settings-models-row-agents"),
+            agent_badges(
+                format!("models-e{eid}-agents"),
+                agent_options,
+                &e.agents,
+                entity.clone(),
+                Arc::new(move |this, v, cx| {
+                    if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
+                        e.agents = v;
+                        this.models_panel.touch(cx);
+                    }
+                }),
             ),
-            field_row(
-                theme,
-                i18n::t("settings-models-row-url"),
-                input_field(&e.url),
+        ),
+    ];
+    if agents_include_copilot(&e.agents) {
+        rows.push(field_row(
+            theme,
+            i18n::t("settings-models-row-copilot"),
+            token_dropdown(
+                format!("models-e{eid}-copilot"),
+                e.copilot_auth.clone(),
+                copilot_options,
+                entity.clone(),
+                Arc::new(move |this, v, _window, cx| {
+                    if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
+                        e.copilot_auth = v;
+                        this.models_panel.touch(cx);
+                    }
+                }),
             ),
-            field_row(
-                theme,
-                i18n::t("settings-models-row-agents"),
-                agent_badges(
-                    format!("models-e{eid}-agents"),
-                    agent_options,
-                    &e.agents,
-                    entity.clone(),
-                    Arc::new(move |this, v, cx| {
-                        if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
-                            e.agents = v;
-                            this.models_panel.touch(cx);
-                        }
-                    }),
-                ),
-            ),
-            field_row(
-                theme,
-                i18n::t("settings-models-row-copilot"),
-                token_dropdown(
-                    format!("models-e{eid}-copilot"),
-                    e.copilot_auth.clone(),
-                    copilot_options,
-                    entity.clone(),
-                    Arc::new(move |this, v, _window, cx| {
-                        if let Some(e) = this.models_panel.endpoint_mut(pid, eid) {
-                            e.copilot_auth = v;
-                            this.models_panel.touch(cx);
-                        }
-                    }),
-                ),
-            ),
-        ],
-    );
+        ));
+    }
+    let card = plain_card(theme, rows);
     let key = format!("models-e{eid}-remove");
     let is_pending = pending.as_deref() == Some(key.as_str());
     h_flex()
@@ -1954,7 +1961,7 @@ fn agent_badges(
                 .rounded(px(6.))
                 .bg(gpui::hsla(0., 0., 0.5, 0.08))
                 .text_xs()
-                .child(SharedString::from(tag.clone()))
+                .child(SharedString::from(agent_display_name(tag)))
                 .child(
                     Button::new(format!("{id_prefix}-rm-{tag}"))
                         .icon(Icon::new(IconName::Close).small())
@@ -1996,7 +2003,7 @@ fn agent_badges(
                     let apply = apply.clone();
                     let selected_vec = selected_vec.clone();
                     menu.item(
-                        PopupMenuItem::new(SharedString::from(tag.clone())).on_click(
+                        PopupMenuItem::new(SharedString::from(agent_display_name(&tag))).on_click(
                             move |_ev, _window, cx| {
                                 let mut next = selected_vec.clone();
                                 next.push(tag.clone());

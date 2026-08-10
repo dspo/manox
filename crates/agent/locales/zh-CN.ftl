@@ -225,7 +225,6 @@ settings-desc-config-reinstall = 删除本地捆绑包，重新下载后重新�
 settings-btn-reinstall = 重新安装
 
 ### views/settings.rs — 模型面板
-settings-panel-models = 模型
 settings-models-add-provider = 添加 Provider
 settings-models-no-path = 无法解析 Provider 配置路径
 settings-models-reload-failed-title = Provider 重载失败
@@ -249,7 +248,7 @@ settings-models-row-url = URL
 settings-models-ph-url = https://api.example.com
 settings-models-agents-all-hint = 未选择 = 全部 Agents
 settings-models-agents-add = 添加
-settings-models-row-copilot = 鉴权方式
+settings-models-row-copilot = GitHub Copilot 认证方式
 settings-models-env-empty = 暂无环境变量
 settings-models-empty-models = 暂无模型
 settings-models-value-unset = 未设置
