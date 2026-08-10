@@ -2388,6 +2388,14 @@ impl Workspace {
             format!("/{key} {args}")
         };
         let meta = self.user_turn_meta(cx);
+        // Persist the send-time chrome with the turn: the expanded macro/skill
+        // body is the model-facing text, and `display_text` keeps the bubble
+        // showing the compact `/key args` invocation after a reload — the same
+        // form the live view shows at send time.
+        let ui = agent::MessageUiMetadata {
+            display_text: Some(display_text.clone()),
+            ..Self::message_ui_metadata(&meta)
+        };
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
@@ -2396,8 +2404,8 @@ impl Workspace {
         // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
         let hit = self.thread.update(cx, |thread, cx| match kind {
-            RegistryTurnKind::Command => thread.submit_command(key, args, cx),
-            RegistryTurnKind::Skill => thread.submit_skill(key, args, cx),
+            RegistryTurnKind::Command => thread.submit_command(key, args, Some(ui.clone()), cx),
+            RegistryTurnKind::Skill => thread.submit_skill(key, args, Some(ui), cx),
         });
         if !hit {
             let i18n_key = match kind {
@@ -2969,6 +2977,7 @@ impl Workspace {
             approval_mode: meta.approval_mode.map(|mode| mode.as_i64()),
             steered: meta.steered.then_some(true),
             external_event: None,
+            display_text: None,
         }
     }
 
