@@ -28,11 +28,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use cx_providers::{
-    AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
-    PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
-    ProviderModels, ResolvedAgent, ResolvedModel, WireApi, active_provider_config_path,
-    canonical_agent_id, context_window_from_suffix, cx_state_dir, effective_agents_for_model,
-    read_config_file, resolve_apikey, resolved_agents,
+    AgentConfig, ApiKeySourceKind, ChatGptAppSettings, CopilotAuth, CxConfig, EndpointConfig,
+    ModelConfig, PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec,
+    ProviderModelConfig, ProviderModels, ResolvedAgent, ResolvedModel, WireApi,
+    active_provider_config_path, canonical_agent_id, context_window_from_suffix, cx_state_dir,
+    effective_agents_for_model, read_config_file, resolve_apikey, resolved_agents,
 };
 
 mod chatgpt_app;
@@ -337,6 +337,7 @@ fn available_agents_for_add(config: &CxConfig) -> Vec<ResolvedAgent> {
     resolved_agents(&CxConfig {
         providers: Vec::new(),
         agents: default_agent_configs(),
+        chatgpt_app: None,
     })
     .into_iter()
     .filter(|a| !a.hidden)
@@ -748,6 +749,27 @@ pub(crate) fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) 
     }
 }
 
+/// 在 merge_codex_config 渲染结果中注入 `supports_websockets = <bool>`。
+/// 插入点是首个 `wire_api = ...` 行之后——merge_codex_config 会整体丢弃用户
+/// `[model_providers.*]` 段并只重新生成本次注入的一个，因此首个匹配即注入段；
+/// 保留的用户内容排在其后，不受影响。找不到插入点时原样返回（防御）。
+fn inject_supports_websockets(config: &str, supports: bool) -> String {
+    let marker = "\nwire_api = ";
+    let Some(pos) = config.find(marker) else {
+        return config.to_string();
+    };
+    let rest = &config[pos + marker.len()..];
+    let Some(eol) = rest.find('\n') else {
+        return config.to_string();
+    };
+    let insert_at = pos + marker.len() + eol + 1;
+    let mut out = String::with_capacity(config.len() + 32);
+    out.push_str(&config[..insert_at]);
+    out.push_str(&format!("supports_websockets = {supports}\n"));
+    out.push_str(&config[insert_at..]);
+    out
+}
+
 fn prepare_codex_launch_home(
     model: &ResolvedModel,
     provider: &ResolvedProvider,
@@ -805,6 +827,7 @@ fn prepare_chatgpt_launch_home_for_app(
     provider: &ResolvedProvider,
     wire_api: WireApi,
     injected_models: &[ResolvedModel],
+    chatgpt_settings: &ChatGptAppSettings,
 ) -> Result<ChatGptAppPrepared> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let codex_dir = cx_state_dir()?.join(".codex");
@@ -861,6 +884,13 @@ fn prepare_chatgpt_launch_home_for_app(
         context_window,
         model_catalog_json.as_deref(),
     )?;
+    // supports_websockets（Settings → 外部工具开放项）：merge_codex_config 重新生成
+    // 且唯一持有 `[model_providers.*]` 段，在其后注入该行即可。未配置按 false——
+    // 自定义 provider 普遍不支持 WS 流式，引擎默认 true 会导致请求失败。
+    let merged_config = inject_supports_websockets(
+        &merged_config,
+        chatgpt_settings.supports_websockets.unwrap_or(false),
+    );
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
 
@@ -868,6 +898,7 @@ fn prepare_chatgpt_launch_home_for_app(
         codex_home: codex_dir,
         env_key,
         reasoning_effort,
+        custom_env: chatgpt_settings.env.clone(),
     })
 }
 
@@ -876,6 +907,8 @@ struct ChatGptAppPrepared {
     codex_home: PathBuf,
     env_key: String,
     reasoning_effort: String,
+    /// Settings 配置的自定义环境变量（保留键在注入时过滤）。
+    custom_env: BTreeMap<String, String>,
 }
 
 fn load_config() -> Result<CxConfig> {
@@ -894,6 +927,7 @@ fn load_config_for_add() -> Result<(CxConfig, PathBuf)> {
         CxConfig {
             providers: Vec::new(),
             agents: default_agent_configs(),
+            chatgpt_app: None,
         }
     };
     Ok((config, path))
@@ -920,25 +954,36 @@ fn random_urlsafe(bytes: usize) -> String {
 fn build_all_models(config: &CxConfig) -> Vec<ResolvedModel> {
     let mut models = Vec::new();
     for provider in &config.providers {
-        let resolved_models = match probe::runtime().block_on(provider.list_models()) {
-            Ok(m) => m,
+        match resolved_models_for_provider(config, provider) {
+            Ok(mut resolved) => models.append(&mut resolved),
             Err(e) => {
                 eprintln!(
                     "警告: 获取 Provider `{}` 的 models 失败: {e}",
                     provider.name
                 );
-                continue;
-            }
-        };
-        for endpoint in provider.normalized_endpoints_resolved(&resolved_models) {
-            for model in &endpoint.models {
-                models.push(resolved_model_from_config(
-                    config, provider, &endpoint, model,
-                ));
             }
         }
     }
     models
+}
+
+/// 解析单个 provider 下的全部模型（在线拉取 + endpoint 归一）。
+/// 网络/解析失败以 Err 返回，由调用方决定可见性：启动路径回落跳过，
+/// Settings 目录则以「加载失败」条目呈现，避免把网络故障误归因于配置。
+fn resolved_models_for_provider(
+    config: &CxConfig,
+    provider: &ProviderConfig,
+) -> Result<Vec<ResolvedModel>> {
+    let fetched = probe::runtime().block_on(provider.list_models())?;
+    let mut models = Vec::new();
+    for endpoint in provider.normalized_endpoints_resolved(&fetched) {
+        for model in &endpoint.models {
+            models.push(resolved_model_from_config(
+                config, provider, &endpoint, model,
+            ));
+        }
+    }
+    Ok(models)
 }
 
 fn provider_supports_agent(config: &CxConfig, provider: &ProviderConfig, agent_id: &str) -> bool {
@@ -1136,11 +1181,117 @@ fn resolve_chatgpt_app_apikey_interactive(provider: &ResolvedProvider) -> Result
 /// 调用方应在后台线程执行。
 pub fn launch_chatgpt_app(provider_name: &str, default_model_id: &str) -> Result<()> {
     let config = load_config()?;
+    let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
     let mut all_models = build_all_models(&config);
     apply_probe_cache(&mut all_models);
     let selection = build_chatgpt_selection(&config, &all_models, provider_name, default_model_id)?;
     let apikey = resolve_chatgpt_app_apikey(&selection.provider)?;
-    chatgpt_app::launch_with_injection(&selection, &apikey, &[])
+    chatgpt_app::launch_with_injection(&selection, &apikey, &[], &chatgpt_settings)
+}
+
+/// ChatGPT.app 注入使用的 CODEX_HOME 目录（Settings 只读展示）。
+pub fn chatgpt_codex_home() -> Result<PathBuf> {
+    Ok(cx_state_dir()?.join(".codex"))
+}
+
+/// 加载 ChatGPT.app 注入设置（`chatgpt_app:` 段缺失时返回默认空设置）。
+pub fn chatgpt_app_settings() -> Result<ChatGptAppSettings> {
+    Ok(load_config()?.chatgpt_app.unwrap_or_default())
+}
+
+/// `supports_websockets: Some(false)` 归一为 `None`（启动端 `None` 按 false
+/// 处理，语义等价），使净零操作与 `default()` 相等、整段可省略。纯函数，便于单测。
+fn normalize_chatgpt_app_settings(mut settings: ChatGptAppSettings) -> ChatGptAppSettings {
+    if settings.supports_websockets == Some(false) {
+        settings.supports_websockets = None;
+    }
+    settings
+}
+
+/// 保存 ChatGPT.app 注入设置（保留配置文件的 providers/agents 等其余段）。
+pub fn save_chatgpt_app_settings(settings: &ChatGptAppSettings) -> Result<()> {
+    let (mut config, path) = load_config_for_add()?;
+    // 归一后全默认时整段省略，避免净零操作残留 `chatgpt_app:` 段。
+    let normalized = normalize_chatgpt_app_settings(settings.clone());
+    config.chatgpt_app = if normalized == ChatGptAppSettings::default() {
+        None
+    } else {
+        Some(normalized)
+    };
+    save_config(&path, &config)
+}
+
+/// ChatGPT.app 可注入模型目录：provider 名 → 可注入 model id 列表，
+/// 或该 provider 的拉取错误（面板以「加载失败」呈现，不静默省略）。
+pub type ChatGptInjectableCatalog = Vec<(String, Result<Vec<String>, String>)>;
+
+/// ChatGPT.app 可注入模型目录（Settings 只读展示）：每个支持 ChatGPT.app
+/// 注入的 provider → 其可注入模型（Responses 能力 + ChatGPT.app 可见）。
+/// per-provider 拉取失败以 Err 条目返回（面板显示「加载失败」），不静默省略。
+pub fn chatgpt_injectable_catalog() -> Result<ChatGptInjectableCatalog> {
+    let config = load_config()?;
+    let mut catalog = Vec::new();
+    for provider in &config.providers {
+        if !provider_supports_agent(&config, provider, "ChatGPT.app") {
+            continue;
+        }
+        let entry = match resolved_models_for_provider(&config, provider) {
+            Ok(resolved) => Ok(injected_models_for_chatgpt_app(&resolved, &provider.name)
+                .into_iter()
+                .map(|m| m.id)
+                .collect()),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        catalog.push((provider.name.clone(), entry));
+    }
+    Ok(catalog)
+}
+
+/// cx 托管的基础保留环境变量键（与 provider 无关）。
+fn base_reserved_env_keys() -> Vec<String> {
+    vec![
+        "CODEX_HOME".to_string(),
+        "CX_MODEL".to_string(),
+        "CX_WARP_SESSION_ID".to_string(),
+    ]
+}
+
+/// cx 托管的保留环境变量键：用户自定义 env 不允许覆盖。
+/// 启动注入端使用：基础保留键 + 所选 provider 的 env_key。
+pub(crate) fn chatgpt_reserved_env_keys(env_key: &str) -> Vec<String> {
+    let mut keys = base_reserved_env_keys();
+    keys.push(env_key.to_string());
+    keys
+}
+
+/// 保存校验端保留键：基础保留键 + 全部 provider 的 env_key。
+/// 是启动端过滤的超集（「校验 ⊇ 启动过滤」不变量，见测试）。
+fn all_reserved_env_keys(config: &CxConfig) -> Vec<String> {
+    let mut keys = base_reserved_env_keys();
+    for provider in &config.providers {
+        keys.push(env_key_for_apikey_source(provider.apikey_source.as_deref()));
+    }
+    keys
+}
+
+/// 校验 ChatGPT.app 自定义环境变量键：与 cx 保留键
+/// （CODEX_HOME / CX_MODEL / CX_WARP_SESSION_ID / 各 provider env_key）冲突即报错。
+pub fn validate_chatgpt_custom_env(env: &BTreeMap<String, String>) -> Result<()> {
+    if env.is_empty() {
+        return Ok(());
+    }
+    let config = load_config()?;
+    let reserved = all_reserved_env_keys(&config);
+    let offenders: Vec<&str> = env
+        .keys()
+        .filter(|k| reserved.iter().any(|r| r == *k))
+        .map(|s| s.as_str())
+        .collect();
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        bail!("自定义环境变量与 cx 保留键冲突: {}", offenders.join(", "))
+    }
 }
 
 /// 构造 VS Code 启动所需的 `Selection`：选中模型即唯一 BYOK 目标（无模型目录
@@ -1586,7 +1737,13 @@ fn run_launcher(
         }
         let apikey = resolve_chatgpt_app_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
-        return chatgpt_app::launch_with_injection(&selection, &apikey, &passthrough_args);
+        let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
+        return chatgpt_app::launch_with_injection(
+            &selection,
+            &apikey,
+            &passthrough_args,
+            &chatgpt_settings,
+        );
     }
 
     // VS Code 走专门的进程 env 注入路径（VSCODE_CLI=1），不经通用
@@ -1743,6 +1900,12 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
     let merged = CxConfig {
         providers: merge_providers(&existing.providers, &incoming.providers),
         agents: merge_agents(&existing.agents, &incoming.agents),
+        // chatgpt_app 段不属于 provider patch 的内容：来源文件显式带有时覆盖，
+        // 否则保留本机既有设置。
+        chatgpt_app: incoming
+            .chatgpt_app
+            .clone()
+            .or(existing.chatgpt_app.clone()),
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -4141,6 +4304,7 @@ mod tests {
                     env: BTreeMap::new(),
                 },
             ],
+            chatgpt_app: None,
         }
     }
 
@@ -4205,6 +4369,7 @@ mod tests {
                 env: BTreeMap::new(),
             }],
             agents: default_agent_configs(),
+            chatgpt_app: None,
         }
     }
 
@@ -4883,6 +5048,7 @@ agents:
                 env: BTreeMap::new(),
             }],
             agents: default_agent_configs(),
+            chatgpt_app: None,
         }
     }
 
@@ -5193,6 +5359,7 @@ agents:
         let config = CxConfig {
             providers: vec![provider.clone()],
             agents: default_agent_configs(),
+            chatgpt_app: None,
         };
         let endpoints = provider.normalized_endpoints();
         let model = &endpoints[0].models[0];
@@ -5507,6 +5674,7 @@ agents:
                 env: BTreeMap::new(),
             }],
             agents: default_agent_configs(),
+            chatgpt_app: None,
         };
         let provider = &config.providers[0];
         assert!(provider_supports_agent(&config, provider, "copilot"));
@@ -5975,6 +6143,73 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn inject_supports_websockets_inserts_after_wire_api() {
+        let config = "model = \"m\"\nmodel_provider = \"p\"\n\n[model_providers.\"p\"]\n\
+                      name = \"P\"\nbase_url = \"https://example.com\"\nenv_key = \"K\"\n\
+                      wire_api = \"responses\"\n\n[projects.\"/w\"]\n\ntrust_level = \"trusted\"\n";
+        let injected = inject_supports_websockets(config, false);
+        assert!(injected.contains("wire_api = \"responses\"\nsupports_websockets = false\n"));
+        // 注入行只出现一次，且其后内容（projects 段）原样保留。
+        assert_eq!(injected.matches("supports_websockets").count(), 1);
+        assert!(injected.contains("[projects.\"/w\"]"));
+        assert!(injected.contains("trust_level = \"trusted\""));
+    }
+
+    #[test]
+    fn inject_supports_websockets_no_marker_returns_original() {
+        let config = "model = \"m\"\n";
+        assert_eq!(inject_supports_websockets(config, true), config);
+    }
+
+    #[test]
+    fn chatgpt_reserved_env_keys_include_dynamic_key() {
+        let keys = chatgpt_reserved_env_keys("DASHSCOPE_API_KEY");
+        assert!(keys.contains(&"CODEX_HOME".to_string()));
+        assert!(keys.contains(&"CX_MODEL".to_string()));
+        assert!(keys.contains(&"CX_WARP_SESSION_ID".to_string()));
+        assert!(keys.contains(&"DASHSCOPE_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn validate_reserved_keys_superset_launch_filter() {
+        // 不变量：保存端校验的保留键集合 ⊇ 启动端过滤集合，
+        // 即「保存通过 → 启动必不丢弃」。对每个 provider 的 env_key 成立。
+        let config = minimal_test_config();
+        let all = all_reserved_env_keys(&config);
+        for provider in &config.providers {
+            let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
+            for key in chatgpt_reserved_env_keys(&env_key) {
+                assert!(
+                    all.contains(&key),
+                    "save-side validation must cover launch-side reserved key {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_chatgpt_app_settings_drops_false_keeps_true() {
+        let off = ChatGptAppSettings {
+            supports_websockets: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_chatgpt_app_settings(off).supports_websockets,
+            None,
+            "Some(false) 应归一为 None（与默认等价、整段可省略）"
+        );
+        let on = ChatGptAppSettings {
+            supports_websockets: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_chatgpt_app_settings(on).supports_websockets,
+            Some(true),
+            "Some(true) 必须保留"
+        );
+    }
+
+    #[test]
     fn extract_reasoning_effort_strips_quotes_and_ignores_empty() {
         assert_eq!(
             extract_reasoning_effort(Some("model_reasoning_effort = \"medium\"")),
@@ -6158,6 +6393,7 @@ trust_level = "trusted"
                     env: BTreeMap::new(),
                 },
             ],
+            chatgpt_app: None,
         };
         let agents = resolved_agents(&config);
         assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);

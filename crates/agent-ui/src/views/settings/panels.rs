@@ -53,7 +53,7 @@ pub(super) fn panel_scroll(content: impl IntoElement) -> AnyElement {
 /// A single settings row: title (left) + control (right), with an optional
 /// muted description. The description slot is an `AnyElement` so callers can
 /// include link chips or other inline widgets without losing styling.
-fn row_with_control(
+pub(super) fn row_with_control(
     title: SharedString,
     description: Option<AnyElement>,
     control: AnyElement,
@@ -144,6 +144,7 @@ pub(super) fn section_card(theme: &Theme, children: Vec<AnyElement>) -> AnyEleme
 pub(super) fn muted_text(label: SharedString, muted: Hsla) -> AnyElement {
     div()
         .text_xs()
+        .font_weight(gpui::FontWeight::NORMAL)
         .text_color(muted)
         .child(label)
         .into_any_element()
@@ -250,53 +251,62 @@ fn mock_dropdown_with_post(
         .into_any_element()
 }
 
-/// Segmented 2-button group. Both segments are styled identically; the
-/// active one is filled, the inactive one outlined.
+/// Segmented 2-choice group (visual reference: ChatGPT.app Settings
+/// "Default terminal location" bottom/right): active = filled rounded pill
+/// (secondary bg + foreground text), inactive = plain muted text, no border.
+type SegmentedApply =
+    Arc<dyn Fn(&mut SettingsView, &mut Context<SettingsView>) + Send + Sync + 'static>;
+
 fn mock_segmented(
     id: impl Into<gpui::ElementId>,
     active: bool,
     label: SharedString,
+    theme: &Theme,
     view: Entity<SettingsView>,
-    apply: Arc<dyn Fn(&mut SettingsView) + Send + Sync + 'static>,
+    apply: SegmentedApply,
 ) -> AnyElement {
-    let view = view;
     let id = id.into();
-    let label_for_active = label.clone();
-    let label_for_inactive = label;
-    if active {
-        Button::new(id)
-            .label(label_for_active)
-            .small()
-            .on_click(move |_ev, _window, cx| {
-                view.update(cx, |this, cx| {
-                    apply(this);
-                    cx.notify();
-                });
-            })
-            .into_any_element()
+    let (bg, fg, weight) = if active {
+        (theme.secondary, theme.foreground, gpui::FontWeight::MEDIUM)
     } else {
-        Button::new(id)
-            .label(label_for_inactive)
-            .small()
-            .outline()
-            .on_click(move |_ev, _window, cx| {
-                view.update(cx, |this, cx| {
-                    apply(this);
-                    cx.notify();
-                });
-            })
-            .into_any_element()
-    }
+        (
+            gpui::transparent_black(),
+            theme.muted_foreground,
+            gpui::FontWeight::NORMAL,
+        )
+    };
+    let hover_fg = theme.foreground;
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded(px(6.))
+        .bg(bg)
+        .text_xs()
+        .font_weight(weight)
+        .text_color(fg)
+        .cursor_pointer()
+        .hover(move |s| s.text_color(hover_fg))
+        .on_click(move |_ev, _window, cx| {
+            view.update(cx, |this, cx| {
+                apply(this, cx);
+                cx.notify();
+            });
+        })
+        .child(label)
+        .into_any_element()
 }
 
-fn build_segmented_pair(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_segmented_pair(
     id_prefix: &'static str,
     active_is_left: bool,
     left_label: SharedString,
     right_label: SharedString,
+    theme: &Theme,
     view: Entity<SettingsView>,
-    pick_left: Arc<dyn Fn(&mut SettingsView) + Send + Sync + 'static>,
-    pick_right: Arc<dyn Fn(&mut SettingsView) + Send + Sync + 'static>,
+    pick_left: SegmentedApply,
+    pick_right: SegmentedApply,
 ) -> AnyElement {
     h_flex()
         .gap_2()
@@ -304,6 +314,7 @@ fn build_segmented_pair(
             format!("{}-L", id_prefix),
             active_is_left,
             left_label,
+            theme,
             view.clone(),
             pick_left,
         ))
@@ -311,6 +322,7 @@ fn build_segmented_pair(
             format!("{}-R", id_prefix),
             !active_is_left,
             right_label,
+            theme,
             view,
             pick_right,
         ))
@@ -548,9 +560,10 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                     terminal_active_is_left,
                     term_bottom_label.clone(),
                     term_right_label.clone(),
+                    &theme,
                     entity.clone(),
-                    Arc::new(move |this| this.terminal_location = term_bottom_label.clone()),
-                    Arc::new(move |this| this.terminal_location = term_right_label.clone()),
+                    Arc::new(move |this, _cx| this.terminal_location = term_bottom_label.clone()),
+                    Arc::new(move |this, _cx| this.terminal_location = term_right_label.clone()),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
@@ -573,9 +586,10 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                     code_review_active_is_left,
                     cr_inline_label.clone(),
                     cr_detached_label.clone(),
+                    &theme,
                     entity.clone(),
-                    Arc::new(move |this| this.code_review_mode = cr_inline_label.clone()),
-                    Arc::new(move |this| this.code_review_mode = cr_detached_label.clone()),
+                    Arc::new(move |this, _cx| this.code_review_mode = cr_inline_label.clone()),
+                    Arc::new(move |this, _cx| this.code_review_mode = cr_detached_label.clone()),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),

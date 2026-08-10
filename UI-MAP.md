@@ -99,7 +99,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### Settings
 
-- [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsModelsPanel](#settingsmodelspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
+- [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsModelsPanel](#settingsmodelspanel) · [SettingsChatGptAppPanel](#settingschatgptapppanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
 
 ### Terminal
 
@@ -721,7 +721,7 @@ Root of settings overlay, `size_full`, `bg:background`. Mirrors the app-page sca
 
 #### SettingsTitleBar
 
-Absolute-positioned `TitleBar` overlay (`h(TITLE_BAR_HEIGHT)`, `top_0/left_0/right_0`) in the settings main column — same chrome as the conversation column's TitleBar. Shows the currently-selected settings item's localized label (truncating) on the leading side; falls back to the generic "Settings" title when nothing is selected. Carries the window-drag region and macOS traffic-light avoidance. No back button — back lives in [SettingsLeftNav](#settingsleftnav).
+Absolute-positioned `TitleBar` overlay (`h(TITLE_BAR_HEIGHT)`, `top_0/left_0/right_0`) in the settings main column — same chrome as the conversation column's TitleBar. Pure window-drag region: it renders no text (the selected item's identity is carried by each panel's own big page heading, mirroring ChatGPT.app Settings). Carries macOS traffic-light avoidance. No back button — back lives in [SettingsLeftNav](#settingsleftnav).
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -745,13 +745,13 @@ Scrollable list of settings groups with section headers.
 
 #### SettingsGroup
 
-A labeled group of settings items. Groups: General, Integrations, Coding, Archived.
+A labeled group of settings items. Groups: General, Integrations, Coding, External Tools, Archived.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsItem
 
-Single settings row: icon + label, clickable, highlights when selected.
+Single settings row: icon + label, clickable, highlights when selected. An item may carry an optional `brand_icon` (an embedded brand SVG asset path, e.g. `icons/chatgpt.svg`) rendered via `Icon::default().path(...)` in preference to the `IconName` (same mechanism as the sidebar's external-session rows); the External Tools → ChatGPT.app item uses it.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -763,7 +763,7 @@ Right content area, dispatches to panel renderers. Each panel/content view owns 
 
 #### SettingsPanel
 
-A specific settings panel rendered in the right pane. Implemented panels: General, Config, Models (the cx provider config editor, see [SettingsModelsPanel](#settingsmodelspanel)), Personalization, Environment. Every other left-nav item (Appearance, Pets, Keyboard, Snapshots, Plugins, Browser, Computer, Hooks, …) renders the shared "Coming soon" placeholder.
+A specific settings panel rendered in the right pane. Implemented panels: General, Config, Models (the cx provider config editor, see [SettingsModelsPanel](#settingsmodelspanel)), Personalization, Environment, ChatGPT.app (External Tools, see [SettingsChatGptAppPanel](#settingschatgptapppanel)). Every other left-nav item (Appearance, Pets, Keyboard, Snapshots, Plugins, Browser, Computer, Hooks, …) renders the shared "Coming soon" placeholder.
 
 > Source: `agent-ui/src/views/settings/panels.rs`
 
@@ -772,6 +772,12 @@ A specific settings panel rendered in the right pane. Implemented panels: Genera
 Settings → General → Models: two-column form editor for the cx provider config (`~/.config/cx/cx.providers.config.yaml`). Left column is a tree nav: provider nodes (double-click header renames inline) whose expanded children are the four module names — 基本信息 / 环境变量 / 端点配置 / 模型列表 — and a dashed 「+ 添加 Provider」 button at the list end; clicking a module child selects (provider, module) and the wide right column renders that module's form in a bordered panel: 基本信息 (API Key kind dropdown/value pair), 环境变量 (indented key/value rows with per-row 「-」/「+」), 端点配置 (one card per endpoint) or 模型列表 (one card per model, 手动配置 / 自动获取 tab). Add-item buttons are dashed full-width and sit at the end of their lists. Remove controls are uniform 「-」 buttons with two-step confirmation (first click arms with a danger tint, second deletes); block-level removes (model / endpoint) sit outside the block's right edge, vertically centered; selected tree items use `theme.info` text; form blocks carry no background fill; the 手动配置 / 自动获取 tabs underline the active choice in `theme.info`; double-click provider rename exits on blur, Enter or mouse-down-out and autosaves. Every edit debounces into an autosave: validate, atomically write the whole config back (top-level `agents:` preserved verbatim), then reload the provider registry off the main thread. Autosave is disabled while the file fails to parse. Endpoints are unique per Wire API and displayed as Anthropic Messages / OpenAI Responses / OpenAI Completions; `agents:` filters are badge pickers fed by a dropdown (empty selection = all agents); supports_tools / supports_images echo their effective defaults instead of an unset state.
 
 > Source: `agent-ui/src/views/settings/models.rs`
+
+#### SettingsChatGptAppPanel
+
+Settings → External Tools → ChatGPT.app: visualizes and edits the ChatGPT.app injection settings (`cx_providers::ChatGptAppSettings`, top-level `chatgpt_app:` section of `cx.providers.config.yaml`, shared by the CLI and GUI launch paths). Visual language mirrors ChatGPT.app Settings: a big page heading (`text_xl`, the TitleBar renders no text), then per-block name (14px foreground, non-bold) + muted description left-aligned **above** a border-only rounded card (no fill) whose rows are separated by hairlines; each row is two-line (name foreground + description muted, left) with the value right-aligned. Four blocks: **Codex Home** (read-only CODEX_HOME value with copy / reveal-in-Finder), **Model Injection** (injection mode as a segmented two-choice — model list via CDP vs single model via the official config.toml mechanism, active segment a filled pill / inactive plain muted text, with the CDP risk note as the row's inline description — plus a read-only Providers & LLMs catalog, one two-line row per provider, per-provider fetch failures shown as a "failed to load" row rather than omitted), **Variable Injection** (custom env key/value rows with add/remove; reserved keys rejected on save), **More Settings** (`supports_websockets` switch, default false). Editable items autosave through the same debounced touch/save_generation mechanism as the Models panel; the Models panel carries `chatgpt_app:` over from a fresh disk read on save so the two panels never clobber each other. Launch args and the CDP script injection are internal mechanics and are not surfaced.
+
+> Source: `agent-ui/src/views/settings/chatgpt.rs`
 
 #### SettingsSectionCard
 

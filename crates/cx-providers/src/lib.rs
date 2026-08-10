@@ -169,6 +169,48 @@ pub struct CxConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
+    /// ChatGPT.app 注入个性化设置（顶层 `chatgpt_app:` 段）。CLI 与 GUI 启动
+    /// 路径共同消费；未配置时为 `None`，序列化时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_app: Option<ChatGptAppSettings>,
+}
+
+/// ChatGPT.app 注入设置（`cx.providers.config.yaml` 顶层 `chatgpt_app:` 段）。
+/// CLI（`cx` 选 ChatGPT.app）与 GUI（工具菜单）启动路径共同消费，
+/// Settings → 外部工具 → ChatGPT.app 面板读写。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ChatGptAppSettings {
+    /// 注入 ChatGPT.app 子进程的额外环境变量（代理、特性开关等）。
+    /// cx 托管的保留键（`CODEX_HOME` / `CX_MODEL` / provider env_key 等）
+    /// 在启动注入时被忽略。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+
+    /// provider endpoint 是否支持 WebSocket 流式。`Some` 时写进注入
+    /// config.toml 的 `[model_providers.*]` 段 `supports_websockets`；
+    /// `None`（未配置）按 `false` 处理——自定义 provider 普遍不支持 WS 流式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_websockets: Option<bool>,
+
+    /// 模型注入方式：`List`（默认）经 CDP 注入完整自定义模型列表；
+    /// `Single` 仅写 config.toml（官方机制），不开调试端口、不做 CDP。
+    #[serde(default, skip_serializing_if = "model_injection_is_default")]
+    pub model_injection: ModelInjection,
+}
+
+/// 模型注入方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelInjection {
+    /// CDP 注入完整模型列表到 renderer 模型选择器（现状行为）。
+    #[default]
+    List,
+    /// 仅经 config.toml 注入单个默认模型（官方机制，无 CDP）。
+    Single,
+}
+
+fn model_injection_is_default(mode: &ModelInjection) -> bool {
+    *mode == ModelInjection::default()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1506,6 +1548,7 @@ providers:
                 wire_apis: vec!["anthropic".into()],
                 env: std::collections::BTreeMap::new(),
             }],
+            chatgpt_app: None,
         };
 
         write_config_file(&path, &config).unwrap();
@@ -1544,6 +1587,46 @@ providers:
         assert_eq!(model.wire_apis, vec!["anthropic".to_string()]);
         assert_eq!(read_back.agents.len(), 1);
         assert_eq!(read_back.agents[0].binary, "claude");
+    }
+
+    #[test]
+    fn chatgpt_app_settings_round_trip() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "http_proxy".to_string(),
+            "http://127.0.0.1:7890".to_string(),
+        );
+        let config = CxConfig {
+            providers: Vec::new(),
+            agents: Vec::new(),
+            chatgpt_app: Some(ChatGptAppSettings {
+                env,
+                supports_websockets: Some(false),
+                model_injection: ModelInjection::Single,
+            }),
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("chatgpt_app:"));
+        assert!(yaml.contains("supports_websockets: false"));
+        assert!(yaml.contains("model_injection: single"));
+        let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
+        let chatgpt = read_back.chatgpt_app.expect("chatgpt_app 应保留");
+        assert_eq!(chatgpt.supports_websockets, Some(false));
+        assert_eq!(chatgpt.model_injection, ModelInjection::Single);
+        assert_eq!(
+            chatgpt.env.get("http_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+    }
+
+    #[test]
+    fn chatgpt_app_settings_omitted_when_none() {
+        let config = CxConfig::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("chatgpt_app"));
+        // 缺省段读回为 None（默认空设置）。
+        let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(read_back.chatgpt_app.is_none());
     }
 
     #[test]
