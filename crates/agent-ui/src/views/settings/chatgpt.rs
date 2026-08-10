@@ -467,18 +467,22 @@ fn render_injection_block(
         build_segmented_pair(
             "chatgpt-injection",
             current == ModelInjection::List,
-            i18n::t("settings-value-injection-list"),
-            i18n::t("settings-value-injection-single"),
+            (
+                i18n::t("settings-value-injection-list"),
+                Arc::new(|this, cx| {
+                    this.chatgpt_panel.model_injection = ModelInjection::List;
+                    this.chatgpt_panel.touch(cx);
+                }),
+            ),
+            (
+                i18n::t("settings-value-injection-single"),
+                Arc::new(|this, cx| {
+                    this.chatgpt_panel.model_injection = ModelInjection::Single;
+                    this.chatgpt_panel.touch(cx);
+                }),
+            ),
             theme,
             entity.clone(),
-            Arc::new(|this, cx| {
-                this.chatgpt_panel.model_injection = ModelInjection::List;
-                this.chatgpt_panel.touch(cx);
-            }),
-            Arc::new(|this, cx| {
-                this.chatgpt_panel.model_injection = ModelInjection::Single;
-                this.chatgpt_panel.touch(cx);
-            }),
         ),
     )];
 

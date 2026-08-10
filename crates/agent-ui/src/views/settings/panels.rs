@@ -257,6 +257,10 @@ fn mock_dropdown_with_post(
 type SegmentedApply =
     Arc<dyn Fn(&mut SettingsView, &mut Context<SettingsView>) + Send + Sync + 'static>;
 
+/// One segment of the pair: its label bundled with the callback that picks it,
+/// so the builder stays under the argument-count lint without a params struct.
+type SegmentedOption = (SharedString, SegmentedApply);
+
 fn mock_segmented(
     id: impl Into<gpui::ElementId>,
     active: bool,
@@ -297,17 +301,16 @@ fn mock_segmented(
         .into_any_element()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_segmented_pair(
     id_prefix: &'static str,
     active_is_left: bool,
-    left_label: SharedString,
-    right_label: SharedString,
+    left: SegmentedOption,
+    right: SegmentedOption,
     theme: &Theme,
     view: Entity<SettingsView>,
-    pick_left: SegmentedApply,
-    pick_right: SegmentedApply,
 ) -> AnyElement {
+    let (left_label, pick_left) = left;
+    let (right_label, pick_right) = right;
     h_flex()
         .gap_2()
         .child(mock_segmented(
@@ -558,12 +561,20 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                 build_segmented_pair(
                     "term",
                     terminal_active_is_left,
-                    term_bottom_label.clone(),
-                    term_right_label.clone(),
+                    (
+                        term_bottom_label.clone(),
+                        Arc::new(move |this, _cx| {
+                            this.terminal_location = term_bottom_label.clone()
+                        }),
+                    ),
+                    (
+                        term_right_label.clone(),
+                        Arc::new(move |this, _cx| {
+                            this.terminal_location = term_right_label.clone()
+                        }),
+                    ),
                     &theme,
                     entity.clone(),
-                    Arc::new(move |this, _cx| this.terminal_location = term_bottom_label.clone()),
-                    Arc::new(move |this, _cx| this.terminal_location = term_right_label.clone()),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
@@ -584,12 +595,18 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                 build_segmented_pair(
                     "cr",
                     code_review_active_is_left,
-                    cr_inline_label.clone(),
-                    cr_detached_label.clone(),
+                    (
+                        cr_inline_label.clone(),
+                        Arc::new(move |this, _cx| this.code_review_mode = cr_inline_label.clone()),
+                    ),
+                    (
+                        cr_detached_label.clone(),
+                        Arc::new(move |this, _cx| {
+                            this.code_review_mode = cr_detached_label.clone()
+                        }),
+                    ),
                     &theme,
                     entity.clone(),
-                    Arc::new(move |this, _cx| this.code_review_mode = cr_inline_label.clone()),
-                    Arc::new(move |this, _cx| this.code_review_mode = cr_detached_label.clone()),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
