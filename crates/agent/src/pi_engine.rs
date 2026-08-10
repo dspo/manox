@@ -37,7 +37,11 @@ enum SessionCmd {
     /// Start a turn with the given user text.
     Prompt(String),
     /// Inject a steer into the running turn.
-    Steer { id: String, text: String },
+    Steer {
+        id: String,
+        text: String,
+        images: Vec<pi::types::ContentBlock>,
+    },
     /// Retract a queued steer.
     CancelSteer(String),
     /// Abort the running turn.
@@ -240,11 +244,12 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Prompt(prompt));
     }
 
-    fn steer(&self, text: String) -> String {
+    fn steer(&self, text: String, images: Vec<pi::types::ContentBlock>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let _ = self.cmd_tx.send(SessionCmd::Steer {
             id: id.clone(),
             text,
+            images,
         });
         id
     }
@@ -413,12 +418,16 @@ fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators)
     orch.background.attach(session);
 }
 
-fn steer_message(text: String) -> AgentMessage {
+fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
+    let mut content = vec![ContentBlock::Text {
+        text,
+        signature: None,
+    }];
+    // TS `createUserMessage(text, images)` parity: image blocks ride the
+    // steered user message behind the text.
+    content.extend(images);
     AgentMessage::User {
-        content: vec![ContentBlock::Text {
-            text,
-            signature: None,
-        }],
+        content,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -450,8 +459,8 @@ where
                     abort_requested = true;
                     handle.abort();
                 }
-                Some(SessionCmd::Steer { id, text }) => {
-                    handle.steer(steer_message(text));
+                Some(SessionCmd::Steer { id, text, images }) => {
+                    handle.steer(steer_message(text, images));
                     run_steers.push(id);
                 }
                 Some(SessionCmd::CancelSteer(id)) => {
@@ -837,10 +846,10 @@ async fn run_actor(
                     break;
                 }
             }
-            SessionCmd::Steer { id, text } => {
+            SessionCmd::Steer { id, text, images } => {
                 // A steer queued while idle is injected into the next turn;
                 // confirmation (SteerInjected) rides that turn's settlement.
-                session.handle().steer(steer_message(text));
+                session.handle().steer(steer_message(text, images));
                 run_steers.push(id);
             }
             SessionCmd::CancelSteer(id) => {
@@ -1740,5 +1749,28 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
         assert_eq!(loaded.approval_mode.as_deref(), Some("danger"));
+    }
+
+    #[test]
+    fn steer_message_carries_images_behind_text() {
+        let msg = steer_message(
+            "look at this".to_string(),
+            vec![pi::types::ContentBlock::Image {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        );
+        let pi::types::AgentMessage::User { content, .. } = &msg else {
+            panic!("steer message must be a user message");
+        };
+        assert_eq!(content.len(), 2, "text first, then the image block");
+        assert!(matches!(
+            &content[0],
+            pi::types::ContentBlock::Text { text, .. } if text == "look at this"
+        ));
+        assert!(matches!(
+            &content[1],
+            pi::types::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+        ));
     }
 }
