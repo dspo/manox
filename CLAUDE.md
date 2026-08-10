@@ -50,6 +50,53 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 GPUI 栈走 git 仓库地址（crates.io 无 gpui-component）：`gpui`/`gpui_platform` pin zed rev，`gpui-component`/`gpui-component-assets` pin longbridge rev，**三者必须同一 gpui 版本**。`gpui-rich-text`（`crates/rich_text`）是 manox first-party crate。gpui 相关依赖在 debug 下需 opt-level=3。
 
+## crates/pi 接线开发纪律（pi harness 分层）
+
+manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 退役为 `crates/harness-manox` 归档 crate）。接线开发遵循以下纪律：
+
+### 分层与依赖链
+
+`agent（宿主）→ pi-extensions（扩展）→ pi（内核）`；`cx-providers` 不进扩展层（仅服务 cx 路由域/外部 CLI 会话）。
+
+- **crates/pi 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
+- **crates/pi-extensions**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
+- **agent / agent-ui 宿主**：装配 + UI chrome + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。
+- **crates/harness-manox**：退役归档 crate，死代码保鲜（保持可编译、测试随 workspace 跑），不作为活路径依赖。
+
+### 能力定层判定（每条新能力开工前必做）
+
+先对照 `~/projects/github/pi`（TS 上游）与 harness-manox（老实现）实证，再按三分法定层：
+
+1. **TS pi 原生支持 → 照搬进 crates/pi**（parity）：wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook；`HookPoint` 集即 TS extension 事件的镜像）。
+2. **TS 无、pi 拓展点可承载 → pi-extensions**。
+3. **TS 无、manox 原创 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
+4. **偏离 TS 必须显式注明理由**（写进 PR 的 Assumptions，例：省略 `streamingBehavior`、pi 的 MCP 工具比老 manox 更保守地过审批门控）。
+
+### 内核纪律红线
+
+- 内核不承载域字段：provider/模型配置走通用 metadata 通道，cx 域字段不进内核类型。
+- 内核不认宿主历史：manox 风格别名/命名由宿主经 catalog/适配层注入（如 `LegacyAliasCatalog`）。
+- 选择/路由逻辑归扩展层或宿主，内核只给机制。
+- 同步 hook 不做异步 UI 往返：审批等异步交互在宿主 wrapper 实现（hook 只能同步阻断）。
+
+### 归档代码共享化模式
+
+- harness 无关的归档模块移入 agent 共享层（permission / approval_review / skill / command / frontmatter / proposed_plan / collaboration_mode / mcp 核心 / image / title），harness-manox 留 re-export shim，归档 import 路径不变。
+- 两变体 duck-typing：facade 保持同名同参，共享 UI 代码零 cfg 分流。
+- 归档变体（agent-ui `harness-manox` feature）必须保持编译通过：门禁含该变体 check/clippy。
+
+### 安全语义
+
+- fail-closed：reviewer 不可用/超时/解析失败一律升级用户，绝不静默放行。
+- 保守门控：远程/变更类工具默认过审批；always-allow 缓存按会话隔离。
+
+### 工作流约定
+
+- 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
+- 每 PR 门禁：两 harness 变体 `cargo clippy -D warnings --all-targets` + 全量 `cargo test` + `cargo fmt`。
+- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归。
+- PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
+
 ## 项目规则
 
 - **技术选型喜新厌旧**：能选最新 stable 就选最新 stable（依赖、工具链、API）。
