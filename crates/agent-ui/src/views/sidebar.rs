@@ -1067,7 +1067,11 @@ impl SidebarThreadItem {
             selected,
             indent,
             icon: RowIcon::External(summary.kind.icon_asset()),
-            wash: theme.accent,
+            // Same wash as AutoPilot threads: `theme.accent` resolves to
+            // `neutral-100` (near-white) in the forced Light theme, which made
+            // the external row's hover/active/selected wash invisible on the
+            // white sidebar. `theme.info` (cyan) is the visible default tint.
+            wash: theme.info,
             kind: RowKind::External,
         }
     }
@@ -1433,7 +1437,11 @@ mod tests {
         // and the workspace feeds to `set_selected`, so the selection lands on
         // this row's `is_selected` check.
         assert_eq!(external.id, "external:claude:deadbeef");
-        assert_eq!(external.wash, theme.accent);
+        // Fully unified: the external row's wash is the same visible tint a
+        // default (AutoPilot) manox thread carries — never the near-white
+        // `theme.accent`, which disappears against the light sidebar.
+        assert_eq!(external.wash, thread.wash);
+        assert_eq!(external.wash, theme.info);
         assert!(external.wash.a > 0.0);
         assert!(matches!(external.kind, RowKind::External));
     }
