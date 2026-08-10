@@ -52,7 +52,7 @@ GPUI 栈走 git 仓库地址（crates.io 无 gpui-component）：`gpui`/`gpui_pl
 
 ## crates/pi 接线开发纪律（pi harness 分层）
 
-manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 退役为 `crates/harness-manox` 归档 crate）。接线开发遵循以下纪律：
+manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
 
 ### 分层与依赖链
 
@@ -60,12 +60,11 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 
 - **crates/pi 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
 - **crates/pi-extensions**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
-- **agent / agent-ui 宿主**：装配 + UI chrome + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。
-- **crates/harness-manox**：退役归档 crate，死代码保鲜（保持可编译、测试随 workspace 跑），不作为活路径依赖。
+- **agent / agent-ui 宿主**：装配 + UI chrome + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。pi 是唯一 harness 后端（harness 选择 feature 已移除）。
 
 ### 能力定层判定（每条新能力开工前必做）
 
-先对照 `~/projects/github/pi`（TS 上游）与 harness-manox（老实现）实证，再按三分法定层：
+先对照 `~/projects/github/pi`（TS 上游）与老 manox 实现（git 历史 / `origin/Manox` 分支）实证，再按三分法定层：
 
 1. **TS pi 原生支持 → 照搬进 crates/pi**（parity）：wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook；`HookPoint` 集即 TS extension 事件的镜像）。
 2. **TS 无、pi 拓展点可承载 → pi-extensions**。
@@ -79,11 +78,9 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 - 选择/路由逻辑归扩展层或宿主，内核只给机制。
 - 同步 hook 不做异步 UI 往返：审批等异步交互在宿主 wrapper 实现（hook 只能同步阻断）。
 
-### 归档代码共享化模式
+### 退役代码处置
 
-- harness 无关的归档模块移入 agent 共享层（permission / approval_review / skill / command / frontmatter / proposed_plan / collaboration_mode / mcp 核心 / image / title），harness-manox 留 re-export shim，归档 import 路径不变。
-- 两变体 duck-typing：facade 保持同名同参，共享 UI 代码零 cfg 分流。
-- 归档变体（agent-ui `harness-manox` feature）必须保持编译通过：门禁含该变体 check/clippy。
+- 老 manox harness 曾退役为 `crates/harness-manox` 归档 crate；其中有价值的 harness 无关模块已迁入 agent 共享层（permission / approval_review / skill / command / frontmatter / proposed_plan / collaboration_mode / mcp 核心 / image / title）。归档 crate 本体与 agent-ui 的 `harness-manox` 变体已完全删除——需要参考老实现时查 git 历史或 `origin/Manox` 备份分支。
 
 ### 安全语义
 

@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use agent::i18n;
 use agent::thread::ApprovalMode;
-#[cfg(not(feature = "harness-manox"))]
 use agent::{ThreadStore, ThreadStoreEvent};
-#[cfg_attr(not(feature = "harness-manox"), allow(unused_imports))]
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
@@ -31,8 +29,6 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-#[cfg(feature = "harness-manox")]
-use harness_manox::{ThreadStore, ThreadStoreEvent};
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so
@@ -170,9 +166,6 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
-        #[cfg(feature = "harness-manox")]
-        let store = harness_manox::thread_store_global();
-        #[cfg(not(feature = "harness-manox"))]
         let store = agent::thread_store_global();
         let sub = cx.subscribe(
             &store,
@@ -237,14 +230,11 @@ impl Sidebar {
         self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
-        // Under the pi build the external-agent entries are compiled out,
-        // leaving the closure's window/cx unused.
-        #[cfg_attr(not(feature = "harness-manox"), allow(unused_variables))]
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
-            let sidebar_manox = sidebar.clone();
+            let sidebar_new = sidebar.clone();
             menu = menu.item(
                 PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
                     .icon(
@@ -254,7 +244,7 @@ impl Sidebar {
                             .text_color(theme.muted_foreground),
                     )
                     .on_click(move |_, _window, cx| {
-                        let _ = sidebar_manox.update(cx, |this, cx| {
+                        let _ = sidebar_new.update(cx, |this, cx| {
                             let project = this.new_session_project.take();
                             this.close_new_session_menu();
                             if let Some(p) = project {

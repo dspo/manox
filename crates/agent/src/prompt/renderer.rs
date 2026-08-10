@@ -471,8 +471,8 @@ mod tests {
     #[test]
     fn en_and_zh_template_dirs_are_symmetric() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/prompt/templates");
-        // `mode` templates moved to the retired `harness-manox` crate with
-        // `collaboration_mode`; the remaining subdirs must stay symmetric.
+        // `mode` templates were removed with the retired manox harness
+        // (`collaboration_mode`); the remaining subdirs must stay symmetric.
         for sub in ["side_call", "system", "title", "tools", "wrapper"] {
             let en = list_md(&format!("{root}/en/{sub}"));
             let zh = list_md(&format!("{root}/zh-CN/{sub}"));

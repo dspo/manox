@@ -7,46 +7,39 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ---
 
-## harness-pi 接线状态（阶段 2：Thread/ThreadStore 门面 + 三栏恢复）
+## Harness 现状（pi-only）
 
-构建期通过 feature 选择 harness 核心：`harness-manox`（默认，现有自研
-harness）与 `harness-pi`（crates/pi + pi-extensions）。pi 侧不新建 UI——
-`agent-ui::pi_backend` 适配层让 pi 会话直接说现有 UI 的语言
-（`ThreadEvent` 流 + `agent::Message` 历史），打磨过的渲染管线
-（`build_items` / `ConversationState` / message 视图）原样复用。
+老 manox harness（`harness-manox` crate 与 agent-ui 的 manox 变体）已完全
+删除；`crates/pi`（TS Pi 内核移植）+ `crates/pi-extensions` 是唯一 harness
+核心，`agent` / `agent-ui` 是宿主接线层。本文件只描述当前 pi 路径的 UI；
+引用老 manox 实现请查 git 历史或 `origin/Manox` 备份分支。
 
-暂时接不了线的 UI/UX 用 `#[cfg(feature = "harness-manox")]` 跳过，
-每处紧邻 `// TODO(pi-wire): <能力>` 标记。剩余接线量 =
-`rg 'TODO\(pi-wire\)' | wc -l`。**基线：49 处**（2026-08-05，
-`codex/pi-main-path`）。
-
-| 能力 | harness-pi 状态 | 说明 |
+| 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| 会话主路径（流式文本 / thinking / 工具卡片 / cancel） | ✅ 已接线 | `pi_backend::session` + `adapt` |
-| 单会话持久化与重启恢复 | ✅ 已接线 | pi jsonl，`pi-sessions/` 下最新会话 |
-| 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ 已接线 | 复用现有渲染管线 |
-| Composer 文本输入 / steer / abort | ✅ 已接线 | 空闲 `prompt()`，运行中 `steer()` |
-| Settings（provider 凭据 / 模型注册表） | ✅ 已接线 | provider 层是 pi 的注入式适配器 |
-| 审批（ToolCallAuthorization / AskUserQuestion / inbound 写入） | ⏳ 未接线 | 本阶段明确后排；pi 工具集全量放开 |
-| MCP | ⏳ 未接线 | init 跳过 mcp registry |
-| Sidebar / 会话列表 / 新建与切换 | ✅ 已接线 | pi `SessionRepository` + `session_meta` sidecar |
-| ContextRail / Cockpit | ✅ 已接线（骨架） | usage 来自 PiEngine 累计；plan/compact 为 manox 流 |
-| Plan 模式（PlanPreview / PlanReview 卡片） | ⏳ 未接线 | plan 是 manox 流程 |
-| Member / Subagent 观察面板 | ⏳ 未接线 | pi-extensions SubagentTool 已装配，观察 UI 未接 |
-| Browser 标签 | ✅ 已接线 | webview host 两模式复用 |
-| Terminal 标签 | ✅ 已接线 | 平台 surface，两模式复用 |
-| Slash commands / skills / @mentions | ⏳ 未接线 | 依赖 manox command/skill/agent_def 注册表 |
-| 图片附件 / Plus 菜单 | ⏳ 未接线 | pi prompt 当前仅文本 |
-| 模型选择器 | ✅ 已接线 | 经 `AgentSession::set_model` 热切换（同 provider） |
-| Project / Goal / Team chips | ⏳ 未接线 | 依赖 manox 项目与目标体系 |
-| 后台线程（ctrl-b 置底） | ⏳ 未接线 | manox 多会话编排；归档已接线 |
-| 外部会话（Claude Code / Codex / GitHub Copilot CLI）+ VS Code 注入启动 | ✅ 已接线 | 侧边栏新建会话菜单 provider→model 级联；CLI 走 cx AgentBuilder，VS Code 走 vscode_app BYOK 注入并打开项目目录 |
-| TurnNavigator | ⏳ 未接线 | 代码保留，overlay 未在 pi 布局挂载 |
+| 会话主路径（流式文本 / thinking / 工具卡片 / cancel / steer） | ✅ | `pi_backend::session` + `adapt`；空闲 `prompt()`，运行中 `steer()` |
+| 会话持久化与重启恢复 | ✅ | pi jsonl + `session_meta` sidecar |
+| 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ | 共享渲染管线 |
+| 审批门控（ToolCallAuthorization / AskUserQuestion / AutoPilot reviewer） | ✅ | 宿主 `ApprovalGatedTool` wrapper；AccessChip 切 AutoPilot/Danger |
+| Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)；`/danger` `/plan` `/goal` 与 markdown/skill 适配器随 manox 移除 |
+| 模型选择器 | ✅ | pi `ProviderRegistry`，按 provider 显示名分组 |
+| 项目（composer chip / 侧栏文件夹 / 绑定新会话） | ✅ | 共享 threads.db `projects` 表 |
+| Sidebar / 会话列表 / 新建切换归档 / LLM 标题 | ✅ | pi `SessionRepository` + sidecar；标题双模式语义移植自 manox |
+| ContextRail（usage/cost/cockpit 相位/git 状态/plan/changes/branch） | ✅ | cost 来自内核 `session_stats`（rate card 计价）；cockpit 相位随事件流驱动 |
+| `/compact` + Recap 卡片 | ✅ | 内核 `HarnessEvent` compaction 事件（manual/threshold/overflow） |
+| 后台线程（ctrl-b 置底 / 切换自动 park） | ✅ | `background_threads` + `attach_thread` parking |
+| 外部会话（Claude Code / Codex / GitHub Copilot CLI / VS Code 注入） | ✅ | 侧栏 provider→model 级联 + `ViewMode::ExternalSession` |
+| Browser 标签 / Terminal 标签 | ✅ | webview host notify/inbound 桥；平台 terminal surface |
+| TurnNavigator | ✅ | cmd-m / cmd-shift-; |
+| 图片附件 | ✅ 部分 | 剪贴板粘贴 → chip → 气泡渲染已通；构造 pi prompt 时图片块仍被丢弃（text-only） |
+| MCP | ⏳ | init 跳过 mcp registry |
+| Plus 菜单（文件 / 目标 / 插件） | ⏳ | composer plus 槽位当前为空 div |
+| skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
+| Sub-agent 观察面板 / Agents 树 | ⏳ | pi-extensions SubagentTool 已装配，观察 UI 随 manox 移除 |
+| Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
+| Goal / Team | ⏳ | manox 目标/团队体系，随 harness 移除 |
 
-约束：crates/pi 只做 TS Pi 对齐与扩展点（`AgentSession::subscribe` 是唯一
-已落地的公开面补齐）；harness 能力扩展一律走 crates/pi-extensions；manox
-单向适应这两个 crate。默认 feature 保持 `harness-manox`；翻转默认值与
-TODO(pi-wire) 清零属后续对齐阶段。
+分层纪律：crates/pi 只做 TS Pi 对齐与扩展点；harness 能力扩展一律走
+crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ---
 
@@ -62,11 +55,11 @@ TODO(pi-wire) 清零属后续对齐阶段。
 
 ### MainColumn
 
-- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
 
 ### ContextRail
 
-- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailAgents](#contextrailagents) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
+- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
 
 ### Hero
 
@@ -82,7 +75,7 @@ TODO(pi-wire) 清零属后续对齐阶段。
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [ModeChip](#modechip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
+- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [ProjectChip](#projectchip)
 
 ### AskDrawer
 
@@ -90,19 +83,15 @@ TODO(pi-wire) 清零属后续对齐阶段。
 
 ### Popups & Dropdowns
 
-- [PlusMenu](#plusmenu) · [CompletionPopover](#completionpopover) · [ModelMenu](#modelmenu) · [AccessMenu](#accessmenu) · [EffortMenu](#effortmenu) · [ProjectMenu](#projectmenu) · [TitleMenu](#titlemenu) · [GoalPopover](#goalpopover)
+- [CompletionPopover](#completionpopover) · [ModelMenu](#modelmenu) · [AccessMenu](#accessmenu) · [ProjectMenu](#projectmenu) · [TitleMenu](#titlemenu)
 
 ### Overlays
 
-- [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
+- [BlankProjectOverlay](#blankprojectoverlay)
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel) · [SubagentPanel](#subagentpanel) · [BrowserView](#browserview) · [PlanPreviewTab](#planpreviewtab)
-
-### Composer (team)
-
-- [TeamChip](#teamchip) · [TeamDrawer](#teamdrawer)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [BrowserView](#browserview)
 
 ### ManagementShell
 
@@ -111,10 +100,6 @@ TODO(pi-wire) 清零属后续对齐阶段。
 ### Settings
 
 - [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsModelsPanel](#settingsmodelspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
-
-### PluginManager
-
-- [PluginManagerView](#pluginmanagerview) · [PluginManagerTabBar](#pluginmanagertabbar) · [PluginManagerNoticeBanner](#pluginmanagernoticebanner) · [PluginManagerBusyIndicator](#pluginmanagerbusyindicator) · [PluginManagerTabContent](#pluginmanagertabcontent) · [MarketplaceTab](#marketplacetab) · [PluginTab](#plugintab) · [SkillTab](#skilltab) · [McpTab](#mcptab) · [PluginCard](#plugincard) · [SkillCard](#skillcard) · [McpServerCard](#mcpservercard) · [FormCard](#formcard)
 
 ### Terminal
 
@@ -126,7 +111,7 @@ TODO(pi-wire) 清零属后续对齐阶段。
 
 ### 状态
 
-- [ApprovalMode](#approval-modes) · [ToolCallStatus](#tool-call-statuses) · [ReasoningEffort](#reasoning-effort-levels)
+- [ApprovalMode](#approval-modes) · [ToolCallStatus](#tool-call-statuses)
 
 ---
 
@@ -166,7 +151,7 @@ Root container, horizontal flex (`h_flex`), owns all sub-views.
 Default — sidebar + conversation + composer.
 
 #### ViewMode::Settings
-Full-window settings overlay with slide-in animation. Plugin/skill/MCP management lives under Settings → Integrations → Plugins (rendered in the right pane, not a separate mode).
+Full-window settings overlay with slide-in animation.
 
 #### ViewMode::Terminal
 Full-window terminal emulator.
@@ -293,12 +278,6 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### TitleBarGoalChip
-
-Persistent Goal status chip (visible for Active, Paused, Blocked, BudgetLimited, and Complete), click → [GoalPopover](#goalpopover). The elapsed label uses active Goal time and therefore does not advance in Plan or terminal states.
-
-> Source: `agent-ui/src/workspace.rs`
-
 #### TitleBarMenuButton
 
 "..." button → opens [TitleMenu](#titlemenu) popup.
@@ -371,7 +350,7 @@ Folded batch of tool calls from one model response, rendered as one Claude Code�
 
 #### ToolCallCard
 
-A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). A proposed plan now renders inline as a [PlanReviewCard](#planreviewcard) drawer card in the message list at turn end, reusing the AskUserQuestion drawer shell with the verdict buttons in the card.
+A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel).
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 
@@ -379,7 +358,7 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 
 #### AgentTaskCard
 
-Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use a braille-dot spinner (`BrailleSpinner`); terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking the row opens or focuses the corresponding read-only [SubagentPanel](#subagentpanel) in the right pane.
+Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use a braille-dot spinner (`BrailleSpinner`); terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking is a no-op today — the read-only observation panel was retired with the manox harness.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -491,27 +470,9 @@ Dropdown chip showing [ApprovalMode](#approval-modes) → [AccessMenu](#accessme
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### EffortChip
-
-Dropdown chip showing [ReasoningEffort](#reasoning-effort-levels) → [EffortMenu](#effortmenu) popup.
-
-> Source: `agent-ui/src/workspace.rs`
-
 #### ProjectChip
 
 Dropdown chip showing current project → [ProjectMenu](#projectmenu) popup.
-
-> Source: `agent-ui/src/workspace.rs`
-
-#### ModeChip
-
-Always-visible chip showing the thread's [CollaborationMode](#collaboration-modes) (`mode-chip-default` / `mode-chip-plan`). Click, `/plan`, or `shift-tab` (the `CycleCollaborationMode` action) cycles Plan↔Default. In Plan mode the tool set is read-only and the model submits a plan via a `<proposed_plan>` block surfaced as a [PlanReviewCard](#planreviewcard) drawer card (verdict buttons in the card); in Default the full tool set is restored.
-
-> Source: `agent-ui/src/workspace.rs` — `render_mode_chip`, `mode_chip_visual`.
-
-#### PlusBtn
-
-"+" button → [PlusMenu](#plusmenu) popup.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -569,12 +530,6 @@ Prev / Next / Cancel / Submit buttons.
 
 `PopupMenu` entries are `PopupMenu` entities created on open and destroyed on close. [CompletionPopover](#completionpopover) is not a `PopupMenu` — it is a pure render overlay that never takes focus.
 
-#### PlusMenu
-
-Trigger: [PlusBtn](#plusbtn). "Add" menu: files, goal, cycle Plan↔Default, plugins.
-
-> Source: `agent-ui/src/views/composer_menu.rs`
-
 #### CompletionPopover
 
 Trigger: typing `/` (slash commands) or `@` (skills + subagents) at the caret in [InputField](#inputfield). A typeahead list anchored above the composer: filters live on every keystroke, navigated with up/down, confirmed with Tab or Enter, dismissed with Escape. While open the composer wrapper sets a `completion = open` key context so the `completion == open > Input` keybindings shadow the Input's own navigation bindings. A pure render overlay — [InputField](#inputfield) keeps focus throughout, so the query keeps filtering as the user types.
@@ -593,12 +548,6 @@ Trigger: [AccessChip](#accesschip). [ApprovalMode](#approval-modes) selector: Au
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### EffortMenu
-
-Trigger: [EffortChip](#effortchip). [ReasoningEffort](#reasoning-effort-levels): High / Max.
-
-> Source: `agent-ui/src/workspace.rs`
-
 #### ProjectMenu
 
 Trigger: [ProjectChip](#projectchip). Recent projects + create blank / select folder.
@@ -611,22 +560,10 @@ Trigger: [TitleBarMenuButton](#titlebarmenubutton). Pin, archive, copy, schedule
 
 > Source: `agent-ui/src/views/title_menu.rs`
 
-#### GoalPopover
-
-Trigger: [TitleBarGoalChip](#titlebargoalchip) or bare `/goal`. Shows the authoritative objective, lifecycle status/reason, active elapsed time, tokens used, optional budget, and remaining tokens. Actions follow the persisted state: Active can Pause/Edit/Clear; Paused and Blocked can Resume/Edit/Replace/Clear; BudgetLimited can Edit budget/Replace/Clear and resumes only after budget is raised or removed; Complete can start a New Goal or Clear. Objective edit prefills `/goal edit <objective>`, budget edit prefills `/goal budget <tokens|none>`, and Replace prefills the explicit confirmation command `/goal replace <objective>` in [InputField](#inputfield). Edit keeps the Goal id and accounting; Replace creates a fresh id and resets accounting. Internal Goal continuation/objective-update messages remain model-visible and persisted but never produce [UserMessage](#usermessage) bubbles.
-
-> Source: `agent-ui/src/workspace.rs`
-
 #### 3.2.5 Overlays
 
 Absolute-positioned over [Body](#body), with scrim.
 
-
-#### PlanReviewCard
-
-Plan-review card rendered in the message list (`ConvItem::PlanReview { plan_text, active }`, `render_plan_review_card`). Pushed `active=true` by a `ThreadEvent::PlanReady` at a terminal stop in Plan mode — the `Workspace` PlanReady handler both pushes the plan body into the conversation as this card and sets `pending_plan_review` (no modal). **Active** state reuses the same drawer shell as [AskUserQuestion](#askuserquestion)'s card (`render_ask_user_card`): `pb_5().mb(px(-10.)).shadow_lg()` so the composer covers the card's tail and it reads as emerging from beneath the composer, a 180ms `ease_out_quint` slide-in animation, and a `PlanDrawer` key context. Layout: an accent-tinted header (dashboard icon + "Plan" label) carrying three ghost icon buttons — download (clipboard fallback) / copy (clipboard) / open-in-side-panel (opens a [PlanPreviewTab](#planpreviewtab)); the plan body as a persistent selectable [Markdown](#markdown) view; and a top-bordered footer action row with two verdicts — Clear-&-Implement (ghost, exit Plan → Default, archive this thread + spawn a fresh one seeded with the plan) / Implement (ghost, exit Plan → Default, inject "Implement the approved plan." user turn — the rail's plan seeds later from the model's first `UpdatePlan` call, not the approved text) — both delegating to `respond_plan_review`. There is no "stay in Plan mode" button: staying is not a verdict — the user simply keeps typing, which dismisses the pending plan (see Dismissed below) and lets the model re-propose. The composer stays live so the user may type to discuss or refine the plan. **Verdict as a user bubble**: an implement verdict retires the ephemeral card and pushes the verdict as a user message carrying the approved plan text (`agent::implement_plan_user_message`) with the same UI metadata (`MessageUiMetadata`) the thread injects — so the live view and a reloaded thread both show this one bubble and no plan card. `Implement` pops the pending card from the tail (`ConversationState::pop_plan_review_tail` — safe because the pending card is the live tail at verdict time) then pushes the bubble to the live conversation and calls `Thread::implement_approved_plan` (seed + run on the current thread). `ImplementClearContext` does not touch the current conversation — it archives this thread and spawns a fresh one: the workspace inherits the old thread's model / reasoning effort / approval mode / cwd / project, constructs a new `Thread`, calls `Thread::seed_approved_plan` (inserts the verdict bubble as the new thread's first user message, no run), `attach_thread`es it (saving the old thread, rebuilding the conversation from the new thread so only the seed bubble shows, wiring the event sub, clearing the input draft), `save_thread(touch=true)` so the new thread appears in the sidebar, then `run_turn`s it — events stream into the live view — and finally `archive_thread(old, true)` removes the old thread from the sidebar's active list (consistent with any archived thread; no "show archived" UI today). The user perceives only that the underlying thread id changed and prior messages vanished. **Dismissed (no verdict)**: a free-form message sent without verdicting means the user is revising, not accepting — `ConversationState::consume_plan_review` demotes the most recent active card to a plain bordered record (header + markdown body, no drawer shadow/slide, no verdict footer) so the plan stays readable while the user discusses it but cannot be re-judged. The dismissed plan is also persisted as a UI note (`UiNoteKind::PlanReview`, `thread_ui_notes`) anchored to the user message that triggered the plan's turn, so `rebuild_from_messages` splices the collapsed card back at that turn's end — ahead of the dismissing message — and the plan survives a thread switch and a full reload (the live card is otherwise UI-only and never enters `Thread::messages`). Only the active (still-pending, undecided) plan is not persisted: it is stashed in-memory across a thread switch (see below) and resets on restart, mirroring `collaboration_mode`'s session scope. The `<proposed_plan>` block content never enters the model-facing message history; only the verdict bubble (implement) or the user's own typed message (dismiss) persists, plus the UI note reproducing the dismissed card. Because the active pending plan text would otherwise vanish when switching threads, `Workspace` keeps a per-thread `pending_plans` stash (mirroring `drafts`): switching away from a thread with a pending verdict stashes the plan, and switching back re-pushes the card (active) and re-enters Plan mode so the verdict buttons stay actionable across the round-trip.
-
-> Source: `agent-ui/src/views/message.rs` — `render_plan_review_card`. Verdict dispatch: `agent-ui/src/workspace.rs` — `respond_plan_review` (Implement = retire card + push verdict bubble + `Thread::implement_approved_plan`; ImplementClearContext = archive old thread + spawn fresh thread seeded via `Thread::seed_approved_plan` + attach + run + archive old), `Workspace::send_user_turn` (free-form dismiss = demote card + persist `PlanReview` note). Conversation state: `ConversationState::push_plan_review`, `ConversationState::pop_plan_review_tail` (implement verdict), `ConversationState::consume_plan_review` (free-form dismiss). Shared verdict text: `agent::collaboration_mode::implement_plan_user_message`. Thread seed/run split: `Thread::seed_approved_plan` / `Thread::implement_approved_plan` (`crates/agent/src/thread.rs`). Persisted dismissed-plan note: `agent::db::UiNoteKind::PlanReview` (`record_ui_note` on dismiss, `note_to_item` → `ConvItem::PlanReview { active: false }` on rebuild). Switch round-trip: `Workspace::attach_thread` (stash active plan on switch-away, restore + re-enter Plan on switch-back).
 
 #### BlankProjectOverlay
 
@@ -656,11 +593,10 @@ Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
 - **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
-- **Agents tree**: [ContextRailAgents](#contextrailagents), with `Main` as the root and every direct or nested sub-agent underneath it.
-- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" / "消费" header with cumulative token total, then a per-model tree (sorted by total tokens desc, empty for unused models). Each model node carries a tree prefix (`├─` / `└─`), shows its context-window size as `[1m]` via `registry::global().get_model`, and has a trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`). Three tree children per model, all indented with `│  ` / `   ` + `├─` / `└─`:
-  1. **Context budget row** (i18n `workspace-env-context-budget`): per-model `Context {pct}% {used} / {cap}`, computed by `context_budget_pct(model.max_token_count(), effective_context_tokens(...))`. Goes warning-colored at ≥90%.
-  2. **Input/cache row**: `├─ 穿透 ↑{input}  缓存 ↑{cache}` (i18n `workspace-env-throughput` / `workspace-env-cache`).
-  3. **Output row**: `└─ 输出 ↓{output}` (i18n `workspace-env-output`).
+- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" / "消费" header with cumulative token total, plus cumulative USD cost via `format_cost` when the session carries priced usage (kernel `session_stats` rate-card pricing); a hover tooltip splits main-call vs side-call usage. Then a per-model tree (sorted by total tokens desc, empty for unused models). Each model node carries a tree prefix (`├─` / `└─`) and shows its display name — `provider/model` composite keys, with the `[1m]` context-window suffix resolved from pi registry model metadata (`model_window_tokens`). Tree children per model (indented `│   ` / `    ` + `├─` / `└─`):
+  1. **Context budget row**: `{pct}% {used}/{cap}` from `context_budget_pct(window_tokens, effective_context_tokens(...))`; only when the model's window size resolves. Goes warning-colored at ≥90%.
+  2. **Token row**: `↑{input} ↓{output} R{cache_read} CH{cache_hit%}` (`--` when there is no input to measure).
+  3. **Cost row** (only for priced models): `format_cost(cost)` from `Thread::per_model_cost`.
 - **Plan section** (`render_plan_section`, collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): the model's execution plan, taken verbatim from the `PlanSnapshot` it publishes via the `UpdatePlan` tool.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
 - **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
@@ -670,12 +606,6 @@ Contents, top to bottom:
 Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render inside `render_usage_section` to auto-prune cells whose model disappeared.
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_panel`)
-
-#### ContextRailAgents
-
-Compact navigation tree headed by `Agents`. `Main` is the root row and reflects the current main thread state; direct and nested sub-agents are indented according to the parent tool-use id recorded by `Workspace`. Every sub-agent row shows the same braille-spinner/terminal status language as [AgentTaskCard](#agenttaskcard), displays `type · short title` with single-line truncation and a tooltip, and opens or focuses its [SubagentPanel](#subagentpanel) when clicked. Completed nodes remain visible for the lifetime of the current main task, including nodes recursively recovered from persisted Agent result envelopes.
-
-> Source: `agent-ui/src/views/context_rail.rs`, `agent-ui/src/workspace.rs`
 
 #### ContextRailCollapseBtn
 
@@ -739,13 +669,13 @@ Right-side panel, shown when `editor_open` is true. 640px default (320–960 dra
 
 #### RightPane
 
-Vertical flex, right panel. A tab container holding the markdown editor, team-member observers, sub-agent observers, browser tabs, and plan preview as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
+Vertical flex, right panel. A tab container holding the markdown editor and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### RightTabBar
 
-Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [Explore · title] [browser:url] [plan] …`. Selecting a tab switches `active_right_tab`. Member, Subagent, Browser, and PlanPreview tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). A sub-agent id can appear only once: a repeat open focuses the existing tab. The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`). Switching the main task closes all sub-agent tabs and binds the Agents tree to the newly active task.
+Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Selecting a tab switches `active_right_tab`. Browser tabs carry a `×` suffix that closes the tab via `close_right_tab` → `close_browser_tab` (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -761,27 +691,9 @@ Rendered markdown view (`Markdown`).
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### MemberTab
-
-A right-pane tab observing one team worker member. Content is the [MemberPanel](#memberpanel) view.
-
-> Source: `agent-ui/src/workspace.rs`
-
-#### MemberPanel
-
-Read-only observation panel for a single team worker member. Subscribes to the member `Thread`'s events and feeds them into a private [ConversationState](#conversation-state), reusing the full [message](#message) rendering pipeline (agent text, reasoning folds, tool-call cards, peer-message bubbles). Header: member name + status dot (idle/running/gone) + role. A compact task board shows this member's owned tasks plus the unassigned pool, read from the shared team `TaskList`. No composer — the leader is the sole input face.
-
-> Source: `agent-ui/src/views/member_panel.rs`
-
-#### SubagentPanel
-
-Read-only observation panel for one Agent tool invocation (`RightTab::Subagent(tool_use_id)`). A live panel holds a strong child `Entity<Thread>`, subscribes to its `ThreadEvent`s, and applies them to a private [ConversationState](#conversation-state), reusing the main-column `MessageItem` rendering, scrolling, and tail-follow behavior without a composer. Nested `SubagentStarted` events register child nodes back into the current task's `Workspace` registry. Completed live children remain observable until the main task changes. Reloaded tasks recursively scan the Agent ToolUse/ToolResult envelope's stored `messages` and create frozen snapshot panels, requiring no additional database schema.
-
-> Source: `agent-ui/src/views/subagent_panel.rs`, `agent-ui/src/workspace.rs`
-
 #### BrowserView
 
-A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor` / `Member`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`) and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab.
+A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. The process-wide bridges attach at build via `WorkspaceBrowserHost::attach_to_builder`; the host itself is installed once at startup in `main` (`WorkspaceBrowserHost::install`) and routes notifications back to their tab. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`) and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab. The inbound-write authorization overlay (manox's `InboundWriteOverlay`) was retired with the manox harness; `ThreadEvent::InboundAuthorization` still exists but has no UI consumer today.
 
 Two transient banners render between the chrome row and the content area, both driven by flags the `BrowserHost` sets on the view (cleared on navigation / resolution):
 
@@ -790,31 +702,6 @@ Two transient banners render between the chrome row and the content area, both d
 
 > Source: `agent-ui/src/views/browser_view.rs`
 
-#### PlanPreviewTab
-
-A right-pane tab (`RightTab::PlanPreview`, an equal citizen of the right tab bar alongside `Editor` / `Member` / `Browser`) that renders the current proposed plan at full height for side-by-side reading while the conversation continues. Opened from a [PlanReviewCard](#planreviewcard)'s "open-in-side-panel" icon (`open_plan_in_editor`) — if one already exists it is focused and its text updated. Content reuses the editor pane's Write/Preview `TabBar` layout with Preview selected (Write is a visual peer, greyed/non-editable) and a `div().overflow_y_scroll().track_scroll(&editor_preview_scroll)` body hosting a `Markdown` view of `plan_preview_text`. Shares the editor-preview `ScrollHandle` so the offset is preserved across tab switches.
-
-> Source: `agent-ui/src/workspace.rs` — `RightTab::PlanPreview`, `Workspace::open_plan_in_editor`, `plan_preview_text`.
-
-#### InboundWriteOverlay
-
-A scrim + card modal surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is mode-blind — a web page must never gain a write path because the agent runs in Danger — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound question-card pipeline (`pending_ask` / `resolve_auth`). Stacked in `pending_inbounds`.
-
-> Source: `agent-ui/src/workspace.rs`
-
-#### TeamChip
-
-`👥 team · N` accent pill in the composer chip row, shown only while the leader has formed a team. `N` is the worker count (leader excluded). Click toggles the [TeamDrawer](#teamdrawer).
-
-> Source: `agent-ui/src/workspace.rs`
-
-#### TeamDrawer
-
-Popover above the composer: a thin roster of worker members (name / role / status dot / task count). Clicking a row opens (or focuses) that member's [MemberTab](#membertab) in the right pane and closes the drawer. The leader is not listed — it is the main conversation.
-
-> Source: `agent-ui/src/workspace.rs`
-
----
 
 ## 4. ViewMode::Settings
 
@@ -870,13 +757,13 @@ Single settings row: icon + label, clickable, highlights when selected.
 
 #### SettingsRightPane
 
-Right content area, dispatches to panel renderers (and to the [PluginManagerView](#pluginmanagerview) when the Integrations → Plugins item is selected). Each panel/content view owns its own scroll and padding.
+Right content area, dispatches to panel renderers. Each panel/content view owns its own scroll and padding.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsPanel
 
-A specific settings panel rendered in the right pane. Panels: General, Appearance, Config, Models, Personalization, MCP, Environment, Keyboard, Snapshots, Browser, Computer, Hooks, Connections, Git, Worktrees, Archived, Chat Settings.
+A specific settings panel rendered in the right pane. Implemented panels: General, Config, Models (the cx provider config editor, see [SettingsModelsPanel](#settingsmodelspanel)), Personalization, Environment. Every other left-nav item (Appearance, Pets, Keyboard, Snapshots, Plugins, Browser, Computer, Hooks, …) renders the shared "Coming soon" placeholder.
 
 > Source: `agent-ui/src/views/settings/panels.rs`
 
@@ -914,85 +801,7 @@ Small bold label for a subsection.
 
 ## 5. PluginManager (in Settings)
 
-Plugin/skill/MCP management, rendered as the right-pane content of [ViewMode::Settings](#viewmodesettings) when the Integrations → Plugins item is selected — no longer a standalone full-window mode. The settings shell owns the window TitleBar (drag region + traffic-light avoidance) and the back affordance; this view fills the right pane with its tab bar + tab content.
-
-#### PluginManagerView
-
-View rendered inside [SettingsRightPane](#settingsrightpane) when `settings-item-plugins` is selected.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginManagerTabBar
-
-Four tabs: Marketplace, Plugin, Skill, MCP. The filter search input sits on the trailing side of this tab bar row (moved out of the former management TitleBar, which no longer exists).
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginManagerNoticeBanner
-
-Conditional notice banner.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginManagerBusyIndicator
-
-Conditional braille-spinner busy indicator.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginManagerTabContent
-
-Content area dispatching on selected tab.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### MarketplaceTab
-
-URL input + add btn, marketplace cards (360px), plugin cards with install/update/enable-disable/uninstall actions.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginTab
-
-Installed plugin cards with update/enable-disable/uninstall buttons.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### SkillTab
-
-Skill form (name, description, body) + skill cards with edit/delete.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### McpTab
-
-MCP form (name, command, args, url) + user/plugin MCP server cards.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginCard
-
-Rounded card with bg/border, selected state, action buttons.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### SkillCard
-
-Skill record card with edit/delete buttons.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### McpServerCard
-
-MCP server config card with edit/delete buttons.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### FormCard
-
-Form container with title and input children.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
+The plugin/skill/MCP management UI (PluginManagerView, tab bar, marketplace/plugin/skill/MCP cards) was retired with the manox harness. The Settings → Plugins item remains in the left nav and renders the shared "Coming soon" placeholder; the backend registry (`agent::plugin::PluginManager`) stays in the agent crate.
 
 ---
 
@@ -1107,27 +916,13 @@ Blue — a safety reviewer automatically approves safe tool calls; risky ones ar
 Red — bypass all approvals, bash runs outside the sandbox.
 ---
 
-## 9. Collaboration Modes
-
-The thread's [`ModeKind`](#modechip) (`collaboration_mode` on `Thread`). Two modes, cycled by [ModeChip](#modechip) click / `/plan` / `shift-tab` (the `CycleCollaborationMode` action).
-
-#### Default
-
-Execution mode. Full tool set. No mode-specific developer instructions injected beyond the default instructions.
-
-#### Plan
-
-Read-only research-and-plan mode. Tool set filtered to read-only (no write/bash/submit tools). Plan inherits the thread's reasoning effort (no override) and injects plan-mode developer instructions as a fixed-position `<collaboration_mode>` User message at request-build time — never persisted into history, never woven into the system prompt, so the provider prefix cache stays warm across mode-stable turns. The model submits a plan by emitting a single `<proposed_plan>…</proposed_plan>` block; block content surfaces as a [PlanReviewCard](#planreviewcard) drawer card in the message list (verdict buttons in the card). Goal accounting is suspended in Plan mode.
-
----
-
-## 10. Tool Call Statuses
+## 9. Tool Call Statuses
 
 States of a [ToolCallCard](#toolcallcard).
 
 #### PendingApproval
 
-Waiting for user, surfaces as the [AskUserQuestion](#askuserquestion) card.
+Waiting for user, surfaces as the [AskDrawer](#askdrawer) question card.
 
 #### Running
 
@@ -1147,9 +942,9 @@ Greyed out, "denied" label.
 
 ---
 
-## 11. Reasoning Effort Levels
+## 10. Reasoning Effort Levels
 
-Values selectable in [EffortMenu](#effortmenu).
+Thread-level reasoning effort. No selector UI in the pi path today — the value is inherited across `/new` (`archive_current_thread_inheriting`) and set via the engine facade; High / Max remain the canonical values.
 
 #### High
 #### Max

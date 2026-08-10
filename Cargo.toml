@@ -28,7 +28,6 @@ members = [
     "crates/webview-macros",
     "crates/cx",
     "crates/cx-providers",
-    "crates/harness-manox",
 ]
 resolver = "2"
 
@@ -41,7 +40,6 @@ publish = false
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 agent = { path = "crates/agent" }
-harness-manox = { path = "crates/harness-manox" }
 agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }

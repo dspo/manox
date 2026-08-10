@@ -8,14 +8,6 @@ publish.workspace = true
 name = "agent_ui"
 path = "src/lib.rs"
 
-[features]
-default = ["harness-pi"]
-# The retired manox harness UI variant: kept compiling behind this feature
-# (no binary enables it) so the archived chrome survives alongside the
-# `harness-manox` crate.
-harness-manox = ["dep:harness-manox"]
-# The pi harness backend: the workspace drives the pi-backed `Thread` facade.
-harness-pi = ["dep:pi", "dep:pi-extensions"]
 
 [dependencies]
 anyhow.workspace = true
@@ -49,12 +41,10 @@ cx.workspace = true
 # `cx.providers.config.yaml` through these structs.
 cx-providers.workspace = true
 
-# pi harness backend — only compiled for the `harness-pi` feature.
-pi = { workspace = true, optional = true }
-pi-extensions = { workspace = true, optional = true }
+# pi harness backend.
+pi = { workspace = true }
+pi-extensions = { workspace = true }
 
-# Retired manox harness — only compiled for the dead `harness-manox` feature.
-harness-manox = { workspace = true, optional = true }
 
 [dev-dependencies]
 agent = { workspace = true, features = ["test-support"] }

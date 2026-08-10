@@ -71,6 +71,10 @@ struct EngineState {
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
+    /// USD cost aggregated from the kernel's rate-card pricing (#418 wire
+    /// boundary costing); 0 until the session carries priced usage.
+    cumulative_cost: Mutex<f64>,
+    per_model_cost: Mutex<HashMap<String, f64>>,
     /// Shared with the approval gate so `SetModel` is visible to the
     /// reviewer without a second synchronization point.
     model: Arc<Mutex<Option<PiModel>>>,
@@ -111,6 +115,8 @@ pub fn spawn_engine(
         request_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
+        cumulative_cost: Mutex::new(0.0),
+        per_model_cost: Mutex::new(HashMap::new()),
         model: model_slot,
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
@@ -152,6 +158,14 @@ impl ThreadEngine for PiEngine {
 
     fn per_model_token_usage(&self) -> HashMap<String, TokenUsage> {
         self.state.per_model.lock().unwrap().clone()
+    }
+
+    fn cumulative_cost(&self) -> f64 {
+        *self.state.cumulative_cost.lock().unwrap()
+    }
+
+    fn per_model_cost(&self) -> HashMap<String, f64> {
+        self.state.per_model_cost.lock().unwrap().clone()
     }
 
     fn model(&self) -> Option<PiModel> {
@@ -973,11 +987,17 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     };
     let cumulative = token_usage_from_totals(&stats.tokens);
     let mut per_model = HashMap::new();
+    let mut per_model_cost = HashMap::new();
     for entry in &stats.per_model {
         per_model.insert(entry.key.clone(), token_usage_from_totals(&entry.totals));
+        if entry.totals.cost > 0.0 {
+            per_model_cost.insert(entry.key.clone(), entry.totals.cost);
+        }
     }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
+    *state.cumulative_cost.lock().unwrap() = stats.tokens.cost;
+    *state.per_model_cost.lock().unwrap() = per_model_cost;
     *state.request_usage.lock().unwrap() = request_attribution(session);
 }
 
@@ -1024,6 +1044,8 @@ fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
     }
     *state.cumulative.lock().unwrap() = cumulative;
     *state.per_model.lock().unwrap() = per_model;
+    *state.cumulative_cost.lock().unwrap() = 0.0;
+    *state.per_model_cost.lock().unwrap() = HashMap::new();
     *state.request_usage.lock().unwrap() = request_attribution(session);
 }
 

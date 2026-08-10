@@ -41,6 +41,6 @@ pub const TASK_STOP: &str = "TaskStop";
 
 pub const WRITE: &str = "Write";
 
-// The manox harness tool implementations moved to the `harness-manox`
-// crate (retired); the constants above remain the shared wire-name source
-// of truth.
+// The manox harness tool implementations were removed with the retired
+// manox harness; the constants above remain the shared wire-name source of
+// truth.

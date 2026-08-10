@@ -157,7 +157,6 @@ fn main() {
             // Terminal tab: cmd-t opens, cmd-shift-t focuses, cmd-shift-c
             // returns to the conversation pane. Handlers live on the active
             // Workspace (see `Workspace::Render`).
-            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
             gpui::KeyBinding::new("cmd-t", agent_ui::NewTerminalTab, None),
             gpui::KeyBinding::new("cmd-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(target_os = "macos")]
@@ -168,7 +167,6 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
             // Built-in browser. cmd-b opens a new browser tab in the right
             // pane, cmd-shift-b closes the active browser tab.
-            // TODO(pi-wire): browser tabs are unwired under harness-pi.
             gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserTab, None),
             gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserTab, None),
             gpui::KeyBinding::new("ctrl-alt-b", agent_ui::OpenBrowserTab, None),
@@ -178,7 +176,7 @@ fn main() {
             // this task" gesture. No-op when idle. cmd-b stays the browser key
             // on macOS, so ctrl-b is free there; on other platforms the browser
             // tab moved to ctrl-alt-b to free ctrl-b for this action.
-            // TODO(pi-wire): background threads are unwired under harness-pi.
+            gpui::KeyBinding::new("ctrl-b", agent_ui::BackgroundCurrentThread, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
             #[cfg(target_os = "macos")]
@@ -188,7 +186,6 @@ fn main() {
             // Cockpit milestone panel: cmd/ctrl-shift-m collapses or expands
             // the plan-steps section in the "Conversation Info" card. The
             // header is also clickable; this is the keyboard affordance.
-            // TODO(pi-wire): cockpit panel is unwired under harness-pi.
             gpui::KeyBinding::new("cmd-shift-m", agent_ui::ToggleCockpitTasks, None),
             gpui::KeyBinding::new("ctrl-shift-m", agent_ui::ToggleCockpitTasks, None),
             // Completion popover (driven while the composer Input is focused and
@@ -225,7 +222,6 @@ fn main() {
                 Some("completion == open > Input"),
             ),
             // Archive the current thread and start a fresh one.
-            // TODO(pi-wire): thread archival is unwired under harness-pi.
             gpui::KeyBinding::new("cmd-;", agent_ui::ArchiveCurrentThread, None),
             gpui::KeyBinding::new("ctrl-;", agent_ui::ArchiveCurrentThread, None),
             // Open turn navigator (additional binding alongside cmd-m).
@@ -403,7 +399,9 @@ fn main() {
             // closure with no `&mut App`, so the drainer (which owns an
             // `AsyncApp`) is the cx-bearing sink that emits onto the owning
             // thread.
-            // TODO(pi-wire): the embedded browser host is manox-only chrome.
+            if let Some(workspace) = agent_ui::dispatch::workspace_global() {
+                agent_ui::browser_host::WorkspaceBrowserHost::install(workspace.clone(), cx);
+            }
         })
         .detach();
     });
@@ -511,7 +509,6 @@ fn build_app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action(agent::i18n::t("menu-quit"), Quit),
             ]),
-            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
             build_tools_menu(),
         ]
     }
@@ -522,7 +519,6 @@ fn build_app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
             MenuItem::separator(),
-            // TODO(pi-wire): terminal tabs are unwired under harness-pi.
             MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]
     }
