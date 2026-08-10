@@ -949,15 +949,19 @@ pub fn known_agent_ids(config: &CxConfig) -> Vec<String> {
 }
 
 /// Canonicalize a config/registry agent id. Remaps legacy entries only:
-/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`) and
-/// `Codex.app` → `ChatGPT.app` (the desktop app was renamed; old config
-/// `agents:` allow-lists keep working).
+/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`),
+/// `Codex.app` → `ChatGPT.app` (the desktop app was renamed), and
+/// `codex+` → `codex` (the hidden fork entry was removed permanently, so
+/// stale config entries normalize onto the plain CLI). Old config `agents:`
+/// allow-lists keep working.
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
         "codex-app" => "codex",
         // Backward-compat: the desktop agent was renamed Codex.app → ChatGPT.app.
         "Codex.app" => "ChatGPT.app",
+        // Backward-compat: the codex+ hidden fork was removed; legacy entries behave as codex.
+        "codex+" => "codex",
         _ => agent_id,
     }
 }
@@ -973,6 +977,41 @@ pub fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
         }
     }
     normalized
+}
+
+/// User-facing name for an agent id (settings pickers/badges): built-ins get
+/// brand names, everything else (user-configured agents) displays as its
+/// canonical id.
+pub fn agent_display_name(agent_id: &str) -> String {
+    match canonical_agent_id(agent_id) {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "copilot" => "GitHub Copilot".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Canonicalize + dedupe a config `agents:` section (first entry per canonical
+/// id wins) so legacy ids such as the removed `codex+` never round-trip back
+/// into the config file. A canonical (non-legacy) entry replaces a previously
+/// kept legacy duplicate, so the stale entry's bin/env/args payload never
+/// shadows the real one.
+pub fn normalize_agent_configs(agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
+    let mut normalized: Vec<(AgentConfig, bool)> = Vec::new();
+    for mut agent in agents {
+        let canonical = canonical_agent_id(&agent.id).to_string();
+        let legacy = canonical != agent.id;
+        agent.id = canonical;
+        match normalized
+            .iter()
+            .position(|(existing, _)| existing.id == agent.id)
+        {
+            Some(pos) if !legacy && normalized[pos].1 => normalized[pos] = (agent, false),
+            Some(_) => {}
+            None => normalized.push((agent, legacy)),
+        }
+    }
+    normalized.into_iter().map(|(agent, _)| agent).collect()
 }
 
 /// Hardcoded wire_apis each built-in agent supports. The config file's per-agent
@@ -1147,6 +1186,60 @@ agents:
         assert!(ids.contains(&"my-agent".to_string()));
         assert!(ids.contains(&"VS Code".to_string()));
         assert!(ids.contains(&"copilot".to_string()));
+    }
+
+    #[test]
+    fn codex_plus_legacy_id_canonicalizes_to_codex() {
+        assert_eq!(canonical_agent_id("codex+"), "codex");
+        let yaml = r#"
+agents:
+- id: codex
+  bin: codex
+- id: codex+
+  bin: codex+
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        // The picker candidates never surface the removed legacy id.
+        let ids = known_agent_ids(&config);
+        assert!(!ids.iter().any(|id| id == "codex+"));
+        assert_eq!(ids.iter().filter(|id| id.as_str() == "codex").count(), 1);
+        // The preserved `agents:` section drops the stale entry on round-trip.
+        let normalized = normalize_agent_configs(config.agents);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "codex");
+    }
+
+    #[test]
+    fn normalize_agent_configs_prefers_canonical_payload_over_legacy() {
+        let yaml = r#"
+agents:
+- id: codex+
+  bin: codex+
+  env:
+    STALE: "1"
+- id: codex
+  bin: codex
+  env:
+    REAL: "1"
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let normalized = normalize_agent_configs(config.agents);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "codex");
+        assert!(normalized[0].env.contains_key("REAL"));
+        assert!(!normalized[0].env.contains_key("STALE"));
+    }
+
+    #[test]
+    fn agent_display_name_maps_builtin_brands() {
+        assert_eq!(agent_display_name("claude"), "Claude Code");
+        assert_eq!(agent_display_name("codex"), "Codex");
+        assert_eq!(agent_display_name("copilot"), "GitHub Copilot");
+        assert_eq!(agent_display_name("ChatGPT.app"), "ChatGPT.app");
+        assert_eq!(agent_display_name("VS Code"), "VS Code");
+        // Legacy ids display as their canonical brand; custom ids echo back.
+        assert_eq!(agent_display_name("codex+"), "Codex");
+        assert_eq!(agent_display_name("my-agent"), "my-agent");
     }
 
     #[test]

@@ -277,7 +277,6 @@ settings-desc-config-reinstall = Remove the local bundle, redownload, and reload
 settings-btn-reinstall = Reinstall
 
 ### views/settings.rs — Models panel
-settings-panel-models = Models
 settings-models-add-provider = Add provider
 settings-models-no-path = Provider config path is unavailable
 settings-models-reload-failed-title = Provider reload failed
@@ -301,7 +300,7 @@ settings-models-row-url = URL
 settings-models-ph-url = https://api.example.com
 settings-models-agents-all-hint = None selected = all agents
 settings-models-agents-add = Add
-settings-models-row-copilot = Auth scheme
+settings-models-row-copilot = GitHub Copilot auth scheme
 settings-models-env-empty = No environment variables yet
 settings-models-empty-models = No models yet
 settings-models-value-unset = Unset
