@@ -1091,12 +1091,18 @@ impl Thread {
     /// The retired manox harness additionally applies the macro's
     /// `allowed-tools` filter for the turn; the pi harness runs its full
     /// toolset.
-    pub fn submit_command(&mut self, name: &str, args: &str, cx: &mut Context<Self>) -> bool {
+    pub fn submit_command(
+        &mut self,
+        name: &str,
+        args: &str,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
         };
         let rendered = cmd.render(args);
-        self.insert_user_message_with_ui_metadata(rendered, None, cx);
+        self.insert_user_message_with_ui_metadata(rendered, ui, cx);
         self.run_turn(cx);
         true
     }
@@ -1104,7 +1110,13 @@ impl Thread {
     /// Run a skill turn: inject the named skill's body (description + body,
     /// the user's args appended) as the user message, mirroring the retired
     /// manox harness's `submit_skill`.
-    pub fn submit_skill(&mut self, key: &str, args: &str, cx: &mut Context<Self>) -> bool {
+    pub fn submit_skill(
+        &mut self,
+        key: &str,
+        args: &str,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(skill) = crate::skill::global().get(key).cloned() else {
             return false;
         };
@@ -1118,7 +1130,7 @@ impl Thread {
             },
         )
         .expect("skill body render");
-        self.insert_user_message_with_ui_metadata(rendered, None, cx);
+        self.insert_user_message_with_ui_metadata(rendered, ui, cx);
         self.run_turn(cx);
         true
     }

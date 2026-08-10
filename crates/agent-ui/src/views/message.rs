@@ -3028,6 +3028,15 @@ impl ItemBuilder {
                             })
                             .collect::<Vec<_>>()
                             .join("");
+                    // A registry slash turn persists a compact display form
+                    // (`/name args`) alongside the expanded model-facing body;
+                    // the bubble shows the display form so a reloaded thread
+                    // matches the live send-time view.
+                    let text =
+                        m.ui.as_ref()
+                            .and_then(|ui| ui.display_text.clone())
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or(text);
                     let images: Vec<UserImage> = m
                         .content
                         .iter()
@@ -3825,6 +3834,38 @@ mod tests {
             "historical segment must pin elapsed to stop the timer"
         );
     }
+
+    #[test]
+    fn build_items_prefers_persisted_display_text_for_user_bubble() {
+        // A registry slash turn persists the expanded macro body as the
+        // model-facing text plus a compact `display_text`; the rebuilt bubble
+        // must show the compact form (parity with the live send-time view).
+        let mut message = Message::user("EXPANDED MACRO BODY".to_string());
+        message.ui = Some(agent::MessageUiMetadata {
+            display_text: Some("/gitwork:deliver fast".to_string()),
+            ..Default::default()
+        });
+        let items = build_items(&[message], &HashMap::new(), false);
+        let texts: Vec<&String> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConvItem::User { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["/gitwork:deliver fast"]);
+    }
+
+    #[test]
+    fn build_items_user_bubble_keeps_plain_text_without_display_text() {
+        let message = Message::user("plain turn".to_string());
+        let items = build_items(&[message], &HashMap::new(), false);
+        assert!(matches!(
+            items.first(),
+            Some(ConvItem::User { text, .. }) if text == "plain turn"
+        ));
+    }
+
     #[test]
     fn build_items_user_prompt_is_turn_boundary_tool_result_is_not() {
         let messages = vec![
