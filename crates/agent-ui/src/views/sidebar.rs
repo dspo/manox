@@ -1067,7 +1067,11 @@ impl SidebarThreadItem {
             selected,
             indent,
             icon: RowIcon::External(summary.kind.icon_asset()),
-            wash: theme.accent,
+            // Same wash as AutoPilot threads: `theme.accent` resolves to
+            // `neutral-100` (near-white) in the forced Light theme, which made
+            // the external row's hover/active/selected wash invisible on the
+            // white sidebar. `theme.info` (cyan) is the visible default tint.
+            wash: theme.info,
             kind: RowKind::External,
         }
     }
@@ -1363,5 +1367,93 @@ fn truncate(s: &str, max_chars: usize) -> String {
         format!("{t}…")
     } else {
         one_line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_component::theme::ThemeColor;
+
+    /// A real (non-transparent) theme — `Theme::default()` derives all-zero
+    /// colors, so it cannot validate wash visibility.
+    fn real_theme() -> Theme {
+        Theme::from(&*ThemeColor::light())
+    }
+
+    fn sample_thread() -> agent::ThreadSummary {
+        agent::ThreadSummary {
+            id: "thread-abcdef12".into(),
+            summary: "Summarize the diff".into(),
+            title: None,
+            title_override: None,
+            model_id: "claude".into(),
+            provider_id: None,
+            approval_mode: 0,
+            project: String::new(),
+            depth: 0,
+            parent_id: None,
+            archived: false,
+            pinned: false,
+            has_unread: false,
+            errored: false,
+            created_at: 0,
+            interacted_at: 0,
+            updated_at: 0,
+            cumulative_total_tokens: 0,
+        }
+    }
+
+    fn sample_external() -> crate::external_session::ExternalSessionSummary {
+        crate::external_session::ExternalSessionSummary {
+            id: "external:claude:deadbeef".into(),
+            kind: crate::external_session::SessionKind::ClaudeCode,
+            created_at: 0,
+            project: None,
+            title: None,
+            cx_session_id: "deadbeef".into(),
+            socket_path: None,
+        }
+    }
+
+    /// The unified row projection: a selected external session carries the
+    /// same `selected` flag, id-namespace, and a non-transparent wash as a
+    /// selected manox thread, so `set_selected(external_id)` highlights its
+    /// row through the same `render_thread_item` wash the threads use.
+    #[test]
+    fn external_selection_mirrors_thread_selection() {
+        let theme = real_theme();
+
+        let thread = SidebarThreadItem::from_thread(&sample_thread(), true, false, px(0.), &theme);
+        assert!(thread.selected);
+        assert_eq!(thread.id, "thread-abcdef12");
+        assert_eq!(thread.wash, approval_mode_color(0, &theme));
+        assert!(thread.wash.a > 0.0);
+        assert!(matches!(thread.kind, RowKind::Thread { archived: false }));
+
+        let external = SidebarThreadItem::from_external(&sample_external(), true, px(0.), &theme);
+        assert!(external.selected);
+        // The row's id is the same string the click emits (`OpenExternalSession`)
+        // and the workspace feeds to `set_selected`, so the selection lands on
+        // this row's `is_selected` check.
+        assert_eq!(external.id, "external:claude:deadbeef");
+        // Fully unified: the external row's wash is the same visible tint a
+        // default (AutoPilot) manox thread carries — never the near-white
+        // `theme.accent`, which disappears against the light sidebar.
+        assert_eq!(external.wash, thread.wash);
+        assert_eq!(external.wash, theme.info);
+        assert!(external.wash.a > 0.0);
+        assert!(matches!(external.kind, RowKind::External));
+    }
+
+    /// Deselected rows stay deselected for both kinds (hover-only feedback),
+    /// so the `selected` flag alone drives the persistent wash.
+    #[test]
+    fn external_and_thread_rows_share_deselected_state() {
+        let theme = real_theme();
+        let thread = SidebarThreadItem::from_thread(&sample_thread(), false, false, px(0.), &theme);
+        let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
+        assert!(!thread.selected);
+        assert!(!external.selected);
     }
 }

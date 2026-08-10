@@ -47,11 +47,11 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### 顶层
 
-- [Window](#window) · [NativeMenuBar](#nativemenubar) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
+- [Window](#window) · [NativeMenuBar](#nativemenubar) · [Workspace](#workspace) · [WorkspaceShell](#workspaceshell) · [TerminalColumn](#terminalcolumn) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
-- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarExternalSection](#sidebarexternalsection) · [SidebarExternalSessionItem](#sidebarexternalsessionitem) · [SidebarDivider](#sidebardivider)
+- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarDivider](#sidebardivider)
 
 ### MainColumn
 
@@ -154,16 +154,16 @@ Default — sidebar + conversation + composer.
 Full-window settings overlay with slide-in animation.
 
 #### ViewMode::Terminal
-Full-window terminal emulator.
+Full-window terminal emulator, rendered through the shared [WorkspaceShell](#workspaceshell) with a [TerminalColumn](#terminalcolumn) (TitleBar + the built-in `TerminalView`) as the main column — the sidebar divider stays draggable here.
 
 #### ViewMode::ExternalSession
-Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent's live OSC title (falling back to the kind label — "Claude Code" / "Codex" / "GitHub Copilot") + provider/model. The session has no dedicated titlebar close button: it is archived the same way a thread row is — via the hover archive control on its [SidebarExternalSessionItem](#sidebarexternalsessionitem) row (or the title menu). Lives in memory only — never persisted; the sidebar row is removed both on archive (kill + drop the `SessionHandle`) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). The terminal's OSC title is mirrored into `ExternalSession.title` so the titlebar and sidebar row share one `display_title()`. If the removed session was the active one, the view falls back to the conversation pane.
+Full-window external agent CLI session (claude / codex / copilot). Rendered through the shared [WorkspaceShell](#workspaceshell) with a [TerminalColumn](#terminalcolumn) showing the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation; the TitleBar shows the agent's live OSC title (falling back to the kind label — "Claude Code" / "Codex" / "GitHub Copilot"). The session has no dedicated titlebar close button: it is archived the same way a thread row is — via the hover archive control on its unified [SidebarThreadItem](#sidebarthreaditem) row (or the title menu). Lives in memory only — never persisted; the sidebar row is removed both on archive (kill + drop the `SessionHandle`) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). The terminal's OSC title is mirrored into `ExternalSession.title` so the titlebar and sidebar row share one `display_title()`. If the removed session was the active one, the view falls back to the conversation pane.
 
 ---
 
 ## 3. ViewMode::Workspace Layout
 
-The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebardivider): left = [Sidebar](#sidebar), right = the middle column — a relative `v_flex` that holds a shared [TitleBar](#titlebar) overlay on top (spanning the whole middle column) and the conversation column underneath. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; while it is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
+Every non-Settings `ViewMode` renders through one shared shell ([WorkspaceShell](#workspaceshell)): `sidebar | SidebarDivider | mode main column`. The sidebar divider (drag-resize, double-click reset, width clamp + sync to the sidebar entity) is defined in exactly one place, so the conversation, built-in terminal, and external-session views all resize the sidebar identically — only the main column differs per mode. In the default mode the main column is the conversation column: a relative `v_flex` that holds a shared [TitleBar](#titlebar) overlay on top (spanning the whole middle column) and the conversation column underneath. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; while it is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
 
 ```
 ┌──────────┬──┬──────────────────────────────┐
@@ -179,6 +179,18 @@ The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebar
 │          │  │                └─────────┘ │  │
 └──────────┴──┴──────────────────────────────┘
 ```
+
+#### WorkspaceShell
+
+The shared window shell built by `Workspace::shell_root`: an `h_flex` root with `sidebar | 6px SidebarDivider | mode main column`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every non-Settings `ViewMode` routes through it — the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…), the right [EditorPane](#editordpane) + [EditorDivider](#editordivider) columns, and the turn-navigator overlay onto it; the Terminal and ExternalSession modes chain only their own extras. Terminal-style main columns are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### TerminalColumn
+
+The terminal-style main column shared by [ViewMode::Terminal](#viewmodeterminal) and [ViewMode::ExternalSession](#viewmodeexternalsession): a [TitleBar](#titlebar) (leading icon + title) over a full-bleed terminal view (`flex_1`). One shape for both, so the two terminal surfaces read as peers inside the shared shell.
+
+> Source: `agent-ui/src/workspace.rs`
 
 ### 3.1 Sidebar
 
@@ -234,25 +246,13 @@ Bottom section: loose (non-project) threads. The header's `+` button opens the `
 
 #### SidebarThreadItem
 
-Unified row projection (`SidebarThreadItem` struct: `id`/`display_id`/`title`/`updated_at`/`project`/`selected`/`running`/`icon`/`archive_action`) rendered by one `render_thread_item` for both native threads and external-agent sessions. Native thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, hover archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread. External rows reuse the same layout but swap the leading icon for the agent's brand SVG and drop the unread/pin/token/running shimmer affordances. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the hover archive button to the right `SidebarEvent` (`ArchiveThread` / `ArchiveExternalSession`).
-
-> Source: `agent-ui/src/views/sidebar.rs`
-
-#### SidebarExternalSection
-
-Section below "Conversations" listing live external agent sessions (claude / codex / copilot). Rendered only when at least one `ExternalSession` is live. The sidebar holds a `Vec<ExternalSessionSummary>` projection pushed by the Workspace — it never owns the PTY-bearing `ExternalSession` structs.
-
-> Source: `agent-ui/src/views/sidebar.rs`
-
-#### SidebarExternalSessionItem
-
-Single external-session row, rendered through the unified `render_thread_item` (see [SidebarThreadItem](#sidebarthreaditem)) with `RowKind::External`. Leading icon is the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`); title is `display_title()` (the agent's OSC title, falling back to the kind label); the short-id tag shows the cx session id (derived from the `<id>.sock` filename of the session's socket path) with click-to-copy of the full id / socket path. The row has no trailing `×` — it shares the thread row's hover archive button, which emits `ArchiveExternalSession(id)` (kill + drop the `SessionHandle`, the unified archive semantics). Clicking the row emits `OpenExternalSession(id)`. External rows live in their own section and don't participate in the conversation selection slide.
+Unified row projection (`SidebarThreadItem` struct: `id`/`short_id`/`title`/`updated`/`pinned`/`has_unread`/`errored`/`running`/`selected`/`indent`/`icon`/`wash`/`kind`) rendered by one `render_thread_item` for both native threads and external-agent sessions. The two kinds are merged into one recency-ordered list (loose rows under "Conversations", project-bound rows inside their folder group) and share the selection-slide wash animation, the hover/active wash, and the hover archive action. Native thread row: unread red dot (8px, `theme.info`, shown when `summary.has_unread`), pinned star, error triangle, title, short-id tag (shimmer while running), relative time, hover archive button. The hover/active/selected wash uses the thread's last saved approval-mode color (`theme.info` AutoPilot / `theme.danger` Danger). The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread. External rows reuse the same layout but swap the leading icon for the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`), carry the same visible wash as AutoPilot threads (`theme.info` — `theme.accent` resolves to the near-white `neutral-100` in the forced Light theme, invisible on the sidebar), show the cx session id prefix in the short-id tag (click-to-copy of the full id / socket path, traceable to `~/.config/cx/sessions/<id>.sock`), and drop the unread/pin/error/running-shimmer affordances. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the open click and the hover archive button to the right `SidebarEvent` (`OpenThread` / `ArchiveThread` vs `OpenExternalSession` / `ArchiveExternalSession` — the latter kills + drops the `SessionHandle`, the unified archive semantics).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
 #### SidebarDivider
 
-6px drag handle between Sidebar and MainColumn, `cursor:col-resize`.
+6px drag handle between Sidebar and the mode main column, `cursor:col-resize`. Constructed once inside [WorkspaceShell](#workspaceshell), so it appears — and behaves identically (drag-resize, double-click reset to the 260px default) — in the conversation, terminal, and external-session views.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -807,7 +807,7 @@ The plugin/skill/MCP management UI (PluginManagerView, tab bar, marketplace/plug
 
 ## 6. ViewMode::Terminal
 
-Full-window terminal emulator.
+Full-window terminal emulator, rendered through the shared [WorkspaceShell](#workspaceshell): sidebar + draggable divider + a [TerminalColumn](#terminalcolumn) (TitleBar over the full-bleed `TerminalView`). The terminal view owns its PTY and grid; the workspace only mounts it. Resize/scrollback/selection are handled inside `TerminalView` / `TerminalElement`.
 
 #### TerminalView
 

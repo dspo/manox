@@ -4322,42 +4322,32 @@ impl Workspace {
                     el.relative().ml(offset)
                 },
             );
-            return h_flex().size_full().child(anim_el);
+            return h_flex().size_full().child(anim_el).into_any_element();
         }
-        // Terminal pane: sidebar (for tab switching) + a full-bleed terminal
-        // view filling the main column. The terminal view owns its PTY and
-        // grid; this branch only mounts it. Resize/scrollback/selection are
-        // handled inside `TerminalView` / `TerminalElement`.
+        // Terminal pane: the shared shell (sidebar + draggable divider) with a
+        // full-bleed terminal view as the main column. The terminal view owns
+        // its PTY and grid; this branch only mounts it.
+        // Resize/scrollback/selection are handled inside `TerminalView` /
+        // `TerminalElement`.
         if matches!(self.view_mode, ViewMode::Terminal) {
-            let theme = cx.theme().clone();
-            let title_text = self
+            let title_text: SharedString = self
                 .thread
                 .read(cx)
                 .project()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
                 .unwrap_or("manox")
-                .to_string();
+                .to_string()
+                .into();
             let terminal = self
                 .terminal_view
                 .clone()
                 .expect("view_mode == Terminal implies terminal_view is set");
-            return h_flex()
-                .size_full()
-                .bg(theme.background)
-                .text_color(theme.foreground)
-                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
-                    this.focus_conversation(cx);
-                }))
-                .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
-                    this.focus_terminal(cx);
-                }))
-                .on_action(cx.listener(|this, _: &NewTerminalTab, _window, cx| {
-                    this.open_terminal_tab(cx);
-                }))
-                .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
-                    this.close_terminal_tab(cx);
-                }))
+            let icon = Icon::new(IconName::SquareTerminal)
+                .small()
+                .into_any_element();
+            return self
+                .shell_root(self.render_terminal_column(icon, title_text, terminal), cx)
                 .on_action(
                     cx.listener(|this, _: &crate::ToggleCockpitTasks, _window, cx| {
                         this.context_rail.update(cx, |r, cx| {
@@ -4367,99 +4357,46 @@ impl Workspace {
                         cx.notify();
                     }),
                 )
-                .child(self.sidebar.clone())
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .relative()
-                        .child(
-                            TitleBar::new().child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Icon::new(IconName::SquareTerminal).small())
-                                    .child(
-                                        gpui::div()
-                                            .text_sm()
-                                            .text_left()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(title_text),
-                                    ),
-                            ),
-                        )
-                        .child(v_flex().flex_1().h_full().w_full().child(terminal)),
-                );
+                .into_any_element();
         }
         // External agent CLI session: render the active session's terminal TUI
-        // in place of the conversation. Mirrors the Terminal branch — sidebar on
-        // the left, a TitleBar + the terminal filling the main column. The bar
-        // title is the agent's OSC title (mirrored from `TerminalEvent::Title`),
-        // falling back to the kind label ("Claude Code" / "Codex" / "GitHub
-        // Copilot") until the TUI sets its own. The provider/model picked at
-        // spawn is intentionally omitted: the user can switch models mid-session
-        // inside the TUI (`/model`), and manox cannot observe that change.
+        // in place of the conversation. Same shared shell as the conversation
+        // and terminal views — only the main column (the agent's TUI) and the
+        // title differ, so the sidebar divider stays draggable here too. The
+        // bar title is the agent's OSC title (mirrored from
+        // `TerminalEvent::Title`), falling back to the kind label ("Claude
+        // Code" / "Codex" / "GitHub Copilot") until the TUI sets its own. The
+        // provider/model picked at spawn is intentionally omitted: the user
+        // can switch models mid-session inside the TUI (`/model`), and manox
+        // cannot observe that change.
         if matches!(self.view_mode, ViewMode::ExternalSession) {
-            let theme = cx.theme().clone();
             let active = self
                 .active_external
                 .as_deref()
                 .and_then(|id| self.external_sessions.iter().find(|s| s.id == id));
-            let Some(session) = active else {
-                // No live session matches the recorded id (closed underneath
-                // us). Fall back to the conversation pane.
-                self.view_mode = ViewMode::Workspace;
-                cx.notify();
-                return h_flex().size_full().child(self.sidebar.clone());
-            };
-            let kind = session.kind;
-            // Titlebar + sidebar share `display_title()` so a TUI rename
-            // (OSC title) updates both at once.
-            let title: SharedString = session.display_title().to_string().into();
-            let terminal = session.terminal_view.clone();
-            return h_flex()
-                .size_full()
-                .bg(theme.background)
-                .text_color(theme.foreground)
-                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
-                    this.focus_conversation(cx);
-                }))
-                .child(self.sidebar.clone())
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .relative()
-                        .child(
-                            TitleBar::new().child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        gpui::svg()
-                                            .path(kind.icon_asset())
-                                            .size(px(16.))
-                                            .text_color(theme.muted_foreground),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .text_sm()
-                                            .text_left()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(title),
-                                    ),
-                            ),
-                        )
-                        .child(v_flex().flex_1().h_full().w_full().child(terminal)),
-                );
+            if let Some(session) = active {
+                let kind = session.kind;
+                // Titlebar + sidebar share `display_title()` so a TUI rename
+                // (OSC title) updates both at once.
+                let title: SharedString = session.display_title().to_string().into();
+                let terminal = session.terminal_view.clone();
+                let icon = gpui::svg()
+                    .path(kind.icon_asset())
+                    .size(px(16.))
+                    .text_color(cx.theme().muted_foreground)
+                    .into_any_element();
+                return self
+                    .shell_root(self.render_terminal_column(icon, title, terminal), cx)
+                    .into_any_element();
+            }
+            // No live session matches the recorded id (closed underneath us).
+            // Fall back to the conversation pane: flip the mode and fall
+            // through to the Workspace branch below, so this frame renders the
+            // full shell (sidebar + divider + conversation) rather than a
+            // sidebar-only stub that skips the divider and the mode-switching
+            // actions.
+            self.view_mode = ViewMode::Workspace;
+            cx.notify();
         }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
@@ -4613,40 +4550,8 @@ impl Workspace {
                     }
                 }),
             );
-        // Sidebar divider: same shape as the editor divider but lives on the
-        // right edge of the sidebar. Double-click resets to the default
-        // `SIDEBAR_WIDTH` for symmetry with the editor pane.
-        let sidebar_divider = gpui::div()
-            .id("sidebar-divider")
-            .w(px(SIDEBAR_DIVIDER_WIDTH))
-            .h_full()
-            .flex_shrink_0()
-            .relative()
-            .cursor(CursorStyle::ResizeLeftRight)
-            .child(
-                gpui::div()
-                    .absolute()
-                    .left(px(2.5))
-                    .w(px(1.))
-                    .h_full()
-                    .bg(theme.border),
-            )
-            .on_drag(DraggedSidebarDivider, |_, _, _, cx| {
-                cx.stop_propagation();
-                cx.new(|_| DraggedSidebarDivider)
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, e: &MouseUpEvent, _, cx| {
-                    if e.click_count >= 2 {
-                        let reset = px(SIDEBAR_WIDTH);
-                        this.sidebar_width = reset;
-                        this.sidebar.update(cx, |s, cx| s.set_width(reset, cx));
-                        cx.notify();
-                    }
-                }),
-            );
+        // The sidebar divider lives in `shell_root` — shared by every view
+        // mode so the sidebar resizes identically everywhere.
         // Right pane is a peer tab container for the editor, member/sub-agent
         // observers, browser views, and plan preview. The top-level TabBar is
         // built from `right_tabs`; the content below dispatches on the active
@@ -4796,11 +4701,156 @@ impl Workspace {
                     }),
             );
 
-        h_flex()
-            .size_full()
-            .relative()
-            .bg(theme.background)
-            .text_color(theme.foreground)
+        // The shared shell provides the sidebar + draggable divider and the
+        // mode-switching actions; this mode chains the conversation-only
+        // actions, the right editor pane, and the turn-navigator overlay onto
+        // it. The conversation column is the shell's main column.
+        // Bind the column to a local before the shell call: the column's
+        // builder borrows `self` (title-menu trigger, context rail), which
+        // would collide with `shell_root`'s `&mut self` receiver inside a
+        // single call expression.
+        let conversation_column = {
+            v_flex()
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .relative()
+                .overflow_hidden()
+                .child({
+                    // Body wrapper: hero / list / footer / overlay. `pt`
+                    // reserves space for the title-bar overlay; `pr` (when
+                    // the card is shown) reserves the floating card's width
+                    // so the message list never hides behind it.
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .pt(TITLE_BAR_HEIGHT)
+                        .pb_2()
+                        .when(show_rail, |this| {
+                            this.pr(px(crate::views::context_rail::ENV_CONTENT_INSET))
+                        })
+                        // Empty first screen shows the centered hero in place
+                        // of the (empty) message list; otherwise an
+                        // index-anchored, tail-following virtualized list.
+                        .children(hero)
+                        .children((!first_screen).then(|| {
+                            let conv = self.conversation.clone();
+                            let list_state = self.list_state.clone();
+                            // `ListAlignment::Bottom` gives the list native
+                            // chat-log semantics: short conversations sit at
+                            // the bottom, long ones scroll. The list only
+                            // renders/measures the items in the viewport plus
+                            // overdraw, so a long thread's first frame pays
+                            // only for the visible turn. Item heights are
+                            // reconciled from the ThreadEvent handler via
+                            // `splice`/`remeasure_items`, so the per-item
+                            // height cache never falls out of sync.
+                            let list_el = gpui::list(list_state, move |ix, _window, cx| {
+                                let item = conv.read(cx).items().get(ix).cloned();
+                                match item {
+                                    // Defensive `flex_shrink_0`: the gpui
+                                    // list measures each row by its natural
+                                    // content height, so this flag is not
+                                    // what makes heights honest — it only
+                                    // guards against any available height
+                                    // leaking down the flex chain and
+                                    // compressing a row (e.g. a tall
+                                    // markdown block under a short one).
+                                    Some(item) => v_flex()
+                                        .w_full()
+                                        .pt_1()
+                                        .pb_4()
+                                        .flex_shrink_0()
+                                        .min_w_0()
+                                        .child(item)
+                                        .into_any_element(),
+                                    // Index out of range mid-splice (count changed
+                                    // between a layout pass and the render closure):
+                                    // render an empty row rather than panic.
+                                    None => gpui::div().into_any_element(),
+                                }
+                            })
+                            .with_sizing_behavior(ListSizingBehavior::Auto)
+                            .w_full()
+                            .h_full()
+                            .min_h_0()
+                            .min_w_0()
+                            // Body typeface: Lilex Light. Every message row
+                            // (assistant, user, reasoning, tool cards, notices)
+                            // inherits from here; markdown bold/headings
+                            // resolve to Medium via nearest-weight, italic syntax
+                            // and tool-card overrides hit the italic cuts.
+                            .font_family(theme.mono_font_family.clone())
+                            .font_weight(gpui::FontWeight::LIGHT);
+                            let list_wrap = v_flex()
+                                .flex_1()
+                                .h_full()
+                                .min_h_0()
+                                .min_w_0()
+                                .child(list_el);
+                            h_flex()
+                                .flex_1()
+                                .w_full()
+                                .min_h_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(list_wrap)
+                        }))
+                        .children(footer)
+                        // Approval overlay (if any)
+                        .children(overlay)
+                })
+                // Title-bar overlay: absolute top of the conversation column,
+                // painted after the body so the "..." menu isn't covered by
+                // the conversation list.
+                .child(
+                    gpui::div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(TITLE_BAR_HEIGHT)
+                        .child(
+                            TitleBar::new()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .pr_4()
+                                        .child(
+                                            gpui::svg()
+                                                .path("icons/manox.svg")
+                                                .size(px(16.))
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .text_sm()
+                                                .text_left()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(title_text),
+                                        ),
+                                )
+                                .child(h_flex()),
+                        ),
+                )
+                // Floating context card: absolute top-right of the
+                // conversation column, below the title bar. Its own `Render`
+                // positions it (`top` clears the title bar, `right` + the
+                // body wrapper's `pr` keep the message list clear). Hidden
+                // while the editor pane is open, on the first screen, before
+                // the thread interacts, or below the narrow width gate.
+                .when(show_rail, |this| this.child(self.context_rail.clone()))
+        };
+        let mut root = self.shell_root(conversation_column, cx);
+        root = root
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.enter_settings(window, cx);
             }))
@@ -4818,18 +4868,6 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &ToggleTurnNavigator, window, cx| {
                 this.toggle_turn_navigator(window, cx);
                 cx.stop_propagation();
-            }))
-            .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
-                this.focus_terminal(cx);
-            }))
-            .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
-                this.focus_conversation(cx);
-            }))
-            .on_action(cx.listener(|this, _: &NewTerminalTab, _window, cx| {
-                this.open_terminal_tab(cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
-                this.close_terminal_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenBrowserTab, window, cx| {
                 this.open_browser_tab(crate::views::browser_view::DEFAULT_URL, window, cx);
@@ -4876,154 +4914,6 @@ impl Workspace {
                     this.archive_current_thread(window, cx);
                 }),
             )
-            // Left sidebar with a draggable divider on its right edge.
-            .child(self.sidebar.clone())
-            .child(sidebar_divider)
-            // Middle column: the conversation column. The context card floats
-            // over the conversation's top-right as an absolute overlay — a peer
-            // in the z-stack, not a flex column — so the column itself is the
-            // conversation alone. The editor pane is a third top-level column to
-            // the right.
-            .child({
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .relative()
-                    .overflow_hidden()
-                    .child({
-                        // Body wrapper: hero / list / footer / overlay. `pt`
-                        // reserves space for the title-bar overlay; `pr` (when
-                        // the card is shown) reserves the floating card's width
-                        // so the message list never hides behind it.
-                        v_flex()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .w_full()
-                            .overflow_hidden()
-                            .pt(TITLE_BAR_HEIGHT)
-                            .pb_2()
-                            .when(show_rail, |this| {
-                                this.pr(px(crate::views::context_rail::ENV_CONTENT_INSET))
-                            })
-                            // Empty first screen shows the centered hero in place
-                            // of the (empty) message list; otherwise an
-                            // index-anchored, tail-following virtualized list.
-                            .children(hero)
-                            .children((!first_screen).then(|| {
-                                let conv = self.conversation.clone();
-                                let list_state = self.list_state.clone();
-                                // `ListAlignment::Bottom` gives the list native
-                                // chat-log semantics: short conversations sit at
-                                // the bottom, long ones scroll. The list only
-                                // renders/measures the items in the viewport plus
-                                // overdraw, so a long thread's first frame pays
-                                // only for the visible turn. Item heights are
-                                // reconciled from the ThreadEvent handler via
-                                // `splice`/`remeasure_items`, so the per-item
-                                // height cache never falls out of sync.
-                                let list_el = gpui::list(list_state, move |ix, _window, cx| {
-                                    let item = conv.read(cx).items().get(ix).cloned();
-                                    match item {
-                                        // Defensive `flex_shrink_0`: the gpui
-                                        // list measures each row by its natural
-                                        // content height, so this flag is not
-                                        // what makes heights honest — it only
-                                        // guards against any available height
-                                        // leaking down the flex chain and
-                                        // compressing a row (e.g. a tall
-                                        // markdown block under a short one).
-                                        Some(item) => v_flex()
-                                            .w_full()
-                                            .pt_1()
-                                            .pb_4()
-                                            .flex_shrink_0()
-                                            .min_w_0()
-                                            .child(item)
-                                            .into_any_element(),
-                                        // Index out of range mid-splice (count changed
-                                        // between a layout pass and the render closure):
-                                        // render an empty row rather than panic.
-                                        None => gpui::div().into_any_element(),
-                                    }
-                                })
-                                .with_sizing_behavior(ListSizingBehavior::Auto)
-                                .w_full()
-                                .h_full()
-                                .min_h_0()
-                                .min_w_0()
-                                // Body typeface: Lilex Light. Every message row
-                                // (assistant, user, reasoning, tool cards, notices)
-                                // inherits from here; markdown bold/headings
-                                // resolve to Medium via nearest-weight, italic syntax
-                                // and tool-card overrides hit the italic cuts.
-                                .font_family(theme.mono_font_family.clone())
-                                .font_weight(gpui::FontWeight::LIGHT);
-                                let list_wrap = v_flex()
-                                    .flex_1()
-                                    .h_full()
-                                    .min_h_0()
-                                    .min_w_0()
-                                    .child(list_el);
-                                h_flex()
-                                    .flex_1()
-                                    .w_full()
-                                    .min_h_0()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .child(list_wrap)
-                            }))
-                            .children(footer)
-                            // Approval overlay (if any)
-                            .children(overlay)
-                    })
-                    // Title-bar overlay: absolute top of the conversation column,
-                    // painted after the body so the "..." menu isn't covered by
-                    // the conversation list.
-                    .child(
-                        gpui::div()
-                            .absolute()
-                            .top(px(0.))
-                            .left(px(0.))
-                            .right(px(0.))
-                            .h(TITLE_BAR_HEIGHT)
-                            .child(
-                                TitleBar::new()
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .pr_4()
-                                            .child(
-                                                gpui::svg()
-                                                    .path("icons/manox.svg")
-                                                    .size(px(16.))
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            .child(
-                                                gpui::div()
-                                                    .text_sm()
-                                                    .text_left()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .child(title_text),
-                                            ),
-                                    )
-                                    .child(h_flex()),
-                            ),
-                    )
-                    // Floating context card: absolute top-right of the
-                    // conversation column, below the title bar. Its own `Render`
-                    // positions it (`top` clears the title bar, `right` + the
-                    // body wrapper's `pr` keep the message list clear). Hidden
-                    // while the editor pane is open, on the first screen, before
-                    // the thread interacts, or below the narrow width gate.
-                    .when(show_rail, |this| this.child(self.context_rail.clone()))
-            })
             // Right editor pane: a third top-level column when an editor is
             // open (browser/terminal tabs will join it as future right-pane
             // surfaces). Sits outside the middle column so it is not a sibling
@@ -5056,13 +4946,81 @@ impl Workspace {
                     this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), max_w);
                     cx.notify();
                 },
-            ))
+            ));
+        root.into_any_element()
+    }
+    /// The shared window shell every non-Settings `ViewMode` renders through:
+    /// `sidebar | sidebar-divider | main`, plus the mode-switching actions and
+    /// the sidebar drag/reset handling. The divider (drag handle, double-click
+    /// reset, width clamp + sync to the `Sidebar` entity) lives here once, so
+    /// the conversation, built-in terminal, and external-session views all
+    /// resize the sidebar identically — the main column is the only
+    /// mode-specific part. Modes chain their own actions/children onto the
+    /// returned root before converting it to an element.
+    fn shell_root(&mut self, main: impl IntoElement, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = cx.theme().clone();
+        // The divider is the visual separator and the drag handle for resizing
+        // the sidebar. Double-click resets to the default `SIDEBAR_WIDTH` for
+        // symmetry with the editor pane.
+        let sidebar_divider = gpui::div()
+            .id("sidebar-divider")
+            .w(px(SIDEBAR_DIVIDER_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .relative()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .child(
+                gpui::div()
+                    .absolute()
+                    .left(px(2.5))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(theme.border),
+            )
+            .on_drag(DraggedSidebarDivider, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| DraggedSidebarDivider)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if e.click_count >= 2 {
+                        let reset = px(SIDEBAR_WIDTH);
+                        this.sidebar_width = reset;
+                        this.sidebar.update(cx, |s, cx| s.set_width(reset, cx));
+                        cx.notify();
+                    }
+                }),
+            );
+
+        h_flex()
+            .size_full()
+            .relative()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            // Mode-switching shortcuts apply in every view mode.
+            .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                this.focus_conversation(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
+                this.focus_terminal(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminalTab, _window, cx| {
+                this.open_terminal_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
+                this.close_terminal_tab(cx);
+            }))
+            .child(self.sidebar.clone())
+            .child(sidebar_divider)
+            .child(main)
             .on_drag_move(cx.listener(
                 |this, e: &DragMoveEvent<DraggedSidebarDivider>, _window, cx| {
-                    // The root fills the window, so the sidebar's right edge
-                    // is the cursor's x position relative to the root's left.
-                    // Clamp so the main column (and the editor pane when
-                    // open) always retain at least `MAIN_MIN_WIDTH`.
+                    // The root fills the window, so the sidebar's right edge is
+                    // the cursor's x position relative to the root's left.
+                    // Clamp so the main column (and the editor pane when open)
+                    // always retain at least `MAIN_MIN_WIDTH`.
                     let new_w = e.event.position.x - e.bounds.left();
                     let editor_reserve = if this.right_pane_open() {
                         this.editor_width + px(EDITOR_DIVIDER_WIDTH)
@@ -5082,6 +5040,43 @@ impl Workspace {
                     cx.notify();
                 },
             ))
+    }
+
+    /// The terminal-style main column shared by the built-in Terminal tab and
+    /// external agent CLI sessions: a TitleBar (leading icon + title) over a
+    /// full-bleed terminal view. One shape for both, so the two terminal
+    /// surfaces read as peers inside the shared shell.
+    fn render_terminal_column(
+        &self,
+        icon: AnyElement,
+        title: SharedString,
+        content: impl IntoElement,
+    ) -> gpui::Div {
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .relative()
+            .child(
+                TitleBar::new().child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_1()
+                        .min_w_0()
+                        .child(icon)
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_left()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(title),
+                        ),
+                ),
+            )
+            .child(v_flex().flex_1().h_full().w_full().child(content))
     }
 }
 
