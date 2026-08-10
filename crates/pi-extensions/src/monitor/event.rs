@@ -8,22 +8,19 @@ use std::time::Duration;
 
 /// Maximum bytes for a single batched event payload.
 const DEFAULT_MAX_EVENT_BYTES: usize = 4 * 1024;
-/// Maximum bytes across all in-flight batches before the queue is trimmed.
-const DEFAULT_MAX_QUEUE_BYTES: usize = 256 * 1024;
 /// Maximum lines per batch before a flush is forced.
 const DEFAULT_MAX_BATCH_SIZE: usize = 20;
 /// Wall-clock window before a partial batch is flushed.
 const DEFAULT_BATCH_INTERVAL: Duration = Duration::from_millis(300);
 
-/// Tracks the running byte total and the underflow boundary so
-/// the caller can pause input when the queue is full.
+/// Bounded line accumulator. A batch flushes when it exceeds the byte cap,
+/// reaches the line cap, or the caller's timer fires (`batch_interval`).
+/// Lines larger than the byte cap are dropped outright.
 #[derive(Default)]
 pub struct EventBatcher {
     buffer: Vec<String>,
     batch_bytes: usize,
-    total_bytes: usize,
     max_event_bytes: usize,
-    max_queue_bytes: usize,
     max_batch_size: usize,
     batch_interval: Duration,
 }
@@ -32,7 +29,6 @@ impl EventBatcher {
     pub fn new() -> Self {
         Self {
             max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
-            max_queue_bytes: DEFAULT_MAX_QUEUE_BYTES,
             max_batch_size: DEFAULT_MAX_BATCH_SIZE,
             batch_interval: DEFAULT_BATCH_INTERVAL,
             ..Default::default()
@@ -44,17 +40,15 @@ impl EventBatcher {
         self.max_event_bytes = v;
         self
     }
-    pub fn with_max_queue_bytes(mut self, v: usize) -> Self {
-        self.max_queue_bytes = v;
-        self
-    }
     pub fn with_max_batch_size(mut self, v: usize) -> Self {
         self.max_batch_size = v;
         self
     }
+
     /// Push a line.  Returns `Some(batch)` when the batch should be flushed.
-    /// `None` means the line was buffered (or dropped due to overflow).
-    /// When triggered, the flush includes the triggering line.
+    /// `None` means the line was buffered (or dropped for exceeding the
+    /// per-event cap). When triggered, the flush includes the triggering
+    /// line.
     pub fn push(&mut self, line: String) -> Option<Vec<String>> {
         let line_bytes = line.len() + 1; // +1 for the newline we'll append
 
@@ -63,17 +57,9 @@ impl EventBatcher {
             return None;
         }
 
-        // If the total queue is already at the cap, drop the line.
-        if self.total_bytes + line_bytes > self.max_queue_bytes {
-            return None;
-        }
-
-        // Add the line to the buffer.
         self.buffer.push(line);
         self.batch_bytes += line_bytes;
-        self.total_bytes += line_bytes;
 
-        // If the buffer now exceeds limits, flush it.
         if self.batch_bytes > self.max_event_bytes || self.buffer.len() >= self.max_batch_size {
             return Some(self.take_batch());
         }
@@ -97,9 +83,7 @@ impl EventBatcher {
 
     fn take_batch(&mut self) -> Vec<String> {
         let batch = std::mem::take(&mut self.buffer);
-        let bytes: usize = batch.iter().map(|l| l.len() + 1).sum();
         self.batch_bytes = 0;
-        self.total_bytes = self.total_bytes.saturating_sub(bytes);
         batch
     }
 }
@@ -136,16 +120,6 @@ mod tests {
     }
 
     #[test]
-    fn overflow_line_is_dropped_when_queue_is_full() {
-        let mut b = EventBatcher::new().with_max_queue_bytes(50);
-        b.push("x".repeat(30));
-        // Second line pushes past the cap.
-        assert!(b.push("y".repeat(30)).is_none());
-        // First line is still in the buffer.
-        assert_eq!(b.buffer.len(), 1);
-    }
-
-    #[test]
     fn batch_exceeds_max_event_bytes_triggers_immediate_flush() {
         let mut b = EventBatcher::new().with_max_event_bytes(20);
         b.push("a".to_string()); // 2 bytes
@@ -158,5 +132,11 @@ mod tests {
             Some(vec!["a".into(), "b".into(), "1234567890123456".into()])
         );
         assert!(b.buffer.is_empty());
+    }
+
+    #[test]
+    fn batch_interval_defaults_to_300ms() {
+        let b = EventBatcher::new();
+        assert_eq!(b.batch_interval(), Duration::from_millis(300));
     }
 }

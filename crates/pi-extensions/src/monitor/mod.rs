@@ -24,6 +24,14 @@
 //!   → Monitor finished → steer(terminal) message
 //! ```
 //!
+//! ## Approval semantics
+//!
+//! The `ws` half is pure read-only network observation and rides ungated.
+//! The `command` half executes an arbitrary shell command under `sh -c` —
+//! the same surface as `Bash` — so it opts into the host approval gate via
+//! the params-aware `requires_approval`. Monitor output is always framed as
+//! untrusted external data either way.
+//!
 //! ## Teardown semantics
 //!
 //! A run `Abort` (user Esc) is not terminal — monitors survive it and keep
@@ -55,11 +63,13 @@ pub use self::registry::{WsMonitorRegistry, WsSnapshot, WsTaskId, WsTaskStatus};
 
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
+/// Lower bound so a `timeout: 0/1` from the model cannot kill a monitor on
+/// its first ticker tick.
+const MIN_TIMEOUT_MS: u64 = 1_000;
 
 /// Monitor-specific batcher limits, pinned explicitly at construction (the
 /// batcher defaults are a shared baseline, not a contract).
 const MONITOR_MAX_EVENT_BYTES: usize = 4 * 1024;
-const MONITOR_MAX_QUEUE_BYTES: usize = 256 * 1024;
 const MONITOR_MAX_BATCH_SIZE: usize = 20;
 
 /// How a monitor event reaches the bound session.
@@ -99,6 +109,16 @@ pub enum MonitorKind {
     WebSocket,
 }
 
+/// A tracked monitor: its kind plus the teardown flag shared with the exit
+/// path.
+struct MonitorTask {
+    kind: MonitorKind,
+    /// Set when `kill_all_sync` initiates the stop. The monitor's exit path
+    /// then suppresses its own terminal event and steer — the teardown
+    /// already reported `Killed`, and the bound session is going away.
+    kill_initiated: Arc<AtomicBool>,
+}
+
 // ── Input schema ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Debug)]
@@ -120,8 +140,8 @@ struct MonitorInput {
     /// WebSocket connection to monitor. Mutually exclusive with `command`.
     #[serde(default)]
     ws: Option<WsInput>,
-    /// Wall-clock limit in milliseconds. Default 5 min; clamped to 1 hour.
-    /// Ignored when `persistent` is true.
+    /// Wall-clock limit in milliseconds. Default 5 min; clamped to
+    /// [1s, 1h]. Ignored when `persistent` is true.
     #[serde(rename = "timeout", default)]
     timeout_ms: Option<u64>,
     /// When true, the monitor runs indefinitely. Default false.
@@ -153,7 +173,7 @@ pub struct MonitorManager {
     event_tx: broadcast::Sender<MonitorEvent>,
     /// Active monitors keyed by task id; the kind routes `kill_all_sync` to
     /// the right registry. Entries leave when their monitor terminates.
-    tasks: Arc<Mutex<HashMap<String, MonitorKind>>>,
+    tasks: Arc<Mutex<HashMap<String, MonitorTask>>>,
 }
 
 impl MonitorManager {
@@ -206,10 +226,10 @@ impl MonitorManager {
         let batcher = Arc::new(Mutex::new(
             EventBatcher::new()
                 .with_max_event_bytes(MONITOR_MAX_EVENT_BYTES)
-                .with_max_queue_bytes(MONITOR_MAX_QUEUE_BYTES)
                 .with_max_batch_size(MONITOR_MAX_BATCH_SIZE),
         ));
         let timed_out = Arc::new(AtomicBool::new(false));
+        let kill_initiated = Arc::new(AtomicBool::new(false));
         let timeout_secs = timeout.as_secs();
 
         let on_output = Box::new({
@@ -231,16 +251,23 @@ impl MonitorManager {
             let tasks = Arc::clone(&self.tasks);
             let batcher = Arc::clone(&batcher);
             let timed_out = Arc::clone(&timed_out);
+            let kill_initiated = Arc::clone(&kill_initiated);
             let desc = desc.clone();
             move |task_id: &pi::TaskId, exit_code: Option<Option<i32>>| {
                 let tid = task_id.0.clone();
+                tasks.lock().expect("tasks lock poisoned").remove(&tid);
+                if kill_initiated.load(Ordering::Relaxed) {
+                    // kill_all_sync already reported Killed and the session
+                    // is tearing down — no duplicate event, no terminal
+                    // steer.
+                    return;
+                }
                 // Flush the residual batch before the terminal event so no
                 // output is lost.
                 let residual = batcher.lock().expect("batcher lock poisoned").flush();
                 if let Some(residual) = residual {
                     steer_batch(&steerer, &tid, &desc, residual);
                 }
-                tasks.lock().expect("tasks lock poisoned").remove(&tid);
 
                 let (text, event) = if timed_out.load(Ordering::Relaxed) {
                     (
@@ -278,10 +305,13 @@ impl MonitorManager {
             .map_err(|e| format!("{e}"))?;
         let tid = task_id.0.clone();
 
-        self.tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .insert(tid.clone(), MonitorKind::Command);
+        self.tasks.lock().expect("tasks lock poisoned").insert(
+            tid.clone(),
+            MonitorTask {
+                kind: MonitorKind::Command,
+                kill_initiated: Arc::clone(&kill_initiated),
+            },
+        );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description,
@@ -324,12 +354,16 @@ impl MonitorManager {
         let addrs = websocket::resolve_and_validate_addrs(host, port).await?;
 
         let cancel = CancellationToken::new();
+        let kill_initiated = Arc::new(AtomicBool::new(false));
         let task_id = self.ws_registry.register(url.clone(), cancel.clone());
         let tid = task_id.0.clone();
-        self.tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .insert(tid.clone(), MonitorKind::WebSocket);
+        self.tasks.lock().expect("tasks lock poisoned").insert(
+            tid.clone(),
+            MonitorTask {
+                kind: MonitorKind::WebSocket,
+                kill_initiated: Arc::clone(&kill_initiated),
+            },
+        );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description: description.clone(),
@@ -355,8 +389,18 @@ impl MonitorManager {
                 &driver_tid,
                 &desc,
                 &steerer,
+                &kill_initiated,
             )
             .await;
+            tasks
+                .lock()
+                .expect("tasks lock poisoned")
+                .remove(&driver_tid);
+            if kill_initiated.load(Ordering::Relaxed) {
+                // kill_all_sync already reported Killed and the session is
+                // tearing down — no duplicate terminal bookkeeping.
+                return;
+            }
             let (status, event) = match reason {
                 WsExit::Closed => (
                     WsTaskStatus::Completed,
@@ -386,10 +430,6 @@ impl MonitorManager {
                 ),
             };
             ws_registry.set_status(&driver_task_id, status);
-            tasks
-                .lock()
-                .expect("tasks lock poisoned")
-                .remove(&driver_tid);
             let _ = event_tx.send(event);
         });
         self.ws_registry.set_driver(&task_id, driver);
@@ -401,22 +441,26 @@ impl MonitorManager {
     ///
     /// Command monitors are killed through `BackgroundRegistry::kill_sync`
     /// (process-group SIGKILL; the drain task's `wait()` reaps); WebSocket
-    /// monitors get their token cancelled and driver aborted. Safe to call
-    /// from a `Drop` — no awaits.
+    /// monitors get their token cancelled and driver aborted. Each monitor's
+    /// `kill_initiated` flag is raised first so its exit path suppresses the
+    /// duplicate terminal event. Safe to call from a `Drop` — no awaits.
     pub fn kill_all_sync(&self) {
-        let tasks: Vec<(String, MonitorKind)> = self
+        let tasks: Vec<(String, MonitorTask)> = self
             .tasks
             .lock()
             .expect("tasks lock poisoned")
             .drain()
             .collect();
-        for (id, kind) in tasks {
-            match kind {
+        for (id, task) in tasks {
+            task.kill_initiated.store(true, Ordering::Relaxed);
+            match task.kind {
                 MonitorKind::Command => {
                     let _ = self.bg_registry.kill_sync(&pi::TaskId(id.clone()));
                 }
                 MonitorKind::WebSocket => {
-                    self.ws_registry.abort(&WsTaskId(id.clone()));
+                    let ws_id = WsTaskId(id.clone());
+                    self.ws_registry.abort(&ws_id);
+                    self.ws_registry.set_status(&ws_id, WsTaskStatus::Stopped);
                 }
             }
             let _ = self.event_tx.send(MonitorEvent::Killed { id });
@@ -520,17 +564,22 @@ impl AgentTool for MonitorTool {
          in the format `mon_N` (command) or `ws_N` (WebSocket)."
     }
 
-    /// Monitor is an observability tool: it spawns watchers but does not
-    /// mutate the workspace itself. Read-only here means "exempt from the
-    /// host approval gate" (needs_gate = requires_approval || !is_read_only)
-    /// — a deliberate retired-harness decision: observability needs network
-    /// access the sandbox would defeat.
+    /// Default gate stance for the observability half: `ws` monitors are
+    /// pure read-only network watching and need no approval. The `command`
+    /// half executes arbitrary shell and opts into the gate through the
+    /// params-aware `requires_approval` below — `is_read_only` has no
+    /// params, so it cannot distinguish the halves itself.
     fn is_read_only(&self) -> bool {
         true
     }
 
-    fn requires_approval(&self, _params: &JsonValue) -> bool {
-        false
+    /// The `command` half runs an arbitrary command under `sh -c` — the
+    /// same surface as `Bash` — so it rides the same host approval gate.
+    fn requires_approval(&self, params: &JsonValue) -> bool {
+        params
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| !c.trim().is_empty())
     }
 
     fn parameters_schema(&self) -> JsonValue {
@@ -563,7 +612,7 @@ impl AgentTool for MonitorTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds (default: 300000, max: 3600000)"
+                    "description": "Timeout in milliseconds (default: 300000, min: 1000, max: 3600000)"
                 },
                 "persistent": {
                     "type": "boolean",
@@ -602,23 +651,18 @@ impl AgentTool for MonitorTool {
         }
 
         let persistent = parsed.persistent.unwrap_or(false);
+        // Persistent monitors report timeoutMs=0 and run without a runtime
+        // deadline; a WebSocket connection phase still keeps its per-address
+        // connect timeout inside `connect_pinned`.
         let timeout_ms = if persistent {
             0
         } else {
             parsed
                 .timeout_ms
                 .unwrap_or(DEFAULT_TIMEOUT_MS)
-                .min(MAX_TIMEOUT_MS)
+                .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
         };
-        // Persistent monitors report timeoutMs=0 to the model but still get
-        // an internal deadline for their connection phase; only the ticker's
-        // kill deadline is suppressed.
-        let internal_timeout_ms = if persistent {
-            DEFAULT_TIMEOUT_MS
-        } else {
-            timeout_ms
-        };
-        let timeout = Duration::from_millis(internal_timeout_ms);
+        let timeout = Duration::from_millis(timeout_ms);
 
         if has_command {
             let command = parsed.command.expect("has_command");
@@ -724,6 +768,10 @@ enum WsExit {
 }
 
 /// Run a WebSocket monitor, steering each text frame into the session.
+///
+/// A per-interval flush delivers sparse streams promptly (a frame per minute
+/// must not wait for the 20-line batch threshold); the same window/limits
+/// semantics as the command path.
 #[allow(clippy::too_many_arguments)] // monitor plumbing: each input is a distinct concern
 async fn run_ws_monitor(
     url: &str,
@@ -734,6 +782,7 @@ async fn run_ws_monitor(
     task_id: &str,
     description: &str,
     steerer: &Arc<Mutex<Option<Steerer>>>,
+    kill_initiated: &AtomicBool,
 ) -> WsExit {
     let mut stream = match websocket::connect_pinned(url, addrs, cancel.clone()).await {
         Ok(stream) => stream,
@@ -760,12 +809,21 @@ async fn run_ws_monitor(
 
     let mut batcher = EventBatcher::new()
         .with_max_event_bytes(MONITOR_MAX_EVENT_BYTES)
-        .with_max_queue_bytes(MONITOR_MAX_QUEUE_BYTES)
         .with_max_batch_size(MONITOR_MAX_BATCH_SIZE);
+    let mut interval = tokio::time::interval(batcher.batch_interval());
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires immediately; skip it so a fresh monitor gets a
+    // full window before its first time-based flush.
+    interval.tick().await;
 
     let exit = loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                if !kill_initiated.load(Ordering::Relaxed)
+                    && let Some(steer) = steerer.lock().expect("steerer lock poisoned").as_ref()
+                {
+                    steer(make_monitor_message(task_id, description, "[monitor stopped]"));
+                }
                 break WsExit::Cancelled;
             }
             _ = async {
@@ -775,7 +833,22 @@ async fn run_ws_monitor(
                     std::future::pending::<()>().await;
                 }
             } => {
+                let secs = timeout.as_secs();
+                if !kill_initiated.load(Ordering::Relaxed)
+                    && let Some(steer) = steerer.lock().expect("steerer lock poisoned").as_ref()
+                {
+                    steer(make_monitor_message(
+                        task_id,
+                        description,
+                        &format!("[monitor timed out after {secs}s and was terminated]"),
+                    ));
+                }
                 break WsExit::TimedOut;
+            }
+            _ = interval.tick() => {
+                if let Some(batch) = batcher.flush() {
+                    steer_batch(steerer, task_id, description, batch);
+                }
             }
             frame = websocket::read_frame(&mut stream) => {
                 match frame {
@@ -829,8 +902,11 @@ async fn run_ws_monitor(
         }
     };
 
-    // Flush the residual batch so no received frame is lost.
-    if let Some(batch) = batcher.flush() {
+    // Flush the residual batch so no received frame is lost. Suppressed when
+    // the teardown initiated the stop (the session is going away).
+    if !kill_initiated.load(Ordering::Relaxed)
+        && let Some(batch) = batcher.flush()
+    {
         steer_batch(steerer, task_id, description, batch);
     }
     exit
@@ -894,24 +970,31 @@ mod tests {
         assert_eq!(m.persistent, Some(true));
     }
 
+    /// The `command` half executes arbitrary shell — the same surface as
+    /// `Bash` — so it opts into the approval gate; the `ws` half is pure
+    /// read-only observation and stays exempt. A whitespace-only command is
+    /// not a command at all.
     #[test]
-    fn monitor_runs_without_approval() {
+    fn monitor_gates_command_half_and_exempts_ws_half() {
         let manager = MonitorManager::new(Arc::new(BackgroundRegistry::new()));
         let tool = MonitorTool::new(Arc::new(manager));
-        assert!(!tool.requires_approval(&serde_json::json!({
-            "description": "d",
-            "command": "tail -f /var/log/system.log",
-        })));
-        assert!(!tool.requires_approval(&serde_json::json!({
-            "description": "d",
-            "ws": {"url": "wss://example.com/ws"},
-        })));
-        assert!(!tool.requires_approval(&serde_json::json!({
-            "description": "d",
-            "command": "osascript -e 'tell application \"Finder\" to quit'",
-        })));
-        // The host gate computes needs_gate = requires_approval ||
-        // !is_read_only; the exemption requires both halves.
+        for params in [
+            serde_json::json!({"description": "d", "command": "tail -f /var/log/system.log"}),
+            serde_json::json!({"description": "d", "command": "osascript -e 'tell application \"Finder\" to quit'"}),
+        ] {
+            assert!(
+                tool.requires_approval(&params),
+                "command monitor must ride the gate: {params}"
+            );
+        }
+        assert!(!tool.requires_approval(
+            &serde_json::json!({"description": "d", "ws": {"url": "wss://example.com/ws"}})
+        ));
+        assert!(!tool.requires_approval(&serde_json::json!({"description": "d"})));
+        assert!(
+            !tool.requires_approval(&serde_json::json!({"description": "d", "command": "   "})),
+            "whitespace-only command is not a command"
+        );
         assert!(tool.is_read_only());
     }
 
@@ -1004,8 +1087,8 @@ mod tests {
                     break;
                 }
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) => break, // channel closed
-                Err(_) => {}         // slow tick: keep waiting until deadline
+                Ok(Err(_)) => break,
+                Err(_) => {}
             }
         }
         assert!(timed_out, "TimedOut event observed");
@@ -1053,5 +1136,160 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(killed, "kill_all_sync killed the command monitor");
+    }
+
+    /// Teardown kills emit exactly one terminal event per monitor: the exit
+    /// path suppresses its own `Stopped` duplicate and does not steer
+    /// terminal text into the session being torn down.
+    #[tokio::test]
+    async fn kill_all_sync_suppresses_duplicate_terminal_events() {
+        let manager = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let handle_steer: Steerer = Arc::new(move |message| {
+            if let AgentMessage::User { content, .. } = message {
+                for block in content {
+                    if let ContentBlock::Text { text, .. } = block {
+                        seen2.lock().unwrap().push(text);
+                    }
+                }
+            }
+        });
+        *manager.steerer.lock().unwrap() = Some(handle_steer);
+        let mut events = manager.subscribe();
+
+        let tid = manager
+            .spawn_command(
+                "long".into(),
+                "sleep 30".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(60),
+                false,
+            )
+            .unwrap();
+
+        manager.kill_all_sync();
+
+        let mut got_killed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+                Ok(Ok(MonitorEvent::Killed { id })) if id == tid => got_killed = true,
+                Ok(Ok(MonitorEvent::Stopped { id })) if id == tid => {
+                    panic!("kill_all_sync must not produce a duplicate Stopped event")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(got_killed, "Killed event observed");
+        // No terminal text steered into the dying session.
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|t| !t.contains("terminated by signal")),
+            "teardown must not steer terminal text"
+        );
+    }
+
+    /// A sparse WebSocket stream (one frame, then silence) reaches the model
+    /// via the interval flush — it must not wait for the 20-line batch
+    /// threshold. Also covers the Cancelled terminal text on TaskStop-style
+    /// cancellation. Drives `run_ws_monitor` directly against a local
+    /// server: `spawn_websocket` rejects loopback addresses by design.
+    #[tokio::test]
+    async fn ws_monitor_interval_flush_delivers_sparse_frames() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // Minimal WS server: accept one connection, send a single text
+        // frame, then hold the socket open.
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            // Socket bind is blocked in sandboxed dev environments; CI
+            // exercises the full path.
+            return;
+        };
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.send(Message::Text("solo frame".into())).await;
+            // Hold the connection open so only the interval flush can
+            // deliver the frame (batch threshold is 20 lines).
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let steerer: Arc<Mutex<Option<Steerer>>> =
+            Arc::new(Mutex::new(Some(Arc::new(move |message| {
+                if let AgentMessage::User { content, .. } = message {
+                    for block in content {
+                        if let ContentBlock::Text { text, .. } = block {
+                            seen2.lock().unwrap().push(text);
+                        }
+                    }
+                }
+            }))));
+
+        let cancel = CancellationToken::new();
+        let kill_initiated = AtomicBool::new(false);
+        let url = format!("ws://{addr}");
+
+        // Watcher: observe the interval flush, then cancel (TaskStop-style)
+        // so the monitor run below settles.
+        let watcher = {
+            let seen = Arc::clone(&seen);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while tokio::time::Instant::now() < deadline {
+                    if seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t.contains("solo frame"))
+                    {
+                        cancel.cancel();
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                false
+            })
+        };
+
+        // The solo frame must be steered by the interval flush well before
+        // any count/size threshold; the run settles when the watcher cancels.
+        let exit = run_ws_monitor(
+            &url,
+            &[addr],
+            Duration::from_secs(30),
+            false,
+            cancel.clone(),
+            "ws_test",
+            "sparse stream",
+            &steerer,
+            &kill_initiated,
+        )
+        .await;
+        assert!(
+            watcher.await.unwrap(),
+            "interval flush delivered the sparse frame"
+        );
+        assert!(matches!(exit, WsExit::Cancelled));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.contains("[monitor stopped]")),
+            "cancelled ws monitor steers terminal text"
+        );
     }
 }
