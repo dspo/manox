@@ -551,6 +551,10 @@ impl HarnessHandle {
 /// Hook points that consumers can register handlers for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {
+    /// User input received, before any processing (TS extension `input`
+    /// event). Handlers observe the prompt text + attached images and may
+    /// transform them or mark the input handled (no turn runs).
+    Input,
     /// Before the agent starts processing a turn.
     BeforeAgentStart,
     /// Before the context is sent to the provider.
@@ -575,6 +579,26 @@ pub enum HookPoint {
 
 /// A hook handler receives context about the event and can mutate it.
 pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
+
+/// The `Input` hook's event payload, serialized into [`HookContext::data`]
+/// (TS `InputEvent` shape). `source` names where the input came from; the
+/// TS `streamingBehavior` field is omitted — Rust sessions queue at the host
+/// layer, so a session-level prompt never carries delivery semantics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InputHookEvent {
+    pub text: String,
+    pub images: Vec<crate::types::ContentBlock>,
+    pub source: String,
+}
+
+/// A transformed user input supplied by an `Input` hook handler (TS
+/// `{ action: "transform", text, images? }`). `images` is `None` when the
+/// handler kept the original attachments (TS `images ?? currentImages`).
+#[derive(Debug, Clone)]
+pub struct InputHookTransform {
+    pub text: String,
+    pub images: Option<Vec<crate::types::ContentBlock>>,
+}
 
 /// The typed `before_agent_start` hook event, mirroring the TS
 /// `BeforeAgentStartEvent`. Serialized into [`HookContext::data`] so a handler
@@ -706,6 +730,13 @@ pub struct HookContext {
     pub agent_context: Option<AgentContext>,
     /// Arbitrary data attached to the hook event.
     pub data: serde_json::Value,
+    /// At the `Input` point, marks the input fully handled — the session
+    /// skips the turn entirely (TS `{ action: "handled" }`).
+    pub input_handled: bool,
+    /// At the `Input` point, replaces the prompt text (and optionally the
+    /// image attachments) before expansion/processing (TS
+    /// `{ action: "transform" }`).
+    pub input_transform: Option<InputHookTransform>,
     /// `Some(reason)` at the `ToolCall` point blocks the call before it runs.
     pub block_reason: Option<String>,
     /// A replacement `AgentToolResult` at the `ToolResult` point; when set it
@@ -745,6 +776,8 @@ impl HookContext {
             hook,
             agent_context: None,
             data: serde_json::Value::Null,
+            input_handled: false,
+            input_transform: None,
             block_reason: None,
             tool_result: None,
             cancel_compaction: false,
@@ -1809,6 +1842,25 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// Run all registered hooks for a given point.
+    /// Fire the TS-parity `Input` hook over a user prompt and return the
+    /// handlers' verdict (transform / handled / continue).
+    pub(crate) fn run_input_hook(
+        &self,
+        text: &str,
+        images: &[crate::types::ContentBlock],
+    ) -> HookContext {
+        let event = InputHookEvent {
+            text: text.to_string(),
+            images: images.to_vec(),
+            source: "interactive".to_string(),
+        };
+        self.run_hooks(
+            HookPoint::Input,
+            HookContext::new(HookPoint::Input)
+                .with_data(serde_json::to_value(event).unwrap_or(serde_json::Value::Null)),
+        )
+    }
+
     fn run_hooks(&self, hook: HookPoint, mut ctx: HookContext) -> HookContext {
         let hooks = self.hooks.lock().unwrap();
         for (point, handler) in hooks.iter() {
