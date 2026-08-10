@@ -91,6 +91,12 @@ pub fn settings_file() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("settings.toml"))
 }
 
+/// `$HOME/.config/cx/manox/themes` — terminal color themes (`.ottytheme`
+/// TOML files), referenced by name from `[terminal].theme` in settings.
+pub fn themes_dir() -> Result<PathBuf> {
+    Ok(manox_config_dir()?.join("themes"))
+}
+
 fn dirs() -> PathBuf {
     if let Some(p) = home_dir() {
         return p;

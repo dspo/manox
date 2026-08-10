@@ -1,12 +1,13 @@
 //! Terminal color theme — alacritty `Color` → gpui `Hsla`.
 //!
-//! manox ships a default ANSI-16 palette + fg/bg/cursor. Stage 8 lets
-//! `TerminalSettings` override these. `convert` resolves any alacritty
-//! `Color` (named, truecolor, 256-indexed) against a `TerminalTheme`.
+//! manox ships a default ANSI-16 palette + fg/bg/cursor, and can derive a
+//! palette from the app theme or from a `.ottytheme` file named by
+//! `TerminalSettings.theme`. `convert` resolves any alacritty `Color`
+//! (named, truecolor, 256-indexed) against a `TerminalTheme`.
 
 use gpui::Hsla;
 use gpui_component::Theme;
-use terminal::{Color, NamedColor, Rgb};
+use terminal::{Color, NamedColor, Rgb, theme::ThemeFile};
 
 /// Resolved terminal palette used by the renderer. Compared by the view to
 /// bust the shaped-line cache on a theme switch.
@@ -100,6 +101,17 @@ impl TerminalTheme {
                     fg,                          // BrightWhite → theme fg
                 ],
             }
+        }
+    }
+
+    /// Build a palette from a parsed `.ottytheme` file. The cursor follows
+    /// the foreground, mirroring the app-theme palette.
+    pub fn from_theme_file(file: &ThemeFile) -> Self {
+        Self {
+            default_fg: rgb_to_hsla(&file.foreground),
+            default_bg: rgb_to_hsla(&file.background),
+            cursor: rgb_to_hsla(&file.foreground),
+            ansi: std::array::from_fn(|i| rgb_to_hsla(&file.palette[i])),
         }
     }
 }
