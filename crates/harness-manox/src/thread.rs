@@ -3362,13 +3362,6 @@ impl Thread {
         .detach();
     }
 
-    /// Run the side LLM call that summarizes `messages[0..insertion_ix]` into a
-    /// handoff summary, then insert a `Compaction` message at `insertion_ix`,
-    /// emit `ThreadEvent::CompactionStarted` (before the call) then
-    /// `ThreadEvent::Compaction` (after), persist, record the event, and bust
-    /// the prefix-cache fingerprint. The summary request is built and streamed
-    /// outside any `this` write lease; only the final insert + bookkeeping hold
-    /// the lease. Returns the summary text on success.
     /// The overflow recovery shared by the handshake and mid-stream failure
     /// paths: compact history once so the re-request can fit the window.
     /// Returns `false` when there is nothing left to compact — the caller
@@ -3398,6 +3391,13 @@ impl Thread {
         Ok(true)
     }
 
+    /// Run the side LLM call that summarizes `messages[0..insertion_ix]` into a
+    /// handoff summary, then insert a `Compaction` message at `insertion_ix`,
+    /// emit `ThreadEvent::CompactionStarted` (before the call) then
+    /// `ThreadEvent::Compaction` (after), persist, record the event, and bust
+    /// the prefix-cache fingerprint. The summary request is built and streamed
+    /// outside any `this` write lease; only the final insert + bookkeeping hold
+    /// the lease. Returns the summary text on success.
     async fn perform_compaction(
         this: &WeakEntity<Self>,
         model: &AnyLanguageModel,
