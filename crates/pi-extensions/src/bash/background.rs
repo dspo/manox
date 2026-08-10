@@ -14,6 +14,12 @@ use serde_json::Value as JsonValue;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+/// Per-line stdout callback for line-event monitors.
+pub type LineEventCallback = Box<dyn Fn(&pi::TaskId, String) + Send + Sync + 'static>;
+/// Exit callback for line-event monitors: the outer `Option` is `None` when
+/// the child handle was gone, the inner one is `None` for signal deaths.
+pub type ExitEventCallback = Box<dyn Fn(&pi::TaskId, Option<Option<i32>>) + Send + Sync + 'static>;
+
 /// Hard cap on the accumulated output buffer per task; older bytes are
 /// dropped from the front once the cap is hit.
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
@@ -103,6 +109,88 @@ impl BackgroundRegistry {
                 || now.duration_since(*e.last_activity.lock().expect("activity lock poisoned"))
                     < GC_AFTER_EXIT
         });
+    }
+
+    /// Spawn a background command with per-line callbacks.
+    ///
+    /// Same process management as `spawn()` (process group, ring buffer, wait
+    /// reaping), but each stdout line also triggers `on_output` and the exit
+    /// triggers `on_exit`. The ring buffer still accumulates so the task
+    /// remains observable via `poll()` / `status()`.
+    pub fn spawn_with_line_events(
+        &self,
+        command: &str,
+        cwd: &Path,
+        on_output: LineEventCallback,
+        on_exit: ExitEventCallback,
+    ) -> Result<pi::TaskId, pi::TaskError> {
+        self.gc();
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| pi::TaskError::Spawn(format!("{e}")))?;
+        let pid = child.id().map(|p| p as i32).unwrap_or(-1);
+        let id = pi::TaskId(format!(
+            "mon_{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let entry = Arc::new(TaskEntry::new(child, pid));
+        self.tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .insert(id.0.clone(), Arc::clone(&entry));
+        tokio::spawn(drain_task_with_line_events(
+            stdout,
+            stderr,
+            entry,
+            id.clone(),
+            on_output,
+            on_exit,
+        ));
+        Ok(id)
+    }
+
+    /// Synchronous core of `kill`: signal the task's process group without
+    /// awaiting. Usable from non-async contexts (a `Drop` teardown cannot
+    /// await); the drain task's `wait()` still reaps the child.
+    ///
+    /// An exited task's group id may have been recycled by the OS; do not
+    /// signal it.
+    pub fn kill_sync(&self, id: &pi::TaskId) -> Result<(), pi::TaskError> {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
+        entry.touch();
+        if entry
+            .exit_code
+            .lock()
+            .expect("exit lock poisoned")
+            .is_some()
+        {
+            return Ok(());
+        }
+        let pid = *entry.pid.lock().expect("pid lock poisoned");
+        if let Some(pid) = pid {
+            // Negative pid signals the whole process group.
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -214,6 +302,65 @@ async fn drain_task(
     entry.touch();
 }
 
+/// Drain a task's pipes into its ring buffer, calling `on_output` for each
+/// stdout line and `on_exit` when the process exits.
+///
+/// stdout is read in raw chunks (like `drain_task`) so the ring buffer keeps
+/// the exact byte stream — `poll()` accounting stays identical. Lines are
+/// split out of the chunk stream separately: a partial line carries across
+/// chunk boundaries, a trailing line without a final newline is emitted at
+/// EOF, and a trailing `\r` from CRLF input is stripped from the emitted
+/// line text only (the raw bytes in the ring buffer are untouched).
+async fn drain_task_with_line_events(
+    mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
+    entry: Arc<TaskEntry>,
+    id: pi::TaskId,
+    on_output: LineEventCallback,
+    on_exit: ExitEventCallback,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut out_chunk = [0u8; 8192];
+    let mut err_chunk = [0u8; 8192];
+    let mut out_done = false;
+    let mut err_done = false;
+    let mut carry: Vec<u8> = Vec::new();
+    while !(out_done && err_done) {
+        tokio::select! {
+            n = stdout.read(&mut out_chunk), if !out_done => match n {
+                Ok(0) | Err(_) => {
+                    // EOF: emit a trailing partial line (no final newline).
+                    if !carry.is_empty() {
+                        let tail = String::from_utf8_lossy(&carry).into_owned();
+                        carry.clear();
+                        on_output(&id, tail);
+                    }
+                    out_done = true;
+                }
+                Ok(n) => {
+                    let data = &out_chunk[..n];
+                    entry.push(data);
+                    emit_lines(&id, data, &mut carry, &*on_output);
+                }
+            },
+            n = stderr.read(&mut err_chunk), if !err_done => match n {
+                Ok(0) | Err(_) => err_done = true,
+                Ok(n) => entry.push(&err_chunk[..n]),
+            },
+        }
+    }
+    let mut child = entry.child.lock().expect("child lock poisoned").take();
+    let code = match child.as_mut() {
+        Some(c) => c.wait().await.ok().map(|s| s.code()),
+        None => None,
+    }
+    .flatten();
+    *entry.exit_code.lock().expect("exit lock poisoned") = Some(code);
+    let _ = entry.exit.send(Some(code));
+    on_exit(&id, Some(code));
+    entry.touch();
+}
+
 #[async_trait::async_trait]
 impl BackgroundTaskRegistry for BackgroundRegistry {
     fn spawn(&self, command: &str, cwd: &Path) -> Result<pi::TaskId, pi::TaskError> {
@@ -223,6 +370,7 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
             .arg(command)
             .current_dir(cwd)
             .process_group(0)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -278,35 +426,35 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
     }
 
     async fn kill(&self, id: &pi::TaskId) -> Result<(), pi::TaskError> {
-        let entry = self
-            .tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .get(&id.0)
-            .cloned()
-            .ok_or_else(|| pi::TaskError::NotFound(id.0.clone()))?;
-        entry.touch();
-        // An exited task's group id may have been recycled by the OS; do not
-        // signal it.
-        if entry
-            .exit_code
-            .lock()
-            .expect("exit lock poisoned")
-            .is_some()
-        {
-            return Ok(());
+        self.kill_sync(id)
+    }
+}
+
+/// Split `data` into lines against `\n`, joining onto any partial line
+/// carried over from a previous chunk. Each complete line is emitted without
+/// its newline (and without a trailing `\r` from CRLF input); the remainder
+/// after the last newline stays in `carry` for the next chunk.
+fn emit_lines(
+    id: &pi::TaskId,
+    data: &[u8],
+    carry: &mut Vec<u8>,
+    on_output: &(dyn Fn(&pi::TaskId, String) + Send + Sync),
+) {
+    let mut start = 0usize;
+    for (idx, &byte) in data.iter().enumerate() {
+        if byte != b'\n' {
+            continue;
         }
-        // Signal the recorded process group; the child handle is not touched
-        // so no mutex guard crosses an await.
-        let pid = *entry.pid.lock().expect("pid lock poisoned");
-        if let Some(pid) = pid {
-            // Negative pid signals the whole process group.
-            #[cfg(unix)]
-            unsafe {
-                let _ = libc::kill(-pid, libc::SIGKILL);
-            }
+        let mut line = std::mem::take(carry);
+        line.extend_from_slice(&data[start..idx]);
+        start = idx + 1;
+        if line.last() == Some(&b'\r') {
+            line.pop();
         }
-        Ok(())
+        on_output(id, String::from_utf8_lossy(&line).into_owned());
+    }
+    if start < data.len() {
+        carry.extend_from_slice(&data[start..]);
     }
 }
 
@@ -388,13 +536,28 @@ impl AgentTool for BashOutputTool {
 }
 
 /// `task_stop` tool — terminate a background task's process group.
+///
+/// With a WebSocket monitor registry attached, ids unknown to the background
+/// registry fall back to cancelling the WS monitor (`ws_N` ids), so a single
+/// tool stops every background task kind.
 pub struct TaskStopTool {
     registry: Arc<dyn BackgroundTaskRegistry>,
+    ws_registry: Option<Arc<crate::monitor::WsMonitorRegistry>>,
 }
 
 impl TaskStopTool {
     pub fn new(registry: Arc<dyn BackgroundTaskRegistry>) -> Self {
-        TaskStopTool { registry }
+        TaskStopTool {
+            registry,
+            ws_registry: None,
+        }
+    }
+
+    /// Attach the WebSocket monitor registry as a stop fallback for `ws_N`
+    /// ids.
+    pub fn with_ws_registry(mut self, ws_registry: Arc<crate::monitor::WsMonitorRegistry>) -> Self {
+        self.ws_registry = Some(ws_registry);
+        self
     }
 }
 
@@ -431,13 +594,24 @@ impl AgentTool for TaskStopTool {
         let task_id = params["task_id"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("task_id is required".into()))?;
-        self.registry
-            .kill(&pi::TaskId(task_id.to_string()))
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
-        Ok(AgentToolResult::text(format!(
-            "Stopped background task `{task_id}`"
-        )))
+        match self.registry.kill(&pi::TaskId(task_id.to_string())).await {
+            Ok(()) => Ok(AgentToolResult::text(format!(
+                "Stopped background task `{task_id}`"
+            ))),
+            Err(pi::TaskError::NotFound(_)) if self.ws_registry.is_some() => {
+                let ws = self.ws_registry.as_ref().expect("checked is_some");
+                if ws.cancel_str(task_id) {
+                    Ok(AgentToolResult::text(format!(
+                        "Stopped WebSocket monitor `{task_id}`"
+                    )))
+                } else {
+                    Err(ToolError::ExecutionFailed(format!(
+                        "task not found: {task_id}"
+                    )))
+                }
+            }
+            Err(e) => Err(ToolError::ExecutionFailed(format!("{e}"))),
+        }
     }
 }
 
@@ -553,5 +727,165 @@ mod wait_exit_tests {
         let start = std::time::Instant::now();
         registry.wait_exit(&id).await.unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod task_stop_ws_fallback_tests {
+    use super::*;
+    use crate::monitor::WsMonitorRegistry;
+    use pi::tool::{AgentTool, LocalToolContext, ToolState};
+    use std::sync::Arc;
+
+    fn ctx() -> LocalToolContext {
+        LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(std::env::temp_dir())),
+            std::env::temp_dir(),
+            Arc::new(ToolState::new()),
+        )
+    }
+
+    /// A `mon_N` command monitor lives in the shared BackgroundRegistry, so
+    /// TaskStop reaches it without any fallback.
+    #[tokio::test]
+    async fn task_stop_kills_command_monitor_via_bg_registry() {
+        let registry = Arc::new(BackgroundRegistry::new());
+        let tool = TaskStopTool::new(Arc::clone(&registry) as Arc<dyn BackgroundTaskRegistry>);
+        let id = registry
+            .spawn_with_line_events(
+                "sleep 30",
+                Path::new("/tmp"),
+                Box::new(|_id, _line| {}),
+                Box::new(|_id, _code| {}),
+            )
+            .unwrap();
+        assert!(id.0.starts_with("mon_"));
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"task_id": id.0}),
+                CancellationToken::new(),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        // The kill lands via SIGKILL; wait for the recorded exit.
+        let mut stopped = false;
+        for _ in 0..50 {
+            if !registry.status(&id, 0).unwrap().is_running {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(stopped, "command monitor stopped through bg registry");
+    }
+
+    /// A `ws_N` id is unknown to the background registry; with a ws registry
+    /// attached, TaskStop falls back to cancelling the WebSocket monitor.
+    #[tokio::test]
+    async fn task_stop_falls_back_to_ws_registry() {
+        let registry = Arc::new(BackgroundRegistry::new());
+        let ws_registry = Arc::new(WsMonitorRegistry::new());
+        let cancel = CancellationToken::new();
+        let ws_id = ws_registry.register("wss://example.com/ws".into(), cancel.clone());
+        let tool = TaskStopTool::new(Arc::clone(&registry) as Arc<dyn BackgroundTaskRegistry>)
+            .with_ws_registry(Arc::clone(&ws_registry));
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"task_id": ws_id.0}),
+                CancellationToken::new(),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(cancel.is_cancelled(), "ws monitor cancelled via fallback");
+    }
+
+    /// Without a ws registry, an unknown id surfaces a not-found error
+    /// rather than silently succeeding.
+    #[tokio::test]
+    async fn task_stop_unknown_id_errors_without_ws_registry() {
+        let registry = Arc::new(BackgroundRegistry::new());
+        let tool = TaskStopTool::new(Arc::clone(&registry) as Arc<dyn BackgroundTaskRegistry>);
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::json!({"task_id": "ws_404"}),
+                CancellationToken::new(),
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("not found"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod line_framing_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Chunk-boundary line framing: partial lines carry across chunks, a
+    /// trailing line without a newline is emitted at EOF, and CRLF lines
+    /// lose the `\r` in the emitted text only.
+    #[tokio::test]
+    async fn line_events_handle_crlf_and_trailing_partial_line() {
+        let registry = BackgroundRegistry::new();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lines_c = Arc::clone(&lines);
+        let id = registry
+            .spawn_with_line_events(
+                r"printf 'alpha\r\nbeta\r\n'; printf 'no-newline-tail'",
+                Path::new("/tmp"),
+                Box::new(move |_id, line| lines_c.lock().unwrap().push(line)),
+                Box::new(|_id, _code| {}),
+            )
+            .unwrap();
+        registry.wait_exit(&id).await.unwrap();
+
+        let got = lines.lock().unwrap().clone();
+        assert_eq!(got, vec!["alpha", "beta", "no-newline-tail"]);
+
+        // The ring buffer keeps the raw byte stream (CRLF intact), so
+        // `poll()` accounting matches the process output exactly.
+        let poll = registry.poll(&id).await.unwrap();
+        assert!(
+            poll.new_output.contains("alpha\r\nbeta\r\n"),
+            "raw bytes preserved: {:?}",
+            poll.new_output
+        );
+        assert!(poll.new_output.contains("no-newline-tail"));
+        assert_eq!(
+            poll.total_bytes,
+            "alpha\r\nbeta\r\nno-newline-tail".len() as u64
+        );
+    }
+
+    /// `emit_lines` across chunk boundaries: a half line carries over, and
+    /// multiple lines in one chunk all emit in order.
+    #[test]
+    fn emit_lines_carries_partial_lines_across_chunks() {
+        let id = pi::TaskId("mon_test".into());
+        let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut carry: Vec<u8> = Vec::new();
+        let on_output = {
+            let got = Arc::clone(&got);
+            move |_id: &pi::TaskId, line: String| got.lock().unwrap().push(line)
+        };
+
+        emit_lines(&id, b"fir", &mut carry, &on_output);
+        assert!(got.lock().unwrap().is_empty(), "no newline yet");
+        emit_lines(&id, b"st\nsecond\r\nth", &mut carry, &on_output);
+        emit_lines(&id, b"ird", &mut carry, &on_output);
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        // The trailing partial line stays in the carry for the EOF path.
+        assert_eq!(carry, b"third");
     }
 }

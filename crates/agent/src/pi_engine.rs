@@ -20,6 +20,7 @@ use pi_extensions::agents::{SubagentTool, register_defaults};
 use pi_extensions::bash::BashTool;
 use pi_extensions::bash::orchestration::BackgroundManager;
 use pi_extensions::bash::persistent::PersistentShellOperations;
+use pi_extensions::monitor::{MonitorManager, MonitorTool};
 use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
@@ -265,14 +266,19 @@ fn system_prompt(cwd: &Path) -> String {
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
 /// no gate — approval policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
+///
+/// Returns the tools plus the session-scoped orchestrators that must attach
+/// once the session exists (their steerers and lifecycle hooks need a live
+/// session handle).
 fn build_tools(
     cwd: &Path,
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
-) -> Vec<Arc<dyn PiAgentTool>> {
+) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
+    let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     let bash = BashTool::new(
         Arc::new(PersistentShellOperations::new(cwd)),
         background.clone(),
@@ -287,8 +293,9 @@ fn build_tools(
         Arc::new(pi::tools::find::FindTool),
         Arc::new(pi::tools::ls::LsTool),
         Arc::new(bash),
+        Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
-        Arc::new(TaskStopTool::new(background)),
+        Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
     ];
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
@@ -315,7 +322,32 @@ fn build_tools(
         .with_model(model.clone());
         tools.push(Arc::new(subagent));
     }
-    tools
+    (
+        tools,
+        SessionOrchestrators {
+            monitor,
+            background: manager,
+        },
+    )
+}
+
+/// Session-scoped orchestrators that attach once a session exists: the
+/// monitor manager (background command / WebSocket monitors) and the bash
+/// background manager. Both are held by the session's tools as well, so the
+/// managers live exactly as long as their session — a replaced session drops
+/// its tools, and the monitor manager's `Drop` stops every monitor.
+struct SessionOrchestrators {
+    monitor: Arc<MonitorManager>,
+    background: Arc<BackgroundManager>,
+}
+
+/// Bind the orchestrators to a freshly built session: the monitor steerer
+/// lands events in the session's steering queue, and the background manager
+/// subscribes to the session's lifecycle.
+fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators) {
+    let handle = session.handle();
+    orch.monitor.attach(&handle);
+    orch.background.attach(session);
 }
 
 fn steer_message(text: String) -> AgentMessage {
@@ -326,6 +358,110 @@ fn steer_message(text: String) -> AgentMessage {
         }],
         timestamp: chrono::Utc::now(),
     }
+}
+
+/// Drive one session run to completion while still servicing mid-run
+/// commands (abort/steer/cancel/shutdown) through the session handle.
+/// Shared by user prompts and monitor idle-wakeups. Returns the run result
+/// and whether an abort was requested.
+async fn drive_run<F>(
+    run: F,
+    handle: &pi::harness::HarnessHandle,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+    run_steers: &mut Vec<String>,
+    shutdown_after_run: &mut bool,
+) -> (anyhow::Result<Vec<AgentMessage>>, bool)
+where
+    F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
+{
+    tokio::pin!(run);
+    let mut abort_requested = false;
+    let mut channel_open = true;
+    let result = loop {
+        if !channel_open {
+            break run.await;
+        }
+        tokio::select! {
+            maybe_cmd = cmd_rx.recv() => match maybe_cmd {
+                Some(SessionCmd::Abort) => {
+                    abort_requested = true;
+                    handle.abort();
+                }
+                Some(SessionCmd::Steer { id, text }) => {
+                    handle.steer(steer_message(text));
+                    run_steers.push(id);
+                }
+                Some(SessionCmd::CancelSteer(id)) => {
+                    handle.cancel_steer(&id);
+                }
+                Some(SessionCmd::Shutdown) => *shutdown_after_run = true,
+                Some(_) => {} // queued prompts/reconfigs wait for settle
+                None => {
+                    // Facade dropped mid-run: abort, settle, exit.
+                    channel_open = false;
+                    *shutdown_after_run = true;
+                    if !abort_requested {
+                        abort_requested = true;
+                        handle.abort();
+                    }
+                }
+            },
+            result = &mut run => break result,
+        }
+    };
+    (result, abort_requested)
+}
+
+/// Post-run settlement shared by user prompts and monitor idle-wakeups:
+/// error notice, running flag, history/usage/session-list mirrors, steer
+/// accounting, title eligibility, and the `Settled` notice.
+#[allow(clippy::too_many_arguments)] // settlement plumbing: each input is a distinct sink
+async fn settle_run(
+    result: &anyhow::Result<Vec<AgentMessage>>,
+    abort_requested: bool,
+    session: &AgentSession,
+    state: &Arc<EngineState>,
+    repo: &pi::session::repository::SessionRepository,
+    title_state: &Arc<Mutex<TitleState>>,
+    runtime: &ModelRuntime,
+    pi_model: &PiModel,
+    sessions_dir: &Path,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    run_steers: &mut Vec<String>,
+) {
+    let failed = result.is_err();
+    if let Err(err) = result {
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+            anyhow::anyhow!("{err:#}"),
+        ))));
+    }
+    state.running.store(false, Ordering::Relaxed);
+    sync_history(session, state);
+    sync_usage(session, state).await;
+    refresh_session_list(repo, state).await;
+    let (steered, stranded) = if abort_requested || failed {
+        (Vec::new(), std::mem::take(run_steers))
+    } else {
+        (std::mem::take(run_steers), Vec::new())
+    };
+    // A natural terminal turn may earn (or re-earn) the LLM title;
+    // cancelled/failed turns keep the interim summary.
+    if !abort_requested && !failed {
+        maybe_generate_title(
+            title_state,
+            runtime,
+            pi_model,
+            session,
+            sessions_dir,
+            notice_tx,
+        );
+    }
+    let _ = notice_tx.send(BackendNotice::Settled {
+        cancelled: abort_requested,
+        failed,
+        steered,
+        stranded,
+    });
 }
 
 /// Forward every pi run event through the adapt mapping onto the notice
@@ -361,9 +497,18 @@ fn subscribe_session(
 fn subscribe_harness_events(
     session: &mut AgentSession,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    wakeup_tx: &mpsc::UnboundedSender<()>,
 ) -> pi::harness::HarnessSubscription {
     let tx = notice_tx.clone();
+    let wake = wakeup_tx.clone();
     session.subscribe_harness(Arc::new(move |event| match event {
+        // Idle-wakeup signal: a monitor steered events into the queue. The
+        // actor decides whether the session is idle and resumes it
+        // (`continue_` drains the steering queue first) — the listener stays
+        // stateless and never touches the session itself.
+        pi::harness::HarnessEvent::QueueUpdate { steer, .. } if steer > 0 => {
+            let _ = wake.send(());
+        }
         pi::harness::HarnessEvent::CompactionStart { .. } => {
             let _ = tx.send(BackendNotice::Event(Box::new(
                 ThreadEvent::CompactionStarted { tokens_before: 0 },
@@ -392,17 +537,18 @@ fn session_builder(
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
-) -> pi::coding_agent::AgentSessionBuilder {
+) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
+    let (tools, orchestrators) = build_tools(cwd, runtime, model, gate);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
         .with_system_prompt(system_prompt(cwd))
-        .with_tools(build_tools(cwd, runtime, model, gate));
+        .with_tools(tools);
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
-    builder
+    (builder, orchestrators)
 }
 
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
@@ -461,7 +607,7 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
-        let builder = session_builder(
+        let (builder, orchestrators) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
@@ -469,7 +615,8 @@ async fn run_actor(
             &state.gate,
         );
         match builder.open(info.path).await {
-            Ok(s) => {
+            Ok(mut s) => {
+                attach_orchestrators(&mut s, &orchestrators);
                 restored = true;
                 session = Some(s);
             }
@@ -481,10 +628,13 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let builder =
+            let (builder, orchestrators) =
                 session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
             match builder.build().await {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    attach_orchestrators(&mut s, &orchestrators);
+                    s
+                }
                 Err(err) => {
                     // Self-diagnosing failure: name what the registry held at
                     // build time so startup reports are actionable.
@@ -509,10 +659,14 @@ async fn run_actor(
     }
     refresh_session_list(&repo, &state).await;
 
+    // Idle-wakeup channel: the harness listener signals when monitor events
+    // land in the steering queue; the actor resumes an idle session below.
+    let (wakeup_tx, mut wakeup_rx) = mpsc::unbounded_channel::<()>();
+
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let mut _subscription = subscribe_session(&session, &notice_tx);
-    let mut _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
+    let mut _harness_subscription = subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
 
     // The approval mode rides the session sidecar: restore it so a
     // reopened Danger session doesn't silently gate (or vice versa).
@@ -532,85 +686,83 @@ async fn run_actor(
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
 
-    while let Some(cmd) = cmd_rx.recv().await {
+    loop {
+        // Between runs the actor wakes on either a facade command or a
+        // monitor idle-wakeup (steered events queued while the session was
+        // idle). Mid-run wakeups simply accumulate and are re-checked after
+        // settlement.
+        let cmd = tokio::select! {
+            // None = facade dropped: shut down.
+            cmd = cmd_rx.recv() => cmd,
+            _ = wakeup_rx.recv() => {
+                // Collapse wakeups queued while the actor was busy; the
+                // steering-queue check below decides whether a run is owed.
+                while wakeup_rx.try_recv().is_ok() {}
+                if !session.steering_messages().is_empty() {
+                    // Idle wakeup — the Rust equivalent of TS Pi's
+                    // `sendUserMessage` idle semantics: a monitor steered
+                    // events while the session was idle, so resume the run;
+                    // `continue_` drains the steering queue first.
+                    state.running.store(true, Ordering::Relaxed);
+                    let handle = session.handle();
+                    let (result, abort_requested) = drive_run(
+                        session.continue_(),
+                        &handle,
+                        &mut cmd_rx,
+                        &mut run_steers,
+                        &mut shutdown_after_run,
+                    )
+                    .await;
+                    settle_run(
+                        &result,
+                        abort_requested,
+                        &session,
+                        &state,
+                        &repo,
+                        &title_state,
+                        &runtime,
+                        &pi_model,
+                        &sessions_dir,
+                        &notice_tx,
+                        &mut run_steers,
+                    )
+                    .await;
+                    if shutdown_after_run {
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(cmd) = cmd else { break };
         match cmd {
             SessionCmd::Prompt(text) => {
                 state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
-                let mut abort_requested = false;
-                let mut channel_open = true;
                 // Drive the run while still servicing mid-run commands
                 // (abort/steer) through the session handle.
-                let result = {
-                    let prompt = session.prompt(&text);
-                    tokio::pin!(prompt);
-                    loop {
-                        if !channel_open {
-                            break prompt.await;
-                        }
-                        tokio::select! {
-                            maybe_cmd = cmd_rx.recv() => match maybe_cmd {
-                                Some(SessionCmd::Abort) => {
-                                    abort_requested = true;
-                                    handle.abort();
-                                }
-                                Some(SessionCmd::Steer { id, text }) => {
-                                    handle.steer(steer_message(text));
-                                    run_steers.push(id);
-                                }
-                                Some(SessionCmd::CancelSteer(id)) => {
-                                    handle.cancel_steer(&id);
-                                }
-                                Some(SessionCmd::Shutdown) => shutdown_after_run = true,
-                                Some(_) => {} // queued prompts/reconfigs wait for settle
-                                None => {
-                                    // Facade dropped mid-run: abort, settle, exit.
-                                    channel_open = false;
-                                    shutdown_after_run = true;
-                                    if !abort_requested {
-                                        abort_requested = true;
-                                        handle.abort();
-                                    }
-                                }
-                            },
-                            result = &mut prompt => break result,
-                        }
-                    }
-                };
-
-                let failed = result.is_err();
-                if let Err(err) = &result {
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!("{err:#}"),
-                    ))));
-                }
-                state.running.store(false, Ordering::Relaxed);
-                sync_history(&session, &state);
-                sync_usage(&session, &state).await;
-                refresh_session_list(&repo, &state).await;
-                let (steered, stranded) = if abort_requested || failed {
-                    (Vec::new(), std::mem::take(&mut run_steers))
-                } else {
-                    (std::mem::take(&mut run_steers), Vec::new())
-                };
-                // A natural terminal turn may earn (or re-earn) the LLM
-                // title; cancelled/failed turns keep the interim summary.
-                if !abort_requested && !failed {
-                    maybe_generate_title(
-                        &title_state,
-                        &runtime,
-                        &pi_model,
-                        &session,
-                        &sessions_dir,
-                        &notice_tx,
-                    );
-                }
-                let _ = notice_tx.send(BackendNotice::Settled {
-                    cancelled: abort_requested,
-                    failed,
-                    steered,
-                    stranded,
-                });
+                let (result, abort_requested) = drive_run(
+                    session.prompt(&text),
+                    &handle,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                )
+                .await;
+                settle_run(
+                    &result,
+                    abort_requested,
+                    &session,
+                    &state,
+                    &repo,
+                    &title_state,
+                    &runtime,
+                    &pi_model,
+                    &sessions_dir,
+                    &notice_tx,
+                    &mut run_steers,
+                )
+                .await;
                 if shutdown_after_run {
                     break;
                 }
@@ -694,7 +846,8 @@ async fn run_actor(
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
-                _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
+                _harness_subscription =
+                    subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
@@ -703,13 +856,15 @@ async fn run_actor(
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd, project } => {
-                let builder =
+                let (builder, orchestrators) =
                     session_builder(&cwd, &sessions_dir, &runtime, Some(&pi_model), &state.gate);
                 match builder.build().await {
-                    Ok(s) => {
+                    Ok(mut s) => {
+                        attach_orchestrators(&mut s, &orchestrators);
                         session = s;
                         _subscription = subscribe_session(&session, &notice_tx);
-                        _harness_subscription = subscribe_harness_events(&mut session, &notice_tx);
+                        _harness_subscription =
+                            subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         if let Some(project) = &project {
                             write_project_sidecar(&sessions_dir, session.path(), project).await;
@@ -769,9 +924,12 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
-    let builder = session_builder(&cwd, sessions_dir, runtime, Some(model), gate);
+    let (builder, orchestrators) = session_builder(&cwd, sessions_dir, runtime, Some(model), gate);
     match builder.open(path.to_path_buf()).await {
-        Ok(s) => *session = s,
+        Ok(mut s) => {
+            attach_orchestrators(&mut s, &orchestrators);
+            *session = s;
+        }
         Err(err) => {
             let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
                 "pi session open failed: {err}"

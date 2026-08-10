@@ -1104,4 +1104,32 @@ mod tests {
             ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce),
         );
     }
+
+    /// Gate-level pin of the monitor exemption: the `Monitor` tool is an
+    /// observability tool (deliberate retired-harness decision — it needs
+    /// network access the sandbox would defeat), so wrapping it in the host
+    /// approval gate must not prompt. `needs_gate` is
+    /// `requires_approval || !is_read_only`; the exemption requires both.
+    #[tokio::test]
+    async fn monitor_tool_passes_gate_without_approval() {
+        let gate = gate();
+        let manager = Arc::new(pi_extensions::monitor::MonitorManager::new(Arc::new(
+            pi_extensions::BackgroundRegistry::new(),
+        )));
+        let monitor = ApprovalGatedTool::new(
+            Arc::new(pi_extensions::monitor::MonitorTool::new(manager)),
+            Arc::clone(&gate),
+        );
+        for params in [
+            serde_json::json!({"description": "d", "command": "tail -f /var/log/system.log"}),
+            serde_json::json!({"description": "d", "ws": {"url": "wss://example.com/ws"}}),
+        ] {
+            assert!(
+                !monitor.requires_approval(&params),
+                "monitor must ride ungated: {params}"
+            );
+        }
+        // No authorization notice was queued for either check.
+        assert!(gate.pending_entries().is_empty());
+    }
 }
