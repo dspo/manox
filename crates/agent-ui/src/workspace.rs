@@ -4374,29 +4374,29 @@ impl Workspace {
                 .active_external
                 .as_deref()
                 .and_then(|id| self.external_sessions.iter().find(|s| s.id == id));
-            let Some(session) = active else {
-                // No live session matches the recorded id (closed underneath
-                // us). Fall back to the conversation pane.
-                self.view_mode = ViewMode::Workspace;
-                cx.notify();
-                return h_flex()
-                    .size_full()
-                    .child(self.sidebar.clone())
+            if let Some(session) = active {
+                let kind = session.kind;
+                // Titlebar + sidebar share `display_title()` so a TUI rename
+                // (OSC title) updates both at once.
+                let title: SharedString = session.display_title().to_string().into();
+                let terminal = session.terminal_view.clone();
+                let icon = gpui::svg()
+                    .path(kind.icon_asset())
+                    .size(px(16.))
+                    .text_color(cx.theme().muted_foreground)
                     .into_any_element();
-            };
-            let kind = session.kind;
-            // Titlebar + sidebar share `display_title()` so a TUI rename
-            // (OSC title) updates both at once.
-            let title: SharedString = session.display_title().to_string().into();
-            let terminal = session.terminal_view.clone();
-            let icon = gpui::svg()
-                .path(kind.icon_asset())
-                .size(px(16.))
-                .text_color(cx.theme().muted_foreground)
-                .into_any_element();
-            return self
-                .shell_root(self.render_terminal_column(icon, title, terminal), cx)
-                .into_any_element();
+                return self
+                    .shell_root(self.render_terminal_column(icon, title, terminal), cx)
+                    .into_any_element();
+            }
+            // No live session matches the recorded id (closed underneath us).
+            // Fall back to the conversation pane: flip the mode and fall
+            // through to the Workspace branch below, so this frame renders the
+            // full shell (sidebar + divider + conversation) rather than a
+            // sidebar-only stub that skips the divider and the mode-switching
+            // actions.
+            self.view_mode = ViewMode::Workspace;
+            cx.notify();
         }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
