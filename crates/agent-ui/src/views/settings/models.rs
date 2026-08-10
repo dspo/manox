@@ -37,7 +37,7 @@ use cx_providers::{
     AgentConfig, ApiKeySourceKind, CxConfig, ProviderConfig, ProviderEndpointDetail,
     ProviderEndpointSpec, ProviderModelConfig, ProviderModels, active_provider_config_path,
     agent_display_name, canonical_agent_id, known_agent_ids, normalize_agent_configs,
-    read_config_file, split_apikey_source, write_config_file,
+    normalize_agent_ids, read_config_file, split_apikey_source, write_config_file,
 };
 
 use super::SettingsView;
@@ -742,9 +742,13 @@ impl ProviderForm {
             .map(|(wire_api, spec)| {
                 let (url, agents, copilot_auth) = match spec {
                     ProviderEndpointSpec::Url(url) => (url, Vec::new(), None),
-                    ProviderEndpointSpec::Detailed(detail) => {
-                        (detail.url, detail.agents, detail.copilot_auth)
-                    }
+                    // Nested allow-lists get the same legacy cleanup as the
+                    // top-level `agents:` section.
+                    ProviderEndpointSpec::Detailed(detail) => (
+                        detail.url,
+                        normalize_agent_ids(&detail.agents),
+                        detail.copilot_auth,
+                    ),
                 };
                 EndpointForm {
                     id: take_id(),
@@ -797,7 +801,7 @@ impl ProviderForm {
                     wire_anthropic: m.wire_apis.iter().any(|w| w == "anthropic"),
                     wire_responses: m.wire_apis.iter().any(|w| w == "responses"),
                     wire_completions: m.wire_apis.iter().any(|w| w == "completions"),
-                    agents: m.agents,
+                    agents: normalize_agent_ids(&m.agents),
                     env: m
                         .env
                         .into_iter()

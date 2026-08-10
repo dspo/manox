@@ -993,18 +993,25 @@ pub fn agent_display_name(agent_id: &str) -> String {
 
 /// Canonicalize + dedupe a config `agents:` section (first entry per canonical
 /// id wins) so legacy ids such as the removed `codex+` never round-trip back
-/// into the config file.
+/// into the config file. A canonical (non-legacy) entry replaces a previously
+/// kept legacy duplicate, so the stale entry's bin/env/args payload never
+/// shadows the real one.
 pub fn normalize_agent_configs(agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
-    let mut normalized: Vec<AgentConfig> = Vec::new();
+    let mut normalized: Vec<(AgentConfig, bool)> = Vec::new();
     for mut agent in agents {
         let canonical = canonical_agent_id(&agent.id).to_string();
-        if normalized.iter().any(|existing| existing.id == canonical) {
-            continue;
-        }
+        let legacy = canonical != agent.id;
         agent.id = canonical;
-        normalized.push(agent);
+        match normalized
+            .iter()
+            .position(|(existing, _)| existing.id == agent.id)
+        {
+            Some(pos) if !legacy && normalized[pos].1 => normalized[pos] = (agent, false),
+            Some(_) => {}
+            None => normalized.push((agent, legacy)),
+        }
     }
-    normalized
+    normalized.into_iter().map(|(agent, _)| agent).collect()
 }
 
 /// Hardcoded wire_apis each built-in agent supports. The config file's per-agent
@@ -1200,6 +1207,27 @@ agents:
         let normalized = normalize_agent_configs(config.agents);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].id, "codex");
+    }
+
+    #[test]
+    fn normalize_agent_configs_prefers_canonical_payload_over_legacy() {
+        let yaml = r#"
+agents:
+- id: codex+
+  bin: codex+
+  env:
+    STALE: "1"
+- id: codex
+  bin: codex
+  env:
+    REAL: "1"
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let normalized = normalize_agent_configs(config.agents);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, "codex");
+        assert!(normalized[0].env.contains_key("REAL"));
+        assert!(!normalized[0].env.contains_key("STALE"));
     }
 
     #[test]
