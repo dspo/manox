@@ -20,29 +20,21 @@
 //! conversation reclaims its width.
 
 use agent::i18n;
-#[cfg(not(feature = "harness-manox"))]
 use agent::{Thread, ThreadEvent};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
-    SharedString, WeakEntity, Window, prelude::*, px,
+    SharedString, Window, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
-#[cfg(feature = "harness-manox")]
-use harness_manox::provider::registry;
-#[cfg(feature = "harness-manox")]
-use harness_manox::{Thread, ThreadEvent};
 use std::path::PathBuf;
 
-use crate::Workspace;
 use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
-#[cfg(feature = "harness-manox")]
-use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
@@ -86,9 +78,6 @@ pub(crate) struct ContextRail {
     /// per-frame file read in the context-budget render.
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
-    weak_workspace: WeakEntity<Workspace>,
-    #[cfg(feature = "harness-manox")]
-    agents: Vec<SubagentInfo>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
@@ -103,7 +92,6 @@ pub(crate) struct ContextRail {
 impl ContextRail {
     pub(crate) fn new(
         thread: Entity<Thread>,
-        weak_workspace: WeakEntity<Workspace>,
         auto_compact_enabled: bool,
         auto_compact_threshold: f64,
     ) -> Self {
@@ -115,9 +103,6 @@ impl ContextRail {
             plan_seen: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
-            weak_workspace,
-            #[cfg(feature = "harness-manox")]
-            agents: Vec::new(),
             side_calls: Vec::new(),
             main_call: None,
             git_change_stats: None,
@@ -144,8 +129,6 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.side_calls.clear();
         self.main_call = None;
-        #[cfg(feature = "harness-manox")]
-        self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
         } else {
@@ -210,12 +193,6 @@ impl ContextRail {
         cx.notify();
     }
 
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn set_agents(&mut self, agents: Vec<SubagentInfo>, cx: &mut Context<Self>) {
-        self.agents = agents;
-        cx.notify();
-    }
-
     /// Threshold above which a freshly-seen plan auto-collapses so a long list
     /// does not dominate the rail. At or below this, the plan starts expanded.
     const PLAN_AUTOCOLLAPSE_ABOVE: usize = 5;
@@ -250,17 +227,6 @@ impl ContextRail {
             thread.project().cloned()
         };
 
-        let agents_section = {
-            #[cfg(feature = "harness-manox")]
-            {
-                self.render_agents_section(theme, cx)
-            }
-            #[cfg(not(feature = "harness-manox"))]
-            {
-                gpui::div().into_any_element()
-            }
-        };
-
         v_flex()
             .w_full()
             .min_h_0()
@@ -281,7 +247,6 @@ impl ContextRail {
                     .text_color(theme.foreground)
                     .child(i18n::t("context-rail-title")),
             )
-            .child(agents_section)
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx))
             .child(self.render_plan_section(theme, cx))
@@ -319,6 +284,14 @@ impl ContextRail {
         let total = crate::cockpit::format_tokens(
             self.thread.read(cx).cumulative_token_usage().total_tokens(),
         );
+        // Rate-card cost (#418 wire-boundary pricing); backends/sessions
+        // without pricing keep the tokens-only header.
+        let cumulative_cost = self.thread.read(cx).cumulative_cost();
+        let total = if cumulative_cost > 0.0 {
+            SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
+        } else {
+            SharedString::from(total)
+        };
         let main_call = self.main_call.clone();
         let side_calls = self.side_calls.clone();
         let theme_clone = theme.clone();
@@ -339,7 +312,7 @@ impl ContextRail {
                 gpui::div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(SharedString::from(total)),
+                    .child(total),
             );
         let header: AnyElement = if has_tooltip {
             header
@@ -361,6 +334,7 @@ impl ContextRail {
         // Per-model token breakdown tree with context budget integrated.
         let thread = self.thread.read(cx);
         let per_model = thread.per_model_token_usage();
+        let per_model_cost = thread.per_model_cost();
         let effective_tokens = agent::compact::effective_context_tokens(
             thread.messages(),
             thread.request_token_usage(),
@@ -416,18 +390,27 @@ impl ContextRail {
 
                 // Token line: ↑input ↓output Rcache_read CHcache_hit_rate. `--`
                 // (the tooltip convention) when there is no input to measure.
+                // With a priced model the cost row follows as the last child.
                 let cache_hit = crate::cockpit::cache_read_ratio(**usage)
                     .map(|r| format!("{:.1}", r * 100.0))
                     .unwrap_or_else(|| "--".into());
+                let cost = per_model_cost.get(*model_name).copied().unwrap_or(0.0);
+                let token_branch = if cost > 0.0 { "├─" } else { "└─" };
                 section = section.child(gpui::div().text_xs().text_color(muted).truncate().child(
                     SharedString::from(format!(
-                        "{indent}└─ ↑{} ↓{} R{} CH{}",
+                        "{indent}{token_branch} ↑{} ↓{} R{} CH{}",
                         crate::cockpit::format_tokens_pi(usage.input_tokens),
                         crate::cockpit::format_tokens_pi(usage.output_tokens),
                         crate::cockpit::format_tokens_pi(usage.cache_read_input_tokens),
                         cache_hit,
                     )),
                 ));
+                if cost > 0.0 {
+                    section =
+                        section.child(gpui::div().text_xs().text_color(muted).truncate().child(
+                            SharedString::from(format!("{indent}└─ {}", format_cost(cost))),
+                        ));
+                }
             }
         }
         section.into_any_element()
@@ -588,134 +571,6 @@ impl ContextRail {
         block.into_any_element()
     }
 
-    /// Status indicator for the Captain (main agent) row.
-    /// The Captain uses `ship-wheel` for the completed state, distinguishing it
-    /// from sub-agents that use `circle-check-big`.
-    fn captain_status_indicator(status: agent::ToolCallStatus, theme: &Theme) -> AnyElement {
-        use agent::ToolCallStatus;
-        match status {
-            ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
-                crate::views::braille_spinner::BrailleSpinner::new()
-                    .xsmall()
-                    .color(theme.accent_foreground)
-                    .into_any_element()
-            }
-            ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()
-                .path("icons/ship-wheel.svg")
-                .xsmall()
-                .text_color(theme.success)
-                .into_any_element(),
-            ToolCallStatus::Error | ToolCallStatus::Denied => Icon::new(IconName::CircleX)
-                .xsmall()
-                .text_color(theme.danger)
-                .into_any_element(),
-            ToolCallStatus::Cancelled => Icon::new(IconName::Minus)
-                .xsmall()
-                .text_color(theme.muted_foreground)
-                .into_any_element(),
-        }
-    }
-
-    #[cfg(feature = "harness-manox")]
-    fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        fn append_children(
-            parent_id: Option<&str>,
-            agents: &[SubagentInfo],
-            weak_workspace: &WeakEntity<Workspace>,
-            theme: &Theme,
-            rows: &mut Vec<AnyElement>,
-        ) {
-            for info in agents
-                .iter()
-                .filter(|info| info.parent_id.as_deref() == parent_id)
-            {
-                let title = subagent_display_title(info);
-                let tooltip_text = title.clone();
-                let id = info.id.clone();
-                let weak = weak_workspace.clone();
-                rows.push(
-                    h_flex()
-                        .id(SharedString::from(format!("context-agent-{}", info.id)))
-                        .w_full()
-                        .min_w_0()
-                        .py_0p5()
-                        .pl(px(12.))
-                        .gap_1p5()
-                        .items_center()
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.secondary.opacity(0.5)))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(tooltip_text.clone()).build(window, cx)
-                        })
-                        .on_click(move |_, _window, cx: &mut App| {
-                            let _ = weak.update(cx, |workspace, cx| {
-                                workspace.open_subagent_tab_by_id(&id, cx);
-                            });
-                        })
-                        .child(status_indicator(info.status, theme))
-                        .child(
-                            gpui::div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.foreground)
-                                .child(title),
-                        )
-                        .into_any_element(),
-                );
-                append_children(Some(&info.id), agents, weak_workspace, theme, rows);
-            }
-        }
-
-        let main_status = if self.cockpit_phase == CockpitPhase::Failed {
-            agent::ToolCallStatus::Error
-        } else if self.thread.read(cx).is_running() {
-            agent::ToolCallStatus::Running
-        } else {
-            agent::ToolCallStatus::Success
-        };
-        let mut rows = vec![
-            h_flex()
-                .w_full()
-                .py_0p5()
-                .gap_1p5()
-                .items_center()
-                .child(Self::captain_status_indicator(main_status, theme))
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child("Captain"),
-                )
-                .into_any_element(),
-        ];
-        append_children(None, &self.agents, &self.weak_workspace, theme, &mut rows);
-
-        v_flex()
-            .w_full()
-            .gap_0p5()
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::Bot)
-                            .xsmall()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(i18n::t("context-agents-title")),
-                    ),
-            )
-            .children(rows)
-            .into_any_element()
-    }
     /// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
     /// Within each priority group the original chronological order is preserved
     /// by `sort_by_key`'s stable sort.
@@ -1042,17 +897,23 @@ fn env_row_clickable(
         .into_any_element()
 }
 
+/// USD cost for the rail: `$1.23` at a dollar and above, three decimals for
+/// cents, four below a cent — rate cards price per 1M tokens, so sub-cent
+/// totals are the common case early in a session.
+fn format_cost(cost: f64) -> String {
+    if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else if cost >= 0.01 {
+        format!("${cost:.3}")
+    } else {
+        format!("${cost:.4}")
+    }
+}
+
 /// Context window for a model name on the usage rail: the pi build probes
 /// the shared pi provider registry (by wire id, then display name); the
 /// retired manox build probes its own registry.
 fn model_window_tokens(model_name: &str) -> Option<u64> {
-    #[cfg(feature = "harness-manox")]
-    {
-        registry::global()
-            .get_model_by_name(model_name)
-            .map(|m| m.max_token_count())
-    }
-    #[cfg(not(feature = "harness-manox"))]
     {
         let registry = agent::pi_providers::global();
         // per_model keys are composite "{provider}/{model_id}"; resolve O(1).
@@ -1073,5 +934,19 @@ fn model_window_tokens(model_name: &str) -> Option<u64> {
                         .is_some_and(|name| name == model_name)
             })
             .map(|m| m.context_window as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_cost;
+
+    #[test]
+    fn format_cost_tiers() {
+        assert_eq!(format_cost(1.2345), "$1.23");
+        assert_eq!(format_cost(0.0234), "$0.023");
+        assert_eq!(format_cost(0.000123), "$0.0001");
+        assert_eq!(format_cost(12.0), "$12.00");
+        assert_eq!(format_cost(0.01), "$0.010");
     }
 }

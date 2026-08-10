@@ -9,23 +9,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent::PermissionDecision;
-#[cfg(feature = "harness-manox")]
-use agent::ReasoningEffort;
 use agent::i18n;
 use agent::language_model::StopReason;
-use agent::provider::WireApi;
 use agent::settings;
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
-#[cfg(not(feature = "harness-manox"))]
 use agent::{Thread, ThreadEvent, ThreadId, save_thread};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
@@ -33,7 +26,6 @@ use gpui::{
     Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
     ease_out_quint, prelude::*, px,
 };
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// Shared across both harnesses: workspace struct fields hold
 /// `Option<Entity<PopupMenu>>` regardless of feature.
@@ -46,7 +38,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, Paste, RopeExt},
     v_flex,
 };
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use gpui_component::{
     StyledExt as _,
     menu::PopupMenuItem,
@@ -56,139 +47,41 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
-#[cfg(feature = "harness-manox")]
-use harness_manox::PlanReviewChoice;
-#[cfg(feature = "harness-manox")]
-use harness_manox::provider::registry;
-#[cfg(feature = "harness-manox")]
-use harness_manox::{Thread, ThreadEvent, ThreadId, save_thread};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::cockpit::CockpitPhase;
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
 use crate::external_session::{ExternalSession, SessionKind};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
     slash_source,
 };
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use crate::views::composer_menu::build_plus_menu;
 use crate::views::composer_menu::{PendingAttachment, load_attachment, render_attachment_chips};
-#[cfg(feature = "harness-manox")]
-use crate::views::member_panel::MemberPanel;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-#[cfg(feature = "harness-manox")]
-use crate::views::subagent_panel::{SubagentInfo, SubagentPanel};
-#[cfg(feature = "harness-manox")]
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use crate::views::subagent_panel::{
-    SubagentSnapshot, snapshots_from_messages, subagent_display_title,
-};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
     ToggleTurnNavigator,
 };
 use crate::{FocusConversation, OpenSettings};
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
-/// The session entity driving the workspace. One type serves both harnesses:
-/// the manox build drives `agent::Thread` directly, the pi build drives the
-/// pi-backed facade — same `ThreadEvent` stream, same `agent::Message`
-/// history — so the polished render pipeline is reused unchanged.
-#[cfg(feature = "harness-manox")]
-pub(crate) type ThreadEntity = harness_manox::Thread;
-#[cfg(not(feature = "harness-manox"))]
 pub(crate) type ThreadEntity = agent::Thread;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
-/// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
-/// worker's conversation + tasks; `Subagent(id)` is a read-only
-/// [`SubagentPanel`]; `Browser(id)` is an untrusted embedded webview (see
+/// (Write/Preview); `Browser(id)` is an untrusted embedded webview (see
 /// [`BrowserView`]).
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 enum RightTab {
     Editor,
-    Member(String),
-    Subagent(String),
     Browser(BrowserTabId),
-    PlanPreview,
-}
-
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
-fn ensure_subagent_tab(tabs: &mut Vec<RightTab>, id: &str) -> usize {
-    if let Some(ix) = tabs
-        .iter()
-        .position(|tab| matches!(tab, RightTab::Subagent(open_id) if open_id == id))
-    {
-        return ix;
-    }
-    tabs.push(RightTab::Subagent(id.to_string()));
-    tabs.len() - 1
-}
-
-#[cfg(feature = "harness-manox")]
-fn remove_subagent_tabs(tabs: &mut Vec<RightTab>, active: &mut usize) {
-    let mut ix = 0;
-    while ix < tabs.len() {
-        if matches!(tabs.get(ix), Some(RightTab::Subagent(_))) {
-            tabs.remove(ix);
-            if *active > ix {
-                *active -= 1;
-            } else if *active >= tabs.len() {
-                *active = tabs.len().saturating_sub(1);
-            }
-        } else {
-            ix += 1;
-        }
-    }
-}
-
-#[cfg(feature = "harness-manox")]
-struct SubagentRecord {
-    info: SubagentInfo,
-    panel: Entity<SubagentPanel>,
-}
-
-#[cfg(feature = "harness-manox")]
-#[derive(Default)]
-struct SubagentSession {
-    records: BTreeMap<String, SubagentRecord>,
-    order: Vec<String>,
-}
-
-/// A completed `<proposed_plan>` block awaiting the user's three-way review
-/// verdict. Carries the plan text for the overlay body and (on an implement
-/// verdict) for re-injection as the implement turn's seed.
-struct PendingPlanReview {
-    plan_text: String,
-}
-
-/// A pending inbound-write request from a built-in browser tab, surfaced by
-/// `ThreadEvent::InboundAuthorization`. Unlike outbound tool approval this
-/// axis is mode-blind — a web page must never gain a write path
-/// because the agent runs in Danger — so the overlay always shows and the
-/// decision always routes through `Thread::respond_inbound`, not the outbound
-/// approval pipeline.
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
-struct PendingInbound {
-    id: String,
-    intent: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -200,7 +93,6 @@ struct PendingAsk {
 }
 
 #[derive(Clone)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardSnapshot {
     pub id: String,
     pub step: usize,
@@ -211,7 +103,6 @@ pub(crate) struct AskCardSnapshot {
 }
 
 #[derive(Clone)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardQuestion {
     pub question: String,
     pub header: String,
@@ -220,7 +111,6 @@ pub(crate) struct AskCardQuestion {
 }
 
 #[derive(Clone)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub(crate) struct AskCardOption {
     pub label: String,
     pub description: String,
@@ -297,7 +187,6 @@ struct QueuedFollowUp {
     state: FollowUpState,
 }
 
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<ThreadEntity>,
@@ -307,6 +196,11 @@ pub struct Workspace {
     /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
     /// while parked marks the thread unread for the sidebar red dot.
     background_threads: Vec<BackgroundThread>,
+    /// Generation counter for git-status refreshes: bumping it means any
+    /// prior in-flight refresh self-cancels instead of overwriting newer
+    /// state. The refresh runs on the global tokio runtime and delivers its
+    /// result back via `async_channel`, the same bridge the worktree tool uses.
+    git_status_gen: u64,
     pub(crate) sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -333,23 +227,11 @@ pub struct Workspace {
     /// `h_full`-percentage) scroll container reliably engages `overflow_y_scroll`
     /// instead of letting content overflow and clip.
     editor_preview_scroll: ScrollHandle,
-    /// Plan text for the `RightTab::PlanPreview` tab. `None` when no plan
-    /// preview tab is open.
-    plan_preview_text: Option<String>,
     /// Peer right-pane tabs for the editor, member/sub-agent observers,
     /// browser, and plan preview. The pane renders while non-empty;
     /// `editor_open` tracks whether the Editor tab specifically is active.
     right_tabs: Vec<RightTab>,
     active_right_tab: usize,
-    /// Lazily-built MemberPanel entities, keyed by member name. A member tab
-    /// keeps its panel across tab switches; dropped when the tab closes.
-    #[cfg(feature = "harness-manox")]
-    member_panels: BTreeMap<String, Entity<MemberPanel>>,
-    /// Read-only sub-agent observations keyed by the active root thread id.
-    /// Switching main tasks releases the outgoing registry; completed panels
-    /// can later be rebuilt recursively from persisted result envelopes.
-    #[cfg(feature = "harness-manox")]
-    subagent_sessions: HashMap<String, SubagentSession>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -361,10 +243,6 @@ pub struct Workspace {
     /// In-memory only; never persisted so the user's drag state stays
     /// session-local.
     sidebar_width: Pixels,
-    /// Pending inbound-write requests from built-in browser tabs. Stacked;
-    /// the overlay shows the most recent and queues the rest. Each carries
-    /// its own `Thread::respond_inbound` id.
-    pending_inbounds: Vec<PendingInbound>,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
     /// Current question index in the ask drawer (0-based).
@@ -394,22 +272,6 @@ pub struct Workspace {
     turn_navigator: Option<Entity<TurnNavigator>>,
     turn_navigator_sub: Option<Subscription>,
     turn_navigator_previous_focus: Option<FocusHandle>,
-    /// Title bar "..." dropdown (conversation menu). Mirrors the
-    /// model selector pattern: a button toggles `title_menu_open`; the
-    /// `PopupMenu` entity and its dismiss subscription are created on open.
-    title_menu_open: bool,
-    title_menu: Option<Entity<PopupMenu>>,
-    title_menu_sub: Option<Subscription>,
-    /// A completed plan awaiting the user's implement / clear-context / stay
-    /// verdict, rendered as the inline plan-review drawer card.
-    pending_plan_review: Option<PendingPlanReview>,
-    /// Per-thread stash of `pending_plan_review`, keyed by thread id. A
-    /// pending plan never enters persisted messages (the `<proposed_plan>`
-    /// block is stripped before the assistant text is saved), and a reloaded
-    /// thread always starts in `Default` mode, so without this stash the
-    /// verdict card + buttons vanish on a switch-away/switch-back round-trip.
-    /// Mirrors `drafts`: populated on switch-away, drained on switch-back.
-    pending_plans: HashMap<String, PendingPlanReview>,
     /// Follow-ups submitted while a turn is running. Steer items are injected
     /// into the running turn at the next safe join point; queue items flush as
     /// the next user turn at `TurnFinished`.
@@ -464,10 +326,6 @@ pub struct Workspace {
     /// Whether the goal status popover is open (toggled by the `◎ /goal active`
     /// chip or the bare `/goal` command).
     goal_popover_open: bool,
-    /// Whether the team roster drawer is open (toggled by the `👥 team · N`
-    /// chip when the leader has formed a team). Each row opens that member's
-    /// observation tab in the right pane.
-    team_chip_open: bool,
     /// Generation counter for the goal elapsed-time ticker. Incremented when a
     /// goal is cleared or the active thread changes so the prior ticker
     /// self-terminates instead of notifying a stale chip. Mirrors
@@ -504,12 +362,6 @@ pub struct Workspace {
     /// time" model; switching away parks the session (its terminal keeps
     /// running) rather than killing it.
     active_external: Option<String>,
-    /// Generation counter for the debounced git-status refresh. Bumped on every
-    /// refresh trigger (thread attach, terminal stop, enter/exit worktree) so
-    /// a prior in-flight refresh self-cancels instead of overwriting newer
-    /// state. The refresh runs on the global tokio runtime and delivers its
-    /// result back via `async_channel`, the same bridge the worktree tool uses.
-    git_status_gen: u64,
 }
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
@@ -529,36 +381,27 @@ enum ViewMode {
 /// Right-side composer width. Wide enough for rendered markdown
 /// (headings, lists, code blocks) alongside the 1100px window.
 const EDITOR_PANEL_WIDTH: f32 = 640.;
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_MIN_WIDTH: f32 = 320.;
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_MAX_WIDTH: f32 = 960.;
 /// Width of the drag handle between the main column and the editor pane.
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const EDITOR_DIVIDER_WIDTH: f32 = 6.;
 // Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(SIDEBAR_WIDTH))`).
 // Kept here so the editor pane's resize clamp can reserve space for the
 // sidebar + main column without depending on the sidebar's internals.
 const SIDEBAR_WIDTH: f32 = 260.;
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_MIN_WIDTH: f32 = 200.;
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_MAX_WIDTH: f32 = 480.;
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct TurnNavigatorLayout {
     left_inset: Pixels,
     right_inset: Pixels,
     panel_width: Pixels,
 }
 
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 fn turn_navigator_layout(
     window_width: Pixels,
     sidebar_width: Pixels,
@@ -601,7 +444,6 @@ const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
 /// ghost view, mirroring the `DraggedDock` drag-ghost pattern.
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct DraggedEditorDivider;
 
 impl Render for DraggedEditorDivider {
@@ -613,7 +455,6 @@ impl Render for DraggedEditorDivider {
 /// Drag payload for the sidebar divider. Same shape as the editor divider's
 /// payload; the two are distinguished by type so their drag-move handlers
 /// can each run only on the matching payload.
-#[cfg_attr(feature = "harness-pi", allow(dead_code))]
 struct DraggedSidebarDivider;
 
 impl Render for DraggedSidebarDivider {
@@ -624,13 +465,11 @@ impl Render for DraggedSidebarDivider {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        #[allow(unused_mut)] // mutated only under harness-pi
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // An unbound conversation must not inherit the launch terminal's
         // cwd as its working directory — that is an arbitrary project dir
         // (or `/` under a GUI launch). Home is the neutral default; binding
         // a project via the chip / project "+" overrides it later.
-        #[cfg(feature = "harness-pi")]
         if let Some(home) = agent::paths::home_dir() {
             cwd = home;
         }
@@ -661,11 +500,9 @@ impl Workspace {
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
         let context_rail = {
-            let weak_workspace = cx.weak_entity();
             cx.new(|_| {
                 crate::views::context_rail::ContextRail::new(
                     thread.clone(),
-                    weak_workspace,
                     auto_compact.enabled,
                     auto_compact.threshold,
                 )
@@ -676,6 +513,7 @@ impl Workspace {
             cwd,
             thread,
             background_threads: Vec::new(),
+            git_status_gen: 0,
             sidebar,
             conversation: conversation.clone(),
             input_state,
@@ -685,17 +523,11 @@ impl Workspace {
             editor_preview: false,
             editor_preview_md: None,
             editor_preview_scroll: ScrollHandle::new(),
-            plan_preview_text: None,
             right_tabs: Vec::new(),
             active_right_tab: 0,
-            #[cfg(feature = "harness-manox")]
-            member_panels: BTreeMap::new(),
-            #[cfg(feature = "harness-manox")]
-            subagent_sessions: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
-            pending_inbounds: Vec::new(),
             pending_ask: None,
             ask_step: 0,
             ask_transition_gen: 0,
@@ -713,11 +545,6 @@ impl Workspace {
             turn_navigator: None,
             turn_navigator_sub: None,
             turn_navigator_previous_focus: None,
-            title_menu_open: false,
-            title_menu: None,
-            title_menu_sub: None,
-            pending_plan_review: None,
-            pending_plans: HashMap::new(),
             queued_follow_ups: std::collections::VecDeque::new(),
             queued_follow_ups_by_thread: HashMap::new(),
             composer_placeholder_mode: ComposerPlaceholderMode::Normal,
@@ -735,7 +562,6 @@ impl Workspace {
             exiting_settings: false,
             settings_transition_gen: 0,
             goal_popover_open: false,
-            team_chip_open: false,
             goal_ticker_gen: 0,
             turn_active: false,
             thinking_ticker_gen: 0,
@@ -745,7 +571,6 @@ impl Workspace {
             context_rail,
             external_sessions: Vec::new(),
             active_external: None,
-            git_status_gen: 0,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
@@ -753,16 +578,6 @@ impl Workspace {
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
-        #[cfg(feature = "harness-manox")]
-        {
-            let id = ws.thread.read(cx).id.0.clone();
-            ws.sidebar
-                .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
-            // The initial thread is the one the user lands on at startup: clear
-            // any unread red dot it carried from a prior background completion.
-            let store = agent::thread_store_global();
-            store.update(cx, |s, cx| s.set_unread(&id, false, cx));
-        }
         ws
     }
 
@@ -770,8 +585,6 @@ impl Workspace {
     /// history. The harness-pi restore hook: `PiSession` rebuilds the pi
     /// session asynchronously, then asks the workspace to re-render once the
     /// restored history lands.
-    #[cfg(feature = "harness-pi")]
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
@@ -821,36 +634,6 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                // TODO(pi-wire): plan preview — plan mode is a manox flow.
-                #[cfg(feature = "harness-manox")]
-                ThreadEvent::PlanDelta { .. } => {
-                    // Live plan text streaming in; the finalized plan surfaces
-                    // as a PlanReady review prompt at turn end. Deltas only
-                    // refresh so a future real-time preview can hook here.
-                    cx.notify();
-                }
-                #[cfg(feature = "harness-manox")]
-                ThreadEvent::PlanReady { plan_text } => {
-                    let weak = cx.weak_entity();
-                    let role = this.model_label(cx);
-                    let pt = plan_text.clone();
-                    this.conversation.update(cx, |c, cx| {
-                        c.push_plan_review(pt.clone(), role, weak, cx);
-                    });
-                    this.pending_plan_review = Some(PendingPlanReview { plan_text: pt });
-                    this.sync_list_count(cx);
-                    // The finalized plan surfaces at the tail; reveal it like any
-                    // user-initiated jump to the live end.
-                    this.list_state.set_follow_mode(FollowMode::Tail);
-                    cx.notify();
-                }
-                #[cfg(feature = "harness-manox")]
-                ThreadEvent::PlanUpdated { snapshot } => {
-                    let snapshot = snapshot.clone();
-                    this.context_rail.update(cx, |r, cx| {
-                        r.set_plan(snapshot, cx);
-                    });
-                }
                 ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + Danger badge; no conversation item.
                     cx.notify();
@@ -860,7 +643,6 @@ impl Workspace {
                 // so rebuild once the authoritative history lands (sidebar
                 // open, startup restore). Without this a reopened thread
                 // strands on the hero screen.
-                #[cfg(feature = "harness-pi")]
                 ThreadEvent::HistoryRestored => {
                     this.rebuild_conversation_from_thread(cx);
                 }
@@ -888,14 +670,6 @@ impl Workspace {
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
                     // The conversation view itself stays unchanged (no item).
-                    #[cfg(feature = "harness-manox")]
-                    {
-                        let thread_id = this.thread.read(cx).id.0.clone();
-                        let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| {
-                            s.record_model_change(&thread_id, from.as_deref(), to, cx);
-                        });
-                    }
                     let _ = (from, to);
                     cx.notify();
                 }
@@ -907,47 +681,21 @@ impl Workspace {
                 ThreadEvent::TokenUsageUpdated(_) => {
                     cx.notify();
                 }
-                // TODO(pi-wire): context rail metrics.
-                #[cfg(feature = "harness-manox")]
-                ThreadEvent::SideCallMetricsUpdated(metrics) => {
-                    this.context_rail.update(cx, |rail, cx| {
-                        rail.side_calls = metrics.clone();
-                        cx.notify();
-                    });
-                }
-                #[cfg(feature = "harness-manox")]
-                ThreadEvent::MainCallMetricsUpdated(metric) => {
-                    this.context_rail.update(cx, |rail, cx| {
-                        rail.main_call = Some(metric.clone());
-                        cx.notify();
-                    });
-                }
                 ThreadEvent::TurnStarted => {
                     // Light up the sidebar running indicator immediately —
                     // before the first streaming delta arrives (model warm-up,
                     // network latency). Terminal `Stop`/`Error` below clear it.
-                    #[cfg(feature = "harness-manox")]
-                    {
-                        let thread_id = this.thread.read(cx).id.0.clone();
-                        let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
-                    }
                     // Drive the Thinking status row's per-second "for Xs"
                     // counter while this turn is live. The ticker polls
                     // `turn_active` and self-terminates on the terminal stop.
                     this.turn_active = true;
                     this.spawn_thinking_ticker(cx);
-                    #[cfg(feature = "harness-manox")]
-                    this.context_rail.update(cx, |r, _cx| {
-                        r.cockpit_phase = CockpitPhase::Thinking;
-                    });
                 }
                 ThreadEvent::TurnFinished {
                     cancelled,
                     failed,
                     stranded_steer_ids,
                 } => {
-                    #[cfg(feature = "harness-pi")]
                     let _ = failed;
                     // Seal the conversation's streaming state at the
                     // authoritative turn boundary: a turn that ended without
@@ -975,31 +723,9 @@ impl Workspace {
                     this.mark_stranded_steers_failed(stranded_steer_ids, cx);
                     let thread_id = this.thread.read(cx).id.0.clone();
                     save_thread(this.thread.clone(), true, cx);
-                    #[cfg(feature = "harness-manox")]
-                    {
-                        let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| {
-                            s.mark_idle(&thread_id, cx);
-                            // Clear any mid-turn error flag: the turn recovered and
-                            // completed successfully (or was cancelled, which also
-                            // supersedes a stale error indicator).
-                            if !*failed {
-                                s.set_errored(&thread_id, false, cx);
-                            }
-                        });
-                    }
                     this.turn_active = false;
-                    #[cfg(feature = "harness-manox")]
-                    this.context_rail.update(cx, |r, _cx| {
-                        r.cockpit_phase = if *failed {
-                            CockpitPhase::Failed
-                        } else {
-                            CockpitPhase::Stopped
-                        };
-                    });
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                    #[cfg(feature = "harness-manox")]
                     this.spawn_git_status_refresh(cx);
                     // Dispatch last: `run_turn` emits `TurnStarted`
                     // synchronously, so no terminal bookkeeping above may run
@@ -1031,21 +757,6 @@ impl Workspace {
                     // engaged — re-pins to the end on the next layout.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        // A terminal stop is exactly when a finalized plan
-                        // surfaces — `PlanReady` is emitted just before `Stop`
-                        // in the same thread update, so it has already armed
-                        // the review overlay. Do NOT clear it here (the old
-                        // oneshot-approval clear raced the PlanReady arm).
-                        // Mid-turn `Stop(ToolUse)` carries no plan review.
-                        // A terminal state abandons any parked browser yield
-                        // (the parked Task is cancelled on the thread side)
-                        // and dismisses stranded inbound-write overlays whose
-                        // decision oneshot the thread just dropped.
-                        #[cfg(feature = "harness-manox")]
-                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-                            host.clear_yields_for_thread(this, cx);
-                        }
-                        this.pending_inbounds.clear();
                         save_thread(this.thread.clone(), true, cx);
                         // `Stop` is a provider-round boundary. Queue draining,
                         // idle state, and git refresh wait for `TurnFinished`.
@@ -1090,18 +801,6 @@ impl Workspace {
                     // do not push a duplicate.
                     this.consume_steered_follow_up(message_id, cx);
                 }
-                ThreadEvent::InboundAuthorization { id, intent, .. } => {
-                    // A built-in browser tab requested an inbound write. This
-                    // axis ignores `ApprovalMode` — always confirm, never let
-                    // a page drive the agent unprompted — so it stacks in its
-                    // own queue and resolves through `Thread::respond_inbound`,
-                    // not the outbound question-card pipeline.
-                    this.pending_inbounds.push(PendingInbound {
-                        id: id.clone(),
-                        intent: intent.clone(),
-                    });
-                    cx.notify();
-                }
                 _ => {
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
@@ -1110,41 +809,9 @@ impl Workspace {
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(e) = ev {
                         let thread_id = this.thread.read(cx).id.0.clone();
-                        #[cfg(feature = "harness-manox")]
-                        {
-                            let store = agent::thread_store_global();
-                            store.update(cx, |s, cx| {
-                                s.mark_idle(&thread_id, cx);
-                                s.set_errored(&thread_id, true, cx);
-                                s.set_unread(&thread_id, true, cx);
-                            });
-                        }
                         this.turn_active = false;
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                        // An error is a terminal state symmetric to a terminal
-                        // `Stop`: the turn aborted, so any pending plan review
-                        // is now stale and must not linger over an idle thread.
-                        if this.pending_plan_review.take().is_some() {
-                            this.conversation
-                                .update(cx, |c, cx| c.consume_plan_review(cx));
-                            // The demoted plan card stays in place but flips
-                            // inactive — remeasure so the list's cached height
-                            // for it stays honest.
-                            this.list_state.remeasure();
-                        }
-                        // Symmetric to the terminal `Stop` arm: retire parked
-                        // browser yields + stranded inbound overlays so an
-                        // aborted turn leaves no stale banner behind.
-                        #[cfg(feature = "harness-manox")]
-                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-                            host.clear_yields_for_thread(this, cx);
-                        }
-                        this.pending_inbounds.clear();
-                        #[cfg(feature = "harness-manox")]
-                        this.context_rail.update(cx, |r, _cx| {
-                            r.cockpit_phase = CockpitPhase::Failed;
-                        });
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
@@ -1158,38 +825,8 @@ impl Workspace {
                     // flips back to Streaming; a `Running` tool call caches its
                     // title and flips RunningTool; other tool statuses return to
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
-                    // TODO(pi-wire): context rail cockpit phase.
-                    #[cfg(feature = "harness-manox")]
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
-                    // TODO(pi-wire): member/sub-agent observation panels.
-                    #[cfg(feature = "harness-manox")]
-                    {
-                        let root_thread_id = this.thread.read(cx).id.0.clone();
-                        match ev {
-                            ThreadEvent::SubagentStarted {
-                                id,
-                                subagent_type,
-                                description,
-                                child,
-                            } => this.register_live_subagent(
-                                root_thread_id,
-                                SubagentInfo {
-                                    id: id.clone(),
-                                    parent_id: None,
-                                    subagent_type: subagent_type.clone(),
-                                    description: description.clone(),
-                                    status: agent::ToolCallStatus::Running,
-                                },
-                                child.clone(),
-                                cx,
-                            ),
-                            ThreadEvent::SubagentProgress { id, status, .. } => {
-                                this.update_subagent_status(&root_thread_id, id, *status, cx);
-                            }
-                            _ => {}
-                        }
-                    }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -1241,16 +878,7 @@ impl Workspace {
                     stranded_steer_ids,
                     ..
                 } => {
-                    #[cfg(not(feature = "harness-manox"))]
                     let _ = (cancelled, stranded_steer_ids);
-                    #[cfg(feature = "harness-manox")]
-                    this.finish_background_follow_ups(
-                        &id,
-                        &parked_thread,
-                        *cancelled,
-                        stranded_steer_ids,
-                        cx,
-                    );
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
@@ -1344,7 +972,6 @@ impl Workspace {
     /// one-shot; actors await readiness themselves). A project binds at
     /// construction time — a single session creation, no orphaned session
     /// file.
-    #[cfg(feature = "harness-pi")]
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
@@ -2001,7 +1628,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_up(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.completion.as_mut() {
             state.move_selection(-1);
@@ -2009,7 +1635,6 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_down(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(state) = self.completion.as_mut() {
             state.move_selection(1);
@@ -2017,18 +1642,9 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn completion_confirm_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.completion.as_ref().map(|s| s.selected).unwrap_or(0);
         self.completion_confirm(ix, window, cx);
-    }
-
-    /// Close the title bar "..." dropdown, dropping the menu entity + subscription.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn close_title_menu(&mut self) {
-        self.title_menu_open = false;
-        self.title_menu = None;
-        self.title_menu_sub = None;
     }
 
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
@@ -2043,12 +1659,8 @@ impl Workspace {
         self.project_chip_menu_sub = None;
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn blocking_overlay_active(&self) -> bool {
-        self.pending_plan_review.is_some()
-            || self.pending_ask.is_some()
-            || !self.pending_inbounds.is_empty()
-            || self.blank_project_parent.is_some()
+        self.pending_ask.is_some() || self.blank_project_parent.is_some()
     }
 
     fn toggle_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2252,13 +1864,6 @@ impl Workspace {
         let old_thread = self.thread.clone();
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
-        #[cfg(feature = "harness-manox")]
-        {
-            self.close_subagent_tabs();
-            if old_id != new_id {
-                self.subagent_sessions.remove(&old_id);
-            }
-        }
 
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
@@ -2267,14 +1872,6 @@ impl Workspace {
             old_id.clone(),
             self.input_state.read(cx).value().to_string(),
         );
-
-        // Stash the outgoing thread's pending plan verdict so it survives a
-        // round-trip through another thread. The plan text lives only in
-        // `pending_plan_review` (never in persisted messages), so switching
-        // away would otherwise drop it — and the verdict card with it.
-        if let Some(review) = self.pending_plan_review.take() {
-            self.pending_plans.insert(old_id.clone(), review);
-        }
 
         // Queue state is session-local but belongs to a thread, not to the
         // currently visible workspace. Move it aside before rebinding.
@@ -2314,8 +1911,6 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
-        #[cfg(feature = "harness-manox")]
-        let subagent_snapshots = snapshots_from_messages(&messages);
         let usage = self.thread.read(cx).request_token_usage().clone();
         let notes = self.thread.read(cx).ui_notes().to_vec();
         let background_tasks = self.thread.read(cx).background_task_snapshots();
@@ -2363,21 +1958,6 @@ impl Workspace {
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
-        // Restore the incoming thread's stashed pending plan, if any.
-        self.pending_plan_review = self.pending_plans.remove(&new_id);
-        if let Some(review) = self.pending_plan_review.as_ref() {
-            let plan_text = review.plan_text.clone();
-            let weak = cx.weak_entity();
-            self.conversation.update(cx, |c, cx| {
-                c.push_plan_review(plan_text, role.clone(), weak, cx);
-            });
-            // The card is appended after the earlier `reset`, so splice the
-            // list count and re-pin so the restored drawer is in view.
-            self.sync_list_count(cx);
-            self.list_state.set_follow_mode(FollowMode::Tail);
-        }
-        #[cfg(feature = "harness-manox")]
-        self.restore_queued_follow_ups(&new_id, &messages, running, cx);
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
@@ -2412,12 +1992,6 @@ impl Workspace {
             }
             cx.notify();
         });
-        #[cfg(feature = "harness-manox")]
-        if self.subagent_sessions.contains_key(&new_id) {
-            self.sync_subagents_to_rail(cx);
-        } else {
-            self.rebuild_subagent_observations(subagent_snapshots, cx);
-        }
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
@@ -2430,7 +2004,6 @@ impl Workspace {
         store.update(cx, |s, cx| s.set_unread(&id, false, cx));
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
-        #[cfg(feature = "harness-manox")]
         self.spawn_git_status_refresh(cx);
         // Returning to a thread leaves the external-session view: without this
         // the render still takes the ExternalSession branch and the swapped-in
@@ -2476,7 +2049,6 @@ impl Workspace {
     ///
     /// Uses `cx.background_executor().timer()` — never `tokio::time` on the
     /// gpui foreground (that panics: no current tokio runtime).
-    #[cfg(feature = "harness-manox")]
     fn spawn_git_status_refresh(&mut self, cx: &mut Context<Self>) {
         self.git_status_gen = self.git_status_gen.wrapping_add(1);
         let entity = cx.entity().clone();
@@ -2536,48 +2108,6 @@ impl Workspace {
         if self.pending_ask.is_some() {
             cx.notify();
         }
-    }
-
-    /// Open a fresh thread. The provider registry is reloaded from the cx
-    /// config file first (on a background thread — api key resolution may hit
-    /// the OS keychain), so every new thread starts from the latest providers
-    /// and the swapped-in snapshot is visible to all existing threads' model
-    /// menus. A failed reload keeps the previous registry and surfaces a
-    /// notice; the new thread is still created either way.
-    #[cfg(feature = "harness-manox")]
-    fn start_new_thread(
-        &mut self,
-        project: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let cwd = self.cwd.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let reload_result = cx.background_spawn(async move { registry::reload() }).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                let id = ThreadId(uuid::Uuid::new_v4().to_string());
-                let new = Thread::new(id, cwd, cx);
-                if let Some(dir) = project {
-                    new.update(cx, |t, cx| t.set_project(dir, cx));
-                }
-                this.attach_thread(new, window, cx);
-                // The notice must land after the attach: `add_info_message`
-                // targets the active conversation, which is the outgoing
-                // thread until `attach_thread` swaps it.
-                if let Err(e) = reload_result {
-                    let msg = i18n::t_str(
-                        "workspace-provider-reload-failed",
-                        &[("error", &e.to_string())],
-                    );
-                    this.add_info_message(msg.to_string(), cx);
-                } else {
-                    // The registry snapshot swapped in; rebuild the native menus so
-                    // the `工具 → ChatGPT.app` / `工具 → VS Code` cascades mirror the new providers.
-                    i18n::rebuild_menus(cx);
-                }
-            });
-        })
-        .detach();
     }
 
     /// Archive the active thread and navigate to a fresh empty one. Shared
@@ -2647,15 +2177,12 @@ impl Workspace {
     /// spam empty threads. `attach_thread` does the actual parking: a running
     /// thread is moved into `background_threads` with a terminal-`Stop`/`Error`
     /// subscription that flips its sidebar row to idle + unread when it lands.
-    fn background_current_thread(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        #[cfg(feature = "harness-manox")]
-        {
-            if !self.thread.read(_cx).is_running() {
-                return;
-            }
-            let project = self.thread.read(_cx).project().cloned();
-            self.start_new_thread(project, _window, _cx);
+    fn background_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.thread.read(cx).is_running() {
+            return;
         }
+        let project = self.thread.read(cx).project().cloned();
+        self.start_new_thread(project, window, cx);
     }
 
     fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -2709,14 +2236,6 @@ impl Workspace {
         // input (Handled), asks to inject text as a user turn (InjectUserTurn),
         // or declines (NoOp → fall through to the normal path). Slash parsing
         // only applies to text-only input; attachments force the normal path.
-        // Markdown prompt-macro commands (`/gitwork:deliver …`) are registered
-        // into the same registry as `MarkdownSlashCommand` adapters and dispatch
-        // into `run_command_turn` → `Thread::submit_command`, which substitutes
-        // `$ARGUMENTS` and applies the command's `allowed-tools` filter.
-        // Plugin/user skills are mirrored as `SkillSlashCommand` adapters too,
-        // dispatching into `run_skill_turn` → `Thread::submit_skill`, which injects
-        // the skill body as the turn's user message — so `/gitwork:deliver` works
-        // even though gitwork ships it as a skill, not a command.
         // Slash commands only dispatch while idle — a `/name [args]` typed
         // while a turn is running is parked in the follow-up queue as raw text
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
@@ -2745,24 +2264,14 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let (text, extra, failed) = cx
                 .background_spawn(async move {
-                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
-                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
                     let mut text = text;
                     let mut extra = Vec::new();
-                    #[cfg_attr(feature = "harness-pi", allow(unused_mut))]
-                    let mut failed = 0usize;
+                    let failed = 0usize;
                     for att in &attachments {
                         match att {
                             PendingAttachment::ClipboardImage(_img) => {
                                 // Image attachments are a manox flow; the pi
                                 // backend prompts are text-only in this stage.
-                                #[cfg(feature = "harness-manox")]
-                                match harness_manox::image::gpui_image_to_message_content(
-                                    std::sync::Arc::new(_img.clone()),
-                                ) {
-                                    Some(content) => extra.push(content),
-                                    None => failed += 1,
-                                }
                             }
                             PendingAttachment::File { .. } => {
                                 if let Some(content) = load_attachment(att, &mut text) {
@@ -2793,77 +2302,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Run a markdown prompt-macro slash command turn. The display text
-    /// (`/name args`) is shown to the user as the user bubble; `Thread::submit_command`
-    /// substitutes `$ARGUMENTS` into the command body and applies the command's
-    /// `allowed-tools` whitelist for the turn. An unknown command (adapter
-    /// registered but the data registry miss — shouldn't normally happen)
-    /// surfaces an error and drops the turn.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    pub(crate) fn run_command_turn(&mut self, name: &str, args: &str, cx: &mut Context<Self>) {
-        let display_text = if args.is_empty() {
-            format!("/{name}")
-        } else {
-            format!("/{name} {args}")
-        };
-        let meta = self.user_turn_meta(cx);
-        let weak = cx.weak_entity();
-        self.conversation.update(cx, |c, cx| {
-            c.push_user(display_text, Vec::new(), meta, weak, cx)
-        });
-        self.sync_list_count(cx);
-        // Re-engage tail-follow so the streaming reply stays in view.
-        self.follow_message_tail();
-        let hit = self
-            .thread
-            .update(cx, |thread, cx| thread.submit_command(name, args, cx));
-        if !hit {
-            self.thread.update(cx, |_, cx| {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                    "{}",
-                    i18n::t_str("workspace-unknown-command", &[("name", name)])
-                )));
-            });
-        }
-        // Persist on command submit so the sidebar shows the new entry immediately.
-        save_thread(self.thread.clone(), true, cx);
-        cx.notify();
-    }
-
-    /// Run a skill slash-command turn (`/gitwork:deliver args`). The display
-    /// text (`/key args`) is shown as the user bubble; `Thread::submit_skill`
-    /// injects the skill body (plus the appended args) as the turn's user
-    /// message. An unknown skill (adapter registered but the data registry
-    /// miss — shouldn't normally happen) surfaces an error and drops the turn.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    pub(crate) fn run_skill_turn(&mut self, key: &str, args: &str, cx: &mut Context<Self>) {
-        let display_text = if args.is_empty() {
-            format!("/{key}")
-        } else {
-            format!("/{key} {args}")
-        };
-        let meta = self.user_turn_meta(cx);
-        let weak = cx.weak_entity();
-        self.conversation.update(cx, |c, cx| {
-            c.push_user(display_text, Vec::new(), meta, weak, cx)
-        });
-        self.sync_list_count(cx);
-        self.follow_message_tail();
-        let hit = self
-            .thread
-            .update(cx, |thread, cx| thread.submit_skill(key, args, cx));
-        if !hit {
-            self.thread.update(cx, |_, cx| {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                    "{}",
-                    i18n::t_str("workspace-unknown-skill", &[("name", key)])
-                )));
-            });
-        }
-        save_thread(self.thread.clone(), true, cx);
-        cx.notify();
-    }
-
     /// Append the user turn (text plus any image content) to the thread and start the run.
     fn send_user_turn(
         &mut self,
@@ -2882,10 +2320,6 @@ impl Workspace {
             ui,
             user_images,
         };
-        // A plan review is awaiting the user's verdict. Allow the user to send
-        // messages to discuss or revise the plan. The drawer buttons (implement /
-        // clear-context / stay) provide the explicit verdict, while free-form
-        // input lets the user refine the plan through conversation.
         // A turn is running — every new message first parks as a visible
         // follow-up. Steering is an explicit per-item action.
         if self.thread.read(cx).is_running() {
@@ -2895,31 +2329,6 @@ impl Workspace {
             });
             cx.notify();
             return;
-        }
-        // The thread is idle (not running). If a plan review was awaiting a
-        // verdict, a free-form message means the user is discussing or revising
-        // rather than accepting — drop the stale verdict so the drawer hides
-        // until the agent re-proposes via a fresh `PlanReady`. Without this the
-        // lingering Implement button would act on the now-outdated plan text.
-        let dismissed_plan = self.pending_plan_review.take();
-        if let Some(review) = dismissed_plan.as_ref() {
-            self.conversation
-                .update(cx, |c, cx| c.consume_plan_review(cx));
-            // The demoted plan card stays in place but flips inactive —
-            // remeasure so the list's cached height for it stays honest.
-            self.list_state.remeasure();
-            // Persist the dismissed plan as a UI note so the collapsed record
-            // survives a thread switch / reload — the live card is UI-only and
-            // never enters `Thread::messages`. `record_ui_note` anchors to the
-            // last user message, which at this point (before the dismissing
-            // message is appended below) is the one that triggered the plan's
-            // turn, so the rebuild splices the card back at that turn's end,
-            // ahead of this dismissing message — matching the live order.
-            self.record_ui_note(
-                agent::db::UiNoteKind::PlanReview,
-                review.plan_text.clone(),
-                cx,
-            );
         }
         self.append_and_run_user_turn(turn, weak, cx);
         // The conversation exists the moment the message is sent: refresh
@@ -2986,82 +2395,6 @@ impl Workspace {
             .update(cx, |thread, cx| thread.enqueue_steer(content, Some(ui), cx))
     }
 
-    /// Restore a thread's session-local follow-up queue after a task switch.
-    /// Canonical steers that drained while the thread was in the background are
-    /// already present in `messages` and are discarded from the stash; a still
-    /// pending steer recreates its optimistic bubble.
-    #[cfg(feature = "harness-manox")]
-    fn restore_queued_follow_ups(
-        &mut self,
-        thread_id: &str,
-        messages: &[agent::Message],
-        running: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let canonical_ids: std::collections::HashSet<&str> =
-            messages.iter().map(|message| message.id.as_str()).collect();
-        let pending_ids: std::collections::HashSet<String> = self
-            .thread
-            .read(cx)
-            .pending_steer_ids()
-            .into_iter()
-            .collect();
-        let mut restored = self
-            .queued_follow_ups_by_thread
-            .remove(thread_id)
-            .unwrap_or_default();
-        let mut pending_bubbles = Vec::new();
-        let mut kept = std::collections::VecDeque::new();
-
-        while let Some(mut item) = restored.pop_front() {
-            let steer_id = match &item.state {
-                FollowUpState::SteerPending { message_id }
-                | FollowUpState::Failed { message_id } => Some(message_id.clone()),
-                FollowUpState::Queued => None,
-            };
-            // Canonical history wins over the session stash: this steer was
-            // injected while the task was in the background, so showing the
-            // parked item again would duplicate it.
-            if steer_id
-                .as_deref()
-                .is_some_and(|id| canonical_ids.contains(id))
-            {
-                continue;
-            }
-            // Recreate an optimistic bubble only while the same steer remains
-            // pending on a running turn. Otherwise surface it as retryable;
-            // it was never confirmed by canonical history.
-            if let FollowUpState::SteerPending { message_id } = &item.state {
-                if running && pending_ids.contains(message_id) {
-                    pending_bubbles.push((
-                        item.turn.text.clone(),
-                        item.turn.user_images.clone(),
-                        item.turn.meta.clone(),
-                        message_id.clone(),
-                    ));
-                } else {
-                    item.state = FollowUpState::Failed {
-                        message_id: message_id.clone(),
-                    };
-                }
-            }
-            kept.push_back(item);
-        }
-        self.queued_follow_ups = kept;
-
-        let weak = cx.weak_entity();
-        for (text, images, meta, message_id) in pending_bubbles {
-            self.conversation.update(cx, |conversation, cx| {
-                conversation.push_pending_steer(text, images, meta, message_id, weak.clone(), cx)
-            });
-        }
-        if !self.queued_follow_ups.is_empty() {
-            self.sync_list_count(cx);
-            self.list_state.set_follow_mode(FollowMode::Tail);
-        }
-    }
-
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn consume_background_steer(&mut self, thread_id: &str, message_id: &str) {
         let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
             return;
@@ -3078,57 +2411,6 @@ impl Workspace {
         }
         if queue.is_empty() {
             self.queued_follow_ups_by_thread.remove(thread_id);
-        }
-    }
-
-    #[cfg(feature = "harness-manox")]
-    fn finish_background_follow_ups(
-        &mut self,
-        thread_id: &str,
-        thread: &Entity<ThreadEntity>,
-        cancelled: bool,
-        stranded_steer_ids: &[String],
-        cx: &mut Context<Self>,
-    ) {
-        let stranded: std::collections::HashSet<&str> =
-            stranded_steer_ids.iter().map(String::as_str).collect();
-        let mut queue = self
-            .queued_follow_ups_by_thread
-            .remove(thread_id)
-            .unwrap_or_default();
-        for item in &mut queue {
-            if let FollowUpState::SteerPending { message_id } = &item.state
-                && stranded.contains(message_id.as_str())
-            {
-                item.state = FollowUpState::Failed {
-                    message_id: message_id.clone(),
-                };
-            }
-        }
-
-        let mut retained = std::collections::VecDeque::new();
-        let mut started_follow_up = false;
-        while let Some(item) = queue.pop_front() {
-            if !cancelled && matches!(item.state, FollowUpState::Queued) {
-                append_deferred_turn_to_thread(thread, item.turn, cx);
-                started_follow_up = true;
-            } else {
-                retained.push_back(item);
-            }
-        }
-        if !retained.is_empty() {
-            self.queued_follow_ups_by_thread
-                .insert(thread_id.to_string(), retained);
-        }
-        if started_follow_up {
-            save_thread(thread.clone(), true, cx);
-            let thread = thread.clone();
-            // TurnFinished is delivered from the parked Thread's entity
-            // update. Defer the successor so `run_turn` cannot re-enter that
-            // update and so the terminal store bookkeeping finishes first.
-            cx.defer(move |cx| {
-                thread.update(cx, |thread, cx| thread.run_turn(cx));
-            });
         }
     }
 
@@ -3335,7 +2617,6 @@ impl Workspace {
         }
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn undo_last_queued(&mut self, cx: &mut Context<Self>) {
         if let Some(item) = self.queued_follow_ups.pop_back() {
             let steer_id = match &item.state {
@@ -3378,7 +2659,6 @@ impl Workspace {
             .collect()
     }
 
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor_open {
             self.close_editor(window, cx);
@@ -3388,7 +2668,6 @@ impl Workspace {
     }
 
     /// Whether the right pane has any tab (Editor or Member) showing.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn right_pane_open(&self) -> bool {
         !self.right_tabs.is_empty()
     }
@@ -3419,7 +2698,6 @@ impl Workspace {
     /// `removed_ix` shift left by one, so a still-live active tab to the right
     /// must decrement; the active tab itself being removed (and being the
     /// last) falls back to the new last tab.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn reseat_active_after_close(&mut self, removed_ix: usize) {
         if self.active_right_tab > removed_ix {
             self.active_right_tab -= 1;
@@ -3432,7 +2710,6 @@ impl Workspace {
     /// into the editor so writing continues there. If an Editor tab is already
     /// present, just focus it. Submit from the editor with Cmd-Enter; close with
     /// Ctrl-G / Cmd-W to move the draft back.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Close any open inline menus so they don't linger behind the hidden footer.
         self.close_completion(cx);
@@ -3457,7 +2734,6 @@ impl Workspace {
 
     /// Close the Editor tab without submitting: move the draft back into the
     /// inline composer and reveal it again. No-op when no Editor tab is present.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.editor_tab_ix() else {
             return;
@@ -3480,217 +2756,20 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn register_live_subagent(
-        &mut self,
-        root_thread_id: String,
-        info: SubagentInfo,
-        child: Entity<ThreadEntity>,
-        cx: &mut Context<Self>,
-    ) {
-        let id = info.id.clone();
-        let panel = SubagentPanel::live(
-            child,
-            root_thread_id.clone(),
-            info.clone(),
-            cx.weak_entity(),
-            cx,
-        );
-        let session = self
-            .subagent_sessions
-            .entry(root_thread_id.clone())
-            .or_default();
-        if !session.records.contains_key(&id) {
-            session.order.push(id.clone());
-        }
-        session.records.insert(id, SubagentRecord { info, panel });
-        if self.thread.read(cx).id.0 == root_thread_id {
-            self.sync_subagents_to_rail(cx);
-        }
-        cx.notify();
-    }
-
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn update_subagent_status(
-        &mut self,
-        root_thread_id: &str,
-        id: &str,
-        status: agent::ToolCallStatus,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(record) = self
-            .subagent_sessions
-            .get_mut(root_thread_id)
-            .and_then(|session| session.records.get_mut(id))
-        else {
-            return;
-        };
-        record.info.status = status;
-        record
-            .panel
-            .update(cx, |panel, cx| panel.set_status(status, cx));
-        if self.thread.read(cx).id.0 == root_thread_id {
-            self.sync_subagents_to_rail(cx);
-        }
-        cx.notify();
-    }
-
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn open_subagent_tab_by_id(&mut self, id: &str, cx: &mut Context<Self>) {
-        let root_thread_id = self.thread.read(cx).id.0.clone();
-        if !self
-            .subagent_sessions
-            .get(&root_thread_id)
-            .is_some_and(|session| session.records.contains_key(id))
-        {
-            return;
-        }
-        let ix = ensure_subagent_tab(&mut self.right_tabs, id);
-        self.set_active_right_tab(ix, cx);
-    }
-
-    #[cfg(feature = "harness-manox")]
-    fn sync_subagents_to_rail(&mut self, cx: &mut Context<Self>) {
-        let root_thread_id = self.thread.read(cx).id.0.clone();
-        let agents = self
-            .subagent_sessions
-            .get(&root_thread_id)
-            .map(|session| {
-                session
-                    .order
-                    .iter()
-                    .filter_map(|id| session.records.get(id).map(|record| record.info.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.context_rail
-            .update(cx, |rail, cx| rail.set_agents(agents, cx));
-    }
-
-    #[cfg(feature = "harness-manox")]
-    fn rebuild_subagent_observations(
-        &mut self,
-        snapshots: Vec<SubagentSnapshot>,
-        cx: &mut Context<Self>,
-    ) {
-        let root_thread_id = self.thread.read(cx).id.0.clone();
-        let mut session = SubagentSession::default();
-        let weak = cx.weak_entity();
-        for snapshot in snapshots {
-            let id = snapshot.info.id.clone();
-            let info = snapshot.info.clone();
-            let panel = SubagentPanel::snapshot(snapshot, weak.clone(), cx);
-            session.order.push(id.clone());
-            session.records.insert(id, SubagentRecord { info, panel });
-        }
-        self.subagent_sessions.insert(root_thread_id, session);
-        self.sync_subagents_to_rail(cx);
-    }
-
-    #[cfg(feature = "harness-manox")]
-    fn close_subagent_tabs(&mut self) {
-        remove_subagent_tabs(&mut self.right_tabs, &mut self.active_right_tab);
-        self.editor_open = self
-            .right_tabs
-            .get(self.active_right_tab)
-            .is_some_and(|tab| matches!(tab, RightTab::Editor));
-    }
-
-    /// Focus a member's observation tab, creating it if absent. The panel is
-    /// built from the member's `Thread` + role, read off the leader's active
-    /// team; no-op if no team or no such member.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    #[cfg(feature = "harness-manox")]
-    fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
-        if let Some(ix) = self
-            .right_tabs
-            .iter()
-            .position(|t| matches!(t, RightTab::Member(n) if n == name))
-        {
-            self.set_active_right_tab(ix, cx);
-            return;
-        }
-        let Some(team) = self.thread.read(cx).team().cloned() else {
-            return;
-        };
-        let Some(member_thread) = team.read(cx).thread_for(name).cloned() else {
-            return;
-        };
-        let role = team
-            .read(cx)
-            .members()
-            .get(name)
-            .map(|m| m.role().to_string())
-            .unwrap_or_else(|| name.to_string());
-        let weak = cx.weak_entity();
-        let panel = MemberPanel::new(
-            member_thread,
-            name.to_string(),
-            role,
-            team.downgrade(),
-            weak,
-            cx,
-        );
-        self.member_panels.insert(name.to_string(), panel);
-        self.right_tabs.push(RightTab::Member(name.to_string()));
-        let ix = self.right_tabs.len() - 1;
-        self.set_active_right_tab(ix, cx);
-    }
-
     /// Close a right-pane tab by index. The Editor tab routes through
-    /// `close_editor` to preserve draft-transfer semantics; a Member tab drops
-    /// its panel; a Browser tab drops its webview.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
+    /// `close_editor` to preserve draft-transfer semantics.
     fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
             self.close_editor(window, cx);
             return;
         }
-        #[cfg(feature = "harness-manox")]
-        if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
-            self.right_tabs.remove(ix);
-            self.member_panels.remove(&name);
-            self.reseat_active_after_close(ix);
-            self.editor_open = self
-                .right_tabs
-                .get(self.active_right_tab)
-                .is_some_and(|t| matches!(t, RightTab::Editor));
-            cx.notify();
-            return;
-        }
-        if matches!(self.right_tabs.get(ix), Some(RightTab::Subagent(_))) {
-            self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
-            self.editor_open = self
-                .right_tabs
-                .get(self.active_right_tab)
-                .is_some_and(|t| matches!(t, RightTab::Editor));
-            cx.notify();
-            return;
-        }
-        if let Some(RightTab::PlanPreview) = self.right_tabs.get(ix).cloned() {
-            self.right_tabs.remove(ix);
-            self.plan_preview_text = None;
-            self.reseat_active_after_close(ix);
-            self.editor_open = self
-                .right_tabs
-                .get(self.active_right_tab)
-                .is_some_and(|t| matches!(t, RightTab::Editor));
-            cx.notify();
-            // Under harness-pi the browser block below is cfg'd away, making
-            // this the function's tail statement.
-            #[cfg_attr(feature = "harness-pi", allow(clippy::needless_return))]
-            return;
-        }
-        // TODO(pi-wire): browser tabs.
-        #[cfg(feature = "harness-manox")]
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
             self.close_browser_tab(id, cx);
         }
     }
     /// Close the active right-pane tab if it is a browser tab. No-op
-    /// otherwise (the keybinding is global; it should not close Editor or
-    /// Member tabs that happen to be active).
+    /// otherwise (the keybinding is global; it should not close an Editor
+    /// tab that happens to be active).
     pub fn close_active_browser_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(self.active_right_tab).cloned() {
             self.close_browser_tab(id, cx);
@@ -3699,7 +2778,6 @@ impl Workspace {
 
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_editor_preview(!self.editor_preview, window, cx);
     }
@@ -3707,7 +2785,6 @@ impl Workspace {
     /// Switch the editor panel to preview (`Write` tab) or rendered markdown
     /// (`Preview` tab). No-op when the panel is closed or already in that mode.
     /// Returning to `Write` focuses the editor so typing works immediately.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn set_editor_preview(&mut self, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.editor_open || self.editor_preview == preview {
             return;
@@ -3763,25 +2840,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Open the plan text in a right-pane PlanPreview tab (peer of Editor).
-    /// If a PlanPreview tab already exists, update its text and focus it.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    pub(crate) fn open_plan_in_editor(&mut self, plan_text: String, cx: &mut Context<Self>) {
-        if let Some(ix) = self
-            .right_tabs
-            .iter()
-            .position(|t| matches!(t, RightTab::PlanPreview))
-        {
-            self.plan_preview_text = Some(plan_text);
-            self.set_active_right_tab(ix, cx);
-            return;
-        }
-        self.right_tabs.push(RightTab::PlanPreview);
-        let ix = self.right_tabs.len() - 1;
-        self.plan_preview_text = Some(plan_text);
-        self.set_active_right_tab(ix, cx);
-    }
-
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
         let approval_mode = self.thread.read(cx).approval_mode();
         UserTurnMeta::new(
@@ -3801,7 +2859,6 @@ impl Workspace {
     }
 
     pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
-        #[cfg(feature = "harness-pi")]
         {
             self.thread
                 .read(cx)
@@ -3809,60 +2866,6 @@ impl Workspace {
                 .map(agent::pi_providers::display_name)
                 .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
         }
-        #[cfg(not(feature = "harness-pi"))]
-        {
-            self.thread
-                .read(cx)
-                .model()
-                .map(|m| m.name().to_string())
-                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
-        }
-    }
-
-    /// Pin / unpin the active thread. The DB write + sidebar refresh runs
-    /// through `ThreadStore::pin_thread`; the in-memory `Thread` mirror is
-    /// flipped first so the menu label updates immediately on the next
-    /// re-open. Notifies the workspace so the menu trigger re-renders.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn title_menu_toggle_pin(&mut self, cx: &mut Context<Self>) {
-        let id = self.thread.read(cx).id.0.clone();
-        let next = !self.thread.read(cx).is_pinned();
-        self.thread.update(cx, |t, cx| t.set_pinned(next, cx));
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.pin_thread(&id, next, cx));
-        let msg = if next {
-            i18n::t("titlebar-pinned-notice")
-        } else {
-            i18n::t("titlebar-unpinned-notice")
-        };
-        self.add_info_message(msg.to_string(), cx);
-    }
-
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn title_menu_archive(&mut self, cx: &mut Context<Self>) {
-        let id = self.thread.read(cx).id.0.clone();
-        let next = !self.thread.read(cx).archived();
-        self.thread.update(cx, |t, cx| t.set_archived(next, cx));
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.archive_thread(&id, next, cx));
-        let msg = if next {
-            i18n::t("titlebar-archive-notice")
-        } else {
-            i18n::t("titlebar-unarchive-notice")
-        };
-        self.add_info_message(msg.to_string(), cx);
-        // Note: Navigation away from archived thread is handled by the sidebar
-        // archive button (which has Window access). The title menu archive
-        // action archives the thread but leaves the view as-is; the user can
-        // manually navigate or the next interaction will trigger a switch.
-    }
-    /// Copy a string to the system clipboard, then push a localized notice
-    /// so the user sees what landed in the clipboard. Single funnel for all
-    /// `titlebar-copy-*` actions so the notice phrasing stays consistent.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn title_menu_copy(&mut self, label_key: &str, value: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
-        self.add_info_message(i18n::t(label_key).to_string(), cx);
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
@@ -3923,30 +2926,6 @@ impl Workspace {
         });
     }
 
-    /// Toggle Danger mode on the current thread. Pushes a notice so the
-    /// user sees the state change in the conversation. Called by the
-    /// `/danger` slash command and the access-chip dropdown.
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn toggle_danger(&mut self, cx: &mut Context<Self>) {
-        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Danger {
-            ApprovalMode::AutoPilot
-        } else {
-            ApprovalMode::Danger
-        };
-        self.apply_approval_mode(next, cx);
-    }
-
-    /// Enable Danger mode and immediately send `prompt` as a user turn
-    /// (the `/danger [prompt]` form). If Danger is already on it stays on;
-    /// the prompt still runs.
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn start_danger_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if self.thread.read(cx).approval_mode() != ApprovalMode::Danger {
-            self.apply_approval_mode(ApprovalMode::Danger, cx);
-        }
-        self.send_user_turn(prompt, Vec::new(), cx);
-    }
-
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
         // An AskUserQuestion card's "Cancel" button calls this; the card is
         // the only pending surface, so resolve its id directly.
@@ -3963,21 +2942,6 @@ impl Workspace {
                 agent::ToolAuthorizationResponse::Decision(decision),
                 cx,
             );
-        });
-        cx.notify();
-    }
-
-    /// Resolve the most-recent inbound-write request from a built-in browser
-    /// tab. Routed through `Thread::respond_inbound` — separate from the
-    /// outbound `resolve_auth` pipeline because this axis is `ApprovalMode`-
-    /// blind by design.
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn resolve_inbound(&mut self, allowed: bool, cx: &mut Context<Self>) {
-        let Some(req) = self.pending_inbounds.pop() else {
-            return;
-        };
-        self.thread.update(cx, |thread, cx| {
-            thread.respond_inbound(&req.id, allowed, cx);
         });
         cx.notify();
     }
@@ -4125,347 +3089,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Resolve the pending plan review with the user's three-way verdict.
-    /// Implement (with or without a context clear) delegates to the thread,
-    /// which exits Plan mode and re-injects the plan as the implement turn's
-    /// seed; the rail's plan overview seeds later from the model's first
-    /// `UpdatePlan` call. Staying in Plan mode is not a verdict — the user
-    /// simply keeps typing.
-    #[cfg(feature = "harness-manox")]
-    pub(crate) fn respond_plan_review(
-        &mut self,
-        choice: PlanReviewChoice,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(review) = self.pending_plan_review.take() else {
-            return;
-        };
-        // The verdict becomes a user bubble carrying the approved plan text —
-        // the same text+ui the thread injects below — so the live view and a
-        // reloaded thread both show this one bubble. The ephemeral plan card
-        // (never persisted) is retired in its place.
-        let meta = self.user_turn_meta(cx);
-        let ui = Self::message_ui_metadata(&meta);
-        let text = harness_manox::implement_plan_user_message(&review.plan_text);
-        let plan_text = review.plan_text.clone();
-        if matches!(choice, PlanReviewChoice::ImplementClearContext) {
-            // Clear context = archive this thread and continue on a fresh one
-            // seeded with the approved plan. The user perceives only that the
-            // underlying thread id changed and prior messages vanished — the
-            // new thread starts empty save the seed bubble, then runs.
-            let old_id = self.thread.read(cx).id.0.clone();
-            let cwd = self.thread.read(cx).cwd().to_path_buf();
-            let project = self.thread.read(cx).project().cloned();
-            let model = self.thread.read(cx).model().cloned();
-            let effort = self.thread.read(cx).reasoning_effort();
-            let approval = self.thread.read(cx).approval_mode();
-            let new = match &project {
-                Some(dir) => Thread::new_in_project(
-                    ThreadId(uuid::Uuid::new_v4().to_string()),
-                    dir.clone(),
-                    cx,
-                ),
-                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
-            };
-            new.update(cx, |t, cx| {
-                if let Some(model) = model {
-                    t.set_model(model, cx);
-                }
-                t.set_reasoning_effort(effort, cx);
-                t.set_approval_mode(approval, cx);
-                t.seed_approved_plan(plan_text.clone(), Some(ui), cx);
-            });
-            // Switch the foreground: attach saves the old thread, rebuilds the
-            // conversation from the new thread (just the seed bubble), wires
-            // the event subscription, and clears the input draft. The seed is
-            // inserted but not run yet so turn events stream into the live view.
-            self.attach_thread(new, window, cx);
-            // Surface the new thread in the sidebar immediately, then run —
-            // run_turn marks it running so the sidebar row shows the spinner.
-            save_thread(self.thread.clone(), true, cx);
-            self.thread.update(cx, |t, cx| t.run_turn(cx));
-            // The rail's plan is no longer seeded from the approved plan text.
-            // The model publishes its execution plan via `UpdatePlan` once work
-            // begins; until then the section stays empty (an empty rail beats a
-            // stale 27-bullet dump of the plan's implementation details).
-            // Retire the old thread from the active list (consistent with any
-            // archived thread — no "show archived" UI today).
-            agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
-        } else {
-            // Implement: retire the ephemeral plan card (the pending card is
-            // the live tail at verdict time, so a tail pop is the safe removal)
-            // and push the verdict bubble, then seed + run on the current thread.
-            let weak = cx.weak_entity();
-            self.conversation.update(cx, |c, cx| {
-                c.pop_plan_review_tail(cx);
-            });
-            self.conversation.update(cx, |c, cx| {
-                c.push_user(text, Vec::new(), meta, weak, cx);
-            });
-            self.sync_list_count(cx);
-            // The tail slot was swapped in place (plan card out, verdict bubble
-            // in) — the count is unchanged, so `sync_list_count` alone leaves
-            // the list's cached height for that index pointing at the plan
-            // card. Remeasure it so the verdict bubble renders at its own
-            // height.
-            let ix = self.conversation.read(cx).items().len().saturating_sub(1);
-            self.list_state.remeasure_items(ix..ix + 1);
-            self.list_state.set_follow_mode(FollowMode::Tail);
-            // The rail's plan seeds from the model's first `UpdatePlan` call, not
-            // the approved plan text — see the continue-in-plan branch above.
-            self.thread.update(cx, |thread, cx| {
-                thread.implement_approved_plan(plan_text, Some(ui), cx);
-            });
-        }
-        cx.notify();
-    }
-
-    /// Confirmation overlay for an inbound-write request from a built-in
-    /// browser tab. Scrim + card layout like the question-card surface, but
-    /// resolves through `respond_inbound` (the mode-blind axis).
-    #[cfg(feature = "harness-manox")]
-    fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let req = self.pending_inbounds.last()?;
-        let intent = req.intent.clone();
-        let queued = self.pending_inbounds.len().saturating_sub(1);
-        Some(
-            gpui::div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.foreground.opacity(0.6))
-                .child(
-                    v_flex()
-                        .w(px(420.))
-                        .p_4()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(IconName::TriangleAlert)
-                                        .small()
-                                        .text_color(theme.danger),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(i18n::t("workspace-inbound-title")),
-                                ),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t_str(
-                                    "workspace-inbound-intent",
-                                    &[("intent", intent.as_str())],
-                                )),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t("workspace-inbound-note")),
-                        )
-                        .children(if queued > 0 {
-                            Some(
-                                gpui::div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t_count("workspace-queued", queued as i64)),
-                            )
-                        } else {
-                            None
-                        })
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("inbound-deny")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("workspace-inbound-deny"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.resolve_inbound(false, cx);
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("inbound-allow")
-                                        .primary()
-                                        .small()
-                                        .label(i18n::t("workspace-inbound-allow"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.resolve_inbound(true, cx);
-                                            }
-                                        })),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// Combined model + reasoning-effort selector. Closed: a ghost button
-    /// showing `provider · model · effort` with the model name tinted to
-    /// match its wire API. Open: a PopupMenu with Provider submenus, a
-    /// separator, then High / Max effort items.
-    #[cfg(feature = "harness-manox")]
-    fn render_model_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.model_open;
-        let model = self.thread.read(cx).model().cloned();
-        let effort = self.thread.read(cx).reasoning_effort();
-
-        let trigger = h_flex()
-            .id("model-trigger")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-            .cursor_pointer()
-            .children(if let Some(ref m) = model {
-                let wire = m.wire_api();
-                let model_color = Self::wire_api_text_color(wire, theme);
-                let dot = || {
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("·")
-                };
-                vec![
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(m.provider_name())
-                        .into_any_element(),
-                    dot().into_any_element(),
-                    gpui::div()
-                        .text_xs()
-                        .text_color(model_color)
-                        .child(m.name().to_string())
-                        .into_any_element(),
-                    dot().into_any_element(),
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(effort.wire_value())
-                        .into_any_element(),
-                ]
-            } else {
-                vec![
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(i18n::t("workspace-no-model").to_string())
-                        .into_any_element(),
-                ]
-            })
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(theme.muted_foreground),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.model_open {
-                    this.model_open = false;
-                    this.model_menu = None;
-                    this.model_menu_sub = None;
-                } else {
-                    this.model_open = true;
-                    let workspace = cx.entity().downgrade();
-                    let current_effort = this.thread.read(cx).reasoning_effort();
-                    let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                        Self::build_model_popup_menu(menu, workspace, current_effort, window, cx)
-                    });
-                    let sub = cx.subscribe(
-                        &menu,
-                        |this: &mut Workspace,
-                         _menu: Entity<PopupMenu>,
-                         _: &DismissEvent,
-                         cx: &mut Context<Workspace>| {
-                            this.model_open = false;
-                            this.model_menu = None;
-                            this.model_menu_sub = None;
-                            cx.notify();
-                        },
-                    );
-                    this.model_menu = Some(menu);
-                    this.model_menu_sub = Some(sub);
-                }
-                cx.notify();
-            }));
-
-        if !open {
-            return trigger.into_any_element();
-        }
-
-        let menu = self
-            .model_menu
-            .clone()
-            .expect("model_menu exists when open");
-
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                deferred(
-                    gpui::div()
-                        .id("model-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
-    }
-
-    /// Wire API → text color for the composer model label.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn wire_api_text_color(wire: WireApi, theme: &Theme) -> gpui::Hsla {
-        match wire {
-            WireApi::Anthropic => theme.primary,
-            WireApi::Responses => theme.info,
-            WireApi::Completions => theme.warning,
-            WireApi::Unavailable => theme.muted_foreground,
-        }
-    }
-
-    #[cfg(feature = "harness-manox")]
-    /// WireApi → Tag variant + label mapping for the model menu.
-    fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
-        match wire {
-            WireApi::Anthropic => (TagVariant::Primary, "Anthropic"),
-            WireApi::Responses => (TagVariant::Info, "Responses"),
-            WireApi::Completions => (TagVariant::Warning, "Completions"),
-            WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
-        }
-    }
     /// Wire api string → Tag variant + label for the pi model menu.
-    #[cfg(feature = "harness-pi")]
     fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
         match api {
             "anthropic" => (TagVariant::Primary, "Anthropic"),
@@ -4476,7 +3100,6 @@ impl Workspace {
     }
 
     /// Wire api string → text color for the pi composer model label.
-    #[cfg(feature = "harness-pi")]
     fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
         match api {
             "anthropic" => theme.primary,
@@ -4490,7 +3113,6 @@ impl Workspace {
     /// (the streaming source of truth): closed, a ghost button showing
     /// `provider · model` with the model name tinted by wire api; open, a
     /// PopupMenu of provider submenus.
-    #[cfg(feature = "harness-pi")]
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
         let model = self.thread.read(cx).model().cloned();
@@ -4599,7 +3221,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    #[cfg(feature = "harness-pi")]
     /// Model menu for the pi harness: grouped by provider display name;
     /// each row shows a wire-api Tag and selects through the registry.
     fn build_model_popup_menu_pi(
@@ -4660,257 +3281,6 @@ impl Workspace {
         menu
     }
 
-    #[cfg(feature = "harness-manox")]
-    /// Cascading model menu grouped by provider, followed by a separator and
-    /// reasoning-effort items (High / Max). Each model row shows a wire-api Tag.
-    fn build_model_popup_menu(
-        menu: PopupMenu,
-        workspace: WeakEntity<Workspace>,
-        current_effort: ReasoningEffort,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-    ) -> PopupMenu {
-        let mut providers: Vec<(String, Vec<harness_manox::language_model::AnyLanguageModel>)> =
-            Vec::new();
-        for m in registry::global().models() {
-            let prov = m.provider_name();
-            if let Some(last) = providers.last_mut()
-                && last.0 == prov
-            {
-                last.1.push(m.clone());
-            } else {
-                providers.push((prov, vec![m.clone()]));
-            }
-        }
-        let mut menu = menu;
-        let has_providers = !providers.is_empty();
-        if !has_providers {
-            menu = menu.item(PopupMenuItem::Label("No models configured".into()));
-        }
-        for (prov_name, models) in providers {
-            let ws = workspace.clone();
-            menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
-                let mut submenu = submenu;
-                for m in &models {
-                    let model_id = m.id();
-                    let model_name = m.name().to_string();
-                    let wire = m.wire_api();
-                    let (variant, label) = Self::wire_tag_variant(wire);
-                    let ws = ws.clone();
-                    submenu = submenu.item(
-                        PopupMenuItem::element(move |_window, _cx| {
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Tag::new()
-                                        .with_variant(variant)
-                                        .outline()
-                                        .small()
-                                        .child(label),
-                                )
-                                .child(model_name.clone())
-                        })
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            let _ = ws.update(cx, |this, cx| {
-                                if let Some(m) = registry::global().get_model(model_id.as_ref()) {
-                                    this.thread.update(cx, |t, cx| t.set_model(m, cx));
-                                }
-                            });
-                        }),
-                    );
-                }
-                submenu
-            });
-        }
-
-        // Reasoning effort items, separated from the provider/model list.
-        if has_providers {
-            menu = menu.separator();
-        }
-        for effort in ReasoningEffort::ALL {
-            let ws = workspace.clone();
-            menu = menu.item(
-                PopupMenuItem::new(effort.wire_value())
-                    .checked(effort == current_effort)
-                    .on_click(move |_, _window, cx| {
-                        let _ = ws.update(cx, |this, cx| {
-                            this.thread
-                                .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
-                            cx.notify();
-                        });
-                    }),
-            );
-        }
-        menu
-    }
-
-    /// Title bar "..." trigger + dropdown (conversation menu).
-    ///
-    /// Closed: a small ghost icon button (horizontal ellipsis) next to the
-    /// session title. Open: an absolute-positioned PopupMenu anchored under
-    /// the button. Mirrors the model selector pattern: the menu entity and
-    /// its dismiss subscription are created lazily on open, dropped on close.
-    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-    fn render_title_menu_trigger(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        #[cfg(feature = "harness-manox")]
-        {
-            use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
-
-            let open = self.title_menu_open;
-            let is_pinned = self.thread.read(cx).is_pinned();
-            let is_archived = self.thread.read(cx).archived();
-
-            let trigger = Button::new("titlebar-trigger")
-                .ghost()
-                .small()
-                .icon(IconName::Ellipsis)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if this.title_menu_open {
-                        this.close_title_menu();
-                        cx.notify();
-                        return;
-                    }
-                    this.title_menu_open = true;
-                    let workspace = cx.entity().downgrade();
-                    let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
-                        let cb = TitleMenuCallbacks {
-                            on_pin: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ =
-                                        ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
-                                })
-                            },
-                            on_archive: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
-                                })
-                            },
-                            on_copy_id: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        let id = this.thread.read(cx).id.0.clone();
-                                        this.title_menu_copy("titlebar-copied-id", id, cx);
-                                    });
-                                })
-                            },
-                            on_copy_markdown: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        let md = this.thread.read(cx).to_markdown();
-                                        this.title_menu_copy("titlebar-copied-markdown", md, cx);
-                                    });
-                                })
-                            },
-                            on_copy_cwd: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        let cwd = this.thread.read(cx).cwd().display().to_string();
-                                        this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
-                                    });
-                                })
-                            },
-                            on_copy_deeplink: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        let id = this.thread.read(cx).id.0.clone();
-                                        let link = format!("manox://thread/{id}");
-                                        this.title_menu_copy("titlebar-copied-deeplink", link, cx);
-                                    });
-                                })
-                            },
-                            on_schedule: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        this.add_info_message(
-                                            i18n::t("titlebar-not-implemented").to_string(),
-                                            cx,
-                                        );
-                                    });
-                                })
-                            },
-                            on_new_window: {
-                                let ws = workspace.clone();
-                                Rc::new(move |_, _, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        this.add_info_message(
-                                            i18n::t("titlebar-not-implemented").to_string(),
-                                            cx,
-                                        );
-                                    });
-                                })
-                            },
-                            is_pinned,
-                            is_archived,
-                        };
-                        build_title_menu(menu, window, cx, cb)
-                    });
-                    let sub = cx.subscribe(
-                        &menu,
-                        |this: &mut Workspace,
-                         _menu: Entity<PopupMenu>,
-                         _: &DismissEvent,
-                         cx: &mut Context<Workspace>| {
-                            this.close_title_menu();
-                            cx.notify();
-                        },
-                    );
-                    this.title_menu = Some(menu);
-                    this.title_menu_sub = Some(sub);
-                    cx.notify();
-                }));
-
-            // Color the trigger when open so the affordance matches the dropdown's
-            // presence (a clicked "..." otherwise looks identical to a hovered one).
-            let trigger = if open {
-                trigger.text_color(theme.accent_foreground)
-            } else {
-                trigger
-            };
-
-            if !open {
-                return trigger.into_any_element();
-            }
-
-            let menu = self
-                .title_menu
-                .clone()
-                .expect("title_menu exists when open");
-
-            gpui::div()
-                .relative()
-                .child(trigger)
-                .child(
-                    // `deferred()` + `with_priority(1)` paints the dropdown after
-                    // the whole conversation column tree, escaping overflow_hidden
-                    // clipping from ancestor containers. `right_0()` keeps the menu
-                    // within the viewport when the window sits near the screen edge.
-                    deferred(
-                        gpui::div()
-                            .id("titlebar-dropdown")
-                            .absolute()
-                            .top_full()
-                            .right_0()
-                            .occlude()
-                            .child(menu),
-                    )
-                    .with_priority(1),
-                )
-                .into_any_element()
-        }
-        #[cfg(not(feature = "harness-manox"))]
-        {
-            gpui::div().into_any_element()
-        }
-    }
-
     /// Rendered bare — no card border, fill, or rounding — so it shares the
     /// page background with the message list and reads as the same layer.
     /// The `Input` has no appearance of its own; the only visual separator
@@ -4924,8 +3294,7 @@ impl Workspace {
     ) -> AnyElement {
         // Flip the composer placeholder only on mode transitions, so render
         // doesn't churn the InputState every frame.
-        let followup_mode =
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
+        let followup_mode = running && self.pending_ask.is_none();
         let placeholder_mode = if self.pending_ask.is_some() {
             ComposerPlaceholderMode::Ask
         } else if followup_mode {
@@ -4945,33 +3314,14 @@ impl Workspace {
             });
         }
         let queue = self.render_queued_follow_ups(theme, cx);
-        // TODO(pi-wire): attachments (+ menu), project picker, goal/team chips,
-        // approval menu, model selector — manox surfaces.
-        #[cfg(feature = "harness-manox")]
-        let plus = self.render_plus_button(cx);
-        #[cfg(feature = "harness-pi")]
+        // TODO(pi-wire): plus menu + image attachment input.
         let plus: AnyElement = gpui::div().into_any_element();
-        #[cfg(feature = "harness-manox")]
-        let project_chip = self.render_project_chip(theme, cx);
-        #[cfg(feature = "harness-pi")]
         let project_chip = self.render_project_chip_pi(theme, cx);
-        #[cfg(feature = "harness-manox")]
-        let goal_chip = self.render_goal_chip(theme, cx);
-        #[cfg(feature = "harness-pi")]
         let goal_chip: Option<AnyElement> = None;
-        #[cfg(feature = "harness-manox")]
-        let team_chip = self.render_team_chip(theme, cx);
-        #[cfg(feature = "harness-pi")]
         let team_chip: Option<AnyElement> = None;
         let access = self.render_access_placeholder(theme, cx);
-        #[cfg(feature = "harness-manox")]
-        let model = self.render_model_selector(theme, cx);
-        #[cfg(feature = "harness-pi")]
         let model = self.render_model_selector_pi(theme, cx);
-        let send = self.render_send_button(
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
-            cx,
-        );
+        let send = self.render_send_button(running && self.pending_ask.is_none(), cx);
         // The completion popover overlays the composer; anchoring it on the
         // composer's own v_flex keeps it glued to the input bar in both hero
         // and footer, with a single mount point and ElementId.
@@ -5177,257 +3527,6 @@ impl Workspace {
         rows
     }
 
-    /// Goal-mode chip — shown only while the thread has an active goal. Renders
-    /// `◎ Goal active · {elapsed}` in accent colors so the autonomous-loop
-    /// posture is legible at a glance. Clicking toggles the status popover
-    /// (condition / elapsed / evaluations / last reason / Clear).
-    #[cfg(feature = "harness-manox")]
-    fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let g = self.thread.read(cx).goal()?;
-        let accent = theme.accent;
-        let muted = theme.muted_foreground;
-        let fg = theme.foreground;
-        let status_key = match g.status {
-            agent::goal::GoalStatus::Active => "goal-status-active",
-            agent::goal::GoalStatus::Paused => "goal-status-paused",
-            agent::goal::GoalStatus::Blocked => "goal-status-blocked",
-            agent::goal::GoalStatus::BudgetLimited => "goal-status-budget-limited",
-            agent::goal::GoalStatus::Complete => "goal-status-complete",
-        };
-        let elapsed = format_elapsed(std::time::Duration::from_secs(
-            self.thread
-                .read(cx)
-                .goal_elapsed_seconds()
-                .unwrap_or_default(),
-        ));
-        let label: SharedString = format!("◎ {} · {}", i18n::t(status_key), elapsed).into();
-        let open = self.goal_popover_open;
-
-        let trigger = h_flex()
-            .id("goal-chip")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(accent)
-            .cursor_pointer()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.accent_foreground)
-                    .child(label),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(muted),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.goal_popover_open = !this.goal_popover_open;
-                cx.notify();
-            }));
-
-        if !open {
-            return Some(trigger.into_any_element());
-        }
-
-        let objective = g.objective.clone();
-        let status = i18n::t(status_key);
-        let reason = g.status_reason.clone().unwrap_or_else(|| "—".into());
-        let tokens = g.tokens_used.to_string();
-        let budget = g
-            .token_budget
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "∞".into());
-        let remaining = g
-            .remaining_tokens()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "∞".into());
-        let goal_status = g.status;
-        let objective_label = i18n::t("goal-popover-objective");
-        let status_label = i18n::t("goal-popover-status");
-        let elapsed_label = i18n::t("goal-popover-elapsed");
-        let reason_label = i18n::t("goal-popover-reason");
-        let tokens_label = i18n::t("goal-popover-tokens");
-        let budget_label = i18n::t("goal-popover-budget");
-        let remaining_label = i18n::t("goal-popover-remaining");
-        let clear_label = i18n::t("goal-popover-clear");
-        let pause_label = i18n::t("goal-popover-pause");
-        let resume_label = i18n::t("goal-popover-resume");
-        let edit_label = i18n::t("goal-popover-edit");
-        let edit_budget_label = i18n::t("goal-popover-edit-budget");
-        let replace_label = i18n::t("goal-popover-replace");
-        let new_label = i18n::t("goal-popover-new");
-        let title_label = i18n::t("goal-popover-title");
-        let popover = v_flex()
-            .w_full()
-            .gap_1()
-            .p_3()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.accent_foreground)
-                    .child(format!("◎ {title_label}")),
-            )
-            .child(goal_popover_row(&objective_label, &objective, fg, muted))
-            .child(goal_popover_row(&status_label, &status, fg, muted))
-            .child(goal_popover_row(&elapsed_label, &elapsed, fg, muted))
-            .child(goal_popover_row(&reason_label, &reason, fg, muted))
-            .child(goal_popover_row(&tokens_label, &tokens, fg, muted))
-            .child(goal_popover_row(&budget_label, &budget, fg, muted))
-            .child(goal_popover_row(&remaining_label, &remaining, fg, muted))
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_1()
-                    .when(goal_status == agent::goal::GoalStatus::Active, |row| {
-                        row.child(
-                            Button::new("goal-pause")
-                                .small()
-                                .label(pause_label)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    let _ = this.thread.update(cx, |t, cx| {
-                                        t.set_goal_status(
-                                            agent::goal::GoalStatus::Paused,
-                                            Some("paused by user".into()),
-                                            agent::db::GoalActor::User,
-                                            cx,
-                                        )
-                                    });
-                                })),
-                        )
-                    })
-                    .when(
-                        matches!(
-                            goal_status,
-                            agent::goal::GoalStatus::Paused | agent::goal::GoalStatus::Blocked
-                        ),
-                        |row| {
-                            row.child(
-                                Button::new("goal-resume")
-                                    .small()
-                                    .label(resume_label)
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        let _ = this.thread.update(cx, |t, cx| {
-                                            t.set_goal_status(
-                                                agent::goal::GoalStatus::Active,
-                                                None,
-                                                agent::db::GoalActor::User,
-                                                cx,
-                                            )
-                                        });
-                                    })),
-                            )
-                        },
-                    )
-                    .when(
-                        matches!(
-                            goal_status,
-                            agent::goal::GoalStatus::Active
-                                | agent::goal::GoalStatus::Paused
-                                | agent::goal::GoalStatus::Blocked
-                        ),
-                        |row| {
-                            row.child(Button::new("goal-edit").small().label(edit_label).on_click(
-                                cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.goal_popover_open = false;
-                                    this.begin_goal_edit(window, cx);
-                                }),
-                            ))
-                        },
-                    )
-                    .when(
-                        goal_status == agent::goal::GoalStatus::BudgetLimited,
-                        |row| {
-                            row.child(
-                                Button::new("goal-edit-budget")
-                                    .small()
-                                    .label(edit_budget_label)
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.goal_popover_open = false;
-                                            this.begin_goal_budget_edit(window, cx);
-                                        },
-                                    )),
-                            )
-                        },
-                    )
-                    .when(
-                        matches!(
-                            goal_status,
-                            agent::goal::GoalStatus::Paused
-                                | agent::goal::GoalStatus::Blocked
-                                | agent::goal::GoalStatus::BudgetLimited
-                        ),
-                        |row| {
-                            row.child(
-                                Button::new("goal-replace")
-                                    .small()
-                                    .label(replace_label)
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.goal_popover_open = false;
-                                            this.begin_goal_replace(window, cx);
-                                        },
-                                    )),
-                            )
-                        },
-                    )
-                    .when(goal_status == agent::goal::GoalStatus::Complete, |row| {
-                        row.child(Button::new("goal-new").small().label(new_label).on_click(
-                            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.goal_popover_open = false;
-                                this.begin_goal_new(window, cx);
-                            }),
-                        ))
-                    })
-                    .child(
-                        Button::new("goal-clear")
-                            .small()
-                            .label(clear_label)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                let _ = this.thread.update(cx, |t, cx| {
-                                    t.clear_goal(agent::db::GoalActor::User, cx)
-                                });
-                                this.goal_popover_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            );
-
-        Some(
-            gpui::div()
-                .relative()
-                .child(trigger)
-                .child(
-                    deferred(
-                        gpui::div()
-                            .id("goal-dropdown")
-                            .absolute()
-                            .bottom_full()
-                            .left_0()
-                            .occlude()
-                            .w(gpui::px(360.))
-                            .popover_style(cx)
-                            .child(popover)
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.goal_popover_open = false;
-                                cx.notify();
-                            })),
-                    )
-                    .with_priority(1),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// Open the goal status popover (from the bare `/goal` command).
     pub fn open_goal_popover(&mut self, cx: &mut Context<Self>) {
         self.goal_popover_open = true;
@@ -5490,175 +3589,6 @@ impl Workspace {
             state.set_value("/goal ".to_string(), window, cx);
         });
         cx.notify();
-    }
-
-    /// Team roster chip — shown only while the leader has formed a team. Renders
-    /// `👥 team · N` in accent colors; clicking opens a thin drawer listing
-    /// each worker member (name / role / status dot / task count). Clicking a
-    /// row opens that member's observation tab in the right pane. The leader is
-    /// not listed (it is the main conversation).
-    #[cfg(feature = "harness-manox")]
-    fn render_team_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let team = self.thread.read(cx).team().cloned()?;
-        // Collect member roster metadata in one pass so we never hold a borrow
-        // on the `Team` entity across the render closures below. `Member` is not
-        // `Clone`, so we lift only the cheap, 'static fields the rows need.
-        let (count, rows): (usize, Vec<(String, String, bool, usize)>) = {
-            let t = team.read(cx);
-            let members = t.members();
-            let tasks = t.tasks().read(cx).tasks();
-            let rows = members
-                .iter()
-                .map(|(name, m)| {
-                    let running = m.thread().read(cx).is_running();
-                    let owned = tasks
-                        .iter()
-                        .filter(|tk| tk.owner.as_deref() == Some(name.as_str()))
-                        .count();
-                    (name.clone(), m.role().to_string(), running, owned)
-                })
-                .collect();
-            (members.len(), rows)
-        };
-        let accent = theme.accent;
-        let muted = theme.muted_foreground;
-        let fg = theme.foreground;
-        let open = self.team_chip_open;
-        let label: SharedString = i18n::t_str("team-chip", &[("count", &count.to_string())]);
-
-        let trigger = h_flex()
-            .id("team-chip")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(accent)
-            .cursor_pointer()
-            .child(
-                Icon::new(IconName::User)
-                    .xsmall()
-                    .text_color(theme.accent_foreground),
-            )
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.accent_foreground)
-                    .child(label),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(muted),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.team_chip_open = !this.team_chip_open;
-                cx.notify();
-            }));
-
-        if !open {
-            return Some(trigger.into_any_element());
-        }
-
-        let title = i18n::t("team-drawer-title");
-        let empty = i18n::t("team-drawer-empty");
-
-        // Build a row per worker. The on_click opens (or focuses) that member's
-        // tab and closes the drawer. The row data is pre-collected above so the
-        // render closures only capture cheap, 'static data plus the workspace
-        // handle.
-        let roster = if rows.is_empty() {
-            v_flex()
-                .w_full()
-                .p_3()
-                .child(gpui::div().text_xs().text_color(muted).child(empty))
-        } else {
-            v_flex().w_full().gap_1().p_2().children(
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(ix, (name, role, running, owned))| {
-                        let dot_color = if running {
-                            theme.accent_foreground
-                        } else {
-                            theme.muted_foreground
-                        };
-                        let tasks_label =
-                            i18n::t_str("team-drawer-tasks", &[("count", &owned.to_string())]);
-                        let name_for_click = name.clone();
-                        h_flex()
-                            .id(("team-member-row", ix))
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                            .child(gpui::div().w(px(8.)).h(px(8.)).rounded_full().bg(dot_color))
-                            .child(
-                                gpui::div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .child(name),
-                            )
-                            .child(gpui::div().text_xs().text_color(muted).child(role))
-                            .child(gpui::div().flex_1())
-                            .child(gpui::div().text_xs().text_color(muted).child(tasks_label))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                this.open_member_tab(&name_for_click, cx);
-                                this.team_chip_open = false;
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        let popover = v_flex()
-            .w_full()
-            .gap_1()
-            .p_2()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(accent)
-                    .child(title),
-            )
-            .child(roster);
-
-        Some(
-            gpui::div()
-                .relative()
-                .child(trigger)
-                .child(
-                    deferred(
-                        gpui::div()
-                            .id("team-dropdown")
-                            .absolute()
-                            .bottom_full()
-                            .left_0()
-                            .occlude()
-                            .w(px(320.))
-                            .popover_style(cx)
-                            .child(popover)
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.team_chip_open = false;
-                                cx.notify();
-                            })),
-                    )
-                    .with_priority(1),
-                )
-                .into_any_element(),
-        )
     }
 
     /// Access chip + 3-tier approval popover.
@@ -5762,109 +3692,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The composer `+` button and its popup menu ("add / plugins").
-    #[cfg(feature = "harness-manox")]
-    fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let trigger = Button::new("composer-plus")
-            .ghost()
-            .icon(IconName::Plus)
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.plus_open {
-                    this.close_plus_menu();
-                } else {
-                    this.open_plus_menu(window, cx);
-                }
-                cx.notify();
-            }));
-
-        if !self.plus_open {
-            return trigger.into_any_element();
-        }
-        let Some(menu) = self.plus_menu.clone() else {
-            return trigger.into_any_element();
-        };
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                deferred(
-                    gpui::div()
-                        .id("plus-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .left_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
-    }
-    #[cfg(feature = "harness-manox")]
-    fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let theme = cx.theme().clone();
-        let ws = cx.entity().downgrade();
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            let ws_files = ws.clone();
-            let ws_goal = ws.clone();
-            build_plus_menu(
-                menu,
-                &theme,
-                move |window, cx| {
-                    let _ = ws_files.update(cx, |this, cx| {
-                        this.close_plus_menu();
-                        this.pick_files(window, cx);
-                        cx.notify();
-                    });
-                },
-                move |window, cx| {
-                    let _ = ws_goal.update(cx, |this, cx| {
-                        this.close_plus_menu();
-                        this.input_state.update(cx, |state, cx| {
-                            state.set_value("/goal ".to_string(), window, cx);
-                        });
-                        cx.notify();
-                    });
-                },
-            )
-        });
-        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
-            this.close_plus_menu();
-            cx.notify();
-        });
-        self.plus_open = true;
-        self.plus_menu = Some(menu);
-        self.plus_menu_sub = Some(sub);
-    }
-
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn close_plus_menu(&mut self) {
         self.plus_open = false;
         self.plus_menu = None;
         self.plus_menu_sub = None;
-    }
-
-    /// Open the native file picker and add chosen paths as pending attachments.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                this.update(cx, |this, cx| {
-                    for p in paths {
-                        this.pending_attachments.push(PendingAttachment::new(p));
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
 
     /// Circular icon-only send/stop button.
@@ -5920,10 +3751,7 @@ impl Workspace {
             })
             .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.thread.read(cx).is_running()
-                    && this.pending_plan_review.is_none()
-                    && this.pending_ask.is_none()
-                {
+                if this.thread.read(cx).is_running() && this.pending_ask.is_none() {
                     this.cancel_turn(cx);
                 } else {
                     this.submit_input(window, cx);
@@ -5965,7 +3793,6 @@ impl Workspace {
     }
 
     /// Pending-attachment chips shown above the composer, each removable.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
     fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.pending_attachments.is_empty() {
             return None;
@@ -5991,7 +3818,6 @@ impl Workspace {
     /// blank-project creation and folder selection. Selection is only
     /// allowed on empty threads (same guard as the manox chip). Data source
     /// is the pi thread store only.
-    #[cfg(feature = "harness-pi")]
     fn render_project_chip_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
         let open = self.project_chip_open;
@@ -6239,267 +4065,10 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Project chip: a clickable control showing the current project basename
-    /// (or "Choose project" when unbound). Opens a dropdown listing recent
-    /// projects followed by "Create blank project" / "Select folder" actions.
-    /// Mirrors the access-chip pattern.
-    #[cfg(feature = "harness-manox")]
-    fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = self.thread.read(cx).project().cloned();
-        let open = self.project_chip_open;
-        let workspace = cx.entity().downgrade();
-
-        let (icon, label): (Option<IconName>, SharedString) = match &project {
-            Some(dir) => {
-                let name = dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("project")
-                    .to_string();
-                (Some(IconName::FolderOpen), name.into())
-            }
-            None => (
-                Some(IconName::FolderOpen),
-                i18n::t("workspace-project-choose"),
-            ),
-        };
-
-        let trigger = h_flex()
-            .id("project-chip")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-            .cursor_pointer()
-            .when_some(icon.clone(), |el, ic| {
-                el.child(Icon::new(ic).xsmall().text_color(theme.muted_foreground))
-            })
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(label),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(theme.muted_foreground),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if this.project_chip_open {
-                    this.close_project_chip_menu();
-                    cx.notify();
-                    return;
-                }
-                // Only allow project selection on empty threads.
-                let can_set = this.thread.read(cx).messages().is_empty();
-                if !can_set {
-                    return;
-                }
-                this.project_chip_open = true;
-
-                // Fetch recent projects from the store.
-                let store = harness_manox::thread_store_global();
-                let recent = store.update(cx, |s, cx| s.fetch_recent_projects(20, cx));
-
-                let ws = workspace.clone();
-                let theme = cx.theme().clone();
-
-                // Build menu synchronously with whatever recent list we have
-                // cached; the async fetch will refresh on the next open.
-                let ws_blank = ws.clone();
-                let ws_folder = ws.clone();
-
-                let menu = PopupMenu::build(window, cx, move |menu, _window, cx| {
-                    let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
-                    menu = menu.label(i18n::t("sidebar-section-projects"));
-
-                    let ws_recent = ws.clone();
-                    let theme_recent = theme.clone();
-
-                    // Fetch synchronously from the manox store's cached
-                    // summaries (the pi store is not this chip's source).
-                    let summaries = store.read(cx).summaries();
-                    let mut seen = std::collections::HashSet::new();
-                    let mut recent_projects: Vec<String> = Vec::new();
-                    for s in summaries {
-                        if !s.project.is_empty() && seen.insert(s.project.clone()) {
-                            recent_projects.push(s.project.clone());
-                        }
-                        if recent_projects.len() >= 20 {
-                            break;
-                        }
-                    }
-
-                    for path_str in &recent_projects {
-                        let path = std::path::PathBuf::from(path_str);
-                        let name = path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(path_str)
-                            .to_string();
-                        let display_path = path_str.clone();
-                        let click_path = path_str.clone();
-                        let ws_sel = ws_recent.clone();
-                        let themed = theme_recent.clone();
-                        menu = menu.item(
-                            PopupMenuItem::element(move |_window, _cx| {
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Icon::new(IconName::FolderOpen)
-                                            .xsmall()
-                                            .text_color(themed.muted_foreground),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .text_sm()
-                                            .text_color(themed.foreground)
-                                            .child(name.clone()),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .flex_1()
-                                            .text_xs()
-                                            .text_color(themed.muted_foreground)
-                                            .child(display_path.clone()),
-                                    )
-                            })
-                            .on_click(
-                                move |_, _, cx: &mut gpui::App| {
-                                    let p = std::path::PathBuf::from(&click_path);
-                                    let _ = ws_sel.update(cx, |this, cx| {
-                                        this.close_project_chip_menu();
-                                        this.thread.update(cx, |t, cx| t.set_project(p, cx));
-                                        cx.notify();
-                                    });
-                                },
-                            ),
-                        );
-                    }
-
-                    menu = menu.separator();
-
-                    // "New project" actions as top-level items.
-                    // PopupMenu submenus are clipped by overflow_y_scroll, so they
-                    // cannot coexist with scrollable(true) — which the recent-projects
-                    // list above needs. Flatten instead of nesting under a submenu.
-                    menu = menu.label(i18n::t("workspace-project-new"));
-
-                    let themed_blank = theme.clone();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_window, _cx| {
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Icon::new(IconName::Plus)
-                                        .xsmall()
-                                        .text_color(themed_blank.muted_foreground),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .text_sm()
-                                        .text_color(themed_blank.foreground)
-                                        .child(i18n::t("workspace-project-blank")),
-                                )
-                        })
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            let _ = ws_blank.update(cx, |this, cx| {
-                                this.close_project_chip_menu();
-                                this.open_blank_project(cx);
-                            });
-                        }),
-                    );
-
-                    let themed_folder = theme.clone();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_window, _cx| {
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Icon::new(IconName::FolderOpen)
-                                        .xsmall()
-                                        .text_color(themed_folder.muted_foreground),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .text_sm()
-                                        .text_color(themed_folder.foreground)
-                                        .child(i18n::t("workspace-project-select-folder")),
-                                )
-                        })
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            let _ = ws_folder.update(cx, |this, cx| {
-                                this.close_project_chip_menu();
-                                this.choose_project_inner(cx);
-                            });
-                        }),
-                    );
-
-                    // Suppress unused-variable warning for the async fetch.
-                    drop(recent);
-
-                    menu
-                });
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut Workspace,
-                     _menu: Entity<PopupMenu>,
-                     _: &DismissEvent,
-                     cx: &mut Context<Workspace>| {
-                        this.close_project_chip_menu();
-                        cx.notify();
-                    },
-                );
-                this.project_chip_menu = Some(menu);
-                this.project_chip_menu_sub = Some(sub);
-                cx.notify();
-            }));
-
-        if !open {
-            return trigger.into_any_element();
-        }
-
-        debug_assert!(self.project_chip_open);
-        debug_assert!(self.project_chip_menu.is_some());
-        let menu = self
-            .project_chip_menu
-            .clone()
-            .expect("project_chip_menu exists when open");
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                deferred(
-                    gpui::div()
-                        .id("project-chip-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .left_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
-    }
-
     /// Register a bound project on the active variant's thread store so the
     /// sidebar keeps its folder (persisted; survives restarts and archives).
     fn register_project_in_store(path: &std::path::Path, cx: &mut Context<Self>) {
         let path = path.to_string_lossy().to_string();
-        #[cfg(feature = "harness-manox")]
-        harness_manox::thread_store_global().update(cx, |s, cx| s.register_project(path, cx));
-        #[cfg(not(feature = "harness-manox"))]
         agent::thread_store_global().update(cx, |s, cx| s.register_project(path, cx));
     }
 
@@ -6614,7 +4183,7 @@ impl Workspace {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.pending_ask.is_some() || self.pending_plan_review.is_some() {
+        if self.pending_ask.is_some() {
             return None;
         }
         self.blank_project_parent.as_ref()?;
@@ -6710,177 +4279,6 @@ impl Render for Workspace {
         self.render_manox(window, cx)
     }
 }
-impl Workspace {
-    /// The pi-stage workspace chrome: title bar + conversation column +
-    /// composer. Everything not yet wired to the pi backend is absent by
-    /// construction; search `TODO(pi-wire)` for the remaining surface.
-    #[cfg(feature = "harness-pi")]
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    fn render_pi(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Settings overlay: provider credentials/models are configured here,
-        // so it stays even though the rest of the chrome is reduced.
-        if matches!(self.view_mode, ViewMode::Settings) {
-            let settings = self
-                .settings_view
-                .as_ref()
-                .expect("enter_settings must have created the SettingsView")
-                .clone();
-            let (anim_id, sign) = if self.exiting_settings {
-                (
-                    format!("settings-exit-{}", self.settings_transition_gen),
-                    1.0,
-                )
-            } else {
-                (
-                    format!("settings-enter-{}", self.settings_transition_gen),
-                    -1.0,
-                )
-            };
-            let panel_w = px(280.0);
-            let anim_el = gpui::div().size_full().child(settings).with_animation(
-                anim_id,
-                Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
-                move |el, delta| {
-                    let offset = panel_w * sign * (1.0 - delta);
-                    el.relative().ml(offset)
-                },
-            );
-            return h_flex().size_full().child(anim_el);
-        }
-
-        let theme = cx.theme().clone();
-        let running = self.thread.read(cx).is_running();
-        let title_text: SharedString = {
-            let s = self.thread.read(cx).display_title();
-            if s.is_empty() {
-                "Manox Pi".to_string()
-            } else {
-                s
-            }
-        }
-        .into();
-        let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-
-        let footer = if first_screen {
-            None
-        } else {
-            Some(
-                v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .bg(theme.background)
-                    .py_2()
-                    .gap_2()
-                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
-                    .child(centered(self.render_composer(running, window, &theme, cx))),
-            )
-        };
-
-        let hero = first_screen.then(|| {
-            centered(
-                v_flex()
-                    .w_full()
-                    .gap_4()
-                    .child(
-                        gpui::div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child("Manox Pi"),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(i18n::t("workspace-hero-subtitle")),
-                    )
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .max_w(px(640.))
-                            .child(self.render_composer(running, window, &theme, cx)),
-                    ),
-            )
-        });
-
-        let list = (!first_screen).then(|| {
-            let conv = self.conversation.clone();
-            let list_state = self.list_state.clone();
-            let list_el = gpui::list(list_state, move |ix, _window, cx| {
-                let item = conv.read(cx).items().get(ix).cloned();
-                match item {
-                    Some(item) => v_flex()
-                        .w_full()
-                        .pt_1()
-                        .pb_4()
-                        .flex_shrink_0()
-                        .min_w_0()
-                        .child(item)
-                        .into_any_element(),
-                    None => gpui::div().into_any_element(),
-                }
-            })
-            .with_sizing_behavior(ListSizingBehavior::Auto)
-            .w_full()
-            .h_full()
-            .min_h_0()
-            .min_w_0()
-            .font_family(theme.mono_font_family.clone())
-            .font_weight(gpui::FontWeight::LIGHT);
-            v_flex()
-                .flex_1()
-                .h_full()
-                .min_h_0()
-                .min_w_0()
-                .overflow_hidden()
-                .child(list_el)
-        });
-
-        h_flex()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                this.enter_settings(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
-                this.focus_conversation(cx);
-            }))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .relative()
-                    .child(
-                        TitleBar::new().child(
-                            h_flex().gap_2().items_center().flex_1().min_w_0().child(
-                                gpui::div()
-                                    .text_sm()
-                                    .text_left()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(title_text),
-                            ),
-                        ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .w_full()
-                            .overflow_hidden()
-                            .pt(TITLE_BAR_HEIGHT)
-                            .pb_2()
-                            .children(hero)
-                            .children(list)
-                            .children(footer),
-                    ),
-            )
-    }
-}
-
 impl Workspace {
     /// The full workspace chrome: sidebar, conversation column, context rail,
     /// right pane, approval overlays. Shared by both harness builds.
@@ -7100,17 +4498,7 @@ impl Workspace {
             && !editor_open
             && self.thread.read(cx).has_interacted()
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
-        let inbound = {
-            #[cfg(feature = "harness-manox")]
-            {
-                self.render_inbound_overlay(&theme, cx)
-            }
-            #[cfg(not(feature = "harness-manox"))]
-            {
-                None
-            }
-        };
-        let overlay = inbound.or_else(|| self.render_blank_project_overlay(window, &theme, cx));
+        let overlay = self.render_blank_project_overlay(window, &theme, cx);
         let turn_navigator_overlay =
             self.render_turn_navigator_overlay(window, &theme, right_pane_open, show_rail, cx);
         // The inline composer stays visible while inline AskUserQuestion cards
@@ -7271,22 +4659,6 @@ impl Workspace {
             .map(|(ix, tab)| {
                 let base = match tab {
                     RightTab::Editor => Tab::new().label(i18n::t("member-editor-tab")),
-                    RightTab::Member(name) => {
-                        Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
-                    }
-                    #[cfg(feature = "harness-manox")]
-                    RightTab::Subagent(id) => {
-                        let root_thread_id = self.thread.read(cx).id.0.clone();
-                        let label = self
-                            .subagent_sessions
-                            .get(&root_thread_id)
-                            .and_then(|session| session.records.get(id))
-                            .map(|record| subagent_display_title(&record.info))
-                            .unwrap_or_else(|| i18n::t("subagent-tab-fallback").to_string());
-                        Tab::new().label(label)
-                    }
-                    #[cfg(not(feature = "harness-manox"))]
-                    RightTab::Subagent(_) => Tab::new(),
                     RightTab::Browser(id) => {
                         let url = self
                             .browser_views
@@ -7295,16 +4667,12 @@ impl Workspace {
                             .unwrap_or_default();
                         Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
                     }
-                    RightTab::PlanPreview => Tab::new().label(i18n::t("plan-card-title")),
                 };
                 // Every observational/preview tab carries a close affordance;
                 // the Editor tab keeps its keyboard toggle (`ToggleEditor` /
                 // `CloseEditor`).
                 match tab {
-                    RightTab::Member(_)
-                    | RightTab::Subagent(_)
-                    | RightTab::Browser(_)
-                    | RightTab::PlanPreview => base.suffix(
+                    RightTab::Browser(_) => base.suffix(
                         gpui::div()
                             .id(("right-tab-close", ix))
                             .cursor_pointer()
@@ -7419,67 +4787,11 @@ impl Workspace {
                                     .into_any_element()
                             })
                             .into_any_element(),
-                        #[cfg(feature = "harness-manox")]
-                        Some(RightTab::Member(name)) => self
-                            .member_panels
-                            .get(&name)
-                            .map(|p| p.clone().into_any_element())
-                            .unwrap_or_else(|| gpui::div().into_any_element()),
-                        #[cfg(not(feature = "harness-manox"))]
-                        Some(RightTab::Member(_)) => gpui::div().into_any_element(),
-                        #[cfg(feature = "harness-manox")]
-                        Some(RightTab::Subagent(id)) => {
-                            let root_thread_id = self.thread.read(cx).id.0.clone();
-                            self.subagent_sessions
-                                .get(&root_thread_id)
-                                .and_then(|session| session.records.get(&id))
-                                .map(|record| record.panel.clone().into_any_element())
-                                .unwrap_or_else(|| gpui::div().into_any_element())
-                        }
-                        #[cfg(not(feature = "harness-manox"))]
-                        Some(RightTab::Subagent(_)) => gpui::div().into_any_element(),
                         Some(RightTab::Browser(id)) => self
                             .browser_views
                             .get(&id)
                             .map(|v| v.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
-                        Some(RightTab::PlanPreview) => {
-                            let text = self.plan_preview_text.clone().unwrap_or_default();
-                            let theme = cx.theme().clone();
-                            let scroll = self.editor_preview_scroll.clone();
-                            v_flex()
-                                .h_full()
-                                .child(
-                                    h_flex().w_full().px_2().child(
-                                        TabBar::new("plan-preview-tabs")
-                                            .underline()
-                                            .small()
-                                            .selected_index(1)
-                                            .child("Write")
-                                            .child("Preview"),
-                                    ),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .id("plan-preview-scroll")
-                                        .w_full()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .overflow_y_scroll()
-                                        .track_scroll(&scroll)
-                                        .child(
-                                            gpui::div().w_full().p_4().child(
-                                                cx.new(|_cx| {
-                                                    Markdown::new("plan-preview", text)
-                                                        .theme(&theme)
-                                                        .heading_mode(HeadingMode::Uniform)
-                                                })
-                                                .into_any_element(),
-                                            ),
-                                        ),
-                                )
-                                .into_any_element()
-                        }
                         None => gpui::div().into_any_element(),
                     }),
             );
@@ -7699,8 +5011,7 @@ impl Workspace {
                                                     .min_w_0()
                                                     .truncate()
                                                     .child(title_text),
-                                            )
-                                            .child(self.render_title_menu_trigger(&theme, cx)),
+                                            ),
                                     )
                                     .child(h_flex()),
                             ),
@@ -7888,46 +5199,6 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
     }
 }
 
-/// Format a `Duration` as a compact elapsed-time string for the goal chip
-/// (`42s`, `3m 42s`, `1h 5m`). Not localized — the format is universal.
-#[cfg(feature = "harness-manox")]
-fn format_elapsed(d: std::time::Duration) -> String {
-    let total_secs = d.as_secs();
-    let h = total_secs / 3600;
-    let m = (total_secs % 3600) / 60;
-    let s = total_secs % 60;
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// One label/value row in the goal status popover.
-#[cfg(feature = "harness-manox")]
-fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla) -> gpui::Div {
-    h_flex()
-        .w_full()
-        .items_start()
-        .gap_2()
-        .child(
-            gpui::div()
-                .min_w(px(96.))
-                .text_xs()
-                .text_color(muted)
-                .child(label.to_string()),
-        )
-        .child(
-            gpui::div()
-                .min_w_0()
-                .flex_1()
-                .text_xs()
-                .text_color(fg)
-                .child(value.to_string()),
-        )
-}
 /// Build the 3-tier approval `PopupMenu`:
 ///   - title row: localized question + a "Learn more" link on the right
 ///   - three selectable rows (icon + title + subtitle, check on the right)
@@ -8083,109 +5354,4 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
-}
-
-/// Append a deferred follow-up to a parked thread without touching the
-/// foreground conversation view. The canonical history is rebuilt when the
-/// user switches back to this task.
-#[cfg(feature = "harness-manox")]
-fn append_deferred_turn_to_thread(
-    thread: &Entity<ThreadEntity>,
-    turn: DeferredUserTurn,
-    cx: &mut Context<Workspace>,
-) {
-    use agent::language_model::MessageContent;
-
-    thread.update(cx, |thread, cx| {
-        if turn.images.is_empty() {
-            thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui), cx);
-        } else {
-            let mut content = Vec::with_capacity(turn.images.len() + 1);
-            if !turn.text.trim().is_empty() {
-                content.push(MessageContent::Text(turn.text));
-            }
-            content.extend(turn.images);
-            thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui), cx);
-        }
-    });
-}
-
-#[cfg(test)]
-#[cfg(feature = "harness-manox")]
-mod tests {
-    use super::*;
-
-    fn visual_axis(window_width: Pixels, layout: TurnNavigatorLayout) -> Pixels {
-        layout.left_inset + (window_width - layout.left_inset - layout.right_inset) / 2.
-    }
-
-    #[test]
-    fn turn_navigator_centers_on_conversation_without_context_rail() {
-        let window_width = px(960.);
-        let layout = turn_navigator_layout(window_width, px(260.), None, false);
-
-        assert_eq!(layout.left_inset, px(266.));
-        assert_eq!(layout.right_inset, px(0.));
-        assert_eq!(visual_axis(window_width, layout), px(613.));
-    }
-
-    #[test]
-    fn turn_navigator_centers_on_conversation_with_context_rail() {
-        let window_width = px(960.);
-        let layout = turn_navigator_layout(window_width, px(260.), None, true);
-
-        assert_eq!(layout.right_inset, px(296.));
-        assert_eq!(visual_axis(window_width, layout), px(465.));
-    }
-
-    #[test]
-    fn turn_navigator_accounts_for_resized_sidebar_and_right_pane() {
-        let window_width = px(1440.);
-        let layout = turn_navigator_layout(window_width, px(320.), Some(px(480.)), false);
-
-        assert_eq!(layout.left_inset, px(326.));
-        assert_eq!(layout.right_inset, px(486.));
-        assert_eq!(visual_axis(window_width, layout), px(640.));
-        assert_eq!(layout.panel_width, px(480.));
-    }
-
-    #[test]
-    fn turn_navigator_keeps_twelve_pixel_margins_in_narrow_conversation() {
-        let layout = turn_navigator_layout(px(600.), px(260.), None, false);
-
-        assert_eq!(layout.panel_width, px(310.));
-    }
-
-    #[test]
-    fn subagent_tabs_deduplicate_and_focus_by_tool_use_id() {
-        let mut tabs = vec![RightTab::Editor];
-        let first = ensure_subagent_tab(&mut tabs, "agent-a");
-        let repeated = ensure_subagent_tab(&mut tabs, "agent-a");
-        let second = ensure_subagent_tab(&mut tabs, "agent-b");
-
-        assert_eq!(first, repeated);
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
-        assert_eq!(tabs.len(), 3);
-        assert!(matches!(&tabs[1], RightTab::Subagent(id) if id == "agent-a"));
-        assert!(matches!(&tabs[2], RightTab::Subagent(id) if id == "agent-b"));
-    }
-
-    #[test]
-    fn clearing_subagent_tabs_preserves_peer_tabs_and_reseats_active() {
-        let mut tabs = vec![
-            RightTab::Editor,
-            RightTab::Subagent("agent-a".into()),
-            RightTab::PlanPreview,
-            RightTab::Subagent("agent-b".into()),
-        ];
-        let mut active = 3;
-
-        remove_subagent_tabs(&mut tabs, &mut active);
-
-        assert_eq!(tabs.len(), 2);
-        assert!(matches!(tabs[0], RightTab::Editor));
-        assert!(matches!(tabs[1], RightTab::PlanPreview));
-        assert_eq!(active, 1);
-    }
 }

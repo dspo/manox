@@ -32,17 +32,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-#[cfg(not(feature = "harness-manox"))]
 use agent::thread::{Thread, ThreadEvent};
-use agent::webview_host::{
-    BrowserHost, BrowserInboundWrite as AgentInboundWrite,
-    BrowserNotification as AgentNotification, BrowserTabId,
-};
-#[cfg(feature = "harness-manox")]
-use harness_manox::thread::{Thread, ThreadEvent};
+use agent::webview_host::{BrowserHost, BrowserNotification as AgentNotification, BrowserTabId};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;
@@ -56,10 +50,7 @@ pub(crate) enum HostMessage {
         tab_id: BrowserTabId,
         notification: AgentNotification,
     },
-    InboundWrite {
-        tab_id: BrowserTabId,
-        write: AgentInboundWrite,
-    },
+    InboundWrite,
 }
 
 /// Per-tab routing + pending-oneshot state. Lives in the host's table for the
@@ -98,11 +89,6 @@ pub struct WorkspaceBrowserHost {
 }
 
 static HOST: OnceLock<Arc<WorkspaceBrowserHost>> = OnceLock::new();
-
-/// Process-wide counter allocating unique inbound-write request ids. Globally
-/// unique → unique per-thread (a thread's `pending_inbound` map is keyed by
-/// this id).
-static NEXT_INBOUND_ID: AtomicU64 = AtomicU64::new(1);
 
 impl WorkspaceBrowserHost {
     /// Construct the host bound to the main `Workspace`. Returns the host and
@@ -216,42 +202,10 @@ impl WorkspaceBrowserHost {
                         });
                     });
                 }
-                HostMessage::InboundWrite { tab_id, write } => {
-                    let thread = routes
-                        .tabs
-                        .lock()
-                        .expect("routes lock poisoned")
-                        .get(&tab_id)
-                        .and_then(|t| t.thread.upgrade());
-                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-                    let Some(thread) = thread else {
-                        continue;
-                    };
-                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-                    let id = format!(
-                        "inbound-{}",
-                        NEXT_INBOUND_ID.fetch_add(1, Ordering::Relaxed)
-                    );
-                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-                    let (tx_inbound, rx_inbound) = oneshot::channel::<bool>();
-                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-                    let intent = write.intent.clone();
-                    #[cfg_attr(feature = "harness-pi", allow(unused_variables))]
-                    let payload = write.payload.clone();
-                    #[cfg(feature = "harness-manox")]
-                    thread.update(cx, |t, cx| {
-                        t.register_inbound(id.clone(), intent, payload, tx_inbound, cx);
-                    });
-                    // Park the decision await off the drainer loop. No inbound
-                    // intent is registered yet, so the decision is observed but
-                    // not acted on — the parked `Task` is the forward-compat
-                    // hook for a future write surface, and resolves cleanly
-                    // when the overlay (or a tab close / thread release)
-                    // drops the sender.
-                    cx.background_spawn(async move {
-                        let _ = rx_inbound.await;
-                    })
-                    .detach();
+                HostMessage::InboundWrite => {
+                    // Inbound-write confirmation was manox-harness chrome;
+                    // the pi backend has no write surface for browser pages
+                    // yet, so the request is observed and dropped.
                 }
             }
         }
@@ -392,85 +346,6 @@ impl WorkspaceBrowserHost {
             .remove(&label);
     }
 
-    /// Resolve a parked `yield_to_user` from the GPUI chrome (the yield banner's
-    /// "Done" button). Takes the pending oneshot — the parked `Task` resumes —
-    /// and retires the banner. No-op when no yield is parked (e.g. the user
-    /// clicks Done twice, or the yield already resolved via Stop cleanup).
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    pub(crate) fn resolve_handback(&self, id: BrowserTabId, cx: &mut App) {
-        if let Some(tab) = self
-            .routes
-            .tabs
-            .lock()
-            .expect("routes lock poisoned")
-            .get(&id)
-            && let Some(sender) = tab
-                .pending_yield
-                .lock()
-                .expect("pending_yield lock poisoned")
-                .take()
-        {
-            let _ = sender.send(());
-        }
-        if let Some(ws) = self.weak_ws.upgrade() {
-            ws.update(cx, |ws, cx| {
-                if let Some(view) = ws.browser_views.get(&id).cloned() {
-                    view.update(cx, |v, cx| v.set_yielded(false, cx));
-                }
-            });
-        }
-    }
-
-    /// Retire every outstanding yield owned by the workspace's thread — called
-    /// from the workspace Stop/Error handler so a stopped turn leaves no parked
-    /// yield or stale banner behind. Dropping each pending sender resolves the
-    /// parked `Task` with a cancellation error; the banner is cleared on the
-    /// live view.
-    ///
-    /// Invoked from within the `Workspace` subscribe callback, which already
-    /// holds a lease on the `Workspace` entity. Re-entering it via
-    /// `self.weak_ws.update(cx, ..)` would double-lease the same entity and
-    /// trip GPUI's `double_lease_panic` (the browser-turn crash). The caller
-    /// therefore passes the already-leased `&mut Workspace` in directly; the
-    /// owning thread id is read off `ws.thread`, and only the per-tab
-    /// `BrowserView` entities are leased here — they are distinct from
-    /// `Workspace`.
-    #[cfg_attr(feature = "harness-pi", allow(dead_code))]
-    pub(crate) fn clear_yields_for_thread(&self, ws: &mut Workspace, cx: &mut Context<Workspace>) {
-        let owner_id = ws.thread.entity_id();
-        let owned: Vec<BrowserTabId> = self
-            .routes
-            .tabs
-            .lock()
-            .expect("routes lock poisoned")
-            .iter()
-            .filter(|(_, t)| {
-                t.thread
-                    .upgrade()
-                    .is_some_and(|owner| owner.entity_id() == owner_id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in owned {
-            if let Some(tab) = self
-                .routes
-                .tabs
-                .lock()
-                .expect("routes lock poisoned")
-                .get(&id)
-            {
-                let _ = tab
-                    .pending_yield
-                    .lock()
-                    .expect("pending_yield lock poisoned")
-                    .take();
-            }
-            if let Some(view) = ws.browser_views.get(&id).cloned() {
-                view.update(cx, |v, cx| v.set_yielded(false, cx));
-            }
-        }
-    }
-
     /// Flag the tab's view that a read exposed its content to the agent — a
     /// transparency hint, only on authenticated (https) origins. Http origins
     /// carry no credential worth flagging. Idempotent; cleared by navigation.
@@ -571,23 +446,17 @@ fn handle_inbound(
     routes: &Arc<Routes>,
     tx: &Sender<HostMessage>,
     label: String,
-    w: WvInboundWrite,
+    _w: WvInboundWrite,
 ) {
-    let tab_id = match routes
+    let known = routes
         .label_to_tab
         .lock()
         .expect("routes lock poisoned")
-        .get(&label)
-        .copied()
-    {
-        Some(id) => id,
-        None => return,
-    };
-    let write = AgentInboundWrite {
-        intent: w.intent,
-        payload: w.payload,
-    };
-    if let Err(e) = tx.try_send(HostMessage::InboundWrite { tab_id, write }) {
+        .contains_key(&label);
+    if !known {
+        return;
+    }
+    if let Err(e) = tx.try_send(HostMessage::InboundWrite) {
         tracing::warn!(error = %e, "browser host: inbound channel full, dropping inbound-write request");
     }
 }

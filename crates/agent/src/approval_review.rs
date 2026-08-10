@@ -3,12 +3,10 @@
 //! The reviewer vets tool calls that would otherwise prompt the user. This
 //! module owns the prompt construction, the timeout/cancellation race, and
 //! the verdict parsing; the actual model call is injected as a [`ReviewerFn`]
-//! closure so each harness backend adapts its own call machinery:
+//! closure so the harness backend adapts its own call machinery:
 //!
 //! - pi harness (`pi_approval`): the closure streams through the session
 //!   model's `StreamFn` resolved from the `ModelRuntime`.
-//! - retired manox harness (`harness-manox::approval_review`): the closure
-//!   adapts `AnyLanguageModel::stream_completion`.
 //!
 //! Failures (reviewer unavailable, timeout, malformed response) **all**
 //! downgrade to [`ReviewVerdict::Ask`] — the reviewer is fail-closed so a

@@ -6,9 +6,6 @@
 //! Environment). Items with no matching panel fall back to a "Coming soon…"
 //! placeholder, matching the pre-panels behavior.
 
-#[cfg_attr(feature = "harness-pi", allow(unused_imports))]
-use std::collections::HashSet;
-
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, Render, SharedString,
     Window, ease_out_quint, prelude::*, px,
@@ -20,12 +17,8 @@ use gpui_component::{
 };
 
 use agent::{i18n, settings as user_settings};
-#[cfg(feature = "harness-manox")]
-use harness_manox::mcp;
 
 use crate::views::management_shell::back_control;
-#[cfg(feature = "harness-manox")]
-use crate::views::plugin_manager::PluginManagerView;
 
 mod models;
 mod panels;
@@ -67,8 +60,6 @@ const GROUPS: &[SettingsGroup] = &[
         items: &[
             SettingsItem::new(IconName::Bot, "settings-item-snapshots", None),
             SettingsItem::new(IconName::Frame, "settings-item-plugins", None),
-            #[cfg(feature = "harness-manox")]
-            SettingsItem::new(IconName::ChartPie, "settings-item-mcp", None),
             SettingsItem::new(IconName::Globe, "settings-item-browser", None),
             SettingsItem::new(IconName::Ellipsis, "settings-item-computer", None),
         ],
@@ -147,12 +138,6 @@ const MOCK_PROJECTS: &[MockProject] = &[
 pub struct SettingsView {
     search: Entity<InputState>,
 
-    /// Plugin/marketplace/skill/MCP management view, rendered in the right pane
-    /// when the "Plugins" item is selected. Owned here rather than as a
-    /// top-level Workspace mode so plugins live under Settings → Integrations.
-    #[cfg(feature = "harness-manox")]
-    plugins: Entity<PluginManagerView>,
-
     /// Sidebar item currently highlighted. Stable fluent message id (e.g.
     /// `"settings-item-general"`) so it survives locale switches.
     selected: Option<SharedString>,
@@ -198,14 +183,6 @@ pub struct SettingsView {
     personality: SharedString,
     memory_enabled: bool,
     memory_skip_tool: bool,
-
-    // --- MCP panel state ---
-    /// Servers currently "on" in the UI. The toggle is visual only — the
-    /// actual set of connected servers is determined by `mcp.toml` on the
-    /// next launch — so this set is seeded from the disk config and grown
-    /// as new servers appear.
-    #[cfg(feature = "harness-manox")]
-    mcp_enabled: HashSet<String>,
     // --- Environment panel state ---
     // Mock project list is static; no per-view state needed.
 }
@@ -222,19 +199,8 @@ impl SettingsView {
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder"))
         });
-        // Seed MCP enabled set from the on-disk config so every configured
-        // server starts in the "on" position.
-        #[cfg(feature = "harness-manox")]
-        let mut mcp_enabled = HashSet::new();
-        #[cfg(feature = "harness-manox")]
-        for name in mcp::config::load_global().mcp_servers.keys() {
-            mcp_enabled.insert(name.clone());
-        }
-
         Self {
             search,
-            #[cfg(feature = "harness-manox")]
-            plugins: cx.new(|cx| PluginManagerView::new(window, cx)),
             selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
@@ -269,8 +235,6 @@ impl SettingsView {
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
-            #[cfg(feature = "harness-manox")]
-            mcp_enabled,
         }
     }
 
@@ -551,13 +515,9 @@ impl SettingsView {
             Some("settings-item-personalization") => {
                 panels::render_personalization(self, cx).into_any_element()
             }
-            #[cfg(feature = "harness-manox")]
-            Some("settings-item-mcp") => panels::render_mcp(self, cx).into_any_element(),
             Some("settings-item-environment") => {
                 panels::render_environment(self, cx).into_any_element()
             }
-            #[cfg(feature = "harness-manox")]
-            Some("settings-item-plugins") => self.plugins.clone().into_any_element(),
             _ => {
                 let coming_label: SharedString = match key {
                     Some(label) => {

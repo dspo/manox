@@ -9,7 +9,6 @@ sidebar-search = 搜索
 sidebar-scheduled = 已安排
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
-sidebar-section-external = 外部
 sidebar-new-session-label = 新建会话
 sidebar-new-session-manox = Manox
 sidebar-close-external = 关闭会话
@@ -29,28 +28,12 @@ message-reasoning = 思考
 message-error = 错误
 message-notice = 通知
 message-team = 团队消息
-member-running = 运行中
-member-idle = 空闲
-member-disbanded = 已离线
-member-tasks = 任务
-member-tasks-mine = 我的
-member-tasks-unassigned = 未分配
-member-no-tasks = 暂无任务
-member-tab = { $name }
 member-editor-tab = 编辑器
 browser-tab = { $url }
 browser-address-placeholder = 输入网址
 browser-yield-hint = 已让出控制权（例如用于登录）。完成后请点此。
 browser-yield-complete = 完成
 browser-read-hint = Agent 正在读取本页 —— 页面中已登录的内容将暴露给 agent。
-member-close-tab = 关闭标签页
-team-chip = 团队 · { $count }
-team-drawer-title = 团队
-team-drawer-empty = 暂无成员
-team-drawer-tasks = { $count ->
-    [one] { $count } 个任务
-   *[other] { $count } 个任务
-}
 message-user-role = 你
 recap-card-title = 上下文已压缩
 cache-miss-label = 缓存未命中 · { $tokens } tokens
@@ -65,9 +48,6 @@ status-denied = 已拒绝
 status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
-context-agents-title = 智能体
-subagent-panel-read-only = 只读
-subagent-tab-fallback = 智能体
 thinking-tool-result = 工具结果
 thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件
@@ -80,7 +60,6 @@ thinking-globbing = 匹配 { $count } 个 glob
 thinking-listing = 列出 { $count } 个目录
 thinking-other = { $count } 个其他工具
 thinking-rounds = 思考了 { $count } 轮次
-thinking-files-read = 读取了 { $count } 个文件
 thinking-tool-calls = 调用了 { $count } 次工具
 thinking-duration = { $count } 秒
 
@@ -96,7 +75,6 @@ settings-item-keyboard = 键盘快捷键
 settings-group-integrations = 集成
 settings-item-snapshots = 应用快照
 settings-item-plugins = 插件
-settings-item-mcp = MCP 服务器
 settings-item-browser = 浏览器
 settings-item-computer = 电脑操控
 settings-group-coding = 编码
@@ -115,7 +93,6 @@ settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 
 ### views/settings.rs — 常规面板
-settings-panel-general = 常规
 settings-section-work-mode = 工作模式
 settings-desc-work-mode = 选择 manox 显示多少技术细节
 settings-row-work-mode-programming = 适用于编程
@@ -184,10 +161,6 @@ settings-row-toggle-dictate = 切换听写快捷键
 settings-desc-toggle-dictate = 在桌面任意位置按一次开始听写，再按一次停止
 settings-row-keep-dictation-bar = 保持听写栏可见
 settings-desc-keep-dictation-bar = 听写未激活时显示小型快捷键提醒
-settings-row-dictation-dictionary = 听写词典
-settings-desc-dictation-dictionary = 听写应能识别的单词或短语
-settings-row-dictation-history = 最近的听写记录
-settings-desc-dictation-history = 你最近的听写记录会显示在这里，便于在文本没有出现在预期位置时查找内容
 settings-value-off = 关闭
 settings-value-on = 开启
 
@@ -205,7 +178,6 @@ settings-panel-config = 配置
 settings-desc-config-top = 配置审批策略和沙盒设置
 settings-section-config-toml = 自定义 config.toml 设置
 settings-row-config-user = 用户配置
-settings-btn-open = 打开
 settings-link-open-config = 打开 config.toml
 settings-row-config-approval = 批准策略
 settings-desc-config-approval = 选择 manox 何时请求批准
@@ -241,7 +213,6 @@ settings-models-apikey-env = 环境变量
 settings-models-apikey-keychain = Keychain
 settings-models-apikey-shell = shell 命令
 settings-models-section-env = 环境变量
-settings-models-add-env = 环境变量
 settings-models-section-endpoints = 端点配置
 settings-models-add-endpoint = 添加端点
 settings-models-row-url = URL
@@ -277,13 +248,10 @@ settings-models-err-number = Provider「{$name}」模型「{$id}」：「{$field
 settings-models-err-env-key = Provider「{$name}」：环境变量名不能为空
 
 ### views/settings.rs — 个性化面板
-settings-panel-personalization = 个性化
 settings-section-personality = 个性
 settings-row-personality = 个性
 settings-desc-personality = 选择 manox 回复的默认语气
 settings-value-friendly = 亲和
-
-settings-btn-save = 保存
 
 settings-section-memory = 记忆
 settings-tag-experimental = 实验性
@@ -297,85 +265,12 @@ settings-row-memory-reset = 重置记忆
 settings-desc-memory-reset = 删除所有 manox 记忆
 
 ### views/settings.rs — MCP 面板
-settings-panel-mcp = MCP 服务器
-settings-desc-mcp = 连接外部工具和数据源
-settings-empty-mcp = 尚未配置任何 MCP 服务器。点击"添加服务器"注册一个。
-settings-section-mcp-servers = 服务器
-settings-btn-add-server = + 添加服务器
-settings-section-mcp-plugins = 来自插件
-settings-row-mcp-plugin-name = manox_apps
-
 ### views/plugin_manager.rs
-plugins-title = 插件
-plugins-search-placeholder = 搜索插件、技能、MCP…
-plugins-tab-marketplace = 市场
-plugins-tab-plugin = 插件
-plugins-tab-skill = 技能
-plugins-tab-mcp = MCP
-plugins-busy = 正在处理…
-plugins-new = 新建
-plugins-edit = 编辑
-plugins-view = 查看
-plugins-copy = 复制
-plugins-select = 选择
-plugins-delete = 删除
-plugins-update = 更新
-plugins-install = 安装
-plugins-uninstall = 卸载
-plugins-installed = 已安装
-plugins-not-installed = 未安装
-plugins-enabled = 已启用
-plugins-disabled = 已禁用
-plugins-enable = 启用
-plugins-disable = 禁用
-plugins-description = 描述
-
-plugins-marketplace-url = Git URL，例如 https://github.com/org/marketplace.git
-plugins-add-marketplace = 添加市场
-plugins-marketplace-count = {$count} 个插件
-plugins-marketplace-detail = {$name} 插件
-plugins-empty-marketplaces = 尚无市场。
-plugins-empty-marketplace-selection = 选择一个市场来管理其中的插件。
-plugins-empty-marketplace-plugins = 此市场没有插件。
-plugins-empty-installed = 尚未安装插件。
-plugins-error-marketplace-url = 请输入市场 Git URL。
-plugins-notice-marketplace-added = 市场已添加。
-plugins-notice-marketplace-updated = 市场已更新。
-plugins-notice-marketplace-removed = 市场已删除。
-plugins-notice-plugin-installed = 插件已安装。重启 manox 后会加载新注册的工具、技能、agent、hook 和 MCP 服务器。
-plugins-notice-plugin-removed = 插件已移除。重启 manox 后会卸载启动时加载的运行时注册表。
-plugins-notice-plugin-enabled = 插件已启用。重启 manox 后会加载其工具、技能、agent、hook 和 MCP 服务器。
-plugins-notice-plugin-disabled = 插件已禁用。重启 manox 后会卸载启动时加载的运行时注册表。
-
-plugins-skill-new = 新建用户技能
-plugins-skill-edit = 编辑用户技能
-plugins-skill-name = 技能名称
-plugins-skill-body = 技能正文
-plugins-origin-user = 用户技能
-plugins-origin-plugin = 插件：{$name}
-plugins-empty-skills = 尚无技能。
-plugins-notice-skill-saved = 技能已保存。重启 manox 或启动新进程后，模型可见的技能注册表会刷新。
-plugins-notice-skill-removed = 技能已删除。重启 manox 或启动新进程后，模型可见的技能注册表会刷新。
-
-plugins-mcp-new = 新建 MCP 服务器
-plugins-mcp-edit = 编辑 MCP 服务器
-plugins-mcp-name = 服务器名称
-plugins-mcp-command = 命令，例如 npx
-plugins-mcp-args = 参数，以空格分隔
-plugins-mcp-url = Streamable HTTP URL
-plugins-mcp-user = 用户 mcp.toml
-plugins-mcp-plugin = 插件声明的 MCP
-plugins-empty-mcp = 尚未配置用户 MCP 服务器。
-plugins-empty-plugin-mcp = 尚未发现插件声明的 MCP 服务器。
-plugins-notice-mcp-saved = MCP 服务器已保存到 mcp.toml。重启 manox 后会连接它。
-plugins-notice-mcp-removed = MCP 服务器已从 mcp.toml 删除。已在启动时加载的服务器需重启 manox 后断开。
-
 ### views/settings.rs — 环境面板
 settings-panel-environment = 环境
 settings-desc-environment = 本地环境用于指示 manox 如何为项目设置工作树
 settings-section-projects = 选择项目
 settings-btn-add-project = 添加项目
-settings-row-project = {$name}
 settings-tag-saas = saas
 settings-tag-dspo = dspo
 
@@ -383,7 +278,6 @@ settings-tag-dspo = dspo
 workspace-input-placeholder = 输入消息，点击发送以开始使用
 workspace-composer-placeholder = 编写 markdown…（Cmd-Enter 发送）
 workspace-unknown-command = 未知命令：/{$name}（用 `/` 菜单查看已安装命令）
-workspace-unknown-skill = 未知技能：/{$name}（用 `/` 菜单查看已安装技能）
 workspace-no-model = 未配置模型
 workspace-approval-title = 工具调用审批
 workspace-escalation-allow-once = 允许一次
@@ -393,20 +287,11 @@ workspace-escalation-always-allow-desc = 本次会话内始终允许该工具。
 workspace-escalation-deny = 拒绝
 workspace-escalation-deny-desc = 拒绝执行；原因将返回给模型。
 workspace-escalation-no-verdict-reason = 安全审查器未对此次调用运行。
-workspace-queued = （队列中还有 {$count} 个待审批）
-workspace-inbound-title = 内置浏览器请求操作 Manox
-workspace-inbound-intent = 请求：{$intent}
-workspace-inbound-note = 该请求恒为确认，不受审批模式影响 —— 网页不得在未确认时驱动 agent。
-workspace-inbound-allow = 允许
-workspace-inbound-deny = 拒绝
 workspace-clarify-title = 澄清问题
 workspace-ask-supplement-label = 补充说明
 workspace-ask-supplement-placeholder = 添加可选补充说明
 workspace-ask-recommended = 推荐
 workspace-cancel = 取消
-workspace-submit = 提交
-workspace-mode-normal = 普通
-workspace-mode-section = 模式
 workspace-mode-autopilot-title = 自动驾驶
 workspace-mode-autopilot-desc = 安全审查器自动批准安全工具调用，风险操作将被拒绝
 workspace-mode-danger-title = 危险驾驶
@@ -427,21 +312,13 @@ workspace-project-blank = 新建空白项目
 workspace-project-select-folder = 选择文件夹
 workspace-project-name-prompt = 项目文件夹名称
 workspace-empty-prompt = 我们该做什么？
-workspace-provider-reload-failed = 重新加载 provider 配置失败，已保留原有 providers：{$error}
-
 ### views/composer_menu.rs
 composer-add-label = 添加
 composer-plugins-label = 插件
-composer-commands-label = 命令
-composer-memory-label = 记忆
-composer-skills-label = 技能
 composer-add-files = 文件和文件夹
 composer-attach-editor = 附加编辑器
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
-composer-generate-memory = 生成开
-composer-tag-personal = 个人
-composer-tag-system = 系统
 completion-tag-command = 命令
 completion-tag-skill = 技能
 completion-tag-agent = Agent
@@ -455,42 +332,14 @@ turn-navigator-empty-message = 空消息
 turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
-slash-danger-desc = 切换到危险驾驶（免审批 + bash 沙箱外）；带提示词则切换后直接开工
-slash-plan-desc = 强烈提示深入探索并以 <proposed_plan> 块产出计划；裸 `/plan` 引导规划，`/plan <提示>` 按你的提示规划
-slash-goal-desc = 创建或管理持久目标（`/goal <目标>`、pause、resume、edit、clear）
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
 slash-exit-desc = 归档当前会话并开始一个新会话
 slash-new-desc = 归档当前会话并开始新会话，保留项目、驾驶模式与模型
-workspace-chip-goal-active = 目标进行中
-goal-popover-title = 目标
-goal-popover-objective = 目标内容
-goal-popover-status = 状态
-goal-popover-elapsed = 已运行
-goal-popover-reason = 状态原因
-goal-popover-tokens = 已用 token
-goal-popover-budget = token 预算
-goal-popover-remaining = 剩余 token
-goal-popover-pause = 暂停
-goal-popover-resume = 恢复
-goal-popover-edit = 编辑
-goal-popover-edit-budget = 编辑预算
-goal-popover-replace = 替换
-goal-popover-new = 新建目标
-goal-popover-clear = 清除目标
-goal-status-active = 目标进行中
-goal-status-paused = 目标已暂停
-goal-status-blocked = 目标受阻
-goal-status-budget-limited = 目标已达预算
-goal-status-complete = 目标已完成
-
 ### main.rs (system menus)
 menu-settings = Settings…
 menu-quit = 退出
 menu-open-manox = 打开 Manox
 menu-file = File
-menu-terminal = 终端
-menu-new-terminal = 新建终端标签页
-menu-close-terminal = 关闭终端标签页
 menu-about = 关于 Manox
 menu-tools = 工具
 menu-vscode-plain = 打开
@@ -505,13 +354,10 @@ vscode-app-launched-plain = 已启动 VS Code
 vscode-app-launch-failed = 启动 VS Code 失败
 
 ### terminal-ui (overlay status / search)
-terminal-placeholder = 终端运行中… 输入以交互
 terminal-starting = 正在启动…
-terminal-exited = 终端已退出，退出码 { $code }
 terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）
 
 ### views/title_menu.rs
-titlebar-menu-label = 对话
 titlebar-pin = 置顶会话
 titlebar-unpin = 取消置顶
 titlebar-archive = 归档对话
@@ -527,18 +373,7 @@ titlebar-branch-from-here = 从当前消息分支
 titlebar-branch-from-start = 从对话起点分支
 titlebar-schedule = 添加计划任务...
 titlebar-new-window = 在新窗口中打开
-titlebar-copied-id = 会话 ID 已复制到剪贴板。
-titlebar-copied-cwd = 工作目录已复制到剪贴板。
-titlebar-copied-deeplink = 深度链接已复制到剪贴板（manox://thread/{ $id }）。
-titlebar-copied-markdown = 会话已复制为 Markdown 到剪贴板。
-titlebar-pinned-notice = 会话已置顶。
-titlebar-unpinned-notice = 会话已取消置顶。
-titlebar-archive-notice = 会话已归档。
-titlebar-unarchive-notice = 会话已取消归档。
-titlebar-not-implemented = 尚未实现。
-
 # ── 环境信息面板 ──────────────────────────────────────────────────────
-workspace-env-changes = 变更
 workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
 workspace-env-sources = 来源
@@ -555,16 +390,9 @@ context-rail-title = 对话信息
 context-tooltip-main-calls = 主调用
 context-tooltip-side-calls = 辅助调用
 context-tooltip-calls-unit = 次
-context-side-calls-title = 辅助调用
-context-side-calls-row = {$purpose} · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
-context-main-calls-row = 主调用 · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
-
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
 # 运行状态行的阶段标签（三状态 tag：生成中 / 思考中 / 待输入）。
-cockpit-status-thinking = 思考中
-cockpit-status-streaming = 生成中
 # "待输入"标签归并 idle / stopped / failed / awaiting approval。
-cockpit-status-awaiting-input = 待输入
 # 计划区段标题。
 cockpit-milestones-header = 计划
 # 计划进度计数，显示在标题栏右侧。{$done}/{$total} 为已完成/总数。
@@ -582,15 +410,7 @@ queued-delete-action = 移除
 queued-more-action = 更多
 message-steer-pending-badge = 待引导
 message-steered-badge = 已引导
-plan-card-title = 计划
-plan-card-download = 下载计划
-plan-card-copy = 复制计划
-plan-card-sidebar = 在侧边栏打开
-
 # Plan review card verdict buttons
-plan-drawer-implement = 执行
-plan-drawer-clear = 清空并执行
-
 ### about.rs (About window)
 about-title = 关于 Manox
 about-ok = 确定

@@ -10,7 +10,6 @@ sidebar-search = Search
 sidebar-scheduled = Scheduled
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
-sidebar-section-external = External
 sidebar-new-session-label = New session
 sidebar-new-session-manox = Manox
 sidebar-close-external = Close session
@@ -42,28 +41,12 @@ message-reasoning = Reasoning
 message-error = Error
 message-notice = Notice
 message-team = Team message
-member-running = running
-member-idle = idle
-member-disbanded = gone
-member-tasks = Tasks
-member-tasks-mine = Mine
-member-tasks-unassigned = Unassigned
-member-no-tasks = No tasks
-member-tab = { $name }
 member-editor-tab = Editor
 browser-tab = { $url }
 browser-address-placeholder = Enter URL
 browser-yield-hint = Control yielded to you (e.g. to sign in). Click when done.
 browser-yield-complete = Done
 browser-read-hint = Agent is reading this page — its logged-in content is exposed to the agent.
-member-close-tab = Close tab
-team-chip = team · { $count }
-team-drawer-title = Team
-team-drawer-empty = No members
-team-drawer-tasks = { $count ->
-    [one] { $count } task
-   *[other] { $count } tasks
-}
 message-user-role = You
 recap-card-title = Context compacted
 cache-miss-label = cache miss · { $tokens } tokens
@@ -78,9 +61,6 @@ status-denied = Denied
 status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
-context-agents-title = Agents
-subagent-panel-read-only = Read only
-subagent-tab-fallback = Agent
 thinking-tool-result = tool result
 thinking-reading = { $count ->
     [one] reading {$count} file
@@ -126,10 +106,6 @@ thinking-rounds = { $count ->
     [one] thought {$count} round
    *[other] thought {$count} rounds
 }
-thinking-files-read = { $count ->
-    [one] read {$count} file
-   *[other] read {$count} files
-}
 thinking-tool-calls = { $count ->
     [one] ran {$count} tool call
    *[other] ran {$count} tool calls
@@ -148,7 +124,6 @@ settings-item-keyboard = Keyboard shortcuts
 settings-group-integrations = Integrations
 settings-item-snapshots = App snapshots
 settings-item-plugins = Plugins
-settings-item-mcp = MCP servers
 settings-item-browser = Browser
 settings-item-computer = Computer control
 settings-group-coding = Coding
@@ -167,7 +142,6 @@ settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 
 ### views/settings.rs — General panel
-settings-panel-general = General
 settings-section-work-mode = Work mode
 settings-desc-work-mode = How much technical detail manox shows
 settings-row-work-mode-programming = For programming
@@ -236,10 +210,6 @@ settings-row-toggle-dictate = Toggle dictate shortcut
 settings-desc-toggle-dictate = Press once at any position on the desktop to start dictating, then again to stop
 settings-row-keep-dictation-bar = Keep dictation bar visible
 settings-desc-keep-dictation-bar = Show a small shortcut reminder when dictation is not active
-settings-row-dictation-dictionary = Dictation dictionary
-settings-desc-dictation-dictionary = Words and short phrases dictation should recognize
-settings-row-dictation-history = Recent dictations
-settings-desc-dictation-history = Your recent dictations will be shown here, so you can find content when it did not appear where expected
 settings-value-off = Off
 settings-value-on = On
 
@@ -257,7 +227,6 @@ settings-panel-config = Configuration
 settings-desc-config-top = Configure approval policies and sandbox settings
 settings-section-config-toml = Custom config.toml settings
 settings-row-config-user = User config
-settings-btn-open = Open
 settings-link-open-config = Open config.toml
 settings-row-config-approval = Approval policy
 settings-desc-config-approval = Choose when manox asks for approval
@@ -293,7 +262,6 @@ settings-models-apikey-env = Environment variable
 settings-models-apikey-keychain = Keychain
 settings-models-apikey-shell = Shell command
 settings-models-section-env = Environment variables
-settings-models-add-env = Environment variable
 settings-models-section-endpoints = Endpoint config
 settings-models-add-endpoint = Add endpoint
 settings-models-row-url = URL
@@ -330,13 +298,10 @@ settings-models-err-number = Provider "{$name}", model "{$id}": "{$field}" must 
 settings-models-err-env-key = Provider "{$name}": environment variable name is required
 
 ### views/settings.rs — Personalization panel
-settings-panel-personalization = Personalization
 settings-section-personality = Personality
 settings-row-personality = Personality
 settings-desc-personality = Choose the default tone of manox's replies
 settings-value-friendly = Friendly
-
-settings-btn-save = Save
 
 settings-section-memory = Memory
 settings-tag-experimental = Experimental
@@ -350,85 +315,12 @@ settings-row-memory-reset = Reset memory
 settings-desc-memory-reset = Delete all manox memories
 
 ### views/settings.rs — MCP panel
-settings-panel-mcp = MCP servers
-settings-desc-mcp = Connect external tools and data sources
-settings-empty-mcp = No MCP servers configured. Click "Add server" to register one.
-settings-section-mcp-servers = Servers
-settings-btn-add-server = + Add server
-settings-section-mcp-plugins = From plugins
-settings-row-mcp-plugin-name = manox_apps
-
 ### views/plugin_manager.rs
-plugins-title = Plugins
-plugins-search-placeholder = Search plugins, skills, MCP…
-plugins-tab-marketplace = Marketplace
-plugins-tab-plugin = Plugin
-plugins-tab-skill = Skill
-plugins-tab-mcp = MCP
-plugins-busy = Working…
-plugins-new = New
-plugins-edit = Edit
-plugins-view = View
-plugins-copy = Copy
-plugins-select = Select
-plugins-delete = Delete
-plugins-update = Update
-plugins-install = Install
-plugins-uninstall = Uninstall
-plugins-installed = Installed
-plugins-not-installed = Not installed
-plugins-enabled = Enabled
-plugins-disabled = Disabled
-plugins-enable = Enable
-plugins-disable = Disable
-plugins-description = Description
-
-plugins-marketplace-url = Git URL, for example https://github.com/org/marketplace.git
-plugins-add-marketplace = Add marketplace
-plugins-marketplace-count = {$count} plugins
-plugins-marketplace-detail = {$name} plugins
-plugins-empty-marketplaces = No marketplaces found.
-plugins-empty-marketplace-selection = Select a marketplace to manage its plugins.
-plugins-empty-marketplace-plugins = This marketplace has no plugins.
-plugins-empty-installed = No installed plugins.
-plugins-error-marketplace-url = Enter a marketplace Git URL.
-plugins-notice-marketplace-added = Marketplace added.
-plugins-notice-marketplace-updated = Marketplace updated.
-plugins-notice-marketplace-removed = Marketplace removed.
-plugins-notice-plugin-installed = Plugin installed. Restart manox to load newly registered tools, skills, agents, hooks, and MCP servers.
-plugins-notice-plugin-removed = Plugin removed. Restart manox to unload runtime registries that were loaded at startup.
-plugins-notice-plugin-enabled = Plugin enabled. Restart manox to load its tools, skills, agents, hooks, and MCP servers.
-plugins-notice-plugin-disabled = Plugin disabled. Restart manox to unload runtime registries loaded at startup.
-
-plugins-skill-new = New user skill
-plugins-skill-edit = Edit user skill
-plugins-skill-name = Skill name
-plugins-skill-body = Skill body
-plugins-origin-user = User skill
-plugins-origin-plugin = Plugin: {$name}
-plugins-empty-skills = No skills found.
-plugins-notice-skill-saved = Skill saved. Restart manox or start a new process to refresh the model-visible skill registry.
-plugins-notice-skill-removed = Skill removed. Restart manox or start a new process to refresh the model-visible skill registry.
-
-plugins-mcp-new = New MCP server
-plugins-mcp-edit = Edit MCP server
-plugins-mcp-name = Server name
-plugins-mcp-command = Command, for example npx
-plugins-mcp-args = Args, space separated
-plugins-mcp-url = Streamable HTTP URL
-plugins-mcp-user = User mcp.toml
-plugins-mcp-plugin = Plugin-declared MCP
-plugins-empty-mcp = No user MCP servers configured.
-plugins-empty-plugin-mcp = No plugin-declared MCP servers found.
-plugins-notice-mcp-saved = MCP server saved to mcp.toml. Restart manox to connect it.
-plugins-notice-mcp-removed = MCP server removed from mcp.toml. Restart manox to disconnect a server already loaded at startup.
-
 ### views/settings.rs — Environment panel
 settings-panel-environment = Environment
 settings-desc-environment = Local environment for indicating how manox should set up a worktree for a project
 settings-section-projects = Select a project
 settings-btn-add-project = Add project
-settings-row-project = {$name}
 settings-tag-saas = saas
 settings-tag-dspo = dspo
 
@@ -436,7 +328,6 @@ settings-tag-dspo = dspo
 workspace-input-placeholder = Type a message, then send to begin
 workspace-composer-placeholder = Write markdown… (Cmd-Enter to send)
 workspace-unknown-command = Unknown command: /{$name} (open the `/` menu to see installed commands)
-workspace-unknown-skill = Unknown skill: /{$name} (open the `/` menu to see installed skills)
 workspace-no-model = No model configured
 workspace-approval-title = Tool call approval
 workspace-escalation-allow-once = Allow once
@@ -446,20 +337,11 @@ workspace-escalation-always-allow-desc = Allow this tool for the rest of the ses
 workspace-escalation-deny = Deny
 workspace-escalation-deny-desc = Refuse; the reason is returned to the model.
 workspace-escalation-no-verdict-reason = The safety reviewer did not run for this call.
-workspace-queued = ({$count} more queued for approval)
-workspace-inbound-title = Built-in browser wants to act on Manox
-workspace-inbound-intent = Request: {$intent}
-workspace-inbound-note = This request is always confirmed, regardless of approval mode — a web page must never drive the agent unprompted.
-workspace-inbound-allow = Allow
-workspace-inbound-deny = Deny
 workspace-clarify-title = Clarifying question
 workspace-ask-supplement-label = Supplemental note
 workspace-ask-supplement-placeholder = Add optional context
 workspace-ask-recommended = Recommended
 workspace-cancel = Cancel
-workspace-submit = Submit
-workspace-mode-normal = Normal
-workspace-mode-section = Mode
 workspace-mode-autopilot-title = AutoPilot
 workspace-mode-autopilot-desc = A safety reviewer automatically approves safe tool calls; risky ones are denied
 workspace-mode-danger-title = Danger
@@ -480,21 +362,13 @@ workspace-project-blank = Create blank project
 workspace-project-select-folder = Select folder
 workspace-project-name-prompt = Project folder name
 workspace-empty-prompt = What should we do?
-workspace-provider-reload-failed = Failed to reload provider config; keeping previous providers: {$error}
-
 ### views/composer_menu.rs
 composer-add-label = Add
 composer-plugins-label = Plugins
-composer-commands-label = Commands
-composer-memory-label = Memory
-composer-skills-label = Skills
 composer-add-files = Files and folders
 composer-attach-editor = Attach editor
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
-composer-generate-memory = Generate
-composer-tag-personal = Personal
-composer-tag-system = System
 completion-tag-command = Command
 completion-tag-skill = Skill
 completion-tag-agent = Agent
@@ -508,42 +382,14 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
-slash-danger-desc = Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
-slash-plan-desc = Strongly hint to explore deeply and produce a <proposed_plan> block; bare `/plan` nudges planning, `/plan <prompt>` plans against your prompt
 slash-exit-desc = Archive the current thread and start a fresh one
 slash-new-desc = Archive the current thread and start a fresh one that keeps the project, approval mode, and model
-slash-goal-desc = Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
-workspace-chip-goal-active = Goal active
-goal-popover-title = Goal
-goal-popover-objective = Objective
-goal-popover-status = Status
-goal-popover-elapsed = Elapsed
-goal-popover-reason = Reason
-goal-popover-tokens = Tokens used
-goal-popover-budget = Token budget
-goal-popover-remaining = Remaining
-goal-popover-pause = Pause
-goal-popover-resume = Resume
-goal-popover-edit = Edit
-goal-popover-edit-budget = Edit budget
-goal-popover-replace = Replace
-goal-popover-new = New Goal
-goal-popover-clear = Clear goal
-goal-status-active = Goal active
-goal-status-paused = Goal paused
-goal-status-blocked = Goal blocked
-goal-status-budget-limited = Goal budget limited
-goal-status-complete = Goal complete
-
 ### main.rs (system menus)
 menu-settings = Settings…
 menu-quit = Quit
 menu-open-manox = Open Manox
 menu-file = File
-menu-terminal = Terminal
-menu-new-terminal = New Terminal Tab
-menu-close-terminal = Close Terminal Tab
 menu-about = About Manox
 menu-tools = Tools
 menu-vscode-plain = Open
@@ -558,16 +404,13 @@ vscode-app-launched-plain = Launched VS Code
 vscode-app-launch-failed = Failed to launch VS Code
 
 ### terminal-ui (overlay status / search)
-terminal-placeholder = Terminal running… type to interact
 terminal-starting = Starting…
-terminal-exited = Terminal exited with code { $code }
 terminal-search-status = search: { $pattern }  ({ $count ->
     [one] 1 match
    *[other] { $count } matches
 })
 
 ### views/title_menu.rs
-titlebar-menu-label = Conversation
 titlebar-pin = Pin conversation
 titlebar-unpin = Unpin conversation
 titlebar-archive = Archive conversation
@@ -583,18 +426,7 @@ titlebar-branch-from-here = Branch from here
 titlebar-branch-from-start = Branch from start
 titlebar-schedule = Add scheduled task...
 titlebar-new-window = Open in new window
-titlebar-copied-id = Conversation ID copied to clipboard.
-titlebar-copied-cwd = Working directory copied to clipboard.
-titlebar-copied-deeplink = Deep link copied to clipboard (manox://thread/{ $id }).
-titlebar-copied-markdown = Conversation copied to clipboard as Markdown.
-titlebar-pinned-notice = Conversation pinned.
-titlebar-unpinned-notice = Conversation unpinned.
-titlebar-archive-notice = Conversation archived.
-titlebar-unarchive-notice = Conversation unarchived.
-titlebar-not-implemented = Not implemented yet.
-
 # ── Environment info panel ──────────────────────────────────────────────
-workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
 workspace-env-sources = Sources
@@ -611,18 +443,11 @@ context-rail-title = Conversation Info
 context-tooltip-main-calls = Main calls
 context-tooltip-side-calls = Side calls
 context-tooltip-calls-unit = calls
-context-side-calls-title = Side calls
-context-side-calls-row = {$purpose} · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
-context-main-calls-row = Main · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
-
 # ── Cockpit (run status / milestones / context budget) ──────────────────
 # Phase labels for the run-status row (three-tag pill: generating / reasoning /
 # user-turn).
-cockpit-status-thinking = Reasoning
-cockpit-status-streaming = Generating
 # The "user-turn" tag label (collapsed state of idle/stopped/failed/
 # awaiting-approval).
-cockpit-status-awaiting-input = UserTurn
 # Plan section header.
 cockpit-milestones-header = Plan
 # Plan progress count shown at the right of the header. {$done}/{$total} are
@@ -642,15 +467,7 @@ queued-delete-action = Remove
 queued-more-action = More
 message-steer-pending-badge = Waiting to steer
 message-steered-badge = Steered
-plan-card-title = Plan
-plan-card-download = Download plan
-plan-card-copy = Copy plan
-plan-card-sidebar = Open in side panel
-
 # Plan review card verdict buttons
-plan-drawer-implement = Implement
-plan-drawer-clear = Clear & Implement
-
 ### about.rs (About window)
 about-title = About Manox
 about-ok = OK

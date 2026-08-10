@@ -12,8 +12,6 @@ use std::rc::Rc;
 use agent::i18n;
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
-#[cfg(feature = "harness-manox")]
-use harness_manox::{agent_def, skill};
 
 use crate::slash_command::SlashCommandRegistry;
 use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
@@ -119,25 +117,9 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
 
 /// Skills + subagents, filtered + sorted by `query`.
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
-    #[cfg_attr(feature = "harness-pi", allow(unused_mut))] // TODO(pi-wire): registries offline
-    let mut items = Vec::new();
-    // TODO(pi-wire): skill/subagent mentions — manox registries.
-    #[cfg(feature = "harness-manox")]
-    for def in skill::global().list() {
-        items.push(CompletionItem {
-            name: def.name.clone().into(),
-            description: def.description.clone().into(),
-            kind: CompletionKind::Skill,
-        });
-    }
-    #[cfg(feature = "harness-manox")]
-    for def in agent_def::global().list() {
-        items.push(CompletionItem {
-            name: def.def.name.clone().into(),
-            description: def.def.description.clone().into(),
-            kind: CompletionKind::Agent,
-        });
-    }
+    let items = Vec::new();
+    // TODO(pi-wire): skill/subagent mentions — no registry is wired in the
+    // pi path yet.
     filter_sort(items, query)
 }
 

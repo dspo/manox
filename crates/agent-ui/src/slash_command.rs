@@ -10,30 +10,21 @@
 //! ([`init`]). Each command is an erased `&'static dyn SlashCommand`. The
 //! `⁄` popover in the composer lists registered commands dynamically.
 //!
-//! Built-in commands (registered per harness variant in [`init`]):
-//! `/compact` (manual context compaction, optional focus instructions, see
-//! [`CompactCommand`]), `/exit` (alias `/quit`; archive the current thread
-//! and start a fresh one, see [`ExitCommand`]), and `/new` (aliases
-//! `/clear`, `/archive`; archive the current thread and start a fresh one
-//! that keeps the project, approval mode, and model, see [`NewCommand`]).
-//! The retired manox variant additionally registers `/danger` (toggle Danger
-//! mode), `/plan`, `/goal`, and mirrors markdown prompt-macros
-//! (`/gitwork:deliver`, etc.) are mirrored in at runtime via the
-//! [`MarkdownSlashCommand`] adapter, and plugin/user skills via the
-//! [`SkillSlashCommand`] adapter — so `/<plugin>:<skill>` is slash-invocable
-//! the way it is in Claude Code.
+//! Built-in commands (registered in [`init`]): `/compact` (manual context
+//! compaction, optional focus instructions, see [`CompactCommand`]), `/exit`
+//! (alias `/quit`; archive the current thread and start a fresh one, see
+//! [`ExitCommand`]), and `/new` (aliases `/clear`, `/archive`; archive the
+//! current thread and start a fresh one that keeps the project, approval
+//! mode, and model, see [`NewCommand`]). The retired manox harness
+//! additionally had `/danger`, `/plan`, `/goal`, markdown prompt-macro, and
+//! skill adapters — see git history (`origin/Manox` backup branch) for those
+//! flows.
 
-#[cfg(feature = "harness-manox")]
-use std::sync::Arc;
 use std::sync::OnceLock;
 
 use gpui::{App, Context, SharedString, Window};
 
 use agent::i18n;
-#[cfg(feature = "harness-manox")]
-use harness_manox::command::CommandDefinition;
-#[cfg(feature = "harness-manox")]
-use harness_manox::skill::SkillDefinition;
 
 use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
@@ -128,83 +119,13 @@ impl SlashCommandRegistry {
 }
 
 /// Register the built-in slash commands. Call once during app startup, before
-/// any workspace is created — and after `agent::init`, which populates the
-/// markdown command and skill registries the adapters mirror. Idempotent via
-/// `OnceLock::set`.
+/// any workspace is created. Idempotent via `OnceLock::set`.
 pub fn init(_cx: &mut App) {
-    // The retired manox harness registers the full command surface (danger /
-    // plan / goal flows plus the markdown-macro and skill adapters); the pi
-    // harness registers the commands its engine supports today.
-    #[cfg(feature = "harness-manox")]
-    let mut commands: Vec<Box<dyn SlashCommand>> = vec![
-        // /danger: toggle Danger mode (no args), or enable Danger and immediately run
-        // the prompt as a user turn (with args). Bypasses approvals and runs
-        // bash unsandboxed for the session.
-        Box::new(DangerCommand),
-        Box::new(PlanCommand),
-        Box::new(GoalCommand),
-        Box::new(CompactCommand),
-        Box::new(ExitCommand),
-        Box::new(NewCommand),
-    ];
-    #[cfg(not(feature = "harness-manox"))]
     let commands: Vec<Box<dyn SlashCommand>> = vec![
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
     ];
-    // Names already claimed by built-ins and (below) markdown macros, so a
-    // skill sharing one is skipped — keeps one popover row per name and routes
-    // dispatch to the higher-priority command/built-in.
-    #[cfg(feature = "harness-manox")]
-    let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
-        "danger".to_string(),
-        "plan".to_string(),
-        "goal".to_string(),
-        "compact".to_string(),
-        "exit".to_string(),
-        "new".to_string(),
-    ]);
-    // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
-    // the registry so `parse` recognizes them and the `⁄` popover lists them.
-    // The adapter delegates to `Workspace::run_command_turn`, which substitutes
-    // `$ARGUMENTS` and applies `allowed-tools` via `Thread::submit_command`.
-    // `harness_manox::command::try_global` is `None` only before `agent::init` (which
-    // `main` calls before us); fall back to no macros rather than panicking.
-    #[cfg(feature = "harness-manox")]
-    for (key, def) in harness_manox::command::try_global()
-        .map(|r| r.entries())
-        .unwrap_or_default()
-    {
-        // A macro sharing a built-in name (e.g. `commands/danger.md`) is skipped —
-        // the built-in wins, mirroring the skill-skip rule below, so the popover
-        // never shows two rows for the same name.
-        if command_keys.contains(key.as_str()) {
-            continue;
-        }
-        command_keys.insert(key.clone());
-        commands.push(
-            Box::new(MarkdownSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>,
-        );
-    }
-    // Mirror every loaded skill (`/gitwork:deliver`, bare `/skill`, etc.) the
-    // same way. Skills dispatch to `Workspace::run_skill_turn` →
-    // `Thread::submit_skill`, which injects the skill body as the turn's user
-    // message. A command and a skill may share a key (`gitwork:deliver`); the
-    // command wins — skip a skill whose key an already-registered command owns,
-    // so the popover shows one row and `parse`/`dispatch` hit the command path.
-    #[cfg(feature = "harness-manox")]
-    for (key, def) in harness_manox::skill::try_global()
-        .map(|r| r.entries())
-        .unwrap_or_default()
-    {
-        if command_keys.contains(key.as_str()) {
-            continue;
-        }
-        commands.push(
-            Box::new(SkillSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>
-        );
-    }
     let _ = REGISTRY.set(SlashCommandRegistry::new(commands));
 }
 
@@ -257,316 +178,6 @@ pub fn dispatch(
 }
 
 // ─── built-in commands ─────────────────────────────────────────────────────
-
-/// `/danger` — toggle Danger mode on the current thread.
-///
-/// `/danger` (no args) toggles Danger on/off and pushes a notice.
-/// `/danger [prompt]` enables Danger (if not already on) and immediately sends
-/// `prompt` as a user turn so the agent starts working with full autonomy.
-#[cfg(feature = "harness-manox")]
-struct DangerCommand;
-
-#[cfg(feature = "harness-manox")]
-impl SlashCommand for DangerCommand {
-    fn name(&self) -> &str {
-        "danger"
-    }
-    fn description(&self) -> SharedString {
-        i18n::t("slash-danger-desc")
-    }
-    fn execute(
-        &self,
-        args: &str,
-        workspace: &mut Workspace,
-        _window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> SlashResult {
-        if args.is_empty() {
-            workspace.toggle_danger(cx);
-            SlashResult::Handled
-        } else {
-            workspace.start_danger_turn(args.to_string(), cx);
-            SlashResult::Handled
-        }
-    }
-}
-
-/// Adapter wrapping a markdown prompt-macro `CommandDefinition` as a
-/// `SlashCommand`. The `key` is the full registry key (`gitwork:deliver`), not
-/// the bare filename stem, so `parse` matches what the user actually types.
-/// `execute` delegates to `Workspace::run_command_turn`, which pushes the
-/// display bubble, substitutes `$ARGUMENTS` into the body, and applies the
-/// command's `allowed-tools` whitelist for the turn.
-#[cfg(feature = "harness-manox")]
-struct MarkdownSlashCommand {
-    key: String,
-    def: Arc<CommandDefinition>,
-}
-
-#[cfg(feature = "harness-manox")]
-impl MarkdownSlashCommand {
-    fn new(key: String, def: Arc<CommandDefinition>) -> Self {
-        Self { key, def }
-    }
-}
-
-#[cfg(feature = "harness-manox")]
-impl SlashCommand for MarkdownSlashCommand {
-    fn name(&self) -> &str {
-        &self.key
-    }
-    fn description(&self) -> SharedString {
-        SharedString::from(self.def.description.clone())
-    }
-    fn execute(
-        &self,
-        args: &str,
-        workspace: &mut Workspace,
-        _window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> SlashResult {
-        workspace.run_command_turn(&self.key, args, cx);
-        SlashResult::Handled
-    }
-}
-
-/// Adapter wrapping a `SkillDefinition` as a `SlashCommand`, so a plugin skill
-/// (`/gitwork:deliver`) or user-authored skill (`/myskill`) is slash-invocable
-/// the way it is in Claude Code. The `key` is the full registry lookup name
-/// (`plugin:skill` or bare `skill`), matching what the user types and what
-/// `parse` looks up. `execute` delegates to `Workspace::run_skill_turn`, which
-/// pushes the display bubble and injects the skill body as the turn's user
-/// message via `Thread::submit_skill`.
-#[cfg(feature = "harness-manox")]
-struct SkillSlashCommand {
-    key: String,
-    def: Arc<SkillDefinition>,
-}
-
-#[cfg(feature = "harness-manox")]
-impl SkillSlashCommand {
-    fn new(key: String, def: Arc<SkillDefinition>) -> Self {
-        Self { key, def }
-    }
-}
-
-#[cfg(feature = "harness-manox")]
-impl SlashCommand for SkillSlashCommand {
-    fn name(&self) -> &str {
-        &self.key
-    }
-    fn description(&self) -> SharedString {
-        SharedString::from(self.def.description.clone())
-    }
-    fn kind(&self) -> CompletionKind {
-        CompletionKind::Skill
-    }
-    fn execute(
-        &self,
-        args: &str,
-        workspace: &mut Workspace,
-        _window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> SlashResult {
-        workspace.run_skill_turn(&self.key, args, cx);
-        SlashResult::Handled
-    }
-}
-
-/// `/plan` — a strong hint to the model to explore deeply and produce a
-/// `<proposed_plan>` block. Injects a directive user message that nudges
-/// the model into planning behavior, optionally prefixed with the user's
-/// own prompt. No mode toggle — the model autonomously decides whether to
-/// plan based on task semantics, and `/plan` simply makes that bias
-/// explicit for this turn.
-#[cfg(feature = "harness-manox")]
-struct PlanCommand;
-
-#[cfg(feature = "harness-manox")]
-impl SlashCommand for PlanCommand {
-    fn name(&self) -> &str {
-        "plan"
-    }
-    fn description(&self) -> SharedString {
-        i18n::t("slash-plan-desc")
-    }
-    fn execute(
-        &self,
-        args: &str,
-        _workspace: &mut Workspace,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
-    ) -> SlashResult {
-        let directive = if args.is_empty() {
-            "Explore the task deeply before acting. Read the relevant code, \
-             configs, and docs. Then present your plan in a \
-             `<proposed_plan>` block. Do not call any write tools until the \
-             plan is approved."
-                .to_string()
-        } else {
-            format!(
-                "{args}\n\n\
-                 Explore the task deeply before acting. Read the relevant \
-                 code, configs, and docs. Then present your plan in a \
-                 `<proposed_plan>` block. Do not call any write tools until \
-                 the plan is approved."
-            )
-        };
-        SlashResult::InjectUserTurn(directive)
-    }
-}
-
-/// `/goal` manages the durable Goal lifecycle. Replacing an unfinished Goal
-/// requires the explicit `/goal replace <objective>` confirmation command.
-#[cfg(feature = "harness-manox")]
-struct GoalCommand;
-
-#[cfg(feature = "harness-manox")]
-impl SlashCommand for GoalCommand {
-    fn name(&self) -> &str {
-        "goal"
-    }
-    fn description(&self) -> SharedString {
-        i18n::t("slash-goal-desc")
-    }
-    fn execute(
-        &self,
-        args: &str,
-        workspace: &mut Workspace,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> SlashResult {
-        let thread = workspace.thread.clone();
-        let trimmed = args.trim();
-        if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                if let Err(error) =
-                    t.replace_goal(objective.to_string(), None, agent::db::GoalActor::User, cx)
-                {
-                    cx.emit(harness_manox::ThreadEvent::Error(error));
-                }
-            });
-            return SlashResult::Handled;
-        }
-        if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                let budget = t.goal().and_then(|goal| goal.token_budget);
-                if let Err(error) = t.edit_goal(
-                    objective.to_string(),
-                    budget,
-                    agent::db::GoalActor::User,
-                    cx,
-                ) {
-                    cx.emit(harness_manox::ThreadEvent::Error(error));
-                }
-            });
-            return SlashResult::Handled;
-        }
-        if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                let Some(goal) = t.goal().cloned() else {
-                    cx.emit(harness_manox::ThreadEvent::Error(anyhow::anyhow!(
-                        "thread has no Goal"
-                    )));
-                    return;
-                };
-                let budget = if matches!(value, "none" | "unlimited") {
-                    None
-                } else {
-                    match value.parse::<u64>() {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            cx.emit(harness_manox::ThreadEvent::Error(error.into()));
-                            return;
-                        }
-                    }
-                };
-                if let Err(error) =
-                    t.edit_goal(goal.objective, budget, agent::db::GoalActor::User, cx)
-                {
-                    cx.emit(harness_manox::ThreadEvent::Error(error));
-                }
-            });
-            return SlashResult::Handled;
-        }
-        match trimmed.to_lowercase().as_str() {
-            "" => {
-                if thread.read(cx).goal().is_some() {
-                    workspace.open_goal_popover(cx);
-                } else {
-                    workspace.begin_goal_new(window, cx);
-                }
-                SlashResult::Handled
-            }
-            "clear" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx) {
-                        cx.emit(harness_manox::ThreadEvent::Error(error));
-                    }
-                });
-                cx.notify();
-                SlashResult::Handled
-            }
-            "pause" | "stop" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.set_goal_status(
-                        agent::goal::GoalStatus::Paused,
-                        Some("paused by user".into()),
-                        agent::db::GoalActor::User,
-                        cx,
-                    ) {
-                        cx.emit(harness_manox::ThreadEvent::Error(error));
-                    }
-                });
-                SlashResult::Handled
-            }
-            "resume" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.set_goal_status(
-                        agent::goal::GoalStatus::Active,
-                        None,
-                        agent::db::GoalActor::User,
-                        cx,
-                    ) {
-                        cx.emit(harness_manox::ThreadEvent::Error(error));
-                    }
-                });
-                SlashResult::Handled
-            }
-            "edit" => {
-                workspace.begin_goal_edit(window, cx);
-                SlashResult::Handled
-            }
-            "replace" => {
-                workspace.begin_goal_replace(window, cx);
-                SlashResult::Handled
-            }
-            _ => {
-                let needs_confirmation = thread
-                    .read(cx)
-                    .goal()
-                    .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
-                if needs_confirmation {
-                    workspace.begin_goal_replace_with_objective(trimmed, window, cx);
-                    return SlashResult::Handled;
-                }
-                let created =
-                    thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string(), cx) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            cx.emit(harness_manox::ThreadEvent::Error(error));
-                            false
-                        }
-                    });
-                if !created {
-                    return SlashResult::Handled;
-                }
-                cx.notify();
-                SlashResult::InjectUserTurn(trimmed.to_string())
-            }
-        }
-    }
-}
 
 /// `/compact` — manually trigger a context-compaction pass on the current
 /// thread. Summarizes older history into a handoff message, keeping a recent
@@ -658,8 +269,6 @@ impl SlashCommand for NewCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "harness-manox")]
-    use std::path::PathBuf;
 
     #[test]
     fn parse_basic_command() {
@@ -714,13 +323,6 @@ mod tests {
         assert!(r.get("exit").is_some());
         assert!(r.get("new").is_some());
         assert!(r.get("nope").is_none());
-        #[cfg(feature = "harness-manox")]
-        {
-            assert!(r.get("danger").is_some());
-            assert!(r.get("plan").is_some());
-            assert!(r.get("goal").is_some());
-        }
-        #[cfg(not(feature = "harness-manox"))]
         {
             // The pi registry only carries the commands its engine supports.
             assert!(r.get("danger").is_none());
@@ -744,32 +346,6 @@ mod tests {
         for alias in ["/quit", "/clear", "/archive"] {
             assert!(parse(alias).is_some(), "{alias} must parse");
         }
-    }
-
-    #[cfg(feature = "harness-manox")]
-    #[test]
-    fn parse_goal_command() {
-        // `/goal` bare, `/goal clear`, and `/goal <condition>` all parse.
-        register_for_tests();
-        let p = parse("/goal").unwrap();
-        assert_eq!(p.name, "goal");
-        assert_eq!(p.args, "");
-        let p = parse("/goal tests pass").unwrap();
-        assert_eq!(p.name, "goal");
-        assert_eq!(p.args, "tests pass");
-    }
-
-    #[cfg(feature = "harness-manox")]
-    #[test]
-    fn parse_plan_command() {
-        // `/plan` bare and `/plan <prompt>` both parse once /plan is registered.
-        register_for_tests();
-        let p = parse("/plan").unwrap();
-        assert_eq!(p.name, "plan");
-        assert_eq!(p.args, "");
-        let p = parse("/plan fix the auth flow").unwrap();
-        assert_eq!(p.name, "plan");
-        assert_eq!(p.args, "fix the auth flow");
     }
 
     #[test]
@@ -800,95 +376,12 @@ mod tests {
         assert_eq!(p.args, "fresh start");
     }
 
-    #[cfg(feature = "harness-manox")]
-    #[test]
-    fn skill_adapter_name_and_kind() {
-        // A mirrored skill surfaces under its full registry key and renders with
-        // the Skill kind so the `⁄` popover picks the skill icon. The description
-        // is the skill's own (author language, not i18n).
-        let def = Arc::new(SkillDefinition {
-            name: "deliver".to_string(),
-            description: "deliver a PR".to_string(),
-            body: "body".to_string(),
-            source: PathBuf::new(),
-        });
-        let cmd = SkillSlashCommand::new("gitwork:deliver".to_string(), def);
-        assert_eq!(cmd.name(), "gitwork:deliver");
-        assert_eq!(cmd.kind(), CompletionKind::Skill);
-        assert_eq!(cmd.description().as_ref(), "deliver a PR");
-    }
-
-    #[cfg(feature = "harness-manox")]
-    #[test]
-    fn registry_lookup_finds_mirrored_skill() {
-        // `init` mirrors skills into the same registry `parse` consults; verify
-        // a registry holding a SkillSlashCommand resolves the namespaced key and
-        // reports the Skill kind (command-wins-on-collision is exercised by init
-        // ordering, not by this lookup).
-        let def = Arc::new(SkillDefinition {
-            name: "deliver".to_string(),
-            description: "deliver a PR".to_string(),
-            body: "body".to_string(),
-            source: PathBuf::new(),
-        });
-        let reg = SlashCommandRegistry::new(vec![Box::new(SkillSlashCommand::new(
-            "gitwork:deliver".to_string(),
-            def,
-        )) as Box<dyn SlashCommand>]);
-        let found = reg.get("gitwork:deliver").expect("skill key resolves");
-        assert_eq!(found.name(), "gitwork:deliver");
-        assert_eq!(found.kind(), CompletionKind::Skill);
-    }
-
-    #[cfg(feature = "harness-manox")]
-    #[test]
-    fn registry_command_wins_over_same_key_skill() {
-        // `init` skips a skill whose key a command/built-in already owns. Model
-        // the post-init ordering directly: command pushed before a same-key skill
-        // → `get` (first match) returns the command, so dispatch never lands on
-        // the shadowed skill.
-        let cmd_def = Arc::new(CommandDefinition {
-            name: "danger".to_string(),
-            description: "macro danger".to_string(),
-            argument_hint: None,
-            allowed_tools: Vec::new(),
-            disable_model_invocation: false,
-            body: "body".to_string(),
-            source: PathBuf::new(),
-        });
-        let skill_def = Arc::new(SkillDefinition {
-            name: "danger".to_string(),
-            description: "skill danger".to_string(),
-            body: "body".to_string(),
-            source: PathBuf::new(),
-        });
-        let reg = SlashCommandRegistry::new(vec![
-            Box::new(MarkdownSlashCommand::new("danger".to_string(), cmd_def))
-                as Box<dyn SlashCommand>,
-            Box::new(SkillSlashCommand::new("danger".to_string(), skill_def))
-                as Box<dyn SlashCommand>,
-        ]);
-        let found = reg.get("danger").expect("key resolves");
-        assert_eq!(found.kind(), CompletionKind::Command);
-        assert_eq!(found.description().as_ref(), "macro danger");
-    }
-
     /// Ensure the registry is populated for tests (idempotent). Mirrors
     /// [`init`]'s per-variant command set.
     fn register_for_tests() {
         if REGISTRY.get().is_some() {
             return;
         }
-        #[cfg(feature = "harness-manox")]
-        let commands: Vec<Box<dyn SlashCommand>> = vec![
-            Box::new(DangerCommand),
-            Box::new(PlanCommand),
-            Box::new(GoalCommand),
-            Box::new(CompactCommand),
-            Box::new(ExitCommand),
-            Box::new(NewCommand),
-        ];
-        #[cfg(not(feature = "harness-manox"))]
         let commands: Vec<Box<dyn SlashCommand>> = vec![
             Box::new(CompactCommand),
             Box::new(ExitCommand),

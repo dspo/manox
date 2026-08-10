@@ -180,15 +180,6 @@ pub enum ThreadEvent {
     },
     /// An error during streaming.
     Error(anyhow::Error),
-    /// Live `<proposed_plan>` block delta. Plan mode is a manox flow; the pi
-    /// backend never emits it.
-    PlanDelta { delta: String },
-    /// A turn ended with a complete `<proposed_plan>` block.
-    PlanReady { plan_text: String },
-    /// The model published a structured task list.
-    PlanUpdated {
-        snapshot: crate::plan::PlanSnapshot,
-    },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
     PrefixStability {
         stability_pct: u16,
@@ -602,6 +593,14 @@ impl Thread {
 
     pub fn per_model_token_usage(&self) -> HashMap<String, TokenUsage> {
         self.engine.per_model_token_usage()
+    }
+
+    pub fn cumulative_cost(&self) -> f64 {
+        self.engine.cumulative_cost()
+    }
+
+    pub fn per_model_cost(&self) -> HashMap<String, f64> {
+        self.engine.per_model_cost()
     }
 
     pub fn ui_notes(&self) -> &[UiNoteRecord] {
