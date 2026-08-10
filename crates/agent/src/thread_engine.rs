@@ -138,6 +138,15 @@ pub enum BackendNotice {
         /// Steers stranded by an aborted/failed run.
         stranded: Vec<String>,
     },
+    /// The display-only preview streamed another batch of the session
+    /// transcript into the mirrored history (the authoritative restore is
+    /// still running; it replaces the preview at `Ready`). The facade
+    /// re-mirrors `history()` and lets the workspace append the newly
+    /// available messages.
+    ///
+    /// parity: the facade re-emits this as `ThreadEvent::HistoryProgress` —
+    /// keep the two variants in sync when either side changes.
+    HistoryProgress,
     /// The session could not be built at all.
     Fatal(anyhow::Error),
     /// A user message landed in the session transcript; the sidebar list

@@ -312,6 +312,7 @@ workspace-project-blank = 新建空白项目
 workspace-project-select-folder = 选择文件夹
 workspace-project-name-prompt = 项目文件夹名称
 workspace-empty-prompt = 我们该做什么？
+workspace-loading-history = 正在加载对话…
 ### views/composer_menu.rs
 composer-add-label = 添加
 composer-plugins-label = 插件

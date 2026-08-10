@@ -523,6 +523,12 @@ pub struct ConversationState {
     /// first `ToolCall`. Falls back to `Instant::now()` for the rebuild path
     /// (where durations are unknown anyway).
     turn_started_at: Instant,
+    /// Carry-over state for the streaming history preview
+    /// (`append_history_messages`): the item builder's turn/segment state, so
+    /// a tool loop spanning a batch boundary folds into one activity segment.
+    /// Dropped when the authoritative `rebuild_from_messages` replaces this
+    /// conversation (`HistoryRestored`).
+    history_builder: Option<crate::views::message::ItemBuilder>,
 }
 
 /// What `apply` did to the item list, so the caller can keep the `ListState`
@@ -557,6 +563,7 @@ impl Default for ConversationState {
         Self {
             items: Vec::new(),
             turn_started_at: Instant::now(),
+            history_builder: None,
         }
     }
 }
@@ -881,6 +888,9 @@ impl ConversationState {
             // The pi backend restored an existing session; the workspace
             // rebuilds the conversation from the authoritative history.
             | ThreadEvent::HistoryRestored => ApplyOutcome::Unchanged,
+            // A streaming history preview batch landed; the workspace appends
+            // the newly available messages itself (`append_history_messages`).
+            | ThreadEvent::HistoryProgress => ApplyOutcome::Unchanged,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content. We capture the turn's start instant here so
@@ -1683,37 +1693,51 @@ impl ConversationState {
         let items = merged
             .into_iter()
             .enumerate()
-            .map(|(id, kind)| {
-                cx.new(|cx| {
-                    let text = match &kind {
-                        ConvItem::Assistant { text, .. } => Some(text.clone()),
-                        _ => None,
-                    };
-                    let mut item = MessageItem::new(kind, role.to_string(), id, weak.clone());
-                    // For rebuilt (non-streaming) text items, do a full parse
-                    // + finalize so blocks are populated and the frozen prefix
-                    // is the entire document (no further updates expected).
-                    if let Some(text) = text {
-                        item.update_text(&text, cx);
-                        item.finalize_parser(cx);
-                    }
-                    // Mount + finalize persistent markdown for every historical
-                    // reasoning round inside a `Thinking` segment, so selection
-                    // works on reloaded history (not just live-streamed turns).
-                    item.rebuild_activity_reasoning(cx);
-                    // Mount the persistent `TerminalPanel` for every historical
-                    // tool call (activity-segment entries + top-level ToolCall)
-                    // so reloaded history renders the terminal-styled body with
-                    // working selection, not a per-frame fallback.
-                    item.rebuild_tool_panels(cwd.clone(), cx);
-                    item
-                })
-            })
+            .map(|(id, kind)| new_history_item(kind, id, role, weak.clone(), cwd.clone(), cx))
             .collect();
         Self {
             items,
             turn_started_at: Instant::now(),
+            history_builder: None,
         }
+    }
+
+    /// Append a batch of newly loaded history messages to the conversation
+    /// (the streaming preview). Carries the item builder's turn/segment state
+    /// across batches so the result matches a one-shot
+    /// `rebuild_from_messages` over the same prefix; the final authoritative
+    /// history lands through `rebuild_from_messages` (`HistoryRestored`),
+    /// which drops the builder.
+    pub fn append_history_messages(
+        &mut self,
+        messages: &[Message],
+        usage: &HashMap<String, TokenUsage>,
+        role: &str,
+        ctx: ApplyCtx,
+        cx: &mut App,
+    ) -> ApplyOutcome {
+        if messages.is_empty() {
+            return ApplyOutcome::Unchanged;
+        }
+        let ApplyCtx { weak, cwd } = ctx;
+        let builder = self
+            .history_builder
+            .get_or_insert_with(crate::views::message::ItemBuilder::new);
+        let mut kinds = Vec::new();
+        builder.extend(messages, usage, &mut kinds);
+        let start = self.items.len();
+        for (offset, kind) in kinds.into_iter().enumerate() {
+            let id = start + offset;
+            self.items.push(new_history_item(
+                kind,
+                id,
+                role,
+                weak.clone(),
+                cwd.clone(),
+                cx,
+            ));
+        }
+        ApplyOutcome::Appended
     }
 
     /// Rehydrate persisted background-task cards after rebuilding canonical
@@ -1749,6 +1773,44 @@ impl ConversationState {
             }));
         }
     }
+}
+
+/// Construct a `MessageItem` for a rebuilt/history item: full text parse +
+/// finalize for assistant bubbles, persistent reasoning/tool panels for
+/// historical activity segments. Shared by the one-shot
+/// `rebuild_from_messages` and the streaming `append_history_messages`.
+fn new_history_item(
+    kind: ConvItem,
+    id: usize,
+    role: &str,
+    weak: WeakEntity<Workspace>,
+    cwd: Option<SharedString>,
+    cx: &mut App,
+) -> Entity<MessageItem> {
+    cx.new(|cx| {
+        let text = match &kind {
+            ConvItem::Assistant { text, .. } => Some(text.clone()),
+            _ => None,
+        };
+        let mut item = MessageItem::new(kind, role.to_string(), id, weak);
+        // For rebuilt (non-streaming) text items, do a full parse + finalize
+        // so blocks are populated and the frozen prefix is the entire
+        // document (no further updates expected).
+        if let Some(text) = text {
+            item.update_text(&text, cx);
+            item.finalize_parser(cx);
+        }
+        // Mount + finalize persistent markdown for every historical reasoning
+        // round inside a `Thinking` segment, so selection works on reloaded
+        // history (not just live-streamed turns).
+        item.rebuild_activity_reasoning(cx);
+        // Mount the persistent `TerminalPanel` for every historical tool call
+        // (activity-segment entries + top-level ToolCall) so reloaded history
+        // renders the terminal-styled body with working selection, not a
+        // per-frame fallback.
+        item.rebuild_tool_panels(cwd, cx);
+        item
+    })
 }
 
 /// Splice persisted UI notes back into the rebuilt canonical item list.
@@ -1992,6 +2054,7 @@ mod tests {
     /// assistant bubble is appended. The outcome must carry the closed
     /// segment's index so the caller remeasures it; a bare `Appended` would
     /// only splice the tail and leave the segment's cached height stale.
+    /// only splice the tail and leave the segment's cached height stale.
     #[gpui::test]
     fn agent_text_needs_new_with_live_segment_remeasures_closed_segment(
         cx: &mut gpui::TestAppContext,
@@ -2046,6 +2109,31 @@ mod tests {
                     ),
                 }
                 assert_eq!(c.items().len(), 2);
+            });
+        });
+    }
+
+    /// The `HistoryProgress` preview batch event must never mutate the
+    /// conversation item list — the workspace owns the append path
+    /// (`append_history_messages`). Pin the `apply` arm so a future change
+    /// to `Appended`/`Cleared` here fails loudly instead of double-rendering.
+    #[gpui::test]
+    fn history_progress_apply_is_unchanged(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx { weak, cwd: None };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let outcome = c.apply(
+                    &ThreadEvent::HistoryProgress,
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Unchanged));
+                assert!(c.items().is_empty());
             });
         });
     }

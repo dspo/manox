@@ -11,6 +11,7 @@ pub mod model_ref;
 pub mod monitor;
 pub mod provider;
 pub mod session_meta;
+pub mod session_stream;
 
 pub use agents::SubagentTool;
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};

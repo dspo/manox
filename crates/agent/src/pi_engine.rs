@@ -127,17 +127,80 @@ pub fn spawn_engine(
         cwd,
         model,
         sessions_dir,
-        initial_path,
+        initial_path.clone(),
         fresh,
         project,
         cmd_rx,
-        notice_tx,
+        notice_tx.clone(),
         Arc::clone(&state),
     ));
+    // Display-only streaming preview: while the actor's eager restore reads
+    // the whole session file, stream its transcript into the mirrored history
+    // in batches so the workspace paints the first messages early. The
+    // authoritative `sync_history` at `Ready` replaces the preview.
+    if let Some(path) = initial_path {
+        spawn_history_preview(path, Arc::clone(&state), notice_tx);
+    }
     SpawnedEngine {
         engine: Arc::new(PiEngine { cmd_tx, state }),
         events: notice_rx,
     }
+}
+
+/// Stream a session file's transcript into `state.history` as display-only
+/// preview batches for the workspace while the actor's eager restore runs in
+/// parallel. The extension's lazy reader yields entries in append order; each
+/// batch appends its mapped `Message`s to the mirrored history and notifies
+/// the facade (`HistoryProgress`). The authoritative `sync_history` at
+/// `Ready` replaces the mirror; the length guard below stops the drain once
+/// that happened (appending past the authoritative list would clobber it).
+fn spawn_history_preview(
+    path: PathBuf,
+    state: Arc<EngineState>,
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+) {
+    crate::runtime::handle().spawn(async move {
+        let mut stream = match pi_extensions::session_stream::SessionTranscriptStream::open(&path)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                // The preview degrades to the authoritative restore (which
+                // reports its own error); surface why the display stream
+                // never started so a silent no-preview is diagnosable.
+                tracing::warn!(error = %err, path = %path.display(), "history preview open failed");
+                return;
+            }
+        };
+        let mut expected = 0usize;
+        while let Some(entries) = stream.next_batch(32, 256 * 1024).await {
+            if entries.is_empty() {
+                continue;
+            }
+            let msgs: Vec<Message> = entries
+                .iter()
+                .flat_map(pi::session::session_entry_to_context_messages)
+                .flat_map(|m| adapt::harness_messages_to_messages(std::slice::from_ref(&m)))
+                .collect();
+            if msgs.is_empty() {
+                continue;
+            }
+            let mut history = state.history.lock().unwrap();
+            // Only the preview writer appends before `Ready`; once the
+            // authoritative sync replaced the mirror this guard fails and the
+            // drain stops (the file is fully drained anyway).
+            if history.len() != expected {
+                break;
+            }
+            history.extend(msgs);
+            expected = history.len();
+            drop(history);
+            if notice_tx.send(BackendNotice::HistoryProgress).is_err() {
+                // The facade (thread entity) is gone; stop streaming.
+                break;
+            }
+        }
+    });
 }
 
 impl ThreadEngine for PiEngine {
@@ -673,15 +736,22 @@ async fn run_actor(
     let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
     state.gate.set_mode(approval_mode);
     let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
+
+    // Mirror the authoritative transcript BEFORE `Ready` is sent: the
+    // facade's Ready handler reads `history()` immediately, and a drainer
+    // that woke first would rebuild from a stale (empty or preview-only)
+    // mirror and strand the thread on the loading screen. Unconditional so a
+    // failed restore (fresh fallback session) also clears any preview the
+    // display stream had written.
+    sync_history(&session, &state);
+    if restored {
+        sync_usage(&session, &state).await;
+    }
     let _ = notice_tx.send(BackendNotice::Ready {
         restored,
         model: Some(pi_model.clone()),
         approval_mode,
     });
-    if restored {
-        sync_history(&session, &state);
-        sync_usage(&session, &state).await;
-    }
 
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;

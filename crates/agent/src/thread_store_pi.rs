@@ -206,14 +206,6 @@ impl ThreadStore {
         Some(entity)
     }
 
-    /// Create a fresh empty `Thread` (sidebar "new conversation" button).
-    pub fn new_thread(&mut self, cwd: PathBuf, cx: &mut App) -> Entity<Thread> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let entity = Thread::new(ThreadId(id.clone()), cwd, cx);
-        self.live_threads.insert(id, entity.downgrade());
-        entity
-    }
-
     /// Archive (or unarchive) a session (persisted in its sidecar).
     pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
         self.write_meta(id, move |meta| meta.archived = archived, false, cx);

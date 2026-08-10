@@ -61,9 +61,9 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 - [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
 
-### Hero
+### Hero / LoadingIndicator
 
-- [Hero](#hero)
+- [Hero](#hero) · [LoadingIndicator](#loadingindicator)
 
 ### MessageArea
 
@@ -286,13 +286,14 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
 #### Body
 
-Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) or [MessageArea](#messagearea) + [Footer](#footer).
+Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (or the [LoadingIndicator](#loadingindicator) while a session restores) or [MessageArea](#messagearea) + [Footer](#footer).
 
 > Source: `agent-ui/src/workspace.rs`
 
+
 #### 3.2.1 Hero
 
-Shown when the thread has no substantive messages.
+Shown when the thread has no substantive messages (and is not loading).
 
 #### Hero
 
@@ -300,9 +301,16 @@ Vertically centered welcome area: logo/heading + inline [Composer](#composer).
 
 > Source: `agent-ui/src/workspace.rs`
 
+#### LoadingIndicator
+
+Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown in place of the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer is hidden while loading — input is gated on the thread's `HistoryPhase` until `Ready`; preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`).
+
+> Source: `agent-ui/src/workspace.rs`
+
 #### 3.2.2 MessageArea
 
 Shown when the thread has messages. Replaces [Hero](#hero).
+
 
 #### MessageArea
 
@@ -400,7 +408,7 @@ Amber badge, `bg:warning/0.12`, braille spinner + "Retry N/M (in Xs)" text. The 
 
 #### 3.2.3 Footer
 
-Bottom area of MainColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen).
+Bottom area of MainColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). Hidden entirely while history is loading — no input until the restore lands.
 
 #### Footer
 
