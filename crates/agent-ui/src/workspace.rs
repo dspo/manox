@@ -3421,16 +3421,16 @@ impl Workspace {
                 // component forces `text_sm()` internally (its default
                 // `Size::Medium` maps through `input_text_size`), so the host
                 // pins the body size back with an instance-level `.text_base()`;
-                // family + weight are applied from the wrapper context. While
-                // the completion popover is open this wrapper sets a
-                // `completion = open` key context so the
-                // `completion == open > Input` keybindings in `main.rs` can
-                // shadow the Input's own up/down/enter/tab/escape bindings and
-                // drive the popover instead.
+                // family + weight are applied from the wrapper context.
                 {
                     let mut wrap = gpui::div()
                         .font_family(theme.mono_font_family.clone())
                         .font_weight(gpui::FontWeight::LIGHT);
+                    // With the completion popover open this wrapper sets a
+                    // `completion = open` key context so the
+                    // `completion == open > Input` keybindings in `main.rs` can
+                    // shadow the Input's own up/down/enter/tab/escape bindings
+                    // and drive the popover instead.
                     if self.completion.is_some() {
                         wrap = wrap.key_context("completion = open");
                     }
@@ -4767,9 +4767,7 @@ impl Workspace {
                                         // composer for the same message
                                         // content, so it shares the inline
                                         // input's body typeface: Lilex Light
-                                        // at base size (the `Input`'s internal
-                                        // `text_sm()` is overridden by the
-                                        // instance-level `.text_base()`).
+                                        // at base size.
                                         Input::new(&self.editor_state)
                                             .size_full()
                                             .appearance(false)
