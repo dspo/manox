@@ -61,6 +61,8 @@ status-denied = Denied
 status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
+context-agents-title = Agents
+context-agents-captain = Captain
 thinking-tool-result = tool result
 thinking-reading = { $count ->
     [one] reading {$count} file

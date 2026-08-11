@@ -48,6 +48,8 @@ status-denied = 已拒绝
 status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
+context-agents-title = 智能体
+context-agents-captain = 船长
 thinking-tool-result = 工具结果
 thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件

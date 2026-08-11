@@ -10,6 +10,7 @@ pub mod message;
 pub mod popup_menu;
 pub mod settings;
 pub mod sidebar;
+pub mod subagents;
 pub mod title_menu;
 pub mod turn_navigator;
 

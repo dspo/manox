@@ -863,6 +863,31 @@ impl Workspace {
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
+                    // Sub-agent observation: the pi harness observes its
+                    // ephemeral nested sessions through progress events on
+                    // the rail (the retired manox harness tracked child
+                    // threads in observation panels instead).
+                    if let ThreadEvent::SubagentProgress {
+                        id,
+                        subagent_type,
+                        latest_activity,
+                        status,
+                        ..
+                    } = ev
+                    {
+                        let id = id.clone();
+                        let subagent_type = subagent_type.clone();
+                        let latest_activity = latest_activity.clone();
+                        this.context_rail.update(cx, |r, cx| {
+                            r.apply_subagent_progress(
+                                &id,
+                                &subagent_type,
+                                latest_activity.as_deref(),
+                                *status,
+                                cx,
+                            );
+                        });
+                    }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
