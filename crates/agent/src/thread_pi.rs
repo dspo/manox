@@ -24,7 +24,7 @@ use crate::background_task::TaskSnapshot;
 use crate::db::UiNoteRecord;
 use crate::goal::ThreadGoal;
 use crate::language::Language;
-use crate::language_model::{MessageContent, ReasoningEffort, StopReason, TokenUsage};
+use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
@@ -1102,7 +1102,10 @@ impl Thread {
             return false;
         };
         let rendered = cmd.render(args);
+        let ordinal = self.user_prompt_ordinal();
+        let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
         self.insert_user_message_with_ui_metadata(rendered, ui, cx);
+        self.persist_registry_display(ordinal, display);
         self.run_turn(cx);
         true
     }
@@ -1130,9 +1133,58 @@ impl Thread {
             },
         )
         .expect("skill body render");
+        let ordinal = self.user_prompt_ordinal();
+        let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
         self.insert_user_message_with_ui_metadata(rendered, ui, cx);
+        self.persist_registry_display(ordinal, display);
         self.run_turn(cx);
         true
+    }
+
+    /// The ordinal the next inserted user prompt will occupy among user-role
+    /// prompt messages — the sidecar key for its compact display form. The
+    /// count runs over the mirrored transcript (`self.messages`), which
+    /// matches the pi session's `AgentMessage::User` entries: tool results
+    /// and bash records are separate variants and never consume an ordinal.
+    fn user_prompt_ordinal(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|m| {
+                m.role == Role::User
+                    && m.provenance == crate::message::MessageProvenance::User
+            })
+            .count()
+    }
+
+    /// Persist a registry turn's compact display form (`/key args`) in the
+    /// session sidecar. The pi transcript stores only the expanded
+    /// macro/skill body, so the sidecar is what lets `pi_engine::sync_history`
+    /// restore the send-time bubble after a reload. Fire-and-forget: a lost
+    /// write only narrows the reload window, the live bubble is unaffected.
+    fn persist_registry_display(&self, ordinal: usize, display: Option<String>) {
+        let Some(display) = display else {
+            return;
+        };
+        let Some(sessions_dir) = crate::paths::manox_config_dir()
+            .ok()
+            .map(|dir| dir.join("pi-sessions"))
+        else {
+            return;
+        };
+        let Some(session_path) = self.active_session_path() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut meta = pi_extensions::session_meta::load(&sessions_dir, &session_path)
+                .await
+                .unwrap_or_default();
+            meta.registry_displays.insert(ordinal, display);
+            if let Err(err) =
+                pi_extensions::session_meta::save(&sessions_dir, &session_path, &meta).await
+            {
+                tracing::warn!(error = %err, "failed to persist registry display text");
+            }
+        });
     }
 
     /// Whether the pi backend restored an existing session at startup.

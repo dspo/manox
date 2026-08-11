@@ -600,7 +600,7 @@ async fn settle_run(
         ))));
     }
     state.running.store(false, Ordering::Relaxed);
-    sync_history(session, state);
+    sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
     refresh_session_list(repo, state).await;
     let (steered, stranded) = if abort_requested || failed {
@@ -889,7 +889,7 @@ async fn run_actor(
     // mirror and strand the thread on the loading screen. Unconditional so a
     // failed restore (fresh fallback session) also clears any preview the
     // display stream had written.
-    sync_history(&session, &state);
+    sync_history(&session, &sessions_dir, &state).await;
     if restored {
         sync_usage(&session, &state).await;
     }
@@ -1112,7 +1112,7 @@ async fn run_actor(
                         // The transcript was rebuilt and the summarization
                         // call consumed tokens — re-mirror both, and the
                         // session list (the summary row may have changed).
-                        sync_history(&session, &state);
+                        sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
                     }
@@ -1154,7 +1154,7 @@ async fn run_actor(
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
-                sync_history(&session, &state);
+                sync_history(&session, &sessions_dir, &state).await;
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
@@ -1186,7 +1186,7 @@ async fn run_actor(
                         }
                         resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                         title_state = Arc::new(Mutex::new(TitleState::default()));
-                        sync_history(&session, &state);
+                        sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
                     }
@@ -1509,10 +1509,54 @@ async fn resync_approval_mode(
     )));
 }
 
-/// Mirror the session's authoritative transcript into engine state.
-fn sync_history(session: &AgentSession, state: &Arc<EngineState>) {
-    let mapped = adapt::harness_messages_to_messages(session.harness_messages());
+/// Mirror the session's authoritative transcript into engine state, then
+/// re-attach the registry slash turns' compact display forms from the
+/// sidecar (the transcript stores only the expanded macro/skill body, so
+/// the attach is what keeps a reloaded thread's bubbles compact).
+async fn sync_history(session: &AgentSession, sessions_dir: &Path, state: &Arc<EngineState>) {
+    let mut mapped = adapt::harness_messages_to_messages(session.harness_messages());
+    attach_registry_displays(
+        &mut mapped,
+        &load_registry_displays(sessions_dir, session.path()).await,
+    );
     *state.history.lock().unwrap() = mapped;
+}
+
+/// The compact display forms persisted per user-message ordinal by
+/// `Thread::persist_registry_display`. Missing sidecar or field reads as
+/// empty (no registry turns yet).
+async fn load_registry_displays(
+    sessions_dir: &Path,
+    session_path: &Path,
+) -> std::collections::HashMap<usize, String> {
+    pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .map(|meta| meta.registry_displays)
+        .unwrap_or_default()
+}
+
+/// Re-attach `display_text` to the user prompt message at each persisted
+/// ordinal. The ordinal counts `Role::User` messages with a `User`
+/// provenance — the same set `Thread` counts when persisting — so steers
+/// (user prompts too) and tool results (excluded) align between the two.
+fn attach_registry_displays(
+    history: &mut [Message],
+    displays: &std::collections::HashMap<usize, String>,
+) {
+    if displays.is_empty() {
+        return;
+    }
+    let mut ordinal = 0usize;
+    for message in history {
+        if message.role == crate::language_model::Role::User
+            && message.provenance == crate::message::MessageProvenance::User
+        {
+            if let Some(text) = displays.get(&ordinal) {
+                message.ui.get_or_insert_with(Default::default).display_text = Some(text.clone());
+            }
+            ordinal += 1;
+        }
+    }
 }
 
 /// Persist the bound project in the session sidecar so the sidebar groups
@@ -2085,6 +2129,67 @@ mod tests {
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
             ApprovalMode::AutoPilot
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_registry_displays_restores_sidecar_compact_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-display.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            registry_displays: [
+                (0usize, "/gitwork:deliver fast".to_string()),
+                (2usize, "/healthz".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+
+        let displays = load_registry_displays(dir.path(), &session).await;
+        // Ordinals count user prompts only: a tool result (user role, tool
+        // provenance) and assistant turns must not consume one.
+        let mut history = vec![
+            Message::user("expanded macro body".to_string()), // ordinal 0
+            Message::user("plain turn".to_string()),          // ordinal 1
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                crate::language_model::LanguageModelToolResult {
+                    tool_use_id: "tu_1".into(),
+                    tool_name: "Read".into(),
+                    is_error: false,
+                    content: "ok".into(),
+                },
+            )]),
+            Message::assistant(vec![MessageContent::Text("reply".into())]),
+            Message::user("expanded skill body".to_string()), // ordinal 2
+        ];
+        attach_registry_displays(&mut history, &displays);
+
+        assert_eq!(
+            history[0]
+                .ui
+                .as_ref()
+                .and_then(|ui| ui.display_text.as_deref()),
+            Some("/gitwork:deliver fast")
+        );
+        assert!(history[1].ui.is_none(), "plain turn keeps no display text");
+        assert!(
+            history[2].ui.is_none(),
+            "tool result never consumes a display ordinal"
+        );
+        assert!(
+            history[3].ui.is_none(),
+            "assistant turns never get display text"
+        );
+        assert_eq!(
+            history[4]
+                .ui
+                .as_ref()
+                .and_then(|ui| ui.display_text.as_deref()),
+            Some("/healthz")
         );
     }
 
