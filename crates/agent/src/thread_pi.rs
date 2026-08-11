@@ -28,6 +28,7 @@ use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, T
 use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
+use crate::team::Team;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone)]
@@ -305,6 +306,12 @@ pub struct Thread {
     /// ride the `ProposePlan` tool. Mirrored from the engine on
     /// `PlanModeChanged`/`Ready`.
     plan_mode: bool,
+    /// Member label for team routing: `lead` for the main thread, the
+    /// member name for team workers.
+    label: String,
+    /// The team this thread belongs to. The leader owns the `Entity<Team>`;
+    /// members hold the same entity (set at spawn, cleared on disband).
+    team: Option<Entity<Team>>,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -337,6 +344,8 @@ impl Thread {
             history_phase: HistoryPhase::Ready,
             approval_mode_explicitly_set: false,
             plan_mode: false,
+            label: "lead".into(),
+            team: None,
         })
     }
 
@@ -411,6 +420,8 @@ impl Thread {
                 },
                 approval_mode_explicitly_set: false,
             plan_mode: false,
+                label: "lead".into(),
+                team: None,
             }
         })
     }
@@ -463,6 +474,12 @@ impl Thread {
                     self.plan_mode = enabled;
                 }
                 cx.emit(*event);
+            }
+            BackendNotice::TeamRequest { op, responder } => {
+                // Team state is gpui-side (entities); execute the op here
+                // and reply through the tool's responder channel.
+                let result = crate::team::tools::execute_team_op(self, op, cx);
+                let _ = responder.try_send(result);
             }
             BackendNotice::Ready {
                 restored,
@@ -697,6 +714,18 @@ impl Thread {
         self.running
     }
 
+    /// Test-only: force the running flag so team routing tests can simulate
+    /// a busy thread without a live engine turn.
+    #[cfg(test)]
+    pub(crate) fn set_running_for_test(&mut self, running: bool) {
+        self.running = running;
+    }
+
+    /// Test-only: set the member label.
+    #[cfg(test)]
+    pub(crate) fn set_label_for_test(&mut self, label: String) {
+        self.label = label;
+    }
     // ── Thread duck-type: read accessors ───────────────────────────────────
 
     pub fn messages(&self) -> &[Message] {
@@ -824,9 +853,111 @@ impl Thread {
     }
 
     pub fn agent_label(&self) -> &str {
-        "lead"
+        &self.label
     }
 
+    /// The team this thread belongs to (leader owns; member holds).
+    pub fn team(&self) -> Option<&Entity<Team>> {
+        self.team.as_ref()
+    }
+
+    /// Attach this thread to a team (leader at `TeamCreate`, member at
+    /// spawn).
+    pub fn set_team(&mut self, team: Entity<Team>, _cx: &mut Context<Self>) {
+        self.team = Some(team);
+    }
+
+    /// Detach from the team (disband path).
+    pub fn clear_team(&mut self, _cx: &mut Context<Self>) {
+        self.team = None;
+    }
+
+    /// Deliver peer messages from teammates: render each through the peer
+    /// wrapper template, emit `PeerMessage`, then run a turn over the batch
+    /// (no-op when the engine is mid-turn — the team queues instead).
+    pub fn deliver_peer_messages(
+        &mut self,
+        msgs: Vec<crate::team::PeerMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if msgs.is_empty() {
+            return;
+        }
+        for msg in &msgs {
+            let rendered = crate::prompt::render(
+                crate::prompt::PromptTemplate::WrapperPeerMessage,
+                self.agent_language(),
+                &crate::prompt::PeerMessageData {
+                    from: msg.from.clone(),
+                    content: msg.content.clone(),
+                },
+            )
+            .unwrap_or_else(|_| format!("[from {}] {}", msg.from, msg.content));
+            self.insert_user_message_with_ui_metadata(rendered, None, cx);
+            cx.emit(ThreadEvent::PeerMessage {
+                from: msg.from.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        self.run_turn(cx);
+    }
+
+    /// Construct a team worker thread: a fresh pi session inheriting this
+    /// (leader) thread's cwd / model / approval mode / reasoning effort,
+    /// labeled with the member name. Engine spawned eagerly (members always
+    /// run).
+    pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
+        let id = ThreadId(uuid::Uuid::new_v4().to_string());
+        let cwd = self.cwd.clone();
+        let model = self.model.clone();
+        let approval_mode = self.approval_mode;
+        let reasoning_effort = self.reasoning_effort;
+        let sessions_dir = crate::paths::manox_config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("pi-sessions");
+        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
+            cwd.clone(),
+            model.clone(),
+            sessions_dir,
+            None,
+            true,
+            None,
+        );
+        if approval_mode != ApprovalMode::default() {
+            engine.set_approval_mode(approval_mode);
+        }
+        if reasoning_effort != ReasoningEffort::default() {
+            engine.set_thinking_level(Some(reasoning_effort.wire_value().to_string()));
+        }
+        cx.new(|cx| {
+            drain_engine_notices(cx, events);
+            Self {
+                id,
+                cwd,
+                project: None,
+                model,
+                approval_mode,
+                messages: Vec::new(),
+                reasoning_effort,
+                pinned: false,
+                archived: false,
+                running: false,
+                restored: false,
+                ui_notes: Vec::new(),
+                request_usage: HashMap::new(),
+                pending_prompts: Vec::new(),
+                pending_images: Vec::new(),
+                pending_steers: VecDeque::new(),
+                last_user_ui: None,
+                engine: Some(engine),
+                history_phase: HistoryPhase::Ready,
+                approval_mode_explicitly_set: true,
+                plan_mode: false,
+                label: name,
+                team: None,
+            }
+        })
+    }
     pub fn background_task_snapshots(&self) -> Vec<TaskSnapshot> {
         Vec::new()
     }
@@ -976,8 +1107,20 @@ impl Thread {
         &mut self,
         id: &str,
         response: crate::permission::ToolAuthorizationResponse,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        // Composite ids (`<member>::<child_id>`) route the leader's verdict
+        // to the member thread that owns the actual authorization.
+        if id.contains("::")
+            && let Some(team) = self.team.clone()
+        {
+            let resolved = team.read_with(cx, |t, _| t.resolve_child_auth(id));
+            if let Some((member, child_id)) = resolved {
+                member.update(cx, |m, cx| m.respond_authorization(&child_id, response, cx));
+                team.update(cx, |t, _| t.clear_child_auth(id));
+                return;
+            }
+        }
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
         }
@@ -1233,14 +1376,14 @@ impl Drop for Thread {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// A scripted engine for facade-contract tests: returns the injected
     /// authoritative history, records the mode/effort it was handed.
-    struct FakeEngine {
+    pub(crate) struct FakeEngine {
         history: Vec<Message>,
         shutdown_calls: AtomicUsize,
         approval_mode: Mutex<Option<ApprovalMode>>,
@@ -1249,6 +1392,18 @@ mod tests {
         runs: Mutex<Vec<(String, Vec<pi::types::ContentBlock>)>>,
     }
 
+    impl FakeEngine {
+        /// Empty-history engine for cross-module facade tests (team layer).
+        pub(crate) fn new() -> Self {
+            Self {
+                history: Vec::new(),
+                shutdown_calls: AtomicUsize::new(0),
+                approval_mode: Mutex::new(None),
+                thinking_level: Mutex::new(None),
+                runs: Mutex::new(Vec::new()),
+            }
+        }
+    }
     impl ThreadEngine for FakeEngine {
         fn is_running(&self) -> bool {
             false
@@ -1310,7 +1465,7 @@ mod tests {
     /// Construct a `Thread` facade directly (no actor) with the given
     /// history-loading phase and engine, so the notice-contract tests below
     /// exercise `handle_notice` in isolation.
-    fn thread_with_engine(
+    pub(crate) fn thread_with_engine(
         phase: HistoryPhase,
         engine: Arc<dyn ThreadEngine>,
         cx: &mut gpui::TestAppContext,
@@ -1338,6 +1493,8 @@ mod tests {
                 history_phase: phase,
                 approval_mode_explicitly_set: false,
                 plan_mode: false,
+                label: "lead".into(),
+                team: None,
             })
         })
     }
