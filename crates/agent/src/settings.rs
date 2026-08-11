@@ -18,12 +18,14 @@ use crate::paths;
 
 static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
 static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
+static MCP_DISABLED: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Cache the optimization and side-call tables at startup.
 pub fn init_optimization() {
     let s = load();
     let _ = CONTEXT_OPT.set(s.context_optimization);
     let _ = SIDE_CALLS.set(s.side_calls);
+    let _ = MCP_DISABLED.set(s.mcp.disabled.clone());
 }
 
 /// Cached context-optimization settings. Defaults when not yet initialized.
@@ -34,6 +36,22 @@ pub fn context_optimization() -> ContextOptimizationSettings {
 /// Cached side-call settings. Defaults when not yet initialized.
 pub fn side_calls() -> SideCallsSettings {
     SIDE_CALLS.get().cloned().unwrap_or_default()
+}
+
+/// Cached list of disabled MCP server names (settings `[mcp] disabled`).
+/// Read by `mcp::init` at startup; empty when not yet initialized.
+pub fn mcp_disabled() -> Vec<String> {
+    MCP_DISABLED.get().cloned().unwrap_or_default()
+}
+
+/// Persist the disabled-MCP-server list to `settings.toml` and refresh the
+/// startup cache (the registry itself rebuilds on next launch).
+pub fn set_mcp_disabled(names: Vec<String>) -> Result<()> {
+    let mut settings = load();
+    settings.mcp.disabled = names.clone();
+    save(&settings)?;
+    let _ = MCP_DISABLED.set(names);
+    Ok(())
 }
 
 /// Build the [`crate::claude_md::LoadContext`] for instruction loading.
@@ -93,6 +111,20 @@ pub struct Settings {
     /// summarization.
     #[serde(default)]
     pub side_calls: SideCallsSettings,
+
+    /// MCP server switches (settings UI). The registry is built once at
+    /// startup, so changes apply on the next launch.
+    #[serde(default)]
+    pub mcp: McpSettings,
+}
+
+/// MCP toggles: server names the user switched off in the settings panel.
+/// Absent from the list = enabled (connect at startup).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpSettings {
+    /// Server names skipped by `mcp::init` (persisted by the settings UI).
+    pub disabled: Vec<String>,
 }
 
 /// Network allowlist settings for the sandbox. Read once at startup by

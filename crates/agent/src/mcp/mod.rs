@@ -69,6 +69,7 @@ pub fn init() {
         }
     };
     merge_plugin_declarations(&mut config);
+    retain_enabled(&mut config, &crate::settings::mcp_disabled());
 
     let registry = build_registry(config);
     let count = registry.tool_count();
@@ -90,6 +91,33 @@ pub fn global() -> &'static McpRegistry {
     REGISTRY
         .get()
         .expect("McpRegistry not initialized; call agent::init first")
+}
+
+/// The merged MCP config (mcp.toml + plugin `.mcp.json` layers) without
+/// connecting — the settings panel lists configured servers from it.
+pub fn load_merged_config() -> McpConfig {
+    let mut config = crate::paths::manox_config_dir()
+        .ok()
+        .and_then(|dir| McpConfig::load(&dir).ok())
+        .unwrap_or_default();
+    merge_plugin_declarations(&mut config);
+    config
+}
+
+/// Drop servers the user disabled in settings (persisted `[mcp] disabled`);
+/// the registry is built once at startup, so the switch applies on the next
+/// launch.
+fn retain_enabled(config: &mut McpConfig, disabled: &[String]) {
+    if disabled.is_empty() {
+        return;
+    }
+    config.mcp_servers.retain(|name, _| {
+        let keep = !disabled.iter().any(|d| d == name);
+        if !keep {
+            tracing::info!("MCP server `{name}` disabled in settings, skipped");
+        }
+        keep
+    });
 }
 
 /// Non-panicking accessor for callers that may run before `init`.
@@ -288,6 +316,38 @@ fn header_map(
 mod tests {
     use super::*;
     use rmcp::model::{CallToolResult, Content, RawContent, RawTextContent};
+
+    fn stdio_cfg() -> McpServerConfig {
+        McpServerConfig {
+            transport: crate::mcp::config::McpServerTransportConfig::Stdio {
+                command: "true".into(),
+                args: vec![],
+                env: None,
+                cwd: None,
+            },
+        }
+    }
+
+    #[test]
+    fn retain_enabled_drops_disabled_servers_only() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert("alpha".into(), stdio_cfg());
+        config.mcp_servers.insert("beta".into(), stdio_cfg());
+        config.mcp_servers.insert("gamma".into(), stdio_cfg());
+        retain_enabled(&mut config, &["beta".to_string()]);
+        let names: Vec<&String> = config.mcp_servers.keys().collect();
+        assert_eq!(names.len(), 2);
+        assert!(config.mcp_servers.contains_key("alpha"));
+        assert!(config.mcp_servers.contains_key("gamma"));
+    }
+
+    #[test]
+    fn retain_enabled_noop_on_empty_disabled_list() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert("alpha".into(), stdio_cfg());
+        retain_enabled(&mut config, &[]);
+        assert_eq!(config.mcp_servers.len(), 1);
+    }
 
     #[test]
     fn flatten_text_blocks() {

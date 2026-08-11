@@ -67,6 +67,7 @@ const GROUPS: &[SettingsGroup] = &[
         items: &[
             SettingsItem::new(IconName::Bot, "settings-item-snapshots", None),
             SettingsItem::new(IconName::Frame, "settings-item-plugins", None),
+            SettingsItem::new(IconName::ChartPie, "settings-item-mcp", None),
             SettingsItem::new(IconName::Globe, "settings-item-browser", None),
             SettingsItem::new(IconName::Ellipsis, "settings-item-computer", None),
         ],
@@ -216,6 +217,11 @@ pub struct SettingsView {
     personality: SharedString,
     memory_enabled: bool,
     memory_skip_tool: bool,
+    // --- MCP panel state ---
+    /// Server names switched off by the user; persisted to `settings.toml`
+    /// on toggle (`agent::settings::set_mcp_disabled`). Seeded from settings
+    /// at view creation.
+    pub(crate) mcp_disabled: std::collections::HashSet<String>,
     // --- Environment panel state ---
     // Mock project list is static; no per-view state needed.
 }
@@ -270,6 +276,7 @@ impl SettingsView {
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
+            mcp_disabled: user_settings::mcp_disabled().into_iter().collect(),
         }
     }
 
@@ -538,6 +545,7 @@ impl SettingsView {
             Some("settings-item-environment") => {
                 panels::render_environment(self, cx).into_any_element()
             }
+            Some("settings-item-mcp") => panels::render_mcp(self, cx).into_any_element(),
             Some("settings-item-chatgpt-app") => {
                 chatgpt::render_chatgpt_app(self, cx).into_any_element()
             }
