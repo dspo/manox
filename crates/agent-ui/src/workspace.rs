@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::PermissionDecision;
+use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
 use agent::language_model::StopReason;
 use agent::settings;
@@ -195,6 +196,15 @@ enum RegistryTurnKind {
     Skill,
 }
 
+/// A submitted plan file awaiting the user's review verdict. Carries the
+/// plan file path, its resolved title, and the file content rendered into
+/// the review card.
+struct PendingPlanReview {
+    plan_file: String,
+    title: String,
+    content: String,
+}
+
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<ThreadEntity>,
@@ -253,6 +263,16 @@ pub struct Workspace {
     sidebar_width: Pixels,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
+    /// A completed plan awaiting the user's implement / clear-context verdict,
+    /// rendered as the inline plan-review drawer card.
+    pending_plan_review: Option<PendingPlanReview>,
+    /// Per-thread stash of `pending_plan_review`, keyed by thread id. A
+    /// pending plan never enters persisted messages (the `<proposed_plan>`
+    /// block is stripped before the assistant text is saved), so without this
+    /// stash the verdict card + buttons vanish on a switch-away/switch-back
+    /// round-trip. Mirrors `drafts`: populated on switch-away, drained on
+    /// switch-back.
+    pending_plans: HashMap<String, PendingPlanReview>,
     /// Current question index in the ask drawer (0-based).
     ask_step: usize,
     /// Animation generation counter for the ask drawer slide, bumped on every
@@ -539,6 +559,8 @@ impl Workspace {
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_ask: None,
+            pending_plan_review: None,
+            pending_plans: HashMap::new(),
             ask_step: 0,
             ask_transition_gen: 0,
             model_open: false,
@@ -646,6 +668,34 @@ impl Workspace {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
                     });
+                    cx.notify();
+                }
+                ThreadEvent::PlanReady { plan_file, title } => {
+                    // The model submitted the plan through `ProposePlan`; read
+                    // the file once for the review card body.
+                    let content = std::fs::read_to_string(plan_file.as_str()).unwrap_or_default();
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    this.conversation.update(cx, |c, cx| {
+                        c.push_plan_review(title.clone(), content.clone(), role, weak, cx);
+                    });
+                    this.pending_plan_review = Some(PendingPlanReview {
+                        plan_file: plan_file.clone(),
+                        title: title.clone(),
+                        content,
+                    });
+                    // Persist the pending verdict so a restart re-surfaces
+                    // the card (the engine re-emits PlanReady on Ready).
+                    this.thread
+                        .update(cx, |t, cx| t.set_plan_review_pending(true, cx));
+                    this.sync_list_count(cx);
+                    // The finalized plan surfaces at the tail; reveal it like any
+                    // user-initiated jump to the live end.
+                    this.list_state.set_follow_mode(FollowMode::Tail);
+                    cx.notify();
+                }
+                ThreadEvent::PlanModeChanged { .. } => {
+                    // Refresh the plan chip.
                     cx.notify();
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
@@ -859,6 +909,17 @@ impl Workspace {
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
+                        // An error is a terminal state symmetric to a terminal
+                        // `Stop`: the turn aborted, so any pending plan review
+                        // is now stale and must not linger over an idle thread.
+                        if this.pending_plan_review.take().is_some() {
+                            this.conversation
+                                .update(cx, |c, cx| c.consume_plan_review(cx));
+                            // The demoted plan card stays in place but flips
+                            // inactive — remeasure so the list's cached height
+                            // for it stays honest.
+                            this.list_state.remeasure();
+                        }
                         // The run task emits `TurnFinished` after it has cleared
                         // `running_turn`; queue recovery and follow-up dispatch
                         // happen there.
@@ -1786,7 +1847,9 @@ impl Workspace {
     }
 
     fn blocking_overlay_active(&self) -> bool {
-        self.pending_ask.is_some() || self.blank_project_parent.is_some()
+        self.pending_plan_review.is_some()
+            || self.pending_ask.is_some()
+            || self.blank_project_parent.is_some()
     }
 
     fn toggle_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1999,6 +2062,14 @@ impl Workspace {
             self.input_state.read(cx).value().to_string(),
         );
 
+        // Stash the outgoing thread's pending plan verdict so it survives a
+        // round-trip through another thread. The plan text lives only in
+        // `pending_plan_review` (never in persisted messages), so switching
+        // away would otherwise drop it — and the verdict card with it.
+        if let Some(review) = self.pending_plan_review.take() {
+            self.pending_plans.insert(old_id.clone(), review);
+        }
+
         // Queue state is session-local but belongs to a thread, not to the
         // currently visible workspace. Move it aside before rebinding.
         let outgoing_follow_ups = std::mem::take(&mut self.queued_follow_ups);
@@ -2087,6 +2158,21 @@ impl Workspace {
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
+        // Restore the incoming thread's stashed pending plan, if any.
+        self.pending_plan_review = self.pending_plans.remove(&new_id);
+        if let Some(review) = self.pending_plan_review.as_ref() {
+            let title = review.title.clone();
+            let content = review.content.clone();
+            let role = self.model_label(cx);
+            let weak = cx.weak_entity();
+            self.conversation.update(cx, |c, cx| {
+                c.push_plan_review(title, content, role, weak, cx);
+            });
+            // The card is appended after the earlier `reset`, so splice the
+            // list count and re-pin so the restored drawer is in view.
+            self.sync_list_count(cx);
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        }
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
@@ -2525,6 +2611,33 @@ impl Workspace {
             });
             cx.notify();
             return;
+        }
+        // The thread is idle (not running). If a plan review was awaiting a
+        // verdict, a free-form message means the user is discussing or revising
+        // rather than accepting — drop the stale verdict so the card hides
+        // until the agent re-proposes via a fresh `PlanReady`. Without this the
+        // lingering Implement button would act on the now-outdated plan text.
+        let dismissed_plan = self.pending_plan_review.take();
+        if let Some(review) = dismissed_plan.as_ref() {
+            self.thread
+                .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
+            self.conversation
+                .update(cx, |c, cx| c.consume_plan_review(cx));
+            // The demoted plan card stays in place but flips inactive —
+            // remeasure so the list's cached height for it stays honest.
+            self.list_state.remeasure();
+            // Persist the dismissed plan as a UI note so the collapsed record
+            // survives a thread switch / reload — the live card is UI-only and
+            // never enters `Thread::messages`. `record_ui_note` anchors to the
+            // last user message, which at this point (before the dismissing
+            // message is appended below) is the one that triggered the plan's
+            // turn, so the rebuild splices the card back at that turn's end,
+            // ahead of this dismissing message — matching the live order.
+            self.record_ui_note(
+                agent::db::UiNoteKind::PlanReview,
+                review.content.clone(),
+                cx,
+            );
         }
         self.append_and_run_user_turn(turn, weak, cx);
         // The conversation exists the moment the message is sent: refresh
@@ -3285,6 +3398,121 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Resolve the pending plan review with the user's three-way verdict.
+    /// Implement (with or without a context clear) delegates to the thread,
+    /// which exits Plan mode and re-injects the plan as the implement turn's
+    /// seed; the rail's plan overview seeds later from the model's first
+    /// `UpdatePlan` call. Staying in Plan mode is not a verdict — the user
+    /// simply keeps typing.
+    /// Plan mode active on the current thread (drives the composer chip).
+    pub(crate) fn thread_plan_mode(&self, cx: &mut Context<Self>) -> bool {
+        self.thread.read(cx).plan_mode()
+    }
+
+    /// Toggle plan mode on the current thread (persisted by the engine).
+    pub(crate) fn set_thread_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.thread.update(cx, |t, cx| t.set_plan_mode(enabled, cx));
+    }
+
+    /// The user's verdict on a proposed plan (oh-my-pi's four options):
+    /// execute in fresh context / compact then execute / keep context and
+    /// execute / refine. Execute verdicts exit plan mode and run the rendered
+    /// execution seed referencing the plan file; refine keeps plan mode on
+    /// and waits for the user's feedback turn.
+    pub(crate) fn respond_plan_review(
+        &mut self,
+        choice: PlanReviewChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(review) = self.pending_plan_review.take() else {
+            return;
+        };
+        // Every verdict consumes the card; clear the persisted pending flag.
+        self.thread
+            .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
+        if matches!(choice, PlanReviewChoice::Refine) {
+            // Keep plan mode ON: demote the card and prompt for feedback.
+            // The feedback turn runs under the plan-mode instructions; the
+            // model updates the plan file and proposes again (fresh card).
+            self.conversation
+                .update(cx, |c, cx| c.consume_plan_review(cx));
+            self.list_state.remeasure();
+            self.add_info_message(i18n::t("plan-refine-notice").to_string(), cx);
+            cx.notify();
+            return;
+        }
+        let lang = self.thread.read(cx).agent_language();
+        let seed_text =
+            match agent::collaboration_mode::render_plan_mode_approved(lang, &review.plan_file) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to render plan execution seed");
+                    format!(
+                        "Read and implement the approved plan at {}",
+                        review.plan_file
+                    )
+                }
+            };
+        let meta = self.user_turn_meta(cx);
+        let ui = Self::message_ui_metadata(&meta);
+        if matches!(choice, PlanReviewChoice::ExecuteFresh) {
+            // Fresh context: archive this thread and continue on a new one
+            // seeded with the execution directive. The plan file persists on
+            // disk, so the new thread reads it from the path — no inline
+            // plan-text copy in the transcript.
+            let old_id = self.thread.read(cx).id.0.clone();
+            let cwd = self.thread.read(cx).cwd().to_path_buf();
+            let project = self.thread.read(cx).project().cloned();
+            let model = self.thread.read(cx).model().cloned();
+            let effort = self.thread.read(cx).reasoning_effort();
+            let approval = self.thread.read(cx).approval_mode();
+            let new = match &project {
+                Some(dir) => Thread::new_in_project(
+                    ThreadId(uuid::Uuid::new_v4().to_string()),
+                    dir.clone(),
+                    cx,
+                ),
+                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
+            };
+            new.update(cx, |t, cx| {
+                if let Some(model) = model {
+                    t.set_model(model, cx);
+                }
+                t.set_reasoning_effort(effort, cx);
+                t.set_approval_mode(approval, cx);
+                t.seed_plan_execution(seed_text, Some(ui), cx);
+            });
+            self.attach_thread(new, window, cx);
+            save_thread(self.thread.clone(), true, cx);
+            agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
+        } else {
+            // Compact/keep-context: the engine exits plan mode, optionally
+            // compacts the planning context toward the plan file, then runs
+            // the seed turn. Retire the card and push the verdict bubble so
+            // live and rebuilt views match.
+            let weak = cx.weak_entity();
+            self.conversation.update(cx, |c, cx| {
+                c.pop_plan_review_tail(cx);
+            });
+            self.conversation.update(cx, |c, cx| {
+                c.push_user(seed_text.clone(), Vec::new(), meta, weak, cx);
+            });
+            self.sync_list_count(cx);
+            let ix = self.conversation.read(cx).items().len().saturating_sub(1);
+            self.list_state.remeasure_items(ix..ix + 1);
+            self.list_state.set_follow_mode(FollowMode::Tail);
+            let compact = matches!(choice, PlanReviewChoice::ExecuteCompact);
+            let compact_instructions = compact.then(|| {
+                agent::collaboration_mode::plan_compact_instructions(lang, &review.plan_file)
+            });
+            self.thread.update(cx, |thread, cx| {
+                thread.approve_plan(compact, compact_instructions, seed_text, cx);
+            });
+        }
+        cx.notify();
+    }
+
     /// Wire api string → Tag variant + label for the pi model menu.
     fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
         match api {
@@ -3490,7 +3718,8 @@ impl Workspace {
     ) -> AnyElement {
         // Flip the composer placeholder only on mode transitions, so render
         // doesn't churn the InputState every frame.
-        let followup_mode = running && self.pending_ask.is_none();
+        let followup_mode =
+            running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
         let placeholder_mode = if self.pending_ask.is_some() {
             ComposerPlaceholderMode::Ask
         } else if followup_mode {
@@ -3515,9 +3744,13 @@ impl Workspace {
         let project_chip = self.render_project_chip_pi(theme, cx);
         let goal_chip: Option<AnyElement> = None;
         let team_chip: Option<AnyElement> = None;
+        let plan_chip = self.render_plan_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector_pi(theme, cx);
-        let send = self.render_send_button(running && self.pending_ask.is_none(), cx);
+        let send = self.render_send_button(
+            running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
+            cx,
+        );
         // The completion popover overlays the composer; anchoring it on the
         // composer's own v_flex keeps it glued to the input bar in both hero
         // and footer, with a single mount point and ElementId.
@@ -3614,6 +3847,7 @@ impl Workspace {
                             .child(project_chip)
                             .when_some(goal_chip, |el, chip| el.child(chip))
                             .when_some(team_chip, |el, chip| el.child(chip))
+                            .when_some(plan_chip, |el, chip| el.child(chip))
                             .child(access),
                     )
                     .child(
@@ -3796,6 +4030,36 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Plan-mode indicator chip: visible while the session plans (read-only
+    /// research + plan-file writes), so the state is never silent.
+    fn render_plan_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.thread.read(cx).plan_mode() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .id("plan-mode-chip")
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(theme.warning.opacity(0.12))
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .xsmall()
+                        .text_color(theme.warning),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child(i18n::t("plan-chip-label")),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Access chip + 3-tier approval popover.
     ///
     /// The chip is a mode-aware pill rendered next to the composer send button.
@@ -3956,7 +4220,10 @@ impl Workspace {
             })
             .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.thread.read(cx).is_running() && this.pending_ask.is_none() {
+                if this.thread.read(cx).is_running()
+                    && this.pending_plan_review.is_none()
+                    && this.pending_ask.is_none()
+                {
                     this.cancel_turn(cx);
                 } else {
                     this.submit_input(window, cx);
@@ -4388,7 +4655,7 @@ impl Workspace {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.pending_ask.is_some() {
+        if self.pending_ask.is_some() || self.pending_plan_review.is_some() {
             return None;
         }
         self.blank_project_parent.as_ref()?;

@@ -225,6 +225,17 @@ pub enum ThreadEvent {
         messages_compacted: usize,
         tokens_before: u64,
     },
+    /// The model submitted a plan file for the user's review verdict via
+    /// the `ProposePlan` tool.
+    PlanReady { plan_file: String, title: String },
+    /// The model published/updated its execution task list via `UpdatePlan`;
+    /// the context rail renders it as the plan overview.
+    PlanUpdated {
+        snapshot: crate::plan::PlanSnapshot,
+    },
+    /// Plan mode toggled (persisted in the session sidecar); the workspace
+    /// mirrors it for the plan chip.
+    PlanModeChanged { enabled: bool },
     /// A peer message was delivered from another team member.
     PeerMessage { from: String, content: String },
     /// A queued steer follow-up was drained into `messages`.
@@ -290,6 +301,10 @@ pub struct Thread {
     /// thread; the mode is then not overwritten by the session sidecar's
     /// default when the engine materializes.
     approval_mode_explicitly_set: bool,
+    /// Plan mode active: read-only research + plan-file writes, proposals
+    /// ride the `ProposePlan` tool. Mirrored from the engine on
+    /// `PlanModeChanged`/`Ready`.
+    plan_mode: bool,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -321,6 +336,7 @@ impl Thread {
             engine: None,
             history_phase: HistoryPhase::Ready,
             approval_mode_explicitly_set: false,
+            plan_mode: false,
         })
     }
 
@@ -394,6 +410,7 @@ impl Thread {
                     HistoryPhase::Ready
                 },
                 approval_mode_explicitly_set: false,
+            plan_mode: false,
             }
         })
     }
@@ -442,12 +459,18 @@ impl Thread {
                 if let ThreadEvent::ApprovalModeChanged { mode } = *event {
                     self.approval_mode = mode;
                 }
+                if let ThreadEvent::PlanModeChanged { enabled } = *event {
+                    self.plan_mode = enabled;
+                }
                 cx.emit(*event);
             }
             BackendNotice::Ready {
                 restored,
                 model,
                 approval_mode,
+                plan_mode,
+                plan_file,
+                plan_review_pending,
             } => {
                 self.restored = restored;
                 if let Some(m) = model {
@@ -455,6 +478,25 @@ impl Thread {
                 }
                 if !self.approval_mode_explicitly_set {
                     self.approval_mode = approval_mode;
+                }
+                if plan_mode {
+                    self.plan_mode = true;
+                }
+                if plan_review_pending
+                    && let Some(plan_file) = plan_file
+                {
+                    // Re-surface the pending review card after a restart:
+                    // re-read the plan file and resolve the title the same
+                    // way the live propose did.
+                    let content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+                    let slug = std::path::Path::new(&plan_file)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .trim_end_matches("-plan")
+                        .to_string();
+                    let title = crate::plan_mode::resolve_plan_title(None, &content, &slug);
+                    cx.emit(ThreadEvent::PlanReady { plan_file, title });
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
@@ -824,6 +866,65 @@ impl Thread {
 
     // ── Thread duck-type: setters ──────────────────────────────────────────
 
+    /// Seed the approved plan as the next user message without running it
+    /// (the clear-context verdict inserts on a fresh thread, then the
+    /// workspace launches the turn).
+    /// Seed an approved plan's execution on this thread and run it: the
+    /// rendered execution directive (referencing the plan file) becomes the
+    /// first user message. Used by the fresh-context verdict on the spawned
+    /// thread.
+    pub fn seed_plan_execution(
+        &mut self,
+        seed_text: String,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_user_message_with_ui_metadata(seed_text, ui, cx);
+        self.run_turn(cx);
+    }
+
+    /// Plan mode active for this thread (mirrored from the engine).
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// Persist whether a plan review card is pending, so a restarted
+    /// session re-surfaces the card (the card itself is UI-only state).
+    pub fn set_plan_review_pending(&mut self, pending: bool, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.set_plan_review_pending(pending);
+        }
+        let _ = cx;
+    }
+
+    /// Toggle plan mode: the engine persists the flag in the session
+    /// sidecar, wires the read-only gate, and injects the plan-mode
+    /// instructions (rendered for the configured agent language) every turn.
+    pub fn set_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.plan_mode = enabled;
+        if let Some(engine) = &self.engine {
+            engine.set_plan_mode(enabled);
+        }
+        cx.notify();
+    }
+
+    /// Execute an approved plan on this thread: optionally compact the
+    /// planning context first (distilled toward the plan file), then run
+    /// the execution seed turn.
+    pub fn approve_plan(
+        &mut self,
+        compact: bool,
+        compact_instructions: Option<String>,
+        seed_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.plan_mode = false;
+        if let Some(engine) = &self.engine {
+            engine.approve_plan(compact, compact_instructions, seed_text);
+        }
+        cx.notify();
+    }
+
     pub fn set_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         if self.has_interacted() {
             return;
@@ -1172,6 +1273,7 @@ mod tests {
                 engine: Some(engine),
                 history_phase: phase,
                 approval_mode_explicitly_set: false,
+                plan_mode: false,
             })
         })
     }
@@ -1296,6 +1398,9 @@ mod tests {
                     restored: true,
                     model: None,
                     approval_mode: ApprovalMode::default(),
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
                 },
                 cx,
             );
@@ -1369,6 +1474,9 @@ mod tests {
                     restored: false,
                     model: None,
                     approval_mode: ApprovalMode::AutoPilot,
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
                 },
                 cx,
             );

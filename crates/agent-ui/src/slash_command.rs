@@ -126,6 +126,7 @@ impl SlashCommandRegistry {
 /// any workspace is created. Idempotent via `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
+        Box::new(PlanCommand),
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
@@ -134,6 +135,7 @@ pub fn init(_cx: &mut App) {
     // skill sharing one is skipped — keeps one popover row per name and routes
     // dispatch to the higher-priority command/built-in.
     let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
+        "plan".to_string(),
         "compact".to_string(),
         "exit".to_string(),
         "new".to_string(),
@@ -304,6 +306,45 @@ impl SlashCommand for SkillSlashCommand {
     ) -> SlashResult {
         workspace.run_skill_turn(&self.key, args, cx);
         SlashResult::Handled
+    }
+}
+
+/// `/plan` — toggle plan mode. Entering wires the read-only gate and the
+/// plan-mode research instructions; `/plan <prompt>` also starts planning
+/// the prompt immediately. Running `/plan` again exits plan mode (full
+/// write access restored). Plans are submitted for approval through the
+/// `ProposePlan` tool, never as prose.
+struct PlanCommand;
+
+impl SlashCommand for PlanCommand {
+    fn name(&self) -> &str {
+        "plan"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-plan-desc")
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        // Toggle plan mode. Entering: the engine wires the read-only gate
+        // and injects the plan-mode instructions every turn; a prompt passed
+        // alongside becomes the first planning turn. Leaving: the gate lifts.
+        if workspace.thread_plan_mode(cx) {
+            workspace.set_thread_plan_mode(false, cx);
+            workspace.add_info_message(i18n::t("plan-mode-off-notice").to_string(), cx);
+            return SlashResult::Handled;
+        }
+        workspace.set_thread_plan_mode(true, cx);
+        if args.trim().is_empty() {
+            workspace.add_info_message(i18n::t("plan-mode-on-notice").to_string(), cx);
+            SlashResult::Handled
+        } else {
+            SlashResult::InjectUserTurn(args.to_string())
+        }
     }
 }
 

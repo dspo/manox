@@ -58,6 +58,14 @@ pub enum PromptTemplate {
     // --- command / skill wrappers ---
     SkillBody,
 
+    // --- plan mode ---
+    /// Injected every turn while plan mode is active: read-only discipline,
+    /// plan-file conventions, research discipline, and the propose contract.
+    ModePlanActive,
+    /// Execution seed after a plan is approved: read the plan file and
+    /// implement it top to bottom.
+    ModePlanApproved,
+
     // --- tool descriptions ---
     AgentToolDescription,
 }
@@ -91,6 +99,8 @@ impl PromptTemplate {
             Self::TitleFirstInstruction => "title/first.tera.md",
             Self::TitleTopicShiftInstruction => "title/topic_shift.tera.md",
             Self::SkillBody => "wrapper/skill_body.tera.md",
+            Self::ModePlanActive => "mode/plan_mode_active.tera.md",
+            Self::ModePlanApproved => "mode/plan_mode_approved.tera.md",
             Self::AgentToolDescription => "tools/agent_tool.tera.md",
         }
     }
@@ -100,7 +110,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 23] = [
+pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -123,5 +133,7 @@ pub const ALL: [PromptTemplate; 23] = [
     PromptTemplate::TitleFirstInstruction,
     PromptTemplate::TitleTopicShiftInstruction,
     PromptTemplate::SkillBody,
+    PromptTemplate::ModePlanActive,
+    PromptTemplate::ModePlanApproved,
     PromptTemplate::AgentToolDescription,
 ];

@@ -183,6 +183,111 @@ impl PlanSnapshot {
 /// Pure over `messages`: reload, thread switch, and post-compaction rebuild all
 /// route through here, so the rail's plan state is always a function of the
 /// canonical history and never drifts from it.
+/// The `UpdatePlan` tool (pi `AgentTool` port of the retired manox tool):
+/// the model publishes a structured task list that the context rail renders
+/// as an execution overview. Stateless: validation lives in
+/// [`PlanSnapshot::from_input`]; the validated snapshot rides
+/// `ThreadEvent::PlanUpdated` to the workspace rail, and the transcript's
+/// tool call feeds [`rebuild_from_messages`] on reload.
+///
+/// Publishing a task list mutates nothing on disk, so the tool rides ungated
+/// (no approval); plan mode's `ToolCall` hook blocks it while planning
+/// (execution tracking starts after approval).
+pub struct UpdatePlanTool {
+    notice_tx: tokio::sync::mpsc::UnboundedSender<crate::thread_engine::BackendNotice>,
+}
+
+impl UpdatePlanTool {
+    pub fn new(
+        notice_tx: tokio::sync::mpsc::UnboundedSender<crate::thread_engine::BackendNotice>,
+    ) -> Self {
+        Self { notice_tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for UpdatePlanTool {
+    fn name(&self) -> &str {
+        UPDATE_PLAN
+    }
+
+    fn description(&self) -> &str {
+        "Publish or update your task list for the current work. The full plan is a short, \
+         ordered list of steps, each with a status (pending / in_progress / completed). Call \
+         this when you begin non-trivial multi-step work (roughly 3+ steps) or right after a \
+         plan is approved, then again whenever progress changes — always send the COMPLETE new \
+         list, not a delta. Keep at most one step in_progress. Mark steps completed as you \
+         finish them and mark all completed before you end. Titles must be concise, single-line, \
+         and free of Markdown. Send an empty plan to clear the list. This drives the plan \
+         overview shown to the user; it does not change files."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        let mut value =
+            serde_json::to_value(schemars::schema_for!(UpdatePlanInput)).expect("schema");
+        strip_schema_metadata(&mut value);
+        value
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        // Validate here so a malformed call returns an error tool result and
+        // the rail keeps the last valid snapshot (rebuild skips errored calls).
+        let snapshot =
+            PlanSnapshot::from_input(&params).map_err(pi::tool::ToolError::InvalidArguments)?;
+        let confirmation = confirmation(&snapshot);
+        let _ = self
+            .notice_tx
+            .send(crate::thread_engine::BackendNotice::Event(Box::new(
+                crate::thread::ThreadEvent::PlanUpdated { snapshot },
+            )));
+        Ok(pi::tool::AgentToolResult {
+            content: vec![pi::types::ContentBlock::Text {
+                text: confirmation,
+                signature: None,
+            }],
+            details: None,
+            is_error: false,
+            usage: None,
+            added_tool_names: None,
+            terminate: false,
+        })
+    }
+}
+
+/// Inline the schema so providers that reject `$ref`/`$defs` accept it.
+fn strip_schema_metadata(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("$defs");
+    }
+}
+
+/// Model-facing confirmation echoing the accepted plan so the model sees
+/// exactly what was recorded. Kept terse; the rich view is the rail.
+fn confirmation(snapshot: &PlanSnapshot) -> String {
+    if snapshot.is_empty() {
+        return "Plan cleared.".to_string();
+    }
+    let (done, total) = snapshot.progress();
+    let mut out = format!("Plan updated: {done}/{total} completed.\n");
+    for (i, step) in snapshot.steps.iter().enumerate() {
+        let marker = match step.status {
+            PlanStepStatus::Completed => "[x]",
+            PlanStepStatus::InProgress => "[>]",
+            PlanStepStatus::Pending => "[ ]",
+        };
+        out.push_str(&format!("{marker} {}. {}\n", i + 1, step.step));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
 pub fn rebuild_from_messages(messages: &[Message]) -> Option<PlanSnapshot> {
     // Collect the ids of tool results that errored, so a failed UpdatePlan call
     // is skipped rather than treated as authoritative.
@@ -232,10 +337,86 @@ mod tests {
     use super::*;
     use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use crate::message::Message;
+    use pi::tool::AgentTool as _;
     use serde_json::json;
 
     fn input(plan: serde_json::Value) -> serde_json::Value {
         json!({ "plan": plan })
+    }
+
+    fn tool_ctx() -> pi::tool::LocalToolContext {
+        pi::tool::LocalToolContext::new(
+            std::sync::Arc::new(pi::env::TokioExecutionEnv::new("/tmp")),
+            std::path::PathBuf::from("/tmp"),
+            std::sync::Arc::new(pi::tool::ToolState::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn update_plan_tool_emits_snapshot_and_confirms() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = UpdatePlanTool::new(tx);
+        assert_eq!(tool.name(), UPDATE_PLAN);
+
+        let ctx = tool_ctx();
+        let result = tool
+            .execute(
+                "call-1",
+                json!({ "plan": [
+                    { "step": "explore", "status": "completed" },
+                    { "step": "implement", "status": "in_progress" },
+                ] }),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("valid plan publishes");
+        assert!(!result.is_error);
+        let text = match &result.content[0] {
+            pi::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text block, got {other:?}"),
+        };
+        assert!(text.contains("1/2 completed"), "{text}");
+        assert!(text.contains("[x] 1. explore"), "{text}");
+        assert!(text.contains("[>] 2. implement"), "{text}");
+
+        // The snapshot rides PlanUpdated to the workspace rail.
+        let notice = rx.try_recv().expect("PlanUpdated emitted");
+        let crate::thread_engine::BackendNotice::Event(event) = notice else {
+            panic!("expected an event notice");
+        };
+        let crate::thread::ThreadEvent::PlanUpdated { snapshot } = *event else {
+            panic!("expected PlanUpdated");
+        };
+        assert_eq!(snapshot.steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_plan_tool_rejects_malformed_input() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = UpdatePlanTool::new(tx);
+        let ctx = tool_ctx();
+        let err = tool
+            .execute(
+                "call-1",
+                json!({ "plan": [ { "step": "x", "status": "nonsense" } ] }),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect_err("invalid status rejected");
+        assert!(matches!(err, pi::tool::ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn update_plan_schema_is_flat_object() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = UpdatePlanTool::new(tx);
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        let obj = schema.as_object().unwrap();
+        assert!(!obj.contains_key("$defs"));
+        assert!(!obj.contains_key("$schema"));
     }
 
     #[test]
