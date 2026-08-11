@@ -599,10 +599,18 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) -> String {
+        let mut images = Vec::new();
         let text: String = content
             .iter()
             .filter_map(|c| match c {
                 MessageContent::Text(t) => Some(t.as_str()),
+                MessageContent::Image { data, mime_type } => {
+                    images.push(pi::types::ContentBlock::Image {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    });
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -612,7 +620,7 @@ impl Thread {
         let id = message.id.clone();
         self.pending_steers.push_back(id.clone());
         if let Some(engine) = &self.engine {
-            engine.steer(text);
+            engine.steer(text, images);
         }
         cx.notify();
         // The canonical message joins history at the next refresh (pi owns the
@@ -1070,7 +1078,7 @@ mod tests {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, _text: String) -> String {
+        fn steer(&self, _text: String, _images: Vec<pi::types::ContentBlock>) -> String {
             String::new()
         }
 

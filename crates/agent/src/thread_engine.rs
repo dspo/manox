@@ -62,9 +62,10 @@ pub trait ThreadEngine: Send + Sync {
     /// settlement lands in `history`.
     fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>);
 
-    /// Inject a steer into the running turn. Returns the steer id, which
-    /// `cancel_steer` accepts to retract it before the loop drains it.
-    fn steer(&self, text: String) -> String;
+    /// Inject a steer (text + optional image attachments) into the running
+    /// turn. Returns the steer id, which `cancel_steer` accepts to retract it
+    /// before the loop drains it.
+    fn steer(&self, text: String, images: Vec<pi::types::ContentBlock>) -> String;
 
     /// Retract a queued steer by id. False when it already drained.
     fn cancel_steer(&self, id: &str) -> bool;
