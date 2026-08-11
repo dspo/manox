@@ -45,13 +45,17 @@
 //!   stricter `(deny default)` allowlist is future work.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use pi::env::{CommandResult, ExecutionError};
 use pi::tools::bash::{BashExecRequest, BashOperations};
+// macOS-only: the seatbelt exec path is the only consumer naming `Duration`
+// (the Linux exec stub returns before any timeout handling).
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 /// Default wall-clock limit for a sandboxed command (mirrors the bash
 /// tool's own default).
+#[cfg(target_os = "macos")]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Network policy for sandboxed bash.
@@ -280,11 +284,10 @@ impl SandboxPolicy {
     /// string is never re-evaluated by an outer shell — no escaping, no
     /// injection. The login shell's PATH is injected so the sandboxed bash
     /// finds Homebrew / toolchain binaries the GUI process env otherwise
-    /// lacks (thread `e5047fd2`: `gh` not found). Non-interactive
-    /// editor/pager env is injected when unset so git does not open an
-    /// interactive `$EDITOR`/pager and hang the turn.
     /// The `sandbox-exec` argv for `command` (single argv element to
-    /// `bash -c` — no re-evaluation, no injection).
+    /// `bash -c` — no re-evaluation, no injection). Cross-platform so the
+    /// seatbelt renderer (and its tests) compile on every target even though
+    /// only macOS actually runs `sandbox-exec`.
     #[cfg(target_os = "macos")]
     pub fn wrap_argv(&self, command: &str) -> Vec<String> {
         vec![
@@ -297,6 +300,12 @@ impl SandboxPolicy {
         ]
     }
 
+    /// Build the `sandbox-exec` invocation for a command. The login shell's
+    /// PATH is injected so the sandboxed bash finds Homebrew / toolchain
+    /// binaries the GUI process env otherwise lacks (thread `e5047fd2`:
+    /// `gh` not found). Non-interactive editor/pager env is injected when
+    /// unset so git does not open an interactive `$EDITOR`/pager and hang
+    /// the turn.
     #[cfg(target_os = "macos")]
     pub fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -329,7 +338,6 @@ pub fn canonicalize_best_effort(path: &Path) -> PathBuf {
 }
 
 /// Escape a path for a seatbelt `(subpath "...")` string literal.
-#[cfg(target_os = "macos")]
 fn escape_seatbelt_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -363,6 +371,7 @@ fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
 
 /// The login shell's PATH (cached), with a conservative fallback — mirrors
 /// `path_env` (PR #467); consolidated after both land.
+#[cfg(target_os = "macos")] // sole caller is the seatbelt `wrap_command`
 fn login_shell_path() -> String {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
