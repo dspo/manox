@@ -1108,9 +1108,12 @@ fn list_block(
     cursor: &mut usize,
     selection: &DocSelection,
 ) -> AnyElement {
-    let mut col = v_flex().id(("md-list", idx)).w_full().min_w_0().gap_1();
+    // Vertical rhythm matches the document body: items (and the blocks inside
+    // a multi-block item) sit gap_2 apart — the same paragraph gap the root
+    // column applies between body blocks, so a list reads as body text.
+    let mut col = v_flex().id(("md-list", idx)).w_full().min_w_0().gap_2();
     for (i, item) in items.into_iter().enumerate() {
-        let mut item_col = v_flex().flex_1().min_w_0().gap_1();
+        let mut item_col = v_flex().flex_1().min_w_0().gap_2();
         for (j, b) in item.blocks.into_iter().enumerate() {
             item_col = item_col.child(render_block(b, styles, mode, j, false, cursor, selection));
         }
