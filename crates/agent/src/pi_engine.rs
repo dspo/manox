@@ -916,6 +916,7 @@ fn session_builder(
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
         .with_system_prompt(system_prompt(cwd))
+        .with_resources(instruction_resources(cwd))
         .with_tools(tools);
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
@@ -941,6 +942,34 @@ fn attach_plan_hooks(
         pi::harness::HookPoint::ToolCall,
         crate::plan_mode::gate_handler(Arc::clone(plan), plans_dir, cwd.to_path_buf()),
     );
+}
+
+/// Instruction-file resources for the session: the Claude Code-compatible
+/// memory hierarchy (managed policy, `~/.claude/CLAUDE.md` + rules, the
+/// per-directory chain down to the session cwd) loaded through
+/// [`crate::claude_md`] and folded into the system prompt by the kernel
+/// every turn (TS project-instruction semantics). Skills/templates stay
+/// empty here — manox skills ride the `agent::skill` registry instead.
+fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
+    let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
+    let context_files = set
+        .eager
+        .iter()
+        .map(|src| pi::harness::ContextFile {
+            name: src
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "CLAUDE.md".to_string()),
+            location: src.path.display().to_string(),
+            content: src.content.clone(),
+        })
+        .collect();
+    pi::harness::HarnessResources {
+        skills: Vec::new(),
+        prompt_templates: Vec::new(),
+        context_files,
+    }
 }
 
 /// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Find`/`Ls`)

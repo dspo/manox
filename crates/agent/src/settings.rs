@@ -427,6 +427,19 @@ impl Default for AutoCompactSettings {
 /// Load settings from `settings.toml`. Always returns a usable [`Settings`] —
 /// every failure (missing path, missing file, parse error) warns once and
 /// falls back to the default.
+/// Build the [`crate::claude_md::LoadContext`] for instruction loading:
+/// excludes come from settings; home + managed policy resolve to platform
+/// defaults; external imports stay withheld (no approval surface yet).
+pub fn claude_md_load_context() -> crate::claude_md::LoadContext {
+    let settings = load();
+    crate::claude_md::LoadContext {
+        home: crate::paths::home_dir(),
+        managed: crate::claude_md::managed_policy_path(),
+        excludes: settings.claude_md_excludes.clone(),
+        allow_external: false,
+    }
+}
+
 pub fn load() -> Settings {
     let Ok(path) = paths::settings_file() else {
         tracing::warn!("settings.toml path unavailable; using defaults");
