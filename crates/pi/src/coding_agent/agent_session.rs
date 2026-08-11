@@ -182,6 +182,13 @@ impl AgentSession {
         self.prompt_with_images(text, Vec::new()).await
     }
 
+    /// Register a hook handler (TS extension `on(event, handler)` parity).
+    /// Handlers fire at their [`crate::harness::HookPoint`] for every prompt
+    /// this session runs.
+    pub fn on(&mut self, hook: crate::harness::HookPoint, handler: crate::harness::HookHandler) {
+        self.harness.on(hook, handler);
+    }
+
     /// Prompt with attached images (TS `prompt(text, { images })` parity).
     /// Image blocks ride the prompt's own user message; providers translate
     /// them per wire API.
@@ -190,7 +197,18 @@ impl AgentSession {
         text: &str,
         images: Vec<crate::types::ContentBlock>,
     ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        let expanded = self.expand_prompt(text);
+        // TS extension `input` event parity: handlers may transform the
+        // input or mark it fully handled (then no turn runs). Fires before
+        // skill/template expansion, exactly like the TS session.
+        let hook_ctx = self.harness.run_input_hook(text, &images);
+        if hook_ctx.input_handled {
+            return Ok(Vec::new());
+        }
+        let (text, images) = match hook_ctx.input_transform {
+            Some(transform) => (transform.text, transform.images.unwrap_or(images)),
+            None => (text.to_string(), images),
+        };
+        let expanded = self.expand_prompt(&text);
         // The facade delivers its pending next-turn messages as asides AFTER
         // the prompt's own user message (user-first); the harness's own
         // queue keeps pi-agent-core queued-first semantics.
@@ -3648,5 +3666,218 @@ mod tests {
             "saw message start: {seen:?}"
         );
         assert!(seen.contains(&"message_end"), "saw message end: {seen:?}");
+    }
+
+    async fn input_hook_session(dir: &tempfile::TempDir) -> AgentSession {
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn input_hook_transforms_prompt_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir).await;
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                let text = ctx.data["text"].as_str().unwrap_or_default().to_string();
+                ctx.input_transform = Some(crate::harness::InputHookTransform {
+                    text: format!("rewritten: {text}"),
+                    images: None,
+                });
+                ctx
+            }),
+        );
+        session.prompt("original").await.unwrap();
+        let crate::types::AgentMessage::User { content, .. } = &session.harness_messages()[0]
+        else {
+            panic!("first message must be the user prompt");
+        };
+        assert!(matches!(
+            &content[0],
+            crate::types::ContentBlock::Text { text, .. } if text == "rewritten: original"
+        ));
+    }
+
+    #[tokio::test]
+    async fn input_hook_handled_skips_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir).await;
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                ctx.input_handled = true;
+                ctx
+            }),
+        );
+        let messages = session.prompt("never runs").await.unwrap();
+        assert!(messages.is_empty(), "handled input runs no turn");
+        assert!(
+            session.harness_messages().is_empty(),
+            "no transcript entry for a handled input"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_hook_transforms_images_and_keeps_original_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir).await;
+        // Replace the attachments with a marker image.
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                ctx.input_transform = Some(crate::harness::InputHookTransform {
+                    text: ctx.data["text"].as_str().unwrap_or_default().to_string(),
+                    images: Some(vec![crate::types::ContentBlock::Image {
+                        data: "bmV3".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }]),
+                });
+                ctx
+            }),
+        );
+        let original = vec![crate::types::ContentBlock::Image {
+            data: "b2xk".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        session
+            .prompt_with_images("with image", original)
+            .await
+            .unwrap();
+        let crate::types::AgentMessage::User { content, .. } = &session.harness_messages()[0]
+        else {
+            panic!("first message must be the user prompt");
+        };
+        assert!(matches!(
+            content.last(),
+            Some(crate::types::ContentBlock::Image { data, .. }) if data == "bmV3"
+        ));
+
+        // A transform without `images` keeps the original attachments (TS
+        // `images ?? currentImages`).
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir2).await;
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                ctx.input_transform = Some(crate::harness::InputHookTransform {
+                    text: "text-only rewrite".to_string(),
+                    images: None,
+                });
+                ctx
+            }),
+        );
+        let original = vec![crate::types::ContentBlock::Image {
+            data: "a2VwdA==".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        session
+            .prompt_with_images("keep my image", original)
+            .await
+            .unwrap();
+        let crate::types::AgentMessage::User { content, .. } = &session.harness_messages()[0]
+        else {
+            panic!("first message must be the user prompt");
+        };
+        assert!(matches!(
+            content.last(),
+            Some(crate::types::ContentBlock::Image { data, .. }) if data == "a2VwdA=="
+        ));
+    }
+
+    #[tokio::test]
+    async fn input_hook_continue_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir).await;
+        // A hook that only inspects the payload changes nothing.
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|ctx| {
+                assert_eq!(ctx.data["text"], "untouched");
+                assert_eq!(ctx.data["source"], "interactive");
+                ctx
+            }),
+        );
+        session.prompt("untouched").await.unwrap();
+        let crate::types::AgentMessage::User { content, .. } = &session.harness_messages()[0]
+        else {
+            panic!("first message must be the user prompt");
+        };
+        assert!(matches!(
+            &content[0],
+            crate::types::ContentBlock::Text { text, .. } if text == "untouched"
+        ));
+        assert_eq!(session.harness_messages().len(), 2, "the turn still ran");
+    }
+
+    #[tokio::test]
+    async fn input_hook_chains_transforms_and_short_circuits_on_handled() {
+        // TS runner parity: each handler sees the accumulated transform of
+        // all earlier handlers, and a `handled` result stops the chain.
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir).await;
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                let text = ctx.data["text"].as_str().unwrap_or_default().to_string();
+                ctx.input_transform = Some(crate::harness::InputHookTransform {
+                    text: format!("[one {text}]"),
+                    images: None,
+                });
+                ctx
+            }),
+        );
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                let text = ctx.data["text"].as_str().unwrap_or_default().to_string();
+                ctx.input_transform = Some(crate::harness::InputHookTransform {
+                    text: format!("[two {text}]"),
+                    images: None,
+                });
+                ctx
+            }),
+        );
+        session.prompt("seed").await.unwrap();
+        let crate::types::AgentMessage::User { content, .. } = &session.harness_messages()[0]
+        else {
+            panic!("first message must be the user prompt");
+        };
+        // Handler two transformed handler one's output, not the original prompt.
+        assert!(matches!(
+            &content[0],
+            crate::types::ContentBlock::Text { text, .. } if text == "[two [one seed]]"
+        ));
+
+        // `handled` short-circuits the chain: a later handler never runs.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut session = input_hook_session(&dir2).await;
+        let later_ran = std::sync::Arc::new(std::sync::Mutex::new(false));
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(|mut ctx| {
+                ctx.input_handled = true;
+                ctx
+            }),
+        );
+        let later_ran_clone = later_ran.clone();
+        session.on(
+            crate::harness::HookPoint::Input,
+            std::sync::Arc::new(move |ctx| {
+                *later_ran_clone.lock().unwrap() = true;
+                ctx
+            }),
+        );
+        let messages = session.prompt("never runs").await.unwrap();
+        assert!(messages.is_empty(), "handled input runs no turn");
+        assert!(!*later_ran.lock().unwrap(), "handled stops the chain");
     }
 }
