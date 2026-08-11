@@ -6,6 +6,7 @@
 //! Loading tolerates a missing file (a fresh session has no sidecar yet) but
 //! not a corrupt one: a truncated file is a real fault, not an absence.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,13 @@ pub struct SessionMeta {
     pub unread: bool,
     #[serde(default)]
     pub errored: bool,
+    /// Compact display forms for registry slash turns (`/name args`), keyed
+    /// by the user message's ordinal (0-based among user-role prompt messages)
+    /// in the pi transcript. The transcript stores only the expanded
+    /// macro/skill body, so the sidecar restores the send-time bubble on
+    /// reload.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub registry_displays: HashMap<usize, String>,
 }
 
 /// The sidecar path for a session file: `<dir>/<id>.meta.json`.
@@ -119,5 +127,29 @@ mod tests {
             .await
             .unwrap();
         assert!(load(dir.path(), &session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_displays_round_trip_and_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+
+        // Fresh sidecar: no registry displays.
+        let fresh = load(dir.path(), &session).await.unwrap();
+        assert!(fresh.registry_displays.is_empty());
+
+        let meta = SessionMeta {
+            registry_displays: [(1usize, "/gitwork:deliver fast".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        save(dir.path(), &session, &meta).await.unwrap();
+        let loaded = load(dir.path(), &session).await.unwrap();
+        assert_eq!(
+            loaded.registry_displays.get(&1).map(String::as_str),
+            Some("/gitwork:deliver fast")
+        );
+        assert!(!loaded.registry_displays.contains_key(&0));
     }
 }

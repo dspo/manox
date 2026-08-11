@@ -44,6 +44,13 @@ pub struct MessageUiMetadata {
     /// human user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_event: Option<bool>,
+    /// UI-only display form of this user message — e.g. the compact
+    /// `/name args` invocation for a registry slash turn whose model-facing
+    /// text is the expanded macro/skill body. When set, the conversation
+    /// bubble renders this instead of the model-facing text, live and after
+    /// reload alike. The model request path never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
 }
 
 /// A single conversation message.
@@ -159,5 +166,24 @@ mod tests {
             message.content,
             vec![MessageContent::Text("continue".into())]
         );
+    }
+
+    #[test]
+    fn ui_metadata_display_text_round_trips_and_skips_when_absent() {
+        let with_display = MessageUiMetadata {
+            display_text: Some("/gitwork:deliver fast".into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&with_display).unwrap();
+        assert_eq!(value["display_text"], "/gitwork:deliver fast");
+        let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(back.display_text.as_deref(), Some("/gitwork:deliver fast"));
+
+        // Absent display_text stays out of the persisted form entirely.
+        let plain = MessageUiMetadata::default();
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("display_text").is_none());
+        let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(back.display_text, None);
     }
 }
