@@ -37,9 +37,10 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClipboardItem, Element, ElementId, FocusHandle, FontWeight, GlobalElementId,
-    HighlightStyle, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Style, Window, div, px, rems,
+    AbsoluteLength, AnyElement, App, ClipboardItem, Element, ElementId, FocusHandle, FontWeight,
+    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Style, Window, div,
+    px, rems,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::{
@@ -86,6 +87,10 @@ pub struct Markdown {
     scrollable: bool,
     streaming: bool,
     heading_mode: HeadingMode,
+    /// Document body type size (paragraphs, list items, inline code,
+    /// blockquotes). Defaults to 1rem; dense mounts step below via
+    /// `body_size`. Headings resolve against it per `HeadingMode`.
+    body_size: AbsoluteLength,
     selection: DocSelection,
     /// Lazily created on first render so `new` needs no `cx` (callers construct
     /// `Markdown` inside `cx.new` and may not have a handle handy).
@@ -112,6 +117,7 @@ impl Markdown {
             scrollable: false,
             streaming: false,
             heading_mode: HeadingMode::default(),
+            body_size: rems(1.).into(),
             selection: DocSelection::new(),
             focus: None,
             link_opener: None,
@@ -156,6 +162,14 @@ impl Markdown {
     /// enlarged heading text would drown the body.
     pub fn heading_mode(mut self, mode: HeadingMode) -> Self {
         self.heading_mode = mode;
+        self
+    }
+
+    /// Body text size for the whole document. Defaults to `text_base` (1rem);
+    /// the message list mounts one step below chrome size with
+    /// `body_size(px(13.))` so dense conversation text reads lighter.
+    pub fn body_size(mut self, size: impl Into<AbsoluteLength>) -> Self {
+        self.body_size = size.into();
         self
     }
 
@@ -246,17 +260,18 @@ impl Render for Markdown {
         let block_count = blocks.len();
         let blocks_owned: Vec<Block> = (*blocks).clone();
 
-        // Root carries `text_base` so the document is self-contained: every block
-        // that does not override the size itself (paragraph, list item bodies)
-        // inherits it. The renderer is mounted inside full-width message blocks,
-        // so its root must participate in the same shrink-safe width chain.
+        // Root carries the configured `body_size` (default `text_base`) so the
+        // document is self-contained: every block that does not override the
+        // size itself (paragraph, list item bodies) inherits it. The renderer
+        // is mounted inside full-width message blocks, so its root must
+        // participate in the same shrink-safe width chain.
         let mut col = v_flex()
             .id(self.id.clone())
             .w_full()
             .min_w_0()
             .overflow_hidden()
             .gap_2()
-            .text_base()
+            .text_size(self.body_size)
             // I-beam over the document body: a clickable, selectable text
             // surface signals itself to the pointer.
             .cursor_text()
@@ -521,7 +536,10 @@ struct HeadingSpec {
 
 #[derive(Clone, Copy)]
 enum HeadingSize {
+    /// Chrome base size (1rem) — the single H1 step under `Uniform`.
     Base,
+    /// Inherit the document body size (H2+ under `Uniform`).
+    Body,
     Sm,
 }
 
@@ -529,6 +547,7 @@ impl HeadingSize {
     fn apply<S: Styled>(self, s: S) -> S {
         match self {
             Self::Base => s.text_base(),
+            Self::Body => s,
             Self::Sm => s.text_sm(),
         }
     }
@@ -564,11 +583,11 @@ fn scaled_heading(depth: u8) -> HeadingSpec {
     }
 }
 
-/// `Uniform`: every heading stays at body size. Weight splits H1/H2 (black,
-/// 900) from H3+ (bold, 700); italic + underline mark H1 alone; space-after
-/// separates the three supported levels from the deeper ones that collapse to
-/// plain bold. So the six-level ladder compresses to three distinguishable
-/// levels without any line growing taller than the body.
+/// `Uniform`: H1 steps up to the chrome base size (1rem) with black weight +
+/// italic + underline; H2+ stay at the document body size and discriminate by
+/// weight (black vs bold) + space-after. The six-level ladder compresses to
+/// three distinguishable levels with only the single H1 step growing taller
+/// than the body.
 fn uniform_heading(depth: u8) -> HeadingSpec {
     HeadingSpec {
         weight: if depth <= 2 {
@@ -579,7 +598,11 @@ fn uniform_heading(depth: u8) -> HeadingSpec {
         italic: depth == 1,
         underline: depth == 1,
         space_after: depth <= 3,
-        size: HeadingSize::Base,
+        size: if depth == 1 {
+            HeadingSize::Base
+        } else {
+            HeadingSize::Body
+        },
     }
 }
 
@@ -1141,7 +1164,6 @@ fn list_block(
                     div()
                         .w(marker_w)
                         .whitespace_nowrap()
-                        .text_base()
                         .text_color(match item.checked {
                             Some(true) => styles.diff_add_fg,
                             _ => styles.muted,
@@ -1205,28 +1227,30 @@ mod tests {
 
     #[test]
     fn uniform_heading_compresses_six_levels_to_three() {
-        // H1: black weight + italic + underline + space-after, body size.
+        // H1: black weight + italic + underline + space-after, chrome base size.
         let h1 = HeadingMode::Uniform.spec(1);
         assert_eq!(h1.weight, FontWeight::BLACK);
         assert!(h1.italic && h1.underline && h1.space_after);
         assert!(matches!(h1.size, HeadingSize::Base));
 
-        // H2: black weight, no italic/underline, space-after.
+        // H2: black weight at body size, no italic/underline, space-after.
         let h2 = HeadingMode::Uniform.spec(2);
         assert_eq!(h2.weight, FontWeight::BLACK);
         assert!(!h2.italic && !h2.underline && h2.space_after);
+        assert!(matches!(h2.size, HeadingSize::Body));
 
         // H3: bold weight, space-after.
         let h3 = HeadingMode::Uniform.spec(3);
         assert_eq!(h3.weight, FontWeight::BOLD);
         assert!(!h3.italic && !h3.underline && h3.space_after);
+        assert!(matches!(h3.size, HeadingSize::Body));
 
         // H4–H6 collapse to plain bold, no space-after — indistinguishable.
         for depth in 4..=6 {
             let h = HeadingMode::Uniform.spec(depth);
             assert_eq!(h.weight, FontWeight::BOLD, "depth {depth}");
             assert!(!h.italic && !h.underline && !h.space_after, "depth {depth}");
-            assert!(matches!(h.size, HeadingSize::Base), "depth {depth}");
+            assert!(matches!(h.size, HeadingSize::Body), "depth {depth}");
         }
     }
 

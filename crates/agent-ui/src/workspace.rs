@@ -3424,8 +3424,10 @@ impl Workspace {
                 // at Light weight — the message-list body typeface. The `Input`
                 // component forces `text_sm()` internally (its default
                 // `Size::Medium` maps through `input_text_size`), so the host
-                // pins the body size back with an instance-level `.text_base()`;
-                // family + weight are applied from the wrapper context.
+                // pins the body size back with an instance-level
+                // `.text_size(MESSAGE_BODY_SIZE)` (13px, one step below chrome
+                // `text_base`); family + weight are applied from the wrapper
+                // context.
                 {
                     let mut wrap = gpui::div()
                         .font_family(theme.mono_font_family.clone())
@@ -3438,7 +3440,11 @@ impl Workspace {
                     if self.completion.is_some() {
                         wrap = wrap.key_context("completion = open");
                     }
-                    wrap.child(Input::new(&self.input_state).appearance(false).text_base())
+                    wrap.child(
+                        Input::new(&self.input_state)
+                            .appearance(false)
+                            .text_size(crate::views::message::MESSAGE_BODY_SIZE),
+                    )
                 },
             )
             .child(
@@ -4741,6 +4747,7 @@ impl Workspace {
                                         Markdown::new("editor-preview", value.clone())
                                             .theme(&theme)
                                             .heading_mode(HeadingMode::Uniform)
+                                            .body_size(crate::views::message::MESSAGE_BODY_SIZE)
                                     }));
                                 }
                                 let md = self
@@ -4771,13 +4778,13 @@ impl Workspace {
                                         // composer for the same message
                                         // content, so it shares the inline
                                         // input's body typeface: Lilex Light
-                                        // at base size.
+                                        // at MESSAGE_BODY_SIZE (13px).
                                         Input::new(&self.editor_state)
                                             .size_full()
                                             .appearance(false)
                                             .font_family(theme.mono_font_family.clone())
                                             .font_weight(gpui::FontWeight::LIGHT)
-                                            .text_base()
+                                            .text_size(crate::views::message::MESSAGE_BODY_SIZE)
                                             .into_any_element(),
                                     )
                                     .into_any_element()
