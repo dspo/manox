@@ -7,6 +7,7 @@ pub mod composer_menu;
 pub mod context_rail;
 pub mod management_shell;
 pub mod message;
+pub mod plugin_manager;
 pub mod popup_menu;
 pub mod settings;
 pub mod sidebar;
