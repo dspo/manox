@@ -22,6 +22,7 @@ pub mod language;
 pub mod language_model;
 pub mod mcp;
 pub mod message;
+pub mod path_env;
 pub mod path_policy;
 pub mod paths;
 pub mod permission;
@@ -67,6 +68,12 @@ pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_glo
 /// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
 /// subagent / skill / command / hook registries. Call at App startup.
 pub fn init(cx: &mut App) {
+    // Login-shell PATH install (background): GUI processes inherit a minimal
+    // launchd PATH, so bash/LSP/MCP/monitor subprocesses would lose Homebrew
+    // binaries. Resolved once and applied process-wide; first thing so later
+    // init work (provider shell credentials, MCP spawns) benefits as soon as
+    // the resolver lands.
+    path_env::install();
     runtime::init(cx);
     // i18n before anything that renders UI or builds a system prompt, so the
     // user's locale is settled before the first frame / first turn.
