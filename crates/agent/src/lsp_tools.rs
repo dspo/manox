@@ -752,7 +752,6 @@ impl AgentTool for DiagnosticsTool {
     }
 }
 
-
 /// Render a file's diagnostics as `path:line:col [severity] message`.
 fn render_diagnostics(path: &Path, diags: &[lsp_types::Diagnostic]) -> String {
     if diags.is_empty() {
