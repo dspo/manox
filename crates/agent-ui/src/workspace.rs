@@ -310,6 +310,11 @@ pub struct Workspace {
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
+    /// Messages from the thread's mirrored history already rendered into the
+    /// conversation. The streaming preview (`ThreadEvent::HistoryProgress`)
+    /// appends only `thread.messages()[history_rendered..]`; reset whenever
+    /// the conversation is rebuilt from scratch.
+    history_rendered: usize,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
     view_mode: ViewMode,
@@ -474,10 +479,7 @@ impl Workspace {
             cwd = home;
         }
         let auto_compact = settings::load().auto_compact;
-        let thread = {
-            let id = ThreadId(uuid::Uuid::new_v4().to_string());
-            Thread::new(id, cwd.clone(), cx)
-        };
+        let thread = { Thread::landing(cwd.clone(), cx) };
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -558,6 +560,7 @@ impl Workspace {
             editor_sub: None,
             list_state: ListState::new(0, ListAlignment::Bottom, px(MSG_LIST_OVERDRAW)),
             list_count: 0,
+            history_rendered: 0,
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
@@ -611,6 +614,9 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
+        // The authoritative list is fully rendered now; future preview
+        // batches append from here.
+        self.history_rendered = messages.len();
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
         cx.notify();
@@ -641,10 +647,40 @@ impl Workspace {
                 // The pi actor restores session history asynchronously; the
                 // attach-time conversation rebuild saw an empty transcript,
                 // so rebuild once the authoritative history lands (sidebar
-                // open, startup restore). Without this a reopened thread
-                // strands on the hero screen.
+                // open). Without this a reopened thread strands on the
+                // loading screen, and a forked session's preview is corrected
+                // to the authoritative active branch here.
                 ThreadEvent::HistoryRestored => {
                     this.rebuild_conversation_from_thread(cx);
+                }
+                // A display-only preview batch landed while the authoritative
+                // restore is still running: append the newly available
+                // messages incrementally (paint as many as are loaded),
+                // keeping the list pinned at the tail while the user waits.
+                // Input stays gated on the thread's `HistoryPhase::Loading`.
+                ThreadEvent::HistoryProgress => {
+                    if this.thread.read(cx).history_phase().is_loading() {
+                        let messages: Vec<agent::Message> =
+                            this.thread.read(cx).messages().to_vec();
+                        if messages.len() > this.history_rendered {
+                            let new_messages = messages[this.history_rendered..].to_vec();
+                            let usage = this.thread.read(cx).request_token_usage().clone();
+                            let role = this.model_label(cx);
+                            let cwd = thread_cwd(&this.thread, cx);
+                            let weak = cx.weak_entity();
+                            let outcome = this.conversation.update(cx, |c, cx| {
+                                c.append_history_messages(
+                                    &new_messages,
+                                    &usage,
+                                    &role,
+                                    crate::conversation::ApplyCtx { weak, cwd },
+                                    cx,
+                                )
+                            });
+                            this.history_rendered = messages.len();
+                            this.apply_list_outcome(outcome, cx);
+                        }
+                    }
                 }
                 ThreadEvent::ApprovalDecision {
                     tool_title,
@@ -1955,6 +1991,9 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
+        // All of the thread's current messages are rendered (a restoring
+        // thread has none yet — the preview batches append from here).
+        self.history_rendered = messages.len();
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
@@ -2205,6 +2244,11 @@ impl Workspace {
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // History is still loading: nothing may be submitted (the composer is
+        // hidden, this guard covers keyboard paths that bypass the render).
+        if self.thread.read(cx).history_phase().is_loading() {
+            return;
+        }
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
         if self.pending_ask.is_some() {
@@ -4422,7 +4466,11 @@ impl Workspace {
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
+        // A restoring thread is neither hero nor conversation: it shows the
+        // loading indicator instead (and hides the composer — no input while
+        // history is loading).
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
+        let loading = self.thread.read(cx).history_phase().is_loading();
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
             - px(SIDEBAR_DIVIDER_WIDTH)
@@ -4441,7 +4489,8 @@ impl Workspace {
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
-        let footer = if editor_open || first_screen {
+        // A loading thread hides it too — no input while history loads.
+        let footer = if editor_open || first_screen || loading {
             None
         } else {
             Some(
@@ -4456,6 +4505,7 @@ impl Workspace {
                     .child(centered(self.render_composer(running, window, &theme, cx))),
             )
         };
+
         // Hero occupies the message-list region on the first screen.
         // Notice items on the first screen (e.g. Danger toggle acknowledgement).
         // They are stored in the conversation but hidden behind the hero layout;
@@ -4480,6 +4530,31 @@ impl Workspace {
         };
         let hero = if editor_open || !first_screen {
             None
+        } else if loading {
+            // History is still restoring: a centered loading indicator in
+            // place of the hero. No composer — input is gated until `Ready`.
+            Some(
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .justify_center()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .gap_3()
+                            .items_center()
+                            .child(
+                                crate::views::braille_spinner::BrailleSpinner::new()
+                                    .color(theme.muted_foreground),
+                            )
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-loading-history")),
+                            ),
+                    ),
+            )
         } else {
             Some(
                 v_flex()
@@ -4517,6 +4592,7 @@ impl Workspace {
                     )),
             )
         };
+
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
         // The divider is the visual separator and the drag handle for resizing.

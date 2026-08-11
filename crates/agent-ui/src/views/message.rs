@@ -2705,255 +2705,182 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// a single activity segment (mirroring the live `apply` path, where
 /// `StopReason::ToolUse` does not close the segment). A user prompt (text-
 /// bearing user message) is the turn boundary; a user-role ToolResult is not.
-pub fn build_items(
-    messages: &[Message],
-    usage: &HashMap<String, TokenUsage>,
-    trailing_streaming: bool,
-) -> Vec<ConvItem> {
-    let mut items: Vec<ConvItem> = Vec::new();
-    // Id of the most recent user message; usage is keyed by it, so an
-    // assistant reply inherits the usage of the user message preceding it.
-    let mut last_user_id: Option<&str> = None;
-    // Index of the active activity segment for the current user turn. `None`
-    // before the first ordinary tool call and after the turn closes. Ordinary
-    // tool calls across the whole turn (multiple assistant messages, tool-
-    // result user messages, flanking prose) fold into this one segment so a
-    // reloaded thread reproduces the live "one summary per turn" behavior.
-    let mut active_segment_ix: Option<usize> = None;
-
-    /// Close the active segment for a turn boundary or a special tool that
-    /// stays standalone. Freezes and auto-collapses it; clears the index.
-    ///
-    /// `frozen_secs` is pinned to `Some(0)` so historical containers rebuilt
-    /// from persisted messages do not fall back to a live
-    /// `started_at.elapsed()` — `build_items` creates every container with a
-    /// fresh `Instant::now()`, so an unfrozen timer would tick forever from
-    /// zero on a reloaded thread.
-    fn close_segment(items: &mut [ConvItem], seg_ix: Option<usize>) {
-        if let Some(ix) = seg_ix
-            && let Some(ConvItem::Thinking(t)) = items.get_mut(ix)
-        {
-            t.accepting_entries = false;
-            t.streaming = false;
-            t.collapsed = !t.user_toggled;
-            if t.frozen_secs.is_none() {
-                t.frozen_secs = Some(0);
-            }
+/// Close the active activity segment: freezes and auto-collapses it. Shared
+/// by the one-shot `build_items` and the incremental `ItemBuilder::finish`.
+///
+/// `frozen_secs` is pinned to `Some(0)` so historical containers rebuilt
+/// from persisted messages do not fall back to a live `started_at.elapsed()`
+/// — every container is created with a fresh `Instant::now()`, so an
+/// unfrozen timer would tick forever from zero on a reloaded thread.
+fn close_segment(items: &mut [ConvItem], seg_ix: Option<usize>) {
+    if let Some(ix) = seg_ix
+        && let Some(ConvItem::Thinking(t)) = items.get_mut(ix)
+    {
+        t.accepting_entries = false;
+        t.streaming = false;
+        t.collapsed = !t.user_toggled;
+        if t.frozen_secs.is_none() {
+            t.frozen_secs = Some(0);
         }
     }
+}
 
-    for m in messages {
-        if m.is_hidden_from_ui() {
-            continue;
-        }
-        match m.role {
-            Role::User => {
-                let external_event =
-                    m.ui.as_ref()
-                        .and_then(|ui| ui.external_event)
-                        .unwrap_or(false);
-                let has_prompt_text = !external_event
-                    && m.content.iter().any(|c| match c {
-                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
-                            !t.is_empty()
-                        }
-                        _ => false,
-                    })
-                    || m.content
+/// Stateful item builder: appends `ConvItem`s from a message sequence while
+/// carrying the turn/segment state (last user id, open activity segment)
+/// across calls. `build_items` uses it for one-shot rebuilds; the streaming
+/// history preview (`ConversationState::append_history_messages`) uses it to
+/// append batches without re-processing the prefix, so a tool loop spanning a
+/// batch boundary folds into one activity segment exactly as a one-shot build
+/// would.
+#[derive(Debug, Default)]
+pub struct ItemBuilder {
+    last_user_id: Option<String>,
+    active_segment_ix: Option<usize>,
+}
+
+impl ItemBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append items for `messages` to `items`. A trailing open activity
+    /// segment is left accepting entries so the next `extend` can fold into
+    /// it; call `finish` on the last batch to close it.
+    pub fn extend(
+        &mut self,
+        messages: &[Message],
+        usage: &HashMap<String, TokenUsage>,
+        items: &mut Vec<ConvItem>,
+    ) {
+        for m in messages {
+            if m.is_hidden_from_ui() {
+                continue;
+            }
+            match m.role {
+                Role::User => {
+                    let external_event =
+                        m.ui.as_ref()
+                            .and_then(|ui| ui.external_event)
+                            .unwrap_or(false);
+                    let has_prompt_text = !external_event
+                        && m.content.iter().any(|c| match c {
+                            MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
+                                !t.is_empty()
+                            }
+                            _ => false,
+                        })
+                        || m.content
+                            .iter()
+                            .any(|c| matches!(c, MessageContent::Image { .. }));
+                    if has_prompt_text {
+                        // A new user prompt closes the current turn's activity
+                        // segment so the next turn opens a fresh one. A pure-
+                        // tool-result user message has no prompt text and is NOT
+                        // a turn boundary.
+                        close_segment(items, self.active_segment_ix);
+                        self.active_segment_ix = None;
+                    }
+                    if !external_event {
+                        self.last_user_id = Some(m.id.clone());
+                    }
+                    // Text becomes a user bubble; ToolResult blocks pair back to the
+                    // ToolCall item emitted from the preceding assistant ToolUse.
+                    // ToolResults live in user messages per the Anthropic wire contract.
+                    let text: String =
+                        m.content
+                            .iter()
+                            .filter_map(|c| match c {
+                                MessageContent::Text(t)
+                                | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                    let images: Vec<UserImage> = m
+                        .content
                         .iter()
-                        .any(|c| matches!(c, MessageContent::Image { .. }));
-                if has_prompt_text {
-                    // A new user prompt closes the current turn's activity
-                    // segment so the next turn opens a fresh one. A pure-
-                    // tool-result user message has no prompt text and is NOT
-                    // a turn boundary.
-                    close_segment(&mut items, active_segment_ix);
-                    active_segment_ix = None;
-                }
-                if !external_event {
-                    last_user_id = Some(m.id.as_str());
-                }
-                // Text becomes a user bubble; ToolResult blocks pair back to the
-                // ToolCall item emitted from the preceding assistant ToolUse.
-                // ToolResults live in user messages per the Anthropic wire contract.
-                let text: String = m
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
-                            Some(t.as_str())
+                        .filter_map(|c| match c {
+                            MessageContent::Image { data, mime_type } => {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .decode(data.as_bytes())
+                                    .ok()?;
+                                let fmt = gpui::ImageFormat::from_mime_type(mime_type.as_str())?;
+                                Some(UserImage(Arc::new(gpui::Image::from_bytes(fmt, bytes))))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !external_event && (!text.is_empty() || !images.is_empty()) {
+                        items.push(ConvItem::User {
+                            text,
+                            images,
+                            meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
+                            display_state: crate::conversation::UserMessageDisplayState::Normal,
+                        });
+                    }
+                    for c in &m.content {
+                        match c {
+                            MessageContent::ToolResult(tr) => {
+                                pair_tool_result(items, tr);
+                            }
+                            MessageContent::Compaction(summary) => {
+                                // A compaction message is role User but carries no
+                                // prompt text — render it as a Recap card instead of
+                                // an empty user bubble.
+                                items.push(ConvItem::Recap {
+                                    summary: summary.clone(),
+                                    collapsed: true,
+                                    user_toggled: false,
+                                });
+                            }
+                            _ => {}
                         }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let images: Vec<UserImage> = m
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        MessageContent::Image { data, mime_type } => {
-                            let bytes = base64::engine::general_purpose::STANDARD
-                                .decode(data.as_bytes())
-                                .ok()?;
-                            let fmt = gpui::ImageFormat::from_mime_type(mime_type.as_str())?;
-                            Some(UserImage(Arc::new(gpui::Image::from_bytes(fmt, bytes))))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if !external_event && (!text.is_empty() || !images.is_empty()) {
-                    items.push(ConvItem::User {
-                        text,
-                        images,
-                        meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
-                        display_state: crate::conversation::UserMessageDisplayState::Normal,
-                    });
-                }
-                for c in &m.content {
-                    match c {
-                        MessageContent::ToolResult(tr) => {
-                            pair_tool_result(&mut items, tr);
-                        }
-                        MessageContent::Compaction(summary) => {
-                            // A compaction message is role User but carries no
-                            // prompt text — render it as a Recap card instead of
-                            // an empty user bubble.
-                            items.push(ConvItem::Recap {
-                                summary: summary.clone(),
-                                collapsed: true,
-                                user_toggled: false,
-                            });
-                        }
-                        _ => {}
                     }
                 }
-            }
-            Role::Assistant => {
-                for c in &m.content {
-                    match c {
-                        MessageContent::Text(t) => {
-                            // Assistant prose interrupts the activity segment:
-                            // reasoning after it starts a fresh round.
-                            close_segment(&mut items, active_segment_ix);
-                            // Snapshot the segment's totals (after close pins
-                            // `frozen_secs`) for this reply's model row.
-                            let activity_summary =
-                                active_segment_ix.and_then(|ix| match &items[ix] {
-                                    ConvItem::Thinking(seg) => seg.activity_summary(),
-                                    _ => None,
-                                });
-                            active_segment_ix = None;
-                            items.push(ConvItem::Assistant {
-                                text: t.clone(),
-                                streaming: false,
-                                token_usage: last_user_id.and_then(|id| usage.get(id).copied()),
-                                activity_summary,
-                            });
-                        }
-                        MessageContent::Thinking { text, .. } => {
-                            // Fold reasoning into the active activity segment.
-                            // A reasoning block before any tool calls opens the
-                            // segment; subsequent reasoning and tools share it.
-                            let entry = ActivityEntry::Reasoning {
-                                text: text.clone(),
-                                streaming: false,
-                                collapsed: true,
-                                user_toggled: false,
-                                markdown: None,
-                            };
-                            match active_segment_ix {
-                                Some(ix) => {
-                                    if let Some(ConvItem::Thinking(t)) = items.get_mut(ix) {
-                                        t.entries.push(entry);
-                                    }
-                                }
-                                None => {
-                                    active_segment_ix = Some(items.len());
-                                    items.push(ConvItem::Thinking(ThinkingContainer {
-                                        entries: vec![entry],
-                                        accepting_entries: true,
-                                        streaming: false,
-                                        collapsed: true,
-                                        user_toggled: false,
-                                        started_at: Instant::now(),
-                                        frozen_secs: None,
-                                    }));
-                                }
-                            }
-                        }
-                        MessageContent::ToolUse(tu) => {
-                            if tu.name.as_ref() == agent::tools::AGENT {
-                                // Sub-agent tasks stay as standalone compact
-                                // rows; their full conversation lives in a
-                                // read-only right-pane tab.
-                                close_segment(&mut items, active_segment_ix);
-                                active_segment_ix = None;
-                                let (subagent_type, description) =
-                                    crate::conversation::agent_task_labels(&tu.input);
-                                items.push(ConvItem::AgentTask(AgentTaskItem {
-                                    id: tu.id.clone(),
-                                    subagent_type,
-                                    description,
-                                    status: ToolCallStatus::Success,
-                                    is_error: false,
-                                }));
-                            } else if tu.name.as_ref() == agent::tools::ASK_USER_QUESTION {
-                                // An inline clarify card: stays a top-level
-                                // ToolCall so `render_ask_user_card` can drive
-                                // its interactive snapshot while pending; the
-                                // paired ToolResult stamps the user's answer
-                                // into `output`. Never folded into a segment.
-                                close_segment(&mut items, active_segment_ix);
-                                active_segment_ix = None;
-                                items.push(ConvItem::ToolCall(ToolCallItem {
-                                    id: tu.id.clone(),
-                                    name: tu.name.to_string(),
-                                    title: agent::thread::tool_title(
-                                        tu.name.as_ref(),
-                                        &tu.input,
-                                        None,
-                                    ),
-                                    status: ToolCallStatus::PendingApproval,
-                                    output: String::new(),
-                                    is_error: false,
-                                    input: tu.input.clone(),
+                Role::Assistant => {
+                    for c in &m.content {
+                        match c {
+                            MessageContent::Text(t) => {
+                                // Assistant prose interrupts the activity segment:
+                                // reasoning after it starts a fresh round.
+                                close_segment(items, self.active_segment_ix);
+                                // Snapshot the segment's totals (after close pins
+                                // `frozen_secs`) for this reply's model row.
+                                let activity_summary =
+                                    self.active_segment_ix.and_then(|ix| match &items[ix] {
+                                        ConvItem::Thinking(seg) => seg.activity_summary(),
+                                        _ => None,
+                                    });
+                                self.active_segment_ix = None;
+                                items.push(ConvItem::Assistant {
+                                    text: t.clone(),
                                     streaming: false,
-                                    collapsed: false,
-                                    user_toggled: false,
-                                    panel: None,
-                                }));
-                            } else {
-                                // Ordinary tool call: fold into the active
-                                // activity segment. The segment is created at
-                                // the first ordinary tool call's position and
-                                // stays there; subsequent tool calls (across
-                                // assistant messages and tool-result user
-                                // messages within the same turn) append to it.
-                                let entry = ActivityEntry::Tool(ToolCallItem {
-                                    id: tu.id.clone(),
-                                    name: tu.name.to_string(),
-                                    title: agent::thread::tool_title(
-                                        tu.name.as_ref(),
-                                        &tu.input,
-                                        None,
-                                    ),
-                                    status: ToolCallStatus::Success,
-                                    output: String::new(),
-                                    is_error: false,
-                                    input: tu.input.clone(),
+                                    token_usage: self
+                                        .last_user_id
+                                        .as_deref()
+                                        .and_then(|id| usage.get(id).copied()),
+                                    activity_summary,
+                                });
+                            }
+                            MessageContent::Thinking { text, .. } => {
+                                // Fold reasoning into the active activity segment.
+                                // A reasoning block before any tool calls opens the
+                                // segment; subsequent reasoning and tools share it.
+                                let entry = ActivityEntry::Reasoning {
+                                    text: text.clone(),
                                     streaming: false,
                                     collapsed: true,
                                     user_toggled: false,
-                                    panel: None,
-                                });
-                                match active_segment_ix {
+                                    markdown: None,
+                                };
+                                match self.active_segment_ix {
                                     Some(ix) => {
                                         if let Some(ConvItem::Thinking(t)) = items.get_mut(ix) {
                                             t.entries.push(entry);
                                         }
                                     }
                                     None => {
-                                        active_segment_ix = Some(items.len());
+                                        self.active_segment_ix = Some(items.len());
                                         items.push(ConvItem::Thinking(ThinkingContainer {
                                             entries: vec![entry],
                                             accepting_entries: true,
@@ -2966,57 +2893,158 @@ pub fn build_items(
                                     }
                                 }
                             }
-                        }
-                        MessageContent::ToolResult(tr) => {
-                            // Defensive: tool results normally live in user messages,
-                            // but pair them here too if they ever appear in an assistant turn.
-                            pair_tool_result(&mut items, tr);
-                        }
-                        MessageContent::Image { .. } => {}
-                        // Compaction messages are `Role::User` by construction;
-                        // they cannot appear in an assistant turn. Reachable
-                        // here only if a future caller mis-assigns the role.
-                        MessageContent::Compaction(summary) => {
-                            close_segment(&mut items, active_segment_ix);
-                            active_segment_ix = None;
-                            items.push(ConvItem::Recap {
-                                summary: summary.clone(),
-                                collapsed: true,
-                                user_toggled: false,
-                            });
+                            MessageContent::ToolUse(tu) => {
+                                if tu.name.as_ref() == agent::tools::AGENT {
+                                    // Sub-agent tasks stay as standalone compact
+                                    // rows; their full conversation lives in a
+                                    // read-only right-pane tab.
+                                    close_segment(items, self.active_segment_ix);
+                                    self.active_segment_ix = None;
+                                    let (subagent_type, description) =
+                                        crate::conversation::agent_task_labels(&tu.input);
+                                    items.push(ConvItem::AgentTask(AgentTaskItem {
+                                        id: tu.id.clone(),
+                                        subagent_type,
+                                        description,
+                                        status: ToolCallStatus::Success,
+                                        is_error: false,
+                                    }));
+                                } else if tu.name.as_ref() == agent::tools::ASK_USER_QUESTION {
+                                    // An inline clarify card: stays a top-level
+                                    // ToolCall so `render_ask_user_card` can drive
+                                    // its interactive snapshot while pending; the
+                                    // paired ToolResult stamps the user's answer
+                                    // into `output`. Never folded into a segment.
+                                    close_segment(items, self.active_segment_ix);
+                                    self.active_segment_ix = None;
+                                    items.push(ConvItem::ToolCall(ToolCallItem {
+                                        id: tu.id.clone(),
+                                        name: tu.name.to_string(),
+                                        title: agent::thread::tool_title(
+                                            tu.name.as_ref(),
+                                            &tu.input,
+                                            None,
+                                        ),
+                                        status: ToolCallStatus::PendingApproval,
+                                        output: String::new(),
+                                        is_error: false,
+                                        input: tu.input.clone(),
+                                        streaming: false,
+                                        collapsed: false,
+                                        user_toggled: false,
+                                        panel: None,
+                                    }));
+                                } else {
+                                    // Ordinary tool call: fold into the active
+                                    // activity segment. The segment is created at
+                                    // the first ordinary tool call's position and
+                                    // stays there; subsequent tool calls (across
+                                    // assistant messages and tool-result user
+                                    // messages within the same turn) append to it.
+                                    let entry = ActivityEntry::Tool(ToolCallItem {
+                                        id: tu.id.clone(),
+                                        name: tu.name.to_string(),
+                                        title: agent::thread::tool_title(
+                                            tu.name.as_ref(),
+                                            &tu.input,
+                                            None,
+                                        ),
+                                        status: ToolCallStatus::Success,
+                                        output: String::new(),
+                                        is_error: false,
+                                        input: tu.input.clone(),
+                                        streaming: false,
+                                        collapsed: true,
+                                        user_toggled: false,
+                                        panel: None,
+                                    });
+                                    match self.active_segment_ix {
+                                        Some(ix) => {
+                                            if let Some(ConvItem::Thinking(t)) = items.get_mut(ix) {
+                                                t.entries.push(entry);
+                                            }
+                                        }
+                                        None => {
+                                            self.active_segment_ix = Some(items.len());
+                                            items.push(ConvItem::Thinking(ThinkingContainer {
+                                                entries: vec![entry],
+                                                accepting_entries: true,
+                                                streaming: false,
+                                                collapsed: true,
+                                                user_toggled: false,
+                                                started_at: Instant::now(),
+                                                frozen_secs: None,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                            MessageContent::ToolResult(tr) => {
+                                // Defensive: tool results normally live in user messages,
+                                // but pair them here too if they ever appear in an assistant turn.
+                                pair_tool_result(items, tr);
+                            }
+                            MessageContent::Image { .. } => {}
+                            // Compaction messages are `Role::User` by construction;
+                            // they cannot appear in an assistant turn. Reachable
+                            // here only if a future caller mis-assigns the role.
+                            MessageContent::Compaction(summary) => {
+                                close_segment(items, self.active_segment_ix);
+                                self.active_segment_ix = None;
+                                items.push(ConvItem::Recap {
+                                    summary: summary.clone(),
+                                    collapsed: true,
+                                    user_toggled: false,
+                                });
+                            }
                         }
                     }
                 }
+                Role::System => {}
             }
-            Role::System => {}
         }
     }
-    // Close any still-open segment at the end of the message list.
-    close_segment(&mut items, active_segment_ix);
-    // The trailing in-flight assistant/reasoning content of a still-running
-    // thread must read as live so resumed `AgentText`/`AgentThinking` deltas
-    // append to it instead of spawning a second bubble.
-    if trailing_streaming && let Some(last) = items.last_mut() {
-        match last {
-            ConvItem::Assistant { streaming, .. } => {
-                *streaming = true;
+
+    /// Close any open activity segment and apply the trailing-streaming
+    /// postlude (a still-running thread's tail must read as live so resumed
+    /// `AgentText`/`AgentThinking` deltas append to it instead of spawning a
+    /// second bubble). Consumes the builder: `finish` is terminal, so a
+    /// caller cannot forget the mandatory close.
+    pub fn finish(self, items: &mut [ConvItem], trailing_streaming: bool) {
+        close_segment(items, self.active_segment_ix);
+        if trailing_streaming && let Some(last) = items.last_mut() {
+            match last {
+                ConvItem::Assistant { streaming, .. } => {
+                    *streaming = true;
+                }
+                ConvItem::Thinking(t) => {
+                    // A resumed turn may still be mid-segment: mark the
+                    // container live so later-arriving `ToolCall`/`ToolOutput`
+                    // deltas fold into it instead of opening a fresh one.
+                    // Unfreeze the timer too — `close_segment` just pinned it,
+                    // but a live container must tick from `started_at` (now).
+                    t.accepting_entries = true;
+                    t.streaming = true;
+                    t.frozen_secs = None;
+                }
+                _ => {}
             }
-            ConvItem::Thinking(t) => {
-                // A resumed turn may still be mid-segment: mark the
-                // container live so later-arriving `ToolCall`/`ToolOutput`
-                // deltas fold into it instead of opening a fresh one.
-                // Unfreeze the timer too — `close_segment` just pinned it,
-                // but a live container must tick from `started_at` (now).
-                t.accepting_entries = true;
-                t.streaming = true;
-                t.frozen_secs = None;
-            }
-            _ => {}
         }
     }
-    items
 }
 
+/// One-shot item build over a complete message list (historical rebuild).
+pub fn build_items(
+    messages: &[Message],
+    usage: &HashMap<String, TokenUsage>,
+    trailing_streaming: bool,
+) -> Vec<ConvItem> {
+    let mut builder = ItemBuilder::new();
+    let mut items = Vec::new();
+    builder.extend(messages, usage, &mut items);
+    builder.finish(&mut items, trailing_streaming);
+    items
+}
 /// Attach a tool_result to its matching item by id. Sub-agent results only
 /// stamp their compact row's terminal state; ordinary tool results stamp the
 /// entry inside the owning `ThinkingContainer`. A result with no matching
@@ -3408,6 +3436,83 @@ mod tests {
             })
             .collect();
         assert_eq!(tool_ids, vec!["tu_1", "tu_2", "tu_3"]);
+    }
+
+    /// The streaming history preview appends messages batch-by-batch through
+    /// `ItemBuilder::extend`, carrying the turn/segment state across calls. A
+    /// tool loop spanning a batch boundary must fold into the same activity
+    /// segment as a one-shot `build_items` — not spawn a second segment.
+    #[test]
+    fn item_builder_incremental_matches_one_shot_across_batch_boundary() {
+        let messages = vec![
+            Message::user("turn one".to_string()),
+            Message::assistant(vec![
+                MessageContent::Thinking {
+                    text: "reasoning".to_string(),
+                    signature: None,
+                },
+                tu("tu_1", "Read", serde_json::json!({"path": "a.rs"})),
+            ]),
+            Message::user_with_content(vec![tr("tu_1", "Read", "a contents")]),
+            Message::assistant(vec![MessageContent::Text("done".to_string())]),
+        ];
+        let usage = HashMap::new();
+
+        // One-shot build (the authoritative rebuild path).
+        let one_shot = build_items(&messages, &usage, false);
+
+        fn segment_entry_counts(items: &[ConvItem]) -> Vec<usize> {
+            items
+                .iter()
+                .filter_map(|it| match it {
+                    ConvItem::Thinking(t) => Some(t.entries.len()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Every candidate split point must reproduce the one-shot build —
+        // the carried turn/segment state makes the batch boundary invisible.
+        for split in 1..messages.len() {
+            let mut builder = ItemBuilder::new();
+            let mut incremental: Vec<ConvItem> = Vec::new();
+            builder.extend(&messages[..split], &usage, &mut incremental);
+            builder.extend(&messages[split..], &usage, &mut incremental);
+            builder.finish(&mut incremental, false);
+            assert_eq!(
+                segment_entry_counts(&incremental),
+                segment_entry_counts(&one_shot),
+                "split at {split}: the tool loop folds into one segment"
+            );
+            assert_eq!(
+                incremental.len(),
+                one_shot.len(),
+                "split at {split}: same item count as the one-shot build"
+            );
+        }
+
+        // A three-batch chain (per-message batches) must also match.
+        let mut builder = ItemBuilder::new();
+        let mut incremental: Vec<ConvItem> = Vec::new();
+        for message in &messages {
+            builder.extend(std::slice::from_ref(message), &usage, &mut incremental);
+        }
+        builder.finish(&mut incremental, false);
+        assert_eq!(
+            segment_entry_counts(&incremental),
+            segment_entry_counts(&one_shot),
+            "per-message batches fold identically"
+        );
+        assert_eq!(incremental.len(), one_shot.len());
+
+        // The result stamped into the segment's tool entry, and the assistant
+        // reply follows as a fresh bubble — no second segment opened.
+        assert_eq!(segment_entry_counts(&one_shot), vec![2]);
+        let last = one_shot.last().unwrap();
+        assert!(
+            matches!(last, ConvItem::Assistant { text, .. } if text == "done"),
+            "assistant reply closes the segment and stands alone"
+        );
     }
 
     /// Historical `ThinkingContainer`s rebuilt from persisted messages must

@@ -96,6 +96,24 @@ pub struct WorktreeState {
     pub subagent_created: bool,
 }
 
+/// History-loading state of a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryPhase {
+    /// No history pending (fresh / landing threads); the message list is
+    /// final as soon as it exists.
+    Ready,
+    /// An existing session is being restored. Display-only preview batches
+    /// may stream into `messages` while the authoritative restore runs; the
+    /// workspace hides the composer and shows a loading indicator.
+    Loading,
+}
+
+impl HistoryPhase {
+    pub fn is_loading(self) -> bool {
+        matches!(self, Self::Loading)
+    }
+}
+
 /// Events emitted by `Thread` to the UI. The pi backend produces the run
 /// lifecycle subset; the remaining variants exist so the workspace and
 /// conversation list compile against the shared contract and simply never
@@ -226,6 +244,12 @@ pub enum ThreadEvent {
     BackgroundTaskUpdated {
         snapshot: TaskSnapshot,
     },
+    /// The display-only history preview streamed another batch; the
+    /// workspace appends the newly available messages to the conversation.
+    ///
+    /// parity: the backend emits this from `BackendNotice::HistoryProgress` —
+    /// keep the two variants in sync when either side changes.
+    HistoryProgress,
     /// The pi backend restored an existing session and the authoritative
     /// history is ready. The workspace rebuilds the conversation view.
     HistoryRestored,
@@ -254,15 +278,46 @@ pub struct Thread {
     /// UI metadata of the most recently inserted user turn, re-attached to
     /// the authoritative history's last user message after each refresh.
     last_user_ui: Option<MessageUiMetadata>,
-    engine: Arc<dyn ThreadEngine>,
+    /// The harness backend, materialized lazily for landing threads (see
+    /// `Thread::landing` / `ensure_engine`).
+    engine: Option<Arc<dyn ThreadEngine>>,
+    /// History-loading state (see `HistoryPhase`).
+    history_phase: HistoryPhase,
+    /// Whether the user explicitly set the approval mode on a landing
+    /// thread; the mode is then not overwritten by the session sidecar's
+    /// default when the engine materializes.
+    approval_mode_explicitly_set: bool,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Startup constructor: restores the newest session when one exists.
-    pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, None, false, cx)
+    /// The startup landing state: a detached thread with no engine. No
+    /// session is loaded at launch — the user picks a conversation from the
+    /// sidebar (`open_existing` swaps in its engine) or starts typing
+    /// (`run_turn` materializes a fresh engine on first use).
+    pub fn landing(cwd: PathBuf, cx: &mut App) -> Entity<Self> {
+        cx.new(|_| Self {
+            id: ThreadId(uuid::Uuid::new_v4().to_string()),
+            cwd,
+            project: None,
+            model: crate::pi_providers::default_model(),
+            approval_mode: ApprovalMode::default(),
+            messages: Vec::new(),
+            reasoning_effort: ReasoningEffort::default(),
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            ui_notes: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: None,
+            history_phase: HistoryPhase::Ready,
+            approval_mode_explicitly_set: false,
+        })
     }
 
     /// A genuinely empty thread (sidebar new-conversation): never restores
@@ -291,84 +346,25 @@ impl Thread {
         fresh: bool,
         cx: &mut App,
     ) -> Entity<Self> {
+        // A concrete session file means an authoritative restore is pending;
+        // the facade reports `Loading` until `Ready` so the workspace can
+        // gate input and render the streaming preview.
+        let loading = initial_path.is_some();
         let model = crate::pi_providers::default_model();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("pi-sessions");
-        let SpawnedEngine { engine, mut events } = crate::pi_engine::spawn_engine(
+        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
             cwd.clone(),
             model.clone(),
-            sessions_dir.clone(),
+            sessions_dir,
             initial_path,
             fresh,
             project.clone(),
         );
 
         cx.new(|cx| {
-            // The gpui drainer: adapts backend notices onto this entity and
-            // refreshes the mirrored history/usage on settlement.
-            cx.spawn(async move |this, cx| {
-                while let Some(notice) = events.recv().await {
-                    let ok = this
-                        .update(cx, |t: &mut Thread, cx| match notice {
-                            BackendNotice::Event(event) => {
-                                // Mirror the gate policy before the chip
-                                // hears about the change.
-                                if let ThreadEvent::ApprovalModeChanged { mode } = *event {
-                                    t.approval_mode = mode;
-                                }
-                                cx.emit(*event);
-                            }
-                            BackendNotice::Ready {
-                                restored,
-                                model,
-                                approval_mode,
-                            } => {
-                                t.restored = restored;
-                                if let Some(m) = model {
-                                    t.model = Some(m);
-                                }
-                                t.approval_mode = approval_mode;
-                                if restored {
-                                    t.refresh_history(cx);
-                                    cx.emit(ThreadEvent::HistoryRestored);
-                                }
-                            }
-                            BackendNotice::Settled {
-                                cancelled,
-                                failed,
-                                steered,
-                                stranded,
-                            } => {
-                                for message_id in steered {
-                                    cx.emit(ThreadEvent::SteerInjected { message_id });
-                                }
-                                t.running = false;
-                                t.pending_steers.clear();
-                                t.refresh_history(cx);
-                                cx.emit(ThreadEvent::TurnFinished {
-                                    cancelled,
-                                    failed,
-                                    stranded_steer_ids: stranded,
-                                });
-                            }
-                            BackendNotice::Fatal(err) => {
-                                t.running = false;
-                                cx.emit(ThreadEvent::Error(err));
-                            }
-                            BackendNotice::SessionListDirty => {
-                                let store = crate::thread_store::global();
-                                store.update(cx, |s, cx| s.refresh(cx));
-                            }
-                        })
-                        .is_ok();
-                    if !ok {
-                        break;
-                    }
-                }
-            })
-            .detach();
-
+            drain_engine_notices(cx, events);
             Self {
                 id,
                 cwd,
@@ -386,9 +382,128 @@ impl Thread {
                 pending_prompts: Vec::new(),
                 pending_steers: VecDeque::new(),
                 last_user_ui: None,
-                engine,
+                engine: Some(engine),
+                history_phase: if loading {
+                    HistoryPhase::Loading
+                } else {
+                    HistoryPhase::Ready
+                },
+                approval_mode_explicitly_set: false,
             }
         })
+    }
+
+    /// Lazily materialize the engine for a landing thread (no engine until
+    /// the user acts: a sidebar open swaps the whole thread via
+    /// `open_existing` instead; a first prompt or project bind calls this).
+    /// Spawns a fresh session (never restores) bound to `project`, wires the
+    /// notice drainer, and replays the stored approval mode / reasoning
+    /// effort. `spawn_engine` is infallible (it only queues the actor), so
+    /// the engine is always available after this returns.
+    fn ensure_engine(&mut self, project: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.engine.is_some() {
+            return;
+        }
+        let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
+        let model = self.model.clone();
+        let sessions_dir = crate::paths::manox_config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("pi-sessions");
+        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
+            cwd.clone(),
+            model,
+            sessions_dir,
+            None,
+            true,
+            project,
+        );
+        if self.approval_mode != ApprovalMode::default() {
+            engine.set_approval_mode(self.approval_mode);
+        }
+        if self.reasoning_effort != ReasoningEffort::default() {
+            engine.set_thinking_level(Some(self.reasoning_effort.wire_value().to_string()));
+        }
+        self.engine = Some(engine.clone());
+        drain_engine_notices(cx, events);
+    }
+
+    /// Handle one backend notice on the gpui thread: mirror state and re-emit
+    /// the UI-facing event.
+    fn handle_notice(&mut self, notice: BackendNotice, cx: &mut Context<Self>) {
+        match notice {
+            BackendNotice::Event(event) => {
+                // Mirror the gate policy before the chip hears about the
+                // change.
+                if let ThreadEvent::ApprovalModeChanged { mode } = *event {
+                    self.approval_mode = mode;
+                }
+                cx.emit(*event);
+            }
+            BackendNotice::Ready {
+                restored,
+                model,
+                approval_mode,
+            } => {
+                self.restored = restored;
+                if let Some(m) = model {
+                    self.model = Some(m);
+                }
+                if !self.approval_mode_explicitly_set {
+                    self.approval_mode = approval_mode;
+                }
+                let was_loading = self.history_phase.is_loading();
+                self.history_phase = HistoryPhase::Ready;
+                self.refresh_history(cx);
+                // Rebuild on restore, and also after a failed restore — the
+                // preview may have streamed a corrupt file's partial content
+                // and the fresh fallback session is empty, so the workspace
+                // must return to the hero. Fresh threads skip the rebuild
+                // (nothing changed since attach).
+                if restored || was_loading {
+                    cx.emit(ThreadEvent::HistoryRestored);
+                }
+            }
+            BackendNotice::HistoryProgress => {
+                if self.history_phase.is_loading() {
+                    self.refresh_history(cx);
+                    cx.emit(ThreadEvent::HistoryProgress);
+                }
+            }
+            BackendNotice::Settled {
+                cancelled,
+                failed,
+                steered,
+                stranded,
+            } => {
+                for message_id in steered {
+                    cx.emit(ThreadEvent::SteerInjected { message_id });
+                }
+                self.running = false;
+                self.pending_steers.clear();
+                self.refresh_history(cx);
+                cx.emit(ThreadEvent::TurnFinished {
+                    cancelled,
+                    failed,
+                    stranded_steer_ids: stranded,
+                });
+            }
+            BackendNotice::Fatal(err) => {
+                self.running = false;
+                // The actor will not send `Ready` (it bailed out): clear the
+                // loading phase so the workspace leaves the spinner and the
+                // input gate opens. Any preview content is stale — the
+                // session never assembled — so drop it and rebuild to the
+                // hero (the error surfaces as a conversation notice).
+                self.history_phase = HistoryPhase::Ready;
+                self.messages.clear();
+                cx.emit(ThreadEvent::HistoryRestored);
+                cx.emit(ThreadEvent::Error(err));
+            }
+            BackendNotice::SessionListDirty => {
+                let store = crate::thread_store::global();
+                store.update(cx, |s, cx| s.refresh(cx));
+            }
+        }
     }
 
     /// Restore the bound project from a reopened session's sidecar without
@@ -399,9 +514,13 @@ impl Thread {
     }
 
     /// Replace the mirrored history with the engine's authoritative transcript
-    /// and re-attach the last user turn's UI metadata.
+    /// and re-attach the last user turn's UI metadata. No-op while the engine
+    /// is not materialized (a landing thread has no backend history).
     fn refresh_history(&mut self, cx: &mut Context<Self>) {
-        let mut mapped = self.engine.history();
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let mut mapped = engine.history();
         if let Some(ui) = self.last_user_ui.clone()
             && let Some(last_user) = mapped
                 .iter_mut()
@@ -411,7 +530,7 @@ impl Thread {
             last_user.ui = Some(ui);
         }
         self.messages = mapped;
-        self.request_usage = self.engine.request_token_usage();
+        self.request_usage = engine.request_token_usage();
         cx.notify();
     }
 
@@ -475,7 +594,9 @@ impl Thread {
         message.ui = ui;
         let id = message.id.clone();
         self.pending_steers.push_back(id.clone());
-        self.engine.steer(text);
+        if let Some(engine) = &self.engine {
+            engine.steer(text);
+        }
         cx.notify();
         // The canonical message joins history at the next refresh (pi owns the
         // transcript); the workspace renders the optimistic bubble until
@@ -487,15 +608,21 @@ impl Thread {
         if self.running || self.pending_prompts.is_empty() {
             return;
         }
+        self.ensure_engine(self.project.clone(), cx);
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         self.running = true;
         cx.emit(ThreadEvent::TurnStarted);
-        self.engine.run(prompt);
+        self.engine
+            .as_ref()
+            .expect("ensure_engine materialized the engine")
+            .run(prompt);
         cx.notify();
     }
 
     pub fn cancel(&mut self, _cx: &mut Context<Self>) {
-        self.engine.abort();
+        if let Some(engine) = &self.engine {
+            engine.abort();
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -588,19 +715,28 @@ impl Thread {
     }
 
     pub fn cumulative_token_usage(&self) -> TokenUsage {
-        self.engine.cumulative_token_usage()
+        self.engine
+            .as_ref()
+            .map(|e| e.cumulative_token_usage())
+            .unwrap_or_default()
     }
 
     pub fn per_model_token_usage(&self) -> HashMap<String, TokenUsage> {
-        self.engine.per_model_token_usage()
+        self.engine
+            .as_ref()
+            .map(|e| e.per_model_token_usage())
+            .unwrap_or_default()
     }
 
     pub fn cumulative_cost(&self) -> f64 {
-        self.engine.cumulative_cost()
+        self.engine.as_ref().map(|e| e.cumulative_cost()).unwrap_or(0.0)
     }
 
     pub fn per_model_cost(&self) -> HashMap<String, f64> {
-        self.engine.per_model_cost()
+        self.engine
+            .as_ref()
+            .map(|e| e.per_model_cost())
+            .unwrap_or_default()
     }
 
     pub fn ui_notes(&self) -> &[UiNoteRecord] {
@@ -668,7 +804,13 @@ impl Thread {
         }
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
-        self.engine.new_session(dir.clone(), Some(dir));
+        if let Some(engine) = &self.engine {
+            engine.new_session(dir.clone(), Some(dir));
+        } else {
+            // Landing thread: materialize a project-bound fresh engine in
+            // one step (no orphaned pre-project session file).
+            self.ensure_engine(Some(dir), cx);
+        }
         cx.notify();
     }
 
@@ -679,7 +821,9 @@ impl Thread {
         if self.running {
             return;
         }
-        self.engine.compact(custom_instructions);
+        if let Some(engine) = &self.engine {
+            engine.compact(custom_instructions);
+        }
     }
 
     pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
@@ -687,9 +831,14 @@ impl Thread {
             return;
         }
         self.approval_mode = mode;
-        // The engine applies the mode to its gate and persists it in the
-        // session sidecar; the chip reflects the change immediately.
-        self.engine.set_approval_mode(mode);
+        // An explicit user choice must survive engine materialization: the
+        // session sidecar's default would otherwise overwrite it at `Ready`.
+        self.approval_mode_explicitly_set = true;
+        if let Some(engine) = &self.engine {
+            // The engine applies the mode to its gate and persists it in the
+            // session sidecar; the chip reflects the change immediately.
+            engine.set_approval_mode(mode);
+        }
         cx.emit(ThreadEvent::ApprovalModeChanged { mode });
         cx.notify();
     }
@@ -702,13 +851,18 @@ impl Thread {
         response: crate::permission::ToolAuthorizationResponse,
         _cx: &mut Context<Self>,
     ) {
-        self.engine.respond_tool_authorization(id, response);
+        if let Some(engine) = &self.engine {
+            engine.respond_tool_authorization(id, response);
+        }
     }
 
     /// Pending authorizations with their card metadata, so the workspace can
     /// re-surface a card after switching back to this thread.
     pub fn pending_auth_entries(&self) -> Vec<(String, crate::permission::PendingAuthMeta)> {
-        self.engine.pending_auth_entries()
+        self.engine
+            .as_ref()
+            .map(|e| e.pending_auth_entries())
+            .unwrap_or_default()
     }
 
     pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
@@ -716,12 +870,13 @@ impl Thread {
         cx.notify();
     }
 
-
     pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
-        self.engine.set_model(model);
+        if let Some(engine) = &self.engine {
+            engine.set_model(model);
+        }
         cx.emit(ThreadEvent::ModelChanged { from, to });
         cx.notify();
     }
@@ -731,7 +886,9 @@ impl Thread {
             return;
         }
         self.reasoning_effort = effort;
-        self.engine.set_thinking_level(Some(effort.wire_value().to_string()));
+        if let Some(engine) = &self.engine {
+            engine.set_thinking_level(Some(effort.wire_value().to_string()));
+        }
         cx.emit(ThreadEvent::ReasoningEffortChanged { effort });
         cx.notify();
     }
@@ -740,6 +897,24 @@ impl Thread {
         self.archived = archived;
         cx.notify();
     }
+}
+
+/// Drain a spawned engine's notice channel on the gpui thread, dispatching
+/// each notice through `Thread::handle_notice`. Shared by `open` (engine
+/// present at construction) and `ensure_engine` (landing materialization).
+fn drain_engine_notices(
+    this: &mut Context<Thread>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+) {
+    this.spawn(async move |this, cx| {
+        while let Some(notice) = events.recv().await {
+            let ok = this.update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx)).is_ok();
+            if !ok {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// Human-readable tool card title from the pi tool name + arguments. The
@@ -771,7 +946,9 @@ impl Thread {
     pub fn cancel_pending_steer(&mut self, id: &str) -> bool {
         if let Some(pos) = self.pending_steers.iter().position(|s| s == id) {
             self.pending_steers.remove(pos);
-            self.engine.cancel_steer(id);
+            if let Some(engine) = &self.engine {
+                engine.cancel_steer(id);
+            }
             true
         } else {
             false
@@ -797,35 +974,149 @@ impl Thread {
         self.restored
     }
 
-    /// The session file the backend currently drives.
+    /// The session file the backend currently drives. `None` while the engine
+    /// is not materialized (a landing thread).
     pub fn active_session_path(&self) -> Option<PathBuf> {
-        self.engine.active_session_path()
+        self.engine.as_ref().and_then(|e| e.active_session_path())
     }
 
     /// The sessions the backend can list (sidebar source), newest first.
     pub fn session_list(&self) -> Vec<crate::db::ThreadSummary> {
-        self.engine.session_list()
+        self.engine
+            .as_ref()
+            .map(|e| e.session_list())
+            .unwrap_or_default()
     }
 
     /// Re-point the backend at an existing session file.
     pub fn open_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.engine.open_session(path);
+        if let Some(engine) = &self.engine {
+            engine.open_session(path);
+        }
         self.running = false;
         cx.notify();
+    }
+
+    /// History-loading state (see `HistoryPhase`).
+    pub fn history_phase(&self) -> HistoryPhase {
+        self.history_phase
     }
 }
 
 impl Drop for Thread {
     fn drop(&mut self) {
         // The engine owns the actor; ask it to close gracefully. If the
-        // channel is already gone the actor exited on its own.
-        self.engine.shutdown();
+        // channel is already gone the actor exited on its own. A landing
+        // thread has no engine to shut down.
+        if let Some(engine) = &self.engine {
+            engine.shutdown();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// A scripted engine for facade-contract tests: returns the injected
+    /// authoritative history, records the mode/effort it was handed.
+    struct FakeEngine {
+        history: Vec<Message>,
+        shutdown_calls: AtomicUsize,
+        approval_mode: Mutex<Option<ApprovalMode>>,
+        thinking_level: Mutex<Option<String>>,
+    }
+
+    impl ThreadEngine for FakeEngine {
+        fn is_running(&self) -> bool {
+            false
+        }
+
+        fn history(&self) -> Vec<Message> {
+            self.history.clone()
+        }
+
+        fn request_token_usage(&self) -> HashMap<String, TokenUsage> {
+            HashMap::new()
+        }
+
+        fn model(&self) -> Option<PiModel> {
+            None
+        }
+
+        fn run(&self, _prompt: String) {}
+
+        fn steer(&self, _text: String) -> String {
+            String::new()
+        }
+
+        fn cancel_steer(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn abort(&self) {}
+
+        fn set_model(&self, _model: PiModel) {}
+
+        fn set_thinking_level(&self, level: Option<String>) {
+            *self.thinking_level.lock().unwrap() = level;
+        }
+
+        fn open_session(&self, _path: PathBuf) {}
+
+        fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
+
+        fn active_session_path(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn session_list(&self) -> Vec<crate::db::ThreadSummary> {
+            Vec::new()
+        }
+
+        fn shutdown(&self) {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn set_approval_mode(&self, mode: ApprovalMode) {
+            *self.approval_mode.lock().unwrap() = Some(mode);
+        }
+    }
+
+    /// Construct a `Thread` facade directly (no actor) with the given
+    /// history-loading phase and engine, so the notice-contract tests below
+    /// exercise `handle_notice` in isolation.
+    fn thread_with_engine(
+        phase: HistoryPhase,
+        engine: Arc<dyn ThreadEngine>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<Thread> {
+        cx.update(|cx| {
+            cx.new(|_| Thread {
+                id: ThreadId("test-thread".to_string()),
+                cwd: PathBuf::from("/tmp"),
+                project: None,
+                model: None,
+                approval_mode: ApprovalMode::default(),
+                messages: Vec::new(),
+                reasoning_effort: ReasoningEffort::default(),
+                pinned: false,
+                archived: false,
+                running: false,
+                restored: false,
+                ui_notes: Vec::new(),
+                request_usage: HashMap::new(),
+                pending_prompts: Vec::new(),
+                pending_steers: VecDeque::new(),
+                last_user_ui: None,
+                engine: Some(engine),
+                history_phase: phase,
+                approval_mode_explicitly_set: false,
+            })
+        })
+    }
 
     #[test]
     fn approval_mode_maps_i64_roundtrip() {
@@ -834,5 +1125,106 @@ mod tests {
         assert_eq!(ApprovalMode::from_i64(2), ApprovalMode::Danger);
         assert_eq!(ApprovalMode::AutoPilot.as_i64(), 0);
         assert_eq!(ApprovalMode::Danger.as_i64(), 1);
+    }
+
+    /// The race-fix contract: `Ready` — regardless of preview batches that
+    /// may have streamed before it — replaces the mirror with the engine's
+    /// authoritative history and clears `Loading`, so the workspace leaves
+    /// the spinner and re-enables input.
+    #[gpui::test]
+    fn ready_replaces_preview_with_authoritative_history_and_clears_loading(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let engine = Arc::new(FakeEngine {
+            history: vec![Message::user("authoritative".to_string())],
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        // Simulate a preview batch that landed before the authoritative sync.
+        thread.update(cx, |t, cx| {
+            t.messages = vec![Message::user("preview-only".to_string())];
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: true,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                },
+                cx,
+            );
+        });
+        let (phase, texts) = cx.read(|cx| {
+            let t = thread.read(cx);
+            let texts: Vec<String> = t
+                .messages()
+                .iter()
+                .filter_map(|m| match &m.content[0] {
+                    MessageContent::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            (t.history_phase(), texts)
+        });
+        assert_eq!(phase, HistoryPhase::Ready);
+        assert_eq!(
+            texts,
+            vec!["authoritative".to_string()],
+            "the authoritative sync wins over any preview content"
+        );
+    }
+
+    /// K1: a `Fatal` before `Ready` (no model configured, session build
+    /// failed — the actor bails without `Ready`) must clear `Loading` and
+    /// drop any stale preview, so the workspace returns to the hero instead
+    /// of spinning forever with input gated.
+    #[gpui::test]
+    fn fatal_before_ready_clears_loading_and_preview(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.messages = vec![Message::user("stale-preview".to_string())];
+            t.handle_notice(BackendNotice::Fatal(anyhow::anyhow!("no model configured")), cx);
+        });
+        let (phase, count) = cx.read(|cx| {
+            let t = thread.read(cx);
+            (t.history_phase(), t.messages().len())
+        });
+        assert_eq!(phase, HistoryPhase::Ready, "input gate opens");
+        assert_eq!(count, 0, "stale preview is dropped");
+    }
+
+    /// I3: an explicit user approval-mode choice on a landing thread survives
+    /// the sidecar default arriving at `Ready` (`approval_mode_explicitly_set`).
+    #[gpui::test]
+    fn explicit_approval_mode_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, _cx| {
+            t.set_approval_mode(ApprovalMode::Danger, _cx);
+        });
+        // The fresh session's sidecar reports AutoPilot at Ready; the user's
+        // Danger choice must not be overwritten.
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: false,
+                    model: None,
+                    approval_mode: ApprovalMode::AutoPilot,
+                },
+                cx,
+            );
+        });
+        assert_eq!(cx.read(|cx| thread.read(cx).approval_mode()), ApprovalMode::Danger);
     }
 }
