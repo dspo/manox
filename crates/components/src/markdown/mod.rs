@@ -246,9 +246,13 @@ impl Markdown {
 
 impl Render for Markdown {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        let Some(styles) = self.styles.clone() else {
-            return div().id(self.id.clone()).into_any_element();
+        let mut styles = match self.styles.clone() {
+            Some(styles) => styles,
+            None => return div().id(self.id.clone()).into_any_element(),
         };
+        // Per-mount body tier override lands in the style table so nested
+        // blocks (lists, blockquotes) see it without extra plumbing.
+        styles.body_size = self.body_size;
 
         // Lazily create the focus handle on first render.
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
@@ -536,7 +540,7 @@ struct HeadingSpec {
 
 #[derive(Clone, Copy)]
 enum HeadingSize {
-    /// Chrome base size (1rem) — the single H1 step under `Uniform`.
+    /// Chrome base size (1rem) — H1 under `Uniform`, H1–H3 under `Scaled`.
     Base,
     /// Inherit the document body size (H2+ under `Uniform`).
     Body,
@@ -1135,17 +1139,24 @@ fn list_block(
     // a multi-block item) sit gap_2 apart — the same paragraph gap the root
     // column applies between body blocks, so a list reads as body text.
     let mut col = v_flex().id(("md-list", idx)).w_full().min_w_0().gap_2();
-    // The marker column is sized in monospace advances (the message body face
-    // is a mono family app-wide): wide enough for the longest marker in this
-    // list so content columns align across items. `whitespace_nowrap` keeps
-    // the marker on one line — a fixed 16px column used to wrap "• " / "N. "
-    // onto an invisible extra line, inflating every item by a full line box.
+    // The marker column is sized in monospace advances of the *body* size
+    // (Lilex's advance is exactly 0.6em for every glyph, including "•" and
+    // "✓"): wide enough for the longest marker in this list so content
+    // columns align across items. Deriving it from `body_size` (not the
+    // chrome rem) keeps the column tracking the marker text when the body
+    // tier moves. `whitespace_nowrap` only stops wrapping, not overflow, so
+    // the width itself must fit: U+2610 "☐" (unchecked task marker) is not
+    // in Lilex's cmap and renders via a system fallback face — a tight fit
+    // there is accepted rather than widening every column for it.
     let marker_chars = if ordered {
         format!("{}. ", items.len()).chars().count()
     } else {
         2
     };
-    let marker_w = rems(0.6 * marker_chars as f32);
+    let marker_w: AbsoluteLength = match styles.body_size {
+        AbsoluteLength::Pixels(p) => (p * 0.6 * marker_chars as f32).into(),
+        AbsoluteLength::Rems(r) => rems(r.0 * 0.6 * marker_chars as f32).into(),
+    };
     for (i, item) in items.into_iter().enumerate() {
         let mut item_col = v_flex().flex_1().min_w_0().gap_2();
         for (j, b) in item.blocks.into_iter().enumerate() {

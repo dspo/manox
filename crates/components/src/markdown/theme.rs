@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Hsla, hsla};
+use gpui::{AbsoluteLength, Hsla, hsla, rems};
 use gpui_component::Theme;
 use gpui_component::highlighter::HighlightTheme;
 
@@ -34,6 +34,10 @@ pub struct MdStyles {
     pub selection_bg: Hsla,
     /// Underline color for clickable link spans.
     pub link_color: Hsla,
+    /// Document body type size (paragraphs, list items, inline code,
+    /// blockquotes; headings inherit it except the 1rem steps). Mounts
+    /// override per instance; default is the chrome base size (1rem).
+    pub body_size: AbsoluteLength,
 }
 
 impl MdStyles {
@@ -58,6 +62,7 @@ impl MdStyles {
             // light/dark themes.
             selection_bg: hsla(211.0 / 360.0, 0.85, 0.6, 0.4),
             link_color: theme.accent_foreground,
+            body_size: rems(1.).into(),
         }
     }
 }

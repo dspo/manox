@@ -1,7 +1,10 @@
 //! List blocks must occupy the same vertical footprint as equivalent body
-//! paragraphs. A regression here (marker column too narrow for its mono
-//! marker text) wrapped "• " / "N. " onto an invisible extra line, inflating
-//! every list item by a full line box and blowing up item spacing.
+//! paragraphs, and `body_size`/heading tiers must render at their configured
+//! sizes. The first guard catches the marker-wrap regression (a too-narrow
+//! marker column wrapped "• " / "N. " onto an invisible extra line, inflating
+//! every item by a full line box). The second mounts the real `Root` (which
+//! pins `rem` to `theme.font_size`, 14px in the app) and pins the rendered
+//! line boxes: body 13px, H1 at 1rem (14px), H2+ back at body size.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -10,8 +13,8 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, Element, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, ParentElement, Pixels, Render, Style, Styled, Window, div, px,
 };
-use gpui_component::Theme;
-use manox_components::markdown::Markdown;
+use gpui_component::{Root, Theme};
+use manox_components::markdown::{HeadingMode, Markdown};
 
 struct Measure {
     child: AnyElement,
@@ -71,29 +74,42 @@ impl Element for Measure {
 }
 
 struct Host {
-    md: gpui::Entity<Markdown>,
+    source: String,
+    body: Option<Pixels>,
     out: Rc<Cell<Pixels>>,
 }
 
 impl Render for Host {
-    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        let mut md = Markdown::new("m", self.source.clone())
+            .theme(&Theme::default())
+            .heading_mode(HeadingMode::Uniform);
+        if let Some(b) = self.body {
+            md = md.body_size(b);
+        }
+        let md = cx.new(|_cx| md);
         div().w(px(600.)).text_base().child(Measure {
-            child: self.md.clone().into_any_element(),
+            child: md.into_any_element(),
             out: self.out.clone(),
         })
     }
 }
 
-fn measure(cx: &mut gpui::TestAppContext, source: &str) -> f32 {
+fn measure_raw(cx: &mut gpui::TestAppContext, source: &str, body: Option<Pixels>) -> f32 {
     let out = Rc::new(Cell::new(px(0.)));
     let src = source.to_string();
-    let out2 = out.clone();
-    let (_view, cx) = cx.add_window_view(move |_window, cx| {
-        let md = cx.new(|_cx| Markdown::new("m", src).theme(&Theme::default()));
-        Host { md, out: out2 }
+    let o2 = out.clone();
+    let (_view, cx) = cx.add_window_view(move |_window, _cx| Host {
+        source: src,
+        body,
+        out: o2,
     });
     cx.run_until_parked();
     f32::from(out.get())
+}
+
+fn measure(cx: &mut gpui::TestAppContext, source: &str) -> f32 {
+    measure_raw(cx, source, None)
 }
 
 #[gpui::test]
@@ -141,5 +157,59 @@ fn list_vertical_footprint_matches_body_paragraphs(cx: &mut gpui::TestAppContext
     assert!(
         (twelve_ordered - twelve_par).abs() <= 1.0,
         "12-item ordered list {twelve_ordered}px must match 12 paragraphs {twelve_par}px"
+    );
+}
+
+/// Mirrors the app: `Root` pins `rem` to `theme.font_size` (14px), so `1rem`
+/// headings render at 14 while a `body_size(px(13.))` document renders at 13.
+/// Line box = phi (≈1.618) × font size, pixel-snapped: 13px → 21, 14px → 23.
+/// The root col's Sentinel child plus its gap_2 add a constant 7px (0.5rem @
+/// rem 14) to every single-block document, so measured heights are line + 7.
+#[gpui::test]
+fn body_size_and_heading_tiers_render_at_configured_sizes(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        gpui_component::Theme::global_mut(cx).font_size = px(14.);
+    });
+
+    // Wrap the host in the real Root so set_rem_size(14) applies, like the app.
+    let measure = |cx: &mut gpui::TestAppContext, source: &str, body: Option<Pixels>| {
+        let out = Rc::new(Cell::new(px(0.)));
+        let src = source.to_string();
+        let o2 = out.clone();
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            let host = cx.new(|_cx| Host {
+                source: src,
+                body,
+                out: o2,
+            });
+            Root::new(host, window, cx)
+        });
+        cx.run_until_parked();
+        f32::from(out.get())
+    };
+
+    let body_default = measure(cx, "alpha bravo charlie", None);
+    let body_13 = measure(cx, "alpha bravo charlie", Some(px(13.)));
+    let h1_at_13 = measure(cx, "# alpha", Some(px(13.)));
+    let h4_at_13 = measure(cx, "#### alpha", Some(px(13.)));
+
+    assert!(
+        (body_13 - 28.0).abs() <= 1.0,
+        "body_size(13px) single line ≈21px + 7px sentinel gap, got {body_13}"
+    );
+    assert!(
+        (body_default - body_13 - 1.6).abs() <= 1.0,
+        "1rem body must exceed 13px body by one phi step (≈1.6px), got {body_default} vs {body_13}"
+    );
+    // H1 carries mb_2 (space_after), hence one extra 7px over body_default.
+    assert!(
+        (h1_at_13 - body_default - 7.0).abs() <= 1.0,
+        "Uniform H1 line must equal the 1rem body line (+mb_2), got {h1_at_13} vs {body_default}"
+    );
+    // H4+ has no space_after: pure line-box comparison against the 13px body.
+    assert!(
+        (h4_at_13 - body_13).abs() <= 0.5,
+        "Uniform H4 must follow the 13px body, got {h4_at_13} vs {body_13}"
     );
 }
