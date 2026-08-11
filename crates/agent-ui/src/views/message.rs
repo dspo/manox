@@ -48,6 +48,11 @@ use gpui_component::{
 use manox_components::markdown::ast::LinkKind;
 use manox_components::markdown::terminal_panel::GitSummary;
 use manox_components::markdown::{HeadingMode, Markdown, PanelKind, TerminalPanel};
+
+/// Message body type size: one step below the chrome `text_base` (14px) so
+/// dense conversation text reads lighter. Composer + Editor tab pin the same
+/// value so input text stays interchangeable with message content.
+pub const MESSAGE_BODY_SIZE: gpui::Pixels = gpui::px(13.);
 use manox_components::turn_frame::TurnFrame;
 use std::path::{Path, PathBuf};
 
@@ -102,6 +107,7 @@ fn markdown_tv(
             .theme(theme)
             .scrollable(scrollable)
             .heading_mode(HeadingMode::Uniform)
+            .body_size(MESSAGE_BODY_SIZE)
     })
     .into_any_element()
 }
@@ -203,6 +209,7 @@ impl MessageItem {
                     Markdown::new(("md", id), current)
                         .theme(cx.theme())
                         .heading_mode(HeadingMode::Uniform)
+                        .body_size(MESSAGE_BODY_SIZE)
                         .streaming(streaming)
                         .on_open_link(Some(Arc::new(move |url, kind| match kind {
                             LinkKind::Url => {
@@ -272,6 +279,7 @@ impl MessageItem {
                 Markdown::new(("reasoning-md", id), "")
                     .theme(cx.theme())
                     .heading_mode(HeadingMode::Uniform)
+                    .body_size(MESSAGE_BODY_SIZE)
                     .streaming(streaming)
             }));
         }
