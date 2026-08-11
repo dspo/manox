@@ -179,6 +179,17 @@ impl AgentSession {
     /// block (with `args` appended), and `/name args` expands a prompt
     /// template by name with `substituteArgs`.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        self.prompt_with_images(text, Vec::new()).await
+    }
+
+    /// Prompt with attached images (TS `prompt(text, { images })` parity).
+    /// Image blocks ride the prompt's own user message; providers translate
+    /// them per wire API.
+    pub async fn prompt_with_images(
+        &mut self,
+        text: &str,
+        images: Vec<crate::types::ContentBlock>,
+    ) -> Result<Vec<AgentMessage>, anyhow::Error> {
         let expanded = self.expand_prompt(text);
         // The facade delivers its pending next-turn messages as asides AFTER
         // the prompt's own user message (user-first); the harness's own
@@ -187,7 +198,7 @@ impl AgentSession {
         self.harness
             .prompt_input(crate::harness::PromptInput {
                 text: expanded,
-                images: Vec::new(),
+                images,
                 asides,
             })
             .await

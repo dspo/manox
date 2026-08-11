@@ -273,6 +273,9 @@ pub struct Thread {
     /// Text of user messages inserted since the last run, drained by
     /// `run_turn` into one prompt.
     pending_prompts: Vec<String>,
+    /// Image blocks attached to the pending prompts, drained by `run_turn`
+    /// onto the engine (kernel `ContentBlock::Image`).
+    pending_images: Vec<pi::types::ContentBlock>,
     /// Steer message ids handed to the engine this run, awaiting settlement.
     pending_steers: VecDeque<String>,
     /// UI metadata of the most recently inserted user turn, re-attached to
@@ -312,6 +315,7 @@ impl Thread {
             ui_notes: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
             engine: None,
@@ -380,6 +384,7 @@ impl Thread {
                 ui_notes: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
+                pending_images: Vec::new(),
                 pending_steers: VecDeque::new(),
                 last_user_ui: None,
                 engine: Some(engine),
@@ -556,12 +561,21 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
-        // Image attachments are not wired yet — pi prompts are text-only in
-        // this stage; image blocks are dropped from the prompt text.
+        // Text blocks join the prompt text; image blocks ride the next
+        // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
+        // parity).
+        let mut images = Vec::new();
         let text: String = content
             .iter()
             .filter_map(|c| match c {
                 MessageContent::Text(t) => Some(t.as_str()),
+                MessageContent::Image { data, mime_type } => {
+                    images.push(pi::types::ContentBlock::Image {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    });
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -571,6 +585,9 @@ impl Thread {
         self.messages.push(message);
         if !text.trim().is_empty() {
             self.pending_prompts.push(text);
+        }
+        if !images.is_empty() {
+            self.pending_images.extend(images);
         }
         self.last_user_ui = ui;
         cx.notify();
@@ -605,17 +622,18 @@ impl Thread {
     }
 
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
-        if self.running || self.pending_prompts.is_empty() {
+        if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
         }
         self.ensure_engine(self.project.clone(), cx);
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
+        let images = std::mem::take(&mut self.pending_images);
         self.running = true;
         cx.emit(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
-            .run(prompt);
+            .run(prompt, images);
         cx.notify();
     }
 
@@ -1027,6 +1045,8 @@ mod tests {
         shutdown_calls: AtomicUsize,
         approval_mode: Mutex<Option<ApprovalMode>>,
         thinking_level: Mutex<Option<String>>,
+        /// Recorded `run` calls: (prompt, images) pairs.
+        runs: Mutex<Vec<(String, Vec<pi::types::ContentBlock>)>>,
     }
 
     impl ThreadEngine for FakeEngine {
@@ -1046,7 +1066,9 @@ mod tests {
             None
         }
 
-        fn run(&self, _prompt: String) {}
+        fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>) {
+            self.runs.lock().unwrap().push((prompt, images));
+        }
 
         fn steer(&self, _text: String) -> String {
             String::new()
@@ -1109,6 +1131,7 @@ mod tests {
                 ui_notes: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
+                pending_images: Vec::new(),
                 pending_steers: VecDeque::new(),
                 last_user_ui: None,
                 engine: Some(engine),
@@ -1127,6 +1150,93 @@ mod tests {
         assert_eq!(ApprovalMode::Danger.as_i64(), 1);
     }
 
+    fn png_image(data: &str) -> MessageContent {
+        MessageContent::Image {
+            data: data.to_string(),
+            mime_type: "image/png".to_string(),
+        }
+    }
+
+    /// TS parity: images ride the prompt's own user message. `run_turn` must
+    /// hand the queued text AND the queued images to the engine in one turn,
+    /// draining both queues.
+    #[gpui::test]
+    fn run_turn_drains_pending_text_and_images(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| {
+            t.insert_user_message_with_content_and_ui_metadata(
+                vec![
+                    MessageContent::Text("look at these".to_string()),
+                    png_image("aW1hZ2Ux"),
+                    png_image("aW1hZ2Uy"),
+                ],
+                None,
+                cx,
+            );
+            t.run_turn(cx);
+        });
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "exactly one turn ran");
+        let (prompt, images) = &runs[0];
+        assert_eq!(prompt, "look at these");
+        assert_eq!(images.len(), 2, "both images ride the turn");
+        drop(runs);
+        thread.update(cx, |t, _| {
+            assert!(t.pending_prompts.is_empty(), "text queue drained");
+            assert!(t.pending_images.is_empty(), "image queue drained");
+        });
+    }
+
+    /// An image-only insert (no text) still starts a turn — the guard keys on
+    /// BOTH queues being empty, so the engine receives an empty prompt plus
+    /// the image (kernel pushes the empty text block, TS parity).
+    #[gpui::test]
+    fn run_turn_image_only_insert_still_starts_turn(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| {
+            t.insert_user_message_with_content_and_ui_metadata(
+                vec![png_image("aW1hZ2Ux")],
+                None,
+                cx,
+            );
+            t.run_turn(cx);
+        });
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "image-only turn ran");
+        let (prompt, images) = &runs[0];
+        assert_eq!(prompt, "", "no text was queued");
+        assert_eq!(images.len(), 1);
+    }
+
+    /// With neither text nor images pending, `run_turn` is a no-op.
+    #[gpui::test]
+    fn run_turn_noop_when_nothing_pending(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| t.run_turn(cx));
+        assert!(engine.runs.lock().unwrap().is_empty(), "no turn ran");
+    }
+
     /// The race-fix contract: `Ready` — regardless of preview batches that
     /// may have streamed before it — replaces the mirror with the engine's
     /// authoritative history and clears `Loading`, so the workspace leaves
@@ -1140,6 +1250,7 @@ mod tests {
             shutdown_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
         // Simulate a preview batch that landed before the authoritative sync.
@@ -1185,6 +1296,7 @@ mod tests {
             shutdown_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
         thread.update(cx, |t, cx| {
@@ -1208,6 +1320,7 @@ mod tests {
             shutdown_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
         thread.update(cx, |t, _cx| {
