@@ -400,11 +400,21 @@ fn build_tools(
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
-    let bash = BashTool::new(
-        Arc::new(PersistentShellOperations::new(cwd)),
-        background.clone(),
-    )
-    .with_manager(Arc::clone(&manager));
+    // Bash execution backend: seatbelt-wrapped one-shot commands when the
+    // OS backend is available (writes + network confined; shell state does
+    // not persist — the tool's `cwd` parameter pins each call), otherwise
+    // the unsandboxed persistent brush shell (approval-gated as always).
+    // Background tasks spawn outside this backend either way (see
+    // sandbox module docs).
+    let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if crate::sandbox::is_available() {
+        Arc::new(crate::sandbox::SandboxedBashOperations::new(
+            cwd,
+            crate::sandbox::SandboxPolicy::for_project(cwd),
+        ))
+    } else {
+        Arc::new(PersistentShellOperations::new(cwd))
+    };
+    let bash = BashTool::new(bash_ops, background.clone()).with_manager(Arc::clone(&manager));
 
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
