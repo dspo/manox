@@ -39,7 +39,7 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, ClipboardItem, Element, ElementId, FocusHandle, FontWeight, GlobalElementId,
     HighlightStyle, Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Style, Window, div, px,
+    MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Style, Window, div, px, rems,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::{
@@ -1112,6 +1112,17 @@ fn list_block(
     // a multi-block item) sit gap_2 apart — the same paragraph gap the root
     // column applies between body blocks, so a list reads as body text.
     let mut col = v_flex().id(("md-list", idx)).w_full().min_w_0().gap_2();
+    // The marker column is sized in monospace advances (the message body face
+    // is a mono family app-wide): wide enough for the longest marker in this
+    // list so content columns align across items. `whitespace_nowrap` keeps
+    // the marker on one line — a fixed 16px column used to wrap "• " / "N. "
+    // onto an invisible extra line, inflating every item by a full line box.
+    let marker_chars = if ordered {
+        format!("{}. ", items.len()).chars().count()
+    } else {
+        2
+    };
+    let marker_w = rems(0.6 * marker_chars as f32);
     for (i, item) in items.into_iter().enumerate() {
         let mut item_col = v_flex().flex_1().min_w_0().gap_2();
         for (j, b) in item.blocks.into_iter().enumerate() {
@@ -1128,7 +1139,8 @@ fn list_block(
                 .items_start()
                 .child(
                     div()
-                        .w(px(16.))
+                        .w(marker_w)
+                        .whitespace_nowrap()
                         .text_base()
                         .text_color(match item.checked {
                             Some(true) => styles.diff_add_fg,
