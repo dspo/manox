@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::background_task::TaskSnapshot;
 use crate::db::UiNoteRecord;
 use crate::goal::ThreadGoal;
+use crate::goal_tools::GoalBridge;
 use crate::language::Language;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use pi::types::Model as PiModel;
@@ -312,6 +313,9 @@ pub struct Thread {
     /// The team this thread belongs to. The leader owns the `Entity<Team>`;
     /// members hold the same entity (set at spawn, cleared on disband).
     team: Option<Entity<Team>>,
+    /// Shared goal state with the engine's goal tools; `None` only when the
+    /// threads db is unavailable (goal features degrade off).
+    goal_bridge: Option<Arc<GoalBridge>>,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -346,6 +350,7 @@ impl Thread {
             plan_mode: false,
             label: "lead".into(),
             team: None,
+            goal_bridge: None,
         })
     }
 
@@ -383,6 +388,10 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("pi-sessions");
+        // Goal bridge seeds from the persisted goal (restore path) and is
+        // shared with the engine's goal tools; db unavailability degrades
+        // goal features off rather than blocking the thread.
+        let goal_bridge = GoalBridge::for_thread(&id.0);
         let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
             cwd.clone(),
             model.clone(),
@@ -391,6 +400,7 @@ impl Thread {
             fresh,
             project.clone(),
             id.0.clone(),
+            goal_bridge.clone(),
         );
 
         cx.new(|cx| {
@@ -423,6 +433,7 @@ impl Thread {
             plan_mode: false,
                 label: "lead".into(),
                 team: None,
+                goal_bridge,
             }
         })
     }
@@ -438,6 +449,9 @@ impl Thread {
         if self.engine.is_some() {
             return;
         }
+        if self.goal_bridge.is_none() {
+            self.goal_bridge = GoalBridge::for_thread(&self.id.0);
+        }
         let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
         let model = self.model.clone();
         let sessions_dir = crate::paths::manox_config_dir()
@@ -451,6 +465,7 @@ impl Thread {
             true,
             project,
             self.id.0.clone(),
+            self.goal_bridge.clone(),
         );
         if self.approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(self.approval_mode);
@@ -846,8 +861,111 @@ impl Thread {
         None
     }
 
-    pub fn goal(&self) -> Option<&ThreadGoal> {
-        None
+    /// The thread's persisted Goal — one shared snapshot with the engine's
+    /// goal tools (model-side writes land here too).
+    pub fn goal(&self) -> Option<ThreadGoal> {
+        self.goal_bridge.as_ref().and_then(|bridge| bridge.snapshot())
+    }
+
+    /// Elapsed seconds shown on the goal chip: accumulated accounting plus
+    /// wall clock since creation while the goal is live. Per-turn token/time
+    /// accounting is a follow-up, so `time_used_seconds` stays 0 and the
+    /// display is creation-anchored wall time for non-terminal goals.
+    pub fn goal_elapsed_seconds(&self) -> Option<u64> {
+        let goal = self.goal()?;
+        let live = if goal.status.is_terminal() {
+            0
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            (now - goal.created_at).max(0) as u64
+        };
+        Some(goal.time_used_seconds.saturating_add(live))
+    }
+
+    fn goal_bridge_or_bail(&self) -> anyhow::Result<Arc<GoalBridge>> {
+        self.goal_bridge
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("goal store unavailable"))
+    }
+
+    /// User-side Goal creation (`/goal <objective>` or the model's
+    /// `CreateGoal` tool both land on the shared bridge).
+    pub fn create_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: crate::db::GoalActor,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let bridge = self.goal_bridge_or_bail()?;
+        bridge.create_goal(objective, token_budget, actor)?;
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        Ok(())
+    }
+
+    /// Convenience for `/goal <objective>`: create with no budget as the
+    /// user.
+    pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        self.create_goal(objective, None, crate::db::GoalActor::User, cx)
+    }
+
+    /// Edit objective/budget in place (keeps id and status).
+    pub fn edit_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: crate::db::GoalActor,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let bridge = self.goal_bridge_or_bail()?;
+        let goal = bridge.edit_goal(objective, token_budget, actor)?;
+        cx.emit(ThreadEvent::GoalChanged {
+            active: !goal.status.is_terminal(),
+        });
+        Ok(())
+    }
+
+    /// Replace an unfinished Goal with a fresh one (explicit `/goal
+    /// replace` confirmation path).
+    pub fn replace_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: crate::db::GoalActor,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let bridge = self.goal_bridge_or_bail()?;
+        bridge.replace_goal(objective, token_budget, actor)?;
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        Ok(())
+    }
+
+    /// Pause/resume/blocked transitions with the domain guards.
+    pub fn set_goal_status(
+        &mut self,
+        status: crate::goal::GoalStatus,
+        reason: Option<String>,
+        actor: crate::db::GoalActor,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let bridge = self.goal_bridge_or_bail()?;
+        let goal = bridge.set_goal_status(status, reason, actor)?;
+        cx.emit(ThreadEvent::GoalChanged {
+            active: !goal.status.is_terminal(),
+        });
+        Ok(())
+    }
+
+    /// Clear the current Goal (row deleted, audit trail kept).
+    pub fn clear_goal(
+        &mut self,
+        actor: crate::db::GoalActor,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let bridge = self.goal_bridge_or_bail()?;
+        bridge.clear_goal(actor)?;
+        cx.emit(ThreadEvent::GoalChanged { active: false });
+        Ok(())
     }
 
     pub fn depth(&self) -> u32 {
@@ -907,7 +1025,8 @@ impl Thread {
     /// Construct a team worker thread: a fresh pi session inheriting this
     /// (leader) thread's cwd / model / approval mode / reasoning effort,
     /// labeled with the member name. Engine spawned eagerly (members always
-    /// run).
+    /// run). Members carry no goal bridge: the goal contract belongs to the
+    /// leader's user-facing conversation.
     pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
@@ -925,6 +1044,7 @@ impl Thread {
             true,
             None,
             id.0.clone(),
+            None,
         );
         if approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(approval_mode);
@@ -956,6 +1076,7 @@ impl Thread {
                 history_phase: HistoryPhase::Ready,
                 approval_mode_explicitly_set: true,
                 plan_mode: false,
+                goal_bridge: None,
                 label: name,
                 team: None,
             }
@@ -1498,6 +1619,7 @@ pub(crate) mod tests {
                 plan_mode: false,
                 label: "lead".into(),
                 team: None,
+                goal_bridge: None,
             })
         })
     }

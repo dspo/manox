@@ -51,7 +51,7 @@ use gpui_component::{WindowExt as _, notification::Notification};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 
-use crate::cockpit::CockpitPhase;
+use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
 use crate::external_session::{ExternalSession, SessionKind};
@@ -3751,7 +3751,7 @@ impl Workspace {
         // TODO(pi-wire): plus menu + image attachment input.
         let plus: AnyElement = gpui::div().into_any_element();
         let project_chip = self.render_project_chip_pi(theme, cx);
-        let goal_chip: Option<AnyElement> = None;
+        let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip: Option<AnyElement> = None;
         let plan_chip = self.render_plan_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
@@ -4037,6 +4037,264 @@ impl Workspace {
             state.set_value("/goal ".to_string(), window, cx);
         });
         cx.notify();
+    }
+
+    /// Goal-mode chip — shown only while the thread has a goal. Renders
+    /// `◎ Goal active · {elapsed}` in accent colors so the autonomous-loop
+    /// posture is legible at a glance. Clicking toggles the status popover
+    /// (objective / status / accounting / pause / resume / edit / replace /
+    /// clear).
+    fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let g = self.thread.read(cx).goal()?;
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let status_key = match g.status {
+            agent::goal::GoalStatus::Active => "goal-status-active",
+            agent::goal::GoalStatus::Paused => "goal-status-paused",
+            agent::goal::GoalStatus::Blocked => "goal-status-blocked",
+            agent::goal::GoalStatus::BudgetLimited => "goal-status-budget-limited",
+            agent::goal::GoalStatus::Complete => "goal-status-complete",
+        };
+        let elapsed = format_elapsed(std::time::Duration::from_secs(
+            self.thread
+                .read(cx)
+                .goal_elapsed_seconds()
+                .unwrap_or_default(),
+        ));
+        let label: SharedString = format!("◎ {} · {}", i18n::t(status_key), elapsed).into();
+        let open = self.goal_popover_open;
+
+        let trigger = h_flex()
+            .id("goal-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(accent)
+            .cursor_pointer()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.accent_foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.goal_popover_open = !this.goal_popover_open;
+                cx.notify();
+            }));
+
+        if !open {
+            return Some(trigger.into_any_element());
+        }
+
+        let objective = g.objective.clone();
+        let status = i18n::t(status_key);
+        let reason = g.status_reason.clone().unwrap_or_else(|| "—".into());
+        let tokens = g.tokens_used.to_string();
+        let budget = g
+            .token_budget
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "∞".into());
+        let remaining = g
+            .remaining_tokens()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "∞".into());
+        let goal_status = g.status;
+        let objective_label = i18n::t("goal-popover-objective");
+        let status_label = i18n::t("goal-popover-status");
+        let elapsed_label = i18n::t("goal-popover-elapsed");
+        let reason_label = i18n::t("goal-popover-reason");
+        let tokens_label = i18n::t("goal-popover-tokens");
+        let budget_label = i18n::t("goal-popover-budget");
+        let remaining_label = i18n::t("goal-popover-remaining");
+        let clear_label = i18n::t("goal-popover-clear");
+        let pause_label = i18n::t("goal-popover-pause");
+        let resume_label = i18n::t("goal-popover-resume");
+        let edit_label = i18n::t("goal-popover-edit");
+        let edit_budget_label = i18n::t("goal-popover-edit-budget");
+        let replace_label = i18n::t("goal-popover-replace");
+        let new_label = i18n::t("goal-popover-new");
+        let title_label = i18n::t("goal-popover-title");
+        let popover = v_flex()
+            .w_full()
+            .gap_1()
+            .p_3()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.accent_foreground)
+                    .child(format!("◎ {title_label}")),
+            )
+            .child(goal_popover_row(&objective_label, &objective, fg, muted))
+            .child(goal_popover_row(&status_label, &status, fg, muted))
+            .child(goal_popover_row(&elapsed_label, &elapsed, fg, muted))
+            .child(goal_popover_row(&reason_label, &reason, fg, muted))
+            .child(goal_popover_row(&tokens_label, &tokens, fg, muted))
+            .child(goal_popover_row(&budget_label, &budget, fg, muted))
+            .child(goal_popover_row(&remaining_label, &remaining, fg, muted))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .when(goal_status == agent::goal::GoalStatus::Active, |row| {
+                        row.child(
+                            Button::new("goal-pause")
+                                .small()
+                                .label(pause_label)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.thread.update(cx, |t, cx| {
+                                        if let Err(error) = t.set_goal_status(
+                                            agent::goal::GoalStatus::Paused,
+                                            Some("paused by user".into()),
+                                            agent::db::GoalActor::User,
+                                            cx,
+                                        ) {
+                                            cx.emit(ThreadEvent::Error(error));
+                                        }
+                                    });
+                                })),
+                        )
+                    })
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Paused | agent::goal::GoalStatus::Blocked
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new("goal-resume")
+                                    .small()
+                                    .label(resume_label)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.thread.update(cx, |t, cx| {
+                                            if let Err(error) = t.set_goal_status(
+                                                agent::goal::GoalStatus::Active,
+                                                None,
+                                                agent::db::GoalActor::User,
+                                                cx,
+                                            ) {
+                                                cx.emit(ThreadEvent::Error(error));
+                                            }
+                                        });
+                                    })),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Active
+                                | agent::goal::GoalStatus::Paused
+                                | agent::goal::GoalStatus::Blocked
+                        ),
+                        |row| {
+                            row.child(Button::new("goal-edit").small().label(edit_label).on_click(
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.goal_popover_open = false;
+                                    this.begin_goal_edit(window, cx);
+                                }),
+                            ))
+                        },
+                    )
+                    .when(
+                        goal_status == agent::goal::GoalStatus::BudgetLimited,
+                        |row| {
+                            row.child(
+                                Button::new("goal-edit-budget")
+                                    .small()
+                                    .label(edit_budget_label)
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.goal_popover_open = false;
+                                            this.begin_goal_budget_edit(window, cx);
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Paused
+                                | agent::goal::GoalStatus::Blocked
+                                | agent::goal::GoalStatus::BudgetLimited
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new("goal-replace")
+                                    .small()
+                                    .label(replace_label)
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.goal_popover_open = false;
+                                            this.begin_goal_replace(window, cx);
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    .when(goal_status == agent::goal::GoalStatus::Complete, |row| {
+                        row.child(Button::new("goal-new").small().label(new_label).on_click(
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.goal_popover_open = false;
+                                this.begin_goal_new(window, cx);
+                            }),
+                        ))
+                    })
+                    .child(
+                        Button::new("goal-clear")
+                            .small()
+                            .label(clear_label)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.thread.update(cx, |t, cx| {
+                                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx)
+                                    {
+                                        cx.emit(ThreadEvent::Error(error));
+                                    }
+                                });
+                                this.goal_popover_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        Some(
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    deferred(
+                        gpui::div()
+                            .id("goal-dropdown")
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .occlude()
+                            .w(gpui::px(360.))
+                            .popover_style(cx)
+                            .child(popover)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.goal_popover_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .with_priority(1),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Plan-mode indicator chip: visible while the session plans (read-only
@@ -5615,6 +5873,28 @@ impl Workspace {
 /// `TerminalPanel` prompt line. Reads the `Thread` entity (not the `Workspace`)
 /// so it stays safe inside a `Workspace::update` closure, where reading the
 /// `Workspace` itself would double-lease. `None` only when the path is empty.
+/// One label/value row of the goal status popover.
+fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla) -> gpui::Div {
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_2()
+        .child(
+            gpui::div()
+                .min_w(px(96.))
+                .text_xs()
+                .text_color(muted)
+                .child(label.to_string()),
+        )
+        .child(
+            gpui::div()
+                .flex_1()
+                .text_xs()
+                .text_color(fg)
+                .child(value.to_string()),
+        )
+}
+
 fn thread_cwd(thread: &Entity<ThreadEntity>, cx: &App) -> Option<SharedString> {
     let cwd = thread.read(cx).cwd();
     if cwd.as_os_str().is_empty() {

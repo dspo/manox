@@ -105,6 +105,10 @@ struct EngineState {
     /// The host approval gate wrapping every tool (mode, always-allow
     /// cache, pending UI round trips).
     gate: Arc<ApprovalGate>,
+    /// Shared goal state with the thread facade; the goal tools read/write
+    /// through it, `GoalChanged` rides the notice channel. `None` when the
+    /// threads db is unavailable (goal features degrade off).
+    goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
 }
 
 /// The pi harness backend behind the `Thread` facade.
@@ -116,6 +120,7 @@ pub struct PiEngine {
 /// Spawn the pi actor and return the engine handle plus its notice receiver.
 /// The facade drains the receiver on the gpui thread. `initial_path`, when
 /// given, opens that session file instead of restoring the newest one.
+#[allow(clippy::too_many_arguments)] // engine spawn: startup options stay explicit
 pub fn spawn_engine(
     cwd: PathBuf,
     model: Option<PiModel>,
@@ -124,6 +129,7 @@ pub fn spawn_engine(
     fresh: bool,
     project: Option<PathBuf>,
     thread_id: String,
+    goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -145,6 +151,7 @@ pub fn spawn_engine(
         active_path: Mutex::new(initial_path.clone()),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
+        goal_bridge,
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -398,6 +405,7 @@ fn build_tools(
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
@@ -478,6 +486,21 @@ fn build_tools(
     tools.push(Arc::new(crate::team::tools::TaskGetTool::new(
         notice_tx.clone(),
     )));
+    // Goal lifecycle tools (GetGoal/CreateGoal/UpdateGoal): ungated like
+    // AskUserQuestion/ProposePlan — they persist the durable goal contract,
+    // not filesystem side effects. Absent when the db is unavailable.
+    if let Some(bridge) = goal_bridge {
+        tools.push(Arc::new(crate::goal_tools::GetGoalTool::new(Arc::clone(
+            bridge,
+        ))));
+        tools.push(Arc::new(crate::goal_tools::CreateGoalTool::new(
+            Arc::clone(bridge),
+        )));
+        tools.push(Arc::new(crate::goal_tools::UpdateGoalTool::new(
+            Arc::clone(bridge),
+        )));
+    }
+
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
@@ -748,6 +771,7 @@ fn subscribe_harness_events(
 
 /// Build the session builder against the given project dir, using the shared
 /// runtime and model.
+#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
@@ -756,8 +780,10 @@ fn session_builder(
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
-    let (tools, orchestrators) = build_tools(cwd, runtime, model, gate, plan, notice_tx);
+    let (tools, orchestrators) =
+        build_tools(cwd, runtime, model, gate, plan, notice_tx, goal_bridge);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
@@ -874,6 +900,11 @@ async fn run_actor(
     ));
     // Reviewer side calls resolve their stream through this runtime.
     state.gate.set_runtime(runtime.clone());
+    // Goal tools emit `GoalChanged` through the notice channel once the
+    // actor owns it (facade-side operations emit on the gpui thread).
+    if let Some(bridge) = &state.goal_bridge {
+        bridge.set_sender(notice_tx.clone());
+    }
     let Some(mut pi_model) = model.or_else(crate::pi_providers::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
@@ -914,6 +945,7 @@ async fn run_actor(
             &state.gate,
             &state.plan,
             &notice_tx,
+            state.goal_bridge.as_ref(),
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -939,6 +971,7 @@ async fn run_actor(
                 &state.gate,
                 &state.plan,
                 &notice_tx,
+                state.goal_bridge.as_ref(),
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -1274,6 +1307,7 @@ async fn run_actor(
                     &notice_tx,
                     &state.gate,
                     &state.plan,
+                    state.goal_bridge.as_ref(),
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
@@ -1301,6 +1335,7 @@ async fn run_actor(
                     &state.gate,
                     &state.plan,
                     &notice_tx,
+                    state.goal_bridge.as_ref(),
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -1364,6 +1399,7 @@ async fn rebuild_session(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
+    goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -1393,6 +1429,7 @@ async fn rebuild_session(
         gate,
         plan,
         notice_tx,
+        goal_bridge,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
