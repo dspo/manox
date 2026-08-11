@@ -17,6 +17,7 @@ sidebar-close-external = Close session
 sidebar-archive = Archive
 external-wizard-no-model = No model configured for this agent
 external-session-start-failed = Failed to start external agent
+plain-session-start-failed = Failed to start terminal session
 sidebar-empty-summary = (New chat)
 sidebar-copy-thread-id = Copy thread id
 sidebar-time-just-now = Just now

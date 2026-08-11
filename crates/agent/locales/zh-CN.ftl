@@ -16,6 +16,7 @@ sidebar-close-external = 关闭会话
 sidebar-archive = 归档
 external-wizard-no-model = 尚无模型支持该 agent
 external-session-start-failed = 启动外部 agent 失败
+plain-session-start-failed = 启动终端会话失败
 sidebar-empty-summary = (新对话)
 sidebar-copy-thread-id = 复制 thread id
 sidebar-time-just-now = 刚刚

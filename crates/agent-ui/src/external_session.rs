@@ -138,7 +138,7 @@ impl ExternalSession {
     /// when it has set a non-empty one, else the kind label.
     pub fn display_title(&self) -> SharedString {
         match self.title.as_deref().filter(|t| !t.trim().is_empty()) {
-            Some(t) => SharedString::from(t.to_string()),
+            Some(t) => SharedString::from(t),
             None => self.kind.label(),
         }
     }
@@ -187,7 +187,7 @@ impl ExternalSessionSummary {
     /// label.
     pub fn display_title(&self) -> SharedString {
         match self.title.as_deref().filter(|t| !t.trim().is_empty()) {
-            Some(t) => SharedString::from(t.to_string()),
+            Some(t) => SharedString::from(t),
             None => self.kind.label(),
         }
     }

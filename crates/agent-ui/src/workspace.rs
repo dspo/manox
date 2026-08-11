@@ -1286,7 +1286,7 @@ impl Workspace {
                     window.push_notification(
                         Notification::error(format!(
                             "{}: {e}",
-                            i18n::t("external-session-start-failed")
+                            i18n::t("plain-session-start-failed")
                         )),
                         cx,
                     );
@@ -1307,10 +1307,7 @@ impl Workspace {
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for plain session");
                 window.push_notification(
-                    Notification::error(format!(
-                        "{}: {e}",
-                        i18n::t("external-session-start-failed")
-                    )),
+                    Notification::error(format!("{}: {e}", i18n::t("plain-session-start-failed"))),
                     cx,
                 );
                 return;
