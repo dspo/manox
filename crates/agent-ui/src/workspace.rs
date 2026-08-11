@@ -4868,19 +4868,24 @@ impl Workspace {
                             .w_full()
                             .h_full()
                             .min_h_0()
-                            .min_w_0()
+                            .min_w_0();
                             // Body typeface: Lilex Light. Every message row
                             // (assistant, user, reasoning, tool cards, notices)
-                            // inherits from here; markdown bold/headings
-                            // resolve to Medium via nearest-weight, italic syntax
-                            // and tool-card overrides hit the italic cuts.
-                            .font_family(theme.mono_font_family.clone())
-                            .font_weight(gpui::FontWeight::LIGHT);
+                            // inherits from this wrapper div: gpui's List applies
+                            // its own text refinements only while requesting its
+                            // own layout, and with `Auto` sizing the item rows are
+                            // laid out in prepaint outside that scope — so the
+                            // family/weight must live on a wrapping div. Markdown
+                            // bold/headings resolve to Medium via nearest-weight,
+                            // italic syntax and tool-card overrides hit the
+                            // italic cuts.
                             let list_wrap = v_flex()
                                 .flex_1()
                                 .h_full()
                                 .min_h_0()
                                 .min_w_0()
+                                .font_family(theme.mono_font_family.clone())
+                                .font_weight(gpui::FontWeight::LIGHT)
                                 .child(list_el);
                             h_flex()
                                 .flex_1()
