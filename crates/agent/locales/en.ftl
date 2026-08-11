@@ -542,3 +542,19 @@ background-task-status-timed-out = Timed out
 background-task-status-stopped = Stopped
 background-task-status-session-ended = Session ended
 background-task-stop = Stop
+
+member-running = running
+member-idle = idle
+member-disbanded = gone
+member-tasks = Tasks
+member-tasks-mine = Mine
+member-tasks-unassigned = Unassigned
+member-no-tasks = No tasks
+member-tab = { $name }
+team-chip = team · { $count }
+team-drawer-title = Team
+team-drawer-empty = No members
+team-drawer-tasks = { $count ->
+    [one] { $count } task
+   *[other] { $count } tasks
+}

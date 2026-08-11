@@ -485,3 +485,19 @@ background-task-status-timed-out = 已超时
 background-task-status-stopped = 已停止
 background-task-status-session-ended = 会话已结束
 background-task-stop = 停止
+
+member-running = 运行中
+member-idle = 空闲
+member-disbanded = 已离线
+member-tasks = 任务
+member-tasks-mine = 我的
+member-tasks-unassigned = 未分配
+member-no-tasks = 暂无任务
+member-tab = { $name }
+team-chip = 团队 · { $count }
+team-drawer-title = 团队
+team-drawer-empty = 暂无成员
+team-drawer-tasks = { $count ->
+    [one] { $count } 个任务
+   *[other] { $count } 个任务
+}

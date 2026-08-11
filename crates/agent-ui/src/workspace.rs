@@ -83,6 +83,8 @@ pub(crate) type ThreadEntity = agent::Thread;
 enum RightTab {
     Editor,
     Browser(BrowserTabId),
+    /// A team member's observation panel, keyed by member name.
+    Member(String),
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -250,6 +252,11 @@ pub struct Workspace {
     /// `editor_open` tracks whether the Editor tab specifically is active.
     right_tabs: Vec<RightTab>,
     active_right_tab: usize,
+    /// Team chip popover open state (composer chip).
+    team_chip_open: bool,
+    /// Member observation panels keyed by member name; lifetime is the
+    /// tab's (dropped when the tab closes).
+    member_panels: HashMap<String, Entity<crate::views::member_panel::MemberPanel>>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -555,6 +562,8 @@ impl Workspace {
             editor_preview_scroll: ScrollHandle::new(),
             right_tabs: Vec::new(),
             active_right_tab: 0,
+            team_chip_open: false,
+            member_panels: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -3083,6 +3092,12 @@ impl Workspace {
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
             self.close_browser_tab(id, cx);
         }
+        if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
+            self.member_panels.remove(&name);
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix);
+            cx.notify();
+        }
     }
     /// Close the active right-pane tab if it is a browser tab. No-op
     /// otherwise (the keybinding is global; it should not close an Editor
@@ -3093,6 +3108,42 @@ impl Workspace {
         }
     }
 
+    /// Open (or focus) a team member's observation panel in the right pane.
+    fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Member(n) if n == name))
+        {
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
+        let Some(team) = self.thread.read(cx).team().cloned() else {
+            return;
+        };
+        let Some(member_thread) = team.read(cx).thread_for(name).cloned() else {
+            return;
+        };
+        let role = team
+            .read(cx)
+            .members()
+            .get(name)
+            .map(|m| m.role().to_string())
+            .unwrap_or_else(|| name.to_string());
+        let weak = cx.weak_entity();
+        let panel = crate::views::member_panel::MemberPanel::new(
+            member_thread,
+            name.to_string(),
+            role,
+            team.downgrade(),
+            weak,
+            cx,
+        );
+        self.member_panels.insert(name.to_string(), panel);
+        self.right_tabs.push(RightTab::Member(name.to_string()));
+        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+        cx.notify();
+    }
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
     fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3752,7 +3803,7 @@ impl Workspace {
         let plus: AnyElement = gpui::div().into_any_element();
         let project_chip = self.render_project_chip_pi(theme, cx);
         let goal_chip: Option<AnyElement> = None;
-        let team_chip: Option<AnyElement> = None;
+        let team_chip = self.render_team_chip(theme, cx);
         let plan_chip = self.render_plan_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector_pi(theme, cx);
@@ -4037,6 +4088,168 @@ impl Workspace {
             state.set_value("/goal ".to_string(), window, cx);
         });
         cx.notify();
+    }
+
+    /// Team chip — shown while the thread belongs to a team. `team · N`
+    /// with a roster popover: each member row shows liveness dot, role and
+    /// owned-task count; clicking opens (or focuses) the member's
+    /// observation tab.
+    fn render_team_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let team = self.thread.read(cx).team().cloned()?;
+        // Collect member roster metadata in one pass so we never hold a
+        // borrow on the `Team` entity across the render closures below.
+        let (count, rows): (usize, Vec<(String, String, bool, usize)>) = {
+            let t = team.read(cx);
+            let members = t.members();
+            let tasks = t.tasks().read(cx).tasks();
+            let rows = members
+                .iter()
+                .map(|(name, m)| {
+                    let running = m.thread().read(cx).is_running();
+                    let owned = tasks
+                        .iter()
+                        .filter(|tk| tk.owner.as_deref() == Some(name.as_str()))
+                        .count();
+                    (name.clone(), m.role().to_string(), running, owned)
+                })
+                .collect();
+            (members.len(), rows)
+        };
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let open = self.team_chip_open;
+        let label: SharedString = i18n::t_str("team-chip", &[("count", &count.to_string())]);
+
+        let trigger = h_flex()
+            .id("team-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(accent)
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::User)
+                    .xsmall()
+                    .text_color(theme.accent_foreground),
+            )
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.accent_foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.team_chip_open = !this.team_chip_open;
+                cx.notify();
+            }));
+
+        if !open {
+            return Some(trigger.into_any_element());
+        }
+
+        let title = i18n::t("team-drawer-title");
+        let empty = i18n::t("team-drawer-empty");
+
+        let roster = if rows.is_empty() {
+            v_flex()
+                .w_full()
+                .p_3()
+                .child(gpui::div().text_xs().text_color(muted).child(empty))
+        } else {
+            v_flex().w_full().gap_1().p_2().children(
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(ix, (name, role, running, owned))| {
+                        let dot_color = if running {
+                            theme.accent_foreground
+                        } else {
+                            theme.muted_foreground
+                        };
+                        let tasks_label =
+                            i18n::t_str("team-drawer-tasks", &[("count", &owned.to_string())]);
+                        let name_for_click = name.clone();
+                        h_flex()
+                            .id(("team-member-row", ix))
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(theme.radius)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+                            .child(gpui::div().w(px(8.)).h(px(8.)).rounded_full().bg(dot_color))
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child(name),
+                            )
+                            .child(gpui::div().text_xs().text_color(muted).child(role))
+                            .child(gpui::div().flex_1())
+                            .child(gpui::div().text_xs().text_color(muted).child(tasks_label))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.open_member_tab(&name_for_click, cx);
+                                this.team_chip_open = false;
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let popover = v_flex()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(accent)
+                    .child(title),
+            )
+            .child(roster);
+
+        Some(
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    deferred(
+                        gpui::div()
+                            .id("team-dropdown")
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .occlude()
+                            .w(px(320.))
+                            .popover_style(cx)
+                            .child(popover)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.team_chip_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .with_priority(1),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Plan-mode indicator chip: visible while the session plans (read-only
@@ -5077,6 +5290,9 @@ impl Workspace {
             .map(|(ix, tab)| {
                 let base = match tab {
                     RightTab::Editor => Tab::new().label(i18n::t("member-editor-tab")),
+                    RightTab::Member(name) => {
+                        Tab::new().label(i18n::t_str("member-tab", &[("name", name.as_str())]))
+                    }
                     RightTab::Browser(id) => {
                         let url = self
                             .browser_views
@@ -5090,7 +5306,7 @@ impl Workspace {
                 // the Editor tab keeps its keyboard toggle (`ToggleEditor` /
                 // `CloseEditor`).
                 match tab {
-                    RightTab::Browser(_) => base.suffix(
+                    RightTab::Browser(_) | RightTab::Member(_) => base.suffix(
                         gpui::div()
                             .id(("right-tab-close", ix))
                             .cursor_pointer()
@@ -5218,6 +5434,11 @@ impl Workspace {
                             .browser_views
                             .get(&id)
                             .map(|v| v.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Member(name)) => self
+                            .member_panels
+                            .get(&name)
+                            .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
                         None => gpui::div().into_any_element(),
                     }),
