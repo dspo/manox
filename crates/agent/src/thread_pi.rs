@@ -118,6 +118,22 @@ impl HistoryPhase {
 /// lifecycle subset; the remaining variants exist so the workspace and
 /// conversation list compile against the shared contract and simply never
 /// fire.
+/// One streamed child-session observation from a running sub-agent (pi path:
+/// bridged from the child's `AgentEvent`s through the Agent tool's progress
+/// channel). Text/thinking deltas append to the drill-down transcript; tool
+/// start/end render as activity lines.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubagentChildEvent {
+    /// Assistant text delta from the child.
+    Text(String),
+    /// Assistant thinking delta from the child.
+    Thinking(String),
+    /// The child started a tool call (name + one-field argument hint).
+    ToolStart { name: String, summary: Option<String> },
+    /// The child's tool call finished.
+    ToolEnd { name: String, is_error: bool },
+}
+
 #[derive(Debug)]
 pub enum ThreadEvent {
     /// Assistant text delta.
@@ -159,6 +175,14 @@ pub enum ThreadEvent {
         token_usage: TokenUsage,
         latest_activity: Option<String>,
         status: ToolCallStatus,
+    },
+    /// A streamed child-session event from a running sub-agent (the pi
+    /// bridge of the child's text/thinking deltas and tool lifecycle). The
+    /// conversation attaches these to the Agent tool call's drill-down
+    /// output; the rail uses them for live activity.
+    SubagentChild {
+        id: String,
+        child: SubagentChildEvent,
     },
     /// Request user authorization for a tool call: approval-gated tools
     /// escalate here, and `AskUserQuestion` rides the same channel. The

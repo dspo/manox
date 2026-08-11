@@ -51,7 +51,9 @@ pub use permission::{
     PendingAuthMeta, PermissionCache, PermissionDecision, ToolAuthorizationResponse,
 };
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
-pub use thread::{SideCallMetric, Thread, ThreadEvent, ThreadId, ToolCallStatus};
+pub use thread::{
+    SideCallMetric, SubagentChildEvent, Thread, ThreadEvent, ThreadId, ToolCallStatus,
+};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use pi::coding_agent::ModelRuntime;
 use pi::coding_agent::create_agent_session;
 use pi::ext_point_agent::{AgentDef, AgentRegistry};
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError, ToolProgress};
 use pi::tools::truncate::{self, TruncateConfig};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
@@ -106,10 +106,36 @@ impl AgentTool for SubagentTool {
 
     async fn execute(
         &self,
+        tool_call_id: &str,
+        params: JsonValue,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        self.execute_inner(tool_call_id, params, signal, ctx, None)
+            .await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: JsonValue,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+        progress: &dyn ToolProgress,
+    ) -> Result<AgentToolResult, ToolError> {
+        self.execute_inner(tool_call_id, params, signal, ctx, Some(progress))
+            .await
+    }
+}
+
+impl SubagentTool {
+    async fn execute_inner(
+        &self,
         _tool_call_id: &str,
         params: JsonValue,
         signal: CancellationToken,
         ctx: &dyn ToolContext,
+        progress: Option<&dyn ToolProgress>,
     ) -> Result<AgentToolResult, ToolError> {
         let subagent_type = params["subagent_type"]
             .as_str()
@@ -150,20 +176,46 @@ impl AgentTool for SubagentTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
 
+        // Live observation: the child session's streaming events are bridged
+        // to the parent's ToolProgress channel (the host surfaces them as
+        // the Agent tool call's drill-down transcript + rail activity).
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<pi::types::AgentEvent>();
+        let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
+            let _ = ev_tx.send(event);
+            Box::pin(async move {})
+        }));
+        let forward_child = |event: &pi::types::AgentEvent| {
+            if let Some(progress) = progress
+                && let Some(payload) = subagent_event_json(event)
+            {
+                progress.emit(payload);
+            }
+        };
+
         // The caller's abort signal must interrupt the subagent mid-run; the
         // inner session runs on its own token, so race it here.
         let sig = signal.clone();
         let mut prompt_fut = Box::pin(session.prompt(prompt));
-        let messages = tokio::select! {
-            r = prompt_fut.as_mut() => {
-                r.map_err(|e| ToolError::ExecutionFailed(format!("subagent failed: {e}")))?
-            }
-            _ = sig.cancelled() => {
-                drop(prompt_fut);
-                let _ = session.abort();
-                return Err(ToolError::Aborted);
+        let messages = loop {
+            tokio::select! {
+                r = prompt_fut.as_mut() => {
+                    break r.map_err(|e| {
+                        ToolError::ExecutionFailed(format!("subagent failed: {e}"))
+                    })?;
+                }
+                Some(event) = ev_rx.recv() => forward_child(&event),
+                _ = sig.cancelled() => {
+                    drop(prompt_fut);
+                    let _ = session.abort();
+                    return Err(ToolError::Aborted);
+                }
             }
         };
+        // Drain child events queued before settlement so the observer sees
+        // the whole run.
+        while let Ok(event) = ev_rx.try_recv() {
+            forward_child(&event);
+        }
 
         let text = collect_text(&messages);
 
@@ -182,6 +234,57 @@ impl AgentTool for SubagentTool {
         }
         Ok(AgentToolResult::text(out))
     }
+}
+
+/// Map a child-session event to the host-facing progress payload
+/// (`{"subagent_event": {...}}`). Only observer-relevant events are
+/// forwarded: assistant text/thinking deltas and tool start/end. Everything
+/// else returns `None` (no emit).
+fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
+    use pi::types::{AgentEvent, AssistantMessageEvent};
+    let inner = match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            AssistantMessageEvent::TextDelta { delta, .. } if !delta.is_empty() => {
+                serde_json::json!({ "kind": "text", "text": delta })
+            }
+            AssistantMessageEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
+                serde_json::json!({ "kind": "thinking", "text": delta })
+            }
+            _ => return None,
+        },
+        AgentEvent::ToolExecutionStart {
+            tool_name,
+            arguments,
+            ..
+        } => {
+            // A one-field hint (path / command / pattern) keeps the rail
+            // activity line informative without shipping full arguments.
+            let summary = ["path", "command", "pattern", "query"]
+                .iter()
+                .find_map(|key| arguments.get(*key).and_then(|v| v.as_str()))
+                .map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.len() > 80 {
+                        format!("{}…", &trimmed[..trimmed.floor_char_boundary(80)])
+                    } else {
+                        trimmed.to_string()
+                    }
+                });
+            serde_json::json!({ "kind": "tool_start", "tool": tool_name, "summary": summary })
+        }
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            is_error,
+            ..
+        } => {
+            serde_json::json!({ "kind": "tool_end", "tool": tool_name, "is_error": is_error })
+        }
+        _ => return None,
+    };
+    Some(serde_json::json!({ "subagent_event": inner }))
 }
 
 /// Resolve a definition's tool names against the caller's tool snapshot.
@@ -475,5 +578,59 @@ mod tests {
             },
         ];
         assert_eq!(collect_text(&messages), "answer\n part 2");
+    }
+
+    #[test]
+    fn subagent_event_json_forwards_observer_events_only() {
+        use pi::types::{AgentEvent, AssistantMessageEvent};
+
+        // Text delta → forwarded.
+        let payload = subagent_event_json(&AgentEvent::MessageUpdate {
+            message: Box::new(pi::types::AgentMessage::Assistant {
+                content: vec![],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "anthropic".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+                usage: Box::default(),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            }),
+            assistant_message_event: AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".into(),
+            },
+        })
+        .expect("text delta forwarded");
+        assert_eq!(payload["subagent_event"]["kind"], "text");
+        assert_eq!(payload["subagent_event"]["text"], "hello");
+
+        // Tool start carries the one-field hint.
+        let payload = subagent_event_json(&AgentEvent::ToolExecutionStart {
+            tool_call_id: "c1".into(),
+            tool_name: "Read".into(),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+        })
+        .expect("tool start forwarded");
+        assert_eq!(payload["subagent_event"]["kind"], "tool_start");
+        assert_eq!(payload["subagent_event"]["summary"], "src/main.rs");
+
+        // Tool end carries the error flag.
+        let payload = subagent_event_json(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "c1".into(),
+            tool_name: "Read".into(),
+            result: pi::tool::AgentToolResult::text("ok"),
+            is_error: false,
+        })
+        .expect("tool end forwarded");
+        assert_eq!(payload["subagent_event"]["kind"], "tool_end");
+        assert_eq!(payload["subagent_event"]["is_error"], false);
+
+        // Lifecycle noise (turn start) is not forwarded.
+        assert!(subagent_event_json(&AgentEvent::TurnStart).is_none());
     }
 }
