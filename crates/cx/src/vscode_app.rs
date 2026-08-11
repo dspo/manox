@@ -75,7 +75,7 @@ pub fn launch(
     folder: Option<&Path>,
 ) -> Result<()> {
     if claude.is_none() && codex.is_none() {
-        return launch_plain();
+        return launch_plain(folder);
     }
 
     // 重启确认框展示用标签：优先 Claude 部分，其次 Codex 部分。
@@ -185,12 +185,17 @@ fn vscode_reserved_env_keys(env_key: &str) -> Vec<String> {
 }
 
 /// 以普通方式启动 VS Code：等效 Dock 正常打开（已运行时仅激活窗口）。
-pub fn launch_plain() -> Result<()> {
+/// `folder` 为 `Some` 时透传给 `open -a`，新实例打开该目录——双块均不注入时
+/// 侧边栏的项目目录约定仍然成立。
+pub fn launch_plain(folder: Option<&Path>) -> Result<()> {
     let binary = resolve_vscode_binary()?;
     let app = app_bundle_path(&binary).context("无法从二进制路径定位 VS Code .app bundle")?;
-    let status = Command::new("open")
-        .arg("-a")
-        .arg(&app)
+    let mut command = Command::new("open");
+    command.arg("-a").arg(&app);
+    if let Some(folder) = folder {
+        command.arg(folder);
+    }
+    let status = command
         .status()
         .with_context(|| format!("打开 VS Code 失败: {}", app.display()))?;
     if !status.success() {

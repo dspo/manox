@@ -395,7 +395,7 @@ chatgpt-app-launched = 已启动 ChatGPT.app · { $provider } · { $model }
 chatgpt-app-launch-failed = 启动 ChatGPT.app 失败
 
 ## VS Code 启动通知（工具 → VS Code 单一入口，注入按 vscode_app 设置解析）
-vscode-app-launched-plain = 已启动 VS Code
+vscode-app-launched = 已启动 VS Code
 vscode-app-launch-failed = 启动 VS Code 失败
 
 ### terminal-ui (overlay status / search)

@@ -1238,6 +1238,10 @@ pub fn chatgpt_injectable_catalog() -> Result<ChatGptInjectableCatalog> {
         if !provider_supports_agent(&config, provider, "ChatGPT.app") {
             continue;
         }
+        // 与启动候选同一谓词：无 endpoints 的 provider 无注入目标，不列入目录。
+        if !provider.has_endpoints() {
+            continue;
+        }
         let entry = match resolved_models_for_provider(&config, provider) {
             Ok(resolved) => Ok(injected_models_for_chatgpt_app(&resolved, &provider.name)
                 .into_iter()
@@ -1261,6 +1265,10 @@ pub fn vscode_claude_injectable_catalog() -> Result<VsCodeClaudeCatalog> {
     let mut catalog = Vec::new();
     for provider in &config.providers {
         if !provider_supports_agent(&config, provider, "VS Code") {
+            continue;
+        }
+        // 与启动候选同一谓词：无 endpoints 的 provider 无注入目标，不列入目录。
+        if !provider.has_endpoints() {
             continue;
         }
         let entry = match resolved_models_for_provider(&config, provider) {
@@ -1564,12 +1572,6 @@ fn pick_vscode_provider<'a>(
         },
         None => Some(&candidates[0]),
     }
-}
-
-/// 普通启动 VS Code（等效 Dock 正常打开）。
-/// `launch_vscode_app_from_settings` 在两块均不注入时内部复用。
-pub fn launch_vscode_plain() -> Result<()> {
-    vscode_app::launch_plain()
 }
 
 /// VS Code 是否已安装（供 manox 菜单禁用决策）。

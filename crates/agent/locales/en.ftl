@@ -445,7 +445,7 @@ chatgpt-app-launched = Launched ChatGPT.app · { $provider } · { $model }
 chatgpt-app-launch-failed = Failed to launch ChatGPT.app
 
 ## VS Code launch notifications (Tools → VS Code menu cascade)
-vscode-app-launched-plain = Launched VS Code
+vscode-app-launched = Launched VS Code
 vscode-app-launch-failed = Failed to launch VS Code
 
 ### terminal-ui (overlay status / search)

@@ -1440,7 +1440,7 @@ impl Workspace {
             let _ = this.update_in(cx, |_, window, cx| match result {
                 Ok(()) => {
                     window.push_notification(
-                        Notification::success(i18n::t("vscode-app-launched-plain")),
+                        Notification::success(i18n::t("vscode-app-launched")),
                         cx,
                     );
                 }
