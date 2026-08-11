@@ -4,6 +4,8 @@
 // plus a per-session UI-metadata sidecar (`pi_extensions::session_meta`).
 // The pi transcript persists itself, so `save_thread` is a no-op and the
 // manox SQLite timeline/note records are not produced.
+// Archived sessions are excluded from the sidebar list but stay in
+// `session_paths` so their sidecar remains addressable.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -142,7 +144,7 @@ impl ThreadStore {
         if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
             s.has_unread = unread;
         }
-        self.write_meta(id, move |meta| meta.unread = unread, true, cx);
+        self.write_meta(id, move |meta| meta.unread = unread, cx);
     }
 
     /// Set the errored flag on a session (persisted in its sidecar).
@@ -155,7 +157,7 @@ impl ThreadStore {
         if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
             s.errored = errored;
         }
-        self.write_meta(id, move |meta| meta.errored = errored, true, cx);
+        self.write_meta(id, move |meta| meta.errored = errored, cx);
     }
 
     /// Re-read the session directory and refresh the summary list. Runs off
@@ -172,8 +174,9 @@ impl ThreadStore {
                 .await
                 .unwrap_or_default();
             this.update(cx, |s, cx| {
-                s.session_paths = list.iter().map(|(sum, path)| (sum.id.clone(), path.clone())).collect();
-                s.summaries = list.into_iter().map(|(sum, _)| sum).collect();
+                let (session_paths, summaries) = project_session_lists(list);
+                s.session_paths = session_paths;
+                s.summaries = summaries;
                 cx.emit(ThreadStoreEvent::SummariesUpdated);
                 cx.notify();
             })
@@ -206,16 +209,25 @@ impl ThreadStore {
         Some(entity)
     }
 
-    /// Archive (or unarchive) a session (persisted in its sidecar).
+    /// Archive (or unarchive) a session. Archiving removes the row from the
+    /// sidebar list immediately; the post-write refresh in `write_meta`
+    /// re-syncs the list from disk (an unarchived session returns to the
+    /// list on the next refresh).
     pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
-        self.write_meta(id, move |meta| meta.archived = archived, false, cx);
-        self.refresh(cx);
+        if archived {
+            self.summaries.retain(|s| s.id != id);
+        } else if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
+            s.archived = false;
+        }
+        self.write_meta(id, move |meta| meta.archived = archived, cx);
     }
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
     pub fn pin_thread(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
-        self.write_meta(id, move |meta| meta.pinned = pinned, false, cx);
-        self.refresh(cx);
+        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
+            s.pinned = pinned;
+        }
+        self.write_meta(id, move |meta| meta.pinned = pinned, cx);
     }
 
     /// Append a `model_change` event. The pi transcript records model changes
@@ -251,37 +263,41 @@ impl ThreadStore {
     ) {
     }
 
-    /// Load the sidecar meta for a session, apply `update`, and write back.
-    /// `refresh_list` emits `SummariesUpdated` for the in-memory flags; the
-    /// archive/pin path refreshes the whole list instead.
+    /// Persist a sidecar change for a session. The caller's in-memory update
+    /// is the render source of truth, so `SummariesUpdated` fires up front;
+    /// the sidecar write is best-effort. The list is rescanned only after
+    /// the write lands — a rescan racing the write would re-read stale
+    /// sidecar flags and revert the in-memory state.
     fn write_meta(
         &self,
         id: &str,
         update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + 'static,
-        refresh_list: bool,
         cx: &mut Context<Self>,
     ) {
+        cx.emit(ThreadStoreEvent::SummariesUpdated);
+        cx.notify();
         let Some(path) = self.session_paths.get(id).cloned() else {
             return;
         };
         let dir = self.sessions_dir.clone();
-        cx.spawn(async move |_, _| {
-            let handle = crate::runtime::handle();
-            handle
+        let this = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let saved = crate::runtime::handle()
                 .spawn(async move {
-                    if let Ok(mut meta) = pi_extensions::session_meta::load(&dir, &path).await {
-                        update(&mut meta);
-                        let _ = pi_extensions::session_meta::save(&dir, &path, &meta).await;
-                    }
+                    let mut meta = match pi_extensions::session_meta::load(&dir, &path).await {
+                        Ok(meta) => meta,
+                        Err(_) => return false,
+                    };
+                    update(&mut meta);
+                    pi_extensions::session_meta::save(&dir, &path, &meta).await.is_ok()
                 })
                 .await
-                .ok();
+                .unwrap_or(false);
+            if saved {
+                this.update(cx, |s, cx| s.refresh(cx)).ok();
+            }
         })
         .detach();
-        if refresh_list {
-            cx.emit(ThreadStoreEvent::SummariesUpdated);
-            cx.notify();
-        }
     }
 }
 
@@ -309,6 +325,26 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
         out.push((session_info_to_summary(&info, &meta), path));
     }
     out
+}
+
+/// Split a loaded session list into the id→path map (every session — an
+/// archived session must stay addressable so archive/unarchive and the
+/// unread/error flags can still reach its sidecar) and the active list the
+/// sidebar renders (archived sessions are hidden, matching the retired
+/// SQLite store's `list(false)` default).
+fn project_session_lists(
+    list: Vec<(ThreadSummary, PathBuf)>,
+) -> (HashMap<String, PathBuf>, Vec<ThreadSummary>) {
+    let paths = list
+        .iter()
+        .map(|(sum, path)| (sum.id.clone(), path.clone()))
+        .collect();
+    let active = list
+        .into_iter()
+        .filter(|(sum, _)| !sum.archived)
+        .map(|(sum, _)| sum)
+        .collect();
+    (paths, active)
 }
 
 /// Map a pi session info + sidecar onto the sidebar summary shape.
@@ -431,5 +467,42 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    fn sample_summary(id: &str, archived: bool) -> ThreadSummary {
+        ThreadSummary {
+            id: id.to_string(),
+            summary: String::new(),
+            title: None,
+            title_override: None,
+            model_id: String::new(),
+            provider_id: None,
+            approval_mode: 0,
+            project: String::new(),
+            depth: 0,
+            parent_id: None,
+            archived,
+            pinned: false,
+            has_unread: false,
+            errored: false,
+            created_at: 0,
+            interacted_at: 0,
+            updated_at: 0,
+            cumulative_total_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn project_session_lists_hides_archived_keeps_paths() {
+        let (paths, active) = project_session_lists(vec![
+            (sample_summary("active", false), PathBuf::from("active.jsonl")),
+            (sample_summary("archived", true), PathBuf::from("archived.jsonl")),
+        ]);
+        let ids: Vec<&str> = active.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["active"]);
+        // The archived session stays addressable (unarchive / unread / pin
+        // still reach its sidecar) even though the sidebar no longer lists it.
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains_key("archived"));
+        assert_eq!(paths.get("active").unwrap().file_name().unwrap(), "active.jsonl");
+    }
 }
 
