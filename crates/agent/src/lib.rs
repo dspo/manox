@@ -11,6 +11,7 @@ pub mod collaboration_mode;
 pub mod command;
 pub mod compact;
 pub mod db;
+pub mod file_lock;
 pub mod frontmatter;
 pub mod goal;
 pub mod i18n;
