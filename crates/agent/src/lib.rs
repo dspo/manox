@@ -4,6 +4,7 @@
 //! gpui-native. The LLM connects directly to providers declared in
 //! `~/.config/cx/cx.providers.config.yaml`.
 
+pub mod agent_defs;
 pub mod approval;
 pub mod approval_review;
 pub mod background_task;
