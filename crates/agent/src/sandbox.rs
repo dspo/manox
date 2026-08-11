@@ -573,8 +573,12 @@ mod tests {
             policy.is_protected(&sibling_git.join("config")),
             "sibling .git stays protected"
         );
+        // A path outside the temp dir entirely is not writable. (Cannot use
+        // `/tmp/x` here: on Linux `temp_dir` IS `/tmp`, hence `temp_root`,
+        // so `/tmp` is legitimately in the writable set; on macOS `temp_dir`
+        // is `/var/folders/…`, distinct from `/tmp`.)
         assert!(
-            !policy.is_writable(Path::new("/tmp/x")),
+            !policy.is_writable(Path::new("/manox-sandbox-outside-temp-test/x")),
             "tmp not admitted under worktree"
         );
         assert_eq!(
