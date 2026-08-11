@@ -123,6 +123,7 @@ pub fn spawn_engine(
     initial_path: Option<PathBuf>,
     fresh: bool,
     project: Option<PathBuf>,
+    thread_id: String,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -155,6 +156,7 @@ pub fn spawn_engine(
         cmd_rx,
         notice_tx.clone(),
         Arc::clone(&state),
+        thread_id,
     ));
     // Display-only streaming preview: while the actor's eager restore reads
     // the whole session file, stream its transcript into the mirrored history
@@ -635,16 +637,31 @@ fn subscribe_session(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) -> pi::agent::Subscription {
     let event_tx = notice_tx.clone();
+    // A fresh session's jsonl file is deferred until the first assistant
+    // message, so the sidebar only learns the thread exists once that file
+    // materializes. The user MessageEnd fires before it; the first assistant
+    // MessageEnd (the materialization moment — the persistence middleware
+    // appends before listeners observe) is the authoritative signal.
+    let assistant_signal_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let assistant_flag = std::sync::Arc::clone(&assistant_signal_sent);
     session.subscribe(Arc::new(move |event, _cancel| {
         let tx = event_tx.clone();
+        let assistant_flag = std::sync::Arc::clone(&assistant_flag);
         Box::pin(async move {
-            // The user entry lands in the transcript right after the first
-            // TurnStart; its MessageEnd is the earliest reliable "the
-            // conversation now exists" signal for the sidebar.
-            if let AgentEvent::MessageEnd { message } = &event
-                && matches!(**message, AgentMessage::User { .. })
-            {
-                let _ = tx.send(BackendNotice::SessionListDirty);
+            if let AgentEvent::MessageEnd { message } = &event {
+                match &**message {
+                    AgentMessage::User { .. } => {
+                        let _ = tx.send(BackendNotice::SessionListDirty);
+                    }
+                    AgentMessage::Assistant { .. }
+                        if !assistant_flag.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        // First assistant message: the deferred session file
+                        // just materialized, so the sidebar can list it.
+                        let _ = tx.send(BackendNotice::SessionListDirty);
+                    }
+                    _ => {}
+                }
             }
             for te in adapt::agent_event_to_thread_events(&event) {
                 let _ = tx.send(BackendNotice::Event(Box::new(te)));
@@ -756,6 +773,7 @@ async fn run_actor(
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
+    thread_id: String,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -834,7 +852,10 @@ async fn run_actor(
                 &state.plan,
                 &notice_tx,
             );
-            match builder.build().await {
+            // The fresh session carries the facade thread's id so the
+            // sidebar row (keyed by session id) and the in-memory thread
+            // share one identity.
+            match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
@@ -1192,7 +1213,11 @@ async fn run_actor(
                     &state.plan,
                     &notice_tx,
                 );
-                match builder.build().await {
+                // Same identity contract as the startup build: the session
+                // carries the facade thread's id (the previous deferred
+                // session never materialized — `set_project` requires a
+                // non-interacted thread).
+                match builder.with_session_id(thread_id.clone()).build().await {
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
                         attach_plan_hooks(&mut s, &state.plan, &cwd);

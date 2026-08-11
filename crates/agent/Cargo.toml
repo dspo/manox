@@ -58,6 +58,10 @@ tera.workspace = true
 tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
+# Self-reference with `test-support`: integration tests (`tests/`) compile the
+# lib without `cfg(test)`, so the test seams (`init_for_test` /
+# `drop_for_test` / `drop_global_for_test`) must come from the feature.
+agent = { path = ".", features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 

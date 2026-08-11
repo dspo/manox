@@ -7,7 +7,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, WeakEntity};
 
@@ -39,7 +38,10 @@ pub struct ThreadStore {
 
 impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
 
-static GLOBAL: OnceLock<Entity<ThreadStore>> = OnceLock::new();
+/// `Mutex<Option<_>>` (not a `OnceLock`) so test-support can reset the
+/// global between gpui test apps — the store entity otherwise leaks past the
+/// test context's leak detector.
+static GLOBAL: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-support"))]
 static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
@@ -71,7 +73,7 @@ pub fn init(cx: &mut App) {
         db,
     });
     entity.update(cx, |s, cx| s.refresh(cx));
-    let _ = GLOBAL.set(entity);
+    *GLOBAL.lock().unwrap() = Some(entity);
 }
 
 /// Returns the global `ThreadStore` `Entity`. Panics if `init` was not called.
@@ -81,9 +83,17 @@ pub fn global() -> Entity<ThreadStore> {
         return entity;
     }
     GLOBAL
-        .get()
-        .expect("ThreadStore not initialized; call agent::init first")
+        .lock()
+        .unwrap()
         .clone()
+        .expect("ThreadStore not initialized; call agent::init first")
+}
+
+/// Drop the global store entity — test-support only, so a gpui test app can
+/// tear down without the leak detector tripping on the process-global entity.
+#[cfg(any(test, feature = "test-support"))]
+pub fn drop_global_for_test() {
+    *GLOBAL.lock().unwrap() = None;
 }
 
 impl ThreadStore {
@@ -432,4 +442,3 @@ mod tests {
     }
 
 }
-
