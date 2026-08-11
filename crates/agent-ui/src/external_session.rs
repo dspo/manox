@@ -17,8 +17,8 @@ use terminal_ui::TerminalView;
 
 /// Which session a sidebar `+` spawn runs. The first three are external agent
 /// CLIs driven through cx (provider/model injection + IPC handle); `Terminal`
-/// and `Pi` are plain PTY sessions with no cx involvement — the user's shell,
-/// or the `pi` TUI binary resolved from disk.
+/// is a plain PTY session with no cx involvement — the user's shell in the
+/// session's cwd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     ClaudeCode,
@@ -26,8 +26,6 @@ pub enum SessionKind {
     GithubCopilot,
     /// A plain interactive shell in the session's cwd.
     Terminal,
-    /// The `pi` coding-agent TUI, spawned directly (no provider injection).
-    Pi,
 }
 
 impl SessionKind {
@@ -39,7 +37,6 @@ impl SessionKind {
             Self::Codex => "Codex".into(),
             Self::GithubCopilot => "GitHub Copilot".into(),
             Self::Terminal => i18n::t("session-kind-terminal"),
-            Self::Pi => "Pi".into(),
         }
     }
 
@@ -49,7 +46,7 @@ impl SessionKind {
             Self::ClaudeCode => Some(cx::Agent::Claude),
             Self::Codex => Some(cx::Agent::Codex),
             Self::GithubCopilot => Some(cx::Agent::Copilot),
-            Self::Terminal | Self::Pi => None,
+            Self::Terminal => None,
         }
     }
 
@@ -63,7 +60,6 @@ impl SessionKind {
             Self::Codex => "codex",
             Self::GithubCopilot => "copilot",
             Self::Terminal => "terminal",
-            Self::Pi => "pi",
         }
     }
 
@@ -76,7 +72,6 @@ impl SessionKind {
             Self::Codex => "icons/codex.svg",
             Self::GithubCopilot => "icons/githubcopilot.svg",
             Self::Terminal => "icons/terminal.svg",
-            Self::Pi => "icons/pi.svg",
         }
     }
 }
@@ -131,7 +126,7 @@ pub struct ExternalSession {
     pub socket_path: Option<PathBuf>,
     pub terminal_view: Entity<TerminalView>,
     /// The cx IPC handle for agent kinds — the close path kills through it.
-    /// `None` for plain PTY sessions (Terminal / Pi): dropping the
+    /// `None` for plain PTY sessions (Terminal): dropping the
     /// `TerminalView` drops the `PtyHandle`, whose teardown kills the child
     /// tree, so no explicit kill reference is needed.
     pub handle: Option<Arc<cx::SessionHandle>>,
@@ -259,10 +254,6 @@ mod tests {
         terminal.kind = SessionKind::Terminal;
         terminal.title = None;
         assert!(!terminal.display_title().is_empty());
-        let mut pi = sample_summary();
-        pi.kind = SessionKind::Pi;
-        pi.title = None;
-        assert_eq!(pi.display_title().as_str(), "Pi");
     }
 
     #[test]

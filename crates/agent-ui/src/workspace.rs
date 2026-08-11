@@ -1260,12 +1260,12 @@ impl Workspace {
         self.attach_external_session(&id, window, cx);
     }
 
-    /// Launch a plain PTY session — the user's shell (`Terminal`) or the
-    /// resolved `pi` binary (`Pi`) — with no cx provider/model injection.
-    /// Mirrors the `spawn_external_session` flow (sidebar row, ChildExit
-    /// teardown, OSC title mirroring, project grouping), but the PTY is a
-    /// local `PtyHandle` and `ExternalSession.handle` stays `None` — closing
-    /// drops the view, whose PTY teardown kills the child tree.
+    /// Launch a plain PTY session — the user's shell (`Terminal`) — with no
+    /// cx provider/model injection. Mirrors the `spawn_external_session` flow
+    /// (sidebar row, ChildExit teardown, OSC title mirroring, project
+    /// grouping), but the PTY is a local `PtyHandle` and
+    /// `ExternalSession.handle` stays `None` — closing drops the view, whose
+    /// PTY teardown kills the child tree.
     ///
     /// `project_cwd` is `Some(path)` when launched from a project folder's
     /// `+` button — the session runs in that project's directory. `None`
@@ -1293,37 +1293,6 @@ impl Workspace {
                     return;
                 }
             },
-            SessionKind::Pi => {
-                let program = match cx::resolve_binary("pi") {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(error = %e, "pi binary not found");
-                        window.push_notification(
-                            Notification::error(format!(
-                                "{}: {e}",
-                                i18n::t("external-session-start-failed")
-                            )),
-                            cx,
-                        );
-                        return;
-                    }
-                };
-                let env = pi_session_env(&program);
-                match terminal::pty::open(&cwd, 80, 24, Some(&program.to_string_lossy()), &env) {
-                    Ok(h) => Box::new(h),
-                    Err(e) => {
-                        tracing::error!(error = ?e, "failed to open pi pty");
-                        window.push_notification(
-                            Notification::error(format!(
-                                "{}: {e}",
-                                i18n::t("external-session-start-failed")
-                            )),
-                            cx,
-                        );
-                        return;
-                    }
-                }
-            }
             _ => {
                 tracing::warn!(
                     agent_id = kind.agent_id(),
@@ -5598,33 +5567,4 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
-}
-
-/// Env for the `pi` PTY: the user's `[terminal].env` plus a PATH override.
-/// `pi` is a `#!/usr/bin/env node` script, and a GUI-launched manox inherits
-/// a sparse PATH that resolves neither it nor node — prepend the pi binary's
-/// directory, node's directory (resolved through cx's same fallbacks), and
-/// the usual bin dirs ahead of the inherited PATH.
-fn pi_session_env(program: &std::path::Path) -> Vec<(String, String)> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = program.parent() {
-        dirs.push(dir.to_path_buf());
-    }
-    if let Ok(node) = cx::resolve_binary("node")
-        && let Some(dir) = node.parent()
-    {
-        dirs.push(dir.to_path_buf());
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
-    let mut paths: Vec<std::ffi::OsString> = dirs.into_iter().map(|d| d.into_os_string()).collect();
-    if let Some(existing) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&existing).map(|p| p.into_os_string()));
-    }
-    let settings = terminal::settings::load();
-    let mut env = settings.env;
-    if let Ok(joined) = std::env::join_paths(paths.iter().filter(|d| !d.is_empty())) {
-        env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
-    }
-    env
 }
