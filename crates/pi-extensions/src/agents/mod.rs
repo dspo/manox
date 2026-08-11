@@ -32,6 +32,35 @@ pub fn register_defaults(registry: &mut AgentRegistry) {
     registry.register(explore_agent_def());
 }
 
+/// Resolve a definition's `model` override (assembly-layer concern per
+/// `AgentDef.model`): `None` when the definition declares nothing; the
+/// resolved model when the injected registry resolves the reference; a loud
+/// error when the override is declared but cannot be resolved (missing
+/// registry or unknown reference) — never a silent fallback.
+fn resolve_model_override(
+    def: &AgentDef,
+    subagent_type: &str,
+    provider_registry: Option<&Arc<pi::ProviderRegistry>>,
+) -> Result<Option<pi::types::Model>, ToolError> {
+    Ok(match (def.model.as_deref(), provider_registry) {
+        (Some(reference), Some(registry)) => {
+            let reference = reference.trim();
+            Some(
+                crate::model_ref::resolve_model_ref(registry, reference).ok_or_else(|| {
+                    ToolError::ExecutionFailed(format!(
+                        "agent `{subagent_type}` model override `{reference}` did not resolve"
+                    ))
+                })?,
+            )
+        }
+        (Some(reference), None) => {
+            return Err(ToolError::ExecutionFailed(format!(
+                "agent `{subagent_type}` declares model override `{reference}` but no provider registry is available to resolve it"
+            )));
+        }
+        (None, _) => None,
+    })
+}
 /// The `agent` tool — invoke an agent definition as a subagent.
 pub struct SubagentTool {
     registry: Arc<AgentRegistry>,
@@ -42,6 +71,10 @@ pub struct SubagentTool {
     model_runtime: Option<ModelRuntime>,
     /// Optional explicit model; without one the session uses its default.
     model: Option<pi::types::Model>,
+    /// Optional provider registry for resolving a definition's `model`
+    /// override (id or alias). Assembly-layer concern per `AgentDef.model`;
+    /// injected by the harness that owns the registry.
+    provider_registry: Option<Arc<pi::ProviderRegistry>>,
 }
 
 impl SubagentTool {
@@ -51,6 +84,7 @@ impl SubagentTool {
             tools,
             model_runtime: None,
             model: None,
+            provider_registry: None,
         }
     }
 
@@ -64,6 +98,15 @@ impl SubagentTool {
     /// Pin the model the subagent session uses (wired to the caller's model).
     pub fn with_model(mut self, model: pi::types::Model) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Inject the provider registry used to resolve a definition's `model`
+    /// override. Without one, a definition declaring a model override fails
+    /// loudly at dispatch (resolution is impossible, and silently running
+    /// the caller's model would hide the manifest's intent).
+    pub fn with_provider_registry(mut self, registry: Arc<pi::ProviderRegistry>) -> Self {
+        self.provider_registry = Some(registry);
         self
     }
 }
@@ -146,14 +189,13 @@ impl SubagentTool {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
-        // A declared model override cannot be applied by this dispatcher
-        // (model resolution is the assembly layer's job); refuse loudly
-        // rather than silently running the default model.
-        if def.model.is_some() {
-            return Err(ToolError::InvalidArguments(format!(
-                "agent `{subagent_type}` declares a model override, which the dispatcher does not support yet"
-            )));
-        }
+        // A definition's `model` override wins over the caller's pinned
+        // model — that is the manifest's intent. Resolution needs the
+        // injected provider registry; refuse loudly when the override is
+        // declared but cannot be resolved (missing registry or unknown
+        // reference), never silently fall back.
+        let model_override =
+            resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
 
         let selected = select_tools(&self.tools, def);
         // The subagent transcript lives in a throwaway temp directory so a
@@ -168,8 +210,9 @@ impl SubagentTool {
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
-        if let Some(model) = &self.model {
-            builder = builder.with_model(model.clone());
+        // Definition override first, then the caller's pinned model.
+        if let Some(model) = model_override.or_else(|| self.model.clone()) {
+            builder = builder.with_model(model);
         }
         let mut session = builder
             .build()
@@ -503,7 +546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_model_override_is_rejected() {
+    async fn declared_model_override_without_registry_is_loud() {
         let mut registry = AgentRegistry::new();
         registry.register(AgentDef {
             name: "M".into(),
@@ -523,8 +566,8 @@ mod tests {
             .await;
         let err = format!("{}", result.unwrap_err());
         assert!(
-            err.contains("does not support"),
-            "refuses loudly instead of silently ignoring: {err}"
+            err.contains("no provider registry"),
+            "refuses loudly instead of silently running the caller's model: {err}"
         );
     }
 
@@ -632,5 +675,85 @@ mod tests {
 
         // Lifecycle noise (turn start) is not forwarded.
         assert!(subagent_event_json(&AgentEvent::TurnStart).is_none());
+    fn registry_with_model(id: &str) -> Arc<pi::ProviderRegistry> {
+        use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
+        let registry = Arc::new(pi::ProviderRegistry::new());
+        registry
+            .register_provider(
+                &format!("p-{id}"),
+                ProviderConfig {
+                    name: Some("P".into()),
+                    base_url: Some("https://p.example".into()),
+                    api_key: Some("k".into()),
+                    api: Some(Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![ProviderModelConfig {
+                        id: id.into(),
+                        name: id.into(),
+                        reasoning: false,
+                        input: vec![pi::provider_registry::InputModality::Text],
+                        context_window: 1000,
+                        max_tokens: 100,
+                        cost: Cost::default(),
+                        api: None,
+                        base_url: None,
+                        metadata: std::collections::HashMap::new(),
+                    }],
+                },
+            )
+            .unwrap();
+        registry
     }
+
+    fn def_with_model(model: Option<&str>) -> AgentDef {
+        AgentDef {
+            name: "worker".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: model.map(|m| m.to_string()),
+            system_prompt: "sp".into(),
+        }
+    }
+
+    #[test]
+    fn model_override_absent_yields_none() {
+        let def = def_with_model(None);
+        let registry = registry_with_model("haiku");
+        assert!(
+            resolve_model_override(&def, "worker", Some(&registry))
+                .unwrap()
+                .is_none()
+        );
+        // Also fine without a registry — nothing to resolve.
+        assert!(
+            resolve_model_override(&def, "worker", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_override_resolves_against_registry() {
+        let def = def_with_model(Some("haiku"));
+        let registry = registry_with_model("haiku");
+        let resolved = resolve_model_override(&def, "worker", Some(&registry))
+            .unwrap()
+            .expect("override resolves");
+        assert_eq!(resolved.id, "haiku");
+    }
+
+    #[test]
+    fn model_override_unresolvable_is_loud() {
+        let def = def_with_model(Some("no-such-model"));
+        let registry = registry_with_model("haiku");
+        let err = resolve_model_override(&def, "worker", Some(&registry)).unwrap_err();
+        assert!(err.to_string().contains("did not resolve"), "{err}");
+    }
+
+    #[test]
+    fn model_override_without_registry_is_loud() {
+        let def = def_with_model(Some("haiku"));
+        let err = resolve_model_override(&def, "worker", None).unwrap_err();
+        assert!(err.to_string().contains("no provider registry"), "{err}");    }
 }
