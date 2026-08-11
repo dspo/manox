@@ -21,7 +21,7 @@ pub use views::settings::SettingsView;
 pub use workspace::Workspace;
 
 pub use chatgpt_app::LaunchChatGptApp;
-pub use vscode_app::{LaunchVSCode, LaunchVSCodePlain};
+pub use vscode_app::LaunchVSCode;
 
 // Open/close the right-side markdown composer, plus the global OpenSettings
 // action that flips the Workspace into the Settings overlay. AskPrev/AskNext

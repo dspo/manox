@@ -1,19 +1,28 @@
-//! VS Code 桌面端启动注入：macOS「工具 → VS Code → provider → model」级联的落点。
-//! 入口 [`launch`]（BYOK 注入）与 [`launch_plain`]（普通打开）。
+//! VS Code 桌面端启动注入：macOS「工具 → VS Code」单一入口的落点。
+//! 入口 [`launch`]（按持久化 `vscode_app:` 设置注入）与 [`launch_plain`]（普通打开）。
 //!
-//! 注入机制：先解析用户登录 shell 环境（`$SHELL -i -l` env dump），把 Claude Code
-//! BYOK env 以最高优先级叠加其上，再带 `VSCODE_CLI=1` 直接启动 VS Code 二进制。
+//! 注入两个扩展（各自可独立关闭）：
+//! - **Claude Code Extension**：`ANTHROPIC_*` BYOK env（扩展直接消费）；
+//! - **Codex Extension**：`CODEX_HOME` + config.toml（复用 ChatGPT.app 的
+//!   `prepare_chatgpt_launch_home_for_app` 机制；官方确认 IDE 扩展读 CODEX_HOME、
+//!   与 CLI 共享 config.toml 语义），API Key 经 provider `env_key` 环境变量传入。
+//!
+//! 注入机制：先解析用户登录 shell 环境（`$SHELL -i -l` env dump），把注入 env
+//! 以最高优先级叠加其上，再带 `VSCODE_CLI=1` 直接启动 VS Code 二进制。
 //! VS Code 检测 `VSCODE_CLI=1` 即跳过自身 shell env 解析（preload 合并顺序
 //! `process.env < shellEnv < userEnv`，跳过时 shellEnv 为空），扩展宿主、
-//! Claude Code 扩展内置 CLI 与集成终端因此全部继承注入 env——可覆盖
+//! 各扩展与集成终端因此全部继承注入 env——可覆盖
 //! `~/.zshrc` 导出的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`。
-//! 不写任何 settings.json，API Key 不落盘。
+//! 不写任何 settings.json，API Key 不落盘（Codex 部分写入 CODEX_HOME 下
+//! config.toml 的 `env_key` 间接引用，与 ChatGPT.app 路径一致）。
 //!
 //! VS Code 同一 user-data-dir 的第二实例会转发给已运行实例（env 丢失），因此
 //! 注入前若 VS Code 正在运行，先弹确认框请求重启：osascript 优雅退出并等待，
 //! 超时（如有未保存对话框未处理）则中止注入、VS Code 保持运行。
 
 use crate::Selection;
+use crate::VsCodeClaudePart;
+use crate::VsCodeCodexPart;
 use crate::parse_model_context_suffix;
 use crate::probe::runtime;
 use anyhow::{Context, Result, bail};
@@ -55,34 +64,124 @@ pub fn is_installed() -> bool {
     resolve_vscode_binary().is_ok()
 }
 
-/// 带 BYOK env 注入启动 VS Code（GUI detach）。VS Code 正在运行时先请求重启。
-/// `folder` 为 `Some` 时以位置参数传给 VS Code 二进制，新实例直接打开该目录
-/// （等效 `code <folder>`）；`None` 则不带目录启动（系统菜单路径）。
-pub fn launch(selection: &Selection, apikey: &str, folder: Option<&Path>) -> Result<()> {
-    let model = selection.model.as_ref().context("VS Code 未选中模型")?;
+/// 按持久化设置注入并启动 VS Code（GUI detach）。VS Code 正在运行时先请求重启。
+/// `claude` 为 Claude Code Extension 注入部分（ANTHROPIC_* env），`codex` 为
+/// Codex Extension 注入部分（CODEX_HOME + config.toml）；两者可各自缺席，
+/// 均缺席时退化为普通打开。`folder` 为 `Some` 时以位置参数传给 VS Code 二进制，
+/// 新实例直接打开该目录（等效 `code <folder>`）；`None` 则不带目录启动（系统菜单路径）。
+pub fn launch(
+    claude: Option<&VsCodeClaudePart>,
+    codex: Option<&VsCodeCodexPart>,
+    folder: Option<&Path>,
+) -> Result<()> {
+    if claude.is_none() && codex.is_none() {
+        return launch_plain();
+    }
 
-    restart_running_instance_if_any(&selection.provider.name, &model.id)?;
+    // 重启确认框展示用标签：优先 Claude 部分，其次 Codex 部分。
+    let (label_provider, label_model) = match claude {
+        Some(part) => (
+            part.selection.provider.name.clone(),
+            part.selection
+                .model
+                .as_ref()
+                .map(|m| m.id.clone())
+                .unwrap_or_default(),
+        ),
+        None => {
+            let part = codex.expect("两部分均缺席已提前返回");
+            (part.provider_name.clone(), part.model_id.clone())
+        }
+    };
+    restart_running_instance_if_any(&label_provider, &label_model)?;
 
     let mut env = resolve_login_shell_env();
-    apply_byok_env(selection, apikey, &mut env);
+    apply_injection_env(claude, codex, &mut env);
     // VSCODE_CLI=1：复刻 `code` CLI 的启动语义，令 VS Code 跳过自身 shell env
-    // 解析，进程 env 直达扩展宿主与集成终端。
+    // 解析，进程 env 直达扩展宿主与集成终端。必须最后写入，防止自定义 env 覆盖。
     env.insert("VSCODE_CLI".into(), "1".into());
 
     let binary = resolve_vscode_binary()?;
     spawn_detached(&binary, &env, folder)?;
 
+    let claude_desc = claude
+        .map(|p| {
+            format!(
+                "Claude Code: {} · {}",
+                p.selection.provider.name,
+                p.selection
+                    .model
+                    .as_ref()
+                    .map(|m| m.id.as_str())
+                    .unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+    let codex_desc = codex
+        .map(|p| format!("Codex: {} · {}", p.provider_name, p.model_id))
+        .unwrap_or_default();
+    let parts = [claude_desc, codex_desc]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
     println!();
     println!(
-        "启动 VS Code | Provider: {} | Model: {}{}（BYOK env 注入，VSCODE_CLI=1）",
-        selection.provider.name,
-        model.id,
+        "启动 VS Code | {}{}（env 注入，VSCODE_CLI=1）",
+        parts,
         folder
             .map(|f| format!(" | Folder: {}", f.display()))
             .unwrap_or_default()
     );
     println!();
     Ok(())
+}
+
+/// 注入 env 叠加：chatgpt_app 自定义 env（过滤保留键）→ Claude Code BYOK env →
+/// Codex 部分（CODEX_HOME / env_key / model env）。`VSCODE_CLI` 由调用方最后写入。
+/// 自定义 env 先于其余部分写入，保证 cx 托管键与 BYOK 载荷不会被其覆盖。
+fn apply_injection_env(
+    claude: Option<&VsCodeClaudePart>,
+    codex: Option<&VsCodeCodexPart>,
+    env: &mut BTreeMap<String, String>,
+) {
+    if let Some(part) = codex {
+        let reserved = vscode_reserved_env_keys(&part.prepared.env_key);
+        for (key, value) in &part.prepared.custom_env {
+            if reserved.iter().any(|k| k == key) {
+                println!("[cx] 忽略自定义环境变量 {key}: 保留键");
+                continue;
+            }
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    if let Some(part) = claude {
+        apply_byok_env(&part.selection, &part.apikey, env);
+    }
+    if let Some(part) = codex {
+        // Claude 部分缺席时 CX_MODEL 改以 Codex 模型表示（两者均在时沿用
+        // Claude 模型——apply_byok_env 已写入，此处不覆盖）。
+        if claude.is_none() {
+            env.insert("CX_MODEL".into(), part.api_model_id.clone());
+        }
+        env.insert(
+            "CODEX_HOME".into(),
+            part.prepared.codex_home.display().to_string(),
+        );
+        env.insert(part.prepared.env_key.clone(), part.apikey.clone());
+        for (key, value) in &part.model_env {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// VS Code 注入的保留环境变量键：cx 基础保留键 + Codex provider 的 env_key +
+/// `VSCODE_CLI` + Claude Code 载荷的各 `ANTHROPIC_*` 键。自定义 env 不得覆盖。
+fn vscode_reserved_env_keys(env_key: &str) -> Vec<String> {
+    let mut keys = crate::chatgpt_reserved_env_keys(env_key);
+    keys.push("VSCODE_CLI".to_string());
+    keys.extend(BYOK_OVERRIDE_KEYS.iter().map(|s| (*s).to_string()));
+    keys
 }
 
 /// 以普通方式启动 VS Code：等效 Dock 正常打开（已运行时仅激活窗口）。
@@ -553,5 +652,98 @@ mod tests {
     #[test]
     fn escape_applescript_escapes_quotes_and_backslashes() {
         assert_eq!(escape_applescript("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    fn vscode_test_codex_part(custom_env: BTreeMap<String, String>) -> crate::VsCodeCodexPart {
+        crate::VsCodeCodexPart {
+            prepared: crate::ChatGptAppPrepared {
+                codex_home: std::path::PathBuf::from("/tmp/cx-test-codex-home"),
+                env_key: "DASHSCOPE_API_KEY".to_string(),
+                reasoning_effort: "high".to_string(),
+                custom_env,
+            },
+            apikey: "codex-key".to_string(),
+            provider_name: "百炼".to_string(),
+            model_id: "qwen3.7-max[1m]".to_string(),
+            api_model_id: "qwen3.7-max".to_string(),
+            model_env: BTreeMap::new(),
+        }
+    }
+
+    /// Codex 部分单独注入：CODEX_HOME / env_key / CX_MODEL 写入；自定义 env
+    /// 的保留键（CODEX_HOME / VSCODE_CLI / env_key / ANTHROPIC_*）被过滤。
+    #[test]
+    fn apply_injection_env_codex_only() {
+        let mut custom = BTreeMap::new();
+        custom.insert("http_proxy".into(), "http://127.0.0.1:7890".into());
+        custom.insert("CODEX_HOME".into(), "/evil".into());
+        custom.insert("VSCODE_CLI".into(), "0".into());
+        custom.insert("DASHSCOPE_API_KEY".into(), "evil".into());
+        custom.insert("ANTHROPIC_BASE_URL".into(), "https://evil".into());
+        let part = vscode_test_codex_part(custom);
+
+        let mut env = BTreeMap::new();
+        apply_injection_env(None, Some(&part), &mut env);
+
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/cx-test-codex-home")
+        );
+        assert_eq!(
+            env.get("DASHSCOPE_API_KEY").map(String::as_str),
+            Some("codex-key")
+        );
+        assert_eq!(env.get("CX_MODEL").map(String::as_str), Some("qwen3.7-max"));
+        assert_eq!(
+            env.get("http_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("VSCODE_CLI"));
+    }
+
+    /// 两部分同时注入：Claude 载荷优先（ANTHROPIC_* / CX_MODEL 以 Claude 模型
+    /// 为准），Codex 部分仍写入 CODEX_HOME / env_key。
+    #[test]
+    fn apply_injection_env_both_parts_claude_payload_wins() {
+        let mut custom = BTreeMap::new();
+        custom.insert("ANTHROPIC_MODEL".into(), "custom-model".into());
+        let codex = vscode_test_codex_part(custom);
+        let claude = crate::VsCodeClaudePart {
+            selection: vscode_test_selection("glm-5.2", BTreeMap::new()),
+            apikey: "claude-key".into(),
+        };
+
+        let mut env = BTreeMap::new();
+        apply_injection_env(Some(&claude), Some(&codex), &mut env);
+
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some("glm-5.2")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("claude-key")
+        );
+        assert_eq!(env.get("CX_MODEL").map(String::as_str), Some("glm-5.2"));
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/tmp/cx-test-codex-home")
+        );
+        assert_eq!(
+            env.get("DASHSCOPE_API_KEY").map(String::as_str),
+            Some("codex-key")
+        );
+    }
+
+    #[test]
+    fn vscode_reserved_env_keys_cover_managed_keys() {
+        let keys = vscode_reserved_env_keys("MY_KEY");
+        assert!(keys.contains(&"CODEX_HOME".to_string()));
+        assert!(keys.contains(&"CX_MODEL".to_string()));
+        assert!(keys.contains(&"VSCODE_CLI".to_string()));
+        assert!(keys.contains(&"MY_KEY".to_string()));
+        assert!(keys.contains(&"ANTHROPIC_BASE_URL".to_string()));
+        assert!(keys.contains(&"ANTHROPIC_API_KEY".to_string()));
     }
 }

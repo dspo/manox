@@ -647,6 +647,7 @@ impl ModelsPanelState {
             // Carried over from a fresh disk read in `save()`; this form does
             // not model the section (owned by the ChatGPT.app panel).
             chatgpt_app: None,
+            vscode_app: None,
         })
     }
 

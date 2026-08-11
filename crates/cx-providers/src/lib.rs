@@ -173,6 +173,10 @@ pub struct CxConfig {
     /// 路径共同消费；未配置时为 `None`，序列化时省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chatgpt_app: Option<ChatGptAppSettings>,
+    /// VS Code 注入设置（顶层 `vscode_app:` 段）。GUI（工具菜单/侧边栏单一
+    /// 入口）与 CLI 启动路径共同消费；未配置时为 `None`，序列化时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vscode_app: Option<VsCodeAppSettings>,
 }
 
 /// ChatGPT.app 注入设置（`cx.providers.config.yaml` 顶层 `chatgpt_app:` 段）。
@@ -211,6 +215,43 @@ pub enum ModelInjection {
 
 fn model_injection_is_default(mode: &ModelInjection) -> bool {
     *mode == ModelInjection::default()
+}
+
+/// VS Code 注入设置（`cx.providers.config.yaml` 顶层 `vscode_app:` 段）。
+/// GUI（工具菜单 / 侧边栏单一入口）与 CLI 启动路径共同消费，
+/// Settings → 外部工具 → Visual Studio Code.app 面板读写。
+///
+/// 段缺失 = 两块均按默认态处理（启动时回落第一个兼容 Provider）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct VsCodeAppSettings {
+    /// Claude Code Extension 配置块（Anthropic wire provider）。
+    #[serde(default, skip_serializing_if = "vscode_block_is_default")]
+    pub claude_code: VsCodeExtensionBlock,
+    /// Codex Extension 配置块（Responses wire provider，复用 ChatGPT.app
+    /// 的 CODEX_HOME / config.toml 注入机制）。
+    #[serde(default, skip_serializing_if = "vscode_block_is_default")]
+    pub codex: VsCodeExtensionBlock,
+}
+
+/// VS Code 面板内的单个扩展配置块。
+///
+/// 语义：`disabled: false` 且 `provider: None` = 默认态（启动时回落第一个
+/// 兼容 Provider，整块可被序列化省略）；`disabled: true` = 不注入该扩展；
+/// `provider: Some` = 显式指定 Provider（不存在时启动端回落并告警）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct VsCodeExtensionBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "vscode_flag_is_false")]
+    pub disabled: bool,
+}
+
+fn vscode_block_is_default(block: &VsCodeExtensionBlock) -> bool {
+    block == &VsCodeExtensionBlock::default()
+}
+
+fn vscode_flag_is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1549,6 +1590,7 @@ providers:
                 env: std::collections::BTreeMap::new(),
             }],
             chatgpt_app: None,
+            vscode_app: None,
         };
 
         write_config_file(&path, &config).unwrap();
@@ -1604,6 +1646,7 @@ providers:
                 supports_websockets: Some(false),
                 model_injection: ModelInjection::Single,
             }),
+            vscode_app: None,
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("chatgpt_app:"));
@@ -1627,6 +1670,76 @@ providers:
         // 缺省段读回为 None（默认空设置）。
         let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(read_back.chatgpt_app.is_none());
+    }
+
+    #[test]
+    fn vscode_app_settings_round_trip() {
+        let config = CxConfig {
+            providers: Vec::new(),
+            agents: Vec::new(),
+            chatgpt_app: None,
+            vscode_app: Some(VsCodeAppSettings {
+                claude_code: VsCodeExtensionBlock {
+                    provider: Some("百炼".into()),
+                    disabled: false,
+                },
+                codex: VsCodeExtensionBlock {
+                    provider: None,
+                    disabled: true,
+                },
+            }),
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("vscode_app:"));
+        assert!(yaml.contains("claude_code:"));
+        let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
+        let vscode = read_back.vscode_app.expect("vscode_app 应保留");
+        assert_eq!(
+            vscode.claude_code.provider.as_deref(),
+            Some("百炼")
+        );
+        assert!(!vscode.claude_code.disabled);
+        assert!(vscode.codex.disabled);
+        assert!(vscode.codex.provider.is_none());
+    }
+
+    #[test]
+    fn vscode_app_default_blocks_serialize_compact() {
+        // 默认块省略 provider/disabled 字段；整段仅显式配置时出现。
+        let settings = VsCodeAppSettings {
+            claude_code: VsCodeExtensionBlock::default(),
+            codex: VsCodeExtensionBlock {
+                provider: Some("P".into()),
+                disabled: false,
+            },
+        };
+        let yaml = serde_yaml::to_string(&settings).unwrap();
+        assert!(!yaml.contains("claude_code"));
+        assert!(yaml.contains("codex:"));
+        assert!(!yaml.contains("disabled"));
+        // 双 disabled 不等于默认态：必须保留。
+        let both_disabled = VsCodeAppSettings {
+            claude_code: VsCodeExtensionBlock {
+                provider: None,
+                disabled: true,
+            },
+            codex: VsCodeExtensionBlock {
+                provider: None,
+                disabled: true,
+            },
+        };
+        assert_ne!(both_disabled, VsCodeAppSettings::default());
+        let yaml = serde_yaml::to_string(&both_disabled).unwrap();
+        assert!(yaml.contains("disabled: true"));
+    }
+
+    #[test]
+    fn vscode_app_settings_omitted_when_none() {
+        let config = CxConfig::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("vscode_app"));
+        let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(read_back.vscode_app.is_none());
     }
 
     #[test]

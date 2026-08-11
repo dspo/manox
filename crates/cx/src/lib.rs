@@ -30,9 +30,10 @@ use url::Url;
 use cx_providers::{
     AgentConfig, ApiKeySourceKind, ChatGptAppSettings, CopilotAuth, CxConfig, EndpointConfig,
     ModelConfig, PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec,
-    ProviderModelConfig, ProviderModels, ResolvedAgent, ResolvedModel, WireApi,
-    active_provider_config_path, canonical_agent_id, context_window_from_suffix, cx_state_dir,
-    effective_agents_for_model, read_config_file, resolve_apikey, resolved_agents,
+    ProviderModelConfig, ProviderModels, ResolvedAgent, ResolvedModel, VsCodeAppSettings,
+    VsCodeExtensionBlock, WireApi, active_provider_config_path, canonical_agent_id,
+    context_window_from_suffix, cx_state_dir, effective_agents_for_model, read_config_file,
+    resolve_apikey, resolved_agents,
 };
 
 mod chatgpt_app;
@@ -338,6 +339,7 @@ fn available_agents_for_add(config: &CxConfig) -> Vec<ResolvedAgent> {
         providers: Vec::new(),
         agents: default_agent_configs(),
         chatgpt_app: None,
+        vscode_app: None,
     })
     .into_iter()
     .filter(|a| !a.hidden)
@@ -928,6 +930,7 @@ fn load_config_for_add() -> Result<(CxConfig, PathBuf)> {
             providers: Vec::new(),
             agents: default_agent_configs(),
             chatgpt_app: None,
+            vscode_app: None,
         }
     };
     Ok((config, path))
@@ -1247,6 +1250,54 @@ pub fn chatgpt_injectable_catalog() -> Result<ChatGptInjectableCatalog> {
     Ok(catalog)
 }
 
+/// VS Code Claude Code Extension 可注入模型目录（Settings 只读展示）：每个
+/// 支持 VS Code（Anthropic wire）的 provider → 其可见模型。per-provider
+/// 拉取失败以 Err 条目返回（面板显示「加载失败」），不静默省略。
+pub type VsCodeClaudeCatalog = Vec<(String, Result<Vec<String>, String>)>;
+
+/// VS Code Claude Code Extension 可注入模型目录。
+pub fn vscode_claude_injectable_catalog() -> Result<VsCodeClaudeCatalog> {
+    let config = load_config()?;
+    let mut catalog = Vec::new();
+    for provider in &config.providers {
+        if !provider_supports_agent(&config, provider, "VS Code") {
+            continue;
+        }
+        let entry = match resolved_models_for_provider(&config, provider) {
+            Ok(resolved) => Ok(injected_models_for_vscode_claude(&resolved, &provider.name)
+                .into_iter()
+                .map(|m| m.id)
+                .collect()),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        catalog.push((provider.name.clone(), entry));
+    }
+    Ok(catalog)
+}
+
+/// 收集某 provider 下所有 VS Code 可见（Anthropic wire）的模型，按 model id
+/// 升序排序，同一 id 仅保留一条。首个元素即默认模型（与 ChatGPT.app 目录同约定）。
+fn injected_models_for_vscode_claude(
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+) -> Vec<ResolvedModel> {
+    let mut models: Vec<ResolvedModel> = all_models
+        .iter()
+        .filter(|m| {
+            m.provider_name == provider_name
+                && resolved_model_supports_agent(m, "VS Code")
+                // 显式确认 Anthropic wire（supports_agent 已隐含，防配置层不变量漂移，
+                // 与 build_vscode_selection 的过滤保持一致）。
+                && m.model_wire_apis.contains(&WireApi::Anthropic)
+        })
+        .cloned()
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.id.clone()));
+    models
+}
+
 /// cx 托管的基础保留环境变量键（与 provider 无关）。
 fn base_reserved_env_keys() -> Vec<String> {
     vec![
@@ -1348,40 +1399,179 @@ fn resolve_vscode_apikey(provider: &ResolvedProvider) -> Result<String> {
     Ok(apikey)
 }
 
-/// VS Code 的 API Key 交互解析（CLI 路径）：Keychain 缺失时提示输入并回写。
-fn resolve_vscode_apikey_interactive(provider: &ResolvedProvider) -> Result<String> {
-    let Some(source) = provider.apikey_source.as_deref() else {
-        bail!(
-            "Provider `{}` 需要 API Key 但未配置 apikey_source",
-            provider.name
-        );
-    };
-    let apikey = resolve_apikey_interactive(source)?;
-    if apikey.is_empty() {
-        bail!("VS Code 注入需要 API Key，但未提供");
-    }
-    Ok(apikey)
+/// 加载 VS Code 注入设置（`vscode_app:` 段缺失时返回默认空设置）。
+pub fn vscode_app_settings() -> Result<VsCodeAppSettings> {
+    Ok(load_config()?.vscode_app.unwrap_or_default())
 }
 
-/// 非交互启动 VS Code 并注入 Claude Code BYOK env：显式指定 provider 与模型，
-/// 无 TUI。供 GUI 嵌入方（manox 系统菜单「工具 → VS Code」级联、侧边栏
-/// 新建会话菜单的 VS Code 项）调用。`folder` 为 `Some` 时新实例直接打开该
-/// 目录（侧边栏项目路径）；系统菜单路径传 `None`。
-/// 机制见 `vscode_app` 模块：解析登录 shell env 后以最高优先级叠加 BYOK env，
-/// 带 VSCODE_CLI=1 启动，令扩展宿主 / Claude Code 扩展 / 集成终端继承注入值。
+/// 保存 VS Code 注入设置（保留配置文件的 providers/agents 等其余段）。
+/// 归一后全默认时整段省略；双「不注入」不等于默认，必须保留。
+pub fn save_vscode_app_settings(settings: &VsCodeAppSettings) -> Result<()> {
+    let (mut config, path) = load_config_for_add()?;
+    config.vscode_app = normalize_vscode_app_settings(settings.clone());
+    save_config(&path, &config)
+}
+
+fn normalize_vscode_app_settings(settings: VsCodeAppSettings) -> Option<VsCodeAppSettings> {
+    if settings == VsCodeAppSettings::default() {
+        None
+    } else {
+        Some(settings)
+    }
+}
+
+/// VS Code 的 Claude Code 扩展注入部分（ANTHROPIC_* BYOK env）。
+pub(crate) struct VsCodeClaudePart {
+    pub selection: Selection,
+    pub apikey: String,
+}
+
+/// VS Code 的 Codex 扩展注入部分（CODEX_HOME + config.toml 官方机制，
+/// 复用 ChatGPT.app 的准备逻辑）。
+pub(crate) struct VsCodeCodexPart {
+    pub prepared: ChatGptAppPrepared,
+    pub apikey: String,
+    /// 启动摘要展示用。
+    pub provider_name: String,
+    pub model_id: String,
+    /// 发给 provider 的 model id（剥除上下文后缀）；Claude 部分缺席时用作 CX_MODEL。
+    pub api_model_id: String,
+    /// Provider + Model 级自定义环境变量（ResolvedModel.env 已合并）。
+    pub model_env: BTreeMap<String, String>,
+}
+
+/// 非交互启动 VS Code：读取持久化 `vscode_app:` 设置，按需注入
+/// Claude Code Extension（ANTHROPIC_* env）与 Codex Extension
+///（CODEX_HOME + config.toml，复用 ChatGPT.app 注入机制）；两块均不注入时
+/// 等效普通打开。供 GUI 嵌入方（manox 系统菜单 / 侧边栏单一入口）与 CLI TUI
+/// 调用。`folder` 为 `Some` 时新实例直接打开该目录（侧边栏项目路径）；
+/// 系统菜单路径传 `None`。
+/// 机制见 `vscode_app` 模块：解析登录 shell env 后以最高优先级叠加注入 env，
+/// 带 VSCODE_CLI=1 启动，令扩展宿主 / 各扩展 / 集成终端继承注入值。
 /// 阻塞调用（shell 解析至多 10s；VS Code 运行中时含确认与退出等待，至多约
 /// 60s+），调用方应在后台线程执行。
-pub fn launch_vscode_app(provider_name: &str, model_id: &str, folder: Option<&Path>) -> Result<()> {
+pub fn launch_vscode_app_from_settings(folder: Option<&Path>) -> Result<()> {
     let config = load_config()?;
     let mut all_models = build_all_models(&config);
     apply_probe_cache(&mut all_models);
-    let selection = build_vscode_selection(&config, &all_models, provider_name, model_id)?;
-    let apikey = resolve_vscode_apikey(&selection.provider)?;
-    vscode_app::launch(&selection, &apikey, folder)
+    let settings = config.vscode_app.clone().unwrap_or_default();
+    let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
+    let claude = resolve_vscode_claude_part(&config, &all_models, &settings.claude_code)?;
+    let codex = resolve_vscode_codex_part(
+        &config,
+        &all_models,
+        &settings.codex,
+        &chatgpt_settings,
+    )?;
+    vscode_app::launch(claude.as_ref(), codex.as_ref(), folder)
 }
 
-/// 普通启动 VS Code（等效 Dock 正常打开）。供 manox
-/// 「工具 → VS Code → 打开」菜单项调用。
+/// 解析 VS Code 的 Claude Code 扩展注入部分。
+///
+/// `disabled` 返回 `None`；无任何可注入 provider（候选为空）同样返回 `None`
+///（等效未配置，按不注入处理）。持久化 provider 不可用时回落第一个兼容
+/// provider 并告警。默认模型 = 该 provider 首个 id 序 Anthropic wire 模型。
+fn resolve_vscode_claude_part(
+    config: &CxConfig,
+    all_models: &[ResolvedModel],
+    block: &VsCodeExtensionBlock,
+) -> Result<Option<VsCodeClaudePart>> {
+    if block.disabled {
+        return Ok(None);
+    }
+    let candidates: Vec<(ResolvedProvider, Vec<ResolvedModel>)> =
+        providers_for_agent(config, "VS Code")
+            .into_iter()
+            .filter(|p| p.has_endpoints)
+            .filter_map(|p| {
+                let models = injected_models_for_vscode_claude(all_models, &p.name);
+                (!models.is_empty()).then_some((p, models))
+            })
+            .collect();
+    let Some((provider, models)) =
+        pick_vscode_provider(&candidates, block.provider.as_deref(), "Claude Code")
+    else {
+        return Ok(None);
+    };
+    let model_id = models[0].id.clone();
+    let selection = build_vscode_selection(config, all_models, &provider.name, &model_id)?;
+    let apikey = resolve_vscode_apikey(&selection.provider)?;
+    Ok(Some(VsCodeClaudePart { selection, apikey }))
+}
+
+/// 解析 VS Code 的 Codex 扩展注入部分。
+///
+/// 候选 / 回落 / 告警语义同 Claude 部分（Responses 目录非空的 provider）。
+/// 默认模型 = `injected_models_for_chatgpt_app` 首元素；全量目录写入
+/// model-catalog.json。`chatgpt_app:` 段设置（env / supports_websockets）复用。
+fn resolve_vscode_codex_part(
+    config: &CxConfig,
+    all_models: &[ResolvedModel],
+    block: &VsCodeExtensionBlock,
+    chatgpt_settings: &ChatGptAppSettings,
+) -> Result<Option<VsCodeCodexPart>> {
+    if block.disabled {
+        return Ok(None);
+    }
+    let candidates: Vec<(ResolvedProvider, Vec<ResolvedModel>)> =
+        providers_for_agent(config, "ChatGPT.app")
+            .into_iter()
+            .filter(|p| p.has_endpoints)
+            .filter_map(|p| {
+                let models = injected_models_for_chatgpt_app(all_models, &p.name);
+                (!models.is_empty()).then_some((p, models))
+            })
+            .collect();
+    let Some((provider, injected)) =
+        pick_vscode_provider(&candidates, block.provider.as_deref(), "Codex")
+    else {
+        return Ok(None);
+    };
+    let default_model = injected[0].clone();
+    let prepared = prepare_chatgpt_launch_home_for_app(
+        &default_model,
+        provider,
+        WireApi::Responses,
+        injected,
+        chatgpt_settings,
+    )?;
+    let apikey = resolve_chatgpt_app_apikey(provider)?;
+    Ok(Some(VsCodeCodexPart {
+        api_model_id: default_model.api_model_id(),
+        provider_name: provider.name.clone(),
+        model_id: default_model.id.clone(),
+        model_env: default_model.env.clone(),
+        prepared,
+        apikey,
+    }))
+}
+
+/// 按 vscode_app 块配置挑选 provider：显式指定优先；缺失或已不可用时回落
+/// 第一个兼容候选（不可用另告警）。候选为空返回 None。
+fn pick_vscode_provider<'a>(
+    candidates: &'a [(ResolvedProvider, Vec<ResolvedModel>)],
+    configured: Option<&str>,
+    block_label: &str,
+) -> Option<&'a (ResolvedProvider, Vec<ResolvedModel>)> {
+    if candidates.is_empty() {
+        return None;
+    }
+    match configured {
+        Some(name) => match candidates.iter().find(|(p, _)| p.name == name) {
+            Some(found) => Some(found),
+            None => {
+                eprintln!(
+                    "[cx] 警告: VS Code {block_label} 块配置的 provider `{name}` 不可用，回落第一个兼容 provider"
+                );
+                Some(&candidates[0])
+            }
+        },
+        None => Some(&candidates[0]),
+    }
+}
+
+/// 普通启动 VS Code（等效 Dock 正常打开）。
+/// `launch_vscode_app_from_settings` 在两块均不注入时内部复用。
 pub fn launch_vscode_plain() -> Result<()> {
     vscode_app::launch_plain()
 }
@@ -1755,9 +1945,8 @@ fn run_launcher(
         if socket.is_some() {
             eprintln!("cx: --socket 对 VS Code 无效（GUI detach，无 IPC 注入）");
         }
-        let apikey = resolve_vscode_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
-        return vscode_app::launch(&selection, &apikey, None);
+        return launch_vscode_app_from_settings(None);
     }
 
     let spec = build_launch_spec(&selection, &passthrough_args, pty, socket, cwd)?;
@@ -1906,6 +2095,11 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
             .chatgpt_app
             .clone()
             .or(existing.chatgpt_app.clone()),
+        // vscode_app 段同 chatgpt_app 语义。
+        vscode_app: incoming
+            .vscode_app
+            .clone()
+            .or(existing.vscode_app.clone()),
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -3986,6 +4180,25 @@ impl AppState {
                 }
                 let agent = &agents[self.agent_index];
                 self.selected_agent_id = agent.id.clone();
+                // VS Code 跳过 Provider/Model 选择步：启动读取持久化
+                // vscode_app 设置统一注入（单一入口，无选择交互）。
+                if agent.id == "VS Code" {
+                    return Some(Selection {
+                        agent_id: agent.id.clone(),
+                        agent_binary: agent.binary.clone(),
+                        agent_args: agent.args.clone(),
+                        agent_env: agent.env.clone(),
+                        selected_wire_api: WireApi::Anthropic,
+                        provider: ResolvedProvider {
+                            name: String::new(),
+                            has_endpoints: false,
+                            apikey_source: None,
+                            env: BTreeMap::new(),
+                        },
+                        model: None,
+                        injected_models: Vec::new(),
+                    });
+                }
                 self.provider_index = 0;
                 self.model_index = 0;
                 self.step = Step::Provider;
@@ -4305,6 +4518,7 @@ mod tests {
                 },
             ],
             chatgpt_app: None,
+            vscode_app: None,
         }
     }
 
@@ -4370,6 +4584,7 @@ mod tests {
             }],
             agents: default_agent_configs(),
             chatgpt_app: None,
+            vscode_app: None,
         }
     }
 
@@ -4666,6 +4881,184 @@ agents:
         // 未知 provider / model 明确报错
         assert!(build_vscode_selection(&config, &all_models, "nope", "m1").is_err());
         assert!(build_vscode_selection(&config, &all_models, "test", "nope").is_err());
+    }
+
+    /// 双 provider 测试配置：`both` 同时有 Anthropic（b1/b2）与 Responses（b1）
+    /// 模型；`anthropic-only` 仅 Anthropic（a1）。
+    fn vscode_settings_test_config() -> CxConfig {
+        r#"
+providers:
+- name: both
+  apikey_source: literal:k
+  models:
+    b2:
+      wire_apis: [anthropic]
+    b1:
+      wire_apis: [anthropic, responses]
+  endpoints:
+    anthropic:
+      url: https://example.com/anthropic
+    responses:
+      url: https://example.com/responses
+- name: anthropic-only
+  apikey_source: literal:k
+  models:
+    a1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com/anthropic2
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+"#
+        .parse()
+        .expect("parse")
+    }
+
+    #[test]
+    fn injected_models_for_vscode_claude_sorts_and_filters() {
+        let config = vscode_settings_test_config();
+        let all_models = config.resolve_all_models();
+        let ids: Vec<String> = injected_models_for_vscode_claude(&all_models, "both")
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["b1".to_string(), "b2".to_string()]);
+        let ids: Vec<String> = injected_models_for_vscode_claude(&all_models, "anthropic-only")
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["a1".to_string()]);
+    }
+
+    #[test]
+    fn resolve_vscode_claude_part_defaults_and_overrides() {
+        let config = vscode_settings_test_config();
+        let all_models = config.resolve_all_models();
+
+        // 默认块 → 第一个兼容 provider（配置序）+ 首个 id 序模型
+        let part = resolve_vscode_claude_part(
+            &config,
+            &all_models,
+            &VsCodeExtensionBlock::default(),
+        )
+        .expect("resolve")
+        .expect("part");
+        assert_eq!(part.selection.provider.name, "both");
+        assert_eq!(part.selection.model.as_ref().unwrap().id, "b1");
+        assert_eq!(part.apikey, "k");
+
+        // 显式 provider
+        let part = resolve_vscode_claude_part(
+            &config,
+            &all_models,
+            &VsCodeExtensionBlock {
+                provider: Some("anthropic-only".into()),
+                disabled: false,
+            },
+        )
+        .expect("resolve")
+        .expect("part");
+        assert_eq!(part.selection.provider.name, "anthropic-only");
+        assert_eq!(part.selection.model.as_ref().unwrap().id, "a1");
+
+        // 未知 provider → 回落第一个兼容候选
+        let part = resolve_vscode_claude_part(
+            &config,
+            &all_models,
+            &VsCodeExtensionBlock {
+                provider: Some("ghost".into()),
+                disabled: false,
+            },
+        )
+        .expect("resolve")
+        .expect("part");
+        assert_eq!(part.selection.provider.name, "both");
+
+        // disabled → 不注入
+        assert!(resolve_vscode_claude_part(
+            &config,
+            &all_models,
+            &VsCodeExtensionBlock {
+                provider: None,
+                disabled: true,
+            },
+        )
+        .expect("resolve")
+        .is_none());
+    }
+
+    #[test]
+    fn pick_vscode_provider_semantics() {
+        let mk = |name: &str| (
+            ResolvedProvider {
+                name: name.into(),
+                has_endpoints: true,
+                apikey_source: None,
+                env: BTreeMap::new(),
+            },
+            vec![ResolvedModel {
+                id: "m".into(),
+                desc: String::new(),
+                wire_api: WireApi::Responses,
+                model_wire_apis: vec![WireApi::Responses],
+                provider_name: name.into(),
+                endpoint_url: "https://example.com".into(),
+                visible_agents: vec![],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: BTreeMap::new(),
+                apikey_source: None,
+                max_tokens: None,
+                context: None,
+                supports_tools: true,
+                supports_images: false,
+            }],
+        );
+        let candidates = vec![mk("p1"), mk("p2")];
+
+        // 未配置 → 第一个候选
+        assert_eq!(
+            pick_vscode_provider(&candidates, None, "t")
+                .map(|(p, _)| p.name.as_str()),
+            Some("p1")
+        );
+        // 显式命中
+        assert_eq!(
+            pick_vscode_provider(&candidates, Some("p2"), "t")
+                .map(|(p, _)| p.name.as_str()),
+            Some("p2")
+        );
+        // 未知 → 回落第一个
+        assert_eq!(
+            pick_vscode_provider(&candidates, Some("ghost"), "t")
+                .map(|(p, _)| p.name.as_str()),
+            Some("p1")
+        );
+        // 空候选 → None
+        let empty: Vec<(ResolvedProvider, Vec<ResolvedModel>)> = Vec::new();
+        assert!(pick_vscode_provider(&empty, None, "t").is_none());
+    }
+
+    #[test]
+    fn tui_confirm_vscode_short_circuits_at_agent_step() {
+        let config = vscode_settings_test_config();
+        let models = config.resolve_all_models();
+        let mut state = AppState::new(None, &config);
+        let agents = state.visible_agents();
+        let idx = agents
+            .iter()
+            .position(|a| a.id == "VS Code")
+            .expect("VS Code agent 应可见");
+        state.agent_index = idx;
+        let selection = state
+            .confirm(&models)
+            .expect("Agent 步选中 VS Code 应立即返回哨兵 Selection");
+        assert_eq!(selection.agent_id, "VS Code");
+        assert!(selection.model.is_none());
+        assert!(selection.provider.name.is_empty());
+        assert_eq!(state.step, Step::Agent);
     }
 
     // ── Launch spec tests ──
@@ -5049,6 +5442,7 @@ agents:
             }],
             agents: default_agent_configs(),
             chatgpt_app: None,
+            vscode_app: None,
         }
     }
 
@@ -5360,6 +5754,7 @@ agents:
             providers: vec![provider.clone()],
             agents: default_agent_configs(),
             chatgpt_app: None,
+            vscode_app: None,
         };
         let endpoints = provider.normalized_endpoints();
         let model = &endpoints[0].models[0];
@@ -5675,6 +6070,7 @@ agents:
             }],
             agents: default_agent_configs(),
             chatgpt_app: None,
+            vscode_app: None,
         };
         let provider = &config.providers[0];
         assert!(provider_supports_agent(&config, provider, "copilot"));
@@ -6394,6 +6790,7 @@ trust_level = "trusted"
                 },
             ],
             chatgpt_app: None,
+            vscode_app: None,
         };
         let agents = resolved_agents(&config);
         assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);
