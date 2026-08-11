@@ -417,6 +417,7 @@ fn build_tools(
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
         Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
     // Plan-mode gate exemption: plan-file writes stay approval-free while
     // plan mode is active (the `ToolCall` hook blocks everything else).
