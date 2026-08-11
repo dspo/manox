@@ -322,7 +322,11 @@ pub(super) fn block(
 }
 
 /// Read-only two-line row: name (foreground) + description (muted), no value.
-pub(super) fn read_only_row(title: SharedString, desc: SharedString, muted: gpui::Hsla) -> AnyElement {
+pub(super) fn read_only_row(
+    title: SharedString,
+    desc: SharedString,
+    muted: gpui::Hsla,
+) -> AnyElement {
     h_flex()
         .w_full()
         .items_start()

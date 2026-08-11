@@ -523,9 +523,8 @@ fn build_tools_menu() -> Menu {
     // VS Code 单一入口：注入目标由持久化 `vscode_app:` 设置决定
     //（Settings → 外部工具 → Visual Studio Code.app），启动时无选择级联。
     // VS Code 未安装时禁用——此时没有任何 VS Code 实例可打开/注入。
-    let vscode =
-        MenuItem::action(agent::i18n::t("menu-vscode-open"), agent_ui::LaunchVSCode)
-            .disabled(!cx::vscode_app_installed());
+    let vscode = MenuItem::action(agent::i18n::t("menu-vscode-open"), agent_ui::LaunchVSCode)
+        .disabled(!cx::vscode_app_installed());
     Menu::new(agent::i18n::t("menu-tools")).items([MenuItem::submenu(chatgpt), vscode])
 }
 
@@ -581,5 +580,3 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
         })
         .collect()
 }
-
-

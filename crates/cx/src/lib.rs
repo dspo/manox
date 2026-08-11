@@ -1457,12 +1457,8 @@ pub fn launch_vscode_app_from_settings(folder: Option<&Path>) -> Result<()> {
     let settings = config.vscode_app.clone().unwrap_or_default();
     let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
     let claude = resolve_vscode_claude_part(&config, &all_models, &settings.claude_code)?;
-    let codex = resolve_vscode_codex_part(
-        &config,
-        &all_models,
-        &settings.codex,
-        &chatgpt_settings,
-    )?;
+    let codex =
+        resolve_vscode_codex_part(&config, &all_models, &settings.codex, &chatgpt_settings)?;
     vscode_app::launch(claude.as_ref(), codex.as_ref(), folder)
 }
 
@@ -2096,10 +2092,7 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
             .clone()
             .or(existing.chatgpt_app.clone()),
         // vscode_app 段同 chatgpt_app 语义。
-        vscode_app: incoming
-            .vscode_app
-            .clone()
-            .or(existing.vscode_app.clone()),
+        vscode_app: incoming.vscode_app.clone().or(existing.vscode_app.clone()),
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -4939,13 +4932,10 @@ agents:
         let all_models = config.resolve_all_models();
 
         // 默认块 → 第一个兼容 provider（配置序）+ 首个 id 序模型
-        let part = resolve_vscode_claude_part(
-            &config,
-            &all_models,
-            &VsCodeExtensionBlock::default(),
-        )
-        .expect("resolve")
-        .expect("part");
+        let part =
+            resolve_vscode_claude_part(&config, &all_models, &VsCodeExtensionBlock::default())
+                .expect("resolve")
+                .expect("part");
         assert_eq!(part.selection.provider.name, "both");
         assert_eq!(part.selection.model.as_ref().unwrap().id, "b1");
         assert_eq!(part.apikey, "k");
@@ -4978,62 +4968,63 @@ agents:
         assert_eq!(part.selection.provider.name, "both");
 
         // disabled → 不注入
-        assert!(resolve_vscode_claude_part(
-            &config,
-            &all_models,
-            &VsCodeExtensionBlock {
-                provider: None,
-                disabled: true,
-            },
-        )
-        .expect("resolve")
-        .is_none());
+        assert!(
+            resolve_vscode_claude_part(
+                &config,
+                &all_models,
+                &VsCodeExtensionBlock {
+                    provider: None,
+                    disabled: true,
+                },
+            )
+            .expect("resolve")
+            .is_none()
+        );
     }
 
     #[test]
     fn pick_vscode_provider_semantics() {
-        let mk = |name: &str| (
-            ResolvedProvider {
-                name: name.into(),
-                has_endpoints: true,
-                apikey_source: None,
-                env: BTreeMap::new(),
-            },
-            vec![ResolvedModel {
-                id: "m".into(),
-                desc: String::new(),
-                wire_api: WireApi::Responses,
-                model_wire_apis: vec![WireApi::Responses],
-                provider_name: name.into(),
-                endpoint_url: "https://example.com".into(),
-                visible_agents: vec![],
-                copilot_auth: CopilotAuth::ApiKey,
-                env: BTreeMap::new(),
-                apikey_source: None,
-                max_tokens: None,
-                context: None,
-                supports_tools: true,
-                supports_images: false,
-            }],
-        );
+        let mk = |name: &str| {
+            (
+                ResolvedProvider {
+                    name: name.into(),
+                    has_endpoints: true,
+                    apikey_source: None,
+                    env: BTreeMap::new(),
+                },
+                vec![ResolvedModel {
+                    id: "m".into(),
+                    desc: String::new(),
+                    wire_api: WireApi::Responses,
+                    model_wire_apis: vec![WireApi::Responses],
+                    provider_name: name.into(),
+                    endpoint_url: "https://example.com".into(),
+                    visible_agents: vec![],
+                    copilot_auth: CopilotAuth::ApiKey,
+                    env: BTreeMap::new(),
+                    apikey_source: None,
+                    max_tokens: None,
+                    context: None,
+                    supports_tools: true,
+                    supports_images: false,
+                }],
+            )
+        };
         let candidates = vec![mk("p1"), mk("p2")];
 
         // 未配置 → 第一个候选
         assert_eq!(
-            pick_vscode_provider(&candidates, None, "t")
-                .map(|(p, _)| p.name.as_str()),
+            pick_vscode_provider(&candidates, None, "t").map(|(p, _)| p.name.as_str()),
             Some("p1")
         );
         // 显式命中
         assert_eq!(
-            pick_vscode_provider(&candidates, Some("p2"), "t")
-                .map(|(p, _)| p.name.as_str()),
+            pick_vscode_provider(&candidates, Some("p2"), "t").map(|(p, _)| p.name.as_str()),
             Some("p2")
         );
         // 未知 → 回落第一个
         assert_eq!(
-            pick_vscode_provider(&candidates, Some("ghost"), "t")
-                .map(|(p, _)| p.name.as_str()),
+            pick_vscode_provider(&candidates, Some("ghost"), "t").map(|(p, _)| p.name.as_str()),
             Some("p1")
         );
         // 空候选 → None

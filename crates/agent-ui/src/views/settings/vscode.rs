@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Anchor, AnyElement, AnyWindowHandle, Context, Entity, IntoElement as _,
-    ParentElement as _, SharedString, Styled as _, Window, div,
+    Anchor, AnyElement, AnyWindowHandle, Context, Entity, IntoElement as _, ParentElement as _,
+    SharedString, Styled as _, Window, div,
 };
 use gpui_component::theme::Theme;
 use gpui_component::{
@@ -98,7 +98,12 @@ impl VsCodePanelState {
     /// Load one catalog off the main thread. Tolerates the Settings overlay
     /// closing before the fetch completes (same `update_in` safety pattern as
     /// the ChatGPT.app panel).
-    fn spawn_catalog_load(&self, window: &mut Window, cx: &mut Context<SettingsView>, kind: BlockKind) {
+    fn spawn_catalog_load(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<SettingsView>,
+        kind: BlockKind,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -272,10 +277,10 @@ fn render_extension_block(
         vec![(i18n::t("settings-vscode-no-inject"), None)];
     if let Some(Ok(entries)) = view.vscode_panel.catalog(kind) {
         for (name, entry) in entries {
-            if let Ok(models) = entry {
-                if !models.is_empty() {
-                    options.push((SharedString::from(name.clone()), Some(name.clone())));
-                }
+            if let Ok(models) = entry
+                && !models.is_empty()
+            {
+                options.push((SharedString::from(name.clone()), Some(name.clone())));
             }
         }
     }
@@ -296,8 +301,11 @@ fn render_extension_block(
     };
     let dropdown = provider_dropdown(dropdown_id, current_label, options, entity, apply);
 
-    let mut rows: Vec<AnyElement> =
-        vec![row_with_control(i18n::t("settings-row-vscode-provider"), None, dropdown)];
+    let mut rows: Vec<AnyElement> = vec![row_with_control(
+        i18n::t("settings-row-vscode-provider"),
+        None,
+        dropdown,
+    )];
 
     // Read-only LLMs row: only for the provider currently selected in the
     // dropdown (explicit pick or the resolved default). 不注入 shows nothing.

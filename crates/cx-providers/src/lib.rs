@@ -1694,10 +1694,7 @@ providers:
         assert!(yaml.contains("claude_code:"));
         let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
         let vscode = read_back.vscode_app.expect("vscode_app 应保留");
-        assert_eq!(
-            vscode.claude_code.provider.as_deref(),
-            Some("百炼")
-        );
+        assert_eq!(vscode.claude_code.provider.as_deref(), Some("百炼"));
         assert!(!vscode.claude_code.disabled);
         assert!(vscode.codex.disabled);
         assert!(vscode.codex.provider.is_none());
