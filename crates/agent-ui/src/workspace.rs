@@ -996,6 +996,9 @@ impl Workspace {
                         cx,
                     );
                 }
+                SidebarEvent::SpawnPlainSession(kind, project) => {
+                    this.spawn_plain_session(*kind, project.clone(), window, cx);
+                }
                 SidebarEvent::LaunchVSCode(provider, model, project) => {
                     // VS Code opens the project directory the menu was launched
                     // from; from the Conversations header (no project) it
@@ -1180,6 +1183,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let agent_id = kind.agent_id();
+        let Some(agent) = kind.agent() else {
+            tracing::warn!(
+                agent_id,
+                "spawn_external_session called with a plain PTY kind"
+            );
+            return;
+        };
         // The agent process runs in the project directory when spawned from a
         // project folder's `+` button, else the workspace cwd. cx's
         // AgentBuilder.cwd forwards to both the PTY-relay and direct spawn
@@ -1188,7 +1198,7 @@ impl Workspace {
         // tree.
         let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
         let handle = match cx::AgentBuilder::new()
-            .agent(kind.agent())
+            .agent(agent)
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
@@ -1226,22 +1236,8 @@ impl Workspace {
         };
         // Tear the session down when the CLI exits on its own (e.g. `/exit`),
         // without waiting for the user to click ×, and mirror the agent's OSC
-        // title into the sidebar row + titlebar as it changes. The subscription
-        // lives on the session so a later close detaches it before any spurious
-        // event.
-        let exit_id = id.clone();
-        let exit_sub = cx.subscribe(
-            &terminal,
-            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| match ev {
-                terminal::event::TerminalEvent::ChildExit(_) => {
-                    this.remove_external_session(&exit_id, cx);
-                }
-                terminal::event::TerminalEvent::Title(title) => {
-                    this.set_external_title(&exit_id, title.clone(), cx);
-                }
-                _ => {}
-            },
-        );
+        // title into the sidebar row + titlebar as it changes.
+        let exit_sub = self.subscribe_session_terminal(&terminal, &id, cx);
         // The cx session id (and its socket path) are the traceable identity for
         // `~/.config/cx/sessions/<id>.sock`, surfaced in the sidebar tag +
         // clipboard copy. cx does not yet expose `SessionHandle::session_id()`,
@@ -1265,11 +1261,112 @@ impl Workspace {
             cx_session_id,
             socket_path,
             terminal_view: view,
-            handle,
+            handle: Some(handle),
             _exit_sub: exit_sub,
         });
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, window, cx);
+    }
+
+    /// Launch a plain PTY session — the user's shell (`Terminal`) — with no
+    /// cx provider/model injection. Mirrors the `spawn_external_session` flow
+    /// (sidebar row, ChildExit teardown, OSC title mirroring, project
+    /// grouping), but the PTY is a local `PtyHandle` and
+    /// `ExternalSession.handle` stays `None` — closing drops the view, whose
+    /// PTY teardown kills the child tree.
+    ///
+    /// `project_cwd` is `Some(path)` when launched from a project folder's
+    /// `+` button — the session runs in that project's directory. `None`
+    /// uses the workspace's default cwd.
+    pub fn spawn_plain_session(
+        &mut self,
+        kind: SessionKind,
+        project_cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        let source: Box<dyn terminal::pty_source::PtySource> = match kind {
+            SessionKind::Terminal => match terminal::pty::default_source(&cwd, 80, 24) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to open terminal pty");
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("plain-session-start-failed")
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+            },
+            _ => {
+                tracing::warn!(
+                    agent_id = kind.agent_id(),
+                    "spawn_plain_session called with an agent kind"
+                );
+                return;
+            }
+        };
+        let id = format!("external:{}:{}", kind.agent_id(), uuid::Uuid::new_v4());
+        let terminal = match Terminal::new(id.clone(), cwd, 80, 24, source, cx) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create terminal for plain session");
+                window.push_notification(
+                    Notification::error(format!("{}: {e}", i18n::t("plain-session-start-failed"))),
+                    cx,
+                );
+                return;
+            }
+        };
+        let exit_sub = self.subscribe_session_terminal(&terminal, &id, cx);
+        let view = TerminalView::new(terminal, cx);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.external_sessions.push(ExternalSession {
+            id: id.clone(),
+            kind,
+            created_at,
+            project: project_cwd,
+            title: None,
+            cx_session_id: String::new(),
+            socket_path: None,
+            terminal_view: view,
+            handle: None,
+            _exit_sub: exit_sub,
+        });
+        self.sync_sidebar_external(cx);
+        self.attach_external_session(&id, window, cx);
+    }
+
+    /// Observe a session terminal's lifecycle, shared by the agent and plain
+    /// spawn paths: `ChildExit` tears the session down on a natural exit
+    /// (e.g. `/exit` or `exit`), and `Title` mirrors the TUI's OSC title into
+    /// the sidebar row + titlebar as it changes. The subscription lives on
+    /// the session so a later close detaches it before any spurious event.
+    fn subscribe_session_terminal(
+        &self,
+        terminal: &Entity<Terminal>,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let exit_id = id.to_string();
+        cx.subscribe(
+            terminal,
+            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| match ev {
+                terminal::event::TerminalEvent::ChildExit(_) => {
+                    this.remove_external_session(&exit_id, cx);
+                }
+                terminal::event::TerminalEvent::Title(title) => {
+                    this.set_external_title(&exit_id, title.clone(), cx);
+                }
+                _ => {}
+            },
+        )
     }
 
     /// Launch ChatGPT.app through cx's injection path with the provider + model
@@ -1486,12 +1583,14 @@ impl Workspace {
             .external_sessions
             .iter()
             .find(|s| s.id == id)
-            .map(|s| Arc::clone(&s.handle));
+            .and_then(|s| s.handle.as_ref().map(Arc::clone));
         if let Some(handle) = kill_handle
             && let Err(e) = handle.kill()
         {
             tracing::warn!(error = %e, id, "external session kill failed");
         }
+        // Plain PTY sessions (no cx handle) tear down on drop: the dropped
+        // TerminalView's PtyHandle kills the child tree in its own Drop.
         self.remove_external_session(id, cx);
     }
 
@@ -4526,7 +4625,7 @@ impl Workspace {
                 let kind = session.kind;
                 // Titlebar + sidebar share `display_title()` so a TUI rename
                 // (OSC title) updates both at once.
-                let title: SharedString = session.display_title().to_string().into();
+                let title: SharedString = session.display_title();
                 let terminal = session.terminal_view.clone();
                 let icon = gpui::svg()
                     .path(kind.icon_asset())
