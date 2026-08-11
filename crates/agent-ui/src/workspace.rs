@@ -3420,22 +3420,25 @@ impl Workspace {
                 )
             })
             .child(
-                // Composer input is message content in the mono family (Lilex).
-                // Weight is pinned to Light to match body type; the Input component
-                // has no per-instance font knob, so family + weight are applied
-                // from the host context here. While the completion popover is open
-                // this wrapper sets a `completion = open` key context so the
-                // `completion == open > Input` keybindings in `main.rs` can shadow
-                // the Input's own up/down/enter/tab/escape bindings and drive the
-                // popover instead.
+                // Composer input is message content in the mono family (Lilex)
+                // at Light weight — the message-list body typeface. The `Input`
+                // component forces `text_sm()` internally (its default
+                // `Size::Medium` maps through `input_text_size`), so the host
+                // pins the body size back with an instance-level `.text_base()`;
+                // family + weight are applied from the wrapper context.
                 {
                     let mut wrap = gpui::div()
                         .font_family(theme.mono_font_family.clone())
                         .font_weight(gpui::FontWeight::LIGHT);
+                    // With the completion popover open this wrapper sets a
+                    // `completion = open` key context so the
+                    // `completion == open > Input` keybindings in `main.rs` can
+                    // shadow the Input's own up/down/enter/tab/escape bindings
+                    // and drive the popover instead.
                     if self.completion.is_some() {
                         wrap = wrap.key_context("completion = open");
                     }
-                    wrap.child(Input::new(&self.input_state).appearance(false))
+                    wrap.child(Input::new(&self.input_state).appearance(false).text_base())
                 },
             )
             .child(
@@ -4764,9 +4767,17 @@ impl Workspace {
                                     .min_h_0()
                                     .overflow_hidden()
                                     .child(
+                                        // The panel editor is a plain-text
+                                        // composer for the same message
+                                        // content, so it shares the inline
+                                        // input's body typeface: Lilex Light
+                                        // at base size.
                                         Input::new(&self.editor_state)
                                             .size_full()
                                             .appearance(false)
+                                            .font_family(theme.mono_font_family.clone())
+                                            .font_weight(gpui::FontWeight::LIGHT)
+                                            .text_base()
                                             .into_any_element(),
                                     )
                                     .into_any_element()
