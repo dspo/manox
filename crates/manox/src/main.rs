@@ -298,26 +298,10 @@ fn main() {
             });
         });
 
-        // VS Code launch from the `工具 → VS Code` cascade (BYOK env injected;
-        // plain entry opens without injection): same deferred dispatch shape.
-        cx.on_action(|action: &agent_ui::LaunchVSCode, cx: &mut App| {
-            let (workspace, handle) = (
-                agent_ui::dispatch::workspace_global(),
-                agent_ui::dispatch::window_global(),
-            );
-            let provider = action.provider.clone();
-            let model = action.model.clone();
-            cx.defer(move |cx| {
-                if let (Some(workspace), Some(handle)) = (workspace, handle) {
-                    let _ = handle.update(cx, |_, window, cx| {
-                        workspace.update(cx, |ws, cx| {
-                            ws.launch_vscode_app(provider, model, None, window, cx)
-                        });
-                    });
-                }
-            });
-        });
-        cx.on_action(|_: &agent_ui::LaunchVSCodePlain, cx: &mut App| {
+        // VS Code launch from the `工具 → VS Code` entry: injection resolves
+        // from the persisted `vscode_app:` settings (no launch-time provider /
+        // model choice): same deferred dispatch shape.
+        cx.on_action(|_: &agent_ui::LaunchVSCode, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
                 agent_ui::dispatch::window_global(),
@@ -325,7 +309,7 @@ fn main() {
             cx.defer(move |cx| {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, window, cx| {
-                        workspace.update(cx, |ws, cx| ws.launch_vscode_plain(window, cx));
+                        workspace.update(cx, |ws, cx| ws.launch_vscode_app(None, window, cx));
                     });
                 }
             });
@@ -536,13 +520,12 @@ fn build_tools_menu() -> Menu {
     let chatgpt = Menu::new("ChatGPT.app").items(build_chatgpt_menu_items());
     let chatgpt_empty = chatgpt.items.is_empty();
     let chatgpt = chatgpt.disabled(chatgpt_empty);
-    let vscode = Menu::new("VS Code").items(build_vscode_menu_items());
-    // VS Code 未安装时整个子菜单禁用——含「打开」项，
-    // 因为此时没有任何 VS Code 实例可打开/注入。
-    let vscode_installed = cx::vscode_app_installed();
-    let vscode = vscode.disabled(!vscode_installed);
-    Menu::new(agent::i18n::t("menu-tools"))
-        .items([MenuItem::submenu(chatgpt), MenuItem::submenu(vscode)])
+    // VS Code 单一入口：注入目标由持久化 `vscode_app:` 设置决定
+    //（Settings → 外部工具 → Visual Studio Code.app），启动时无选择级联。
+    // VS Code 未安装时禁用——此时没有任何 VS Code 实例可打开/注入。
+    let vscode = MenuItem::action(agent::i18n::t("menu-vscode-open"), agent_ui::LaunchVSCode)
+        .disabled(!cx::vscode_app_installed());
+    Menu::new(agent::i18n::t("menu-tools")).items([MenuItem::submenu(chatgpt), vscode])
 }
 
 /// Items inside the `ChatGPT.app` submenu: one nested submenu per provider
@@ -596,65 +579,4 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
             )
         })
         .collect()
-}
-
-/// Items inside the `VS Code` submenu: one nested submenu per provider that
-/// exposes models visible to the `VS Code` agent (Anthropic-wire models
-/// usable by the Claude Code extension), one action item per model — same
-/// grouping/order rules as the ChatGPT cascade. A trailing separator +
-/// 「打开」entry opens VS Code without injection. The submenu
-/// is disabled wholesale when VS Code is not installed.
-#[cfg(target_os = "macos")]
-fn build_vscode_menu_items() -> Vec<MenuItem> {
-    let mut providers: Vec<(String, Vec<String>)> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for model in agent::pi_providers::global().models() {
-        let visible = model
-            .metadata
-            .get("agents")
-            .and_then(|v| v.as_array())
-            .map(|list| list.iter().any(|a| a.as_str() == Some("VS Code")))
-            .unwrap_or(true);
-        if !visible {
-            continue;
-        }
-        let provider = agent::pi_providers::display_provider_name(&model);
-        let model_id = model
-            .metadata
-            .get("config_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(model.id.as_str())
-            .to_string();
-        if !seen.insert((provider.clone(), model_id.clone())) {
-            continue; // same model registered on several wire apis
-        }
-        match providers.iter_mut().find(|(name, _)| *name == provider) {
-            Some((_, models)) => models.push(model_id),
-            None => providers.push((provider, vec![model_id])),
-        }
-    }
-    let mut items: Vec<MenuItem> = providers
-        .into_iter()
-        .map(|(provider, models)| {
-            MenuItem::submenu(
-                Menu::new(provider.clone()).items(models.into_iter().map(|model| {
-                    MenuItem::action(
-                        model.clone(),
-                        agent_ui::LaunchVSCode {
-                            provider: provider.clone(),
-                            model,
-                        },
-                    )
-                })),
-            )
-        })
-        .collect();
-    if !items.is_empty() {
-        items.push(MenuItem::separator());
-    }
-    items.push(MenuItem::action(
-        agent::i18n::t("menu-vscode-plain"),
-        agent_ui::LaunchVSCodePlain,
-    ));
-    items
 }

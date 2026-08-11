@@ -138,6 +138,7 @@ settings-item-environment = Environment
 settings-item-worktrees = Worktrees
 settings-group-external-tools = External Tools
 settings-item-chatgpt-app = ChatGPT.app
+settings-item-vscode-app = Visual Studio Code.app
 settings-group-archived = Archived
 settings-item-archived = Archived chats
 settings-item-chat-settings = Chat Settings
@@ -196,6 +197,18 @@ settings-btn-add-env = Add variable
 settings-section-chatgpt-more = More Settings
 settings-desc-chatgpt-more = Advanced options written into the injected config.toml.
 settings-desc-chatgpt-websockets = Written into the injected [model_providers.*] section. Defaults to false (custom endpoints rarely support WebSocket streaming, so HTTP streaming is used). Set true when the endpoint supports WebSocket streaming.
+
+# External Tools → Visual Studio Code.app panel
+settings-panel-vscode-app = Visual Studio Code.app
+settings-desc-vscode-top = Configure the Provider and LLM for the Claude Code and Codex extensions when launching Visual Studio Code from Manox.app.
+settings-section-vscode-claude = Claude Code Extension
+settings-section-vscode-codex = Codex Extension
+settings-row-vscode-provider = Provider
+settings-vscode-no-inject = Don't inject
+settings-vscode-models-loading = Loading catalog…
+settings-vscode-models-load-failed = Failed to load: { $error }
+settings-vscode-models-empty-anthropic = No injectable models found (needs an Anthropic-capable endpoint).
+settings-vscode-models-empty-responses = No injectable models found (needs a Responses-capable endpoint).
 settings-row-menu-bar = Show in menu bar
 settings-desc-menu-bar = Keep manox in the macOS menu bar after the main window closes
 settings-row-bottom-panel = Bottom panel
@@ -425,15 +438,14 @@ menu-open-manox = Open Manox
 menu-file = File
 menu-about = About Manox
 menu-tools = Tools
-menu-vscode-plain = Open
+menu-vscode-open = Open VS Code
 
 ## ChatGPT.app launch notifications (Tools → ChatGPT.app menu cascade)
 chatgpt-app-launched = Launched ChatGPT.app · { $provider } · { $model }
 chatgpt-app-launch-failed = Failed to launch ChatGPT.app
 
 ## VS Code launch notifications (Tools → VS Code menu cascade)
-vscode-app-launched = Launched VS Code · { $provider } · { $model }
-vscode-app-launched-plain = Launched VS Code
+vscode-app-launched = Launched VS Code
 vscode-app-launch-failed = Failed to launch VS Code
 
 ### terminal-ui (overlay status / search)

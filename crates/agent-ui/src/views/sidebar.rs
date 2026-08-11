@@ -120,11 +120,12 @@ pub enum SidebarEvent {
     /// the session's cwd (when launched from a project folder's `+` button);
     /// `None` falls back to the workspace cwd.
     SpawnPlainSession(crate::external_session::SessionKind, Option<PathBuf>),
-    /// Launch VS Code with Claude Code BYOK env injected for the picked
-    /// provider + model (the VS Code cascade's terminal action). The optional
-    /// PathBuf is the project path the menu was opened from — VS Code opens
-    /// that directory (falls back to the workspace cwd in the handler).
-    LaunchVSCode(String, String, Option<PathBuf>),
+    /// Launch VS Code with injection resolved from the persisted
+    /// `vscode_app:` settings (single entry — no provider/model choice at
+    /// launch time). The optional PathBuf is the project path the menu was
+    /// opened from — VS Code opens that directory (falls back to the
+    /// workspace cwd in the handler).
+    LaunchVSCode(Option<PathBuf>),
     /// Switch the main area to an already-running external session.
     OpenExternalSession(String),
     /// Archive an external session from the sidebar row's hover action (the
@@ -309,9 +310,10 @@ impl Sidebar {
                     },
                 );
             }
-            // VS Code: same provider→model cascade shape, but the terminal
-            // action launches the VS Code desktop app with Claude Code BYOK
-            // env injected, opening the project directory the menu was opened
+            // VS Code: single entry — injection resolves from the persisted
+            // `vscode_app:` settings (Settings → 外部工具 → Visual Studio
+            // Code.app); no provider/model cascade. Launches the VS Code
+            // desktop app opening the project directory the menu was opened
             // from. Disabled outright when VS Code is not installed (parity
             // with the 工具 → VS Code system menu).
             {
@@ -320,24 +322,18 @@ impl Sidebar {
                     .path("icons/vscode.svg")
                     .small()
                     .text_color(theme.muted_foreground);
-                if cx::vscode_app_installed() {
-                    menu = menu.submenu_with_icon(
-                        Some(icon),
-                        "VS Code",
-                        window,
-                        cx,
-                        move |submenu, window, cx| {
-                            build_vscode_model_cascade(submenu, &sidebar, window, cx)
-                        },
-                    );
-                } else {
-                    let submenu = PopupMenu::build(window, cx, |menu, _window, _cx| menu);
-                    menu = menu.item(
-                        PopupMenuItem::submenu("VS Code", submenu)
-                            .icon(icon)
-                            .disabled(true),
-                    );
-                }
+                menu = menu.item(
+                    PopupMenuItem::new("VS Code")
+                        .icon(icon)
+                        .disabled(!cx::vscode_app_installed())
+                        .on_click(move |_, _window, cx| {
+                            let _ = sidebar.update(cx, |this, cx| {
+                                let project = this.new_session_project.clone();
+                                cx.emit(SidebarEvent::LaunchVSCode(project));
+                                cx.notify();
+                            });
+                        }),
+                );
             }
             menu
         });
@@ -957,29 +953,6 @@ fn build_agent_model_cascade(
             cx.emit(SidebarEvent::SpawnExternalSession(
                 kind, provider, model, project,
             ));
-        },
-    )
-}
-
-/// Cascade for the VS Code submenu: models visible to the `VS Code` agent
-/// (Anthropic-wire models usable by the Claude Code extension). Picking a
-/// model emits `LaunchVSCode(provider, model, project)` — the workspace
-/// launches VS Code with Claude Code BYOK env injected, opening the project
-/// directory.
-fn build_vscode_model_cascade(
-    menu: PopupMenu,
-    sidebar: &WeakEntity<Sidebar>,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    build_model_cascade(
-        menu,
-        "VS Code",
-        sidebar,
-        window,
-        cx,
-        |_this, cx, provider, model, project| {
-            cx.emit(SidebarEvent::LaunchVSCode(provider, model, project));
         },
     )
 }

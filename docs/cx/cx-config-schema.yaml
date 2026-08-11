@@ -40,6 +40,22 @@ agents:
     env:
       VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
 
+# VS Code 注入设置（Settings → 外部工具 → Visual Studio Code.app 面板读写）。
+# 「打开 VS Code」（工具菜单 / 侧边栏单一入口 / CLI TUI）无 provider/model
+# 选择交互，统一读取此段：
+#   - claude_code 块 -> 向 VS Code 进程注入 ANTHROPIC_* BYOK env（Claude Code 扩展消费）
+#   - codex 块       -> 复用 ChatGPT.app 注入机制（CODEX_HOME + config.toml，Codex 扩展消费），
+#                       高级选项（env / supports_websockets）沿用顶层 chatgpt_app: 段
+# 块缺省（整段未配置）= 启动时回落第一个兼容 Provider；disabled: true = 不注入该扩展；
+# 两块均不注入时等效普通打开。
+vscode_app:
+  claude_code:
+    provider: "string (optional; Anthropic wire provider 名，缺失时取第一个兼容 Provider)"
+    disabled: "bool (optional; default false; true = 不注入 Claude Code 扩展)"
+  codex:
+    provider: "string (optional; Responses wire provider 名，缺失时取第一个兼容 Provider)"
+    disabled: "bool (optional; default false; true = 不注入 Codex 扩展)"
+
 # 运行时语义
 #
 # 1. 默认兼容性由下面两层自动推导：

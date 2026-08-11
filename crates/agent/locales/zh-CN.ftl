@@ -89,6 +89,7 @@ settings-item-environment = 环境
 settings-item-worktrees = 工作树
 settings-group-external-tools = 外部工具
 settings-item-chatgpt-app = ChatGPT.app
+settings-item-vscode-app = Visual Studio Code.app
 settings-group-archived = 已归档
 settings-item-archived = 已归档对话
 settings-item-chat-settings = 聊天设置
@@ -147,6 +148,18 @@ settings-btn-add-env = 添加变量
 settings-section-chatgpt-more = 更多配置
 settings-desc-chatgpt-more = 写入注入 config.toml 的高级选项。
 settings-desc-chatgpt-websockets = 写入注入的 [model_providers.*] 段，默认 false（自定义端点普遍不支持 WebSocket 流式，走 HTTP 流式）。端点支持 WebSocket 流式时可设为 true。
+
+# 外部工具 → Visual Studio Code.app 面板
+settings-panel-vscode-app = Visual Studio Code.app
+settings-desc-vscode-top = 从 Manox.app 启动 Visual Studio Code 时，为其 Claude Code 拓展和 Codex 拓展配置 Provider 和 LLM。
+settings-section-vscode-claude = Claude Code Extension
+settings-section-vscode-codex = Codex Extension
+settings-row-vscode-provider = Provider
+settings-vscode-no-inject = 不注入
+settings-vscode-models-loading = 正在加载模型目录…
+settings-vscode-models-load-failed = 加载失败：{ $error }
+settings-vscode-models-empty-anthropic = 未找到可注入的模型（需要支持 Anthropic 协议的端点）。
+settings-vscode-models-empty-responses = 未找到可注入的模型（需要支持 Responses 的端点）。
 settings-row-menu-bar = 在菜单栏中显示
 settings-desc-menu-bar = 关闭窗口后，仍在 macOS 菜单栏中保留 manox
 settings-row-bottom-panel = 底部面板
@@ -375,15 +388,14 @@ menu-open-manox = 打开 Manox
 menu-file = File
 menu-about = 关于 Manox
 menu-tools = 工具
-menu-vscode-plain = 打开
+menu-vscode-open = 打开 VS Code
 
 ## ChatGPT.app 启动通知（工具 → ChatGPT.app 菜单级联）
 chatgpt-app-launched = 已启动 ChatGPT.app · { $provider } · { $model }
 chatgpt-app-launch-failed = 启动 ChatGPT.app 失败
 
-## VS Code 启动通知（工具 → VS Code 菜单级联）
-vscode-app-launched = 已启动 VS Code · { $provider } · { $model }
-vscode-app-launched-plain = 已启动 VS Code
+## VS Code 启动通知（工具 → VS Code 单一入口，注入按 vscode_app 设置解析）
+vscode-app-launched = 已启动 VS Code
 vscode-app-launch-failed = 启动 VS Code 失败
 
 ### terminal-ui (overlay status / search)

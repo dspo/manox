@@ -24,6 +24,7 @@ use crate::views::management_shell::back_control;
 mod chatgpt;
 mod models;
 mod panels;
+mod vscode;
 
 const SIDEBAR_W: f32 = 260.;
 const CLICK_FLASH_MS: u64 = 280;
@@ -85,6 +86,8 @@ const GROUPS: &[SettingsGroup] = &[
         items: &[
             SettingsItem::new(IconName::Bot, "settings-item-chatgpt-app", None)
                 .with_brand_icon("icons/chatgpt.svg"),
+            SettingsItem::new(IconName::Bot, "settings-item-vscode-app", None)
+                .with_brand_icon("icons/vscode.svg"),
         ],
     },
     SettingsGroup {
@@ -204,6 +207,11 @@ pub struct SettingsView {
     /// seeded from the file when the Settings view is created.
     chatgpt_panel: chatgpt::ChatGptPanelState,
 
+    // --- External tools → Visual Studio Code.app panel state ---
+    /// Form state for the `vscode_app:` section of `cx.providers.config.yaml`,
+    /// seeded from the file when the Settings view is created.
+    vscode_panel: vscode::VsCodePanelState,
+
     // --- Personalization panel state ---
     personality: SharedString,
     memory_enabled: bool,
@@ -258,6 +266,7 @@ impl SettingsView {
             config_builtin_deps: true,
             models_panel: models::ModelsPanelState::load(window, cx),
             chatgpt_panel: chatgpt::ChatGptPanelState::load(window, cx),
+            vscode_panel: vscode::VsCodePanelState::load(window, cx),
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
@@ -531,6 +540,9 @@ impl SettingsView {
             }
             Some("settings-item-chatgpt-app") => {
                 chatgpt::render_chatgpt_app(self, cx).into_any_element()
+            }
+            Some("settings-item-vscode-app") => {
+                vscode::render_vscode_app(self, cx).into_any_element()
             }
             _ => {
                 let coming_label: SharedString = match key {

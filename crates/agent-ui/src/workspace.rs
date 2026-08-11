@@ -999,19 +999,14 @@ impl Workspace {
                 SidebarEvent::SpawnPlainSession(kind, project) => {
                     this.spawn_plain_session(*kind, project.clone(), window, cx);
                 }
-                SidebarEvent::LaunchVSCode(provider, model, project) => {
+                SidebarEvent::LaunchVSCode(project) => {
                     // VS Code opens the project directory the menu was launched
                     // from; from the Conversations header (no project) it
                     // falls back to the workspace cwd — the same directory a
-                    // fresh session runs in.
+                    // fresh session runs in. Injection targets come from the
+                    // persisted `vscode_app:` settings (no launch-time choice).
                     let folder = project.clone().unwrap_or_else(|| this.cwd.clone());
-                    this.launch_vscode_app(
-                        provider.clone(),
-                        model.clone(),
-                        Some(folder),
-                        window,
-                        cx,
-                    );
+                    this.launch_vscode_app(Some(folder), window, cx);
                 }
                 SidebarEvent::OpenExternalSession(id) => {
                     this.attach_external_session(id, window, cx);
@@ -1419,75 +1414,38 @@ impl Workspace {
         .detach();
     }
 
-    /// Launch VS Code with Claude Code BYOK env injected (工具 → VS Code
-    /// cascade and the sidebar new-session menu's VS Code entry). `folder`
-    /// is `Some` when the launch should open a directory (the sidebar passes
-    /// the project path or the workspace cwd); the 工具 menu passes `None`
-    /// for a folder-less launch. Same background-spawn + notification shape
-    /// as `launch_chatgpt_app`; the cx injection path may block on login-shell
+    /// Launch VS Code with injections resolved from the persisted
+    /// `vscode_app:` settings (Settings → 外部工具 → Visual Studio Code.app):
+    /// Claude Code Extension block → ANTHROPIC_* env; Codex Extension block →
+    /// CODEX_HOME + config.toml; both off → plain open. (工具 → VS Code menu
+    /// entry and the sidebar new-session menu's VS Code item.) `folder` is
+    /// `Some` when the launch should open a directory (the sidebar passes the
+    /// project path or the workspace cwd); the 工具 menu passes `None` for a
+    /// folder-less launch. Same background-spawn + notification shape as
+    /// `launch_chatgpt_app`; the cx injection path may block on login-shell
     /// env resolution and — when VS Code is already running — on the restart
     /// confirmation + graceful quit wait.
     pub fn launch_vscode_app(
         &mut self,
-        provider: String,
-        model: String,
         folder: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.spawn_in(window, async move |this, cx| {
-            let launch_provider = provider.clone();
-            let launch_model = model.clone();
             let result = cx
-                .background_spawn(async move {
-                    cx::launch_vscode_app(&launch_provider, &launch_model, folder.as_deref())
-                })
+                .background_spawn(
+                    async move { cx::launch_vscode_app_from_settings(folder.as_deref()) },
+                )
                 .await;
             let _ = this.update_in(cx, |_, window, cx| match result {
                 Ok(()) => {
                     window.push_notification(
-                        Notification::success(i18n::t_str(
-                            "vscode-app-launched",
-                            &[("provider", &provider), ("model", &model)],
-                        )),
+                        Notification::success(i18n::t("vscode-app-launched")),
                         cx,
                     );
                 }
                 Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        provider = %provider,
-                        model = %model,
-                        "VS Code launch failed"
-                    );
-                    window.push_notification(
-                        Notification::error(format!(
-                            "{}: {e}",
-                            i18n::t("vscode-app-launch-failed")
-                        )),
-                        cx,
-                    );
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Launch VS Code without BYOK injection (equivalent to a normal Dock open).
-    pub fn launch_vscode_plain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { cx::launch_vscode_plain() })
-                .await;
-            let _ = this.update_in(cx, |_, window, cx| match result {
-                Ok(()) => {
-                    window.push_notification(
-                        Notification::success(i18n::t("vscode-app-launched-plain")),
-                        cx,
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "VS Code plain launch failed");
+                    tracing::error!(error = %e, "VS Code launch failed");
                     window.push_notification(
                         Notification::error(format!(
                             "{}: {e}",
