@@ -10,55 +10,73 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{Entity, Subscription};
+use agent::i18n;
+use gpui::{Entity, SharedString, Subscription};
 
 use terminal_ui::TerminalView;
 
-/// Which external agent CLI a session runs.
+/// Which session a sidebar `+` spawn runs. The first three are external agent
+/// CLIs driven through cx (provider/model injection + IPC handle); `Terminal`
+/// and `Pi` are plain PTY sessions with no cx involvement — the user's shell,
+/// or the `pi` TUI binary resolved from disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     ClaudeCode,
     Codex,
     GithubCopilot,
+    /// A plain interactive shell in the session's cwd.
+    Terminal,
+    /// The `pi` coding-agent TUI, spawned directly (no provider injection).
+    Pi,
 }
 
 impl SessionKind {
-    /// The sidebar row label.
-    pub fn label(&self) -> &'static str {
+    /// The sidebar row label. Brand names stay untranslated; `Terminal` is
+    /// UI chrome and localized.
+    pub fn label(&self) -> SharedString {
         match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::GithubCopilot => "GitHub Copilot",
+            Self::ClaudeCode => "Claude Code".into(),
+            Self::Codex => "Codex".into(),
+            Self::GithubCopilot => "GitHub Copilot".into(),
+            Self::Terminal => i18n::t("session-kind-terminal"),
+            Self::Pi => "Pi".into(),
         }
     }
 
-    /// The cx `Agent` to launch.
-    pub fn agent(&self) -> cx::Agent {
+    /// The cx `Agent` to launch; `None` for plain PTY sessions.
+    pub fn agent(&self) -> Option<cx::Agent> {
         match self {
-            Self::ClaudeCode => cx::Agent::Claude,
-            Self::Codex => cx::Agent::Codex,
-            Self::GithubCopilot => cx::Agent::Copilot,
+            Self::ClaudeCode => Some(cx::Agent::Claude),
+            Self::Codex => Some(cx::Agent::Codex),
+            Self::GithubCopilot => Some(cx::Agent::Copilot),
+            Self::Terminal | Self::Pi => None,
         }
     }
 
     /// The cx agent id matching `ResolvedModel.visible_agents` entries, used to
-    /// filter the model list to those that can drive this agent.
+    /// filter the model list to those that can drive this agent. Plain PTY
+    /// sessions have no model cascade; the id only namespaces their session
+    /// id (`external:<id>:<uuid>`).
     pub fn agent_id(&self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
             Self::GithubCopilot => "copilot",
+            Self::Terminal => "terminal",
+            Self::Pi => "pi",
         }
     }
 
     /// Embedded SVG asset path (resolved by `ExtrasAssetSource`) for the
-    /// agent's brand icon. The SVGs use `fill="currentColor"` so the caller
-    /// tints via `.text_color(...)`.
+    /// session's icon. The SVGs use `currentColor` so the caller tints via
+    /// `.text_color(...)`.
     pub fn icon_asset(&self) -> &'static str {
         match self {
             Self::ClaudeCode => "icons/claude.svg",
             Self::Codex => "icons/codex.svg",
             Self::GithubCopilot => "icons/githubcopilot.svg",
+            Self::Terminal => "icons/terminal.svg",
+            Self::Pi => "icons/pi.svg",
         }
     }
 }
@@ -112,19 +130,22 @@ pub struct ExternalSession {
     /// alongside `cx_session_id`.
     pub socket_path: Option<PathBuf>,
     pub terminal_view: Entity<TerminalView>,
-    pub handle: Arc<cx::SessionHandle>,
+    /// The cx IPC handle for agent kinds — the close path kills through it.
+    /// `None` for plain PTY sessions (Terminal / Pi): dropping the
+    /// `TerminalView` drops the `PtyHandle`, whose teardown kills the child
+    /// tree, so no explicit kill reference is needed.
+    pub handle: Option<Arc<cx::SessionHandle>>,
     pub _exit_sub: Subscription,
 }
 
 impl ExternalSession {
-    /// Display line for the sidebar row / titlebar: the agent's OSC title when
-    /// it has set a non-empty one, else the kind label ("Claude Code" / "Codex"
-    /// / "GitHub Copilot").
-    pub fn display_title(&self) -> &str {
-        self.title
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| self.kind.label())
+    /// Display line for the sidebar row / titlebar: the session's OSC title
+    /// when it has set a non-empty one, else the kind label.
+    pub fn display_title(&self) -> SharedString {
+        match self.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            Some(t) => SharedString::from(t.to_string()),
+            None => self.kind.label(),
+        }
     }
 
     /// The lightweight descriptor the sidebar renders from. The sidebar is a
@@ -167,12 +188,13 @@ pub struct ExternalSessionSummary {
 }
 
 impl ExternalSessionSummary {
-    /// Display line: the agent's OSC title when non-empty, else the kind label.
-    pub fn display_title(&self) -> &str {
-        self.title
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| self.kind.label())
+    /// Display line: the session's OSC title when non-empty, else the kind
+    /// label.
+    pub fn display_title(&self) -> SharedString {
+        match self.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            Some(t) => SharedString::from(t.to_string()),
+            None => self.kind.label(),
+        }
     }
 
     /// The value copied to the clipboard from the row's id tag — the cx session
@@ -218,21 +240,29 @@ mod tests {
     #[test]
     fn title_falls_back_to_kind_label() {
         let mut s = sample_summary();
-        assert_eq!(s.display_title(), "Claude Code");
+        assert_eq!(s.display_title().as_str(), "Claude Code");
         s.title = Some("   ".into());
-        assert_eq!(s.display_title(), "Claude Code"); // whitespace-only ignored
+        assert_eq!(s.display_title().as_str(), "Claude Code"); // whitespace-only ignored
         s.title = Some("Refactor auth".into());
-        assert_eq!(s.display_title(), "Refactor auth");
+        assert_eq!(s.display_title().as_str(), "Refactor auth");
     }
 
     #[test]
     fn title_falls_back_per_kind() {
         let mut codex = sample_summary();
         codex.kind = SessionKind::Codex;
-        assert_eq!(codex.display_title(), "Codex");
+        assert_eq!(codex.display_title().as_str(), "Codex");
         let mut copilot = sample_summary();
         copilot.kind = SessionKind::GithubCopilot;
-        assert_eq!(copilot.display_title(), "GitHub Copilot");
+        assert_eq!(copilot.display_title().as_str(), "GitHub Copilot");
+        let mut terminal = sample_summary();
+        terminal.kind = SessionKind::Terminal;
+        terminal.title = None;
+        assert!(!terminal.display_title().is_empty());
+        let mut pi = sample_summary();
+        pi.kind = SessionKind::Pi;
+        pi.title = None;
+        assert_eq!(pi.display_title().as_str(), "Pi");
     }
 
     #[test]

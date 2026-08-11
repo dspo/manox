@@ -115,6 +115,11 @@ pub enum SidebarEvent {
         String,
         Option<PathBuf>,
     ),
+    /// Launch a plain PTY session with no cx provider injection — the user's
+    /// shell (`Terminal`) or the `pi` TUI (`Pi`). The optional PathBuf is the
+    /// project path to use as the session's cwd (when launched from a project
+    /// folder's `+` button); `None` falls back to the workspace cwd.
+    SpawnPlainSession(crate::external_session::SessionKind, Option<PathBuf>),
     /// Launch VS Code with Claude Code BYOK env injected for the picked
     /// provider + model (the VS Code cascade's terminal action). The optional
     /// PathBuf is the project path the menu was opened from — VS Code opens
@@ -256,6 +261,38 @@ impl Sidebar {
                         });
                     }),
             );
+            // Plain PTY sessions: no provider/model cascade — the click spawns
+            // immediately in the menu's project directory (workspace cwd when
+            // opened from the Conversations header). Pi is disabled outright
+            // when its binary cannot be resolved (parity with the VS Code
+            // entry's install gate).
+            for kind in [
+                crate::external_session::SessionKind::Terminal,
+                crate::external_session::SessionKind::Pi,
+            ] {
+                let sidebar_plain = sidebar.clone();
+                let enabled = !matches!(kind, crate::external_session::SessionKind::Pi)
+                    || cx::resolve_binary("pi").is_ok();
+                let mut item = PopupMenuItem::new(kind.label()).icon(
+                    Icon::default()
+                        .path(kind.icon_asset())
+                        .small()
+                        .text_color(theme.muted_foreground),
+                );
+                item = if enabled {
+                    item.on_click(move |_, _window, cx| {
+                        let _ = sidebar_plain.update(cx, |this, cx| {
+                            let project = this.new_session_project.take();
+                            this.close_new_session_menu();
+                            cx.emit(SidebarEvent::SpawnPlainSession(kind, project));
+                            cx.notify();
+                        });
+                    })
+                } else {
+                    item.disabled(true)
+                };
+                menu = menu.item(item);
+            }
             for kind in [
                 crate::external_session::SessionKind::ClaudeCode,
                 crate::external_session::SessionKind::Codex,
@@ -1044,7 +1081,7 @@ impl SidebarThreadItem {
         let title = if display.is_empty() {
             i18n::t("sidebar-empty-summary").to_string()
         } else {
-            truncate(display, 24)
+            truncate(&display, 24)
         };
         // Tag the row with the cx session id prefix (tracks the .sock file);
         // fall back to the manox-internal id prefix when the cx id was not
@@ -1052,7 +1089,18 @@ impl SidebarThreadItem {
         let short_id: String = if !summary.cx_session_id.is_empty() {
             summary.cx_session_id.chars().take(8).collect()
         } else {
-            summary.id.chars().take(8).collect()
+            // No cx id — plain PTY sessions never have one, and an agent
+            // session lands here when its IPC bind failed. Show the trailing
+            // uuid segment of the manox-internal id; the `external:` prefix
+            // would render the same "external" tag on every such row.
+            summary
+                .id
+                .rsplit(':')
+                .next()
+                .unwrap_or(summary.id.as_str())
+                .chars()
+                .take(8)
+                .collect()
         };
         Self {
             id: summary.id.clone(),
@@ -1444,6 +1492,20 @@ mod tests {
         assert_eq!(external.wash, theme.info);
         assert!(external.wash.a > 0.0);
         assert!(matches!(external.kind, RowKind::External));
+    }
+
+    /// Without a cx session id (plain PTY sessions, or an IPC bind failure)
+    /// the id tag shows the trailing uuid segment of the manox-internal id —
+    /// never the `external` prefix every such row would otherwise share.
+    #[test]
+    fn external_short_id_falls_back_to_uuid_segment() {
+        let theme = real_theme();
+        let mut summary = sample_external();
+        summary.kind = crate::external_session::SessionKind::Pi;
+        summary.cx_session_id = String::new();
+        summary.id = "external:pi:0123abcd-uuid".into();
+        let item = SidebarThreadItem::from_external(&summary, false, px(0.), &theme);
+        assert_eq!(item.short_id, "0123abcd");
     }
 
     /// Deselected rows stay deselected for both kinds (hover-only feedback),

@@ -89,6 +89,8 @@ mod tests {
             "icons/claude.svg",
             "icons/codex.svg",
             "icons/githubcopilot.svg",
+            "icons/terminal.svg",
+            "icons/pi.svg",
         ] {
             assert!(LocalAssets::get(path).is_some(), "missing {path}");
         }

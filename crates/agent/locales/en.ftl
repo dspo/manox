@@ -12,6 +12,7 @@ sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-new-session-label = New session
 sidebar-new-session-manox = Manox
+session-kind-terminal = Terminal
 sidebar-close-external = Close session
 sidebar-archive = Archive
 external-wizard-no-model = No model configured for this agent

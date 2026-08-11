@@ -2716,7 +2716,13 @@ fn configure_copilot_auth(
     }
 }
 
-fn resolve_binary(name: &str) -> Result<PathBuf> {
+/// Resolve an external agent CLI binary to an absolute path.
+///
+/// `which` first (honors the process PATH), then user-common fallbacks that a
+/// GUI-launched process never has on its sparse PATH (nvm / `~/.local/bin` /
+/// Homebrew). Library callers (manox sidebar session spawns) share the same
+/// resolution the CLI spawn path uses.
+pub fn resolve_binary(name: &str) -> Result<PathBuf> {
     // CLI binary: use which + fallback paths
     if let Ok(path) = which::which(name) {
         return Ok(path);
