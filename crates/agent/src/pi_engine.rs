@@ -660,6 +660,8 @@ fn subscribe_session(
 /// consumes only the summary.
 fn subscribe_harness_events(
     session: &mut AgentSession,
+    sessions_dir: PathBuf,
+    session_path: PathBuf,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     wakeup_tx: &mpsc::UnboundedSender<()>,
 ) -> pi::harness::HarnessSubscription {
@@ -683,6 +685,12 @@ fn subscribe_harness_events(
             aborted: false,
             ..
         } => {
+            // The transcript was rebuilt as a summary user message that
+            // consumes a display ordinal, so the sidecar's registry display
+            // forms no longer align; drop them so a reload never mislabels a
+            // prompt. Fire-and-forget: the manual `/compact` path awaits the
+            // same clear before mirroring.
+            clear_registry_displays_spawn(sessions_dir.clone(), session_path.clone());
             let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
                 summary: result.summary,
                 messages_compacted: 0,
@@ -862,8 +870,15 @@ async fn run_actor(
 
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
+    let session_path = session.path().to_path_buf();
     let mut _subscription = subscribe_session(&session, &notice_tx);
-    let mut _harness_subscription = subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
+    let mut _harness_subscription = subscribe_harness_events(
+        &mut session,
+        sessions_dir.clone(),
+        session_path,
+        &notice_tx,
+        &wakeup_tx,
+    );
 
     // The approval mode rides the session sidecar: restore it so a
     // reopened Danger session doesn't silently gate (or vice versa).
@@ -1062,7 +1077,7 @@ async fn run_actor(
                 if compact {
                     match session.compact(compact_instructions.as_deref()).await {
                         Ok(_) => {
-                            sync_history(&session, &state);
+                            sync_history(&session, &sessions_dir, &state).await;
                             sync_usage(&session, &state).await;
                             refresh_session_list(&repo, &state).await;
                         }
@@ -1112,6 +1127,10 @@ async fn run_actor(
                         // The transcript was rebuilt and the summarization
                         // call consumed tokens — re-mirror both, and the
                         // session list (the summary row may have changed).
+                        // Await the display-form clear: the mirror below would
+                        // otherwise attach the pre-compaction ordinals to the
+                        // wrong prompts.
+                        clear_registry_displays(&sessions_dir, session.path()).await;
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -1148,8 +1167,13 @@ async fn run_actor(
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx);
-                _harness_subscription =
-                    subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
+                _harness_subscription = subscribe_harness_events(
+                    &mut session,
+                    sessions_dir.to_path_buf(),
+                    path.to_path_buf(),
+                    &notice_tx,
+                    &wakeup_tx,
+                );
                 resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
@@ -1177,9 +1201,15 @@ async fn run_actor(
                         state.plan.set(false, None);
                         state.plan.set_active_instructions(None);
                         session = s;
+                        let new_path = session.path().to_path_buf();
                         _subscription = subscribe_session(&session, &notice_tx);
-                        _harness_subscription =
-                            subscribe_harness_events(&mut session, &notice_tx, &wakeup_tx);
+                        _harness_subscription = subscribe_harness_events(
+                            &mut session,
+                            sessions_dir.clone(),
+                            new_path,
+                            &notice_tx,
+                            &wakeup_tx,
+                        );
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         if let Some(project) = &project {
                             write_project_sidecar(&sessions_dir, session.path(), project).await;
@@ -1533,6 +1563,33 @@ async fn load_registry_displays(
         .await
         .map(|meta| meta.registry_displays)
         .unwrap_or_default()
+}
+
+/// Drop the persisted registry display forms. A compaction rebuilds the
+/// transcript as a summary user message plus the retained tail, which shifts
+/// every persisted display ordinal; the stale forms would otherwise attach to
+/// the wrong user prompt on the next `sync_history`. New registry turns after
+/// the compaction persist fresh ordinals over the rebuilt sequence.
+async fn clear_registry_displays(sessions_dir: &Path, session_path: &Path) {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    if meta.registry_displays.is_empty() {
+        return;
+    }
+    meta.registry_displays.clear();
+    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+        tracing::warn!(error = %err, "failed to clear registry display text");
+    }
+}
+
+/// `clear_registry_displays` from a harness event listener, which is
+/// synchronous — the clear runs on the runtime and its outcome is only a
+/// display form, so a lost write just narrows the reload window.
+fn clear_registry_displays_spawn(sessions_dir: PathBuf, session_path: PathBuf) {
+    tokio::spawn(async move {
+        clear_registry_displays(&sessions_dir, &session_path).await;
+    });
 }
 
 /// Re-attach `display_text` to the user prompt message at each persisted
@@ -2191,6 +2248,40 @@ mod tests {
                 .and_then(|ui| ui.display_text.as_deref()),
             Some("/healthz")
         );
+    }
+
+    #[tokio::test]
+    async fn clear_registry_displays_drops_sidecar_ordinals() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-display-clear.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+
+        clear_registry_displays(dir.path(), &session).await;
+
+        let displays = load_registry_displays(dir.path(), &session).await;
+        assert!(
+            displays.is_empty(),
+            "a compaction clears the stale display ordinals"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_registry_displays_is_noop_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-display-empty.jsonl");
+
+        clear_registry_displays(dir.path(), &session).await;
+
+        let displays = load_registry_displays(dir.path(), &session).await;
+        assert!(displays.is_empty());
     }
 
     #[tokio::test]
