@@ -325,14 +325,28 @@ impl ThreadEngine for PiEngine {
 /// `system_prompt` assembly — that belongs to the manox harness.
 fn system_prompt(cwd: &Path) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d");
-    format!(
+    let mut prompt = format!(
         "You are Manox Pi, a coding agent running inside the manox app on the pi harness.\n\
          Working directory: {cwd}\n\
          Date: {date}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
          Make changes directly, keep replies concise, and verify your work when practical.",
         cwd = cwd.display(),
-    )
+    );
+    // Skill summaries let the model know which skills are installed (users
+    // invoke them via `/name` slash commands). Parity with the retired manox
+    // system prompt, which rendered `skill::summaries_or_empty()` into its
+    // template; the pi path has no skill tool, so the wording only promises
+    // what exists.
+    let summaries = crate::skill::summaries_or_empty();
+    if !summaries.is_empty() {
+        prompt.push_str("\n\n## Available skills\n");
+        prompt.push_str("Installed skills, invocable by the user as `/name` slash commands:\n");
+        for s in &summaries {
+            prompt.push_str(&format!("- {}: {}\n", s.name, s.description));
+        }
+    }
+    prompt
 }
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent

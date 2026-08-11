@@ -358,6 +358,7 @@ settings-tag-dspo = dspo
 workspace-input-placeholder = Type a message, then send to begin
 workspace-composer-placeholder = Write markdown… (Cmd-Enter to send)
 workspace-unknown-command = Unknown command: /{$name} (open the `/` menu to see installed commands)
+workspace-unknown-skill = Unknown skill: /{$name} (open the `/` menu to see installed skills)
 workspace-no-model = No model configured
 workspace-approval-title = Tool call approval
 workspace-escalation-allow-once = Allow once
@@ -402,7 +403,6 @@ composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
 completion-tag-command = Command
 completion-tag-skill = Skill
-completion-tag-agent = Agent
 
 ### User turn navigator
 turn-navigator-search-placeholder = Search user messages…
