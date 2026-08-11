@@ -406,6 +406,9 @@ fn login_shell_path() -> String {
 /// docs for the semantics vs the persistent brush backend).
 pub struct SandboxedBashOperations {
     policy: SandboxPolicy,
+    // Read only by the macOS exec branch; on other platforms the exec stub
+    // returns before touching it, so suppress the dead-code lint there.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     base_cwd: PathBuf,
 }
 
