@@ -151,11 +151,9 @@ settings-desc-chatgpt-websockets = 写入注入的 [model_providers.*] 段，默
 
 # 外部工具 → Visual Studio Code.app 面板
 settings-panel-vscode-app = Visual Studio Code.app
-settings-desc-vscode-top = 配置 cx 启动 VS Code 时注入的扩展配置。启动 VS Code 无 Provider/模型选择，统一读取此处设置。
+settings-desc-vscode-top = 从 Manox.app 启动 Visual Studio Code 时，为其 Claude Code 拓展和 Codex 拓展配置 Provider 和 LLM。
 settings-section-vscode-claude = Claude Code Extension
-settings-desc-vscode-claude = 向 VS Code 进程注入 Anthropic BYOK env，供 Claude Code 扩展消费。
 settings-section-vscode-codex = Codex Extension
-settings-desc-vscode-codex = 复用 ChatGPT.app 的注入机制（CODEX_HOME + config.toml），供 Codex 扩展消费；高级选项（变量 / WebSocket）随 ChatGPT.app 面板。
 settings-row-vscode-provider = Provider
 settings-vscode-no-inject = 不注入
 settings-vscode-models-loading = 正在加载模型目录…

@@ -299,51 +299,53 @@ fn render_extension_block(
     let mut rows: Vec<AnyElement> =
         vec![row_with_control(i18n::t("settings-row-vscode-provider"), None, dropdown)];
 
-    // Read-only catalog rows (same shape as the ChatGPT.app panel).
-    let empty_msg = match kind {
-        BlockKind::ClaudeCode => i18n::t("settings-vscode-models-empty-anthropic"),
-        BlockKind::Codex => i18n::t("settings-vscode-models-empty-responses"),
-    };
-    match view.vscode_panel.catalog(kind) {
-        None => rows.push(read_only_row(
-            i18n::t("settings-row-chatgpt-providers"),
-            i18n::t("settings-vscode-models-loading"),
-            muted,
-        )),
-        Some(Err(e)) => rows.push(read_only_row(
-            i18n::t("settings-row-chatgpt-providers"),
-            SharedString::from(e.clone()),
-            muted,
-        )),
-        Some(Ok(entries)) if entries.is_empty() => rows.push(read_only_row(
-            i18n::t("settings-row-chatgpt-providers"),
-            empty_msg,
-            muted,
-        )),
-        Some(Ok(entries)) => {
-            for (provider, entry) in entries {
-                let provider_label = SharedString::from(provider.clone());
-                let desc = match entry {
-                    Ok(models) if models.is_empty() => empty_msg.clone(),
-                    Ok(models) => SharedString::from(models.join(", ")),
-                    Err(e) => i18n::t_str("settings-vscode-models-load-failed", &[("error", e)]),
-                };
-                rows.push(read_only_row(provider_label, desc, muted));
-            }
+    // Read-only LLMs row: only for the provider currently selected in the
+    // dropdown (explicit pick or the resolved default). 不注入 shows nothing.
+    // The model list is already wire-api filtered by the catalog source
+    // (Anthropic-wire VS Code models / Responses-wire ChatGPT.app models).
+    if let Some(name) = effective.as_ref() {
+        let empty_msg = match kind {
+            BlockKind::ClaudeCode => i18n::t("settings-vscode-models-empty-anthropic"),
+            BlockKind::Codex => i18n::t("settings-vscode-models-empty-responses"),
+        };
+        let label = SharedString::from(name.clone());
+        match view.vscode_panel.catalog(kind) {
+            None => rows.push(read_only_row(
+                label,
+                i18n::t("settings-vscode-models-loading"),
+                muted,
+            )),
+            Some(Err(e)) => rows.push(read_only_row(
+                label,
+                i18n::t_str("settings-vscode-models-load-failed", &[("error", e)]),
+                muted,
+            )),
+            Some(Ok(entries)) => match entries.iter().find(|(p, _)| p == name) {
+                Some((_, Ok(models))) if models.is_empty() => {
+                    rows.push(read_only_row(label, empty_msg, muted));
+                }
+                Some((_, Ok(models))) => rows.push(read_only_row(
+                    label,
+                    SharedString::from(models.join(", ")),
+                    muted,
+                )),
+                Some((_, Err(e))) => rows.push(read_only_row(
+                    label,
+                    i18n::t_str("settings-vscode-models-load-failed", &[("error", e)]),
+                    muted,
+                )),
+                // Provider no longer present in the catalog (stale explicit
+                // selection); the launch path falls back with a warning.
+                None => {}
+            },
         }
     }
 
-    let (title, desc) = match kind {
-        BlockKind::ClaudeCode => (
-            i18n::t("settings-section-vscode-claude"),
-            i18n::t("settings-desc-vscode-claude"),
-        ),
-        BlockKind::Codex => (
-            i18n::t("settings-section-vscode-codex"),
-            i18n::t("settings-desc-vscode-codex"),
-        ),
+    let title = match kind {
+        BlockKind::ClaudeCode => i18n::t("settings-section-vscode-claude"),
+        BlockKind::Codex => i18n::t("settings-section-vscode-codex"),
     };
-    block(title, Some(desc), theme, rows)
+    block(title, None, theme, rows)
 }
 
 fn apply_block(block: &mut VsCodeExtensionBlock, token: Option<String>) {

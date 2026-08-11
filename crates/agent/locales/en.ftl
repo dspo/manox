@@ -200,11 +200,9 @@ settings-desc-chatgpt-websockets = Written into the injected [model_providers.*]
 
 # External Tools → Visual Studio Code.app panel
 settings-panel-vscode-app = Visual Studio Code.app
-settings-desc-vscode-top = Configure the extension injections cx applies when launching VS Code. Launching VS Code has no provider/model picker; these settings are always used.
+settings-desc-vscode-top = Configure the Provider and LLM for the Claude Code and Codex extensions when launching Visual Studio Code from Manox.app.
 settings-section-vscode-claude = Claude Code Extension
-settings-desc-vscode-claude = Injects Anthropic BYOK env into the VS Code process, consumed by the Claude Code extension.
 settings-section-vscode-codex = Codex Extension
-settings-desc-vscode-codex = Reuses ChatGPT.app's injection mechanism (CODEX_HOME + config.toml), consumed by the Codex extension; advanced options (env / WebSocket) live in the ChatGPT.app panel.
 settings-row-vscode-provider = Provider
 settings-vscode-no-inject = Don't inject
 settings-vscode-models-loading = Loading catalog…
