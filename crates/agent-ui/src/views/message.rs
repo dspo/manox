@@ -2846,11 +2846,12 @@ impl ItemBuilder {
                                 close_segment(items, self.active_segment_ix);
                                 // Snapshot the segment's totals (after close pins
                                 // `frozen_secs`) for this reply's model row.
-                                let activity_summary =
-                                    self.active_segment_ix.and_then(|ix| match &items[ix] {
+                                let activity_summary = self.active_segment_ix.and_then(|ix| {
+                                    items.get(ix).and_then(|item| match item {
                                         ConvItem::Thinking(seg) => seg.activity_summary(),
                                         _ => None,
-                                    });
+                                    })
+                                });
                                 self.active_segment_ix = None;
                                 items.push(ConvItem::Assistant {
                                     text: t.clone(),
@@ -3512,6 +3513,55 @@ mod tests {
         assert!(
             matches!(last, ConvItem::Assistant { text, .. } if text == "done"),
             "assistant reply closes the segment and stands alone"
+        );
+    }
+
+    /// `ConversationState::append_history_messages` calls `extend` with a
+    /// fresh scratch vec per batch, so a segment index carried over from a
+    /// previous batch points outside the current vec. `extend` must tolerate
+    /// the stale index instead of panicking (regression: bounds-check abort
+    /// when a fresh batch opens with assistant text).
+    #[test]
+    fn item_builder_extend_survives_stale_segment_index_on_fresh_vec() {
+        let usage = HashMap::new();
+        let mut builder = ItemBuilder::new();
+
+        // Batch 1 leaves an open activity segment (index into `first`).
+        let mut first = Vec::new();
+        builder.extend(
+            &[
+                Message::user("turn one".to_string()),
+                Message::assistant(vec![tu(
+                    "tu_1",
+                    "Read",
+                    serde_json::json!({"path": "a.rs"}),
+                )]),
+            ],
+            &usage,
+            &mut first,
+        );
+
+        // Batch 2 opens with assistant text in a brand-new empty vec: the
+        // carried segment index is out of bounds for it.
+        let mut second = Vec::new();
+        builder.extend(
+            &[Message::assistant(vec![MessageContent::Text(
+                "done".to_string(),
+            )])],
+            &usage,
+            &mut second,
+        );
+
+        assert_eq!(second.len(), 1);
+        assert!(
+            matches!(
+                &second[0],
+                ConvItem::Assistant {
+                    activity_summary: None,
+                    ..
+                }
+            ),
+            "stale segment index degrades to no activity summary"
         );
     }
 
