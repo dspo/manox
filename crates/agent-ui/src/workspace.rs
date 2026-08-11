@@ -3484,7 +3484,7 @@ impl Workspace {
             let delete_btn = Button::new(format!("queue-delete-{idx}"))
                 .ghost()
                 .xsmall()
-                .icon(IconName::Delete)
+                .icon(Icon::default().path("icons/trash-2.svg"))
                 .tooltip(i18n::t("queued-delete-action"))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.delete_follow_up(idx, cx);
