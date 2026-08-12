@@ -790,6 +790,65 @@ fn attach_plan_hooks(
     );
 }
 
+/// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Find`/`Ls`)
+/// are checked against the sensitive-path deny-list and write tools
+/// (`Write`/`Edit`) against write confinement (project root + temp + plans
+/// dir, `.git` protected). Block reasons surface to the model as tool
+/// errors. Bash stays approval-gated only (no seatbelt in the pi slice).
+fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path) {
+    let cwd = cwd.to_path_buf();
+    let read_policy = Arc::new(crate::path_policy::ReadPolicy::new());
+    let write_policy = Arc::new(crate::path_policy::WritePolicy::for_project(&cwd));
+    session.on(
+        pi::harness::HookPoint::ToolCall,
+        Arc::new(move |mut ctx| {
+            let tool_name = ctx
+                .data
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let verdict = match tool_name {
+                "Read" | "Ls" | "Grep" | "Find" => ctx
+                    .data
+                    .get("args")
+                    .and_then(|a| a.get("path"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|raw| read_policy.check(&resolve_tool_path(raw, &cwd)).err()),
+                "Write" => ctx
+                    .data
+                    .get("args")
+                    .and_then(|a| a.get("path"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|raw| write_policy.check(&resolve_tool_path(raw, &cwd)).err()),
+                // Edit carries `{patch}` (hashline) with no top-level `path`;
+                // confinement checks every `[path#TAG]` section target.
+                "Edit" => ctx
+                    .data
+                    .get("args")
+                    .and_then(|a| a.get("patch"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|patch| write_policy.check_edit_patch(patch, &cwd).err()),
+                _ => None,
+            };
+            if let Some(reason) = verdict {
+                ctx.block_reason = Some(reason);
+            }
+            ctx
+        }),
+    );
+}
+
+/// Resolve a tool `path` argument against the session cwd (relative paths),
+/// leaving absolute paths untouched.
+fn resolve_tool_path(raw: &str, cwd: &Path) -> PathBuf {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -860,6 +919,7 @@ async fn run_actor(
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
+                attach_path_policy_hooks(&mut s, &tool_cwd);
                 restored = true;
                 session = Some(s);
             }
@@ -887,6 +947,7 @@ async fn run_actor(
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
+                    attach_path_policy_hooks(&mut s, &cwd);
                     s
                 }
                 Err(err) => {
@@ -1249,6 +1310,7 @@ async fn run_actor(
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
                         attach_plan_hooks(&mut s, &state.plan, &cwd);
+                        attach_path_policy_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
                         state.plan.set(false, None);

@@ -19,6 +19,7 @@ pub mod language;
 pub mod language_model;
 pub mod mcp;
 pub mod message;
+pub mod path_policy;
 pub mod paths;
 pub mod permission;
 pub mod pi_providers;
