@@ -250,7 +250,8 @@ impl SettingsView {
         Self {
             search,
             width,
-            plugins: cx.new(|cx| PluginManagerView::new(window, cx)),            selected: None,
+            plugins: cx.new(|cx| PluginManagerView::new(window, cx)),
+            selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
             permission_autopilot: true,
@@ -585,7 +586,8 @@ impl SettingsView {
                 panels::render_environment(self, cx).into_any_element()
             }
             Some("settings-item-mcp") => panels::render_mcp(self, cx).into_any_element(),
-            Some("settings-item-plugins") => self.plugins.clone().into_any_element(),            Some("settings-item-chatgpt-app") => {
+            Some("settings-item-plugins") => self.plugins.clone().into_any_element(),
+            Some("settings-item-chatgpt-app") => {
                 chatgpt::render_chatgpt_app(self, cx).into_any_element()
             }
             Some("settings-item-vscode-app") => {

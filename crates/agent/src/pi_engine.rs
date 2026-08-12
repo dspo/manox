@@ -611,6 +611,14 @@ fn build_tools(
         cmd_tx.clone(),
         Arc::clone(worktree),
     )));
+    // LSP code-intel tools: read-only, ride ungated. Registered once the
+    // registry probe landed and at least one server spec is available;
+    // otherwise the agent degrades to grep/glob (no LSP on PATH).
+    if let Some(reg) = lsp::registry::try_global()
+        && !reg.available_specs().is_empty()
+    {
+        tools.extend(crate::lsp_tools::tools());
+    }
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
@@ -1172,6 +1180,13 @@ async fn run_actor(
     // the wait: `global()` clones the current Arc, and the init thread
     // swaps it once registration completes — an early handle stays empty.
     crate::pi_providers::wait_ready().await;
+    // Bound the LSP registry probe wait: a missing/slow probe must never
+    // stall session assembly (tools register without LSP when it misses).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::lsp_tools::wait_ready(),
+    )
+    .await;
     let registry = crate::pi_providers::global();
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),

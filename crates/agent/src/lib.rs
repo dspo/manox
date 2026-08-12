@@ -21,6 +21,7 @@ pub mod i18n;
 pub mod image;
 pub mod language;
 pub mod language_model;
+pub mod lsp_tools;
 pub mod mcp;
 pub mod message;
 pub mod path_env;
@@ -87,6 +88,9 @@ pub fn init(cx: &mut App) {
     // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
     // connections settle (per-server timeout); failures are isolated.
     mcp::init();
+    // LSP registry PATH probe on a background thread (sessions await it
+    // bounded before registering the read-only LSP tools).
+    lsp_tools::init_background();
     // Skill/command definition registries (markdown files from plugins and
     // the user config dir) — consumed by the slash-command dispatch and the
     // composer mention surface.
