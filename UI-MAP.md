@@ -206,17 +206,17 @@ Full-height left panel, vertical flex, `bg:background`, right border.
 
 #### SidebarScrollBody
 
-Scrollable body inside Sidebar (`overflow_y_scroll`, `.track_scroll` on a `ScrollHandle`). Its children are two fixed slots measured by the pinned header: child 0 = the project-grouped threads (`SidebarProjectsSection`, zero-height when no registered projects exist), child 1 = the loose threads + external sessions (`SidebarConversationsSection` content, without its header — the header lives in the pinned slot).
+Scrollable body inside Sidebar (`overflow_y_scroll`, `.track_scroll` on a `ScrollHandle`). Its children are two fixed slots measured by the sticky overlay: child 0 = the Projects section (its section header + project-grouped threads, a zero-height slot when no registered projects exist), child 1 = the Conversations section (its section header + loose threads + external sessions). Both section headers live in-flow inside their own slot so the parent-child grouping (each header directly above its rows) is preserved; the sticky overlay only overlays a copy once a header would scroll away.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
 #### SidebarPinnedSectionHeader
 
-Pinned section-header slot above the scroll body (`flex_shrink_0`, `pt(top_inset)` for the traffic-light inset): the section the user is currently reading never scrolls away. Shows the Projects header while the viewport is inside the projects section, then the Conversations header (with its `+` new-session button + dropdown) once the projects content has scrolled fully past the top. The switch threshold is the measured height of scroll-body child 0 (`bounds_for_item(0)`, fallback keeps Projects pinned on the first frame before the container is laid out). When the content fits the viewport (`max_offset() == 0`) every section header shows at its natural position instead, so the Conversations header stays reachable without scrolling.
+Sticky overlay copy of the current section header, absolutely positioned above the scroll body (`top_0`, `pt(top_inset)` for the traffic-light inset, `bg:background` + bottom border). It appears only once `scroll_top > 0` — the in-flow headers stay in the content (parent-child grouping intact) and the overlay takes their place at the resting position while rows scroll underneath. Shows the Projects header while the viewport is inside the projects section, then the Conversations header (with its `+` new-session button + dropdown) once the projects content has scrolled fully past the top. The switch threshold is the measured height of scroll-body child 0 (`bounds_for_item(0)`, fallback keeps Projects before the container is laid out). The overlay only appears once `scroll_top > 0`, which cannot happen before the first layout, so offset/bounds are always measured by then. Because the overlay and the in-flow copy coexist in one tree, the Conversations header's element ids and deferred dropdown are disambiguated by an id prefix and gated so only the visible copy anchors the new-session menu.
 
 #### SidebarProjectsSection
 
-Middle section: project-grouped threads (if any projects exist).
+Middle section: project-grouped threads (if any projects exist). Its section header sits in-flow directly above the folder groups (scroll-body child 0), preserving the parent-child grouping.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -228,7 +228,7 @@ Collapsible folder: chevron + folder icon + project name, indented thread list.
 
 #### SidebarConversationsSection
 
-Loose (non-project) threads + external sessions, the scroll-body child 1 slot. The section's pinned header (`SidebarPinnedSectionHeader`) carries the `+` button opening the `SidebarNewSessionMenu` popup.
+Loose (non-project) threads + external sessions (scroll-body child 1). Its section header sits in-flow directly above these rows and carries the `+` button opening the `SidebarNewSessionMenu` popup; the sticky overlay (`SidebarPinnedSectionHeader`) pins a copy when scrolled.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
