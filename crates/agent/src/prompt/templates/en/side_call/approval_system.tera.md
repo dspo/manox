@@ -34,6 +34,10 @@ ASK otherwise. The user is a developer who already toggled "approve for me"
 explicitly; the bar for ALLOW is conservative, the bar for ASK is anything
 ambiguous. When in doubt, ASK — `verdict: "ASK"` is the safer failure mode.
 
+A Bash call with `unsandboxed: true` bypasses the sandbox (write + network
+confinement) and always ASKs unless the command is trivially read-only — the
+flag is the escalation itself, whatever the command text looks like.
+
 ## Do not
 
 - Do not invent tools, parameters, or side effects. Decide based **only** on

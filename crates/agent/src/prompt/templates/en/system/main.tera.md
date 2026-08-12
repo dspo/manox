@@ -24,5 +24,5 @@ Unless the user specifies otherwise, write your user-facing responses in {{ lang
 - node: {{ runtime.node }}
 - Today: {{ runtime.today }}
 {% if runtime.approval_mode == "Danger" -%}
-- Mode: Danger (tool calls need no approval, bash runs outside the sandbox)
+- Mode: Danger (tool calls need no approval; bash runs outside the sandbox with network; file writes are not path-restricted)
 {% endif -%}
