@@ -231,6 +231,12 @@ pub struct Workspace {
     /// switching away and restored on return, so each thread keeps its own
     /// in-progress draft instead of a single shared input bleeding across.
     drafts: HashMap<String, String>,
+    /// Per-thread right-side editor text, keyed by thread id. The editor pane
+    /// is a right-side resource of the thread it was written for: switching
+    /// away stashes the outgoing text, switching back restores it, so no
+    /// thread ever sees another thread's draft and returning recovers the
+    /// text. Mirrors `drafts` (the composer's per-thread stash).
+    editor_drafts: HashMap<String, String>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
     /// rendered markdown preview (`Markdown`).
@@ -435,7 +441,8 @@ enum ViewMode {
 const EDITOR_PANEL_WIDTH: f32 = 640.;
 const EDITOR_MIN_WIDTH: f32 = 320.;
 const EDITOR_MAX_WIDTH: f32 = 960.;
-/// Width of the drag handle between the main column and the editor pane.
+/// Width of the drag handle between the message column and the right side
+/// view (the editor pane).
 const EDITOR_DIVIDER_WIDTH: f32 = 6.;
 // Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(SIDEBAR_WIDTH))`).
 // Kept here so the editor pane's resize clamp can reserve space for the
@@ -444,7 +451,8 @@ const SIDEBAR_WIDTH: f32 = 260.;
 const SIDEBAR_MIN_WIDTH: f32 = 200.;
 const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
-/// Floor for the main column width when the editor pane is dragged wide.
+/// Floor for the message column width when the right side view (editor
+/// pane) is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -567,6 +575,7 @@ impl Workspace {
             conversation: conversation.clone(),
             input_state,
             drafts: HashMap::new(),
+            editor_drafts: HashMap::new(),
             editor_state,
             editor_open: false,
             editor_preview: false,
@@ -2397,6 +2406,13 @@ impl Workspace {
             old_id.clone(),
             self.input_state.read(cx).value().to_string(),
         );
+        // The editor pane is a right-side resource of the outgoing thread:
+        // stash its text so a switch-back restores the draft (mirrors the
+        // composer `drafts` stash above).
+        self.editor_drafts.insert(
+            old_id.clone(),
+            self.editor_state.read(cx).value().to_string(),
+        );
 
         // Stash the outgoing thread's pending plan verdict so it survives a
         // round-trip through another thread. The plan text lives only in
@@ -2482,6 +2498,13 @@ impl Workspace {
         self.input_state
             .update(cx, |s, cx| s.set_value(saved, window, cx));
         self.sync_completion(window, cx);
+        // Restore the incoming thread's stashed editor draft, or clear the
+        // pane so the previous thread's text never bleeds into this one.
+        // `set_value` is silent (no Change event), so the editor's submit
+        // binding is unaffected.
+        let editor_saved = self.editor_drafts.remove(&new_id).unwrap_or_default();
+        self.editor_state
+            .update(cx, |s, cx| s.set_value(editor_saved, window, cx));
         // Reveal the latest turn for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. Both running and completed threads arm `FollowMode::Tail`:
@@ -6044,8 +6067,10 @@ impl Workspace {
 
         // The shared shell provides the sidebar + draggable divider and the
         // mode-switching actions; this mode chains the conversation-only
-        // actions, the right editor pane, and the turn-navigator overlay onto
-        // it. The conversation column is the shell's main column.
+        // actions and the turn-navigator overlay onto it. The shell's main
+        // slot is the main view: a two-column container holding the message
+        // column (conversation + rail) and, when any right-pane tab is open,
+        // the right side view (editor / browser tabs).
         // Bind the column to a local before the shell call: the column's
         // builder borrows `self` (title-menu trigger, context rail), which
         // would collide with `shell_root`'s `&mut self` receiver inside a
@@ -6194,7 +6219,21 @@ impl Workspace {
                 // the thread interacts, or below the narrow width gate.
                 .when(show_rail, |this| this.child(self.context_rail.clone()))
         };
-        let mut root = self.shell_root(self.sidebar.clone(), conversation_column, cx);
+        // The main view is the shell's main slot: the message column plus the
+        // right side view (editor / browser tabs) as its sub-columns. Nesting
+        // the right pane inside the main view keeps the shell uniformly
+        // `sidebar | divider | main view` across every view mode (Terminal /
+        // ExternalSession / Settings pass a single-column main).
+        let main_view = h_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .relative()
+            .child(conversation_column)
+            .when(right_pane_open, |this| {
+                this.child(editor_divider).child(editor_pane)
+            });
+        let mut root = self.shell_root(self.sidebar.clone(), main_view, cx);
         root = root
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.enter_settings(window, cx);
@@ -6259,27 +6298,24 @@ impl Workspace {
                     this.archive_current_thread(window, cx);
                 }),
             )
-            // Right editor pane: a third top-level column when an editor is
-            // open (browser/terminal tabs will join it as future right-pane
-            // surfaces). Sits outside the middle column so it is not a sibling
-            // of the conversation+rail pair.
-            .when(right_pane_open, |this| {
-                this.child(editor_divider).child(editor_pane)
-            })
+            // The right editor pane moved inside the shell's main view (the
+            // `main_view` container above); it is no longer a top-level shell
+            // column.
             .children(turn_navigator_overlay)
             .on_drag_move(cx.listener(
                 |this, e: &DragMoveEvent<DraggedEditorDivider>, _window, cx| {
                     // The root fills the window, so its right edge is the
                     // window's right edge and the editor pane's width is the
                     // distance from the cursor to that edge. Clamp both to a
-                    // minimum and to leave the middle column at least
-                    // `MAIN_MIN_WIDTH` (sidebar + main + divider sit left of
-                    // the editor), so dragging wide never overflows the window
-                    // or collapses the conversation column. The context card is
-                    // hidden while the editor is open, so it does not claim a
-                    // width here — the conversation alone holds the middle
-                    // column. `sidebar_width` is read live so a wide sidebar
-                    // correctly shrinks the available editor envelope.
+                    // minimum and to leave the message column at least
+                    // `MAIN_MIN_WIDTH` (sidebar + divider + main view sit
+                    // left of the editor), so dragging wide never overflows
+                    // the window or collapses the conversation column. The
+                    // context card is hidden while the editor is open, so it
+                    // does not claim a width here — the conversation alone
+                    // holds the message column. `sidebar_width` is read live
+                    // so a wide sidebar correctly shrinks the available
+                    // editor envelope.
                     let new_w = e.bounds.right() - e.event.position.x;
                     let dynamic_max = e.bounds.size.width
                         - this.sidebar_width
@@ -6375,8 +6411,8 @@ impl Workspace {
                 move |this, e: &DragMoveEvent<DraggedSidebarDivider>, _window, cx| {
                     // The root fills the window, so the sidebar's right edge is
                     // the cursor's x position relative to the root's left.
-                    // Clamp so the main column (and the editor pane when open)
-                    // always retain at least `MAIN_MIN_WIDTH`.
+                    // Clamp so the message column (and the editor pane when
+                    // open) always retain at least `MAIN_MIN_WIDTH`.
                     let new_w = e.event.position.x - e.bounds.left();
                     let editor_reserve = if this.right_pane_open() {
                         this.editor_width + px(EDITOR_DIVIDER_WIDTH)
