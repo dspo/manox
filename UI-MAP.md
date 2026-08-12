@@ -32,7 +32,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | TurnNavigator | ✅ | cmd-m / cmd-shift-; |
 | 图片附件 | ✅ 部分 | 剪贴板粘贴 → chip → 气泡渲染已通；构造 pi prompt 时图片块仍被丢弃（text-only） |
 | MCP | ✅ | 连接核心共享化 + pi AgentTool 桥（#442）；Settings → MCP servers 面板（列表/连接状态/持久开关） |
-| Plus 菜单（文件 / 目标 / 插件） | ⏳ | composer plus 槽位当前为空 div |
+| Plus 菜单（文件 / 目标 / 插件） | ✅ 部分 | 文件 → native picker → pending attachments；目标 → seed `/goal`；Plugins 组为静态装饰（待与插件面板 #474 整合） |
 | skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
 | Sub-agent 观察 | ✅ 部分 | rail 观察行（生命周期/活动）+ Agent 工具卡片实时流式子转录（text/thinking delta、工具 ▸/✓/✗ 行）；独立钻取面板随 manox 移除，卡片体即钻取面 |
 | Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
