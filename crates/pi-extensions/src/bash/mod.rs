@@ -52,6 +52,10 @@ pub struct BashTool {
     /// of the model's `unsandboxed` argument — authorization is host
     /// policy, never the model's word.
     force_unsandboxed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Whether an OS sandbox backend is installed. `false` (Linux/Windows)
+    /// means no seatbelt to confine bash, so every call needs approval and
+    /// background tasks stay bare.
+    sandbox_available: bool,
 }
 
 impl BashTool {
@@ -66,6 +70,7 @@ impl BashTool {
             manager: None,
             unsandboxed_operations: None,
             force_unsandboxed: None,
+            sandbox_available: false,
         }
     }
 
@@ -89,6 +94,15 @@ impl BashTool {
     /// wire this to their authorization state (e.g. Danger mode).
     pub fn with_force_unsandboxed(mut self, resolver: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.force_unsandboxed = Some(resolver);
+        self
+    }
+
+    /// Declare whether an OS sandbox backend confines this tool. When false
+    /// (no seatbelt on the platform), every call requires approval — there
+    /// is no OS confinement to stand in for the gate — and background tasks
+    /// never route through a sandbox wrapper.
+    pub fn with_sandbox_available(mut self, available: bool) -> Self {
+        self.sandbox_available = available;
         self
     }
 
@@ -122,8 +136,17 @@ impl AgentTool for BashTool {
         false
     }
 
-    fn requires_approval(&self, _params: &JsonValue) -> bool {
-        true
+    fn requires_approval(&self, params: &JsonValue) -> bool {
+        // No OS sandbox (Linux/Windows) → no confinement to stand in for
+        // the gate: every call needs approval. With a seatbelt, only
+        // escalated calls need it — the escalation itself is the sensitive
+        // act; sandboxed calls ride the OS confinement (old-harness
+        // semantics).
+        if !self.sandbox_available {
+            return true;
+        }
+        params["unsandboxed"].as_bool().unwrap_or(false)
+            || self.force_unsandboxed.as_ref().is_some_and(|f| f())
     }
 
     /// The persistent shell is stateful: a batch of parallel bash calls
@@ -228,7 +251,19 @@ impl BashTool {
         };
 
         if run_in_background {
+            // Background tasks route through the same confinement decision
+            // as foreground calls: escalated → bare spawn, else sandboxed.
+            // Without a seatbelt there is no wrapper either way.
+            let escalate = params["unsandboxed"].as_bool().unwrap_or(false)
+                || self.force_unsandboxed.as_ref().is_some_and(|f| f());
+            let sandboxed = self.sandbox_available && !escalate;
             let id = match &self.manager {
+                Some(manager) if sandboxed => manager
+                    .spawn_sandboxed(&command, run_cwd)
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
+                // Without a manager there is no sandbox wrapper to route
+                // through — the bare trait path (approval still gates
+                // escalated calls).
                 Some(manager) => manager
                     .spawn(&command, run_cwd)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
@@ -683,5 +718,46 @@ mod tests {
             .await
             .unwrap();
         assert!(output_text(&result).contains("ran=sandboxed"));
+    }
+
+    #[test]
+    fn sandboxed_bash_needs_no_approval_unless_escalated() {
+        let ops = Arc::new(TaggedOps {
+            tag: "t",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(ops, Arc::new(NoopRegistry)).with_sandbox_available(true);
+        // A plain sandboxed call rides the OS confinement: no gate.
+        assert!(!tool.requires_approval(&serde_json::json!({"command": "ls"})));
+        // The explicit flag escalates → approval required.
+        assert!(
+            tool.requires_approval(
+                &serde_json::json!({"command": "git push", "unsandboxed": true})
+            )
+        );
+        // The host force resolver (Danger) escalates regardless of the flag.
+        let ops = Arc::new(TaggedOps {
+            tag: "t",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(ops, Arc::new(NoopRegistry))
+            .with_sandbox_available(true)
+            .with_force_unsandboxed(Arc::new(|| true));
+        assert!(
+            tool.requires_approval(&serde_json::json!({"command": "ls", "unsandboxed": false}))
+        );
+    }
+
+    #[test]
+    fn without_a_sandbox_every_call_needs_approval() {
+        let ops = Arc::new(TaggedOps {
+            tag: "t",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(ops, Arc::new(NoopRegistry));
+        assert!(
+            tool.requires_approval(&serde_json::json!({"command": "ls"})),
+            "no OS confinement → the gate is the only barrier"
+        );
     }
 }

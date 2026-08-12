@@ -449,24 +449,33 @@ fn build_tools(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
-    let background = Arc::new(BackgroundRegistry::new());
-    let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
-    let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (writes + network confined; shell state does
     // not persist — the tool's `cwd` parameter pins each call), otherwise
     // the unsandboxed persistent brush shell (approval-gated as always).
-    // Background tasks spawn outside this backend either way (see
-    // sandbox module docs). Inside a worktree session the policy is
-    // worktree-scoped: writable set narrowed to the worktree, the bound
-    // repo's shared `.git` re-opened, network unrestricted (a worktree is
-    // an approved isolation context).
-    let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if crate::sandbox::is_available() {
+    // Background tasks ride the same policy: the registry's sandbox wrapper
+    // reuses this backend's `wrap_command`, so a non-escalated background
+    // task is confined exactly like a foreground call. Inside a worktree
+    // session the policy is worktree-scoped: writable set narrowed to the
+    // worktree, the bound repo's shared `.git` re-opened, network
+    // unrestricted (a worktree is an approved isolation context).
+    let sandbox_available = crate::sandbox::is_available();
+    let mut background = Arc::new(BackgroundRegistry::new());
+    let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if sandbox_available {
         let policy = worktree_policy(cwd, worktree);
-        Arc::new(crate::sandbox::SandboxedBashOperations::new(cwd, policy))
+        let ops = Arc::new(crate::sandbox::SandboxedBashOperations::new(cwd, policy));
+        // Background tasks: wrap through the same policy/seatbelt as
+        // foreground calls (the wrapper owns the allowlist proxy too).
+        let wrap_ops = Arc::clone(&ops);
+        let wrap: pi_extensions::bash::background::SandboxCommandBuilder =
+            Arc::new(move |command, cwd| wrap_ops.wrap_background(command, cwd));
+        background = Arc::new(BackgroundRegistry::new().with_sandbox(wrap));
+        ops
     } else {
         Arc::new(PersistentShellOperations::new(cwd))
     };
+    let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
+    let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Escalation backend: no confinement at all. Selected per call when the
     // model passes `unsandboxed: true` or the host's force resolver
     // (Danger mode) says so — authorization is host policy, never the
@@ -474,14 +483,16 @@ fn build_tools(
     // on other platforms the default backend is already unsandboxed, and
     // swapping it for a stateless one-shot would only discard shell state.
     let unsandboxed_ops: Option<Arc<dyn pi::tools::bash::BashOperations>> =
-        crate::sandbox::is_available().then(|| {
+        sandbox_available.then(|| {
             let ops: Arc<dyn pi::tools::bash::BashOperations> =
                 Arc::new(crate::sandbox::UnsandboxedBashOperations::new(cwd));
             ops
         });
     let force_gate = Arc::clone(gate);
     let force_unsandboxed = Arc::new(move || force_gate.mode() == ApprovalMode::Danger);
-    let mut bash = BashTool::new(bash_ops, background.clone()).with_manager(Arc::clone(&manager));
+    let mut bash = BashTool::new(bash_ops, background.clone())
+        .with_manager(Arc::clone(&manager))
+        .with_sandbox_available(sandbox_available);
     if let Some(ops) = unsandboxed_ops {
         bash = bash.with_unsandboxed_operations(ops);
     }
@@ -517,13 +528,33 @@ fn build_tools(
         plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
         cwd: cwd.to_path_buf(),
     });
+    // Sandboxed bash rides the OS confinement and skips the gate in
+    // AutoPilot — the old-harness "sandboxed bash needs no approval"
+    // semantics. Escalated calls (`unsandboxed: true`) still gate; Danger
+    // already delegates; platforms without a seatbelt never auto-allow.
+    let bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> =
+        sandbox_available.then(|| {
+            let gate = Arc::clone(gate);
+            let allow: crate::pi_approval::AutoAllowResolver =
+                Arc::new(move |name: &str, params: &serde_json::Value| {
+                    name == "Bash"
+                        && gate.mode() == ApprovalMode::AutoPilot
+                        && !params["unsandboxed"].as_bool().unwrap_or(false)
+                });
+            allow
+        });
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
-            Arc::new(
-                ApprovalGatedTool::new(tool, Arc::clone(gate))
-                    .with_plan_policy(Arc::clone(&plan_policy)),
-            ) as Arc<dyn PiAgentTool>
+            let name = tool.name().to_string();
+            let mut wrapper = ApprovalGatedTool::new(tool, Arc::clone(gate))
+                .with_plan_policy(Arc::clone(&plan_policy));
+            if let Some(allow) = &bash_auto_allow
+                && name == "Bash"
+            {
+                wrapper = wrapper.with_auto_allow(Arc::clone(allow));
+            }
+            Arc::new(wrapper) as Arc<dyn PiAgentTool>
         })
         .collect();
     tools.push(Arc::new(PiAskUserQuestionTool::new(Arc::clone(gate))));
@@ -1217,7 +1248,18 @@ fn path_policy_verdict(
             .get("patch")
             .and_then(|v| v.as_str())
             .and_then(|patch| {
-                let targets = pi::hashline::parse_patch(patch).ok()?;
+                // Fail closed on unparseable patches, mirroring the
+                // non-Danger arm — an unverifiable patch must not ride the
+                // Danger release.
+                let targets = match pi::hashline::parse_patch(patch) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Some(format!(
+                            "Edit blocked by path policy (patch targets unverifiable even in Danger): {e}. \
+                             Fix the hashline patch grammar and retry."
+                        ));
+                    }
+                };
                 let hit = targets.iter().find(|fp| {
                     let t = if fp.path.is_absolute() {
                         fp.path.clone()
@@ -1332,6 +1374,9 @@ async fn run_actor(
     };
     let mut restored = false;
     let mut session = None;
+    // The restored worktree meta (if any) drives both the sandbox policy
+    // (hydrated before the session build) and the post-Ready chip event.
+    let mut worktree_restored: Option<pi_extensions::session_meta::WorktreeMeta> = None;
     if let Some(info) = latest {
         // Sessions created by a GUI launch (process cwd `/`) persisted a
         // useless cwd; heal them to this launch's default instead.
@@ -1339,6 +1384,15 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
+        // Hydrate the worktree state BEFORE `session_builder` runs: it
+        // calls `build_tools`, which derives the sandbox policy from the
+        // active-worktree state (worktree-scoped confinement with the bound
+        // repo's `.git` re-opened). Without this, a worktree session
+        // restored after an app restart boots with the project policy and
+        // commit/push fail until the next session swap.
+        let meta = load_worktree_state(&sessions_dir, &info.path).await;
+        worktree_restored = meta.clone();
+        *state.worktree.lock().unwrap() = meta;
         let (builder, orchestrators) = session_builder(
             &tool_cwd,
             &sessions_dir,
@@ -1362,6 +1416,10 @@ async fn run_actor(
             }
             Err(err) => {
                 tracing::warn!("pi session restore failed ({err}); starting fresh");
+                // The failed restore never materialized the worktree
+                // session; clear the hydrated state so the fresh session
+                // boots with the project policy.
+                *state.worktree.lock().unwrap() = None;
             }
         }
     }
@@ -1450,8 +1508,6 @@ async fn run_actor(
             .set_active_instructions(render_plan_instructions());
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
-    let worktree_restored = load_worktree_state(&sessions_dir, session.path()).await;
-    *state.worktree.lock().unwrap() = worktree_restored.clone();
     let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
@@ -3834,5 +3890,20 @@ mod tests {
         // again, not the stale worktree scope.
         let p2 = worktree_policy(&base, &state);
         assert!(p2.worktree_anchor().is_none());
+    }
+
+    #[test]
+    fn danger_edit_fails_closed_on_unparseable_patch() {
+        let cwd = Path::new("/tmp/manox-policy-hook-proj");
+        let read = crate::path_policy::ReadPolicy::new();
+        let write = crate::path_policy::WritePolicy::for_project(cwd);
+        // An unparseable hashline patch must not ride the Danger release —
+        // the non-Danger arm already fails closed on it.
+        let bad_args = serde_json::json!({ "patch": "[src/lib.rs#1A2B\nDEL 1" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, &write, true).unwrap();
+        assert!(reason.contains("unverifiable"), "{reason}");
     }
 }

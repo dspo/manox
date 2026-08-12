@@ -129,7 +129,30 @@ impl BackgroundManager {
 
     /// Start a background task under this manager and watch it to completion.
     pub fn spawn(&self, command: &str, cwd: &std::path::Path) -> Result<pi::TaskId, pi::TaskError> {
+        // Bare spawn: used for escalated background tasks (no confinement).
         let id = self.registry.spawn(command, cwd)?;
+        self.track_and_observe(id, command)
+    }
+
+    /// Spawn a background task through the registry's sandbox wrapper (when
+    /// configured), else bare. Used for non-escalated background tasks: the
+    /// seatbelt confines writes + network like a foreground sandboxed call.
+    pub fn spawn_sandboxed(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+    ) -> Result<pi::TaskId, pi::TaskError> {
+        let id = self.registry.spawn_sandboxed(command, cwd)?;
+        self.track_and_observe(id, command)
+    }
+
+    /// Register the task with this run, emit the spawned event, and arm the
+    /// completion observer (steer a summary / emit Completed exactly once).
+    fn track_and_observe(
+        &self,
+        id: pi::TaskId,
+        command: &str,
+    ) -> Result<pi::TaskId, pi::TaskError> {
         self.tasks
             .lock()
             .expect("tasks lock poisoned")
