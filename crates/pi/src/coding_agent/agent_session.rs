@@ -1132,6 +1132,9 @@ pub struct AgentSessionBuilder {
     system_prompt: Option<String>,
     settings: Option<crate::settings::Settings>,
     trust: Option<TrustManager>,
+    /// Session id pinned by the caller for a fresh `build()`; `None` draws a
+    /// fresh uuid. `open()` ignores it — the file's own id wins.
+    session_id: Option<String>,
 }
 
 impl AgentSessionBuilder {
@@ -1186,6 +1189,16 @@ impl AgentSessionBuilder {
     /// Mount an allow list of tools; defaults to the seven built-ins.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Pin the session id for the session a fresh `build()` creates; the
+    /// default is a fresh uuid. A host facade that keeps its own thread id
+    /// (manox `ThreadId`) pins it here so the persisted session and the
+    /// in-memory thread share one identity — the sidebar keys rows by it.
+    /// `open()` ignores this: the file's own header id wins.
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
         self
     }
 
@@ -1518,7 +1531,10 @@ impl AgentSessionBuilder {
         let repo = SessionRepository::new(&session_dir);
         let session = repo
             .create(JsonlSessionMetadata {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: self
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 cwd: cwd.to_string_lossy().into_owned(),
                 created_at: chrono::Utc::now(),
                 parent_session_path: None,

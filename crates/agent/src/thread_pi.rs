@@ -381,6 +381,7 @@ impl Thread {
             initial_path,
             fresh,
             project.clone(),
+            id.0.clone(),
         );
 
         cx.new(|cx| {
@@ -438,6 +439,7 @@ impl Thread {
             None,
             true,
             project,
+            self.id.0.clone(),
         );
         if self.approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(self.approval_mode);
