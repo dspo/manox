@@ -551,3 +551,18 @@ plugins-notice-plugin-installed = 插件已安装。重启 manox 后会加载新
 plugins-notice-plugin-removed = 插件已移除。重启 manox 后会卸载启动时加载的运行时注册表。
 plugins-notice-plugin-enabled = 插件已启用。重启 manox 后会加载其工具、技能、agent、hook 和 MCP 服务器。
 plugins-notice-plugin-disabled = 插件已禁用。重启 manox 后会卸载启动时加载的运行时注册表。
+member-running = 运行中
+member-idle = 空闲
+member-disbanded = 已离线
+member-tasks = 任务
+member-tasks-mine = 我的
+member-tasks-unassigned = 未分配
+member-no-tasks = 暂无任务
+member-tab = { $name }
+team-chip = 团队 · { $count }
+team-drawer-title = 团队
+team-drawer-empty = 暂无成员
+team-drawer-tasks = { $count ->
+    [one] { $count } 个任务
+   *[other] { $count } 个任务
+}

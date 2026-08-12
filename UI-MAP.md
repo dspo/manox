@@ -38,7 +38,8 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
 | Goal | ✅ 部分 | facade+GoalBridge 共享快照、GetGoal/CreateGoal/UpdateGoal 工具、`/goal` 命令、composer chip+状态 popover；per-turn 记账/自动续跑/BudgetLimited 强制为后续项 |
 | Team | ✅ 部分 | 后端完整（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）；roster/MemberPanel UI 为后续项 |
-
+| Goal | ⏳ | manox 目标体系，随 harness 移除 |
+| Team | ✅ | 后端（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）+ composer team chip（roster popover）+ MemberPanel 观察标签（右栏 Member tab：成员会话实时渲染 + 任务板） |
 分层纪律：crates/pi 只做 TS Pi 对齐与扩展点；harness 能力扩展一律走
 crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
