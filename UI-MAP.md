@@ -31,7 +31,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | Browser 标签 / Terminal 标签 | ✅ | webview host notify/inbound 桥；平台 terminal surface |
 | TurnNavigator | ✅ | cmd-m / cmd-shift-; |
 | 图片附件 | ✅ 部分 | 剪贴板粘贴 → chip → 气泡渲染已通；构造 pi prompt 时图片块仍被丢弃（text-only） |
-| MCP | ⏳ | init 跳过 mcp registry |
+| MCP | ✅ | 连接核心共享化 + pi AgentTool 桥（#442）；Settings → MCP servers 面板（列表/连接状态/持久开关） |
 | Plus 菜单（文件 / 目标 / 插件） | ⏳ | composer plus 槽位当前为空 div |
 | skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
 | Sub-agent 观察 | ✅ 部分 | rail 观察行（生命周期/活动）+ Agent 工具卡片实时流式子转录（text/thinking delta、工具 ▸/✓/✗ 行）；独立钻取面板随 manox 移除，卡片体即钻取面 |
@@ -816,7 +816,7 @@ Small bold label for a subsection.
 
 ## 5. PluginManager (in Settings)
 
-The plugin/skill/MCP management UI (PluginManagerView, tab bar, marketplace/plugin/skill/MCP cards) was retired with the manox harness. The Settings → Plugins item remains in the left nav and renders the shared "Coming soon" placeholder; the backend registry (`agent::plugin::PluginManager`) stays in the agent crate.
+The plugin/skill management UI (PluginManagerView, tab bar, marketplace/plugin/skill cards) was retired with the manox harness. The Settings → Plugins item remains in the left nav and renders the shared "Coming soon" placeholder; the backend registry (`agent::plugin::PluginManager`) stays in the agent crate. MCP server management has its own panel: Settings → MCP servers lists the merged config (mcp.toml + plugin declarations) with live connection state and persistent per-server switches (`[mcp] disabled` in settings.toml, applied on next launch).
 
 ---
 

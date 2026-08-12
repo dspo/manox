@@ -1075,6 +1075,123 @@ pub fn render_personalization(
 
 // --- MCP panel ------------------------------------------------------------
 
+/// MCP servers: the merged config (mcp.toml + plugin `.mcp.json` layers)
+/// with live connection state from the process registry. Each switch
+/// persists to `settings.toml` (`[mcp] disabled`) and applies from the next
+/// launch — the registry is built once at startup.
+pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let entity = cx.entity();
+    let muted = theme.muted_foreground;
+
+    let config = agent::mcp::load_merged_config();
+    let servers: Vec<String> = config.mcp_servers.keys().cloned().collect();
+    let connected: std::collections::HashMap<String, usize> = agent::mcp::try_global()
+        .map(|registry| {
+            registry
+                .servers()
+                .iter()
+                .map(|s| (s.name.clone(), s.tools.len()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let top_header = v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(gpui::FontWeight::BLACK)
+                        .child(i18n::t("settings-panel-mcp")),
+                )
+                .child(
+                    Button::new("add-mcp")
+                        .label(i18n::t("settings-btn-add-server"))
+                        .outline()
+                        .icon(Icon::new(IconName::Plus))
+                        .on_click(|_ev, _window, _cx| {
+                            // Server registration lives in mcp.toml / plugin
+                            // manifests; a guided adder is a follow-up.
+                            tracing::info!("add MCP server clicked (no-op in this build)");
+                        })
+                        .into_any_element(),
+                )
+                .into_any_element(),
+        )
+        .child(muted_text(i18n::t("settings-desc-mcp"), muted))
+        .child(muted_text(i18n::t("settings-mcp-restart-note"), muted))
+        .into_any_element();
+
+    let mut server_rows: Vec<AnyElement> = vec![section_header("settings-section-mcp-servers")];
+    if servers.is_empty() {
+        server_rows.push(
+            v_flex()
+                .px_3()
+                .py_3()
+                .child(muted_text(i18n::t("settings-empty-mcp"), muted))
+                .into_any_element(),
+        );
+    } else {
+        for (ix, name) in servers.iter().enumerate() {
+            let entity = entity.clone();
+            let name = name.clone();
+            let checked = !view.mcp_disabled.contains(&name);
+            let status: SharedString = if !checked {
+                i18n::t("settings-mcp-status-disabled")
+            } else if let Some(tool_count) = connected.get(&name) {
+                i18n::t_str(
+                    "settings-mcp-tool-count",
+                    &[("count", &tool_count.to_string())],
+                )
+            } else {
+                i18n::t("settings-mcp-status-not-connected")
+            };
+            server_rows.push(row_with_control(
+                i18n::t("settings-row-mcp-server-name"),
+                None,
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child(name.clone()))
+                    .child(div().text_xs().text_color(muted).child(status))
+                    .child(mock_switch(
+                        format!("mcp-{}", name),
+                        checked,
+                        entity,
+                        Arc::new(move |this, enabled| {
+                            if enabled {
+                                this.mcp_disabled.remove(&name);
+                            } else {
+                                this.mcp_disabled.insert(name.clone());
+                            }
+                            let disabled: Vec<String> = this.mcp_disabled.iter().cloned().collect();
+                            if let Err(err) = agent::settings::set_mcp_disabled(disabled) {
+                                tracing::warn!(error = %err, "failed to persist MCP switch");
+                            }
+                        }),
+                    ))
+                    .into_any_element(),
+            ));
+            if ix + 1 < servers.len() {
+                server_rows.push(hairline(theme.border.opacity(0.6)));
+            }
+        }
+    }
+    let servers_section = section_card(&theme, server_rows);
+
+    panel_scroll(
+        v_flex()
+            .w_full()
+            .gap_4()
+            .child(top_header)
+            .child(servers_section),
+    )
+}
+
 // --- Environment panel ----------------------------------------------------
 
 pub fn render_environment(_view: &mut SettingsView, cx: &mut Context<SettingsView>) -> AnyElement {
