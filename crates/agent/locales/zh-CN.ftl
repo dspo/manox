@@ -134,6 +134,7 @@ settings-desc-ui-language = 界面显示语言，保存后立即生效。
 settings-row-agent-language = 对话语言
 settings-desc-agent-language = 新建对话使用的语言。已有对话保持创建时的语言。
 settings-save-failed-title = 设置保存失败
+settings-saved = 已保存
 
 # 外部工具 → ChatGPT.app 面板
 settings-panel-chatgpt-app = ChatGPT.app

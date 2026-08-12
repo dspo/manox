@@ -24,7 +24,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, ClipboardItem, Context, Entity,
-    IntoElement as _, ParentElement as _, SharedString, Styled as _, Window, div, px,
+    InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString, Styled as _,
+    Window, div, px,
 };
 use gpui_component::theme::Theme;
 use gpui_component::{
@@ -41,7 +42,9 @@ use agent::i18n;
 use cx_providers::{ChatGptAppSettings, ModelInjection};
 
 use super::SettingsView;
-use super::panels::{build_segmented_pair, hairline, muted_text, panel_scroll, row_with_control};
+use super::panels::{
+    blur_on_click_out, build_segmented_pair, hairline, muted_text, panel_scroll, row_with_control,
+};
 
 const AUTOSAVE_DEBOUNCE_MS: u64 = 600;
 const KEY_W: f32 = 220.;
@@ -74,6 +77,11 @@ pub struct ChatGptPanelState {
     /// only writes when its captured generation is still current.
     save_generation: usize,
     window_handle: AnyWindowHandle,
+    /// Unsaved edits exist (set by `touch`, cleared by a successful `save`).
+    dirty: bool,
+    /// A save completed since the last blur; the next blur surfaces a "Saved"
+    /// toast.
+    pending_saved_toast: bool,
 }
 
 struct EnvRow {
@@ -101,6 +109,8 @@ impl ChatGptPanelState {
             next_row_id: 1,
             save_generation: 0,
             window_handle: window.window_handle(),
+            dirty: false,
+            pending_saved_toast: false,
         };
         match cx::chatgpt_app_settings() {
             Ok(settings) => state.apply_settings(window, cx, settings),
@@ -177,6 +187,7 @@ impl ChatGptPanelState {
             return;
         }
         self.save_generation = self.save_generation.wrapping_add(1);
+        self.dirty = true;
         let generation = self.save_generation;
         let entity = cx.entity().clone();
         let handle = self.window_handle;
@@ -193,7 +204,9 @@ impl ChatGptPanelState {
             let _ = handle.update(cx, |_view, window, cx| {
                 entity.update(cx, |this, cx| {
                     if this.chatgpt_panel.save_generation == generation {
-                        this.chatgpt_panel.save(window, cx);
+                        // Debounced safety net stays silent; blur surfaces the
+                        // "Saved" toast via `flush_on_blur`.
+                        let _ = this.chatgpt_panel.save(window, cx);
                     }
                 });
             });
@@ -216,8 +229,9 @@ impl ChatGptPanelState {
 
     /// Validate and write to disk. Failures surface as toasts while the form
     /// state is kept for correction. A blank nickname is written as `None` so
-    /// the untouched default stays omitted from the config file.
-    fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) {
+    /// the untouched default stays omitted from the config file. Returns
+    /// whether the settings were written.
+    fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) -> bool {
         let env = self.collect_env(cx);
         let nickname = self.nickname.read(cx).value().trim().to_string();
         if let Err(e) = cx::validate_chatgpt_custom_env(&env) {
@@ -225,7 +239,7 @@ impl ChatGptPanelState {
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                 cx,
             );
-            return;
+            return false;
         }
         let settings = ChatGptAppSettings {
             env,
@@ -239,6 +253,32 @@ impl ChatGptPanelState {
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                 cx,
             );
+            return false;
+        }
+        self.dirty = false;
+        self.pending_saved_toast = true;
+        true
+    }
+
+    /// A blur with unsaved edits flushes the pending autosave immediately, then
+    /// surfaces the "Saved" toast exactly once per edited field. No path guard
+    /// here: this panel persists via `cx::save_chatgpt_app_settings`, which
+    /// resolves the shared config file itself (unlike the Models panel).
+    fn flush_on_blur(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) {
+        if self.load_error.is_some() {
+            return;
+        }
+        if self.dirty {
+            // Invalidate the in-flight debounced save; save now instead.
+            self.save_generation = self.save_generation.wrapping_add(1);
+            if !self.save(window, cx) {
+                return; // `save` already surfaced the error toast.
+            }
+            self.pending_saved_toast = false;
+            window.push_notification(Notification::success(i18n::t("settings-saved")), cx);
+        } else if self.pending_saved_toast {
+            self.pending_saved_toast = false;
+            window.push_notification(Notification::success(i18n::t("settings-saved")), cx);
         }
     }
 }
@@ -274,10 +314,22 @@ fn panel_input(
         }
         state
     });
-    cx.subscribe(&state, |this, _state, event, cx| {
-        if matches!(event, InputEvent::Change) {
-            this.chatgpt_panel.touch(cx);
+    // Text edits flow into the same debounced autosave as discrete picks; a
+    // blur flushes pending edits and surfaces the "Saved" toast.
+    cx.subscribe(&state, |this, _state, event, cx| match event {
+        InputEvent::Change => this.chatgpt_panel.touch(cx),
+        InputEvent::Blur => {
+            let entity = cx.entity();
+            let _ = this
+                .chatgpt_panel
+                .window_handle
+                .update(cx, |_view, window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.chatgpt_panel.flush_on_blur(window, cx);
+                    });
+                });
         }
+        _ => {}
     })
     .detach();
     state
@@ -480,8 +532,14 @@ fn render_injection_block(
         row_with_control(
             i18n::t("settings-row-chatgpt-nickname"),
             Some(muted_text(i18n::t("settings-desc-chatgpt-nickname"), muted)),
-            Input::new(&view.chatgpt_panel.nickname)
+            div()
+                .id(format!(
+                    "settings-input-blur-{:?}",
+                    view.chatgpt_panel.nickname.entity_id()
+                ))
                 .w(px(240.))
+                .on_mouse_down_out(blur_on_click_out(view.chatgpt_panel.nickname.clone()))
+                .child(Input::new(&view.chatgpt_panel.nickname))
                 .into_any_element(),
         ),
         row_with_control(
@@ -573,8 +631,22 @@ fn render_env_block(
                 .py_2()
                 .items_center()
                 .gap_2()
-                .child(div().w(px(KEY_W)).flex_shrink_0().child(Input::new(&key)))
-                .child(div().flex_1().min_w_0().child(Input::new(&value)))
+                .child(
+                    div()
+                        .id(format!("settings-input-blur-{:?}", key.entity_id()))
+                        .w(px(KEY_W))
+                        .flex_shrink_0()
+                        .on_mouse_down_out(blur_on_click_out(key.clone()))
+                        .child(Input::new(&key)),
+                )
+                .child(
+                    div()
+                        .id(format!("settings-input-blur-{:?}", value.entity_id()))
+                        .flex_1()
+                        .min_w_0()
+                        .on_mouse_down_out(blur_on_click_out(value.clone()))
+                        .child(Input::new(&value)),
+                )
                 .child(
                     Button::new(format!("chatgpt-env-del-{row_id}"))
                         .icon(Icon::new(IconName::Minus))

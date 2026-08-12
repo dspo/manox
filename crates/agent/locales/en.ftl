@@ -183,6 +183,7 @@ settings-desc-ui-language = Interface chrome locale. Applies immediately on save
 settings-row-agent-language = Conversation language
 settings-desc-agent-language = Language for new conversations. Existing conversations keep their original language.
 settings-save-failed-title = Settings save failed
+settings-saved = Saved
 
 # External Tools → ChatGPT.app panel
 settings-panel-chatgpt-app = ChatGPT.app

@@ -13,9 +13,11 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement, Styled as _, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, App, Context, Entity, Focusable, Hsla, InteractiveElement, IntoElement,
+    MouseDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement, Styled as _,
+    Window, div, prelude::FluentBuilder as _, px,
 };
+use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
@@ -163,6 +165,22 @@ type PostApply = Arc<
         + Sync
         + 'static,
 >;
+
+/// Blur the input when the user clicks anywhere outside it. GPUI leaves
+/// focus on the input when buttons or plain space are clicked, so the caret
+/// never visibly leaves without this. The focus guard leaves the click
+/// undisturbed when the platform already moved focus to another focusable
+/// element (e.g. a second input).
+pub(super) fn blur_on_click_out(
+    state: Entity<InputState>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    move |_event, window, cx| {
+        let handle = Focusable::focus_handle(&state, cx);
+        if handle.is_focused(window) {
+            window.blur();
+        }
+    }
+}
 
 /// Build a Switch bound to a field via the view entity. The `apply` closure
 /// runs inside `Entity::update`, so it can mutate view state freely.
