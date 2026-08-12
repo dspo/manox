@@ -678,6 +678,7 @@ async fn drive_run<F>(
     live: Arc<Mutex<LiveTranscript>>,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    pi_model: &mut PiModel,
 ) -> (anyhow::Result<Vec<AgentMessage>>, bool)
 where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
@@ -713,6 +714,17 @@ where
                     handle.cancel_steer(&id);
                 }
                 Some(SessionCmd::Shutdown) => *shutdown_after_run = true,
+                Some(SessionCmd::SetModel(new_model)) => {
+                    // Mid-run switch: the harness handle applies it to the
+                    // next provider request immediately and persists a
+                    // model_change entry at the turn boundary (the kernel's
+                    // TS mid-run setModel path). Mirror the shared slot and
+                    // the actor's working model so the approval gate and
+                    // settlement (title, session rebuilds) see it too.
+                    handle.set_model(new_model.clone());
+                    *state.model.lock().unwrap() = Some(new_model.clone());
+                    *pi_model = new_model;
+                }
                 Some(_) => {} // queued prompts/reconfigs wait for settle
                 None => {
                     // Facade dropped mid-run: abort, settle, exit.
@@ -1266,6 +1278,7 @@ async fn run_actor(
                         Arc::clone(&live_mirror),
                         &state,
                         &notice_tx,
+                        &mut pi_model,
                     )
                     .await;
                     settle_run(
@@ -1305,6 +1318,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
+                    &mut pi_model,
                 )
                 .await;
                 settle_run(
@@ -1427,6 +1441,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
+                    &mut pi_model,
                 )
                 .await;
                 settle_run(
@@ -3030,5 +3045,246 @@ mod tests {
             &history[1].content[0],
             crate::language_model::MessageContent::Text(t) if t == "partial-answer"
         ));
+    }
+
+    /// A stream that issues one tool call then stops, recording the model of
+    /// every provider request and parking on barriers so the test can
+    /// interleave a mid-run model switch between the two turns.
+    struct MidRunModelStream {
+        calls: std::sync::atomic::AtomicUsize,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        turn1_started: Arc<tokio::sync::Notify>,
+        release1: Arc<tokio::sync::Notify>,
+        turn2_started: Arc<tokio::sync::Notify>,
+        release2: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl pi::agent_loop::StreamFn for MidRunModelStream {
+        async fn stream(
+            &self,
+            context: &pi::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<pi::types::AgentEvent>,
+        ) -> Result<pi::types::AgentMessage, anyhow::Error> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen.lock().unwrap().push(context.model.id.clone());
+            if n == 0 {
+                self.turn1_started.notify_waiters();
+                self.release1.notified().await;
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"message": "hi"}),
+                        thought_signature: None,
+                    }],
+                    model: context.model.id.clone(),
+                    provider: context.model.provider.clone(),
+                    api: context.model.api.clone(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    raw_stop_reason: None,
+                    stop_reason: Some(pi::types::StopReason::ToolUse),
+                    usage: Box::new(pi::types::Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        ..Default::default()
+                    }),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            } else {
+                self.turn2_started.notify_waiters();
+                self.release2.notified().await;
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                        signature: None,
+                    }],
+                    model: context.model.id.clone(),
+                    provider: context.model.provider.clone(),
+                    api: context.model.api.clone(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    raw_stop_reason: None,
+                    stop_reason: Some(pi::types::StopReason::Stop),
+                    usage: Box::new(pi::types::Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        ..Default::default()
+                    }),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+    }
+
+    /// The `echo` tool the mid-run stream calls, so the run spans two turns.
+    struct EchoTool;
+
+    #[async_trait::async_trait]
+    impl pi::tool::AgentTool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes the input"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!(
+                {"type": "object", "properties": {"message": {"type": "string"}}}
+            )
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _ctx: &dyn pi::tool::ToolContext,
+        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+            Ok(pi::tool::AgentToolResult::text(
+                params["message"].as_str().unwrap_or("no message"),
+            ))
+        }
+    }
+
+    fn test_model_switched() -> PiModel {
+        PiModel {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "new".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: Default::default(),
+        }
+    }
+
+    fn test_model() -> PiModel {
+        PiModel {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "test".into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// A model switch arriving while a turn is in flight must reach the next
+    /// provider request: `drive_run` routes `SetModel` through the harness
+    /// handle (the turn runtime) instead of dropping it, so the turn after
+    /// the switch streams under the new model and the session attributes its
+    /// usage to it. Regression for the mid-conversation switch that showed
+    /// the new model in the UI while requests still ran the old one.
+    #[tokio::test]
+    async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(MidRunModelStream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            turn1_started: Arc::new(tokio::sync::Notify::new()),
+            release1: Arc::new(tokio::sync::Notify::new()),
+            turn2_started: Arc::new(tokio::sync::Notify::new()),
+            release2: Arc::new(tokio::sync::Notify::new()),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: pi::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn pi::agent_loop::StreamFn>)
+        });
+        let runtime = ModelRuntime::new(resolver);
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(runtime)
+            .with_model(test_model())
+            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        let handle = session.handle();
+        let run = drive_run(
+            session.prompt("first turn"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+        );
+        let new_model = test_model_switched();
+
+        let ((result, _aborted), ()) = tokio::join!(run, async {
+            // Turn 1 in flight; switch the model before it resumes. While
+            // the run parks on the barrier, drive_run's select polls the
+            // command channel, so the switch lands before turn 1 returns.
+            stream.turn1_started.notified().await;
+            cmd_tx
+                .send(SessionCmd::SetModel(new_model.clone()))
+                .unwrap();
+            for _ in 0..10_000 {
+                if state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()) == Some("new") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()),
+                Some("new"),
+                "drive_run must apply the mid-run SetModel while the turn is in flight"
+            );
+            stream.release1.notify_waiters();
+            // Turn 2 streams under the switched model; release it.
+            stream.turn2_started.notified().await;
+            stream.release2.notify_waiters();
+        });
+        result.unwrap();
+
+        assert_eq!(
+            *stream.seen.lock().unwrap(),
+            vec!["test".to_string(), "new".to_string()],
+            "the turn after the mid-run switch must stream under the new model"
+        );
+        assert_eq!(
+            pi_model.id, "new",
+            "the actor's working model follows the switch"
+        );
+        // The session attributes the switched turn's usage to the new model:
+        // the per-model breakdown now carries both identities.
+        let stats = session.session_stats().await.unwrap();
+        assert!(
+            stats.per_model.iter().any(|e| e.key == "test/new"),
+            "switched-turn usage must enter the per-model stats: {:?}",
+            stats.per_model
+        );
+        // The switch persisted as a model_change entry, so a reload
+        // attributes the same history the same way.
+        let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
+        assert!(
+            jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
+            "the mid-run switch must persist a model_change entry for the new model"
+        );
     }
 }
