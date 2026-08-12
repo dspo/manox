@@ -33,6 +33,7 @@ pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
 pub mod runtime;
+pub mod sandbox;
 pub mod settings;
 pub mod skill;
 pub mod team;
