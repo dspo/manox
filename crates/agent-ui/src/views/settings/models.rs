@@ -41,7 +41,9 @@ use cx_providers::{
 };
 
 use super::SettingsView;
-use super::panels::{blur_on_click_out, muted_text, section_card, section_header};
+use super::panels::{
+    blur_on_click_out, defer_blur_flush, muted_text, section_card, section_header,
+};
 
 const LABEL_W: f32 = 150.;
 const KEY_W: f32 = 220.;
@@ -931,15 +933,10 @@ fn new_input(
     cx.subscribe(&state, |this, _state, event, cx| match event {
         InputEvent::Change => this.models_panel.touch(cx),
         InputEvent::Blur => {
-            let entity = cx.entity();
-            let _ = this
-                .models_panel
-                .window_handle
-                .update(cx, |_view, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.models_panel.flush_on_blur(window, cx);
-                    });
-                });
+            let handle = this.models_panel.window_handle;
+            defer_blur_flush(cx, handle, |this, window, cx| {
+                this.models_panel.flush_on_blur(window, cx);
+            });
         }
         _ => {}
     })
@@ -2276,5 +2273,90 @@ mod tests {
         let vscode = collected.vscode_app.expect("vscode_app 应被 carry-over");
         assert_eq!(vscode.claude_code.provider.as_deref(), Some("百炼"));
         assert!(vscode.codex.disabled);
+    }
+}
+
+#[cfg(test)]
+mod blur_flush_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{AppContext as _, Entity, ParentElement as _, Render, TestAppContext, div};
+    use gpui_component::Root;
+    use gpui_component::input::{Input, InputEvent, InputState};
+
+    struct ProbeView {
+        input: Entity<InputState>,
+    }
+
+    impl Render for ProbeView {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div().child(Input::new(&self.input))
+        }
+    }
+
+    /// The settings panels flush pending edits when an input blurs. The flush
+    /// is wired in an `InputEvent::Blur` subscription, whose dispatch leases
+    /// the view entity for the whole callback; the flush itself needs
+    /// `&mut Window`, which subscriptions do not receive, so
+    /// `panels::defer_blur_flush` re-enters the view through the saved window
+    /// handle at the end of the effect cycle, after the dispatch lease is
+    /// released (a synchronous re-entry would double-lease the entity and
+    /// panic). This test drives a real focus→blur cycle through gpui's draw
+    /// focus phase and pins that deferred re-entry behavior.
+    #[gpui::test]
+    fn blur_flush_reentry_runs_after_focus_loss(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let flushed = Rc::new(Cell::new(false));
+        let flushed_for_view = flushed.clone();
+        let slot: Rc<std::cell::RefCell<Option<Entity<ProbeView>>>> = Default::default();
+        let slot_for_window = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let window_handle = window.window_handle();
+                let input = cx.new(|cx| InputState::new(window, cx));
+                // Same shape as the `new_input`/`panel_input` Blur arm.
+                let flushed = flushed_for_view.clone();
+                cx.subscribe(&input, move |_this, _state, event, cx| {
+                    if matches!(event, InputEvent::Blur) {
+                        let flushed = flushed.clone();
+                        super::super::panels::defer_blur_flush(
+                            cx,
+                            window_handle,
+                            move |_this, _window, _cx| {
+                                flushed.set(true);
+                            },
+                        );
+                    }
+                })
+                .detach();
+                ProbeView { input }
+            });
+            *slot_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow().clone().expect("view initialized");
+        let input = view.read_with(cx, |view, _| view.input.clone());
+
+        // Focus change events only dispatch while the window is active.
+        cx.update(|window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, _cx| window.blur());
+        cx.run_until_parked();
+
+        assert!(
+            flushed.get(),
+            "deferred blur flush never ran after focus loss"
+        );
     }
 }

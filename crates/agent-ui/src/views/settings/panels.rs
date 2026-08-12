@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, App, Context, Entity, Focusable, Hsla, InteractiveElement, IntoElement,
-    MouseDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement, Styled as _,
-    Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, AnyWindowHandle, App, Context, Entity, Focusable, Hsla, InteractiveElement,
+    IntoElement, MouseDownEvent, ParentElement as _, SharedString, StatefulInteractiveElement,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
@@ -165,6 +165,26 @@ type PostApply = Arc<
         + Sync
         + 'static,
 >;
+
+/// Re-enter the view entity through the window handle at the end of the
+/// current effect cycle. Blur-flush subscriptions need this: their dispatch
+/// leases the view for the whole callback, while the flush needs `&mut
+/// Window`, which only the handle re-entry provides. A synchronous
+/// `entity.update` inside such a subscription would lease the entity a second
+/// time and panic; deferring runs the update after the dispatch lease is
+/// released (same re-entry principle as the debounced autosave task).
+pub(super) fn defer_blur_flush<T: 'static>(
+    cx: &mut Context<T>,
+    window_handle: AnyWindowHandle,
+    flush: impl FnOnce(&mut T, &mut Window, &mut Context<T>) + 'static,
+) {
+    let entity = cx.entity();
+    cx.defer(move |cx| {
+        let _ = window_handle.update(cx, move |_view, window, cx| {
+            entity.update(cx, |this, cx| flush(this, window, cx));
+        });
+    });
+}
 
 /// Blur the input when the user clicks anywhere outside it. GPUI leaves
 /// focus on the input when buttons or plain space are clicked, so the caret

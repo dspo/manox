@@ -43,7 +43,8 @@ use cx_providers::{ChatGptAppSettings, ModelInjection};
 
 use super::SettingsView;
 use super::panels::{
-    blur_on_click_out, build_segmented_pair, hairline, muted_text, panel_scroll, row_with_control,
+    blur_on_click_out, build_segmented_pair, defer_blur_flush, hairline, muted_text, panel_scroll,
+    row_with_control,
 };
 
 const AUTOSAVE_DEBOUNCE_MS: u64 = 600;
@@ -319,15 +320,10 @@ fn panel_input(
     cx.subscribe(&state, |this, _state, event, cx| match event {
         InputEvent::Change => this.chatgpt_panel.touch(cx),
         InputEvent::Blur => {
-            let entity = cx.entity();
-            let _ = this
-                .chatgpt_panel
-                .window_handle
-                .update(cx, |_view, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.chatgpt_panel.flush_on_blur(window, cx);
-                    });
-                });
+            let handle = this.chatgpt_panel.window_handle;
+            defer_blur_flush(cx, handle, |this, window, cx| {
+                this.chatgpt_panel.flush_on_blur(window, cx);
+            });
         }
         _ => {}
     })
