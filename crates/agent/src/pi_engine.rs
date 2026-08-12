@@ -457,16 +457,35 @@ fn build_tools(
     // not persist — the tool's `cwd` parameter pins each call), otherwise
     // the unsandboxed persistent brush shell (approval-gated as always).
     // Background tasks spawn outside this backend either way (see
-    // sandbox module docs).
+    // sandbox module docs). Inside a worktree session the policy is
+    // worktree-scoped: writable set narrowed to the worktree, the bound
+    // repo's shared `.git` re-opened, network unrestricted (a worktree is
+    // an approved isolation context).
     let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if crate::sandbox::is_available() {
-        Arc::new(crate::sandbox::SandboxedBashOperations::new(
-            cwd,
-            crate::sandbox::SandboxPolicy::for_project(cwd),
-        ))
+        let policy = worktree_policy(cwd, worktree);
+        Arc::new(crate::sandbox::SandboxedBashOperations::new(cwd, policy))
     } else {
         Arc::new(PersistentShellOperations::new(cwd))
     };
-    let bash = BashTool::new(bash_ops, background.clone()).with_manager(Arc::clone(&manager));
+    // Escalation backend: no confinement at all. Selected per call when the
+    // model passes `unsandboxed: true` or the host's force resolver
+    // (Danger mode) says so — authorization is host policy, never the
+    // model's word. Installed only where a seatbelt exists to escape from:
+    // on other platforms the default backend is already unsandboxed, and
+    // swapping it for a stateless one-shot would only discard shell state.
+    let unsandboxed_ops: Option<Arc<dyn pi::tools::bash::BashOperations>> =
+        crate::sandbox::is_available().then(|| {
+            let ops: Arc<dyn pi::tools::bash::BashOperations> =
+                Arc::new(crate::sandbox::UnsandboxedBashOperations::new(cwd));
+            ops
+        });
+    let force_gate = Arc::clone(gate);
+    let force_unsandboxed = Arc::new(move || force_gate.mode() == ApprovalMode::Danger);
+    let mut bash = BashTool::new(bash_ops, background.clone()).with_manager(Arc::clone(&manager));
+    if let Some(ops) = unsandboxed_ops {
+        bash = bash.with_unsandboxed_operations(ops);
+    }
+    let bash = bash.with_force_unsandboxed(force_unsandboxed);
 
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
@@ -667,6 +686,30 @@ fn build_tools(
             background: manager,
         },
     )
+}
+
+/// The sandbox policy for a session cwd: worktree-scoped when the session
+/// runs inside the active worktree (writable set narrowed to the worktree,
+/// the bound repo's shared `.git` re-opened, network unrestricted), else
+/// project-scoped. The cwd comparison canonicalizes both sides so the
+/// policy follows the session's actual directory — a stale pre-swap state
+/// or an Exit back to the original repo both classify correctly.
+fn worktree_policy(
+    cwd: &Path,
+    worktree: &crate::worktree::WorktreeState,
+) -> crate::sandbox::SandboxPolicy {
+    let Some(meta) = worktree.lock().unwrap().clone() else {
+        return crate::sandbox::SandboxPolicy::for_project(cwd);
+    };
+    let wt = crate::sandbox::canonicalize_best_effort(Path::new(&meta.worktree_path));
+    let current = crate::sandbox::canonicalize_best_effort(cwd);
+    if current == wt {
+        let main_git_dir =
+            crate::sandbox::canonicalize_best_effort(&Path::new(&meta.original_cwd).join(".git"));
+        crate::sandbox::SandboxPolicy::for_worktree(&wt, &main_git_dir)
+    } else {
+        crate::sandbox::SandboxPolicy::for_project(cwd)
+    }
 }
 
 /// Session-scoped orchestrators that attach once a session exists: the
@@ -1093,47 +1136,113 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
 /// (`Write`/`Edit`) against write confinement (project root + temp + plans
 /// dir, `.git` protected). Block reasons surface to the model as tool
 /// errors. Bash stays approval-gated only (no seatbelt in the pi slice).
-fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path) {
+///
+/// Danger mode lifts write confinement — the user's highest authorization
+/// level honors the settings panel's "edit any file" promise. Reads keep
+/// the sensitive-path deny-list in every mode: a secret read is an
+/// irreversible exfiltration even under full trust.
+fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path, gate: &Arc<ApprovalGate>) {
     let cwd = cwd.to_path_buf();
     let read_policy = Arc::new(crate::path_policy::ReadPolicy::new());
     let write_policy = Arc::new(crate::path_policy::WritePolicy::for_project(&cwd));
+    let gate = Arc::clone(gate);
     session.on(
         pi::harness::HookPoint::ToolCall,
         Arc::new(move |mut ctx| {
+            let danger = gate.mode() == ApprovalMode::Danger;
             let tool_name = ctx
                 .data
                 .get("tool_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let verdict = match tool_name {
-                "Read" | "Ls" | "Grep" | "Find" => ctx
-                    .data
-                    .get("args")
-                    .and_then(|a| a.get("path"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|raw| read_policy.check(&resolve_tool_path(raw, &cwd)).err()),
-                "Write" => ctx
-                    .data
-                    .get("args")
-                    .and_then(|a| a.get("path"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|raw| write_policy.check(&resolve_tool_path(raw, &cwd)).err()),
-                // Edit carries `{patch}` (hashline) with no top-level `path`;
-                // confinement checks every `[path#TAG]` section target.
-                "Edit" => ctx
-                    .data
-                    .get("args")
-                    .and_then(|a| a.get("patch"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|patch| write_policy.check_edit_patch(patch, &cwd).err()),
-                _ => None,
-            };
+            let args = ctx
+                .data
+                .get("args")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let verdict =
+                path_policy_verdict(tool_name, &args, &cwd, &read_policy, &write_policy, danger);
             if let Some(reason) = verdict {
                 ctx.block_reason = Some(reason);
             }
             ctx
         }),
     );
+}
+
+/// Pure verdict for the path-policy hook: `Some(reason)` blocks the call.
+/// Extracted from the hook closure so the danger/read/write matrix is
+/// unit-testable without a live session.
+fn path_policy_verdict(
+    tool_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    cwd: &Path,
+    read_policy: &crate::path_policy::ReadPolicy,
+    write_policy: &crate::path_policy::WritePolicy,
+    danger: bool,
+) -> Option<String> {
+    match tool_name {
+        "Read" | "Ls" | "Grep" | "Find" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| read_policy.check(&resolve_tool_path(raw, cwd)).err()),
+        "Write" => {
+            let target = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|raw| resolve_tool_path(raw, cwd));
+            match target {
+                Some(p) if !danger => write_policy.check(&p).err(),
+                // Danger lifts write confinement but repo internals stay
+                // protected: `.git` is repository structure, not a file the
+                // "edit any file" promise covers (the c5aefe4d escape
+                // class — a direct write into `.git` bypasses git itself).
+                Some(p) if danger && has_git_component(&p) => Some(format!(
+                    "Write blocked by path policy (`.git` is protected even in Danger): {}. \
+                     Use git commands through bash (unsandboxed in Danger) for git state.",
+                    p.display()
+                )),
+                _ => None,
+            }
+        }
+        // Edit carries `{patch}` (hashline) with no top-level `path`;
+        // confinement checks every `[path#TAG]` section target.
+        "Edit" if !danger => args
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .and_then(|patch| write_policy.check_edit_patch(patch, cwd).err()),
+        // Danger: same `.git`-only guard across every patch target.
+        "Edit" if danger => args
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .and_then(|patch| {
+                let targets = pi::hashline::parse_patch(patch).ok()?;
+                let hit = targets.iter().find(|fp| {
+                    let t = if fp.path.is_absolute() {
+                        fp.path.clone()
+                    } else {
+                        cwd.join(&fp.path)
+                    };
+                    has_git_component(&t)
+                });
+                hit.map(|fp| {
+                    format!(
+                        "Edit blocked by path policy (`.git` is protected even in Danger): {}. \
+                     Use git commands through bash (unsandboxed in Danger) for git state.",
+                        fp.path.display()
+                    )
+                })
+            }),
+        _ => None,
+    }
+}
+
+/// Whether a canonicalized path contains a `.git` component anywhere.
+fn has_git_component(path: &Path) -> bool {
+    crate::path_policy::canonicalize_best_effort(path)
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
 }
 
 /// Resolve a tool `path` argument against the session cwd (relative paths),
@@ -1246,7 +1355,7 @@ async fn run_actor(
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
-                attach_path_policy_hooks(&mut s, &tool_cwd);
+                attach_path_policy_hooks(&mut s, &tool_cwd, &state.gate);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 restored = true;
                 session = Some(s);
@@ -1278,7 +1387,7 @@ async fn run_actor(
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
-                    attach_path_policy_hooks(&mut s, &cwd);
+                    attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                     attach_plugin_hooks(&mut s, &cwd);
                     s
                 }
@@ -1707,6 +1816,24 @@ async fn run_actor(
                         continue;
                     }
                 };
+                // The worktree sidecar + shared state must be in place
+                // BEFORE the session rebuild: `build_tools` derives the
+                // sandbox policy from the active-worktree state
+                // (worktree-scoped confinement with the bound repo's `.git`
+                // re-opened). The WorktreeChanged notice fires early here;
+                // the final refresh_session_list repaints everything.
+                let meta = pi_extensions::session_meta::WorktreeMeta {
+                    worktree_path: worktree_path.display().to_string(),
+                    branch,
+                    original_session_path: current_path.display().to_string(),
+                    original_cwd: original_cwd.display().to_string(),
+                };
+                if let Err(err) =
+                    write_worktree_sidecar(&sessions_dir, &fork_path, Some(meta)).await
+                {
+                    tracing::warn!(error = %err, "failed to persist worktree sidecar");
+                }
+                resync_worktree_state(&sessions_dir, &fork_path, &state.worktree, &notice_tx).await;
                 rebuild_session(
                     &mut session,
                     &fork_path,
@@ -1731,18 +1858,6 @@ async fn run_actor(
                     &wakeup_tx,
                 );
                 resync_plan_state(&sessions_dir, &fork_path, &state.plan, &notice_tx).await;
-                let meta = pi_extensions::session_meta::WorktreeMeta {
-                    worktree_path: worktree_path.display().to_string(),
-                    branch,
-                    original_session_path: current_path.display().to_string(),
-                    original_cwd: original_cwd.display().to_string(),
-                };
-                if let Err(err) =
-                    write_worktree_sidecar(&sessions_dir, &fork_path, Some(meta)).await
-                {
-                    tracing::warn!(error = %err, "failed to persist worktree sidecar");
-                }
-                resync_worktree_state(&sessions_dir, &fork_path, &state.worktree, &notice_tx).await;
                 *state.active_path.lock().unwrap() = Some(fork_path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
@@ -1811,7 +1926,7 @@ async fn run_actor(
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
                         attach_plan_hooks(&mut s, &state.plan, &cwd);
-                        attach_path_policy_hooks(&mut s, &cwd);
+                        attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                         attach_plugin_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
@@ -1917,6 +2032,10 @@ async fn rebuild_session(
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
             attach_plan_hooks(&mut s, plan, &cwd);
+            // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
+            // the same path policy as fresh builds — without it the
+            // replaced session loses write confinement entirely.
+            attach_path_policy_hooks(&mut s, &cwd, gate);
             attach_plugin_hooks(&mut s, &cwd);
             *session = s;
         }
@@ -3613,5 +3732,107 @@ mod tests {
             jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
             "the mid-run switch must persist a model_change entry for the new model"
         );
+    }
+
+    #[test]
+    fn path_policy_verdict_blocks_outside_writes_outside_danger() {
+        let cwd = Path::new("/tmp/manox-policy-hook-proj");
+        let read = crate::path_policy::ReadPolicy::new();
+        let write = crate::path_policy::WritePolicy::for_project(cwd);
+        let args = serde_json::json!({ "path": "/etc/manox-hook-x" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let reason = path_policy_verdict("Write", &args, cwd, &read, &write, false).unwrap();
+        assert!(reason.contains("outside"), "{reason}");
+    }
+
+    #[test]
+    fn path_policy_verdict_danger_lifts_write_confinement_but_keeps_read_denylist() {
+        let cwd = Path::new("/tmp/manox-policy-hook-proj");
+        let read = crate::path_policy::ReadPolicy::new();
+        let write = crate::path_policy::WritePolicy::for_project(cwd);
+        // Danger: an out-of-project Write and an out-of-project Edit both pass.
+        let write_args = serde_json::json!({ "path": "/etc/manox-hook-x" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            path_policy_verdict("Write", &write_args, cwd, &read, &write, true).is_none(),
+            "danger Write passes"
+        );
+        let edit_args = serde_json::json!({ "patch": "*** Begin Patch\n[/etc/manox-hook-x#1A2B]\nDEL 1\n*** End Patch" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            path_policy_verdict("Edit", &edit_args, cwd, &read, &write, true).is_none(),
+            "danger Edit passes"
+        );
+        // Repo internals stay protected even under Danger: `.git` is
+        // repository structure, not a file the "edit any file" promise
+        // covers (a direct write bypasses git itself).
+        let git_write_args = serde_json::json!({ "path": cwd.join(".git/config") })
+            .as_object()
+            .unwrap()
+            .clone();
+        let reason =
+            path_policy_verdict("Write", &git_write_args, cwd, &read, &write, true).unwrap();
+        assert!(reason.contains(".git"), "{reason}");
+        let git_edit_args = serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n[{}/.git/config#1A2B]\nDEL 1\n*** End Patch",
+                cwd.display()
+            )
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let reason = path_policy_verdict("Edit", &git_edit_args, cwd, &read, &write, true).unwrap();
+        assert!(reason.contains(".git"), "{reason}");
+        // Reads keep the sensitive-path deny-list even under Danger: a
+        // secret read is an irreversible exfiltration.
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let read_args = serde_json::json!({ "path": home.join(".ssh/id_rsa") })
+            .as_object()
+            .unwrap()
+            .clone();
+        let reason = path_policy_verdict("Read", &read_args, cwd, &read, &write, true).unwrap();
+        assert!(reason.contains("sensitive"), "{reason}");
+    }
+
+    #[test]
+    fn worktree_policy_scopes_to_the_active_worktree_and_falls_back() {
+        let base = crate::sandbox::canonicalize_best_effort(&std::env::temp_dir())
+            .join("manox-wt-policy-proj");
+        let wt = base.join("wt");
+        let state = crate::worktree::new_state();
+        // No active worktree → project policy (anchor None).
+        let p = worktree_policy(&wt, &state);
+        assert!(p.worktree_anchor().is_none());
+        // Active worktree matching the session cwd → worktree-scoped:
+        // writable in the worktree, the bound repo's shared `.git`
+        // re-opened, network unrestricted.
+        *state.lock().unwrap() = Some(pi_extensions::session_meta::WorktreeMeta {
+            worktree_path: wt.display().to_string(),
+            branch: "b".into(),
+            original_session_path: "x".into(),
+            original_cwd: base.display().to_string(),
+        });
+        let p = worktree_policy(&wt, &state);
+        assert_eq!(p.worktree_anchor(), Some(wt.as_path()));
+        assert!(p.is_write_allowed(&wt.join("file")), "worktree writable");
+        assert!(
+            p.is_write_allowed(&base.join(".git/refs/head")),
+            "bound repo .git re-opened"
+        );
+        assert!(matches!(
+            p.network(),
+            crate::sandbox::NetworkPolicy::Unrestricted
+        ));
+        // Session cwd back at the original repo (Exit) → project policy
+        // again, not the stale worktree scope.
+        let p2 = worktree_policy(&base, &state);
+        assert!(p2.worktree_anchor().is_none());
     }
 }

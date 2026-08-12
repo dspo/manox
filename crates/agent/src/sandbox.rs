@@ -27,6 +27,12 @@
 //! (`cd`/exports) does not persist across sandboxed calls; the tool's `cwd`
 //! parameter pins the working directory per call.
 //!
+//! Escalation: the engine also installs [`UnsandboxedBashOperations`] into
+//! the bash tool's escalation slot — direct `bash -c` with no confinement.
+//! A call escalates when the model passes `unsandboxed: true` or the host's
+//! force resolver (Danger mode) says so; authorization is host policy, never
+//! the model's word.
+//!
 //! ## Honest gaps
 //!
 //! - Linux/Windows: [`is_available`] returns false; the engine falls back to
@@ -48,14 +54,13 @@ use std::path::{Path, PathBuf};
 
 use pi::env::{CommandResult, ExecutionError};
 use pi::tools::bash::{BashExecRequest, BashOperations};
-// macOS-only: the seatbelt exec path is the only consumer naming `Duration`
-// (the Linux exec stub returns before any timeout handling).
-#[cfg(target_os = "macos")]
+use tokio_util::sync::CancellationToken;
+// Shared by the sandboxed and unsandboxed exec paths (both honor a
+// wall-clock timeout; the seatbelt path was the original consumer).
 use std::time::Duration;
 
-/// Default wall-clock limit for a sandboxed command (mirrors the bash
-/// tool's own default).
-#[cfg(target_os = "macos")]
+/// Default wall-clock limit for a one-shot command (mirrors the bash tool's
+/// own default).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Network policy for sandboxed bash.
@@ -360,7 +365,9 @@ pub const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
     ("PAGER", "cat"),
 ];
 
-#[cfg(target_os = "macos")]
+/// Inject the non-interactive editor/pager defaults on every platform (the
+/// sandboxed backend only runs on macOS, but the unsandboxed backend is
+/// cross-platform).
 fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
     for (k, v) in NONINTERACTIVE_ENV {
         if std::env::var_os(k).is_none() {
@@ -371,7 +378,7 @@ fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
 
 /// The login shell's PATH (cached), with a conservative fallback — mirrors
 /// `path_env` (PR #467); consolidated after both land.
-#[cfg(target_os = "macos")] // sole caller is the seatbelt `wrap_command`
+#[cfg(target_os = "macos")] // consumers: the seatbelt `wrap_command` + unsandboxed backend
 fn login_shell_path() -> String {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -445,69 +452,123 @@ impl BashOperations for SandboxedBashOperations {
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
-            let mut child = cmd
+            let child = cmd
                 .spawn()
                 .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
-
-            let mut stdout = child.stdout.take().expect("stdout piped");
-            let mut stderr = child.stderr.take().expect("stderr piped");
-            let on_data = request.on_data;
-
-            use tokio::io::AsyncReadExt as _;
-            let drain = async {
-                let mut out_buf = Vec::new();
-                let mut err_buf = Vec::new();
-                let mut out_chunk = [0u8; 8192];
-                let mut err_chunk = [0u8; 8192];
-                let mut out_done = false;
-                let mut err_done = false;
-                loop {
-                    if out_done && err_done {
-                        break;
-                    }
-                    tokio::select! {
-                        r = stdout.read(&mut out_chunk), if !out_done => match r {
-                            Ok(0) => out_done = true,
-                            Ok(n) => {
-                                out_buf.extend_from_slice(&out_chunk[..n]);
-                                if let Some(cb) = on_data { cb(&out_chunk[..n]); }
-                            }
-                            Err(_) => out_done = true,
-                        },
-                        r = stderr.read(&mut err_chunk), if !err_done => match r {
-                            Ok(0) => err_done = true,
-                            Ok(n) => {
-                                err_buf.extend_from_slice(&err_chunk[..n]);
-                                if let Some(cb) = on_data { cb(&err_chunk[..n]); }
-                            }
-                            Err(_) => err_done = true,
-                        },
-                    }
-                }
-                let status = child.wait().await;
-                (out_buf, err_buf, status)
-            };
-
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            let (out_buf, err_buf, status) = tokio::select! {
-                r = drain => r,
-                _ = request.signal.cancelled() => {
-                    // Dropping the child (kill_on_drop) kills the process
-                    // tree.
-                    return Err(ExecutionError::Aborted);
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    return Err(ExecutionError::Timeout(timeout));
-                }
-            };
-
-            let status = status.map_err(|e| ExecutionError::Other(e.to_string()))?;
-            Ok(CommandResult {
-                stdout: String::from_utf8_lossy(&out_buf).into_owned(),
-                stderr: String::from_utf8_lossy(&err_buf).into_owned(),
-                exit_code: status.code().unwrap_or(-1),
-            })
+            run_to_completion(child, request.on_data, timeout, &request.signal).await
         }
+    }
+}
+
+/// Drain a spawned child to completion with streaming output, wall-clock
+/// timeout, and cancellation. Shared by the sandboxed and unsandboxed
+/// backends: both build a `tokio::process::Command`, spawn, then converge
+/// on the same semantics (drop kills the tree via `kill_on_drop`).
+async fn run_to_completion(
+    child: tokio::process::Child,
+    on_data: Option<pi::tools::bash::BashDataCallback<'_>>,
+    timeout: Duration,
+    signal: &CancellationToken,
+) -> Result<CommandResult, ExecutionError> {
+    let mut child = child;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+
+    use tokio::io::AsyncReadExt as _;
+    let drain = async {
+        let mut out_buf = Vec::new();
+        let mut err_buf = Vec::new();
+        let mut out_chunk = [0u8; 8192];
+        let mut err_chunk = [0u8; 8192];
+        let mut out_done = false;
+        let mut err_done = false;
+        loop {
+            if out_done && err_done {
+                break;
+            }
+            tokio::select! {
+                r = stdout.read(&mut out_chunk), if !out_done => match r {
+                    Ok(0) => out_done = true,
+                    Ok(n) => {
+                        out_buf.extend_from_slice(&out_chunk[..n]);
+                        if let Some(cb) = on_data { cb(&out_chunk[..n]); }
+                    }
+                    Err(_) => out_done = true,
+                },
+                r = stderr.read(&mut err_chunk), if !err_done => match r {
+                    Ok(0) => err_done = true,
+                    Ok(n) => {
+                        err_buf.extend_from_slice(&err_chunk[..n]);
+                        if let Some(cb) = on_data { cb(&err_chunk[..n]); }
+                    }
+                    Err(_) => err_done = true,
+                },
+            }
+        }
+        let status = child.wait().await;
+        (out_buf, err_buf, status)
+    };
+
+    let (out_buf, err_buf, status) = tokio::select! {
+        r = drain => r,
+        _ = signal.cancelled() => {
+            // Dropping the child (kill_on_drop) kills the process tree.
+            return Err(ExecutionError::Aborted);
+        }
+        _ = tokio::time::sleep(timeout) => {
+            return Err(ExecutionError::Timeout(timeout));
+        }
+    };
+
+    let status = status.map_err(|e| ExecutionError::Other(e.to_string()))?;
+    Ok(CommandResult {
+        stdout: String::from_utf8_lossy(&out_buf).into_owned(),
+        stderr: String::from_utf8_lossy(&err_buf).into_owned(),
+        exit_code: status.code().unwrap_or(-1),
+    })
+}
+
+/// One-shot unsandboxed bash backend: direct `bash -c` execution with no
+/// seatbelt confinement. Installed as the `BashTool` escalation slot and
+/// selected by Danger mode (host-forced) or a per-call `unsandboxed: true`;
+/// the escalation counterpart of [`SandboxedBashOperations`]. The same
+/// non-interactive git env and login PATH are injected so escalated git/gh
+/// runs behave identically minus the confinement.
+pub struct UnsandboxedBashOperations {
+    base_cwd: PathBuf,
+}
+
+impl UnsandboxedBashOperations {
+    pub fn new(base_cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            base_cwd: base_cwd.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BashOperations for UnsandboxedBashOperations {
+    async fn exec(&self, request: BashExecRequest<'_>) -> Result<CommandResult, ExecutionError> {
+        let cwd = request
+            .cwd
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.base_cwd.clone());
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(request.command)
+            .current_dir(&cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(target_os = "macos")]
+        cmd.env("PATH", login_shell_path());
+        inject_noninteractive_env(&mut cmd);
+        let child = cmd
+            .spawn()
+            .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
+        let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        run_to_completion(child, request.on_data, timeout, &request.signal).await
     }
 }
 
@@ -682,5 +743,59 @@ mod tests {
         let res = ops.exec(req).await.expect("exec itself succeeds");
         assert_ne!(res.exit_code, 0, "seatbelt denies the write");
         assert!(!denied_target.exists());
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_exec_runs_without_confinement() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops = UnsandboxedBashOperations::new(&root);
+
+        let req = BashExecRequest {
+            command: "printf 'hello unsandboxed'",
+            cwd: Some(&root),
+            timeout: Some(Duration::from_secs(30)),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_data: None,
+        };
+        let res = ops.exec(req).await.expect("unsandboxed exec runs");
+        assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout, "hello unsandboxed");
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_exec_respects_timeout() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops = UnsandboxedBashOperations::new(&root);
+
+        let req = BashExecRequest {
+            command: "sleep 30",
+            cwd: Some(&root),
+            timeout: Some(Duration::from_millis(100)),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_data: None,
+        };
+        let err = ops.exec(req).await.expect_err("sleep outlives the timeout");
+        assert!(matches!(err, ExecutionError::Timeout(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_exec_respects_cancellation() {
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let ops = UnsandboxedBashOperations::new(&root);
+        let signal = tokio_util::sync::CancellationToken::new();
+        signal.cancel();
+
+        let req = BashExecRequest {
+            command: "sleep 30",
+            cwd: Some(&root),
+            timeout: Some(Duration::from_secs(30)),
+            signal,
+            on_data: None,
+        };
+        let err = ops.exec(req).await.expect_err("pre-cancelled token aborts");
+        assert!(matches!(err, ExecutionError::Aborted), "{err:?}");
     }
 }

@@ -24,5 +24,5 @@
 - node：{{ runtime.node }}
 - 今天：{{ runtime.today }}
 {% if runtime.approval_mode == "Danger" -%}
-- 模式：危险驾驶（工具调用无需审批，bash 在沙箱外运行）
+- 模式：危险驾驶（工具调用无需审批；bash 在沙箱外运行并带网络；文件写入不受路径限制）
 {% endif -%}

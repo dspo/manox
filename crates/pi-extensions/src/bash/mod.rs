@@ -31,8 +31,11 @@ const DEFAULT_MAX_LINES: usize = 2000;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 /// The bash tool with the manox product surface: optional `cwd`, background
-/// execution via the registry, and head/tail line filters on top of the core
-/// execution semantics.
+/// execution via the registry, head/tail line filters, and an escalation
+/// slot — a per-call `unsandboxed` flag plus a host-injected force resolver
+/// (e.g. Danger mode) that overrides the flag regardless of what the model
+/// passed. Escalated calls run through `unsandboxed_operations` (no
+/// confinement); all other calls ride the default backend.
 pub struct BashTool {
     operations: Arc<dyn BashOperations>,
     registry: Arc<dyn BackgroundTaskRegistry>,
@@ -40,6 +43,15 @@ pub struct BashTool {
     /// Optional orchestrator: when bound, background tasks are registered,
     /// watched, and their completions steered into the agent session.
     manager: Option<Arc<BackgroundManager>>,
+    /// Backend used when a call escalates (`unsandboxed: true` or the force
+    /// resolver returns true). Absent, escalated calls fall back to the
+    /// default backend (the slot stays open for hosts without a second
+    /// backend).
+    unsandboxed_operations: Option<Arc<dyn BashOperations>>,
+    /// Host-injected resolver that forces escalation for a call regardless
+    /// of the model's `unsandboxed` argument — authorization is host
+    /// policy, never the model's word.
+    force_unsandboxed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl BashTool {
@@ -52,12 +64,31 @@ impl BashTool {
             registry,
             command_prefix: None,
             manager: None,
+            unsandboxed_operations: None,
+            force_unsandboxed: None,
         }
     }
 
     /// Prepend a command to every invocation (shell setup commands).
     pub fn with_command_prefix(mut self, prefix: Option<String>) -> Self {
         self.command_prefix = prefix;
+        self
+    }
+
+    /// Bind the escalation backend: calls that escalate (`unsandboxed: true`
+    /// or the force resolver returning true) run through this backend
+    /// instead of the default one. When the host installs no second backend,
+    /// escalated calls keep the default backend.
+    pub fn with_unsandboxed_operations(mut self, ops: Arc<dyn BashOperations>) -> Self {
+        self.unsandboxed_operations = Some(ops);
+        self
+    }
+
+    /// Bind the force-escalation resolver. It runs per call; a `true` return
+    /// escalates regardless of the model's `unsandboxed` argument. Hosts
+    /// wire this to their authorization state (e.g. Danger mode).
+    pub fn with_force_unsandboxed(mut self, resolver: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.force_unsandboxed = Some(resolver);
         self
     }
 
@@ -82,7 +113,9 @@ impl AgentTool for BashTool {
          Optionally run in the background with `run_in_background: true` — the command starts in a \
          fresh shell (no persistent state) at the session cwd — and collect output via `bash_output`; \
          stop it with `task_stop`. Use `head_lines`/`tail_lines` to keep a selection of the output \
-         instead of piping through `head`/`tail`."
+         instead of piping through `head`/`tail`. Set `unsandboxed: true` to run without the sandbox \
+         (no write/network confinement; requires user approval in non-Danger modes). In Danger mode \
+         the host escalates every call regardless of this flag."
     }
 
     fn is_read_only(&self) -> bool {
@@ -118,6 +151,10 @@ impl AgentTool for BashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Start the command in the background and return a task id immediately; poll with bash_output, stop with task_stop"
+                },
+                "unsandboxed": {
+                    "type": "boolean",
+                    "description": "Run without the sandbox (no write/network confinement). Requires user approval in non-Danger modes; Danger mode escalates every call regardless."
                 },
                 "head_lines": {
                     "type": "integer",
@@ -176,6 +213,11 @@ impl BashTool {
         let cwd_override = resolve_cwd(params.get("cwd"), ctx.cwd());
         let run_cwd = cwd_override.as_deref().unwrap_or_else(|| ctx.cwd());
         let run_in_background = params["run_in_background"].as_bool().unwrap_or(false);
+        // Escalation: the model's explicit flag OR the host's force resolver
+        // (Danger mode). Authorization is host policy — the model cannot
+        // downgrade a forced escalation by passing `unsandboxed: false`.
+        let escalate = params["unsandboxed"].as_bool().unwrap_or(false)
+            || self.force_unsandboxed.as_ref().is_some_and(|f| f());
         let head_lines = params["head_lines"].as_u64().map(|v| v as usize);
         let tail_lines = params["tail_lines"].as_u64().map(|v| v as usize);
 
@@ -200,8 +242,14 @@ impl BashTool {
             )));
         }
 
-        let result = self
-            .operations
+        let backend = if escalate {
+            self.unsandboxed_operations
+                .as_deref()
+                .unwrap_or(&*self.operations)
+        } else {
+            &*self.operations
+        };
+        let result = backend
             .exec(BashExecRequest {
                 command: &command,
                 cwd: cwd_override.as_deref(),
@@ -482,5 +530,158 @@ mod tests {
         assert_eq!(select_lines(text, Some(2), None), "a\nb");
         assert_eq!(select_lines(text, None, Some(2)), "d\ne");
         assert_eq!(select_lines(text, None, None), text);
+    }
+
+    /// Recording backend that tags each call with its identity so tests can
+    /// assert which backend handled an invocation.
+    struct TaggedOps {
+        tag: &'static str,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl BashOperations for TaggedOps {
+        async fn exec(
+            &self,
+            _request: BashExecRequest<'_>,
+        ) -> Result<CommandResult, pi::env::ExecutionError> {
+            self.calls.lock().unwrap().push(self.tag.to_string());
+            Ok(CommandResult {
+                stdout: format!("ran={}", self.tag),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    fn output_text(result: &AgentToolResult) -> String {
+        match &result.content[0] {
+            pi::types::ContentBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_calls_ride_the_default_backend() {
+        let sandboxed = Arc::new(TaggedOps {
+            tag: "sandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let unsandboxed = Arc::new(TaggedOps {
+            tag: "unsandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry))
+            .with_unsandboxed_operations(unsandboxed.clone());
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "echo hi"}),
+                CancellationToken::new(),
+                &ctx("/base"),
+            )
+            .await
+            .unwrap();
+        assert!(output_text(&result).contains("ran=sandboxed"));
+        assert_eq!(unsandboxed.calls.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_unsandboxed_flag_routes_to_the_unsandboxed_backend() {
+        let sandboxed = Arc::new(TaggedOps {
+            tag: "sandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let unsandboxed = Arc::new(TaggedOps {
+            tag: "unsandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry))
+            .with_unsandboxed_operations(unsandboxed.clone());
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "git push", "unsandboxed": true}),
+                CancellationToken::new(),
+                &ctx("/base"),
+            )
+            .await
+            .unwrap();
+        assert!(output_text(&result).contains("ran=unsandboxed"));
+        assert_eq!(sandboxed.calls.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn force_resolver_overrides_a_false_flag() {
+        let sandboxed = Arc::new(TaggedOps {
+            tag: "sandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let unsandboxed = Arc::new(TaggedOps {
+            tag: "unsandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry))
+            .with_unsandboxed_operations(unsandboxed.clone())
+            .with_force_unsandboxed(Arc::new(|| true));
+        // The model explicitly passed `unsandboxed: false`; the host's force
+        // resolver (Danger mode) still escalates.
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "git push", "unsandboxed": false}),
+                CancellationToken::new(),
+                &ctx("/base"),
+            )
+            .await
+            .unwrap();
+        assert!(output_text(&result).contains("ran=unsandboxed"));
+        assert_eq!(sandboxed.calls.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn force_resolver_false_keeps_the_sandboxed_backend() {
+        let sandboxed = Arc::new(TaggedOps {
+            tag: "sandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let unsandboxed = Arc::new(TaggedOps {
+            tag: "unsandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry))
+            .with_unsandboxed_operations(unsandboxed.clone())
+            .with_force_unsandboxed(Arc::new(|| false));
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "echo hi", "unsandboxed": true}),
+                CancellationToken::new(),
+                &ctx("/base"),
+            )
+            .await
+            .unwrap();
+        // The explicit flag alone escalates; the resolver only forces.
+        assert!(output_text(&result).contains("ran=unsandboxed"));
+    }
+
+    #[tokio::test]
+    async fn escalated_call_falls_back_to_default_without_second_backend() {
+        let sandboxed = Arc::new(TaggedOps {
+            tag: "sandboxed",
+            calls: Mutex::new(Vec::new()),
+        });
+        // No `with_unsandboxed_operations`: escalation must not fail, it
+        // rides the default backend.
+        let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry));
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "echo hi", "unsandboxed": true}),
+                CancellationToken::new(),
+                &ctx("/base"),
+            )
+            .await
+            .unwrap();
+        assert!(output_text(&result).contains("ran=sandboxed"));
     }
 }
