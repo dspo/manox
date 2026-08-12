@@ -179,8 +179,54 @@ pub enum BackendNotice {
     /// should refresh so the conversation appears at send time, not at
     /// turn end.
     SessionListDirty,
+    /// A team tool's round trip: the tool (tokio) sends the op; the facade
+    /// (gpui, owns the `Entity<Team>` / member threads) executes it on the
+    /// main thread and replies with the model-facing string. Mirrors the
+    /// approval-gate round-trip architecture.
+    TeamRequest {
+        op: TeamOp,
+        responder: async_channel::Sender<Result<String, String>>,
+    },
 }
 
+/// One team operation a team tool asks the facade to run.
+#[derive(Debug, Clone)]
+pub enum TeamOp {
+    Create {
+        name: String,
+        members: Vec<MemberSpec>,
+    },
+    Spawn {
+        spec: MemberSpec,
+    },
+    Send {
+        to: String,
+        content: String,
+    },
+    Disband,
+    TaskCreate {
+        subject: String,
+        description: Option<String>,
+    },
+    TaskList,
+    TaskUpdate {
+        id: String,
+        status: Option<crate::team::TaskStatus>,
+        owner: Option<Option<String>>,
+        subject: Option<String>,
+    },
+    TaskGet {
+        id: String,
+    },
+}
+
+/// A worker member to spawn (`TeamCreate` initial roster / `TeamSpawn`).
+#[derive(Debug, Clone)]
+pub struct MemberSpec {
+    pub name: String,
+    pub role: String,
+    pub prompt: String,
+}
 /// An owned engine handle plus its notice channel receiver. Spawning the
 /// engine returns both; the facade drains the receiver on the gpui thread.
 pub struct SpawnedEngine {

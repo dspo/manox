@@ -31,6 +31,7 @@ pub mod provider;
 pub mod runtime;
 pub mod settings;
 pub mod skill;
+pub mod team;
 pub mod title;
 pub mod tools;
 pub mod version;

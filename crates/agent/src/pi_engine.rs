@@ -450,6 +450,34 @@ fn build_tools(
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
+    // Team coordination tools: every session registers the full set; the
+    // facade routes ops through the calling thread's team (leader or
+    // member), and ops without a team return clean errors. Write-axis
+    // governance rides the thread's approval mode like any other tool.
+    tools.push(Arc::new(crate::team::tools::TeamCreateTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TeamSpawnTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TeamDisbandTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::SendMessageTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TaskCreateTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TaskListTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TaskUpdateTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TaskGetTool::new(
+        notice_tx.clone(),
+    )));
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`

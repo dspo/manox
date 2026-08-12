@@ -36,7 +36,8 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
 | Sub-agent 观察面板 / Agents 树 | ⏳ | pi-extensions SubagentTool 已装配，观察 UI 随 manox 移除 |
 | Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
-| Goal / Team | ⏳ | manox 目标/团队体系，随 harness 移除 |
+| Goal | ⏳ | manox 目标体系，随 harness 移除 |
+| Team | ✅ 部分 | 后端完整（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）；roster/MemberPanel UI 为后续项 |
 
 分层纪律：crates/pi 只做 TS Pi 对齐与扩展点；harness 能力扩展一律走
 crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
