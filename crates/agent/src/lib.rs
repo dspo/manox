@@ -39,6 +39,7 @@ pub mod team;
 pub mod title;
 pub mod tools;
 pub mod version;
+pub mod web_fetch;
 pub mod webview_host;
 
 pub mod thread;
