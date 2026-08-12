@@ -396,6 +396,7 @@ turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
+slash-danger-desc = 切换到危险驾驶（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-exit-desc = 归档当前会话并开始一个新会话
 slash-new-desc = 归档当前会话并开始新会话，保留项目、驾驶模式与模型
 ### main.rs (system menus)
