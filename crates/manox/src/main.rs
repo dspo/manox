@@ -53,6 +53,20 @@ fn main() {
         );
         eprintln!("{msg}");
         tracing::error!("{msg}");
+        // Persist every panic to a durable log: launchd swallows stderr, so a
+        // panicking process would otherwise leave no record for diagnosis.
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::Path::new(&home).join("Library/Logs/Manox");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+                .and_then(|mut f| {
+                    use std::io::Write as _;
+                    writeln!(f, "{msg}")
+                });
+        }
     }));
 
     tracing_subscriber::fmt()
