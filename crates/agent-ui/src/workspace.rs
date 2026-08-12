@@ -6855,6 +6855,29 @@ fn build_approval_content(
 }
 
 impl Workspace {
+    /// Toggle Danger mode on the current thread (`/danger` no-args form):
+    /// Danger → AutoPilot, anything else → Danger. The mode change notice
+    /// rides `apply_approval_mode` so the conversation shows the switch.
+    pub(crate) fn toggle_danger(&mut self, cx: &mut Context<Self>) {
+        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Danger {
+            ApprovalMode::AutoPilot
+        } else {
+            ApprovalMode::Danger
+        };
+        self.apply_approval_mode(next, cx);
+    }
+
+    /// Enable Danger mode (if not already on) and immediately send `prompt`
+    /// as a user turn — the `/danger [prompt]` form. Slash dispatch only
+    /// fires while idle (the submit gate); `/danger Y` typed mid-turn parks
+    /// in the follow-up queue as raw text like any other message.
+    pub(crate) fn start_danger_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.thread.read(cx).approval_mode() != ApprovalMode::Danger {
+            self.apply_approval_mode(ApprovalMode::Danger, cx);
+        }
+        self.send_user_turn(prompt, Vec::new(), cx);
+    }
+
     /// Switch the thread's `ApprovalMode`, post a localized notice, and close
     /// the popover. Centralized so slash command, chip click, and the
     /// future settings-panel wiring all funnel through one path.

@@ -445,6 +445,7 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
+slash-danger-desc = Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-exit-desc = Archive the current thread and start a fresh one
 slash-new-desc = Archive the current thread and start a fresh one that keeps the project, approval mode, and model
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit

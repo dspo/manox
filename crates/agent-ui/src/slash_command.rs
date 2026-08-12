@@ -15,9 +15,9 @@
 //! (alias `/quit`; archive the current thread and start a fresh one, see
 //! [`ExitCommand`]), and `/new` (aliases `/clear`, `/archive`; archive the
 //! current thread and start a fresh one that keeps the project, approval
-//! mode, and model, see [`NewCommand`]). The retired manox harness
-//! additionally had `/danger` (see git history / `origin/Manox` backup
-//! branch); markdown prompt-macros and skills are
+//! mode, and model, see [`NewCommand`]), and `/danger` (toggle the thread's
+//! approval mode, optionally with a prompt that starts working immediately,
+//! see [`DangerCommand`]); markdown prompt-macros and skills are
 //! mirrored into the registry at startup from the shared `agent::command` /
 //! `agent::skill` registries ([`MarkdownSlashCommand`] /
 //! [`SkillSlashCommand`]).
@@ -41,8 +41,8 @@ pub enum SlashResult {
     #[default]
     Handled,
     /// The command wants the remaining text sent as a normal user turn after
-    /// performing any side effects (e.g. `/danger fix it` enables Danger then runs
-    /// the prompt). The `String` is the text to send (may differ from input).
+    /// performing any side effects (e.g. `/plan fix it` enables plan mode then
+    /// runs the prompt). The `String` is the text to send (may differ from input).
     InjectUserTurn(String),
     /// The command did nothing; the input should be treated as a normal
     /// message. Distinct from `Handled` so the caller can fall back to
@@ -126,6 +126,7 @@ impl SlashCommandRegistry {
 /// any workspace is created. Idempotent via `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
+        Box::new(DangerCommand),
         Box::new(PlanCommand),
         Box::new(CompactCommand),
         Box::new(ExitCommand),
@@ -136,6 +137,7 @@ pub fn init(_cx: &mut App) {
     // skill sharing one is skipped — keeps one popover row per name and routes
     // dispatch to the higher-priority command/built-in.
     let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
+        "danger".to_string(),
         "plan".to_string(),
         "compact".to_string(),
         "exit".to_string(),
@@ -316,6 +318,36 @@ impl SlashCommand for SkillSlashCommand {
 /// the prompt immediately. Running `/plan` again exits plan mode (full
 /// write access restored). Plans are submitted for approval through the
 /// `ProposePlan` tool, never as prose.
+/// `/danger` — toggle Danger mode on the current thread.
+///
+/// `/danger` (no args) toggles Danger on/off and pushes a notice.
+/// `/danger [prompt]` enables Danger (if not already on) and immediately sends
+/// `prompt` as a user turn so the agent starts working with full autonomy.
+struct DangerCommand;
+
+impl SlashCommand for DangerCommand {
+    fn name(&self) -> &str {
+        "danger"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-danger-desc")
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        if args.is_empty() {
+            workspace.toggle_danger(cx);
+        } else {
+            workspace.start_danger_turn(args.to_string(), cx);
+        }
+        SlashResult::Handled
+    }
+}
+
 struct PlanCommand;
 
 impl SlashCommand for PlanCommand {
