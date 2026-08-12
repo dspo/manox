@@ -541,7 +541,43 @@ fn build_tools(
         )));
     }
 
-    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    // Browser tools (main-thread host round trips via the facade): the read
+    // axis stays ungated; the write axis rides the same approval gate as
+    // built-ins. Plan mode's ToolCall hook blocks both (fixed allowlist).
+    tools.push(Arc::new(crate::web_tools::WebExploreReadTextTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::web_tools::WebExploreReadDomTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::web_tools::WebExploreScreenshotTool::new(
+        notice_tx.clone(),
+    )));
+    for tool in [
+        Arc::new(crate::web_tools::WebExploreOpenTool::new(notice_tx.clone()))
+            as Arc<dyn PiAgentTool>,
+        Arc::new(crate::web_tools::WebExploreNavigateTool::new(
+            notice_tx.clone(),
+        )),
+        Arc::new(crate::web_tools::WebExploreClickTool::new(
+            notice_tx.clone(),
+        )),
+        Arc::new(crate::web_tools::WebExploreTypeTool::new(notice_tx.clone())),
+        Arc::new(crate::web_tools::WebExploreScrollTool::new(
+            notice_tx.clone(),
+        )),
+        Arc::new(crate::web_tools::WebExploreYieldTool::new(
+            notice_tx.clone(),
+        )),
+        Arc::new(crate::web_tools::WebExploreCloseTool::new(
+            notice_tx.clone(),
+        )),
+    ] {
+        tools.push(Arc::new(
+            ApprovalGatedTool::new(tool, Arc::clone(gate))
+                .with_plan_policy(Arc::clone(&plan_policy)),
+        ));
+    } // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
     // tests) contributes nothing.

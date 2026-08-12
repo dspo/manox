@@ -192,6 +192,14 @@ pub enum BackendNotice {
         op: TeamOp,
         responder: async_channel::Sender<Result<String, String>>,
     },
+    /// A browser tool's host round trip: the tool (tokio) sends the op with
+    /// a responder; the facade (gpui, owns the `BrowserHost`) executes it on
+    /// the main thread and replies through the channel. Mirrors the
+    /// approval-gate round-trip architecture.
+    BrowserRequest {
+        op: BrowserOp,
+        responder: async_channel::Sender<Result<BrowserReply, String>>,
+    },
 }
 
 /// One team operation a team tool asks the facade to run.
@@ -231,6 +239,59 @@ pub struct MemberSpec {
     pub name: String,
     pub role: String,
     pub prompt: String,
+}
+
+/// One browser operation a `web_explore_*` tool asks the host to run.
+#[derive(Debug, Clone)]
+pub enum BrowserOp {
+    Open {
+        url: String,
+    },
+    Navigate {
+        id: crate::webview_host::BrowserTabId,
+        url: String,
+    },
+    ReadText {
+        id: crate::webview_host::BrowserTabId,
+    },
+    ReadDom {
+        id: crate::webview_host::BrowserTabId,
+        selector: Option<String>,
+    },
+    Click {
+        id: crate::webview_host::BrowserTabId,
+        selector: String,
+    },
+    TypeText {
+        id: crate::webview_host::BrowserTabId,
+        selector: String,
+        text: String,
+    },
+    Scroll {
+        id: crate::webview_host::BrowserTabId,
+        dx: i32,
+        dy: i32,
+    },
+    Screenshot {
+        id: crate::webview_host::BrowserTabId,
+    },
+    YieldToUser {
+        id: crate::webview_host::BrowserTabId,
+    },
+    Close {
+        id: crate::webview_host::BrowserTabId,
+    },
+}
+
+/// The host's reply payload for a [`BrowserOp`].
+#[derive(Debug, Clone)]
+pub enum BrowserReply {
+    /// A newly opened tab's id.
+    TabId(crate::webview_host::BrowserTabId),
+    /// Textual read result (page text / DOM / screenshot snapshot).
+    Text(String),
+    /// Unit success (navigate / click / type / scroll / yield / close).
+    Unit,
 }
 /// An owned engine handle plus its notice channel receiver. Spawning the
 /// engine returns both; the facade drains the receiver on the gpui thread.
