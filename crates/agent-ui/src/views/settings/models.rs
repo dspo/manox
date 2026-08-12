@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Anchor, AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity,
+    Anchor, AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, Focusable,
     InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
@@ -41,7 +41,9 @@ use cx_providers::{
 };
 
 use super::SettingsView;
-use super::panels::{muted_text, section_card, section_header};
+use super::panels::{
+    blur_on_click_out, defer_blur_flush, muted_text, section_card, section_header,
+};
 
 const LABEL_W: f32 = 150.;
 const KEY_W: f32 = 220.;
@@ -165,6 +167,11 @@ pub struct ModelsPanelState {
     /// Handle to the settings window, kept so the debounced autosave task
     /// (which only sees an `AsyncApp`) can still surface toasts.
     window_handle: AnyWindowHandle,
+    /// Unsaved edits exist (set by `touch`, cleared by a successful `save`).
+    dirty: bool,
+    /// A save completed since the last blur; the next blur surfaces a "Saved"
+    /// toast.
+    pending_saved_toast: bool,
 }
 
 struct ProviderForm {
@@ -246,6 +253,8 @@ impl ModelsPanelState {
             next_form_id: 1,
             save_generation: 0,
             window_handle: window.window_handle(),
+            dirty: false,
+            pending_saved_toast: false,
         };
         state.reload_from_disk(window, cx);
         state
@@ -260,6 +269,10 @@ impl ModelsPanelState {
         self.pending_delete = None;
         self.selected = None;
         self.load_error = None;
+        // A reload discards unsaved edits; the flush-on-blur flags must not
+        // outlive them.
+        self.dirty = false;
+        self.pending_saved_toast = false;
 
         let path = match active_provider_config_path() {
             Ok(path) => path,
@@ -307,6 +320,7 @@ impl ModelsPanelState {
             return;
         }
         self.save_generation = self.save_generation.wrapping_add(1);
+        self.dirty = true;
         let generation = self.save_generation;
         let entity = cx.entity().clone();
         let handle = self.window_handle;
@@ -323,7 +337,9 @@ impl ModelsPanelState {
             let _ = handle.update(cx, |_view, window, cx| {
                 entity.update(cx, |this, cx| {
                     if this.models_panel.save_generation == generation {
-                        this.models_panel.save(window, cx);
+                        // Debounced safety net stays silent; blur surfaces the
+                        // "Saved" toast via `flush_on_blur`.
+                        let _ = this.models_panel.save(window, cx);
                     }
                 });
             });
@@ -652,10 +668,11 @@ impl ModelsPanelState {
     }
 
     /// Validate, write the config file, and refresh the runtime registry.
-    /// Failures surface as error toasts; success is silent (autosave).
-    fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) {
+    /// Failures surface as error toasts and return `false`; a successful
+    /// write returns `true` with the runtime reload spawned asynchronously.
+    fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) -> bool {
         if self.load_error.is_some() {
-            return;
+            return false;
         }
         let Some(path) = self.path.clone() else {
             window.push_notification(
@@ -663,7 +680,7 @@ impl ModelsPanelState {
                     .title(i18n::t("settings-save-failed-title")),
                 cx,
             );
-            return;
+            return false;
         };
         let mut config = match self.collect(cx) {
             Ok(config) => config,
@@ -672,7 +689,7 @@ impl ModelsPanelState {
                     Notification::error(msg).title(i18n::t("settings-save-failed-title")),
                     cx,
                 );
-                return;
+                return false;
             }
         };
         // The `chatgpt_app:` / `vscode_app:` sections are owned by the External
@@ -690,7 +707,7 @@ impl ModelsPanelState {
                     Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                     cx,
                 );
-                return;
+                return false;
             }
         }
         if let Err(e) = write_config_file(&path, &config) {
@@ -699,8 +716,11 @@ impl ModelsPanelState {
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                 cx,
             );
-            return;
+            return false;
         }
+
+        self.dirty = false;
+        self.pending_saved_toast = true;
 
         // Rebuild the process-wide registry from the freshly written file so
         // new threads see the change without a restart. Api key resolution
@@ -723,6 +743,28 @@ impl ModelsPanelState {
             });
         })
         .detach();
+
+        true
+    }
+
+    /// A blur with unsaved edits flushes the pending autosave immediately, then
+    /// surfaces the "Saved" toast exactly once per edited field.
+    fn flush_on_blur(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) {
+        if self.load_error.is_some() || self.path.is_none() {
+            return;
+        }
+        if self.dirty {
+            // Invalidate the in-flight debounced save; save now instead.
+            self.save_generation = self.save_generation.wrapping_add(1);
+            if !self.save(window, cx) {
+                return; // `save` already surfaced the error toast.
+            }
+            self.pending_saved_toast = false;
+            window.push_notification(Notification::success(i18n::t("settings-saved")), cx);
+        } else if self.pending_saved_toast {
+            self.pending_saved_toast = false;
+            window.push_notification(Notification::success(i18n::t("settings-saved")), cx);
+        }
     }
 }
 
@@ -886,11 +928,17 @@ fn new_input(
         }
         state
     });
-    // Text edits flow into the same debounced autosave as discrete picks.
-    cx.subscribe(&state, |this, _state, event, cx| {
-        if matches!(event, InputEvent::Change) {
-            this.models_panel.touch(cx);
+    // Text edits flow into the same debounced autosave as discrete picks; a
+    // blur flushes pending edits and surfaces the "Saved" toast.
+    cx.subscribe(&state, |this, _state, event, cx| match event {
+        InputEvent::Change => this.models_panel.touch(cx),
+        InputEvent::Blur => {
+            let handle = this.models_panel.window_handle;
+            defer_blur_flush(cx, handle, |this, window, cx| {
+                this.models_panel.flush_on_blur(window, cx);
+            });
         }
+        _ => {}
     })
     .detach();
     state
@@ -1174,6 +1222,7 @@ fn render_provider_node(
             .small()
             .text_color(muted),
         );
+    let name = p.name.clone();
     let out_entity = entity.clone();
     let toggle = if renaming {
         toggle.child(
@@ -1181,11 +1230,17 @@ fn render_provider_node(
                 .id(format!("models-p{pid}-rename"))
                 .flex_1()
                 .min_w_0()
-                .on_mouse_down_out(move |_ev, _window, cx| {
+                .on_mouse_down_out(move |_ev, window, cx| {
                     out_entity.update(cx, |this, cx| {
                         this.models_panel.renaming.remove(&pid);
                         cx.notify();
                     });
+                    // Exiting rename leaves the caret in the name input;
+                    // drop focus so the blur handler surfaces pending edits.
+                    let handle = Focusable::focus_handle(&name, cx);
+                    if handle.is_focused(window) {
+                        window.blur();
+                    }
                 })
                 .child(Input::new(&p.name)),
         )
@@ -1314,7 +1369,17 @@ fn render_basic_module(
                 }
             }),
         ))
-        .child(div().flex_1().min_w_0().child(Input::new(&p.apikey_value)))
+        .child(
+            div()
+                .id(format!(
+                    "settings-input-blur-{:?}",
+                    p.apikey_value.entity_id()
+                ))
+                .flex_1()
+                .min_w_0()
+                .on_mouse_down_out(blur_on_click_out(p.apikey_value.clone()))
+                .child(Input::new(&p.apikey_value)),
+        )
         .into_any_element();
 
     v_flex()
@@ -1389,11 +1454,20 @@ fn render_env_block(
                 .gap_2()
                 .child(
                     div()
+                        .id(format!("settings-input-blur-{:?}", kv.key.entity_id()))
                         .w(px(KEY_W))
                         .flex_shrink_0()
+                        .on_mouse_down_out(blur_on_click_out(kv.key.clone()))
                         .child(Input::new(&kv.key)),
                 )
-                .child(div().flex_1().min_w_0().child(Input::new(&kv.value)))
+                .child(
+                    div()
+                        .id(format!("settings-input-blur-{:?}", kv.value.entity_id()))
+                        .flex_1()
+                        .min_w_0()
+                        .on_mouse_down_out(blur_on_click_out(kv.value.clone()))
+                        .child(Input::new(&kv.value)),
+                )
                 .child({
                     let key = format!("models-kv{kid}-remove");
                     let is_pending = pending.as_deref() == Some(key.as_str());
@@ -1866,7 +1940,12 @@ fn field_row(theme: &Theme, label: SharedString, control: AnyElement) -> AnyElem
 }
 
 fn input_field(state: &Entity<InputState>) -> AnyElement {
-    div().w_full().child(Input::new(state)).into_any_element()
+    div()
+        .id(format!("settings-input-blur-{:?}", state.entity_id()))
+        .w_full()
+        .on_mouse_down_out(blur_on_click_out(state.clone()))
+        .child(Input::new(state))
+        .into_any_element()
 }
 
 /// Dropdown over `(display, token)` pairs; the selected token is applied via
@@ -2194,5 +2273,90 @@ mod tests {
         let vscode = collected.vscode_app.expect("vscode_app 应被 carry-over");
         assert_eq!(vscode.claude_code.provider.as_deref(), Some("百炼"));
         assert!(vscode.codex.disabled);
+    }
+}
+
+#[cfg(test)]
+mod blur_flush_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{AppContext as _, Entity, ParentElement as _, Render, TestAppContext, div};
+    use gpui_component::Root;
+    use gpui_component::input::{Input, InputEvent, InputState};
+
+    struct ProbeView {
+        input: Entity<InputState>,
+    }
+
+    impl Render for ProbeView {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            div().child(Input::new(&self.input))
+        }
+    }
+
+    /// The settings panels flush pending edits when an input blurs. The flush
+    /// is wired in an `InputEvent::Blur` subscription, whose dispatch leases
+    /// the view entity for the whole callback; the flush itself needs
+    /// `&mut Window`, which subscriptions do not receive, so
+    /// `panels::defer_blur_flush` re-enters the view through the saved window
+    /// handle at the end of the effect cycle, after the dispatch lease is
+    /// released (a synchronous re-entry would double-lease the entity and
+    /// panic). This test drives a real focus→blur cycle through gpui's draw
+    /// focus phase and pins that deferred re-entry behavior.
+    #[gpui::test]
+    fn blur_flush_reentry_runs_after_focus_loss(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let flushed = Rc::new(Cell::new(false));
+        let flushed_for_view = flushed.clone();
+        let slot: Rc<std::cell::RefCell<Option<Entity<ProbeView>>>> = Default::default();
+        let slot_for_window = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| {
+                let window_handle = window.window_handle();
+                let input = cx.new(|cx| InputState::new(window, cx));
+                // Same shape as the `new_input`/`panel_input` Blur arm.
+                let flushed = flushed_for_view.clone();
+                cx.subscribe(&input, move |_this, _state, event, cx| {
+                    if matches!(event, InputEvent::Blur) {
+                        let flushed = flushed.clone();
+                        super::super::panels::defer_blur_flush(
+                            cx,
+                            window_handle,
+                            move |_this, _window, _cx| {
+                                flushed.set(true);
+                            },
+                        );
+                    }
+                })
+                .detach();
+                ProbeView { input }
+            });
+            *slot_for_window.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow().clone().expect("view initialized");
+        let input = view.read_with(cx, |view, _| view.input.clone());
+
+        // Focus change events only dispatch while the window is active.
+        cx.update(|window, _cx| window.activate_window());
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, _cx| window.blur());
+        cx.run_until_parked();
+
+        assert!(
+            flushed.get(),
+            "deferred blur flush never ran after focus loss"
+        );
     }
 }
