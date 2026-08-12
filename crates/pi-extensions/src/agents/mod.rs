@@ -675,6 +675,8 @@ mod tests {
 
         // Lifecycle noise (turn start) is not forwarded.
         assert!(subagent_event_json(&AgentEvent::TurnStart).is_none());
+    }
+
     fn registry_with_model(id: &str) -> Arc<pi::ProviderRegistry> {
         use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
         let registry = Arc::new(pi::ProviderRegistry::new());
@@ -755,5 +757,6 @@ mod tests {
     fn model_override_without_registry_is_loud() {
         let def = def_with_model(Some("haiku"));
         let err = resolve_model_override(&def, "worker", None).unwrap_err();
-        assert!(err.to_string().contains("no provider registry"), "{err}");    }
+        assert!(err.to_string().contains("no provider registry"), "{err}");
+    }
 }
