@@ -608,3 +608,18 @@ plugins-notice-plugin-installed = Plugin installed. Restart manox to load newly 
 plugins-notice-plugin-removed = Plugin removed. Restart manox to unload runtime registries that were loaded at startup.
 plugins-notice-plugin-enabled = Plugin enabled. Restart manox to load its tools, skills, agents, hooks, and MCP servers.
 plugins-notice-plugin-disabled = Plugin disabled. Restart manox to unload runtime registries loaded at startup.
+member-running = running
+member-idle = idle
+member-disbanded = gone
+member-tasks = Tasks
+member-tasks-mine = Mine
+member-tasks-unassigned = Unassigned
+member-no-tasks = No tasks
+member-tab = { $name }
+team-chip = team · { $count }
+team-drawer-title = Team
+team-drawer-empty = No members
+team-drawer-tasks = { $count ->
+    [one] { $count } task
+   *[other] { $count } tasks
+}
