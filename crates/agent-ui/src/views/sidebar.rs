@@ -56,19 +56,20 @@ struct SlideCtx {
     gen_id: u64,
 }
 
-/// Which section header the pinned slot above the scroll body shows.
+/// Which section header the sticky overlay above the scroll body shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PinnedSection {
     Projects,
     Conversations,
 }
 
-/// Section-header pinning rule: the Projects header stays pinned while the
-/// viewport is inside the projects section; once the projects content has
-/// scrolled fully past the top (`scroll_top >= projects_height`) the
-/// Conversations header takes over. `projects_height` is `None` before the
-/// scroll container has been laid out (first frame) — keep the Projects
-/// header pinned so a fresh sidebar never flashes the wrong section.
+/// Section-header pinning rule for the sticky overlay: the Projects header
+/// stays pinned while the viewport is inside the projects section; once the
+/// projects content has scrolled fully past the top (`scroll_top >=
+/// projects_height`) the Conversations header takes over. `projects_height`
+/// is `None` before the scroll container has been laid out — the overlay only
+/// appears once `scroll_top > 0`, which cannot happen before the first
+/// layout, so this branch is just a safety fallback.
 fn pinned_section(
     projects_present: bool,
     scroll_top: Pixels,
@@ -195,7 +196,7 @@ pub struct Sidebar {
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
     /// Scroll offset + child-bounds reader for the sidebar scroll body; the
-    /// pinned section-header slot reads it to decide which header to show.
+    /// sticky section-header overlay reads it to decide which header to show.
     scroll_handle: ScrollHandle,
     _sub: Subscription,
 }
@@ -256,12 +257,17 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// The Conversations section header with its `+` new-session button,
-    /// rendered in the pinned header slot once the projects section has
-    /// scrolled past. The dropdown is deferred inside a relative wrapper so it
-    /// paints after sibling rows (z-order) while staying positioned just
-    /// below the button (`top_full()` is 100% of this wrapper's height).
-    fn conversations_section_header(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The Conversations section header with its `+` new-session button.
+    /// `id_prefix` disambiguates element ids when the header exists twice in
+    /// one tree (in-flow copy + sticky overlay), and `dropdown` gates the
+    /// deferred new-session menu so only the visible copy anchors it.
+    fn conversations_section_header(
+        &self,
+        theme: &Theme,
+        id_prefix: &str,
+        dropdown: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         section_header(
             i18n::t("sidebar-section-conversations"),
             theme,
@@ -269,7 +275,7 @@ impl Sidebar {
                 gpui::div()
                     .relative()
                     .child(
-                        Button::new("conv-plus")
+                        Button::new(format!("{id_prefix}-conv-plus"))
                             .ghost()
                             .xsmall()
                             .icon(IconName::Plus)
@@ -283,10 +289,16 @@ impl Sidebar {
                                 cx.notify();
                             })),
                     )
+                    // Deferred inside this relative wrapper so it paints after
+                    // sibling rows (z-order) while staying positioned just
+                    // below the button (`top_full()` is 100% of this wrapper's
+                    // height).
                     .children(
-                        (self.new_session_open && self.new_session_project.is_none())
+                        (dropdown && self.new_session_open && self.new_session_project.is_none())
                             .then(|| {
-                                self.render_new_session_dropdown("new-session-dropdown".into())
+                                self.render_new_session_dropdown(
+                                    format!("{id_prefix}-new-session-dropdown").into(),
+                                )
                             })
                             .flatten(),
                     )
@@ -621,7 +633,7 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
         let known_projects = self.store.read(cx).known_projects().to_vec();
@@ -704,48 +716,45 @@ impl Render for Sidebar {
             px(8.)
         };
 
-        // Pinned section-header slot above the scroll body: the section the
-        // user is currently reading stays visible while its rows scroll
-        // underneath — the section headers never scroll away. The slot shows
-        // the Projects header while the viewport is inside the projects
-        // section, then the Conversations header once the projects content
-        // has scrolled past the top. When the content fits the viewport there
-        // is nothing to scroll past, so every section header shows at its
-        // natural position instead — the Conversations header (and its `+`
-        // new-session button) must stay reachable without scrolling.
+        // Sticky overlay pinned above the scroll body: while the current
+        // section's header would scroll out of view, an overlay copy takes its
+        // place at the header's resting position and the rows scroll
+        // underneath. The in-flow headers stay in the content (parent-child
+        // grouping — each header sits directly above its own section), and
+        // the overlay only appears after the first scroll, by which point the
+        // scroll handle's offset/bounds have been measured.
         let projects_present = !projects.is_empty();
         let scroll_top = -self.scroll_handle.offset().y;
         let projects_height = self.scroll_handle.bounds_for_item(0).map(|b| b.size.height);
         let pinned = pinned_section(projects_present, scroll_top, projects_height);
-        let content_fits = self.scroll_handle.max_offset().y <= px(0.);
-        // The scroll handle's offset/bounds are only known after the scroll
-        // container's first layout; schedule one re-render so the pinned-
-        // header decision never sticks to the un-measured first frame.
-        if self.scroll_handle.bounds_for_item(0).is_none() {
-            let entity = cx.entity().downgrade();
-            window.on_next_frame(move |_window, cx| {
-                let _ = entity.update(cx, |_, cx| cx.notify());
-            });
-        }
-        let pinned_headers: Vec<AnyElement> = if content_fits {
-            let mut headers = Vec::new();
-            if projects_present {
-                headers.push(section_header(
-                    i18n::t("sidebar-section-projects"),
-                    &theme,
-                    None,
-                ));
-            }
-            headers.push(self.conversations_section_header(&theme, cx));
-            headers
-        } else {
-            vec![match pinned {
+        let overlay_visible = scroll_top > px(0.);
+        // When the overlay carries the Conversations header it also anchors
+        // the new-session dropdown; the in-flow copy must then drop its own
+        // copy to avoid two menus.
+        let overlay_shows_conversations = overlay_visible && pinned == PinnedSection::Conversations;
+        let overlay: Option<AnyElement> = overlay_visible.then(|| {
+            let header = match pinned {
                 PinnedSection::Projects => {
                     section_header(i18n::t("sidebar-section-projects"), &theme, None)
                 }
-                PinnedSection::Conversations => self.conversations_section_header(&theme, cx),
-            }]
-        };
+                PinnedSection::Conversations => {
+                    self.conversations_section_header(&theme, "sticky", true, cx)
+                }
+            };
+            gpui::div()
+                .id("sidebar-sticky-header")
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .px_2()
+                .pt(top_inset)
+                .bg(theme.background)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(header)
+                .into_any_element()
+        });
         let projects_el: Vec<AnyElement> = projects
             .into_iter()
             .map(|(path, group)| {
@@ -762,73 +771,87 @@ impl Render for Sidebar {
             .relative()
             .child(
                 v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .px_2()
-                    .pt(top_inset)
-                    .children(pinned_headers),
-            )
-            .child(
-                v_flex()
                     .id("sidebar-body")
                     .flex_1()
                     .w_full()
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
+                    .pt(top_inset)
                     .pb_2()
                     .track_scroll(&self.scroll_handle)
-                    // child 0: project-grouped threads. Rendered even when no
-                    // registered projects exist (a zero-height slot) so
-                    // `bounds_for_item(0)` keeps measuring the projects↔
-                    // conversations boundary for the pinned header.
-                    .child(v_flex().w_full().children(projects_el))
-                    // Merge loose threads and external sessions into one
-                    // recency-ordered list so an external CLI session sits
-                    // among manox threads instead of a separate section.
-                    // External rows sort by spawn time (manox cannot observe
-                    // in-TUI interaction); threads by last interaction.
-                    .child({
-                        let mut rows: Vec<SidebarRow> = loose
-                            .into_iter()
-                            .map(SidebarRow::Thread)
-                            .chain(loose_externals.into_iter().map(SidebarRow::External))
-                            .collect();
-                        rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+                    // child 0: the Projects section — its header sits directly
+                    // above the folder groups (parent-child grouping),
+                    // rendered even when no registered projects exist (a
+                    // zero-height slot) so `bounds_for_item(0)` keeps
+                    // measuring the projects↔conversations boundary for the
+                    // sticky overlay.
+                    .child(
                         v_flex()
                             .w_full()
-                            .gap_0p5()
-                            .children(rows.into_iter().map(|row| {
-                                let is_selected = selected.as_deref() == Some(row.id());
-                                match row {
-                                    SidebarRow::Thread(s) => render_thread_item(
-                                        &SidebarThreadItem::from_thread(
-                                            &s,
-                                            is_selected,
-                                            store.read(cx).is_running(&s.id),
-                                            store.read(cx).pending_auth_contains(&s.id),
-                                            px(0.),
-                                            &theme,
-                                        ),
-                                        &slide,
-                                        &theme,
-                                        cx,
-                                    ),
-                                    SidebarRow::External(s) => render_thread_item(
-                                        &SidebarThreadItem::from_external(
-                                            &s,
-                                            is_selected,
-                                            px(0.),
-                                            &theme,
-                                        ),
-                                        &slide,
-                                        &theme,
-                                        cx,
-                                    ),
-                                }
+                            .children(projects_present.then(|| {
+                                section_header(i18n::t("sidebar-section-projects"), &theme, None)
                             }))
-                    }),
+                            .children(projects_el),
+                    )
+                    // child 1: the Conversations section — header + loose
+                    // (non-project) threads and external sessions, merged by
+                    // recency so an external CLI session sits among manox
+                    // threads instead of a separate section. External rows
+                    // sort by spawn time (manox cannot observe in-TUI
+                    // interaction); threads by last interaction.
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .child(self.conversations_section_header(
+                                &theme,
+                                "inflow",
+                                !overlay_shows_conversations,
+                                cx,
+                            ))
+                            .child({
+                                let mut rows: Vec<SidebarRow> = loose
+                                    .into_iter()
+                                    .map(SidebarRow::Thread)
+                                    .chain(loose_externals.into_iter().map(SidebarRow::External))
+                                    .collect();
+                                rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+                                v_flex()
+                                    .w_full()
+                                    .gap_0p5()
+                                    .children(rows.into_iter().map(|row| {
+                                        let is_selected = selected.as_deref() == Some(row.id());
+                                        match row {
+                                            SidebarRow::Thread(s) => render_thread_item(
+                                                &SidebarThreadItem::from_thread(
+                                                    &s,
+                                                    is_selected,
+                                                    store.read(cx).is_running(&s.id),
+                                                    store.read(cx).pending_auth_contains(&s.id),
+                                                    px(0.),
+                                                    &theme,
+                                                ),
+                                                &slide,
+                                                &theme,
+                                                cx,
+                                            ),
+                                            SidebarRow::External(s) => render_thread_item(
+                                                &SidebarThreadItem::from_external(
+                                                    &s,
+                                                    is_selected,
+                                                    px(0.),
+                                                    &theme,
+                                                ),
+                                                &slide,
+                                                &theme,
+                                                cx,
+                                            ),
+                                        }
+                                    }))
+                            }),
+                    ),
             )
+            .children(overlay)
     }
 }
 
