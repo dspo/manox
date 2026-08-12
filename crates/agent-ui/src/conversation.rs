@@ -1350,6 +1350,44 @@ impl ConversationState {
                     ApplyOutcome::Unchanged
                 }
             }
+            ThreadEvent::SubagentChild { id, child } => {
+                // The Agent tool call's drill-down transcript: child text /
+                // thinking deltas append verbatim; child tool lifecycle
+                // renders as activity lines (same live-output surface as
+                // bash streaming).
+                let chunk: Option<String> = match child {
+                    agent::SubagentChildEvent::Text(text) => Some(text.clone()),
+                    agent::SubagentChildEvent::Thinking(text) => Some(text.clone()),
+                    agent::SubagentChildEvent::ToolStart { name, summary } => {
+                        Some(match summary {
+                            Some(summary) => format!("\n▸ {name} {summary}\n"),
+                            None => format!("\n▸ {name}\n"),
+                        })
+                    }
+                    agent::SubagentChildEvent::ToolEnd { name, is_error } => Some(format!(
+                        "\n{} {name}\n",
+                        if *is_error { "✗" } else { "✓" }
+                    )),
+                };
+                if let Some(chunk) = chunk
+                    && let Some((cix, eix)) = self.find_thinking_entry(id, cx)
+                {
+                    self.items[cix].update(cx, |item, cx| {
+                        if let ConvItem::Thinking(t) = item.kind_mut() {
+                            if let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix) {
+                                entry.output.push_str(&chunk);
+                                entry.streaming = true;
+                            }
+                            t.streaming = true;
+                        }
+                        item.sync_tool_entry_panel(eix, cwd, cx);
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(cix)
+                } else {
+                    ApplyOutcome::Unchanged
+                }
+            }
             ThreadEvent::ToolResult {
                 id,
                 output,

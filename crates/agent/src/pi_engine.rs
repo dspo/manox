@@ -2053,9 +2053,87 @@ pub(crate) mod adapt {
             }
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id,
+                tool_name,
                 partial_result,
                 ..
             } => {
+                // The Agent tool bridges its child session's streamed events
+                // as `{"subagent_event": {...}}` progress: surface them as
+                // drill-down transcript events + live rail activity.
+                if tool_name == crate::tools::AGENT
+                    && let Some(ev) = partial_result.get("subagent_event")
+                {
+                    let mut events = Vec::new();
+                    let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+                    let activity = |text: String| ThreadEvent::SubagentProgress {
+                        id: tool_call_id.clone(),
+                        subagent_type: String::new(),
+                        tool_uses: 0,
+                        token_usage: crate::language_model::TokenUsage::default(),
+                        latest_activity: Some(text),
+                        status: ToolCallStatus::Running,
+                    };
+                    match kind {
+                        "text" => {
+                            if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
+                                events.push(ThreadEvent::SubagentChild {
+                                    id: tool_call_id.clone(),
+                                    child: crate::thread::SubagentChildEvent::Text(
+                                        text.to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
+                                events.push(ThreadEvent::SubagentChild {
+                                    id: tool_call_id.clone(),
+                                    child: crate::thread::SubagentChildEvent::Thinking(
+                                        text.to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                        "tool_start" => {
+                            let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
+                            let summary = ev
+                                .get("summary")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            events.push(ThreadEvent::SubagentChild {
+                                id: tool_call_id.clone(),
+                                child: crate::thread::SubagentChildEvent::ToolStart {
+                                    name: name.to_string(),
+                                    summary: summary.clone(),
+                                },
+                            });
+                            events.push(activity(match summary {
+                                Some(s) => format!("▸ {name} {s}"),
+                                None => format!("▸ {name}"),
+                            }));
+                        }
+                        "tool_end" => {
+                            let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
+                            let is_error = ev
+                                .get("is_error")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            events.push(ThreadEvent::SubagentChild {
+                                id: tool_call_id.clone(),
+                                child: crate::thread::SubagentChildEvent::ToolEnd {
+                                    name: name.to_string(),
+                                    is_error,
+                                },
+                            });
+                            events.push(activity(format!(
+                                "{} {name}",
+                                if is_error { "✗" } else { "✓" }
+                            )));
+                        }
+                        _ => {}
+                    }
+                    return events;
+                }
                 // The pi-extensions bash tool streams `{"output": chunk}`
                 // partials; surface them as live tool output. Other partial
                 // shapes carry no renderable text.
@@ -2578,6 +2656,91 @@ mod tests {
         assert_eq!(events.len(), 1, "plain tools keep a single tool card");
     }
 
+    #[test]
+    fn agent_child_text_delta_maps_to_subagent_child() {
+        let events =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "call-1".into(),
+                tool_name: crate::tools::AGENT.into(),
+                arguments: serde_json::json!({}),
+                partial_result: serde_json::json!({
+                    "subagent_event": { "kind": "text", "text": "found it" }
+                }),
+            });
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::thread::ThreadEvent::SubagentChild { id, child } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(
+                    child,
+                    &crate::thread::SubagentChildEvent::Text("found it".into())
+                );
+            }
+            other => panic!("expected SubagentChild, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_child_tool_lifecycle_maps_to_child_and_rail_activity() {
+        let start = adapt::agent_event_to_thread_events(
+            &pi::types::AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "call-1".into(),
+                tool_name: crate::tools::AGENT.into(),
+                arguments: serde_json::json!({}),
+                partial_result: serde_json::json!({
+                    "subagent_event": { "kind": "tool_start", "tool": "Read", "summary": "src/main.rs" }
+                }),
+            },
+        );
+        assert_eq!(start.len(), 2, "drill-down event + rail activity");
+        assert!(matches!(
+            &start[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::ToolStart { .. },
+                ..
+            }
+        ));
+        match &start[1] {
+            crate::thread::ThreadEvent::SubagentProgress {
+                latest_activity, ..
+            } => assert_eq!(latest_activity.as_deref(), Some("▸ Read src/main.rs")),
+            other => panic!("expected SubagentProgress, got {other:?}"),
+        }
+
+        let end =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "call-1".into(),
+                tool_name: crate::tools::AGENT.into(),
+                arguments: serde_json::json!({}),
+                partial_result: serde_json::json!({
+                    "subagent_event": { "kind": "tool_end", "tool": "Read", "is_error": true }
+                }),
+            });
+        assert_eq!(end.len(), 2);
+        assert!(matches!(
+            &end[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::ToolEnd { is_error: true, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bash_output_update_still_maps_to_tool_output() {
+        let events =
+            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "call-3".into(),
+                tool_name: "Bash".into(),
+                arguments: serde_json::json!({}),
+                partial_result: serde_json::json!({ "output": "line one" }),
+            });
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::ToolOutput { chunk, .. } if chunk == "line one"
+        ));
+    }
     #[test]
     fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
         let plan = "## Steps\n- do the thing";

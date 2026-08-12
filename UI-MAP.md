@@ -34,7 +34,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | MCP | ⏳ | init 跳过 mcp registry |
 | Plus 菜单（文件 / 目标 / 插件） | ⏳ | composer plus 槽位当前为空 div |
 | skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
-| Sub-agent 观察面板 / Agents 树 | ⏳ | pi-extensions SubagentTool 已装配，观察 UI 随 manox 移除 |
+| Sub-agent 观察 | ✅ 部分 | rail 观察行（生命周期/活动）+ Agent 工具卡片实时流式子转录（text/thinking delta、工具 ▸/✓/✗ 行）；独立钻取面板随 manox 移除，卡片体即钻取面 |
 | Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
 | Goal | ✅ 部分 | facade+GoalBridge 共享快照、GetGoal/CreateGoal/UpdateGoal 工具、`/goal` 命令、composer chip+状态 popover；per-turn 记账/自动续跑/BudgetLimited 强制为后续项 |
 | Team | ✅ 部分 | 后端完整（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）；roster/MemberPanel UI 为后续项 |
@@ -367,7 +367,7 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 
 #### AgentTaskCard
 
-Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use a braille-dot spinner (`BrailleSpinner`); terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking is a no-op today — the read-only observation panel was retired with the manox harness.
+Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use a braille-dot spinner (`BrailleSpinner`); terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance; clicking stays a no-op. Live drill-down lives on the Agent tool-call card instead: the child session's streamed text/thinking deltas and tool lifecycle lines (`▸ Tool hint` / `✓ Tool` / `✗ Tool`) append to the card's output in real time (bridged through the Agent tool's progress channel).
 
 > Source: `agent-ui/src/views/message.rs`
 
