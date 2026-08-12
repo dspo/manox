@@ -18,8 +18,8 @@ use agent::thread::ApprovalMode;
 use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
-    EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
-    ease_in_out, prelude::*, px,
+    EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
+    deferred, ease_in_out, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -54,6 +54,34 @@ struct SlideCtx {
     deselecting_id: Option<String>,
     dir: SlideDir,
     gen_id: u64,
+}
+
+/// Which section header the pinned slot above the scroll body shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PinnedSection {
+    Projects,
+    Conversations,
+}
+
+/// Section-header pinning rule: the Projects header stays pinned while the
+/// viewport is inside the projects section; once the projects content has
+/// scrolled fully past the top (`scroll_top >= projects_height`) the
+/// Conversations header takes over. `projects_height` is `None` before the
+/// scroll container has been laid out (first frame) — keep the Projects
+/// header pinned so a fresh sidebar never flashes the wrong section.
+fn pinned_section(
+    projects_present: bool,
+    scroll_top: Pixels,
+    projects_height: Option<Pixels>,
+) -> PinnedSection {
+    if !projects_present {
+        return PinnedSection::Conversations;
+    }
+    match projects_height {
+        None => PinnedSection::Projects,
+        Some(h) if scroll_top < h => PinnedSection::Projects,
+        _ => PinnedSection::Conversations,
+    }
 }
 
 /// Which end of the slide a row is playing this frame.
@@ -166,6 +194,9 @@ pub struct Sidebar {
     /// Live width driven by dragging the divider on the right edge. Updated
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
+    /// Scroll offset + child-bounds reader for the sidebar scroll body; the
+    /// pinned section-header slot reads it to decide which header to show.
+    scroll_handle: ScrollHandle,
     _sub: Subscription,
 }
 
@@ -194,6 +225,7 @@ impl Sidebar {
             new_session_menu_sub: None,
             new_session_project: None,
             width,
+            scroll_handle: ScrollHandle::new(),
             _sub: sub,
         }
     }
@@ -222,6 +254,45 @@ impl Sidebar {
         }
         self.width = width;
         cx.notify();
+    }
+
+    /// The Conversations section header with its `+` new-session button,
+    /// rendered in the pinned header slot once the projects section has
+    /// scrolled past. The dropdown is deferred inside a relative wrapper so it
+    /// paints after sibling rows (z-order) while staying positioned just
+    /// below the button (`top_full()` is 100% of this wrapper's height).
+    fn conversations_section_header(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        section_header(
+            i18n::t("sidebar-section-conversations"),
+            theme,
+            Some(
+                gpui::div()
+                    .relative()
+                    .child(
+                        Button::new("conv-plus")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip(i18n::t("sidebar-new-chat"))
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                if this.new_session_open {
+                                    this.close_new_session_menu();
+                                } else {
+                                    this.open_new_session_menu(None, window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .children(
+                        (self.new_session_open && self.new_session_project.is_none())
+                            .then(|| {
+                                self.render_new_session_dropdown("new-session-dropdown".into())
+                            })
+                            .flatten(),
+                    )
+                    .into_any_element(),
+            ),
+        )
     }
 
     /// Open the new-session `PopupMenu`. `project` is `None` when opened from
@@ -550,7 +621,7 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
         let known_projects = self.store.read(cx).known_projects().to_vec();
@@ -633,6 +704,55 @@ impl Render for Sidebar {
             px(8.)
         };
 
+        // Pinned section-header slot above the scroll body: the section the
+        // user is currently reading stays visible while its rows scroll
+        // underneath — the section headers never scroll away. The slot shows
+        // the Projects header while the viewport is inside the projects
+        // section, then the Conversations header once the projects content
+        // has scrolled past the top. When the content fits the viewport there
+        // is nothing to scroll past, so every section header shows at its
+        // natural position instead — the Conversations header (and its `+`
+        // new-session button) must stay reachable without scrolling.
+        let projects_present = !projects.is_empty();
+        let scroll_top = -self.scroll_handle.offset().y;
+        let projects_height = self.scroll_handle.bounds_for_item(0).map(|b| b.size.height);
+        let pinned = pinned_section(projects_present, scroll_top, projects_height);
+        let content_fits = self.scroll_handle.max_offset().y <= px(0.);
+        // The scroll handle's offset/bounds are only known after the scroll
+        // container's first layout; schedule one re-render so the pinned-
+        // header decision never sticks to the un-measured first frame.
+        if self.scroll_handle.bounds_for_item(0).is_none() {
+            let entity = cx.entity().downgrade();
+            window.on_next_frame(move |_window, cx| {
+                let _ = entity.update(cx, |_, cx| cx.notify());
+            });
+        }
+        let pinned_headers: Vec<AnyElement> = if content_fits {
+            let mut headers = Vec::new();
+            if projects_present {
+                headers.push(section_header(
+                    i18n::t("sidebar-section-projects"),
+                    &theme,
+                    None,
+                ));
+            }
+            headers.push(self.conversations_section_header(&theme, cx));
+            headers
+        } else {
+            vec![match pinned {
+                PinnedSection::Projects => {
+                    section_header(i18n::t("sidebar-section-projects"), &theme, None)
+                }
+                PinnedSection::Conversations => self.conversations_section_header(&theme, cx),
+            }]
+        };
+        let projects_el: Vec<AnyElement> = projects
+            .into_iter()
+            .map(|(path, group)| {
+                self.render_project_group(&path, &group, selected.as_deref(), &store, &slide, cx)
+            })
+            .collect();
+
         v_flex()
             .h_full()
             .w(self.width)
@@ -642,82 +762,27 @@ impl Render for Sidebar {
             .relative()
             .child(
                 v_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .pt(top_inset)
+                    .children(pinned_headers),
+            )
+            .child(
+                v_flex()
                     .id("sidebar-body")
                     .flex_1()
                     .w_full()
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
-                    .pt(top_inset)
                     .pb_2()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_0p5()
-                            .child(static_menu_item(
-                                "search",
-                                IconName::Search,
-                                i18n::t("sidebar-search"),
-                                &theme,
-                            ))
-                            .child(static_menu_item(
-                                "scheduled",
-                                IconName::Calendar,
-                                i18n::t("sidebar-scheduled"),
-                                &theme,
-                            )),
-                    )
-                    .children(
-                        (!projects.is_empty()).then(|| {
-                            section_header(i18n::t("sidebar-section-projects"), &theme, None)
-                        }),
-                    )
-                    .children(projects.into_iter().map(|(path, group)| {
-                        self.render_project_group(
-                            &path,
-                            &group,
-                            selected.as_deref(),
-                            &store,
-                            &slide,
-                            cx,
-                        )
-                    }))
-                    .child(section_header(
-                        i18n::t("sidebar-section-conversations"),
-                        &theme,
-                        Some(
-                            gpui::div()
-                                .relative()
-                                .child(
-                                    Button::new("conv-plus")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Plus)
-                                        .tooltip(i18n::t("sidebar-new-chat"))
-                                        .on_click(cx.listener(|this, _ev, window, cx| {
-                                            if this.new_session_open {
-                                                this.close_new_session_menu();
-                                            } else {
-                                                this.open_new_session_menu(None, window, cx);
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                // Dropdown is deferred inside this relative wrapper so it paints
-                                // after sibling rows (z-order) while staying positioned just below
-                                // the button (`top_full()` is 100% of this wrapper's height).
-                                .children(
-                                    (self.new_session_open && self.new_session_project.is_none())
-                                        .then(|| {
-                                            self.render_new_session_dropdown(
-                                                "new-session-dropdown".into(),
-                                            )
-                                        })
-                                        .flatten(),
-                                )
-                                .into_any_element(),
-                        ),
-                    ))
+                    .track_scroll(&self.scroll_handle)
+                    // child 0: project-grouped threads. Rendered even when no
+                    // registered projects exist (a zero-height slot) so
+                    // `bounds_for_item(0)` keeps measuring the projects↔
+                    // conversations boundary for the pinned header.
+                    .child(v_flex().w_full().children(projects_el))
                     // Merge loose threads and external sessions into one
                     // recency-ordered list so an external CLI session sits
                     // among manox threads instead of a separate section.
@@ -765,52 +830,6 @@ impl Render for Sidebar {
                     }),
             )
     }
-}
-
-/// A clickable top-level menu row.
-fn menu_item(
-    id: &'static str,
-    icon: IconName,
-    label: SharedString,
-    theme: &Theme,
-    on_click: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
-) -> AnyElement {
-    let row = h_flex()
-        .id(id)
-        .w_full()
-        .px_2()
-        .py_1p5()
-        .gap_2()
-        .items_center()
-        .rounded(theme.radius)
-        .hover(|s| s.bg(theme.accent.opacity(0.08)))
-        .child(Icon::new(icon).small().text_color(theme.muted_foreground))
-        .child(
-            gpui::div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(label),
-        );
-
-    match on_click {
-        Some(handler) => row.on_click(handler).into_any_element(),
-        None => row.into_any_element(),
-    }
-}
-
-fn static_menu_item(
-    id: &'static str,
-    icon: IconName,
-    label: SharedString,
-    theme: &Theme,
-) -> AnyElement {
-    menu_item(
-        id,
-        icon,
-        label,
-        theme,
-        None::<fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>,
-    )
 }
 
 fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>) -> AnyElement {
@@ -1508,5 +1527,45 @@ mod tests {
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
         assert!(!thread.selected);
         assert!(!external.selected);
+    }
+
+    /// The pinned slot shows the Conversations header when no registered
+    /// projects exist — the conversations section is the only section, so its
+    /// header is pinned from the top regardless of scroll.
+    #[test]
+    fn pinned_section_without_projects_is_conversations() {
+        assert_eq!(
+            pinned_section(false, px(0.), None),
+            PinnedSection::Conversations
+        );
+        assert_eq!(
+            pinned_section(false, px(120.), Some(px(100.))),
+            PinnedSection::Conversations
+        );
+    }
+
+    /// Inside the projects section the Projects header stays pinned; once the
+    /// projects content has fully scrolled past the top the Conversations
+    /// header takes over.
+    #[test]
+    fn pinned_section_tracks_projects_boundary() {
+        // First frame (no measurement yet) stays on Projects.
+        assert_eq!(pinned_section(true, px(50.), None), PinnedSection::Projects);
+        assert_eq!(
+            pinned_section(true, px(0.), Some(px(200.))),
+            PinnedSection::Projects
+        );
+        assert_eq!(
+            pinned_section(true, px(199.), Some(px(200.))),
+            PinnedSection::Projects
+        );
+        assert_eq!(
+            pinned_section(true, px(200.), Some(px(200.))),
+            PinnedSection::Conversations
+        );
+        assert_eq!(
+            pinned_section(true, px(500.), Some(px(200.))),
+            PinnedSection::Conversations
+        );
     }
 }

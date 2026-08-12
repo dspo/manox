@@ -52,7 +52,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### Sidebar
 
-- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarDivider](#sidebardivider)
+- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarPinnedSectionHeader](#sidebarpinnedsectionheader) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarDivider](#sidebardivider)
 
 ### MainColumn
 
@@ -183,7 +183,7 @@ Every non-Settings `ViewMode` renders through one shared shell ([WorkspaceShell]
 
 #### WorkspaceShell
 
-The shared window shell built by `Workspace::shell_root`: an `h_flex` root with `sidebar | 6px SidebarDivider | mode main column`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every non-Settings `ViewMode` routes through it — the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…), the right [EditorPane](#editordpane) + [EditorDivider](#editordivider) columns, and the turn-navigator overlay onto it; the Terminal and ExternalSession modes chain only their own extras. Terminal-style main columns are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
+The shared window shell built by `Workspace::shell_root(sidebar, main)`: an `h_flex` root with `sidebar-slot | 6px SidebarDivider | mode main column`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every full-window `ViewMode` routes through it — the sidebar slot is the conversation `Sidebar` for Workspace / Terminal / ExternalSession modes and the [SettingsLeftNav](#settingsleftnav) for Settings; the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…), the right [EditorPane](#editordpane) + [EditorDivider](#editordivider) columns, and the turn-navigator overlay onto it; the Terminal and ExternalSession modes chain only their own extras. The divider drag/double-click-reset writes one shared width (`Workspace::sidebar_width`) and syncs it to both the `Sidebar` entity and the `SettingsView`, so the Settings page resizes its sidebar exactly like the app page. Terminal-style main columns are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -205,21 +205,13 @@ Full-height left panel, vertical flex, `bg:background`, right border.
 
 #### SidebarScrollBody
 
-Scrollable body inside Sidebar, `overflow_y_scroll`.
+Scrollable body inside Sidebar (`overflow_y_scroll`, `.track_scroll` on a `ScrollHandle`). Its children are two fixed slots measured by the pinned header: child 0 = the project-grouped threads (`SidebarProjectsSection`, zero-height when no registered projects exist), child 1 = the loose threads + external sessions (`SidebarConversationsSection` content, without its header — the header lives in the pinned slot).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
-#### SidebarMenuSection
+#### SidebarPinnedSectionHeader
 
-Top section: New Thread, Search, Scheduled menu items.
-
-> Source: `agent-ui/src/views/sidebar.rs`
-
-#### SidebarMenuItem
-
-Single menu item, icon + label, clickable.
-
-> Source: `agent-ui/src/views/sidebar.rs`
+Pinned section-header slot above the scroll body (`flex_shrink_0`, `pt(top_inset)` for the traffic-light inset): the section the user is currently reading never scrolls away. Shows the Projects header while the viewport is inside the projects section, then the Conversations header (with its `+` new-session button + dropdown) once the projects content has scrolled fully past the top. The switch threshold is the measured height of scroll-body child 0 (`bounds_for_item(0)`, fallback keeps Projects pinned on the first frame before the container is laid out). When the content fits the viewport (`max_offset() == 0`) every section header shows at its natural position instead, so the Conversations header stays reachable without scrolling.
 
 #### SidebarProjectsSection
 
@@ -235,7 +227,7 @@ Collapsible folder: chevron + folder icon + project name, indented thread list.
 
 #### SidebarConversationsSection
 
-Bottom section: loose (non-project) threads. The header's `+` button opens the `SidebarNewSessionMenu` popup.
+Loose (non-project) threads + external sessions, the scroll-body child 1 slot. The section's pinned header (`SidebarPinnedSectionHeader`) carries the `+` button opening the `SidebarNewSessionMenu` popup.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -714,17 +706,17 @@ Two transient banners render between the chrome row and the content area, both d
 
 ## 4. ViewMode::Settings
 
-Full-window settings overlay. Slides in from left (180ms), slides out to right (200ms).
+Full-window settings page rendered through the shared [WorkspaceShell](#workspaceshell) (`SettingsLeftNav | divider | main`), so the sidebar divider stays draggable exactly like the app page. Slides in from left (180ms), slides out to right (200ms).
 
 #### ManagementBackControl
 
-Unified "back to app" control — `ArrowLeft` + label row mirroring `sidebar::menu_item` density (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted as the first row of the [SettingsLeftNav](#settingsleftnav) (above the search input and group list) so the back affordance reads as a peer of the sidebar menu items, not an isolated button. The settings page no longer ships a shared management TitleBar — each management surface reuses the app-page scaffold (sidebar + overlay TitleBar in the main column), and the back control lives in the sidebar.
+Unified "back to app" control — `ArrowLeft` + label row (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted as the first row of the [SettingsLeftNav](#settingsleftnav) pinned top slot (above the search input and group list) so the back affordance reads as a peer of the sidebar menu items, not an isolated button. The settings page no longer ships a shared management TitleBar — each management surface reuses the app-page scaffold (sidebar + overlay TitleBar in the main column), and the back control lives in the sidebar.
 
 > Source: `agent-ui/src/views/management_shell.rs`
 
 #### SettingsView
 
-Root of settings overlay, `size_full`, `bg:background`. Mirrors the app-page scaffold: an `h_flex` of `[SettingsLeftNav][main column]`, where the main column is a relative `v_flex` with an absolute [SettingsTitleBar](#settingstitlebar) overlay on top and [SettingsRightPane](#settingsrightpane) content below `pt(TITLE_BAR_HEIGHT)`.
+Settings page state + renderers. `render_nav` produces the sidebar slot element and `render_main` the main-column element; the Workspace mounts both into the shared shell. Holds the sidebar `width` (synced from `Workspace::sidebar_width` by the divider drag, and seeded on entry) so the settings sidebar resizes exactly like the app sidebar. The main column is a relative `v_flex` with an absolute [SettingsTitleBar](#settingstitlebar) overlay on top and [SettingsRightPane](#settingsrightpane) content below `pt(TITLE_BAR_HEIGHT)`.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -736,7 +728,7 @@ Absolute-positioned `TitleBar` overlay (`h(TITLE_BAR_HEIGHT)`, `top_0/left_0/rig
 
 #### SettingsLeftNav
 
-260px sidebar (`bg:background`, right border) mirroring the app [Sidebar](#sidebar): no standalone TitleBar, the macOS traffic-light buttons float over its transparent top (`pt(top_inset)`, 28px on macOS / 8px elsewhere). Body is a scrollable `v_flex` (`overflow_y_scroll`) holding, top to bottom: the [ManagementBackControl](#managementbackcontrol) ("Back to app" → emits `SettingsEvent::Exit` → returns to [ViewMode::Workspace](#viewmodeworkspace-layout)), the [SettingsSearchInput](#settingssearchinput), and the [SettingsGroupList](#settingsgrouplist).
+Settings sidebar (`bg:background`, right border) rendered at the shared sidebar width; no standalone TitleBar, the macOS traffic-light buttons float over its transparent top (`pt(top_inset)`, 28px on macOS / 8px elsewhere). The back control + search input live in a pinned top slot that never scrolls; only the [SettingsGroupList](#settingsgrouplist) scrolls (`overflow_y_scroll`) beneath them.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -784,7 +776,7 @@ Settings → General → Models: two-column form editor for the cx provider conf
 
 #### SettingsChatGptAppPanel
 
-Settings → External Tools → ChatGPT.app: visualizes and edits the ChatGPT.app injection settings (`cx_providers::ChatGptAppSettings`, top-level `chatgpt_app:` section of `cx.providers.config.yaml`, shared by the CLI and GUI launch paths). Visual language mirrors ChatGPT.app Settings: a big page heading (`text_xl`, the TitleBar renders no text), then per-block name (14px foreground, non-bold) + muted description left-aligned **above** a border-only rounded card (no fill) whose rows are separated by hairlines; each row is two-line (name foreground + description muted, left) with the value right-aligned. Four blocks: **Codex Home** (read-only CODEX_HOME value with copy / reveal-in-Finder), **Model Injection** (injection mode as a segmented two-choice — model list via CDP vs single model via the official config.toml mechanism, active segment a filled pill / inactive plain muted text, with the CDP risk note as the row's inline description — plus a read-only Providers & LLMs catalog, one two-line row per provider, per-provider fetch failures shown as a "failed to load" row rather than omitted), **Variable Injection** (custom env key/value rows with add/remove; reserved keys rejected on save), **More Settings** (`supports_websockets` switch, default false). Editable items autosave through the same debounced touch/save_generation mechanism as the Models panel; the Models panel carries `chatgpt_app:` over from a fresh disk read on save so the two panels never clobber each other. Launch args and the CDP script injection are internal mechanics and are not surfaced.
+Settings → External Tools → ChatGPT.app: visualizes and edits the ChatGPT.app injection settings (`cx_providers::ChatGptAppSettings`, top-level `chatgpt_app:` section of `cx.providers.config.yaml`, shared by the CLI and GUI launch paths). Visual language mirrors ChatGPT.app Settings: a big page heading (`text_xl`, the TitleBar renders no text), then per-block name (14px foreground, non-bold) + muted description left-aligned **above** a border-only rounded card (no fill) whose rows are separated by hairlines; each row is two-line (name foreground + description muted, left) with the value right-aligned. Four blocks: **Codex Home** (read-only CODEX_HOME value with copy / reveal-in-Finder), **Model Injection** (display nickname input — replaces the injected provider name when set, whatever provider is launched — plus the injection mode as a segmented two-choice — model list via CDP vs single model via the official config.toml mechanism, active segment a filled pill / inactive plain muted text, with the CDP risk note as the row's inline description — plus a read-only Providers & LLMs catalog, one two-line row per provider, per-provider fetch failures shown as a "failed to load" row rather than omitted), **Variable Injection** (custom env key/value rows with add/remove; reserved keys rejected on save), **More Settings** (`supports_websockets` switch, default false). Editable items autosave through the same debounced touch/save_generation mechanism as the Models panel; the Models panel carries `chatgpt_app:` over from a fresh disk read on save so the two panels never clobber each other. Launch args and the CDP script injection are internal mechanics and are not surfaced.
 
 > Source: `agent-ui/src/views/settings/chatgpt.rs`
 

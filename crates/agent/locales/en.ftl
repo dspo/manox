@@ -6,8 +6,6 @@
 
 ### sidebar.rs
 sidebar-new-chat = New chat
-sidebar-search = Search
-sidebar-scheduled = Scheduled
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-new-session-label = New session
@@ -193,6 +191,9 @@ settings-section-chatgpt-home = Codex Home
 settings-desc-chatgpt-home = Main path managing ChatGPT.app conversations, kept separate from the official one.
 settings-section-chatgpt-injection = Model Injection
 settings-desc-chatgpt-injection = Determines how custom models become available inside ChatGPT.app.
+settings-row-chatgpt-nickname = Nickname
+settings-desc-chatgpt-nickname = When set, replaces the provider name used during injection (whatever provider is launched).
+settings-chatgpt-nickname-ph = Optional
 settings-row-chatgpt-injection = Injection mode
 settings-value-injection-list = Model list
 settings-value-injection-single = Single model

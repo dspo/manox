@@ -8,7 +8,7 @@
 //! placeholder, matching the pre-panels behavior.
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, Render, SharedString,
+    Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, Pixels, SharedString,
     Window, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
@@ -26,7 +26,6 @@ mod models;
 mod panels;
 mod vscode;
 
-const SIDEBAR_W: f32 = 260.;
 const CLICK_FLASH_MS: u64 = 280;
 
 /// A single static settings item (icon + label key, optional trailing icon).
@@ -161,6 +160,11 @@ const MOCK_PROJECTS: &[MockProject] = &[
 pub struct SettingsView {
     search: Entity<InputState>,
 
+    /// Sidebar width, driven by the shared shell's divider. The Workspace
+    /// owns the canonical width and syncs it here (and on re-entry) so the
+    /// settings nav resizes exactly like the app sidebar.
+    width: Pixels,
+
     /// Sidebar item currently highlighted. Stable fluent message id (e.g.
     /// `"settings-item-general"`) so it survives locale switches.
     selected: Option<SharedString>,
@@ -228,12 +232,13 @@ pub enum SettingsEvent {
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(width: Pixels, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder"))
         });
         Self {
             search,
+            width,
             selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
@@ -344,8 +349,15 @@ impl SettingsView {
     }
 }
 
-impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl SettingsView {
+    /// The settings nav rendered in the shared shell's sidebar slot: the back
+    /// control and search input live in a pinned top slot (they never scroll
+    /// away), and only the group list scrolls beneath them.
+    pub(crate) fn render_nav(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let selected = self.selected.clone();
         let search = self.search.clone();
@@ -436,84 +448,106 @@ impl Render for SettingsView {
             px(8.)
         };
 
-        h_flex()
-            .w_full()
+        v_flex()
             .h_full()
+            .w(self.width)
             .bg(theme.background)
-            // Settings sidebar — mirrors the app sidebar: no standalone TitleBar,
-            // traffic-light inset at top, back control as the first row.
+            .border_r_1()
+            .border_color(theme.border)
+            // Pinned top slot: back control + search input stay put while the
+            // group list scrolls underneath.
             .child(
                 v_flex()
-                    .h_full()
-                    .w(px(SIDEBAR_W))
-                    .bg(theme.background)
-                    .border_r_1()
-                    .border_color(theme.border)
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .pt(top_inset)
+                    .pb_2()
+                    .gap_2()
+                    .child(back_control(&theme, i18n::t("settings-back"), on_back))
                     .child(
-                        v_flex()
-                            .id("settings-sidebar-body")
-                            .flex_1()
+                        h_flex()
                             .w_full()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .px_2()
-                            .pt(top_inset)
-                            .pb_2()
+                            .items_center()
                             .gap_2()
-                            .child(back_control(&theme, i18n::t("settings-back"), on_back))
+                            .px_2()
+                            .py_1()
+                            .rounded(theme.radius)
+                            .bg(theme.secondary)
                             .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(theme.radius)
-                                    .bg(theme.secondary)
-                                    .child(
-                                        Icon::new(IconName::Search)
-                                            .small()
-                                            .text_color(theme.muted_foreground),
-                                    )
-                                    .child(
-                                        Input::new(&search)
-                                            .appearance(false)
-                                            .bordered(false)
-                                            .focus_bordered(false),
-                                    ),
+                                Icon::new(IconName::Search)
+                                    .small()
+                                    .text_color(theme.muted_foreground),
                             )
-                            .children(groups),
+                            .child(
+                                Input::new(&search)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false),
+                            ),
                     ),
             )
-            // Main column: same overlay scaffold as the conversation column —
-            // content sits below TITLE_BAR_HEIGHT; the TitleBar floats absolute
-            // on top as a drag region only (no text — the page's big heading
-            // carries the section identity, mirroring ChatGPT.app Settings).
+            .child(
+                v_flex()
+                    .id("settings-sidebar-body")
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_2()
+                    .gap_2()
+                    .children(groups),
+            )
+            .into_any_element()
+    }
+
+    /// The settings panel rendered in the shared shell's main column — the
+    /// same overlay scaffold as the conversation column: content sits below
+    /// TITLE_BAR_HEIGHT; the TitleBar floats absolute on top as a drag region
+    /// only (no text — the page's big heading carries the section identity,
+    /// mirroring ChatGPT.app Settings).
+    pub(crate) fn render_main(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .relative()
             .child(
                 v_flex()
                     .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .relative()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_h_0()
-                            .w_full()
-                            .overflow_hidden()
-                            .pt(TITLE_BAR_HEIGHT)
-                            .child(self.render_right_pane(&theme, cx)),
-                    )
-                    .child(
-                        gpui::div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h(TITLE_BAR_HEIGHT)
-                            .child(TitleBar::new().child(h_flex())),
-                    ),
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .pt(TITLE_BAR_HEIGHT)
+                    .child(self.render_right_pane(&theme, cx)),
             )
+            .child(
+                gpui::div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(TITLE_BAR_HEIGHT)
+                    .child(TitleBar::new().child(h_flex())),
+            )
+            .into_any_element()
+    }
+
+    /// Update the rendered nav width. Called by the shared shell's divider
+    /// drag (through the Workspace) so the settings sidebar resizes exactly
+    /// like the app sidebar.
+    pub fn set_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.width == width {
+            return;
+        }
+        self.width = width;
+        cx.notify();
     }
 }
 

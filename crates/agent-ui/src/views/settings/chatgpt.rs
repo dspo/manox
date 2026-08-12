@@ -8,8 +8,9 @@
 //! card whose rows are separated by hairlines (name in foreground color and
 //! description in muted color on the left, value right-aligned). Blocks:
 //! - Codex Home: read-only CODEX_HOME (copy / reveal in Finder);
-//! - Model Injection: injection mode (model list via CDP vs single model via
-//!   the official config.toml mechanism) + read-only Providers & LLMs catalog;
+//! - Model Injection: display nickname (optional) + injection mode (model list
+//!   via CDP vs single model via the official config.toml mechanism) +
+//!   read-only Providers & LLMs catalog;
 //! - Variable Injection: custom environment variables (proxy vars implicitly);
 //! - More Settings: `supports_websockets`.
 //!
@@ -57,6 +58,9 @@ pub struct ChatGptPanelState {
     codex_home: String,
     /// Injectable model catalog. `None` = still loading.
     catalog: Option<Catalog>,
+    /// Nickname replacing the provider display name during injection
+    /// (empty = keep the provider's own name).
+    nickname: Entity<InputState>,
     /// Custom environment variable rows.
     env: Vec<EnvRow>,
     /// `supports_websockets`, default false (custom providers rarely support
@@ -90,6 +94,7 @@ impl ChatGptPanelState {
             load_error: None,
             codex_home,
             catalog: None,
+            nickname: panel_input(window, cx, "", i18n::t("settings-chatgpt-nickname-ph")),
             env: Vec::new(),
             supports_ws: false,
             model_injection: ModelInjection::default(),
@@ -113,6 +118,11 @@ impl ChatGptPanelState {
     ) {
         self.supports_ws = settings.supports_websockets.unwrap_or(false);
         self.model_injection = settings.model_injection;
+        if let Some(nickname) = settings.nickname.as_deref() {
+            self.nickname.update(cx, |state, cx| {
+                state.set_value(nickname, window, cx);
+            });
+        }
         self.env = settings
             .env
             .into_iter()
@@ -205,9 +215,11 @@ impl ChatGptPanelState {
     }
 
     /// Validate and write to disk. Failures surface as toasts while the form
-    /// state is kept for correction.
+    /// state is kept for correction. A blank nickname is written as `None` so
+    /// the untouched default stays omitted from the config file.
     fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) {
         let env = self.collect_env(cx);
+        let nickname = self.nickname.read(cx).value().trim().to_string();
         if let Err(e) = cx::validate_chatgpt_custom_env(&env) {
             window.push_notification(
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
@@ -217,6 +229,7 @@ impl ChatGptPanelState {
         }
         let settings = ChatGptAppSettings {
             env,
+            nickname: (!nickname.is_empty()).then_some(nickname),
             supports_websockets: Some(self.supports_ws),
             model_injection: self.model_injection,
         };
@@ -240,14 +253,14 @@ impl EnvRow {
     ) -> Self {
         Self {
             id,
-            key: env_input(window, cx, key, i18n::t("settings-chatgpt-env-key-ph")),
-            value: env_input(window, cx, value, i18n::t("settings-chatgpt-env-value-ph")),
+            key: panel_input(window, cx, key, i18n::t("settings-chatgpt-env-key-ph")),
+            value: panel_input(window, cx, value, i18n::t("settings-chatgpt-env-value-ph")),
         }
     }
 }
 
-/// One env input; edit events flow into the debounced autosave.
-fn env_input(
+/// One autosaving text input: edit events flow into the debounced save.
+fn panel_input(
     window: &mut Window,
     cx: &mut Context<SettingsView>,
     value: &str,
@@ -449,9 +462,10 @@ fn render_home_block(view: &mut SettingsView, theme: &Theme) -> AnyElement {
     )
 }
 
-/// Model Injection: item 1 = injection mode (segmented two-choice; the CDP
-/// risk note is the row's inline description); item 2 = Providers & LLMs
-/// read-only catalog, one two-line row per provider. Per-provider fetch
+/// Model Injection: item 1 = display nickname (replaces the provider name
+/// during injection when set); item 2 = injection mode (segmented two-choice;
+/// the CDP risk note is the row's inline description); item 3 = Providers &
+/// LLMs read-only catalog, one two-line row per provider. Per-provider fetch
 /// failures render as a "failed to load" row instead of vanishing.
 fn render_injection_block(
     view: &mut SettingsView,
@@ -462,33 +476,42 @@ fn render_injection_block(
     let entity = cx.entity();
     let current = view.chatgpt_panel.model_injection;
 
-    let mut rows = vec![row_with_control(
-        i18n::t("settings-row-chatgpt-injection"),
-        Some(muted_text(
-            i18n::t("settings-desc-chatgpt-injection-risk"),
-            muted,
-        )),
-        build_segmented_pair(
-            "chatgpt-injection",
-            current == ModelInjection::List,
-            (
-                i18n::t("settings-value-injection-list"),
-                Arc::new(|this, cx| {
-                    this.chatgpt_panel.model_injection = ModelInjection::List;
-                    this.chatgpt_panel.touch(cx);
-                }),
-            ),
-            (
-                i18n::t("settings-value-injection-single"),
-                Arc::new(|this, cx| {
-                    this.chatgpt_panel.model_injection = ModelInjection::Single;
-                    this.chatgpt_panel.touch(cx);
-                }),
-            ),
-            theme,
-            entity.clone(),
+    let mut rows = vec![
+        row_with_control(
+            i18n::t("settings-row-chatgpt-nickname"),
+            Some(muted_text(i18n::t("settings-desc-chatgpt-nickname"), muted)),
+            Input::new(&view.chatgpt_panel.nickname)
+                .w(px(240.))
+                .into_any_element(),
         ),
-    )];
+        row_with_control(
+            i18n::t("settings-row-chatgpt-injection"),
+            Some(muted_text(
+                i18n::t("settings-desc-chatgpt-injection-risk"),
+                muted,
+            )),
+            build_segmented_pair(
+                "chatgpt-injection",
+                current == ModelInjection::List,
+                (
+                    i18n::t("settings-value-injection-list"),
+                    Arc::new(|this, cx| {
+                        this.chatgpt_panel.model_injection = ModelInjection::List;
+                        this.chatgpt_panel.touch(cx);
+                    }),
+                ),
+                (
+                    i18n::t("settings-value-injection-single"),
+                    Arc::new(|this, cx| {
+                        this.chatgpt_panel.model_injection = ModelInjection::Single;
+                        this.chatgpt_panel.touch(cx);
+                    }),
+                ),
+                theme,
+                entity.clone(),
+            ),
+        ),
+    ];
 
     match &view.chatgpt_panel.catalog {
         None => rows.push(read_only_row(
