@@ -20,6 +20,11 @@
 //!   while the list positions it by the stale cached height — overlapping the
 //!   next row or leaving a gap. `remeasure(_items)` only discards an
 //!   off-screen row's cached height early.
+//! - A width change resets every cached height to the estimate. Each row was
+//!   measured against the prior list width, so a resize leaves every cached
+//!   height stale; the reset clears off-screen rows so scroll geometry
+//!   self-corrects on resize (visible rows re-measure at the new width this
+//!   frame regardless).
 //!
 //! Feature surface mirrors what the workspace uses from `ListState`:
 //! `reset`, `splice`, `remeasure(_items)`, `scroll_to(_end)`,
@@ -41,7 +46,7 @@ use gpui::{
 /// self-corrects the frame a row enters the overdraw, while a content-derived
 /// guess can be unbounded — the blank-region failure this component exists to
 /// prevent.
-const ESTIMATED_ROW_H: f32 = 96.0;
+pub const ESTIMATED_ROW_H: f32 = 96.0;
 
 /// Follow-tail arbitration, matching the workspace's previous usage of gpui's
 /// `FollowMode`: `Tail` arms auto-pinning (disengaged by upward user scrolls,
@@ -76,6 +81,12 @@ struct StateInner {
     following: bool,
     anchor: ListOffset,
     pending_jump: Option<ListOffset>,
+    /// The list width every cached `Row.height` was measured against. A width
+    /// change makes every cached height stale, so a differing width resets each
+    /// row to the estimate (visible rows re-measure at the new width this frame
+    /// regardless; this only clears stale heights off the draw range so scroll
+    /// geometry self-corrects on resize instead of carrying old-width heights).
+    last_width: Option<Pixels>,
     viewport_h: Pixels,
     total_h: Pixels,
     scroll_top_px: Pixels,
@@ -118,6 +129,7 @@ impl VListState {
                 offset_in_item: px(0.),
             },
             pending_jump: None,
+            last_width: None,
             viewport_h: px(0.),
             total_h: px(0.),
             scroll_top_px: px(0.),
@@ -135,6 +147,7 @@ impl VListState {
         };
         s.pending_jump = None;
         s.following = false;
+        s.last_width = None;
     }
 
     /// Reconcile the item count (append or tail-removal), shifting the anchor
@@ -297,6 +310,20 @@ impl Element for VList {
                 hitbox,
                 scroll_max: s.scroll_max,
             };
+        }
+
+        // A width change invalidates every cached height: each row was measured
+        // against the prior width, so its height no longer holds at the new one.
+        // Visible rows re-measure at the new width below this frame regardless;
+        // this drops the stale heights of off-screen rows so the scroll geometry
+        // (scroll_max, total_h) self-corrects on resize instead of carrying
+        // old-width heights until each row scrolls back into the draw range.
+        // Mirrors gpui::list's width-change invalidation.
+        if s.last_width != Some(width) {
+            for row in s.rows.iter_mut() {
+                row.height = px(ESTIMATED_ROW_H);
+            }
+            s.last_width = Some(width);
         }
 
         let count = s.rows.len();
@@ -651,6 +678,7 @@ mod tests {
         assert_eq!(s.anchor.item_ix, 2);
         assert!(!s.following);
         assert!(s.pending_jump.is_none());
+        assert!(s.last_width.is_none(), "reset drops the cached width");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use agent_ui::views::vlist::{FollowMode, VListState, vlist};
+use agent_ui::views::vlist::{ESTIMATED_ROW_H, FollowMode, VListState, vlist};
 use gpui::{
     AnyWindowHandle, AppContext as _, Context, InteractiveElement as _, IntoElement,
     ParentElement as _, Pixels, Render, Styled as _, TestAppContext, Window, WindowHandle, div, px,
@@ -15,16 +15,18 @@ use gpui::{
 struct VlistProbe {
     state: VListState,
     body: Rc<RefCell<Vec<Pixels>>>,
+    list_width: Pixels,
     viewport_h: Pixels,
 }
 
 impl Render for VlistProbe {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let body = self.body.clone();
+        let list_width = self.list_width;
         let state = self.state.clone();
         div()
             .id("row")
-            .w(px(100.))
+            .w(list_width)
             .h(self.viewport_h)
             .flex()
             .flex_row()
@@ -73,6 +75,7 @@ fn draw_vlist(
         move |_, _| VlistProbe {
             state: build,
             body: body.clone(),
+            list_width: px(100.),
             viewport_h,
         }
     });
@@ -145,5 +148,47 @@ async fn vlist_remeasures_visible_rows_each_frame(cx: &mut TestAppContext) {
         total_h,
         px(240.),
         "a visible row's height change must self-correct without remeasure"
+    );
+}
+
+/// Regression: a list width change (window resize, sidebar toggle) must
+/// invalidate every cached height, not only the visible rows'. Visible rows
+/// re-measure at the new width the same frame regardless; the invariant under
+/// test is that OFF-SCREEN rows drop their stale old-width heights (reset to
+/// the estimate) so scroll geometry self-corrects on resize instead of
+/// carrying old-width heights until each row scrolls back into view. Mirrors
+/// gpui::list's width-change invalidation.
+#[gpui::test]
+async fn vlist_width_change_invalidates_offscreen_heights(cx: &mut TestAppContext) {
+    // 5 rows × 40px in a 100px viewport, overdraw 0, tail-following. With the
+    // estimate (96) larger than a row's real height (40), only the rows that
+    // fall in the visible window ever get measured; the rest stay at the
+    // estimate. After pinning to the tail, row 0 sits off-screen at the
+    // estimate (96) and rows 1-4 are measured (40): total_h = 96 + 4×40.
+    let (window, _body, state) = draw_vlist(cx, vec![px(40.); 5], px(100.));
+    state.set_follow_mode(FollowMode::Tail);
+    redraw(cx, window.into());
+    let (_, _, total_h) = state.scroll_geometry();
+    assert_eq!(
+        total_h,
+        px(ESTIMATED_ROW_H + 4. * 40.),
+        "row 0 off-screen at the estimate, rows 1-4 measured"
+    );
+
+    // Widen the list. The width change resets every cached height to the
+    // estimate; the visible rows (2,3,4) re-measure to 40 this frame, but the
+    // now-off-screen row 1 — previously measured at 40 — keeps the estimate
+    // (96) instead of carrying its old-width height. total_h = 2×96 + 3×40.
+    // Without the width-change reset, row 1 would keep 40 and total_h would
+    // stay at 96 + 4×40.
+    window
+        .update(cx, |probe, _, _| probe.list_width = px(150.))
+        .unwrap();
+    redraw(cx, window.into());
+    let (_, _, total_h) = state.scroll_geometry();
+    let expected = px(2. * ESTIMATED_ROW_H + 3. * 40.);
+    assert_eq!(
+        total_h, expected,
+        "off-screen rows reset to the estimate on width change"
     );
 }
