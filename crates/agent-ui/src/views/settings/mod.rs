@@ -20,6 +20,7 @@ use gpui_component::{
 use agent::{i18n, settings as user_settings};
 
 use crate::views::management_shell::back_control;
+use crate::views::plugin_manager::PluginManagerView;
 
 mod chatgpt;
 mod models;
@@ -165,7 +166,11 @@ pub struct SettingsView {
     /// owns the canonical width and syncs it here (and on re-entry) so the
     /// settings nav resizes exactly like the app sidebar.
     width: Pixels,
-
+    /// Plugin/marketplace management view, rendered in the right pane when
+    /// the "Plugins" item is selected. Owned here rather than as a
+    /// top-level Workspace mode so plugins live under Settings →
+    /// Integrations.
+    plugins: Entity<PluginManagerView>,
     /// Sidebar item currently highlighted. Stable fluent message id (e.g.
     /// `"settings-item-general"`) so it survives locale switches.
     selected: Option<SharedString>,
@@ -245,7 +250,7 @@ impl SettingsView {
         Self {
             search,
             width,
-            selected: None,
+            plugins: cx.new(|cx| PluginManagerView::new(window, cx)),            selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
             permission_autopilot: true,
@@ -580,7 +585,7 @@ impl SettingsView {
                 panels::render_environment(self, cx).into_any_element()
             }
             Some("settings-item-mcp") => panels::render_mcp(self, cx).into_any_element(),
-            Some("settings-item-chatgpt-app") => {
+            Some("settings-item-plugins") => self.plugins.clone().into_any_element(),            Some("settings-item-chatgpt-app") => {
                 chatgpt::render_chatgpt_app(self, cx).into_any_element()
             }
             Some("settings-item-vscode-app") => {
