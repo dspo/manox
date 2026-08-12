@@ -2976,6 +2976,7 @@ mod tests {
         let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
         Arc::new(EngineState {
             running: AtomicBool::new(false),
+            session_start_fired: AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
