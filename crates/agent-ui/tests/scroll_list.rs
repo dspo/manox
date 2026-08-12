@@ -19,9 +19,10 @@ struct VlistProbe {
 }
 
 impl Render for VlistProbe {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = self.body.clone();
         let state = self.state.clone();
+        let entity = cx.entity().clone();
         div()
             .id("row")
             .w(px(100.))
@@ -38,7 +39,7 @@ impl Render for VlistProbe {
                     .flex()
                     .flex_col()
                     .child(
-                        vlist(state, move |ix, _, _| {
+                        vlist(entity, state, move |_this, ix, _window, _cx| {
                             let height = body.borrow().get(ix).copied().unwrap_or(px(0.));
                             div()
                                 .id(("vc", ix))
@@ -64,7 +65,7 @@ fn draw_vlist(
     Rc<RefCell<Vec<Pixels>>>,
     VListState,
 ) {
-    let state = VListState::new(body.len(), px(0.));
+    let state = VListState::new(body.len());
     let build = state.clone();
     let body = Rc::new(RefCell::new(body));
     let window = cx.add_window({

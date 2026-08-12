@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::views::vlist::{FollowMode, ListOffset, VListState, vlist};
+use crate::views::vlist::{FollowMode, VListState, vlist};
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
@@ -152,12 +152,6 @@ struct DeferredUserTurn {
     ui: agent::MessageUiMetadata,
     user_images: Vec<UserImage>,
 }
-
-/// How far above/below the viewport the message `list` still measures items.
-/// Larger = smoother fast-scroll at the cost of less virtualization; two extra
-/// screenfuls cover fast wheel-paging past long tool cards and expanded
-/// markdown without painting an unmeasured gap (zed's chat panel uses 2048).
-const MSG_LIST_OVERDRAW: f32 = 2048.;
 
 /// A thread parked in the background while still running a turn. The held
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
@@ -342,17 +336,17 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll/virtualization state for the message column. The first-party
-    /// `vlist` element (views/vlist.rs) anchors the viewport to a logical
-    /// `ListOffset { item_ix, offset_in_item }` (index + pixel offset into
-    /// that item), so height re-measurement never shifts the visible content;
-    /// items are only measured at the list's definite width and unmeasured
-    /// items carry a small constant estimate, which is the root fix for the
-    /// gpui list's exploded-height blank regions. Bottom alignment gives
-    /// native chat-log semantics: short histories sit at the bottom, long
-    /// ones scroll, and `FollowMode::Tail` re-pins to the end each layout
-    /// while following (disengaging on upward scroll, re-arming at the
-    /// bottom). Only the items in the viewport plus overdraw render.
+    /// Scroll/virtualization state for the message column. `views/vlist.rs`
+    /// wraps gpui-component's `v_virtual_list`: gpui-component owns the
+    /// virtualization Element, scroll handle, visible-range computation, and
+    /// content mask; manox owns per-item height measurement (each visible item
+    /// measured at the list's definite width, cached, fed back as `item_sizes`
+    /// next frame) and tail-follow arbitration. Unmeasured items carry a small
+    /// constant estimate, so height re-measurement never shifts the visible
+    /// content. Bottom alignment gives native chat-log semantics: short
+    /// histories sit at the bottom, long ones scroll, and `FollowMode::Tail`
+    /// re-pins to the end each layout while following (disengaging on upward
+    /// scroll, re-arming at the bottom). Only the visible items render.
     list_state: VListState,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
@@ -620,7 +614,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state: VListState::new(0, px(MSG_LIST_OVERDRAW)),
+            list_state: VListState::new(0),
             list_count: 0,
             history_rendered: 0,
             view_mode: ViewMode::default(),
@@ -2309,10 +2303,7 @@ impl Workspace {
     /// `VListState`).
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Normal);
-        self.list_state.scroll_to(ListOffset {
-            item_ix,
-            offset_in_item: px(0.),
-        });
+        self.list_state.scroll_to(item_ix);
         cx.notify();
     }
 
@@ -6208,73 +6199,84 @@ impl Workspace {
                         // of the (empty) message list; otherwise an
                         // index-anchored, tail-following virtualized list.
                         .children(hero)
+                        // Bottom-align for short histories: a top spacer of
+                        // `(viewport - content)` pushes the list to the viewport
+                        // bottom so a fresh chat logs against the composer (chat-
+                        // log semantics) instead of clinging to the title bar.
+                        // Both terms are one-frame cached (viewport updated by
+                        // the list's own prepaint, heights from last measure), so
+                        // the spacer self-corrects as items settle.
                         .children((!first_screen).then(|| {
-                            let conv = self.conversation.clone();
-                            let list_state = self.list_state.clone();
-                            // `ListAlignment::Bottom` gives the list native
-                            // chat-log semantics: short conversations sit at
-                            // the bottom, long ones scroll. The list only
-                            // renders/measures the items in the viewport plus
-                            // overdraw, so a long thread's first frame pays
-                            // only for the visible turn. Item heights are
-                            // reconciled from the ThreadEvent handler via
-                            // `splice`/`remeasure_items`, so the per-item
-                            // height cache never falls out of sync.
-                            let list_el = vlist(list_state, move |ix, _window, cx| {
-                                let item = conv.read(cx).items().get(ix).cloned();
-                                match item {
-                                    // Defensive `flex_shrink_0`: the gpui
-                                    // list measures each row by its natural
-                                    // content height, so this flag is not
-                                    // what makes heights honest — it only
-                                    // guards against any available height
-                                    // leaking down the flex chain and
-                                    // compressing a row (e.g. a tall
-                                    // markdown block under a short one).
-                                    Some(item) => v_flex()
-                                        .w_full()
-                                        .pt_1()
-                                        .pb_4()
-                                        .flex_shrink_0()
-                                        .min_w_0()
-                                        .child(item)
-                                        .into_any_element(),
-                                    // Index out of range mid-splice (count changed
-                                    // between a layout pass and the render closure):
-                                    // render an empty row rather than panic.
-                                    None => gpui::div().into_any_element(),
-                                }
-                            })
-                            .w_full()
-                            .h_full()
-                            .min_h_0()
-                            .min_w_0();
-                            // Body typeface: Lilex Light. Every message row
-                            // (assistant, user, reasoning, tool cards, notices)
-                            // inherits from this wrapper div: gpui's List applies
-                            // its own text refinements only while requesting its
-                            // own layout, and with `Auto` sizing the item rows are
-                            // laid out in prepaint outside that scope — so the
-                            // family/weight must live on a wrapping div. Markdown
-                            // bold/headings resolve to Medium via nearest-weight,
-                            // italic syntax and tool-card overrides hit the
-                            // italic cuts.
-                            let list_wrap = v_flex()
-                                .flex_1()
-                                .h_full()
-                                .min_h_0()
-                                .min_w_0()
-                                .font_family(theme.mono_font_family.clone())
-                                .font_weight(gpui::FontWeight::LIGHT)
-                                .child(list_el);
-                            h_flex()
-                                .flex_1()
-                                .w_full()
-                                .min_h_0()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(list_wrap)
+                            let h = (self.list_state.viewport_h() - self.list_state.total_height())
+                                .max(px(0.));
+                            gpui::div().h(h).flex_shrink_0()
                         }))
+                        .children({
+                            let entity = cx.entity().clone();
+                            let list_state = self.list_state.clone();
+                            let mono_family = theme.mono_font_family.clone();
+                            (!first_screen).then(move || {
+                                // Backed by gpui-component's `v_virtual_list`: it
+                                // owns the virtualization Element, scroll handle,
+                                // visible-range computation, and content mask; manox
+                                // owns per-item height measurement (run inside the
+                                // render closure at the live content-mask width) and
+                                // the tail-follow arbitration. Item heights are
+                                // reconciled from the ThreadEvent handler via
+                                // `splice`/`remeasure_items`.
+                                let list_el =
+                                    vlist(entity, list_state, move |this, ix, _window, cx| {
+                                        let item =
+                                            this.conversation.read(cx).items().get(ix).cloned();
+                                        match item {
+                                            // `flex_shrink_0` guards against any
+                                            // available height leaking down the
+                                            // flex chain and compressing a row.
+                                            Some(item) => v_flex()
+                                                .w_full()
+                                                .pt_1()
+                                                .pb_4()
+                                                .flex_shrink_0()
+                                                .min_w_0()
+                                                .child(item)
+                                                .into_any_element(),
+                                            // Index out of range mid-splice (count
+                                            // changed between a layout pass and the
+                                            // render closure): render an empty row.
+                                            None => gpui::div().into_any_element(),
+                                        }
+                                    })
+                                    .w_full()
+                                    .h_full()
+                                    .min_h_0()
+                                    .min_w_0();
+                                // Body typeface: Lilex Light. Every message row
+                                // (assistant, user, reasoning, tool cards, notices)
+                                // inherits from this wrapper div: gpui's List applies
+                                // its own text refinements only while requesting its
+                                // own layout, and with `Auto` sizing the item rows are
+                                // laid out in prepaint outside that scope — so the
+                                // family/weight must live on a wrapping div. Markdown
+                                // bold/headings resolve to Medium via nearest-weight,
+                                // italic syntax and tool-card overrides hit the
+                                // italic cuts.
+                                let list_wrap = v_flex()
+                                    .flex_1()
+                                    .h_full()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .font_family(mono_family.clone())
+                                    .font_weight(gpui::FontWeight::LIGHT)
+                                    .child(list_el);
+                                h_flex()
+                                    .flex_1()
+                                    .w_full()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(list_wrap)
+                            })
+                        })
                         .children(footer)
                         // Approval overlay (if any)
                         .children(overlay)
