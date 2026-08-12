@@ -669,6 +669,12 @@ impl Workspace {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
                     });
+                    // The card is visible now, but the marker survives a
+                    // switch-away before the verdict: a parked thread blocked
+                    // on this authorization still shows the sidebar badge.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_auth(&thread_id, true, cx));
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
@@ -897,6 +903,25 @@ impl Workspace {
                     this.consume_steered_follow_up(message_id, cx);
                 }
                 _ => {
+                    // Tool traffic past a pending authorization proves the
+                    // verdict resolved (the call resumed or settled); drop
+                    // the sidebar badge. The `PendingApproval` card itself
+                    // precedes the authorization event and must not clear it.
+                    if matches!(
+                        ev,
+                        ThreadEvent::ToolCall { status, .. }
+                            if !matches!(
+                                status,
+                                agent::thread::ToolCallStatus::PendingApproval
+                            )
+                    ) || matches!(
+                        ev,
+                        ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. }
+                    ) {
+                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.mark_pending_auth(&thread_id, false, cx));
+                    }
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
                     // running. Pulled out of the catch-all rather than given a
@@ -1000,6 +1025,27 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.mark_running(&id, cx));
                 }
+                ThreadEvent::ToolCallAuthorization { .. } => {
+                    // A parked thread's approval card is not visible; the
+                    // sidebar badge is the only signal until the user
+                    // switches back and the card re-surfaces.
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_auth(&id, true, cx));
+                }
+                ThreadEvent::ToolCall { status, .. }
+                    if !matches!(status, agent::thread::ToolCallStatus::PendingApproval) =>
+                {
+                    // Tool traffic past a parked authorization proves the run
+                    // resumed (the verdict resolved); drop the badge. The
+                    // `PendingApproval` card itself precedes the authorization
+                    // event and must not clear it.
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_auth(&id, false, cx));
+                }
+                ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_auth(&id, false, cx));
+                }
                 ThreadEvent::SteerInjected { message_id } => {
                     this.consume_background_steer(&id, message_id);
                 }
@@ -1009,20 +1055,30 @@ impl Workspace {
                     stranded_steer_ids,
                     ..
                 } => {
-                    let _ = (cancelled, stranded_steer_ids);
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.mark_pending_auth(&id, false, cx);
                         if !*failed {
                             s.set_errored(&id, false, cx);
                         }
                         s.set_unread(&id, true, cx);
                     });
+                    // Mirror the foreground terminal bookkeeping: steers the
+                    // aborted turn never drained flip to `Failed` in the
+                    // parked stash (a late `SteerInjected` can still heal
+                    // them), and queued follow-ups only become the next turn
+                    // on a natural settle — never after a cancel.
+                    this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
+                    if !*cancelled {
+                        this.flush_parked_follow_ups(&id, cx);
+                    }
                 }
                 ThreadEvent::Error(_) => {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.mark_pending_auth(&id, false, cx);
                         s.set_errored(&id, true, cx);
                         s.set_unread(&id, true, cx);
                     });
@@ -1035,6 +1091,84 @@ impl Workspace {
                 _ => {}
             },
         )
+    }
+
+    /// Flip the parked thread's `SteerPending` cards whose steers an aborted
+    /// turn never drained to `Failed`, mirroring the foreground
+    /// `mark_stranded_steers_failed` against the per-thread stash. A parked
+    /// thread has no live conversation bubble to roll back (the optimistic
+    /// bubble died with the conversation entity on switch-away), so only the
+    /// queue state changes; the retry affordance renders once the stash is
+    /// restored on switch-back.
+    fn mark_parked_stranded_steers_failed(
+        &mut self,
+        thread_id: &str,
+        stranded_steer_ids: &[String],
+    ) {
+        let stranded: std::collections::HashSet<&str> =
+            stranded_steer_ids.iter().map(String::as_str).collect();
+        if stranded.is_empty() {
+            return;
+        }
+        let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
+            return;
+        };
+        for item in queue.iter_mut() {
+            if let FollowUpState::SteerPending { message_id } = &item.state
+                && stranded.contains(message_id.as_str())
+            {
+                // Keep the id so a later `SteerInjected` can still heal this
+                // provisional rollback (via `consume_background_steer`).
+                let message_id = message_id.clone();
+                item.state = FollowUpState::Failed { message_id };
+            }
+        }
+    }
+
+    /// Drain the stashed `Queued` follow-ups of a parked thread whose turn
+    /// just settled: the follow-up turn runs on the parked thread itself,
+    /// mirroring the foreground flush without a conversation bubble (a
+    /// switch-back rebuild shows it through the thread mirror). `Queued`
+    /// items coalesce into one `run_turn`, matching the foreground flush;
+    /// `SteerPending`/`Failed` cards stay parked for the user.
+    fn flush_parked_follow_ups(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
+            return;
+        };
+        let Some(thread) = self
+            .background_threads
+            .iter()
+            .find(|b| b.entity.read(cx).id.0 == thread_id)
+            .map(|b| b.entity.clone())
+        else {
+            return;
+        };
+        let mut retain: std::collections::VecDeque<QueuedFollowUp> =
+            std::collections::VecDeque::new();
+        let mut flushed = false;
+        while let Some(item) = queue.pop_front() {
+            let is_queued = matches!(&item.state, FollowUpState::Queued);
+            if is_queued {
+                let mut content: Vec<agent::language_model::MessageContent> =
+                    vec![agent::language_model::MessageContent::Text(item.turn.text)];
+                content.extend(item.turn.images);
+                let ui = item.turn.ui;
+                thread.update(cx, |t, cx| {
+                    t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                });
+                flushed = true;
+            } else {
+                retain.push_back(item);
+            }
+        }
+        if flushed {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        }
+        if retain.is_empty() {
+            self.queued_follow_ups_by_thread.remove(thread_id);
+        } else {
+            *queue = retain;
+        }
     }
 
     fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -2081,6 +2215,12 @@ impl Workspace {
             self.queued_follow_ups_by_thread
                 .insert(old_id.clone(), outgoing_follow_ups);
         }
+        // Restore the incoming thread's stashed follow-up queue (moved aside
+        // when it was last switched away); without this the queue silently
+        // vanishes on switch-back.
+        if let Some(queue) = self.queued_follow_ups_by_thread.remove(&new_id) {
+            self.queued_follow_ups = queue;
+        }
 
         // If the old thread is still running a turn, park it in the background
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
@@ -2216,9 +2356,13 @@ impl Workspace {
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
         // The user is now viewing this thread: clear any unread red dot it
-        // carried from a prior background completion.
+        // carried from a prior background completion, and any pending-auth
+        // badge (the verdict card re-surfaced below if one is outstanding).
         let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.set_unread(&id, false, cx));
+        store.update(cx, |s, cx| {
+            s.set_unread(&id, false, cx);
+            s.mark_pending_auth(&id, false, cx);
+        });
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
         self.spawn_git_status_refresh(cx);

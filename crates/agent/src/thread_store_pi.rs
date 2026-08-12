@@ -33,6 +33,11 @@ pub struct ThreadStore {
     /// `projects` table only — thread rows remain the manox store's domain).
     db: std::sync::Arc<crate::db::ThreadsDatabase>,
     running: HashSet<String>,
+    /// Threads with a tool authorization pending a user verdict (a parked
+    /// thread's approval card is not visible, so the sidebar badge is the
+    /// only signal until the user switches back). In-memory only: cleared on
+    /// attach, on terminal events, and when the run resumes past the call.
+    pending_auth: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, WeakEntity<Thread>>,
     sessions_dir: PathBuf,
@@ -70,6 +75,7 @@ pub fn init(cx: &mut App) {
         session_paths: HashMap::new(),
         known_projects,
         running: HashSet::new(),
+        pending_auth: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
@@ -155,6 +161,27 @@ impl ThreadStore {
             s.has_unread = unread;
         }
         self.write_meta(id, move |meta| meta.unread = unread, cx);
+    }
+
+    /// Whether a thread has a tool authorization pending a user verdict.
+    pub fn pending_auth_contains(&self, id: &str) -> bool {
+        self.pending_auth.contains(id)
+    }
+
+    /// Mark/unmark a thread as awaiting a tool-authorization verdict. Fires
+    /// `SummariesUpdated` so the sidebar badge appears without waiting for a
+    /// rescan. In-memory only — the badge is a live-state signal, never
+    /// persisted.
+    pub fn mark_pending_auth(&mut self, id: &str, pending: bool, cx: &mut Context<Self>) {
+        let changed = if pending {
+            self.pending_auth.insert(id.to_string())
+        } else {
+            self.pending_auth.remove(id)
+        };
+        if changed {
+            cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
     }
 
     /// Set the errored flag on a session (persisted in its sidecar).
@@ -398,6 +425,7 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
         known_projects: Vec::new(),
         db: db.clone(),
         running: HashSet::new(),
+        pending_auth: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
     });
@@ -436,6 +464,7 @@ mod tests {
                 known_projects,
                 db,
                 running: HashSet::new(),
+                pending_auth: HashSet::new(),
                 live_threads: HashMap::new(),
                 sessions_dir: std::env::temp_dir(),
             })
@@ -474,6 +503,40 @@ mod tests {
         let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
         assert_eq!(db.list_projects().unwrap().len(), 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The pending-auth badge marker toggles per thread id and only emits
+    /// `SummariesUpdated` on an actual state change.
+    #[test]
+    fn mark_pending_auth_toggles_marker() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = {
+            let events = std::sync::Arc::clone(&events);
+            cx.update(|cx| {
+                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
+                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_auth("t1", true, cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).pending_auth_contains("t1")));
+        // Idempotent mark: no event, no duplicate work.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_auth("t1", true, cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_auth("t1", false, cx));
+        });
+        assert!(!cx.update(|cx| store.read(cx).pending_auth_contains("t1")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(sub);
         std::fs::remove_file(path).ok();
     }
 

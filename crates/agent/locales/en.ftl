@@ -20,6 +20,7 @@ external-session-start-failed = Failed to start external agent
 plain-session-start-failed = Failed to start terminal session
 sidebar-empty-summary = (New chat)
 sidebar-copy-thread-id = Copy thread id
+sidebar-pending-auth = Waiting for approval
 sidebar-time-just-now = Just now
 sidebar-time-minutes = { $count ->
     [one] {$count} minute ago

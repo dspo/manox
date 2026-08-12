@@ -32,6 +32,12 @@ use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool}
 use crate::thread::{ApprovalMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
+/// How often the engine refreshes its history mirror while a run is in
+/// flight. Bounds the mid-run staleness a thread switch-back can observe;
+/// each tick clones the transcript, so the interval balances freshness
+/// against churn on large sessions.
+const LIVE_HISTORY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Commands the gpui side sends to the pi actor.
 enum SessionCmd {
     /// Start a turn with the given user text and attached images.
@@ -109,6 +115,19 @@ struct EngineState {
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
+}
+
+/// Live transcript snapshot maintained by the session listener so the engine
+/// can serve a current view of the in-flight turn without borrowing the
+/// session (the run future owns `&mut AgentSession` for its lifetime).
+/// `messages` accumulates completed messages; `streaming` holds the partial
+/// assistant message being generated (kernel `streaming_message` parity) and
+/// is replaced on `MessageStart`/`MessageUpdate`, sealed into `messages` on
+/// `MessageEnd`.
+#[derive(Default)]
+struct LiveTranscript {
+    messages: Vec<AgentMessage>,
+    streaming: Option<AgentMessage>,
 }
 
 /// The pi harness backend behind the `Thread` facade.
@@ -604,14 +623,22 @@ fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
 
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
-/// Shared by user prompts and monitor idle-wakeups. Returns the run result
-/// and whether an abort was requested.
+/// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
+/// Returns the run result and whether an abort was requested.
+///
+/// While the run is in flight, a periodic tick refreshes the engine's
+/// history mirror from the live transcript (`LiveHistory` notice) so a
+/// thread switched back to mid-turn rebuilds from current progress.
+#[allow(clippy::too_many_arguments)] // drive plumbing: each input is a distinct sink
 async fn drive_run<F>(
     run: F,
     handle: &pi::harness::HarnessHandle,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
     run_steers: &mut Vec<String>,
     shutdown_after_run: &mut bool,
+    live: Arc<Mutex<LiveTranscript>>,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) -> (anyhow::Result<Vec<AgentMessage>>, bool)
 where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
@@ -619,11 +646,21 @@ where
     tokio::pin!(run);
     let mut abort_requested = false;
     let mut channel_open = true;
+    let mut live_ticker = tokio::time::interval(LIVE_HISTORY_TICK);
+    live_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; consume it so the mirror is not
+    // re-synced at run start (the settle/ready path already mirrored).
+    live_ticker.tick().await;
     let result = loop {
         if !channel_open {
             break run.await;
         }
         tokio::select! {
+            _ = live_ticker.tick() => {
+                if sync_live_history(&live, state) {
+                    let _ = notice_tx.send(BackendNotice::LiveHistory);
+                }
+            }
             maybe_cmd = cmd_rx.recv() => match maybe_cmd {
                 Some(SessionCmd::Abort) => {
                     abort_requested = true;
@@ -711,8 +748,12 @@ async fn settle_run(
 fn subscribe_session(
     session: &AgentSession,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    live: Arc<Mutex<LiveTranscript>>,
 ) -> pi::agent::Subscription {
     let event_tx = notice_tx.clone();
+    // Seed the live mirror with the completed transcript so a mid-run tick
+    // never drops restored history; the listener below appends from here.
+    live.lock().unwrap().messages = session.harness_messages().to_vec();
     // A fresh session's jsonl file is deferred until the first assistant
     // message, so the sidebar only learns the thread exists once that file
     // materializes. The user MessageEnd fires before it; the first assistant
@@ -723,7 +764,23 @@ fn subscribe_session(
     session.subscribe(Arc::new(move |event, _cancel| {
         let tx = event_tx.clone();
         let assistant_flag = std::sync::Arc::clone(&assistant_flag);
+        let live = std::sync::Arc::clone(&live);
         Box::pin(async move {
+            // Mirror the in-flight transcript for the live-history ticker:
+            // completed messages accumulate, the streaming partial replaces
+            // the slot until `MessageEnd` seals it.
+            match &event {
+                AgentEvent::MessageStart { message }
+                | AgentEvent::MessageUpdate { message, .. } => {
+                    live.lock().unwrap().streaming = Some((**message).clone());
+                }
+                AgentEvent::MessageEnd { message } => {
+                    let mut guard = live.lock().unwrap();
+                    guard.streaming = None;
+                    guard.messages.push((**message).clone());
+                }
+                _ => {}
+            }
             if let AgentEvent::MessageEnd { message } = &event {
                 match &**message {
                     AgentMessage::User { .. } => {
@@ -744,6 +801,51 @@ fn subscribe_session(
             }
         })
     }))
+}
+
+/// Cheap change fingerprint for the live-history guard: message count plus
+/// the trailing message's content size. Collisions only defer a facade
+/// refresh by one tick, so exactness is unnecessary.
+fn live_fingerprint(mapped: &[Message]) -> (usize, usize) {
+    let trailing = mapped
+        .last()
+        .map(|m| {
+            m.content
+                .iter()
+                .map(|c| match c {
+                    MessageContent::Text(t) => t.len(),
+                    MessageContent::Thinking { text, .. } => text.len(),
+                    MessageContent::Image { data, .. } => data.len(),
+                    MessageContent::Compaction(t) => t.len(),
+                    MessageContent::ToolUse(t) => t.name.len() + t.input.to_string().len(),
+                    MessageContent::ToolResult(t) => t.content.len(),
+                })
+                .sum()
+        })
+        .unwrap_or(0);
+    (mapped.len(), trailing)
+}
+
+/// Refresh the engine's history mirror from the live transcript snapshot
+/// (completed messages + the streaming partial). Returns whether the mirror
+/// changed, so the caller can skip the facade notice on idle ticks (e.g. a
+/// run parked on an approval verdict where nothing is streaming).
+fn sync_live_history(live: &Arc<Mutex<LiveTranscript>>, state: &Arc<EngineState>) -> bool {
+    let mut msgs: Vec<AgentMessage> = Vec::new();
+    {
+        let guard = live.lock().unwrap();
+        msgs.extend(guard.messages.iter().cloned());
+        if let Some(streaming) = &guard.streaming {
+            msgs.push(streaming.clone());
+        }
+    }
+    let mapped = adapt::harness_messages_to_messages(&msgs);
+    let mut history = state.history.lock().unwrap();
+    if live_fingerprint(&history) == live_fingerprint(&mapped) {
+        return false;
+    }
+    *history = mapped;
+    true
 }
 
 /// Adapt harness lifecycle events onto the notice channel. Carries the
@@ -1039,7 +1141,10 @@ async fn run_actor(
     // Stream run events back to the gpui drainer. Re-registered after a
     // session rebuild (listeners live on the old Agent).
     let session_path = session.path().to_path_buf();
-    let mut _subscription = subscribe_session(&session, &notice_tx);
+    // The live-transcript mirror the listener maintains and the run ticker
+    // reads; shared so mid-run history refreshes never borrow the session.
+    let live_mirror: Arc<Mutex<LiveTranscript>> = Arc::new(Mutex::new(LiveTranscript::default()));
+    let mut _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
     let mut _harness_subscription = subscribe_harness_events(
         &mut session,
         sessions_dir.clone(),
@@ -1104,8 +1209,14 @@ async fn run_actor(
                     // Idle wakeup — the Rust equivalent of TS Pi's
                     // `sendUserMessage` idle semantics: a monitor steered
                     // events while the session was idle, so resume the run;
-                    // `continue_` drains the steering queue first.
+                    // `continue_` drains the steering queue first. The
+                    // facade learns the run started (`TurnStarted` sets its
+                    // running flag) so a switch-away parks the thread instead
+                    // of dropping it mid-run.
                     state.running.store(true, Ordering::Relaxed);
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                        ThreadEvent::TurnStarted,
+                    )));
                     let handle = session.handle();
                     let (result, abort_requested) = drive_run(
                         session.continue_(),
@@ -1113,6 +1224,9 @@ async fn run_actor(
                         &mut cmd_rx,
                         &mut run_steers,
                         &mut shutdown_after_run,
+                        Arc::clone(&live_mirror),
+                        &state,
+                        &notice_tx,
                     )
                     .await;
                     settle_run(
@@ -1149,6 +1263,9 @@ async fn run_actor(
                     &mut cmd_rx,
                     &mut run_steers,
                     &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
                 )
                 .await;
                 settle_run(
@@ -1260,6 +1377,7 @@ async fn run_actor(
                     }
                 }
                 state.running.store(true, Ordering::Relaxed);
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
                 let handle = session.handle();
                 let (result, abort_requested) = drive_run(
                     session.prompt(&seed_text),
@@ -1267,6 +1385,9 @@ async fn run_actor(
                     &mut cmd_rx,
                     &mut run_steers,
                     &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
                 )
                 .await;
                 settle_run(
@@ -1335,7 +1456,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                 )
                 .await;
-                _subscription = subscribe_session(&session, &notice_tx);
+                _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
                     sessions_dir.to_path_buf(),
@@ -1377,7 +1498,8 @@ async fn run_actor(
                         state.plan.set_active_instructions(None);
                         session = s;
                         let new_path = session.path().to_path_buf();
-                        _subscription = subscribe_session(&session, &notice_tx);
+                        _subscription =
+                            subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
                         _harness_subscription = subscribe_harness_events(
                             &mut session,
                             sessions_dir.clone(),
@@ -2790,5 +2912,84 @@ mod tests {
         );
         assert!(text.contains("Here is my plan."));
         assert!(text.contains("Shall we?"));
+    }
+
+    fn test_engine_state() -> Arc<EngineState> {
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+        let model_slot = Arc::new(Mutex::new(None));
+        let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
+        Arc::new(EngineState {
+            running: AtomicBool::new(false),
+            history: Mutex::new(Vec::new()),
+            request_usage: Mutex::new(HashMap::new()),
+            cumulative: Mutex::new(TokenUsage::default()),
+            per_model: Mutex::new(HashMap::new()),
+            cumulative_cost: Mutex::new(0.0),
+            per_model_cost: Mutex::new(HashMap::new()),
+            model: model_slot,
+            sessions: Mutex::new(Vec::new()),
+            active_path: Mutex::new(None),
+            gate,
+            plan: crate::plan_mode::PlanSessionState::new(),
+            goal_bridge: None,
+        })
+    }
+
+    fn partial_assistant(text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                signature: None,
+            }],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: None,
+            raw_stop_reason: None,
+            usage: Box::new(pi::types::Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// The live-history mirror serves completed messages plus the streaming
+    /// partial (kernel `streaming_message` parity), and reports change only
+    /// when the snapshot actually moved (the idle-tick guard).
+    #[test]
+    fn sync_live_history_mirrors_completed_plus_streaming_and_reports_change() {
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        live.lock().unwrap().messages.push(AgentMessage::user("hi"));
+        live.lock().unwrap().streaming = Some(partial_assistant("part"));
+
+        assert!(sync_live_history(&live, &state));
+        {
+            let history = state.history.lock().unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(matches!(
+                &history[0].content[0],
+                crate::language_model::MessageContent::Text(t) if t == "hi"
+            ));
+            assert!(matches!(
+                &history[1].content[0],
+                crate::language_model::MessageContent::Text(t) if t == "part"
+            ));
+        }
+
+        // Identical snapshot: no change (a run parked on an approval verdict
+        // streams nothing, so the facade notice is skipped).
+        assert!(!sync_live_history(&live, &state));
+
+        // The streaming partial growing re-syncs.
+        live.lock().unwrap().streaming = Some(partial_assistant("partial-answer"));
+        assert!(sync_live_history(&live, &state));
+        let history = state.history.lock().unwrap();
+        assert!(matches!(
+            &history[1].content[0],
+            crate::language_model::MessageContent::Text(t) if t == "partial-answer"
+        ));
     }
 }
