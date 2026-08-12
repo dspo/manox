@@ -173,6 +173,10 @@ pub struct MessageItem {
     /// rows such as `AgentTask` to open their peer right-pane view.
     weak_workspace: WeakEntity<Workspace>,
     markdown: Option<Entity<Markdown>>,
+    /// Ask-card snapshot budgeted by the list render closure each frame so
+    /// `render` never reads the owning `Workspace` (the list element leases it
+    /// for the duration of the render). Written by `Workspace`'s list closure.
+    pub(crate) ask_snapshot: Option<AskCardSnapshot>,
 }
 
 impl MessageItem {
@@ -183,6 +187,7 @@ impl MessageItem {
             id,
             weak_workspace: weak,
             markdown: None,
+            ask_snapshot: None,
         }
     }
 
@@ -553,16 +558,9 @@ impl Render for MessageItem {
         let agent_ctx = self.weak_workspace.upgrade().map(|ws| AgentTaskCtx {
             weak: ws.downgrade(),
         });
-        let tool_ctx = self.weak_workspace.upgrade().map(|ws| {
-            let tool_id = match &self.kind {
-                ConvItem::ToolCall(t) => Some(t.id.as_str()),
-                _ => None,
-            };
-            let read = ws.read(cx);
-            ToolCallCtx {
-                weak: ws.downgrade(),
-                ask: tool_id.and_then(|id| read.ask_card_snapshot(id, cx)),
-            }
+        let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
+            weak: ws.downgrade(),
+            ask: self.ask_snapshot.clone(),
         });
         // The owned markdown document for text-bearing items (persistent across
         // frames → selection + streaming state survive). `None` for non-text

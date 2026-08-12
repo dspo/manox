@@ -6232,14 +6232,30 @@ impl Workspace {
                                             // `flex_shrink_0` guards against any
                                             // available height leaking down the
                                             // flex chain and compressing a row.
-                                            Some(item) => v_flex()
-                                                .w_full()
-                                                .pt_1()
-                                                .pb_4()
-                                                .flex_shrink_0()
-                                                .min_w_0()
-                                                .child(item)
-                                                .into_any_element(),
+                                            //
+                                            // Budget the ask-card snapshot before
+                                            // rendering: the list element leases
+                                            // the Workspace for the whole closure,
+                                            // so `MessageItem::render` must not
+                                            // read it back. `item` is a distinct
+                                            // entity, safe to lease here.
+                                            Some(item) => {
+                                                let ask = match item.read(cx).kind() {
+                                                    ConvItem::ToolCall(t) => {
+                                                        this.ask_card_snapshot(t.id.as_str(), cx)
+                                                    }
+                                                    _ => None,
+                                                };
+                                                item.update(cx, |it, _cx| it.ask_snapshot = ask);
+                                                v_flex()
+                                                    .w_full()
+                                                    .pt_1()
+                                                    .pb_4()
+                                                    .flex_shrink_0()
+                                                    .min_w_0()
+                                                    .child(item)
+                                                    .into_any_element()
+                                            }
                                             // Index out of range mid-splice (count
                                             // changed between a layout pass and the
                                             // render closure): render an empty row.
