@@ -53,6 +53,9 @@ pub fn launch_with_injection(
             provider.name
         );
     }
+    // 昵称优先：配置后无论选用哪个 provider，注入前都把展示名替换为昵称。
+    let provider_display_name =
+        crate::chatgpt_provider_display_name(&provider.name, chatgpt_settings);
 
     // 1. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
     let prepared = prepare_chatgpt_launch_home_for_app(
@@ -61,6 +64,7 @@ pub fn launch_with_injection(
         selection.selected_wire_api,
         &selection.injected_models,
         chatgpt_settings,
+        provider_display_name,
     )?;
     let ChatGptAppPrepared {
         codex_home,
@@ -133,13 +137,13 @@ pub fn launch_with_injection(
     match debug_port {
         Some(port) => println!(
             "启动 ChatGPT.app | Provider: {} | Model: {} | 注入 {} 个模型（CDP 端口 {port}）",
-            provider.name,
+            provider_display_name,
             default_model.id,
             injected.len()
         ),
         None => println!(
             "启动 ChatGPT.app | Provider: {} | Model: {} | 单模型模式（config.toml 官方机制，无 CDP）",
-            provider.name, default_model.id
+            provider_display_name, default_model.id
         ),
     }
     println!();

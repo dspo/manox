@@ -830,6 +830,7 @@ fn prepare_chatgpt_launch_home_for_app(
     wire_api: WireApi,
     injected_models: &[ResolvedModel],
     chatgpt_settings: &ChatGptAppSettings,
+    provider_display_name: &str,
 ) -> Result<ChatGptAppPrepared> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let codex_dir = cx_state_dir()?.join(".codex");
@@ -880,7 +881,8 @@ fn prepare_chatgpt_launch_home_for_app(
         &env::current_dir()?,
         wire_api,
         &provider_key,
-        &provider.name,
+        // 展示名可被昵称覆盖（ChatGPT.app 注入路径），provider key 不变。
+        provider_display_name,
         &env_key,
         api_model_id,
         context_window,
@@ -1203,12 +1205,36 @@ pub fn chatgpt_app_settings() -> Result<ChatGptAppSettings> {
 }
 
 /// `supports_websockets: Some(false)` 归一为 `None`（启动端 `None` 按 false
-/// 处理，语义等价），使净零操作与 `default()` 相等、整段可省略。纯函数，便于单测。
+/// 处理，语义等价），`nickname` 空白归一为 `None`，使净零操作与
+/// `default()` 相等、整段可省略。纯函数，便于单测。
 fn normalize_chatgpt_app_settings(mut settings: ChatGptAppSettings) -> ChatGptAppSettings {
     if settings.supports_websockets == Some(false) {
         settings.supports_websockets = None;
     }
+    if let Some(nickname) = settings.nickname.take() {
+        let trimmed = nickname.trim();
+        if trimmed.is_empty() {
+            settings.nickname = None;
+        } else {
+            settings.nickname = Some(trimmed.to_string());
+        }
+    }
     settings
+}
+
+/// ChatGPT.app 注入时 provider 的展示名：昵称（trim 非空）优先，否则
+/// provider 本名。CLI 与 GUI 启动路径共用，保证 config.toml 的
+/// `[model_providers.*] name` 与启动摘要一致。
+pub fn chatgpt_provider_display_name<'a>(
+    provider_name: &'a str,
+    chatgpt_settings: &'a ChatGptAppSettings,
+) -> &'a str {
+    chatgpt_settings
+        .nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(provider_name)
 }
 
 /// 保存 ChatGPT.app 注入设置（保留配置文件的 providers/agents 等其余段）。
@@ -1538,6 +1564,9 @@ fn resolve_vscode_codex_part(
         WireApi::Responses,
         injected,
         chatgpt_settings,
+        // 昵称是 ChatGPT.app 注入专属配置；VS Code Codex 扩展复用同一
+        // config.toml 机制时保持 provider 本名。
+        &provider.name,
     )?;
     let apikey = resolve_chatgpt_app_apikey(provider)?;
     Ok(Some(VsCodeCodexPart {
@@ -6595,6 +6624,56 @@ trust_level = "trusted"
             normalize_chatgpt_app_settings(on).supports_websockets,
             Some(true),
             "Some(true) 必须保留"
+        );
+    }
+
+    #[test]
+    fn normalize_chatgpt_app_settings_trims_blank_nickname() {
+        let blank = ChatGptAppSettings {
+            nickname: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_chatgpt_app_settings(blank).nickname,
+            None,
+            "纯空白昵称应归一为 None（整段可省略）"
+        );
+        let trimmed = ChatGptAppSettings {
+            nickname: Some(" 我的模型 ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalize_chatgpt_app_settings(trimmed).nickname.as_deref(),
+            Some("我的模型"),
+            "昵称两侧空白应去除"
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_display_name_prefers_nickname() {
+        let unnamed = ChatGptAppSettings::default();
+        assert_eq!(
+            chatgpt_provider_display_name("百炼", &unnamed),
+            "百炼",
+            "未配置昵称时保持 provider 本名"
+        );
+        let blank = ChatGptAppSettings {
+            nickname: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            chatgpt_provider_display_name("百炼", &blank),
+            "百炼",
+            "空白昵称视为未配置"
+        );
+        let named = ChatGptAppSettings {
+            nickname: Some("我的模型".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            chatgpt_provider_display_name("百炼", &named),
+            "我的模型",
+            "配置昵称后无论哪个 provider 都替换为昵称"
         );
     }
 

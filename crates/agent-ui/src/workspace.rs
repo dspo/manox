@@ -1257,10 +1257,14 @@ impl Workspace {
     /// user's last selection (and any scroll position) survives re-entry.
     pub fn enter_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_view.is_none() {
-            let settings = cx.new(|cx| SettingsView::new(window, cx));
+            let settings = cx.new(|cx| SettingsView::new(self.sidebar_width, window, cx));
             let sub = self.subscribe_settings(&settings, cx);
             self.settings_view = Some(settings);
             self.settings_sub = Some(sub);
+        } else if let Some(settings) = self.settings_view.as_ref() {
+            // Re-entry after a divider resize in the app page: the settings
+            // nav follows the shared sidebar width.
+            settings.update(cx, |s, cx| s.set_width(self.sidebar_width, cx));
         }
         self.view_mode = ViewMode::Settings;
         // Clear any pending exit animation: clicking Settings… while the
@@ -5171,15 +5175,19 @@ impl Workspace {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
         }
-        // Settings overlay replaces the entire window content; the underlying
-        // Workspace state (sidebar, conversation, composer) is preserved and
-        // returns unchanged when the user clicks "Back to app".
+        // Settings reuses the shared shell (`sidebar | divider | main`) — the
+        // same layout container as the app page, only with the settings nav in
+        // the sidebar slot and the settings panel as the main column. The
+        // underlying Workspace state (conversation sidebar, composer) is
+        // preserved and returns unchanged when the user clicks "Back to app".
         if matches!(self.view_mode, ViewMode::Settings) {
             let settings = self
                 .settings_view
                 .as_ref()
                 .expect("enter_settings must have created the SettingsView")
                 .clone();
+            let nav = settings.update(cx, |s, cx| s.render_nav(window, cx));
+            let main = settings.update(cx, |s, cx| s.render_main(window, cx));
             // Horizontal slide: enter glides the panel in from the left edge
             // (offset -PANEL_W → 0), exit glides it out to the right
             // (offset 0 → +PANEL_W). The animation id mixes the current
@@ -5199,7 +5207,8 @@ impl Workspace {
                 )
             };
             let panel_w = px(280.0);
-            let anim_el = gpui::div().size_full().child(settings).with_animation(
+            let shell = self.shell_root(nav, main, cx);
+            let anim_el = shell.with_animation(
                 anim_id,
                 Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
                 move |el, delta| {
@@ -5232,7 +5241,11 @@ impl Workspace {
                 .small()
                 .into_any_element();
             return self
-                .shell_root(self.render_terminal_column(icon, title_text, terminal), cx)
+                .shell_root(
+                    self.sidebar.clone(),
+                    self.render_terminal_column(icon, title_text, terminal),
+                    cx,
+                )
                 .on_action(
                     cx.listener(|this, _: &crate::ToggleCockpitTasks, _window, cx| {
                         this.context_rail.update(cx, |r, cx| {
@@ -5271,7 +5284,11 @@ impl Workspace {
                     .text_color(cx.theme().muted_foreground)
                     .into_any_element();
                 return self
-                    .shell_root(self.render_terminal_column(icon, title, terminal), cx)
+                    .shell_root(
+                        self.sidebar.clone(),
+                        self.render_terminal_column(icon, title, terminal),
+                        cx,
+                    )
                     .into_any_element();
             }
             // No live session matches the recorded id (closed underneath us).
@@ -5779,7 +5796,7 @@ impl Workspace {
                 // the thread interacts, or below the narrow width gate.
                 .when(show_rail, |this| this.child(self.context_rail.clone()))
         };
-        let mut root = self.shell_root(conversation_column, cx);
+        let mut root = self.shell_root(self.sidebar.clone(), conversation_column, cx);
         root = root
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.enter_settings(window, cx);
@@ -5879,19 +5896,32 @@ impl Workspace {
             ));
         root.into_any_element()
     }
-    /// The shared window shell every non-Settings `ViewMode` renders through:
+    /// The shared window shell every full-window `ViewMode` renders through:
     /// `sidebar | sidebar-divider | main`, plus the mode-switching actions and
     /// the sidebar drag/reset handling. The divider (drag handle, double-click
-    /// reset, width clamp + sync to the `Sidebar` entity) lives here once, so
-    /// the conversation, built-in terminal, and external-session views all
-    /// resize the sidebar identically — the main column is the only
-    /// mode-specific part. Modes chain their own actions/children onto the
-    /// returned root before converting it to an element.
-    fn shell_root(&mut self, main: impl IntoElement, cx: &mut Context<Self>) -> gpui::Div {
+    /// reset, width clamp + sync) lives here once, so the conversation,
+    /// built-in terminal, external-session, and Settings pages all resize
+    /// their sidebar identically — only the sidebar slot and main column
+    /// differ per mode. The Settings page passes its own nav as the sidebar
+    /// slot; dragging the divider there updates the same width state so the
+    /// layout container behaves identically across pages.
+    fn shell_root(
+        &mut self,
+        sidebar: impl IntoElement,
+        main: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let theme = cx.theme().clone();
         // The divider is the visual separator and the drag handle for resizing
         // the sidebar. Double-click resets to the default `SIDEBAR_WIDTH` for
         // symmetry with the editor pane.
+        let sync_width = |this: &mut Self, cx: &mut App, width: Pixels| {
+            this.sidebar_width = width;
+            this.sidebar.update(cx, |s, cx| s.set_width(width, cx));
+            if let Some(settings) = this.settings_view.as_ref() {
+                settings.update(cx, |s, cx| s.set_width(width, cx));
+            }
+        };
         let sidebar_divider = gpui::div()
             .id("sidebar-divider")
             .w(px(SIDEBAR_DIVIDER_WIDTH))
@@ -5914,11 +5944,9 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                cx.listener(move |this, e: &MouseUpEvent, _, cx| {
                     if e.click_count >= 2 {
-                        let reset = px(SIDEBAR_WIDTH);
-                        this.sidebar_width = reset;
-                        this.sidebar.update(cx, |s, cx| s.set_width(reset, cx));
+                        sync_width(this, cx, px(SIDEBAR_WIDTH));
                         cx.notify();
                     }
                 }),
@@ -5942,11 +5970,11 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
             }))
-            .child(self.sidebar.clone())
+            .child(sidebar)
             .child(sidebar_divider)
             .child(main)
             .on_drag_move(cx.listener(
-                |this, e: &DragMoveEvent<DraggedSidebarDivider>, _window, cx| {
+                move |this, e: &DragMoveEvent<DraggedSidebarDivider>, _window, cx| {
                     // The root fills the window, so the sidebar's right edge is
                     // the cursor's x position relative to the root's left.
                     // Clamp so the main column (and the editor pane when open)
@@ -5965,8 +5993,7 @@ impl Workspace {
                         .min(px(SIDEBAR_MAX_WIDTH))
                         .max(px(SIDEBAR_MIN_WIDTH));
                     let clamped = new_w.clamp(px(SIDEBAR_MIN_WIDTH), max_w);
-                    this.sidebar_width = clamped;
-                    this.sidebar.update(cx, |s, cx| s.set_width(clamped, cx));
+                    sync_width(this, cx, clamped);
                     cx.notify();
                 },
             ))

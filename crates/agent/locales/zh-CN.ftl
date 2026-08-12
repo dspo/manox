@@ -5,8 +5,6 @@
 
 ### sidebar.rs
 sidebar-new-chat = 新对话
-sidebar-search = 搜索
-sidebar-scheduled = 已安排
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
 sidebar-new-session-label = 新建会话
@@ -144,6 +142,9 @@ settings-section-chatgpt-home = Codex Home
 settings-desc-chatgpt-home = ChatGPT.app 对话管理主路径，用于与官方路径隔离。
 settings-section-chatgpt-injection = 模型注入
 settings-desc-chatgpt-injection = 决定自定义模型在 ChatGPT.app 中的可用方式。
+settings-row-chatgpt-nickname = 昵称
+settings-desc-chatgpt-nickname = 配置后，启动 ChatGPT.app 时以该昵称替换注入的 provider 名称（无论选用哪个 provider）。
+settings-chatgpt-nickname-ph = 选填
 settings-row-chatgpt-injection = 模型注入方式
 settings-value-injection-list = 模型列表
 settings-value-injection-single = 单个模型

@@ -190,6 +190,13 @@ pub struct ChatGptAppSettings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 
+    /// 注入 ChatGPT.app 时 provider 的展示昵称：配置后（非空 trim），
+    /// 无论选用哪个 provider，注入前都把 provider 名称替换为该昵称
+    /// （写进 config.toml 的 `[model_providers.*] name` 与启动摘要）；
+    /// 未配置时保持 provider 本名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+
     /// provider endpoint 是否支持 WebSocket 流式。`Some` 时写进注入
     /// config.toml 的 `[model_providers.*]` 段 `supports_websockets`；
     /// `None`（未配置）按 `false` 处理——自定义 provider 普遍不支持 WS 流式。
@@ -1643,6 +1650,7 @@ providers:
             agents: Vec::new(),
             chatgpt_app: Some(ChatGptAppSettings {
                 env,
+                nickname: Some("我的模型".into()),
                 supports_websockets: Some(false),
                 model_injection: ModelInjection::Single,
             }),
@@ -1652,10 +1660,12 @@ providers:
         assert!(yaml.contains("chatgpt_app:"));
         assert!(yaml.contains("supports_websockets: false"));
         assert!(yaml.contains("model_injection: single"));
+        assert!(yaml.contains("nickname: 我的模型"));
         let read_back: CxConfig = serde_yaml::from_str(&yaml).unwrap();
         let chatgpt = read_back.chatgpt_app.expect("chatgpt_app 应保留");
         assert_eq!(chatgpt.supports_websockets, Some(false));
         assert_eq!(chatgpt.model_injection, ModelInjection::Single);
+        assert_eq!(chatgpt.nickname.as_deref(), Some("我的模型"));
         assert_eq!(
             chatgpt.env.get("http_proxy").map(String::as_str),
             Some("http://127.0.0.1:7890")
