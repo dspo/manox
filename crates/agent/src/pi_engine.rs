@@ -499,7 +499,9 @@ fn build_tools(
     let bash = bash.with_force_unsandboxed(force_unsandboxed);
 
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
-        Arc::new(pi::tools::read::ReadTool),
+        // Read with oh-my-pi path selectors (`path:N-M` / `:raw` / multi-range);
+        // selector-less reads delegate to the kernel ReadTool unchanged.
+        Arc::new(pi_extensions::read::SelectorReadTool::new()),
         // Write/Edit carry the process write lock for their execution window:
         // concurrent writers to the same path get a named-holder conflict
         // instead of silently clobbering each other (old manox file_lock
@@ -697,7 +699,7 @@ fn build_tools(
         let subagent = SubagentTool::new(
             Arc::new(registry),
             vec![
-                Arc::new(pi::tools::read::ReadTool),
+                Arc::new(pi_extensions::read::SelectorReadTool::new()),
                 Arc::new(pi::tools::grep::GrepTool),
                 Arc::new(pi::tools::find::FindTool),
                 Arc::new(pi::tools::ls::LsTool),

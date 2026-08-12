@@ -9,7 +9,9 @@ pub mod agents;
 pub mod bash;
 pub mod model_ref;
 pub mod monitor;
+pub mod path_selector;
 pub mod provider;
+pub mod read;
 pub mod session_meta;
 pub mod session_stream;
 
