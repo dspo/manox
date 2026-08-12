@@ -165,6 +165,8 @@ impl VListState {
     }
 
     /// Mark every item for re-measurement (width-independent content changes).
+    /// `last_width` intentionally survives: prepaint's width check owns the
+    /// width-change invalidation path.
     pub fn remeasure(&self) {
         for row in self.0.borrow_mut().rows.iter_mut() {
             row.dirty = true;
@@ -202,6 +204,13 @@ impl VListState {
 
     pub fn is_following_tail(&self) -> bool {
         self.0.borrow().following
+    }
+
+    /// Last prepaint's scroll geometry `(scroll_top, scroll_max, total_h)`.
+    /// Snapshot for tests/diagnostics; all zero before the first layout.
+    pub fn scroll_geometry(&self) -> (Pixels, Pixels, Pixels) {
+        let s = self.0.borrow();
+        (s.scroll_top_px, s.scroll_max, s.total_h)
     }
 }
 

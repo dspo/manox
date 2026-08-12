@@ -1954,13 +1954,14 @@ impl Workspace {
     /// slash command, thread open) — it always re-arms follow, even if the
     /// user had scrolled up to read back.
     fn follow_message_tail(&mut self) {
+        self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
     /// Jump the viewport so the given conversation item is at the top. Index-
     /// anchored, so it is a single atomic state change — no frame protection
     /// needed against a stale `scroll_to_bottom` (there is no such flag on a
-    /// `ListState`).
+    /// `VListState`).
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Normal);
         self.list_state.scroll_to(ListOffset {
