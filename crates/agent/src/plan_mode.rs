@@ -370,7 +370,7 @@ impl AgentTool for ProposePlanTool {
         Ok(AgentToolResult {
             content: vec![pi::types::ContentBlock::Text {
                 text: format!(
-                    "Plan submitted for review: {title} ({plan_file}). Wait for the user's                      verdict; do not implement before approval."
+                    "Plan submitted for review: {title} ({plan_file}). The turn ends here; wait for the user's verdict and do not implement before approval."
                 ),
                 signature: None,
             }],
@@ -381,7 +381,10 @@ impl AgentTool for ProposePlanTool {
             is_error: false,
             usage: None,
             added_tool_names: None,
-            terminate: false,
+            // End the turn at the proposal so the review card stays the
+            // conversation's last item; without this the model appends a
+            // trailing summary after the card.
+            terminate: true,
         })
     }
 }
@@ -389,6 +392,100 @@ impl AgentTool for ProposePlanTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NullEnv;
+
+    #[async_trait::async_trait]
+    impl pi::env::ExecutionEnv for NullEnv {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/")
+        }
+        fn join_path(&self, parts: &[&str]) -> std::path::PathBuf {
+            parts.iter().collect()
+        }
+        async fn absolute_path(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<std::path::PathBuf, pi::env::FileError> {
+            Ok(path.to_path_buf())
+        }
+        async fn read_file(
+            &self,
+            _path: &std::path::Path,
+            _offset: Option<usize>,
+            _limit: Option<usize>,
+        ) -> Result<String, pi::env::FileError> {
+            Ok(String::new())
+        }
+        async fn write_file(
+            &self,
+            _path: &std::path::Path,
+            _content: &str,
+        ) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &std::path::Path) -> Result<bool, pi::env::FileError> {
+            Ok(false)
+        }
+        async fn file_info(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<pi::env::FileInfo, pi::env::FileError> {
+            Ok(pi::env::FileInfo {
+                path: path.to_path_buf(),
+                is_dir: false,
+                size: 0,
+            })
+        }
+        async fn list_dir(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<Vec<pi::env::FileInfo>, pi::env::FileError> {
+            Ok(Vec::new())
+        }
+        async fn create_dir(&self, _path: &std::path::Path) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn remove(&self, _path: &std::path::Path) -> Result<(), pi::env::FileError> {
+            Ok(())
+        }
+        async fn exec(
+            &self,
+            _command: &str,
+            _timeout: std::time::Duration,
+            _signal: tokio_util::sync::CancellationToken,
+        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
+            Err(pi::env::ExecutionError::Other("null env".into()))
+        }
+    }
+
+    // The agent loop stops a turn only when every finalized tool call reports
+    // `terminate`; this locks the field so the review card stays the
+    // conversation's last item (a silent revert to `false` would let the model
+    // append a trailing summary after the card).
+    #[tokio::test]
+    async fn propose_plan_ends_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit-plan.md"), "# Audit\n\nbody\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = ProposePlanTool::new(tx, PlanSessionState::new(), dir.path().to_path_buf());
+        let ctx = pi::tool::LocalToolContext::new(
+            std::sync::Arc::new(NullEnv),
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(pi::tool::ToolState::new()),
+        );
+        let result = tool
+            .execute(
+                "call",
+                serde_json::json!({ "slug": "audit" }),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("propose succeeds");
+        assert!(result.terminate);
+        assert!(!result.is_error);
+    }
 
     #[test]
     fn slug_validation() {
