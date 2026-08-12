@@ -13,6 +13,13 @@
 //!   guess, so a wrong estimate errs toward "too small", not "ten screens".
 //! - The scroll position is a logical anchor (item index + offset), so height
 //!   re-measurement above the anchor never shifts the visible content.
+//! - Every row in the draw range is re-measured every frame, not only rows an
+//!   explicit `remeasure` flagged. A row's element re-renders each frame, so a
+//!   height that changed without a remeasure signal (async image load, font
+//!   swap, lazy markdown reflow) would otherwise paint at its fresh height
+//!   while the list positions it by the stale cached height — overlapping the
+//!   next row or leaving a gap. `remeasure(_items)` only discards an
+//!   off-screen row's cached height early.
 //!
 //! Feature surface mirrors what the workspace uses from `ListState`:
 //! `reset`, `splice`, `remeasure(_items)`, `scroll_to(_end)`,
@@ -60,8 +67,6 @@ pub struct VListState(Rc<RefCell<StateInner>>);
 #[derive(Clone, Copy)]
 struct Row {
     height: Pixels,
-    measured: bool,
-    dirty: bool,
 }
 
 struct StateInner {
@@ -71,9 +76,8 @@ struct StateInner {
     following: bool,
     anchor: ListOffset,
     pending_jump: Option<ListOffset>,
-    last_width: Option<Pixels>,
-    total_h: Pixels,
     viewport_h: Pixels,
+    total_h: Pixels,
     scroll_top_px: Pixels,
     scroll_max: Pixels,
 }
@@ -82,14 +86,14 @@ impl StateInner {
     fn estimated_rows(count: usize) -> Vec<Row> {
         vec![
             Row {
-                height: px(ESTIMATED_ROW_H),
-                measured: false,
-                dirty: false,
+                height: px(ESTIMATED_ROW_H)
             };
             count
         ]
     }
 
+    /// Sum of per-row heights with a leading zero (so `prefix[ix]` is the
+    /// top of row `ix` and `prefix[count]` is the content height).
     fn prefix_heights(&self) -> Vec<Pixels> {
         let mut prefix = Vec::with_capacity(self.rows.len() + 1);
         let mut acc = px(0.);
@@ -114,9 +118,8 @@ impl VListState {
                 offset_in_item: px(0.),
             },
             pending_jump: None,
-            last_width: None,
-            total_h: px(0.),
             viewport_h: px(0.),
+            total_h: px(0.),
             scroll_top_px: px(0.),
             scroll_max: px(0.),
         })))
@@ -132,24 +135,17 @@ impl VListState {
         };
         s.pending_jump = None;
         s.following = false;
-        s.last_width = None;
     }
 
     /// Reconcile the item count (append or tail-removal), shifting the anchor
-    /// and any pending jump past the edited range.
+    /// and any pending jump past the edited range. New rows enter as estimated
+    /// (unmeasured) and self-correct the frame they enter the draw range.
     pub fn splice(&self, old_range: Range<usize>, count: usize) {
         let mut s = self.0.borrow_mut();
         let removed = old_range.end.saturating_sub(old_range.start);
         let delta = count as isize - removed as isize;
         let range = old_range.start.min(s.rows.len())..old_range.end.min(s.rows.len());
-        s.rows.splice(
-            range,
-            (0..count).map(|_| Row {
-                height: px(ESTIMATED_ROW_H),
-                measured: false,
-                dirty: false,
-            }),
-        );
+        s.rows.splice(range, StateInner::estimated_rows(count));
         let shift = |off: &mut ListOffset| {
             if off.item_ix >= old_range.end {
                 off.item_ix = (off.item_ix as isize + delta).max(0) as usize;
@@ -164,20 +160,23 @@ impl VListState {
         }
     }
 
-    /// Mark every item for re-measurement (width-independent content changes).
-    /// `last_width` intentionally survives: prepaint's width check owns the
-    /// width-change invalidation path.
+    /// Discard every row's cached height, resetting it to the estimate. Visible
+    /// rows re-measure at the definite width on the very next frame regardless,
+    /// so this only matters for off-screen rows: a stale height (the item was
+    /// mutated in place — plan card demoted, steer rolled back) is dropped now
+    /// rather than carried until the row scrolls back into the draw range.
     pub fn remeasure(&self) {
         for row in self.0.borrow_mut().rows.iter_mut() {
-            row.dirty = true;
+            row.height = px(ESTIMATED_ROW_H);
         }
     }
 
-    /// Mark a range for re-measurement.
+    /// Discard the cached height of the rows in `range`. Same contract as
+    /// [`Self::remeasure`], scoped to the mutated items.
     pub fn remeasure_items(&self, range: Range<usize>) {
         let mut s = self.0.borrow_mut();
         for row in s.rows.iter_mut().take(range.end).skip(range.start) {
-            row.dirty = true;
+            row.height = px(ESTIMATED_ROW_H);
         }
     }
 
@@ -300,14 +299,6 @@ impl Element for VList {
             };
         }
 
-        // A width change invalidates every cached height.
-        if s.last_width != Some(width) {
-            for row in s.rows.iter_mut() {
-                row.dirty = true;
-            }
-            s.last_width = Some(width);
-        }
-
         let count = s.rows.len();
 
         // Resolve the logical scroll top for this frame.
@@ -341,35 +332,35 @@ impl Element for VList {
             end += 1;
         }
 
-        // Measure dirty/unmeasured rows in the draw range at the definite
-        // list width, keeping the laid-out element for prepaint below.
+        // Re-measure every row in the draw range at the definite list width,
+        // keeping each laid-out element for the paint pass below. Every row
+        // is re-measured every frame (not only "dirty" ones): the workspace
+        // re-renders each row's element every frame, so a height that changed
+        // without an explicit remeasure signal (async image load, font swap,
+        // lazy markdown reflow) would otherwise paint at its fresh height
+        // while the list positions it by the stale cached height — the row
+        // then overlaps its neighbor or leaves a gap. Out-of-range rows keep
+        // their last/estimated height for scroll math and self-correct the
+        // frame they enter the draw range.
         let measure_space = size(AvailableSpace::Definite(width), AvailableSpace::MinContent);
-        let mut laid_out: Vec<Option<AnyElement>> = Vec::with_capacity(end - start);
-        let mut measured_any = false;
+        let mut elements: Vec<AnyElement> = Vec::with_capacity(end - start);
+        let mut height_changed = false;
         for ix in start..end {
-            let needs = {
-                let row = &s.rows[ix];
-                row.dirty || !row.measured
-            };
-            if needs {
-                let mut element = (self.render_item)(ix, window, cx);
-                let measured = element.layout_as_root(measure_space, window, cx);
-                let row = &mut s.rows[ix];
+            let mut element = (self.render_item)(ix, window, cx);
+            let measured = element.layout_as_root(measure_space, window, cx);
+            let row = &mut s.rows[ix];
+            if row.height != measured.height {
                 row.height = measured.height;
-                row.measured = true;
-                row.dirty = false;
-                measured_any = true;
-                laid_out.push(Some(element));
-            } else {
-                laid_out.push(None);
+                height_changed = true;
             }
+            elements.push(element);
         }
 
         // Re-derive positions from the updated heights. The anchor is
         // re-applied logically — same item, same (clamped) intra-item offset
         // under the new heights — so re-measurement above the anchor never
         // shifts the visible content.
-        if measured_any {
+        if height_changed {
             let mut acc = px(0.);
             for (row, slot) in s.rows.iter().zip(prefix.iter_mut().skip(1)) {
                 acc += row.height;
@@ -388,20 +379,11 @@ impl Element for VList {
         // Bottom alignment: short conversations sit at the viewport bottom.
         let content_top = (viewport_h - prefix[count]).max(px(0.));
 
-        let mut elements: Vec<AnyElement> = Vec::with_capacity(end - start);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for (ix, slot) in (start..end).zip(laid_out) {
-                let mut element = match slot {
-                    Some(element) => element,
-                    None => {
-                        let mut element = (self.render_item)(ix, window, cx);
-                        let _ = element.layout_as_root(measure_space, window, cx);
-                        element
-                    }
-                };
+            for (i, element) in elements.iter_mut().enumerate() {
+                let ix = start + i;
                 let origin = bounds.origin + point(px(0.), content_top + prefix[ix] - scroll_top);
                 element.prepaint_at(origin, window, cx);
-                elements.push(element);
             }
         });
 
@@ -531,18 +513,7 @@ mod tests {
     #[test]
     fn prefix_heights_accumulates_rows() {
         let state = VListState::new(0, px(100.));
-        state.0.borrow_mut().rows = vec![
-            Row {
-                height: px(10.),
-                measured: true,
-                dirty: false,
-            },
-            Row {
-                height: px(20.),
-                measured: true,
-                dirty: false,
-            },
-        ];
+        state.0.borrow_mut().rows = vec![Row { height: px(10.) }, Row { height: px(20.) }];
         let prefix = state.0.borrow().prefix_heights();
         assert_eq!(prefix, vec![px(0.), px(10.), px(30.)]);
     }
@@ -631,7 +602,9 @@ mod tests {
         let s = state.0.borrow();
         assert_eq!(s.rows.len(), 8);
         assert_eq!(s.anchor.item_ix, 8);
-        assert!(s.rows.iter().all(|r| !r.measured));
+        // New rows enter as the constant estimate and self-correct the frame
+        // they enter the draw range.
+        assert!(s.rows.iter().all(|r| r.height == px(ESTIMATED_ROW_H)));
     }
 
     #[test]
@@ -678,7 +651,6 @@ mod tests {
         assert_eq!(s.anchor.item_ix, 2);
         assert!(!s.following);
         assert!(s.pending_jump.is_none());
-        assert!(s.last_width.is_none());
     }
 
     #[test]
@@ -699,21 +671,5 @@ mod tests {
         assert!(state.is_following_tail());
         state.set_follow_mode(FollowMode::Normal);
         assert!(!state.is_following_tail());
-    }
-
-    #[test]
-    fn remeasure_marks_all_rows_dirty() {
-        let state = VListState::new(3, px(100.));
-        state.remeasure();
-        assert!(state.0.borrow().rows.iter().all(|r| r.dirty));
-    }
-
-    #[test]
-    fn remeasure_items_marks_only_the_range() {
-        let state = VListState::new(4, px(100.));
-        state.remeasure_items(1..3);
-        let s = state.0.borrow();
-        let dirty: Vec<bool> = s.rows.iter().map(|r| r.dirty).collect();
-        assert_eq!(dirty, vec![false, true, true, false]);
     }
 }
