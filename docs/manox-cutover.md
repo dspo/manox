@@ -1,5 +1,7 @@
 # pi → manox 切换清单
 
+> **现状（2026-08-12）**：切换已完成——退役 harness（harness-manox）已于 #447 整体删除，pi 路径是 manox 唯一的 harness；本文档保留为移植过程的历史记录与 parity 参考。遗留跟踪见 issue #397（缺口清单）与 #499（plan-capsule）。
+
 > 目的：定义「pi crate 何时成熟到可以替换 manox `agent` crate」的可核对条件。
 > 姊妹文档：TS Pi → crate pi 的行为对齐核验见 [ts-pi-parity.md](ts-pi-parity.md)（含对齐基线 SHA）；本文件只追踪替换旧 harness 所需的 manox 产品能力。
 > 状态图例：✅ 已对等 · 🟡 pi 已有但浅 · 🔲 缺失需移植 · 🚫 有意不做（不面向历史和负债） · ❓ 待决策

@@ -5,6 +5,11 @@
 //! and the runtime-resolver side-call seam (same pattern as the approval
 //! reviewer in `pi_approval`). Pure request-construction/sanitization logic
 //! lives here; the cadence state machine rides the pi actor (`pi_engine`).
+//!
+//! Layering (issue #483 adjudication): TS Pi has no native LLM title
+//! generation (verified against the upstream repo), so this is capability-
+//! layering class ③ (absent from TS, manox original) — host layer is the
+//! correct home, not the pi kernel parity surface.
 
 use pi::coding_agent::ModelRuntime;
 use pi::types::{AgentMessage, ContentBlock, Model as PiModel, StreamOptions};
