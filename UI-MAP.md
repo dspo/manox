@@ -49,15 +49,19 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### 顶层
 
-- [Window](#window) · [NativeMenuBar](#nativemenubar) · [Workspace](#workspace) · [WorkspaceShell](#workspaceshell) · [TerminalColumn](#terminalcolumn) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
+- [Window](#window) · [NativeMenuBar](#nativemenubar) · [Workspace](#workspace) · [WorkspaceShell](#workspaceshell) · [MainView](#mainview) · [TerminalColumn](#terminalcolumn) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
 - [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarPinnedSectionHeader](#sidebarpinnedsectionheader) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [ResumeSidecar](#resumesidecar) · [SidebarDivider](#sidebardivider)
 
-### MainColumn
+### MainView
 
-- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+- [MainView](#mainview)
+
+### MessageColumn
+
+- [MessageColumn](#messagecolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
 
 ### ContextRail
 
@@ -165,26 +169,31 @@ Full-window external agent CLI session (claude / codex / copilot) or a plain ter
 
 ## 3. ViewMode::Workspace Layout
 
-Every non-Settings `ViewMode` renders through one shared shell ([WorkspaceShell](#workspaceshell)): `sidebar | SidebarDivider | mode main column`. The sidebar divider (drag-resize, double-click reset, width clamp + sync to the sidebar entity) is defined in exactly one place, so the conversation, built-in terminal, and external-session views all resize the sidebar identically — only the main column differs per mode. In the default mode the main column is the conversation column: a relative `v_flex` that holds a shared [TitleBar](#titlebar) overlay on top (spanning the whole middle column) and the conversation column underneath. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; while it is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
+Every non-Settings `ViewMode` renders through one shared shell ([WorkspaceShell](#workspaceshell)): `sidebar | SidebarDivider | main view`. The sidebar divider (drag-resize, double-click reset, width clamp + sync to the sidebar entity) is defined in exactly one place, so the conversation, built-in terminal, and external-session views all resize the sidebar identically — only the main view's content differs per mode. In the default mode the main view is a two-column container ([MainView](#mainview)): the [MessageColumn](#messagecolumn) (conversation) on the left and, when any right-pane tab is open, the right side view ([RightPane](#rightpane)) on the right. The old third top-level shell column now nests inside the main view, so the shell stays uniformly two columns. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the message column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. While the right pane is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px message-column width), in which case the message column fills the main view.
 
 ```
-┌──────────┬──┬──────────────────────────────┐
-│          │  │  MiddleColumn (v_flex.relative)│
-│ Sidebar  │▌ │ ┌──────────────────────────┐  │
-│          │  │ │ TitleBar (shared overlay) │  │
-│          │  ├──────────────────────────┤  │
-│          │  │ MainColumn (conversation) │  │
-│          │  │                ┌─────────┐ │  │
-│          │  │                │Context  │ │  │
-│          │  │                │Rail card│ │  │
-│          │  │                │(float)  │ │  │
-│          │  │                └─────────┘ │  │
-└──────────┴──┴──────────────────────────────┘
+┌──────────┬──┬──────────────────────────────────┐
+│          │  │MainView (h_flex)                 │
+│Sidebar   │▌ │ ┌──────────────┬──┬──────────┐   │
+│          │  │ │ MessageColumn│▌ │RightPane  │  │
+│          │  │ │ TitleBar     │  │(editor/  │   │
+│          │  │ │ conversation │  │browser)  │   │
+│          │  │ │ ContextRail  │  │          │   │
+│          │  │ │ float overlay│  │          │   │
+│          │  │ └──────────────┴──┴──────────┘   │
+│          │  │└────────────────────────────────┘│
+└──────────┴──┴──────────────────────────────────┘
 ```
 
 #### WorkspaceShell
 
-The shared window shell built by `Workspace::shell_root(sidebar, main)`: an `h_flex` root with `sidebar-slot | 6px SidebarDivider | mode main column`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every full-window `ViewMode` routes through it — the sidebar slot is the conversation `Sidebar` for Workspace / Terminal / ExternalSession modes and the [SettingsLeftNav](#settingsleftnav) for Settings; the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…), the right [EditorPane](#editordpane) + [EditorDivider](#editordivider) columns, and the turn-navigator overlay onto it; the Terminal and ExternalSession modes chain only their own extras. The divider drag/double-click-reset writes one shared width (`Workspace::sidebar_width`) and syncs it to both the `Sidebar` entity and the `SettingsView`, so the Settings page resizes its sidebar exactly like the app page. Terminal-style main columns are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
+The shared window shell built by `Workspace::shell_root(sidebar, main)`: an `h_flex` root with `sidebar-slot | 6px SidebarDivider | main view`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every full-window `ViewMode` routes through it — the sidebar slot is the conversation `Sidebar` for Workspace / Terminal / ExternalSession modes and the [SettingsLeftNav](#settingsleftnav) for Settings; the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…) and the turn-navigator overlay onto it, and passes a [MainView](#mainview) (message column + right side view) as the main slot; the Terminal and ExternalSession modes pass a single-column [TerminalColumn](#terminalcolumn) instead. The divider drag/double-click-reset writes one shared width (`Workspace::sidebar_width`) and syncs it to both the `Sidebar` entity and the `SettingsView`, so the Settings page resizes its sidebar exactly like the app page. Terminal-style main views are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### MainView
+
+The Workspace mode's main slot: an `h_flex` container holding the [MessageColumn](#messagecolumn) and, when any right-pane tab is open, the [EditorDivider](#editordivider) + [RightPane](#rightpane) as sub-columns. Nesting the right pane inside the main view keeps the shell uniformly `sidebar | divider | main view` across every view mode — the right pane is no longer a third top-level shell column. The right side view's contents are per-thread: switching threads stashes the outgoing editor draft and restores the incoming one, so no thread ever shows another thread's right-side content, and returning to a thread recovers its editor text.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -250,15 +259,15 @@ Durable record of an unclosed external agent session (`agent-ui/src/external_ses
 
 #### SidebarDivider
 
-6px drag handle between Sidebar and the mode main column, `cursor:col-resize`. Constructed once inside [WorkspaceShell](#workspaceshell), so it appears — and behaves identically (drag-resize, double-click reset to the 260px default) — in the conversation, terminal, and external-session views.
+6px drag handle between Sidebar and the mode main view, `cursor:col-resize`. Constructed once inside [WorkspaceShell](#workspaceshell), so it appears — and behaves identically (drag-resize, double-click reset to the 260px default) — in the conversation, terminal, and external-session views.
 
 > Source: `agent-ui/src/workspace.rs`
 
-### 3.2 MainColumn
+### 3.2 MessageColumn
 
-Central conversation column, flex-1. The sole flex child of the middle column under the shared [TitleBar](#titlebar) overlay that spans the whole middle column (not a top-level column itself). The [ContextRail](#contextrail) floats over this column's top-right as an absolute overlay (not a flex sibling); the conversation body reserves `ENV_CONTENT_INSET` right padding when the card is shown so the message list clears it. The composer no longer spans underneath the card.
+Central conversation column, flex-1 — the left sub-column of the [MainView](#mainview) (not a sibling of the shell root). Under the shared [TitleBar](#titlebar) overlay that spans the whole message column (not a top-level column itself). The [ContextRail](#contextrail) floats over this column's top-right as an absolute overlay (not a flex sibling); the conversation body reserves `ENV_CONTENT_INSET` right padding when the card is shown so the message list clears it. The composer no longer spans underneath the card.
 
-#### MainColumn
+#### MessageColumn
 
 Vertical flex container, fills remaining width.
 
@@ -266,7 +275,7 @@ Vertical flex container, fills remaining width.
 
 #### TitleBar
 
-Absolute-positioned top bar at the middle-column level (not the conversation column), height `TITLE_BAR_HEIGHT`, spans both [MainColumn](#maincolumn) and the [ContextRail](#contextrail) card so the pair reads as one middle column under a single bar. Contains thread title and "..." menu.
+Absolute-positioned top bar at the message-column level (not the conversation body), height `TITLE_BAR_HEIGHT`, spans both [MessageColumn](#messagecolumn) and the [ContextRail](#contextrail) card so the pair reads as one message column under a single bar. Contains thread title and "..." menu.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -406,7 +415,7 @@ Amber badge, `bg:warning/0.12`, braille spinner + "Retry N/M (in Xs)" text. The 
 
 #### 3.2.3 Footer
 
-Bottom area of MainColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). Hidden entirely while history is loading — no input until the restore lands.
+Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). Hidden entirely while history is loading — no input until the restore lands.
 
 #### Footer
 
@@ -579,11 +588,11 @@ Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal
 
 ### 3.3 ContextRail
 
-Right-side context panel that floats over the Workspace's conversation column top-right as an absolute overlay — NOT a flex sibling of [MainColumn](#maincolumn). The `Render` impl positions it (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`); the panel body (`render_panel`) carries the card chrome (`border_1` / `rounded(theme.radius)` / drop shadow / `bg:background` + `p_3`/`gap_2`). Content height, never full-height — a compact floating card, not a flush column or a second title bar. The conversation body reserves `ENV_CONTENT_INSET` (card width + 36px gutter) right padding so the message list never hides behind the card. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, the model's `PlanSnapshot`, per-cell counter animation) that used to live on `Workspace`.
+Right-side context panel that floats over the Workspace's conversation column top-right as an absolute overlay — NOT a flex sibling of [MessageColumn](#messagecolumn). The `Render` impl positions it (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`); the panel body (`render_panel`) carries the card chrome (`border_1` / `rounded(theme.radius)` / drop shadow / `bg:background` + `p_3`/`gap_2`). Content height, never full-height — a compact floating card, not a flush column or a second title bar. The conversation body reserves `ENV_CONTENT_INSET` (card width + 36px gutter) right padding so the message list never hides behind the card. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, the model's `PlanSnapshot`, per-cell counter animation) that used to live on `Workspace`.
 
 Visibility is gated on the main-column body width (`ContextRail::rail_width_for`): shown as `Some(ENV_CARD_WIDTH)` (260px) at/above `RAIL_NARROW_BREAK` (900px), folded away (`None`) below it. The card's `top` clears the shared [TitleBar](#titlebar) overlay.
 
-The card stays **hidden while the [EditorPane](#editorpane) is open** — opening the right pane reclaims the card's width for the conversation — and on the empty first screen / before the thread has interacted. It is not the editor's replacement; the editor is a third top-level column outside the middle. Because the card is absent while the editor is open, the editor-divider drag clamp reserves only `MAIN_MIN_WIDTH` (no card width) — the conversation alone holds the middle column while the editor is open. The card floats as an absolute overlay (content height); the conversation column is `flex_1`/`min_w_0` and reserves `ENV_CONTENT_INSET` right padding when the card is shown.
+The card stays **hidden while the [EditorPane](#editorpane) is open** — opening the right pane reclaims the card's width for the conversation — and on the empty first screen / before the thread has interacted. The editor is not the card's replacement: it lives in the right side view, a sub-column of the same [MainView](#mainview) to the right of the message column. Because the card is absent while the editor is open, the editor-divider drag clamp reserves only `MAIN_MIN_WIDTH` (no card width) — the conversation alone holds the message column while the editor is open. The card floats as an absolute overlay (content height); the conversation column is `flex_1`/`min_w_0` and reserves `ENV_CONTENT_INSET` right padding when the card is shown.
 
 #### ContextRail
 
@@ -665,17 +674,17 @@ Pure parsing + tokio-bridged IO module backing [ContextRailChangesRow](#contextr
 
 ### 3.4 EditorPane
 
-Right-side panel, shown when `editor_open` is true. 640px default (320–960 draggable).
+Right side view of the [MainView](#mainview), shown when any right-pane tab is open. 640px default (320–960 draggable). Its contents (the editor's text) are per-thread — switching threads stashes the outgoing draft and restores the incoming one.
 
 #### EditorDivider
 
-6px drag handle between MainColumn and the right pane (conditional — shown while any right-pane tab is open).
+6px drag handle between MessageColumn and the right side view (conditional — shown while any right-pane tab is open).
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### RightPane
 
-Vertical flex, right panel. A tab container holding the markdown editor and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
+Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
 
 > Source: `agent-ui/src/workspace.rs`
 
