@@ -538,6 +538,7 @@ impl Thread {
                 // and reply through the tool's responder channel.
                 let result = crate::team::tools::execute_team_op(self, op, cx);
                 let _ = responder.try_send(result);
+            }
             BackendNotice::BrowserRequest { op, responder } => {
                 // The browser host is a gpui main-thread surface; the tool
                 // (tokio) parked its request here. Execute on the main
@@ -589,7 +590,8 @@ impl Thread {
                     };
                     let _ = responder.send(result).await;
                 })
-                .detach();            }
+                .detach();
+            }
             BackendNotice::Ready {
                 restored,
                 model,

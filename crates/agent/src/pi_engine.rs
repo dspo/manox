@@ -577,7 +577,7 @@ fn build_tools(
             ApprovalGatedTool::new(tool, Arc::clone(gate))
                 .with_plan_policy(Arc::clone(&plan_policy)),
         ));
-    }    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    } // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
     // tests) contributes nothing.
