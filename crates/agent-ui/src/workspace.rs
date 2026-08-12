@@ -1055,7 +1055,6 @@ impl Workspace {
                     stranded_steer_ids,
                     ..
                 } => {
-                    let _ = (cancelled, stranded_steer_ids);
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
@@ -1065,10 +1064,15 @@ impl Workspace {
                         }
                         s.set_unread(&id, true, cx);
                     });
-                    // Mirror the foreground flush: queued follow-ups parked
-                    // while the thread ran become its next turn, on the
-                    // parked thread itself.
-                    this.flush_parked_follow_ups(&id, cx);
+                    // Mirror the foreground terminal bookkeeping: steers the
+                    // aborted turn never drained flip to `Failed` in the
+                    // parked stash (a late `SteerInjected` can still heal
+                    // them), and queued follow-ups only become the next turn
+                    // on a natural settle — never after a cancel.
+                    this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
+                    if !*cancelled {
+                        this.flush_parked_follow_ups(&id, cx);
+                    }
                 }
                 ThreadEvent::Error(_) => {
                     let store = agent::thread_store_global();
@@ -1087,6 +1091,38 @@ impl Workspace {
                 _ => {}
             },
         )
+    }
+
+    /// Flip the parked thread's `SteerPending` cards whose steers an aborted
+    /// turn never drained to `Failed`, mirroring the foreground
+    /// `mark_stranded_steers_failed` against the per-thread stash. A parked
+    /// thread has no live conversation bubble to roll back (the optimistic
+    /// bubble died with the conversation entity on switch-away), so only the
+    /// queue state changes; the retry affordance renders once the stash is
+    /// restored on switch-back.
+    fn mark_parked_stranded_steers_failed(
+        &mut self,
+        thread_id: &str,
+        stranded_steer_ids: &[String],
+    ) {
+        let stranded: std::collections::HashSet<&str> =
+            stranded_steer_ids.iter().map(String::as_str).collect();
+        if stranded.is_empty() {
+            return;
+        }
+        let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
+            return;
+        };
+        for item in queue.iter_mut() {
+            if let FollowUpState::SteerPending { message_id } = &item.state
+                && stranded.contains(message_id.as_str())
+            {
+                // Keep the id so a later `SteerInjected` can still heal this
+                // provisional rollback (via `consume_background_steer`).
+                let message_id = message_id.clone();
+                item.state = FollowUpState::Failed { message_id };
+            }
+        }
     }
 
     /// Drain the stashed `Queued` follow-ups of a parked thread whose turn
