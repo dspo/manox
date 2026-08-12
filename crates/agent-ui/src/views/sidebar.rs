@@ -27,6 +27,7 @@ use gpui_component::{
     h_flex,
     menu::{PopupMenu, PopupMenuItem},
     tag::{Tag, TagVariant},
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -521,6 +522,7 @@ impl Sidebar {
                                 &s,
                                 is_selected,
                                 store.read(cx).is_running(&s.id),
+                                store.read(cx).pending_auth_contains(&s.id),
                                 px(16.),
                                 &theme,
                             ),
@@ -739,6 +741,7 @@ impl Render for Sidebar {
                                             &s,
                                             is_selected,
                                             store.read(cx).is_running(&s.id),
+                                            store.read(cx).pending_auth_contains(&s.id),
                                             px(0.),
                                             &theme,
                                         ),
@@ -993,6 +996,9 @@ struct SidebarThreadItem {
     has_unread: bool,
     errored: bool,
     running: bool,
+    /// A tool authorization is parked waiting for the user's verdict (the
+    /// thread's card is only visible when it is the active thread).
+    pending_auth: bool,
     selected: bool,
     indent: gpui::Pixels,
     icon: RowIcon,
@@ -1007,6 +1013,7 @@ impl SidebarThreadItem {
         summary: &agent::ThreadSummary,
         selected: bool,
         running: bool,
+        pending_auth: bool,
         indent: gpui::Pixels,
         theme: &Theme,
     ) -> Self {
@@ -1026,6 +1033,7 @@ impl SidebarThreadItem {
             has_unread: summary.has_unread,
             errored: summary.errored,
             running,
+            pending_auth,
             selected,
             indent,
             icon: RowIcon::Thread,
@@ -1077,6 +1085,7 @@ impl SidebarThreadItem {
             has_unread: false,
             errored: false,
             running: false,
+            pending_auth: false,
             selected,
             indent,
             icon: RowIcon::External(summary.kind.icon_asset()),
@@ -1279,6 +1288,21 @@ fn render_thread_item(
                                     .text_color(theme.danger),
                             )
                         })
+                        .when(item.pending_auth, |this| {
+                            this.child(
+                                gpui::div()
+                                    .id(format!("thread-pending-auth-{id}"))
+                                    .child(
+                                        Icon::new(IconName::LoaderCircle)
+                                            .xsmall()
+                                            .text_color(theme.accent),
+                                    )
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(i18n::t("sidebar-pending-auth"))
+                                            .build(window, cx)
+                                    }),
+                            )
+                        })
                         .child(
                             gpui::div()
                                 .flex_1()
@@ -1437,7 +1461,8 @@ mod tests {
     fn external_selection_mirrors_thread_selection() {
         let theme = real_theme();
 
-        let thread = SidebarThreadItem::from_thread(&sample_thread(), true, false, px(0.), &theme);
+        let thread =
+            SidebarThreadItem::from_thread(&sample_thread(), true, false, false, px(0.), &theme);
         assert!(thread.selected);
         assert_eq!(thread.id, "thread-abcdef12");
         assert_eq!(thread.wash, approval_mode_color(0, &theme));
@@ -1478,7 +1503,8 @@ mod tests {
     #[test]
     fn external_and_thread_rows_share_deselected_state() {
         let theme = real_theme();
-        let thread = SidebarThreadItem::from_thread(&sample_thread(), false, false, px(0.), &theme);
+        let thread =
+            SidebarThreadItem::from_thread(&sample_thread(), false, false, false, px(0.), &theme);
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
         assert!(!thread.selected);
         assert!(!external.selected);

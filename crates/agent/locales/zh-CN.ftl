@@ -19,6 +19,7 @@ external-session-start-failed = 启动外部 agent 失败
 plain-session-start-failed = 启动终端会话失败
 sidebar-empty-summary = (新对话)
 sidebar-copy-thread-id = 复制 thread id
+sidebar-pending-auth = 等待审批
 sidebar-time-just-now = 刚刚
 sidebar-time-minutes = {$count} 分钟前
 sidebar-time-hours = {$count} 小时前

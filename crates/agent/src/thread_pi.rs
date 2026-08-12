@@ -514,7 +514,24 @@ impl Thread {
                 if let ThreadEvent::PlanModeChanged { enabled } = *event {
                     self.plan_mode = enabled;
                 }
+                // Runs the actor starts on its own (monitor idle-wakeups,
+                // plan-approval seeds) announce themselves with `TurnStarted`;
+                // mirror them onto the running flag so a switch-away parks the
+                // thread instead of dropping it mid-run. Idempotent with the
+                // facade's own `run_turn` (which emits `TurnStarted`
+                // synchronously before the engine picks up the prompt).
+                if matches!(&*event, ThreadEvent::TurnStarted) {
+                    self.running = true;
+                }
                 cx.emit(*event);
+            }
+            BackendNotice::LiveHistory => {
+                // Mid-run mirror refresh (no UI event): the workspace's
+                // switch-back rebuild reads `messages()`, so a thread parked
+                // while still generating shows current progress instead of the
+                // last settled snapshot. The authoritative `Settled` refresh
+                // replaces this mirror.
+                self.refresh_history(cx);
             }
             BackendNotice::TeamRequest { op, responder } => {
                 // Team state is gpui-side (entities); execute the op here
@@ -1655,6 +1672,53 @@ pub(crate) mod tests {
         assert_eq!(ApprovalMode::from_i64(2), ApprovalMode::Danger);
         assert_eq!(ApprovalMode::AutoPilot.as_i64(), 0);
         assert_eq!(ApprovalMode::Danger.as_i64(), 1);
+    }
+
+    /// `LiveHistory` re-mirrors the engine's live transcript into `messages`
+    /// (the switch-back rebuild reads the mirror) without emitting a UI
+    /// event; an actor-initiated `TurnStarted` (monitor wakeup, plan-approval
+    /// seed) flips the running flag so a switch-away parks the thread instead
+    /// of dropping it mid-run, and `Settled` clears it.
+    #[gpui::test]
+    fn live_history_refreshes_mirror_and_actor_turn_started_sets_running(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let engine = Arc::new(FakeEngine {
+            history: vec![Message::assistant(vec![MessageContent::Text(
+                "partial answer".into(),
+            )])],
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, cx| {
+            // Mid-run mirror refresh: the live partial lands in `messages`.
+            t.handle_notice(BackendNotice::LiveHistory, cx);
+            assert_eq!(t.messages.len(), 1);
+            assert!(matches!(
+                &t.messages[0].content[0],
+                MessageContent::Text(text) if text == "partial answer"
+            ));
+            assert!(!t.is_running());
+
+            // Actor-initiated run start mirrors onto the facade running flag.
+            t.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)), cx);
+            assert!(t.is_running());
+
+            // Settlement releases the slot (and refreshes the mirror).
+            t.handle_notice(
+                BackendNotice::Settled {
+                    cancelled: false,
+                    failed: false,
+                    steered: Vec::new(),
+                    stranded: Vec::new(),
+                },
+                cx,
+            );
+            assert!(!t.is_running());
+        });
     }
 
     fn png_image(data: &str) -> MessageContent {

@@ -173,6 +173,11 @@ pub enum BackendNotice {
     /// parity: the facade re-emits this as `ThreadEvent::HistoryProgress` —
     /// keep the two variants in sync when either side changes.
     HistoryProgress,
+    /// The engine's live transcript mirror refreshed mid-run (completed
+    /// messages + the streaming partial). The facade re-mirrors its history
+    /// silently — no UI event — so a thread switched back to mid-turn
+    /// rebuilds from current progress instead of the last settled snapshot.
+    LiveHistory,
     /// The session could not be built at all.
     Fatal(anyhow::Error),
     /// A user message landed in the session transcript; the sidebar list
