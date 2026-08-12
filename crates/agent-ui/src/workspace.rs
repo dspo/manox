@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::views::vlist::{FollowMode, ListOffset, VListState, vlist};
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
@@ -23,9 +24,8 @@ use agent::{Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
-    FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState, MouseButton, Pixels,
-    Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
-    ease_out_quint, prelude::*, px,
+    MouseButton, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
+    anchored, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// Shared across both harnesses: workspace struct fields hold
@@ -324,17 +324,18 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll/virtualization state for the message column. The gpui `list`
-    /// element anchors the viewport to a `ListOffset { item_ix,
-    /// offset_in_item }` (index + pixel offset into that item), so a width
-    /// reflow that re-measures every item re-anchors proportionally and never
-    /// strands the viewport in empty space — the pixel-anchored container's
-    /// "whole list goes blank on resize" failure mode. `ListAlignment::Bottom`
-    /// gives the list native chat-log semantics: short histories sit at the
-    /// bottom, long ones scroll, and `FollowMode::Tail` re-pins to the end
-    /// each layout while following (disengaging on upward scroll, re-arming
-    /// at the bottom). Only the items in the viewport plus overdraw render.
-    list_state: ListState,
+    /// Scroll/virtualization state for the message column. The first-party
+    /// `vlist` element (views/vlist.rs) anchors the viewport to a logical
+    /// `ListOffset { item_ix, offset_in_item }` (index + pixel offset into
+    /// that item), so height re-measurement never shifts the visible content;
+    /// items are only measured at the list's definite width and unmeasured
+    /// items carry a small constant estimate, which is the root fix for the
+    /// gpui list's exploded-height blank regions. Bottom alignment gives
+    /// native chat-log semantics: short histories sit at the bottom, long
+    /// ones scroll, and `FollowMode::Tail` re-pins to the end each layout
+    /// while following (disengaging on upward scroll, re-arming at the
+    /// bottom). Only the items in the viewport plus overdraw render.
+    list_state: VListState,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
@@ -588,7 +589,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state: ListState::new(0, ListAlignment::Bottom, px(MSG_LIST_OVERDRAW)),
+            list_state: VListState::new(0, px(MSG_LIST_OVERDRAW)),
             list_count: 0,
             history_rendered: 0,
             view_mode: ViewMode::default(),
@@ -5270,7 +5271,7 @@ impl Workspace {
                             // reconciled from the ThreadEvent handler via
                             // `splice`/`remeasure_items`, so the per-item
                             // height cache never falls out of sync.
-                            let list_el = gpui::list(list_state, move |ix, _window, cx| {
+                            let list_el = vlist(list_state, move |ix, _window, cx| {
                                 let item = conv.read(cx).items().get(ix).cloned();
                                 match item {
                                     // Defensive `flex_shrink_0`: the gpui
@@ -5295,7 +5296,6 @@ impl Workspace {
                                     None => gpui::div().into_any_element(),
                                 }
                             })
-                            .with_sizing_behavior(ListSizingBehavior::Auto)
                             .w_full()
                             .h_full()
                             .min_h_0()
