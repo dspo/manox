@@ -158,24 +158,6 @@ pub struct EmptyTurnNudgeData {}
 pub struct CompactionPreambleData {
     pub summary: String,
 }
-/// One loaded CLAUDE.md instruction file for the eager `<instructions>` block.
-/// `content` arrives import-expanded and comment-stripped from `claude_md`;
-/// the template owns only the tag wrapper and spacing.
-#[derive(Debug, Clone, Serialize)]
-pub struct InstructionSourcePromptData {
-    pub scope: &'static str,
-    pub path: String,
-    pub content: String,
-}
-
-/// A block of loaded CLAUDE.md instruction files: the eager block injected
-/// as a fixed-slot user message after the system head, or the lazy
-/// `<system-reminder>` appended to a triggering `read_file` tool result.
-#[derive(Debug, Clone, Serialize)]
-pub struct InstructionsPromptData {
-    pub sources: Vec<InstructionSourcePromptData>,
-}
-
 // --- side-call prompts ---
 
 #[derive(Debug, Clone, Serialize)]

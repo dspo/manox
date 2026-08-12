@@ -78,14 +78,6 @@ const TPL_WRAPPER_COMPACTION_PREAMBLE_EN: &str =
     include_str!("templates/en/wrapper/compaction_preamble.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/compaction_preamble.tera.md");
-const TPL_WRAPPER_INSTRUCTIONS_EAGER_EN: &str =
-    include_str!("templates/en/wrapper/instructions_eager.tera.md");
-const TPL_WRAPPER_INSTRUCTIONS_EAGER_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/instructions_eager.tera.md");
-const TPL_WRAPPER_INSTRUCTIONS_LAZY_EN: &str =
-    include_str!("templates/en/wrapper/instructions_lazy.tera.md");
-const TPL_WRAPPER_INSTRUCTIONS_LAZY_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/instructions_lazy.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM_EN: &str =
     include_str!("templates/en/side_call/approval_system.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM_ZH_CN: &str =
@@ -186,16 +178,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperCompactionPreamble,
         TPL_WRAPPER_COMPACTION_PREAMBLE_EN,
         TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN,
-    ),
-    (
-        PromptTemplate::WrapperInstructionsEager,
-        TPL_WRAPPER_INSTRUCTIONS_EAGER_EN,
-        TPL_WRAPPER_INSTRUCTIONS_EAGER_ZH_CN,
-    ),
-    (
-        PromptTemplate::WrapperInstructionsLazy,
-        TPL_WRAPPER_INSTRUCTIONS_LAZY_EN,
-        TPL_WRAPPER_INSTRUCTIONS_LAZY_ZH_CN,
     ),
     (
         PromptTemplate::SideCallApprovalSystem,
@@ -476,8 +458,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 25);
-        assert_eq!(REGISTRATIONS.len(), 25);
+        assert_eq!(template::ALL.len(), 23);
+        assert_eq!(REGISTRATIONS.len(), 23);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -581,38 +563,6 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperMaxTurnsSummary,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperInstructionsEager,
-                    lang,
-                    &crate::prompt::InstructionsPromptData {
-                        sources: vec![crate::prompt::InstructionSourcePromptData {
-                            scope: "project",
-                            path: "/p/CLAUDE.md".to_string(),
-                            content: "body".to_string(),
-                        }],
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperInstructionsEager,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperInstructionsLazy,
-                    lang,
-                    &crate::prompt::InstructionsPromptData {
-                        sources: vec![crate::prompt::InstructionSourcePromptData {
-                            scope: "project",
-                            path: "/p/sub/CLAUDE.md".to_string(),
-                            content: "nested body".to_string(),
-                        }],
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperInstructionsLazy,
                 lang,
             );
             assert_clean(
