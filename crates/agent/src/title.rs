@@ -120,12 +120,17 @@ pub async fn stream_title(
     model: &PiModel,
     convo: Vec<AgentMessage>,
 ) -> anyhow::Result<String> {
-    let stream_fn = (runtime.resolver())(model)?;
+    // The `side_calls.title.model` override wins when it resolves; an empty
+    // or unresolvable reference inherits the session model.
+    let effective_model =
+        crate::pi_providers::resolve_side_call_model(&crate::settings::side_calls().title_policy())
+            .unwrap_or_else(|| model.clone());
+    let stream_fn = (runtime.resolver())(&effective_model)?;
     let context = pi::types::AgentContext {
         system_prompt: String::new(),
         messages: convo,
         tools: std::sync::Arc::new([]),
-        model: model.clone(),
+        model: effective_model,
         thinking_level: None,
         cache_retention: pi::types::CacheRetention::default(),
         session_id: None,

@@ -320,6 +320,12 @@ impl ApprovalGatedTool {
                 "no model configured for the safety reviewer".to_string(),
             );
         };
+        // The `side_calls.approval.model` override wins when it resolves; an
+        // empty or unresolvable reference inherits the session model.
+        let model = crate::pi_providers::resolve_side_call_model(
+            &crate::settings::side_calls().approval_policy(),
+        )
+        .unwrap_or(model);
         let reviewer = pi_reviewer(runtime, model);
         let outcome =
             approval_review::review(&reviewer, name, params, title, cwd, lang, signal.clone())
