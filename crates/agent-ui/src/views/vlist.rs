@@ -25,14 +25,15 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, Style, StyleRefinement, Styled, Window, point,
-    prelude::*, px, relative, size,
+    ScrollDelta, ScrollWheelEvent, Style, StyleRefinement, Styled, Window, point, prelude::*, px,
+    relative, size,
 };
 
-/// Constant height estimate for items that were never measured. Deliberately
-/// small: an underestimate only tightens the tail briefly (the item is
-/// measured the frame it enters the overdraw), while an overestimate is
-/// exactly the blank-region failure this component exists to prevent.
+/// Constant height estimate for items that were never measured. The estimate
+/// errs small on purpose: per-row error is bounded by this constant and
+/// self-corrects the frame a row enters the overdraw, while a content-derived
+/// guess can be unbounded — the blank-region failure this component exists to
+/// prevent.
 const ESTIMATED_ROW_H: f32 = 96.0;
 
 /// Follow-tail arbitration, matching the workspace's previous usage of gpui's
@@ -232,7 +233,6 @@ impl Styled for VList {
 pub struct PrepaintState {
     elements: Vec<AnyElement>,
     hitbox: Hitbox,
-    scroll_top_px: Pixels,
     scroll_max: Pixels,
 }
 
@@ -287,7 +287,6 @@ impl Element for VList {
             return PrepaintState {
                 elements: Vec::new(),
                 hitbox,
-                scroll_top_px: s.scroll_top_px,
                 scroll_max: s.scroll_max,
             };
         }
@@ -311,15 +310,9 @@ impl Element for VList {
                 offset_in_item: px(0.),
             };
         }
-        s.anchor.item_ix = s.anchor.item_ix.min(count);
 
         let mut prefix = s.prefix_heights();
-        let row_h = |prefix: &[Pixels], ix: usize| prefix[ix + 1] - prefix[ix];
-        s.anchor.offset_in_item = s
-            .anchor
-            .offset_in_item
-            .min(row_h(&prefix, s.anchor.item_ix));
-        let mut scroll_top = prefix[s.anchor.item_ix] + s.anchor.offset_in_item;
+        let mut scroll_top = resolve_anchor_scroll(&prefix, &mut s.anchor, count);
         let mut scroll_max = (prefix[count] - viewport_h).max(px(0.));
         if s.following {
             scroll_top = scroll_max;
@@ -342,8 +335,7 @@ impl Element for VList {
         // Measure dirty/unmeasured rows in the draw range at the definite
         // list width, keeping the laid-out element for prepaint below.
         let measure_space = size(AvailableSpace::Definite(width), AvailableSpace::MinContent);
-        let mut laid_out: Vec<Option<(Point<Pixels>, AnyElement)>> =
-            Vec::with_capacity(end - start);
+        let mut laid_out: Vec<Option<AnyElement>> = Vec::with_capacity(end - start);
         let mut measured_any = false;
         for ix in start..end {
             let needs = {
@@ -358,14 +350,16 @@ impl Element for VList {
                 row.measured = true;
                 row.dirty = false;
                 measured_any = true;
-                laid_out.push(Some((point(px(0.), px(0.)), element)));
+                laid_out.push(Some(element));
             } else {
                 laid_out.push(None);
             }
         }
 
-        // Re-derive positions from the updated heights; the logical anchor
-        // keeps the visible content stable across re-measurement.
+        // Re-derive positions from the updated heights. The anchor is
+        // re-applied logically — same item, same (clamped) intra-item offset
+        // under the new heights — so re-measurement above the anchor never
+        // shifts the visible content.
         if measured_any {
             let mut acc = px(0.);
             for (row, slot) in s.rows.iter().zip(prefix.iter_mut().skip(1)) {
@@ -375,6 +369,8 @@ impl Element for VList {
             scroll_max = (prefix[count] - viewport_h).max(px(0.));
             if s.following {
                 scroll_top = scroll_max;
+            } else {
+                scroll_top = resolve_anchor_scroll(&prefix, &mut s.anchor, count);
             }
             scroll_top = scroll_top.max(px(0.)).min(scroll_max);
         }
@@ -387,7 +383,7 @@ impl Element for VList {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for (ix, slot) in (start..end).zip(laid_out) {
                 let mut element = match slot {
-                    Some((_, element)) => element,
+                    Some(element) => element,
                     None => {
                         let mut element = (self.render_item)(ix, window, cx);
                         let _ = element.layout_as_root(measure_space, window, cx);
@@ -407,7 +403,6 @@ impl Element for VList {
         PrepaintState {
             elements,
             hitbox,
-            scroll_top_px: scroll_top,
             scroll_max,
         }
     }
@@ -416,20 +411,21 @@ impl Element for VList {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        for element in prepaint.elements.iter_mut() {
-            element.paint(window, cx);
-        }
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for element in prepaint.elements.iter_mut() {
+                element.paint(window, cx);
+            }
+        });
 
         let state = self.state.clone();
         let current_view = window.current_view();
         let hitbox_id = prepaint.hitbox.id;
-        let scroll_top_px = prepaint.scroll_top_px;
         let scroll_max = prepaint.scroll_max;
         let mut accumulated = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -442,12 +438,7 @@ impl Element for VList {
                 return;
             }
             let mut s = state.0.borrow_mut();
-            let base = if s.scroll_top_px == scroll_top_px {
-                scroll_top_px
-            } else {
-                s.scroll_top_px
-            };
-            let new_top = (base - delta.y)
+            let new_top = (s.scroll_top_px - delta.y)
                 .max(px(0.))
                 .min(s.scroll_max.max(scroll_max));
             if delta.y > px(0.) {
@@ -487,6 +478,22 @@ fn partition_point(v: &[Pixels], mut pred: impl FnMut(Pixels) -> bool) -> usize 
     lo
 }
 
+/// Convert a logical anchor to a pixel scroll top under the given prefix
+/// heights, normalizing the anchor in place: the index clamps to the item
+/// count, and the intra-item offset clamps to the row's current height. The
+/// tail sentinel (`item_ix == count`) pins the scroll top past the content
+/// end and carries no intra-item offset.
+fn resolve_anchor_scroll(prefix: &[Pixels], anchor: &mut ListOffset, count: usize) -> Pixels {
+    anchor.item_ix = anchor.item_ix.min(count);
+    if anchor.item_ix < count {
+        let row_h = prefix[anchor.item_ix + 1] - prefix[anchor.item_ix];
+        anchor.offset_in_item = anchor.offset_in_item.min(row_h);
+    } else {
+        anchor.offset_in_item = px(0.);
+    }
+    prefix[anchor.item_ix] + anchor.offset_in_item
+}
+
 fn logical_offset(prefix: &[Pixels], scroll_top: Pixels, count: usize) -> ListOffset {
     let ix = partition_point(prefix, |h| h <= scroll_top)
         .saturating_sub(1)
@@ -494,5 +501,210 @@ fn logical_offset(prefix: &[Pixels], scroll_top: Pixels, count: usize) -> ListOf
     ListOffset {
         item_ix: ix,
         offset_in_item: (scroll_top - prefix[ix]).max(px(0.)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix_of(row_heights: &[f32]) -> Vec<Pixels> {
+        let mut prefix = Vec::with_capacity(row_heights.len() + 1);
+        let mut acc = px(0.);
+        prefix.push(acc);
+        for h in row_heights {
+            acc += px(*h);
+            prefix.push(acc);
+        }
+        prefix
+    }
+
+    #[test]
+    fn prefix_heights_accumulates_rows() {
+        let state = VListState::new(0, px(100.));
+        state.0.borrow_mut().rows = vec![
+            Row {
+                height: px(10.),
+                measured: true,
+                dirty: false,
+            },
+            Row {
+                height: px(20.),
+                measured: true,
+                dirty: false,
+            },
+        ];
+        let prefix = state.0.borrow().prefix_heights();
+        assert_eq!(prefix, vec![px(0.), px(10.), px(30.)]);
+    }
+
+    #[test]
+    fn resolve_anchor_tail_sentinel_pins_past_content() {
+        // Regression: the tail sentinel (`item_ix == count`) used to feed
+        // `row_h(count)`, indexing one past the prefix and panicking.
+        let prefix = prefix_of(&[100., 100., 100.]);
+        let mut anchor = ListOffset {
+            item_ix: 3,
+            offset_in_item: px(50.),
+        };
+        let top = resolve_anchor_scroll(&prefix, &mut anchor, 3);
+        assert_eq!(anchor.item_ix, 3);
+        assert_eq!(anchor.offset_in_item, px(0.));
+        assert_eq!(top, px(300.));
+    }
+
+    #[test]
+    fn resolve_anchor_clamps_offset_to_row_height() {
+        let prefix = prefix_of(&[100., 40., 100.]);
+        let mut anchor = ListOffset {
+            item_ix: 1,
+            offset_in_item: px(80.),
+        };
+        let top = resolve_anchor_scroll(&prefix, &mut anchor, 3);
+        assert_eq!(anchor.offset_in_item, px(40.));
+        assert_eq!(top, px(140.));
+    }
+
+    #[test]
+    fn resolve_anchor_clamps_index_to_count() {
+        let prefix = prefix_of(&[100., 100.]);
+        let mut anchor = ListOffset {
+            item_ix: 9,
+            offset_in_item: px(10.),
+        };
+        let top = resolve_anchor_scroll(&prefix, &mut anchor, 2);
+        assert_eq!(anchor.item_ix, 2);
+        assert_eq!(top, px(200.));
+    }
+
+    #[test]
+    fn logical_offset_finds_row_containing_scroll_top() {
+        let prefix = prefix_of(&[100., 50., 200.]);
+        let off = logical_offset(&prefix, px(120.), 3);
+        assert_eq!(off.item_ix, 1);
+        assert_eq!(off.offset_in_item, px(20.));
+    }
+
+    #[test]
+    fn logical_offset_clamps_to_last_row_at_content_end() {
+        let prefix = prefix_of(&[100., 50., 200.]);
+        let off = logical_offset(&prefix, px(350.), 3);
+        assert_eq!(off.item_ix, 2);
+        assert_eq!(off.offset_in_item, px(200.));
+    }
+
+    #[test]
+    fn logical_offset_handles_zero_height_rows() {
+        let prefix = prefix_of(&[0., 0., 100.]);
+        let off = logical_offset(&prefix, px(0.), 3);
+        assert_eq!(off.offset_in_item, px(0.));
+    }
+
+    #[test]
+    fn anchor_roundtrips_through_logical_offset() {
+        // The logical anchor is the source of truth across re-measurement:
+        // converting to pixels and back under the same prefix is an identity.
+        let prefix = prefix_of(&[100., 50., 200.]);
+        let mut anchor = ListOffset {
+            item_ix: 2,
+            offset_in_item: px(70.),
+        };
+        let top = resolve_anchor_scroll(&prefix, &mut anchor, 3);
+        let back = logical_offset(&prefix, top, 3);
+        assert_eq!(back.item_ix, 2);
+        assert_eq!(back.offset_in_item, px(70.));
+    }
+
+    #[test]
+    fn splice_insert_shifts_tail_anchor() {
+        let state = VListState::new(5, px(100.));
+        state.splice(2..2, 3);
+        let s = state.0.borrow();
+        assert_eq!(s.rows.len(), 8);
+        assert_eq!(s.anchor.item_ix, 8);
+        assert!(s.rows.iter().all(|r| !r.measured));
+    }
+
+    #[test]
+    fn splice_tail_removal_shrinks_anchor() {
+        let state = VListState::new(5, px(100.));
+        state.splice(4..5, 0);
+        let s = state.0.borrow();
+        assert_eq!(s.rows.len(), 4);
+        assert_eq!(s.anchor.item_ix, 4);
+    }
+
+    #[test]
+    fn splice_engulfing_anchor_reanchors_to_range_end() {
+        let state = VListState::new(5, px(100.));
+        state.0.borrow_mut().anchor = ListOffset {
+            item_ix: 2,
+            offset_in_item: px(10.),
+        };
+        state.splice(1..4, 2);
+        let s = state.0.borrow();
+        assert_eq!(s.anchor.item_ix, 3);
+        assert_eq!(s.anchor.offset_in_item, px(0.));
+    }
+
+    #[test]
+    fn splice_shifts_pending_jump() {
+        let state = VListState::new(5, px(100.));
+        state.scroll_to(ListOffset {
+            item_ix: 4,
+            offset_in_item: px(0.),
+        });
+        state.splice(0..2, 0);
+        let s = state.0.borrow();
+        assert_eq!(s.pending_jump.unwrap().item_ix, 2);
+    }
+
+    #[test]
+    fn reset_restores_tail_sentinel_and_clears_state() {
+        let state = VListState::new(3, px(100.));
+        state.set_follow_mode(FollowMode::Tail);
+        state.reset(2);
+        let s = state.0.borrow();
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.anchor.item_ix, 2);
+        assert!(!s.following);
+        assert!(s.pending_jump.is_none());
+        assert!(s.last_width.is_none());
+    }
+
+    #[test]
+    fn scroll_to_end_arms_following_and_pending_jump() {
+        let state = VListState::new(3, px(100.));
+        state.scroll_to_end();
+        let s = state.0.borrow();
+        assert!(s.following);
+        assert_eq!(s.pending_jump.unwrap().item_ix, 3);
+        assert_eq!(s.pending_jump.unwrap().offset_in_item, px(0.));
+    }
+
+    #[test]
+    fn follow_mode_switch_toggles_following() {
+        let state = VListState::new(3, px(100.));
+        assert!(!state.is_following_tail());
+        state.set_follow_mode(FollowMode::Tail);
+        assert!(state.is_following_tail());
+        state.set_follow_mode(FollowMode::Normal);
+        assert!(!state.is_following_tail());
+    }
+
+    #[test]
+    fn remeasure_marks_all_rows_dirty() {
+        let state = VListState::new(3, px(100.));
+        state.remeasure();
+        assert!(state.0.borrow().rows.iter().all(|r| r.dirty));
+    }
+
+    #[test]
+    fn remeasure_items_marks_only_the_range() {
+        let state = VListState::new(4, px(100.));
+        state.remeasure_items(1..3);
+        let s = state.0.borrow();
+        let dirty: Vec<bool> = s.rows.iter().map(|r| r.dirty).collect();
+        assert_eq!(dirty, vec![false, true, true, false]);
     }
 }
