@@ -29,8 +29,11 @@
 //! The `ws` half is pure read-only network observation and rides ungated.
 //! The `command` half executes an arbitrary shell command under `sh -c` —
 //! the same surface as `Bash` — so it opts into the host approval gate via
-//! the params-aware `requires_approval`. Monitor output is always framed as
-//! untrusted external data either way.
+//! the params-aware `requires_approval`. Deliberately NOT exempted like
+//! sandboxed Bash calls: a monitor is long-running background execution the
+//! user never sees output from until later, so its start stays gated even
+//! though the command is seatbelt-wrapped. Monitor output is always framed
+//! as untrusted external data either way.
 //!
 //! ## Teardown semantics
 //!

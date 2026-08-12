@@ -85,11 +85,23 @@ impl TaskEntry {
     }
 }
 
+/// Command wrapper for sandboxed background tasks: builds the seatbelt
+/// command for a task line + cwd (the registry then adds process-group and
+/// pipes).
+pub type SandboxCommandBuilder = Arc<dyn Fn(&str, &Path) -> tokio::process::Command + Send + Sync>;
+
 /// Default `BackgroundTaskRegistry`: `sh -c` processes with ring-buffered
 /// output, per-task read cursors, and best-effort process-group kill.
+///
+/// A host may inject a sandbox wrapper (`with_sandbox`): then
+/// `spawn_sandboxed` / `spawn_with_line_events` wrap the command in the
+/// seatbelt while the trait `spawn` stays bare — escalation is the caller's
+/// choice (an escalated background task runs without confinement).
 pub struct BackgroundRegistry {
     tasks: Mutex<std::collections::HashMap<String, Arc<TaskEntry>>>,
     next_id: AtomicU64,
+    /// Optional seatbelt wrapper for sandboxed background tasks.
+    sandbox: Option<SandboxCommandBuilder>,
 }
 
 impl BackgroundRegistry {
@@ -97,6 +109,28 @@ impl BackgroundRegistry {
         BackgroundRegistry {
             tasks: Mutex::new(std::collections::HashMap::new()),
             next_id: AtomicU64::new(0),
+            sandbox: None,
+        }
+    }
+
+    /// Inject the sandbox wrapper: background tasks spawned through the
+    /// sandboxed paths run inside it (writes + network confined per the
+    /// wrapped policy).
+    pub fn with_sandbox(mut self, wrap: SandboxCommandBuilder) -> Self {
+        self.sandbox = Some(wrap);
+        self
+    }
+
+    /// Build the command for a sandboxed background task: the injected
+    /// wrapper when present, else a bare `sh -c`.
+    fn sandboxed_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+        match &self.sandbox {
+            Some(wrap) => wrap(command, cwd),
+            None => {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(command).current_dir(cwd);
+                c
+            }
         }
     }
 
@@ -125,15 +159,14 @@ impl BackgroundRegistry {
         on_exit: ExitEventCallback,
     ) -> Result<pi::TaskId, pi::TaskError> {
         self.gc();
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
+        let mut child = self.sandboxed_command(command, cwd);
+        child
             .process_group(0)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = child
             .spawn()
             .map_err(|e| pi::TaskError::Spawn(format!("{e}")))?;
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
@@ -364,32 +397,9 @@ async fn drain_task_with_line_events(
 #[async_trait::async_trait]
 impl BackgroundTaskRegistry for BackgroundRegistry {
     fn spawn(&self, command: &str, cwd: &Path) -> Result<pi::TaskId, pi::TaskError> {
-        self.gc();
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .process_group(0)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| pi::TaskError::Spawn(format!("{e}")))?;
-        let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        let id = pi::TaskId(format!(
-            "bg_{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        let entry = Arc::new(TaskEntry::new(child, pid));
-        self.tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .insert(id.0.clone(), Arc::clone(&entry));
-        tokio::spawn(drain_task(stdout, stderr, entry));
-        Ok(id)
+        // The trait path stays bare: an escalated background task runs
+        // without confinement. Sandboxed backgrounds use `spawn_sandboxed`.
+        self.spawn_impl(command, cwd, false)
     }
 
     async fn poll(&self, id: &pi::TaskId) -> Result<pi::PollResult, pi::TaskError> {
@@ -427,6 +437,55 @@ impl BackgroundTaskRegistry for BackgroundRegistry {
 
     async fn kill(&self, id: &pi::TaskId) -> Result<(), pi::TaskError> {
         self.kill_sync(id)
+    }
+}
+
+impl BackgroundRegistry {
+    /// Spawn a background command inside the sandbox wrapper (when
+    /// configured), else bare — same task lifecycle as `spawn`.
+    pub fn spawn_sandboxed(&self, command: &str, cwd: &Path) -> Result<pi::TaskId, pi::TaskError> {
+        self.spawn_impl(command, cwd, true)
+    }
+
+    /// Shared spawn core: build the child (sandboxed or bare), register the
+    /// task, and drain its output into the ring buffer.
+    fn spawn_impl(
+        &self,
+        command: &str,
+        cwd: &Path,
+        sandboxed: bool,
+    ) -> Result<pi::TaskId, pi::TaskError> {
+        self.gc();
+        let mut child = if sandboxed {
+            self.sandboxed_command(command, cwd)
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(command).current_dir(cwd);
+            c
+        };
+        child
+            .process_group(0)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = child
+            .spawn()
+            .map_err(|e| pi::TaskError::Spawn(format!("{e}")))?;
+        let pid = child.id().map(|p| p as i32).unwrap_or(-1);
+        let id = pi::TaskId(format!(
+            "bg_{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let entry = Arc::new(TaskEntry::new(child, pid));
+        self.tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .insert(id.0.clone(), Arc::clone(&entry));
+        tokio::spawn(drain_task(stdout, stderr, entry));
+        Ok(id)
     }
 }
 
@@ -887,5 +946,69 @@ mod line_framing_tests {
         );
         // The trailing partial line stays in the carry for the EOF path.
         assert_eq!(carry, b"third");
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawn_sandboxed_uses_the_injected_wrapper() {
+        let wrapped = Arc::new(AtomicU64::new(0));
+        let wrapped2 = Arc::clone(&wrapped);
+        let wrap: SandboxCommandBuilder = Arc::new(move |command, cwd| {
+            wrapped2.fetch_add(1, Ordering::Relaxed);
+            let mut c = tokio::process::Command::new("printf");
+            c.arg("wrapped").current_dir(cwd);
+            let _ = command;
+            c
+        });
+        let registry = BackgroundRegistry::new().with_sandbox(wrap);
+        let id = registry
+            .spawn_sandboxed("anything", Path::new("/tmp"))
+            .unwrap();
+        // Poll until the wrapped `printf wrapped` output lands.
+        let mut out = String::new();
+        for _ in 0..50 {
+            let poll = registry.poll(&id).await.unwrap();
+            out.push_str(&poll.new_output);
+            if out.contains("wrapped") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(out.contains("wrapped"), "wrapped command ran: {out}");
+        assert_eq!(wrapped.load(Ordering::Relaxed), 1, "wrapper invoked once");
+    }
+
+    #[tokio::test]
+    async fn trait_spawn_stays_bare_with_a_wrapper_installed() {
+        let wrapped = Arc::new(AtomicU64::new(0));
+        let wrapped2 = Arc::clone(&wrapped);
+        let wrap: SandboxCommandBuilder = Arc::new(move |command, cwd| {
+            wrapped2.fetch_add(1, Ordering::Relaxed);
+            let mut c = tokio::process::Command::new("printf");
+            c.arg("bare").current_dir(cwd);
+            let _ = command;
+            c
+        });
+        let registry = BackgroundRegistry::new().with_sandbox(wrap);
+        let id = registry.spawn("printf bare", Path::new("/tmp")).unwrap();
+        let mut out = String::new();
+        for _ in 0..50 {
+            let poll = registry.poll(&id).await.unwrap();
+            out.push_str(&poll.new_output);
+            if out.contains("bare") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(out.contains("bare"), "bare sh ran: {out}");
+        assert_eq!(
+            wrapped.load(Ordering::Relaxed),
+            0,
+            "trait spawn must not route through the wrapper"
+        );
     }
 }

@@ -155,12 +155,20 @@ impl ApprovalGate {
 
 /// Wraps a pi tool with the host's approval policy. Tools that neither
 /// declare `requires_approval` nor mutate anything pass straight through.
+/// Host-declared run-time gate exemption: `(tool_name, params) -> bypass`.
+pub type AutoAllowResolver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
+
 pub struct ApprovalGatedTool {
     inner: Arc<dyn PiAgentTool>,
     gate: Arc<ApprovalGate>,
     /// Plan-mode exemption: plan-file writes bypass the gate while plan
     /// mode is active (the model drafts the plan incrementally).
     plan_policy: Option<Arc<crate::plan_mode::PlanGatePolicy>>,
+    /// Host-declared run-time exemption: when the resolver returns true for
+    /// a call, it runs ungated (e.g. a sandboxed, non-escalated bash call
+    /// rides the OS confinement and skips the reviewer — the old-harness
+    /// "sandboxed bash needs no approval" semantics).
+    auto_allow: Option<AutoAllowResolver>,
 }
 
 impl ApprovalGatedTool {
@@ -169,6 +177,7 @@ impl ApprovalGatedTool {
             inner,
             gate,
             plan_policy: None,
+            auto_allow: None,
         }
     }
 
@@ -176,6 +185,13 @@ impl ApprovalGatedTool {
     /// approval-free while plan mode is active).
     pub fn with_plan_policy(mut self, policy: Arc<crate::plan_mode::PlanGatePolicy>) -> Self {
         self.plan_policy = Some(policy);
+        self
+    }
+
+    /// Attach the run-time exemption resolver. It sees the tool name + call
+    /// params and returns true to bypass the gate for that call.
+    pub fn with_auto_allow(mut self, resolver: AutoAllowResolver) -> Self {
+        self.auto_allow = Some(resolver);
         self
     }
 
@@ -187,6 +203,13 @@ impl ApprovalGatedTool {
     fn needs_gate(&self, params: &serde_json::Value) -> bool {
         if let Some(policy) = &self.plan_policy
             && policy.is_exempt(self.inner.name(), params)
+        {
+            return false;
+        }
+        if self
+            .auto_allow
+            .as_ref()
+            .is_some_and(|f| f(self.inner.name(), params))
         {
             return false;
         }
@@ -1196,5 +1219,57 @@ mod tests {
             "no authorization notice for the ws half"
         );
         assert!(gate.pending_entries().is_empty());
+    }
+
+    struct MutatingTool;
+    #[async_trait::async_trait]
+    impl pi::tool::AgentTool for MutatingTool {
+        fn name(&self) -> &str {
+            "Mutating"
+        }
+        fn description(&self) -> &str {
+            "test"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+            false
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _ctx: &dyn pi::tool::ToolContext,
+        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+            Ok(pi::tool::AgentToolResult::text("ok"))
+        }
+    }
+
+    fn auto_allow_gated() -> ApprovalGatedTool {
+        ApprovalGatedTool::new(Arc::new(MutatingTool), gate())
+    }
+
+    #[test]
+    fn auto_allow_bypasses_the_gate() {
+        let tool = auto_allow_gated().with_auto_allow(Arc::new(|name, _| name == "Mutating"));
+        // The resolver matches → ungated even though the tool is mutating.
+        assert!(!tool.needs_gate(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn auto_allow_resolver_miss_keeps_the_gate() {
+        let tool = auto_allow_gated().with_auto_allow(Arc::new(|name, _| name == "Other"));
+        // Mutating + no resolver match → still gated.
+        assert!(tool.needs_gate(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn no_auto_allow_keeps_default_gating() {
+        assert!(auto_allow_gated().needs_gate(&serde_json::json!({})));
     }
 }
