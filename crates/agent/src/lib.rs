@@ -30,6 +30,7 @@ pub mod pi_providers;
 pub mod plan;
 pub mod plan_mode;
 pub mod plugin;
+pub mod plugin_hooks;
 pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
@@ -89,6 +90,10 @@ pub fn init(cx: &mut App) {
     // composer mention surface.
     skill::init();
     command::init();
+    // Plugin lifecycle hooks (hooks/hooks.json) — loaded once; fired from
+    // the engine (SessionStart/Stop/PreToolUse/PostToolUse) and the thread
+    // store (SessionEnd on archive).
+    plugin_hooks::init();
     // LSP PATH detection (no spawn — servers start lazily on first code-intel
     // call). Runs after MCP so the registry is settled before the first
     // `main_registry` build picks up LSP tools.

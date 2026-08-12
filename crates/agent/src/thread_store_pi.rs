@@ -257,6 +257,16 @@ impl ThreadStore {
             s.archived = false;
         }
         self.write_meta(id, move |meta| meta.archived = archived, cx);
+        if archived {
+            // Plugin lifecycle: archiving ends the session's working life
+            // (the retired harness fired on thread deletion; the pi path
+            // keeps sessions and archives instead). Fail-open, detached.
+            crate::plugin_hooks::fire(
+                crate::plugin_hooks::HookEvent::SessionEnd,
+                None,
+                serde_json::json!({ "thread_id": id }),
+            );
+        }
     }
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).

@@ -115,6 +115,10 @@ struct EngineState {
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
+    /// Plugin `SessionStart` hook fires once per session lifetime, before
+    /// the first user turn. Restored sessions arm it at Ready (they already
+    /// "started"); Open/NewSession re-arm per session switch.
+    session_start_fired: AtomicBool,
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -171,6 +175,7 @@ pub fn spawn_engine(
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
+        session_start_fired: AtomicBool::new(false),
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -756,6 +761,7 @@ async fn settle_run(
     runtime: &ModelRuntime,
     pi_model: &PiModel,
     sessions_dir: &Path,
+    cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     run_steers: &mut Vec<String>,
 ) {
@@ -792,6 +798,17 @@ async fn settle_run(
         steered,
         stranded,
     });
+    // Plugin lifecycle: `Stop` fires on every settled turn (fail-open,
+    // detached) — after the `Settled` notice so observers see the turn's
+    // final state first.
+    crate::plugin_hooks::fire(
+        crate::plugin_hooks::HookEvent::Stop,
+        cwd.to_str(),
+        serde_json::json!({
+            "cancelled": abort_requested,
+            "failed": failed,
+        }),
+    );
 }
 
 /// Forward every pi run event through the adapt mapping onto the notice
@@ -1053,6 +1070,19 @@ fn resolve_tool_path(raw: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Register the plugin-lifecycle hook bridges (PreToolUse / PostToolUse
+/// fire-and-forget shell-outs). Notification-only; never blocks a call.
+fn attach_plugin_hooks(session: &mut AgentSession, cwd: &Path) {
+    session.on(
+        pi::harness::HookPoint::ToolCall,
+        crate::plugin_hooks::pre_tool_call_handler(cwd.to_path_buf()),
+    );
+    session.on(
+        pi::harness::HookPoint::ToolResult,
+        crate::plugin_hooks::post_tool_result_handler(cwd.to_path_buf()),
+    );
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -1130,6 +1160,7 @@ async fn run_actor(
                 attach_orchestrators(&mut s, &orchestrators);
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
                 attach_path_policy_hooks(&mut s, &tool_cwd);
+                attach_plugin_hooks(&mut s, &tool_cwd);
                 restored = true;
                 session = Some(s);
             }
@@ -1159,6 +1190,7 @@ async fn run_actor(
                     attach_orchestrators(&mut s, &orchestrators);
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
                     attach_path_policy_hooks(&mut s, &cwd);
+                    attach_plugin_hooks(&mut s, &cwd);
                     s
                 }
                 Err(err) => {
@@ -1240,6 +1272,11 @@ async fn run_actor(
         plan_file: plan_file_restored,
         plan_review_pending,
     });
+    // A restored session already "started": arm the SessionStart hook latch
+    // so the first prompt does not re-fire it.
+    if restored {
+        state.session_start_fired.store(true, Ordering::SeqCst);
+    }
 
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
@@ -1291,6 +1328,7 @@ async fn run_actor(
                         &runtime,
                         &pi_model,
                         &sessions_dir,
+                        &cwd,
                         &notice_tx,
                         &mut run_steers,
                     )
@@ -1305,6 +1343,15 @@ async fn run_actor(
         let Some(cmd) = cmd else { break };
         match cmd {
             SessionCmd::Prompt { text, images } => {
+                // Plugin lifecycle: `SessionStart` fires once per session,
+                // before the first user turn (fail-open, detached).
+                if !state.session_start_fired.swap(true, Ordering::SeqCst) {
+                    crate::plugin_hooks::fire(
+                        crate::plugin_hooks::HookEvent::SessionStart,
+                        cwd.to_str(),
+                        serde_json::json!({ "cwd": cwd.display().to_string() }),
+                    );
+                }
                 state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
                 // Drive the run while still servicing mid-run commands
@@ -1331,6 +1378,7 @@ async fn run_actor(
                     &runtime,
                     &pi_model,
                     &sessions_dir,
+                    &cwd,
                     &notice_tx,
                     &mut run_steers,
                 )
@@ -1454,6 +1502,7 @@ async fn run_actor(
                     &runtime,
                     &pi_model,
                     &sessions_dir,
+                    &cwd,
                     &notice_tx,
                     &mut run_steers,
                 )
@@ -1521,6 +1570,9 @@ async fn run_actor(
                 resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                // Opened sessions are resumed conversations: SessionStart
+                // already happened in a prior lifetime.
+                state.session_start_fired.store(true, Ordering::SeqCst);
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
                 sync_history(&session, &sessions_dir, &state).await;
                 sync_usage(&session, &state).await;
@@ -1546,10 +1598,13 @@ async fn run_actor(
                         attach_orchestrators(&mut s, &orchestrators);
                         attach_plan_hooks(&mut s, &state.plan, &cwd);
                         attach_path_policy_hooks(&mut s, &cwd);
+                        attach_plugin_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
                         state.plan.set(false, None);
                         state.plan.set_active_instructions(None);
+                        // …and earns its own SessionStart on the first turn.
+                        state.session_start_fired.store(false, Ordering::SeqCst);
                         session = s;
                         let new_path = session.path().to_path_buf();
                         _subscription =
@@ -1636,6 +1691,7 @@ async fn rebuild_session(
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
             attach_plan_hooks(&mut s, plan, &cwd);
+            attach_plugin_hooks(&mut s, &cwd);
             *session = s;
         }
         Err(err) => {
@@ -2974,6 +3030,7 @@ mod tests {
         let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
         Arc::new(EngineState {
             running: AtomicBool::new(false),
+            session_start_fired: AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
