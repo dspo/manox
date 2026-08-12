@@ -30,15 +30,13 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 外部会话（Claude Code / Codex / GitHub Copilot CLI / VS Code 注入 / 终端纯 PTY） | ✅ | 侧栏 provider→model 级联（agents）+ 终端直接入口（`SpawnPlainSession`）+ `ViewMode::ExternalSession`；agent 会话退出后可从侧栏恢复（sidecar，`--continue`/`resume --last`） |
 | Browser 标签 / Terminal 标签 | ✅ | webview host notify/inbound 桥；平台 terminal surface |
 | TurnNavigator | ✅ | cmd-m / cmd-shift-; |
-| 图片附件 | ✅ 部分 | 剪贴板粘贴 → chip → 气泡渲染已通；构造 pi prompt 时图片块仍被丢弃（text-only） |
+| 图片附件 | ✅ | 剪贴板粘贴 / plus 选择 → chip → 气泡渲染 → 内核 `ContentBlock::Image` 投递（TS `prompt(text, {images})` parity，#438）；steer 带图同路 |
 | MCP | ✅ | 连接核心共享化 + pi AgentTool 桥（#442）；Settings → MCP servers 面板（列表/连接状态/持久开关） |
 | Plus 菜单（文件 / 目标 / 插件） | ✅ 部分 | 文件 → native picker → pending attachments；目标 → seed `/goal`；Plugins 组为静态装饰（待与插件面板 #474 整合） |
-| skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
+| skill / subagent @mentions | ✅ | 共享层 registry（#440）：markdown 斜杆命令 + skill mentions（submit_command/submit_skill）；subagent 定义经 agent_defs 注册（#471） |
 | Sub-agent 观察 | ✅ 部分 | rail 观察行（生命周期/活动）+ Agent 工具卡片实时流式子转录（text/thinking delta、工具 ▸/✓/✗ 行）；独立钻取面板随 manox 移除，卡片体即钻取面 |
-| Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
+| Plan 模式 / PlanReview | ✅ 部分 | 重实现（#441，参照 oh-my-pi）：ProposePlan 结构化工具 + plan 落盘 + 调研指令注入 + 写硬门控 + 4 裁决选项；rail 的 plan 节（`UpdatePlan`）消费执行进度；PlanPreview 独立 tab 按设计不恢复 |
 | Goal | ✅ 部分 | facade+GoalBridge 共享快照、GetGoal/CreateGoal/UpdateGoal 工具、`/goal` 命令、composer chip+状态 popover；per-turn 记账/自动续跑/BudgetLimited 强制为后续项 |
-| Team | ✅ 部分 | 后端完整（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）；roster/MemberPanel UI 为后续项 |
-| Goal | ⏳ | manox 目标体系，随 harness 移除 |
 | Team | ✅ | 后端（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）+ composer team chip（roster popover）+ MemberPanel 观察标签（右栏 Member tab：成员会话实时渲染 + 任务板） |
 分层纪律：crates/pi 只做 TS Pi 对齐与扩展点；harness 能力扩展一律走
 crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
