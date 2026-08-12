@@ -418,8 +418,18 @@ fn build_tools(
 
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(pi::tools::read::ReadTool),
-        Arc::new(pi::tools::write::WriteTool),
-        Arc::new(pi::tools::edit::EditTool),
+        // Write/Edit carry the process write lock for their execution window:
+        // concurrent writers to the same path get a named-holder conflict
+        // instead of silently clobbering each other (old manox file_lock
+        // semantics; owner stays "main" until the team system lands).
+        Arc::new(crate::file_lock::FileLockedTool::new(
+            Arc::new(pi::tools::write::WriteTool),
+            "main",
+        )),
+        Arc::new(crate::file_lock::FileLockedTool::new(
+            Arc::new(pi::tools::edit::EditTool),
+            "main",
+        )),
         Arc::new(pi::tools::grep::GrepTool),
         Arc::new(pi::tools::find::FindTool),
         Arc::new(pi::tools::ls::LsTool),
