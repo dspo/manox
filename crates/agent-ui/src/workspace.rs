@@ -64,7 +64,9 @@ use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
     slash_source,
 };
-use crate::views::composer_menu::{PendingAttachment, load_attachment, render_attachment_chips};
+use crate::views::composer_menu::{
+    PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
+};
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
@@ -4159,8 +4161,7 @@ impl Workspace {
             });
         }
         let queue = self.render_queued_follow_ups(theme, cx);
-        // TODO(pi-wire): plus menu + image attachment input.
-        let plus: AnyElement = gpui::div().into_any_element();
+        let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip_pi(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip = self.render_team_chip(theme, cx);
@@ -4989,6 +4990,111 @@ impl Workspace {
                 .with_priority(1),
             )
             .into_any_element()
+    }
+
+    /// Composer `+` button: attachment entry points (files / goal). Closed,
+    /// the bare trigger; open, a PopupMenu anchored above it.
+    fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let trigger = Button::new("composer-plus")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Plus)
+            .tooltip(i18n::t("composer-add-label"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.plus_open {
+                    this.close_plus_menu();
+                } else {
+                    this.open_plus_menu(window, cx);
+                }
+                cx.notify();
+            }));
+
+        if !self.plus_open {
+            return trigger.into_any_element();
+        }
+        let Some(menu) = self.plus_menu.clone() else {
+            return trigger.into_any_element();
+        };
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                deferred(
+                    gpui::div()
+                        .id("plus-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// Build the `+` menu: "Files and folders" opens the native picker into
+    /// pending attachments; "Goal" seeds the `/goal` slash command into the
+    /// composer.
+    fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = cx.theme().clone();
+        let ws = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            let ws_files = ws.clone();
+            let ws_goal = ws.clone();
+            build_plus_menu(
+                menu,
+                &theme,
+                move |window, cx| {
+                    let _ = ws_files.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.pick_files(window, cx);
+                        cx.notify();
+                    });
+                },
+                move |window, cx| {
+                    let _ = ws_goal.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.input_state.update(cx, |state, cx| {
+                            state.set_value("/goal ".to_string(), window, cx);
+                        });
+                        cx.notify();
+                    });
+                },
+            )
+        });
+        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+            this.close_plus_menu();
+            cx.notify();
+        });
+        self.plus_open = true;
+        self.plus_menu = Some(menu);
+        self.plus_menu_sub = Some(sub);
+    }
+
+    /// Open the native file picker and add chosen paths as pending
+    /// attachments (images render as chips + inline blocks, other files ride
+    /// the attachment chip row).
+    fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = paths.await;
+            this.update(cx, |this, cx| {
+                if let Ok(Ok(Some(paths))) = result {
+                    for path in paths {
+                        this.pending_attachments.push(PendingAttachment::new(path));
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn close_plus_menu(&mut self) {
