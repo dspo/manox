@@ -924,6 +924,7 @@ impl Thread {
             None,
             true,
             None,
+            id.0.clone(),
         );
         if approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(approval_mode);
