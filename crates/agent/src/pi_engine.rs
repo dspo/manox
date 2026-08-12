@@ -3240,5 +3240,12 @@ mod tests {
             "switched-turn usage must enter the per-model stats: {:?}",
             stats.per_model
         );
+        // The switch persisted as a model_change entry, so a reload
+        // attributes the same history the same way.
+        let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
+        assert!(
+            jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
+            "the mid-run switch must persist a model_change entry for the new model"
+        );
     }
 }
