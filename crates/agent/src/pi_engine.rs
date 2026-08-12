@@ -39,7 +39,7 @@ use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 const LIVE_HISTORY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Commands the gpui side sends to the pi actor.
-enum SessionCmd {
+pub(crate) enum SessionCmd {
     /// Start a turn with the given user text and attached images.
     Prompt {
         text: String,
@@ -76,6 +76,16 @@ enum SessionCmd {
     },
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
+    /// Fork the current session into a worktree-cwd session and switch to
+    /// it (`EnterWorktree` tool's git phase already ran).
+    EnterWorktree {
+        worktree_path: PathBuf,
+        branch: String,
+        original_cwd: PathBuf,
+    },
+    /// Return to the pre-worktree session (`ExitWorktree` tool's git
+    /// cleanup already ran).
+    ExitWorktree,
     /// Create a fresh session in the given directory, optionally bound to a
     /// project (persisted in the session sidecar).
     NewSession {
@@ -119,6 +129,9 @@ struct EngineState {
     /// the first user turn. Restored sessions arm it at Ready (they already
     /// "started"); Open/NewSession re-arm per session switch.
     session_start_fired: AtomicBool,
+    /// Active git-worktree binding shared with the worktree tools (nest
+    /// guard + exit routing); persisted in the session sidecar on swap.
+    worktree: crate::worktree::WorktreeState,
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -176,6 +189,7 @@ pub fn spawn_engine(
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
         session_start_fired: AtomicBool::new(false),
+        worktree: crate::worktree::new_state(),
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -184,6 +198,7 @@ pub fn spawn_engine(
         initial_path.clone(),
         fresh,
         project,
+        cmd_tx.clone(),
         cmd_rx,
         notice_tx.clone(),
         Arc::clone(&state),
@@ -422,6 +437,7 @@ fn system_prompt(cwd: &Path) -> String {
 /// Returns the tools plus the session-scoped orchestrators that must attach
 /// once the session exists (their steerers and lifecycle hooks need a live
 /// session handle).
+#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 fn build_tools(
     cwd: &Path,
     runtime: &ModelRuntime,
@@ -430,6 +446,8 @@ fn build_tools(
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
+    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
+    worktree: &crate::worktree::WorktreeState,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     let background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
@@ -582,7 +600,18 @@ fn build_tools(
             ApprovalGatedTool::new(tool, Arc::clone(gate))
                 .with_plan_policy(Arc::clone(&plan_policy)),
         ));
-    } // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    }
+    // Git worktree management: the tools run the git phase and queue the
+    // session swap (actor-side, between turns); both approval-gated.
+    tools.push(Arc::new(crate::worktree::EnterWorktreeTool::new(
+        cmd_tx.clone(),
+        Arc::clone(worktree),
+    )));
+    tools.push(Arc::new(crate::worktree::ExitWorktreeTool::new(
+        cmd_tx.clone(),
+        Arc::clone(worktree),
+    )));
+    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same approval gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
     // tests) contributes nothing.
@@ -976,9 +1005,20 @@ fn session_builder(
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
+    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
+    worktree: &crate::worktree::WorktreeState,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
-    let (tools, orchestrators) =
-        build_tools(cwd, runtime, model, gate, plan, notice_tx, goal_bridge);
+    let (tools, orchestrators) = build_tools(
+        cwd,
+        runtime,
+        model,
+        gate,
+        plan,
+        notice_tx,
+        goal_bridge,
+        cmd_tx,
+        worktree,
+    );
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
@@ -1091,6 +1131,7 @@ async fn run_actor(
     initial_path: Option<PathBuf>,
     fresh: bool,
     project: Option<PathBuf>,
+    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
@@ -1154,6 +1195,8 @@ async fn run_actor(
             &state.plan,
             &notice_tx,
             state.goal_bridge.as_ref(),
+            &cmd_tx,
+            &state.worktree,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -1181,6 +1224,8 @@ async fn run_actor(
                 &state.plan,
                 &notice_tx,
                 state.goal_bridge.as_ref(),
+                &cmd_tx,
+                &state.worktree,
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -1252,6 +1297,8 @@ async fn run_actor(
             .set_active_instructions(render_plan_instructions());
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
+    let worktree_restored = load_worktree_state(&sessions_dir, session.path()).await;
+    *state.worktree.lock().unwrap() = worktree_restored.clone();
     let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
@@ -1276,6 +1323,16 @@ async fn run_actor(
     // so the first prompt does not re-fire it.
     if restored {
         state.session_start_fired.store(true, Ordering::SeqCst);
+    }
+    // Restore the worktree chip after `Ready` so the facade mirror exists
+    // before the event lands (same ordering as plan-mode restore).
+    if let Some(meta) = worktree_restored {
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+            ThreadEvent::WorktreeChanged {
+                active: true,
+                path: Some(meta.worktree_path),
+            },
+        )));
     }
 
     let mut run_steers: Vec<String> = Vec::new();
@@ -1557,6 +1614,8 @@ async fn run_actor(
                     &state.gate,
                     &state.plan,
                     state.goal_bridge.as_ref(),
+                    &cmd_tx,
+                    &state.worktree,
                 )
                 .await;
                 _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
@@ -1568,11 +1627,120 @@ async fn run_actor(
                     &wakeup_tx,
                 );
                 resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
+                resync_worktree_state(&sessions_dir, &path, &state.worktree, &notice_tx).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 // Opened sessions are resumed conversations: SessionStart
                 // already happened in a prior lifetime.
                 state.session_start_fired.store(true, Ordering::SeqCst);
+                title_state = load_title_state(&sessions_dir, session.path(), &session).await;
+                sync_history(&session, &sessions_dir, &state).await;
+                sync_usage(&session, &state).await;
+                refresh_session_list(&repo, &state).await;
+            }
+            SessionCmd::EnterWorktree {
+                worktree_path,
+                branch,
+                original_cwd,
+            } => {
+                let Some(current_path) = state.active_path.lock().unwrap().clone() else {
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!("enter_worktree: no active session"),
+                    ))));
+                    continue;
+                };
+                // Kernel-native `forkFrom`: the forked session carries the
+                // transcript verbatim with the worktree as its header cwd.
+                let fork_path = match repo
+                    .fork_from(&current_path, &worktree_path.display().to_string())
+                    .await
+                {
+                    Ok(forked) => forked.storage().path().to_path_buf(),
+                    Err(err) => {
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                            anyhow::anyhow!("enter_worktree fork failed: {err:#}"),
+                        ))));
+                        continue;
+                    }
+                };
+                rebuild_session(
+                    &mut session,
+                    &fork_path,
+                    &sessions_dir,
+                    &runtime,
+                    &pi_model,
+                    &cwd,
+                    &notice_tx,
+                    &state.gate,
+                    &state.plan,
+                    state.goal_bridge.as_ref(),
+                    &cmd_tx,
+                    &state.worktree,
+                )
+                .await;
+                _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
+                _harness_subscription = subscribe_harness_events(
+                    &mut session,
+                    sessions_dir.to_path_buf(),
+                    fork_path.clone(),
+                    &notice_tx,
+                    &wakeup_tx,
+                );
+                resync_plan_state(&sessions_dir, &fork_path, &state.plan, &notice_tx).await;
+                let meta = pi_extensions::session_meta::WorktreeMeta {
+                    worktree_path: worktree_path.display().to_string(),
+                    branch,
+                    original_session_path: current_path.display().to_string(),
+                    original_cwd: original_cwd.display().to_string(),
+                };
+                if let Err(err) =
+                    write_worktree_sidecar(&sessions_dir, &fork_path, Some(meta)).await
+                {
+                    tracing::warn!(error = %err, "failed to persist worktree sidecar");
+                }
+                resync_worktree_state(&sessions_dir, &fork_path, &state.worktree, &notice_tx).await;
+                *state.active_path.lock().unwrap() = Some(fork_path);
+                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                title_state = load_title_state(&sessions_dir, session.path(), &session).await;
+                sync_history(&session, &sessions_dir, &state).await;
+                sync_usage(&session, &state).await;
+                refresh_session_list(&repo, &state).await;
+            }
+            SessionCmd::ExitWorktree => {
+                let Some(meta) = state.worktree.lock().unwrap().clone() else {
+                    continue;
+                };
+                let original = PathBuf::from(&meta.original_session_path);
+                rebuild_session(
+                    &mut session,
+                    &original,
+                    &sessions_dir,
+                    &runtime,
+                    &pi_model,
+                    &cwd,
+                    &notice_tx,
+                    &state.gate,
+                    &state.plan,
+                    state.goal_bridge.as_ref(),
+                    &cmd_tx,
+                    &state.worktree,
+                )
+                .await;
+                _subscription = subscribe_session(&session, &notice_tx, Arc::clone(&live_mirror));
+                _harness_subscription = subscribe_harness_events(
+                    &mut session,
+                    sessions_dir.to_path_buf(),
+                    original.clone(),
+                    &notice_tx,
+                    &wakeup_tx,
+                );
+                resync_plan_state(&sessions_dir, &original, &state.plan, &notice_tx).await;
+                if let Err(err) = write_worktree_sidecar(&sessions_dir, &original, None).await {
+                    tracing::warn!(error = %err, "failed to clear worktree sidecar");
+                }
+                resync_worktree_state(&sessions_dir, &original, &state.worktree, &notice_tx).await;
+                *state.active_path.lock().unwrap() = Some(original);
+                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 title_state = load_title_state(&sessions_dir, session.path(), &session).await;
                 sync_history(&session, &sessions_dir, &state).await;
                 sync_usage(&session, &state).await;
@@ -1588,6 +1756,8 @@ async fn run_actor(
                     &state.plan,
                     &notice_tx,
                     state.goal_bridge.as_ref(),
+                    &cmd_tx,
+                    &state.worktree,
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -1605,6 +1775,14 @@ async fn run_actor(
                         state.plan.set_active_instructions(None);
                         // …and earns its own SessionStart on the first turn.
                         state.session_start_fired.store(false, Ordering::SeqCst);
+                        // …nor an active worktree binding.
+                        *state.worktree.lock().unwrap() = None;
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::WorktreeChanged {
+                                active: false,
+                                path: None,
+                            },
+                        )));
                         session = s;
                         let new_path = session.path().to_path_buf();
                         _subscription =
@@ -1656,6 +1834,8 @@ async fn rebuild_session(
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
+    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
+    worktree: &crate::worktree::WorktreeState,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -1686,6 +1866,8 @@ async fn rebuild_session(
         plan,
         notice_tx,
         goal_bridge,
+        cmd_tx,
+        worktree,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
@@ -1885,6 +2067,49 @@ async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> b
         Ok(meta) => meta.plan_review_pending.unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// The active worktree binding persisted in a session's sidecar (forked
+/// worktree sessions carry it; originals and plain sessions don't).
+async fn load_worktree_state(
+    sessions_dir: &Path,
+    session_path: &Path,
+) -> Option<pi_extensions::session_meta::WorktreeMeta> {
+    pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .ok()
+        .and_then(|meta| meta.worktree)
+}
+
+/// Persist (or clear) the worktree binding in the session sidecar.
+async fn write_worktree_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    worktree: Option<pi_extensions::session_meta::WorktreeMeta>,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.worktree = worktree;
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// Re-sync the active-worktree state after a session switch: the binding
+/// follows the opened session's sidecar. Emits `WorktreeChanged` so the
+/// facade mirror tracks the session it now mirrors.
+async fn resync_worktree_state(
+    sessions_dir: &Path,
+    session_path: &Path,
+    worktree: &crate::worktree::WorktreeState,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let meta = load_worktree_state(sessions_dir, session_path).await;
+    let active = meta.is_some();
+    let path = meta.as_ref().map(|m| m.worktree_path.clone());
+    *worktree.lock().unwrap() = meta;
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::WorktreeChanged { active, path },
+    )));
 }
 
 async fn write_plan_review_pending_sidecar(
@@ -3043,6 +3268,7 @@ mod tests {
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
+            worktree: crate::worktree::new_state(),
         })
     }
 
