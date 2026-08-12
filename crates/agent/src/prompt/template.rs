@@ -38,12 +38,6 @@ pub enum PromptTemplate {
     WrapperToolDenied,
     WrapperEscalatedApprovalQuestion,
     WrapperCompactionPreamble,
-    /// Multi-level CLAUDE.md eager block: one `<instructions>` tag per loaded
-    /// file, concatenated broadest → most specific.
-    WrapperInstructionsEager,
-    /// Lazy CLAUDE.md discoveries wrapped in a `<system-reminder>`, appended
-    /// to the triggering `read_file` tool result.
-    WrapperInstructionsLazy,
 
     // --- side-call system + user prompts ---
     SideCallApprovalSystem,
@@ -90,8 +84,6 @@ impl PromptTemplate {
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
             Self::WrapperEscalatedApprovalQuestion => "wrapper/escalated_approval_question.tera.md",
             Self::WrapperCompactionPreamble => "wrapper/compaction_preamble.tera.md",
-            Self::WrapperInstructionsEager => "wrapper/instructions_eager.tera.md",
-            Self::WrapperInstructionsLazy => "wrapper/instructions_lazy.tera.md",
             Self::SideCallApprovalSystem => "side_call/approval_system.tera.md",
             Self::SideCallApprovalUser => "side_call/approval_user.tera.md",
             Self::SideCallCompactSystem => "side_call/compact_system.tera.md",
@@ -110,7 +102,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 25] = [
+pub const ALL: [PromptTemplate; 23] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -124,8 +116,6 @@ pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::WrapperToolDenied,
     PromptTemplate::WrapperEscalatedApprovalQuestion,
     PromptTemplate::WrapperCompactionPreamble,
-    PromptTemplate::WrapperInstructionsEager,
-    PromptTemplate::WrapperInstructionsLazy,
     PromptTemplate::SideCallApprovalSystem,
     PromptTemplate::SideCallApprovalUser,
     PromptTemplate::SideCallCompactSystem,
