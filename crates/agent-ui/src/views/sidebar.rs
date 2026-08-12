@@ -1018,6 +1018,11 @@ struct SidebarThreadItem {
     /// A tool authorization is parked waiting for the user's verdict (the
     /// thread's card is only visible when it is the active thread).
     pending_auth: bool,
+    /// A sidecar-restored row with no live process; clicking it resumes the
+    /// CLI. Rendered dimmed with a resume hover action.
+    resumable: bool,
+    /// A resume is in flight for this row; rendered with a loading indicator.
+    resuming: bool,
     selected: bool,
     indent: gpui::Pixels,
     icon: RowIcon,
@@ -1053,6 +1058,8 @@ impl SidebarThreadItem {
             errored: summary.errored,
             running,
             pending_auth,
+            resumable: false,
+            resuming: false,
             selected,
             indent,
             icon: RowIcon::Thread,
@@ -1105,6 +1112,8 @@ impl SidebarThreadItem {
             errored: false,
             running: false,
             pending_auth: false,
+            resumable: summary.resumable,
+            resuming: summary.resuming,
             selected,
             indent,
             icon: RowIcon::External(summary.kind.icon_asset()),
@@ -1135,7 +1144,10 @@ fn render_thread_item(
     let short_id = item.short_id.clone();
     let title = item.title.clone();
     let updated = item.updated.clone();
-    let title_color = if item.errored {
+    let title_color = if item.resumable {
+        // A sidecar-restored row reads as parked: dimmed until resumed.
+        theme.muted_foreground
+    } else if item.errored {
         theme.danger
     } else {
         theme.foreground
@@ -1235,17 +1247,25 @@ fn render_thread_item(
         tag_wrapper.into_any_element()
     };
 
-    let leading_icon = match icon {
-        RowIcon::Thread => gpui::svg()
-            .path("icons/manox.svg")
-            .size(px(16.))
-            .text_color(theme.muted_foreground)
-            .into_any_element(),
-        RowIcon::External(path) => gpui::svg()
-            .path(path)
-            .size(px(16.))
-            .text_color(theme.muted_foreground)
-            .into_any_element(),
+    let leading_icon = if item.resuming {
+        // A resume is in flight: the loading indicator replaces the idle icon.
+        crate::views::braille_spinner::BrailleSpinner::new()
+            .xsmall()
+            .color(theme.muted_foreground)
+            .into_any_element()
+    } else {
+        match icon {
+            RowIcon::Thread => gpui::svg()
+                .path("icons/manox.svg")
+                .size(px(16.))
+                .text_color(theme.muted_foreground)
+                .into_any_element(),
+            RowIcon::External(path) => gpui::svg()
+                .path(path)
+                .size(px(16.))
+                .text_color(theme.muted_foreground)
+                .into_any_element(),
+        }
     };
 
     h_flex()
@@ -1353,9 +1373,10 @@ fn render_thread_item(
                                 .gap_0p5()
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
-                                .child(render_archive_button(
+                                .child(render_hover_action(
                                     id_archive.clone(),
                                     item.kind.clone(),
+                                    item.resumable,
                                     cx,
                                 )),
                         ),
@@ -1364,12 +1385,31 @@ fn render_thread_item(
         .into_any_element()
 }
 
-/// The hover "Inbox" archive button shared by threads and external sessions.
-/// Threads toggle their archived flag; an external session tears itself down
-/// (kill + drop) — the unified archive semantics. Uses `cx.listener` so the
-/// click emits on the sidebar's own context (where `EventEmitter<SidebarEvent>`
+/// The hover action on a row's right edge. Threads and live external sessions
+/// get the Inbox close/archive button; a resumable row gets a Play resume
+/// button (the row click already emits the same `OpenExternalSession` event,
+/// so the affordance is just a visible hint). Uses `cx.listener` so the click
+/// emits on the sidebar's own context (where `EventEmitter<SidebarEvent>`
 /// lives) rather than the bare `App` the standalone `on_click` receives.
-fn render_archive_button(id: String, kind: RowKind, cx: &mut Context<Sidebar>) -> AnyElement {
+fn render_hover_action(
+    id: String,
+    kind: RowKind,
+    resumable: bool,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
+    if resumable {
+        let id_open = id.clone();
+        return Button::new(format!("resume-external-{id}"))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Play)
+            .tooltip(i18n::t("sidebar-resume-external"))
+            .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                cx.stop_propagation();
+                cx.emit(SidebarEvent::OpenExternalSession(id_open.clone()));
+            }))
+            .into_any_element();
+    }
     let id = id.clone();
     Button::new(format!("archive-thread-{id}"))
         .ghost()
@@ -1469,6 +1509,8 @@ mod tests {
             title: None,
             cx_session_id: "deadbeef".into(),
             socket_path: None,
+            resumable: false,
+            resuming: false,
         }
     }
 
@@ -1567,5 +1609,21 @@ mod tests {
             pinned_section(true, px(500.), Some(px(200.))),
             PinnedSection::Conversations
         );
+    }
+
+    /// A sidecar-restored row carries its resumable/resuming states into the
+    /// unified row item, so the renderer can dim it and swap in the loading
+    /// indicator without touching the live-row path.
+    #[test]
+    fn resumable_row_propagates_resume_states() {
+        let theme = real_theme();
+        let mut summary = sample_external();
+        summary.resumable = true;
+        let item = SidebarThreadItem::from_external(&summary, false, px(0.), &theme);
+        assert!(item.resumable);
+        assert!(!item.resuming);
+        summary.resuming = true;
+        let item = SidebarThreadItem::from_external(&summary, false, px(0.), &theme);
+        assert!(item.resuming);
     }
 }

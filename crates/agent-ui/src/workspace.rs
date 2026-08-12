@@ -54,7 +54,10 @@ use manox_components::markdown::Markdown;
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
-use crate::external_session::{ExternalSession, SessionKind};
+use crate::external_session::{
+    ExternalSession, ResumeSidecar, SessionKind, list_sidecars, merge_external_summaries,
+    remove_sidecar, resume_args, write_sidecar,
+};
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
@@ -398,6 +401,14 @@ pub struct Workspace {
     /// `TerminalView` plus a shared `Arc<SessionHandle>` so the close path can
     /// `kill` the agent explicitly.
     pub(crate) external_sessions: Vec<crate::external_session::ExternalSession>,
+    /// Unclosed external sessions from previous runs, restored from their
+    /// sidecars at startup. Rendered in the sidebar as resumable rows; clicking
+    /// one re-spawns the CLI with its resume flag. Never auto-resumed.
+    resumable_external: Vec<ResumeSidecar>,
+    /// Ids of resumable rows whose CLI re-spawn is in flight; the sidebar
+    /// shows a loading indicator on each such row. A set (not a single slot)
+    /// so resuming two rows concurrently cannot steal each other's spinner.
+    resuming_external: std::collections::HashSet<String>,
     /// The currently-displayed external session id when
     /// `view_mode == ExternalSession`. Mirrors `terminal_view`'s "one at a
     /// time" model; switching away parks the session (its terminal keeps
@@ -613,12 +624,17 @@ impl Workspace {
             terminal_view: None,
             context_rail,
             external_sessions: Vec::new(),
+            resumable_external: list_sidecars(),
+            resuming_external: std::collections::HashSet::new(),
             active_external: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
+        // The sidebar lists the restored resumable rows from the first frame;
+        // nothing is resumed until the user clicks one.
+        ws.sync_sidebar_external(cx);
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
         ws
@@ -1214,7 +1230,7 @@ impl Workspace {
                     this.launch_vscode_app(Some(folder), window, cx);
                 }
                 SidebarEvent::OpenExternalSession(id) => {
-                    this.attach_external_session(id, window, cx);
+                    this.open_external_session(id, window, cx);
                 }
                 SidebarEvent::ArchiveExternalSession(id) => {
                     this.close_external_session(id, cx);
@@ -1424,7 +1440,7 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
-        let terminal = match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
+        let terminal = match Terminal::new(id.clone(), cwd.clone(), 80, 24, Box::new(source), cx) {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for external session");
@@ -1456,17 +1472,35 @@ impl Workspace {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        // Persist the session as unclosed from the first frame: the sidecar
+        // survives this process (crash or quit), is kept in sync while live,
+        // and is deleted only on an explicit close — so the next launch offers
+        // exactly the sessions the user never closed.
+        let sidecar = ResumeSidecar {
+            id: id.clone(),
+            agent_id: agent_id.into(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            project: project_cwd,
+            created_at,
+            provider: provider_name,
+            model: model_id,
+            title: None,
+        };
+        if let Err(e) = write_sidecar(&sidecar) {
+            tracing::warn!(error = %e, id, "external session sidecar write failed");
+        }
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
             kind,
             created_at,
-            project: project_cwd,
+            project: sidecar.project.clone(),
             title: None,
             cx_session_id,
             socket_path,
             terminal_view: view,
             handle: Some(handle),
             _exit_sub: exit_sub,
+            sidecar: Some(sidecar),
         });
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, window, cx);
@@ -1542,6 +1576,7 @@ impl Workspace {
             terminal_view: view,
             handle: None,
             _exit_sub: exit_sub,
+            sidecar: None,
         });
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, window, cx);
@@ -1668,6 +1703,133 @@ impl Workspace {
         .detach();
     }
 
+    /// Route a sidebar click on an external row. A live session attaches its
+    /// running TUI; a resumable row (restored from a sidecar) re-spawns the
+    /// CLI with its resume flag. Nothing is resumed at launch — only when the
+    /// user picks the row, mirroring the manox thread contract.
+    pub fn open_external_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.external_sessions.iter().any(|s| s.id == id) {
+            self.attach_external_session(id, window, cx);
+            return;
+        }
+        if self.resumable_external.iter().any(|s| s.id == id) {
+            self.resume_external_session(id, window, cx);
+        }
+    }
+
+    /// Re-spawn an unclosed external session's CLI with its resume flag so the
+    /// CLI's own on-disk storage picks the conversation back up. The sidecar
+    /// replays the original provider / model / cwd — no picker, and the resume
+    /// command is never surfaced; the only feedback is a loading row until the
+    /// TUI takes over. On failure the sidecar stays, so the row remains
+    /// resumable for a retry.
+    fn resume_external_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sidecar) = self.resumable_external.iter().find(|s| s.id == id).cloned() else {
+            return;
+        };
+        let id = id.to_string();
+        let Some(kind) = SessionKind::from_agent_id(&sidecar.agent_id) else {
+            tracing::warn!(id, "resume sidecar carries a non-agent kind");
+            return;
+        };
+        let Some(agent) = kind.agent() else {
+            return;
+        };
+        // Guard and insert are adjacent on the UI thread, so a double-click
+        // between them cannot double-spawn. Only ids that passed the
+        // resolution above ever enter the set, so no early-return path can
+        // strand a spinner.
+        if !self.resuming_external.insert(id.clone()) {
+            return;
+        }
+        self.sync_sidebar_external(cx);
+
+        // The cx spawn (config load, keychain resolve, process spawn, socket
+        // bind) is pure I/O, so it runs off the UI thread and the spinner
+        // stays live while the CLI boots.
+        let args = resume_args(&sidecar.agent_id);
+        let provider = sidecar.provider.clone();
+        let model = sidecar.model.clone();
+        let cwd = PathBuf::from(&sidecar.cwd);
+        let project = sidecar.project.clone();
+        let created_at = sidecar.created_at;
+        let this = cx.weak_entity();
+        cx.spawn_in(window, async move |_window, cx| {
+            let handle = match cx
+                .background_spawn(async move {
+                    cx::AgentBuilder::new()
+                        .agent(agent)
+                        .pty(true)
+                        .provider(provider)
+                        .model(model)
+                        .cwd(cwd)
+                        .passthrough(args)
+                        .spawn()
+                })
+                .await
+            {
+                Ok(h) => Arc::new(h),
+                Err(e) => {
+                    tracing::error!(error = %e, id, "external session resume failed");
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.resuming_external.remove(&id);
+                        this.sync_sidebar_external(cx);
+                        window.push_notification(Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("external-session-resume-failed")
+                        )), cx);
+                    });
+                    return;
+                }
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+                let terminal =
+                    match terminal::Terminal::new(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source), cx)
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(error = %e, id, "failed to create resumed session terminal");
+                            this.resuming_external.remove(&id);
+                            this.sync_sidebar_external(cx);
+                            window.push_notification(Notification::error(format!(
+                                "{}: {e}",
+                                i18n::t("external-session-resume-failed")
+                            )), cx);
+                            return;
+                        }
+                    };
+                let exit_sub = this.subscribe_session_terminal(&terminal, &id, cx);
+                let socket_path = handle.socket_path().map(std::path::Path::to_path_buf);
+                let cx_session_id = handle
+                    .socket_path()
+                    .and_then(crate::external_session::cx_session_id_from_socket)
+                    .unwrap_or_default();
+                let view = TerminalView::new(terminal, cx);
+                this.external_sessions.push(ExternalSession {
+                    id: id.clone(),
+                    kind,
+                    created_at,
+                    project,
+                    title: None,
+                    cx_session_id,
+                    socket_path,
+                    terminal_view: view,
+                    handle: Some(handle),
+                    _exit_sub: exit_sub,
+                    // The resumed session keeps its sidecar (same identity):
+                    // the disk record already represents it, and title sync
+                    // keeps the row fresh for a possible later exit.
+                    sidecar: Some(sidecar),
+                });
+                this.resuming_external.remove(&id);
+                this.sync_sidebar_external(cx);
+                this.attach_external_session(&id, window, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Display an already-running external session in the main area. Does not
     /// touch the foreground `Thread` (the thread entity stays mounted; only the
     /// view mode flips) — the session's terminal keeps running across switches
@@ -1720,7 +1882,7 @@ impl Workspace {
     /// session was already removed (a spurious title after close).
     fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
         let active = self.active_external.as_deref() == Some(id);
-        let new = title.as_deref().filter(|t| !t.is_empty());
+        let new = title.as_deref().filter(|t| !t.trim().is_empty());
         let changed = self.external_sessions.iter_mut().any(|s| {
             if s.id != id {
                 return false;
@@ -1732,6 +1894,20 @@ impl Workspace {
             true
         });
         if changed {
+            // Keep the durable sidecar's title in sync so a later exit offers
+            // the resumable row under the latest OSC title rather than the one
+            // captured at spawn / last resume.
+            if let Some(sidecar) = self
+                .external_sessions
+                .iter_mut()
+                .find(|s| s.id == id)
+                .and_then(|s| s.sidecar.as_mut())
+            {
+                sidecar.title = new.map(str::to_string);
+                if let Err(e) = write_sidecar(sidecar) {
+                    tracing::warn!(error = %e, id, "external session sidecar title update failed");
+                }
+            }
             self.sync_sidebar_external(cx);
             if active {
                 cx.notify();
@@ -1771,6 +1947,11 @@ impl Workspace {
     fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.active_external.as_deref() == Some(id);
         self.external_sessions.retain(|s| s.id != id);
+        // The session is now explicitly closed (sidebar `×` or a natural CLI
+        // exit): drop its sidecar — both the in-memory row and the disk record
+        // — so it is no longer offered for resume.
+        self.resumable_external.retain(|s| s.id != id);
+        remove_sidecar(id);
         if was_active {
             self.active_external = None;
             self.focus_conversation(cx);
@@ -1778,11 +1959,17 @@ impl Workspace {
         self.sync_sidebar_external(cx);
     }
 
-    /// Push a fresh projection of the live external sessions to the sidebar so
-    /// its "External" section reflects spawns / closes without owning the
-    /// PTY-bearing structs.
+    /// Push a fresh projection of the external sessions to the sidebar so its
+    /// list reflects spawns / closes / resumes without owning the
+    /// PTY-bearing structs. Live sessions render first, then the resumable
+    /// rows restored from sidecars.
     fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
-        let summaries: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
+        let live: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
+        let mut summaries = merge_external_summaries(live, self.resumable_external.clone());
+        let resuming = self.resuming_external.clone();
+        for s in &mut summaries {
+            s.resuming = resuming.contains(s.id.as_str());
+        }
         self.sidebar
             .update(cx, |s, cx| s.set_external_sessions(summaries, cx));
     }
