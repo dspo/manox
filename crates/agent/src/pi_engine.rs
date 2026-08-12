@@ -67,6 +67,10 @@ pub(crate) enum SessionCmd {
     SetPlanMode { enabled: bool },
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     SetPlanReviewPending(bool),
+    /// Persist the latest `UpdatePlan` snapshot (compaction survival: the
+    /// transcript's plan tool calls are summarized away; the rail restores
+    /// from the sidecar). `None` clears it (the model dropped its plan).
+    PersistPlanSnapshot(Option<serde_json::Value>),
     /// Execute an approved plan: exit plan mode, optionally compact the
     /// planning context toward the plan file, then run the seed turn.
     ApprovePlan {
@@ -349,6 +353,10 @@ impl ThreadEngine for PiEngine {
 
     fn set_plan_review_pending(&self, pending: bool) {
         let _ = self.cmd_tx.send(SessionCmd::SetPlanReviewPending(pending));
+    }
+
+    fn persist_plan_snapshot(&self, snapshot: Option<serde_json::Value>) {
+        let _ = self.cmd_tx.send(SessionCmd::PersistPlanSnapshot(snapshot));
     }
 
     fn approve_plan(&self, compact: bool, compact_instructions: Option<String>, seed_text: String) {
@@ -1508,6 +1516,7 @@ async fn run_actor(
             .set_active_instructions(render_plan_instructions());
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
+    let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
     let mut title_state = load_title_state(&sessions_dir, session.path(), &session).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
@@ -1527,6 +1536,7 @@ async fn run_actor(
         plan_mode: plan_mode_restored,
         plan_file: plan_file_restored,
         plan_review_pending,
+        plan_snapshot,
     });
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -1706,6 +1716,13 @@ async fn run_actor(
                     write_plan_review_pending_sidecar(&sessions_dir, session.path(), pending).await
                 {
                     tracing::warn!(error = %err, "failed to persist plan review pending flag");
+                }
+            }
+            SessionCmd::PersistPlanSnapshot(snapshot) => {
+                if let Err(err) =
+                    write_plan_snapshot_sidecar(&sessions_dir, session.path(), snapshot).await
+                {
+                    tracing::warn!(error = %err, "failed to persist plan snapshot");
                 }
             }
             SessionCmd::ApprovePlan {
@@ -2288,6 +2305,16 @@ async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> b
     }
 }
 
+/// The last `UpdatePlan` snapshot persisted in the sidecar (compaction
+/// survival: the transcript's plan tool calls are summarized away, but the
+/// rail's plan restores from here).
+async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<serde_json::Value> {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => meta.plan_snapshot,
+        Err(_) => None,
+    }
+}
+
 /// The active worktree binding persisted in a session's sidecar (forked
 /// worktree sessions carry it; originals and plain sessions don't).
 async fn load_worktree_state(
@@ -2340,6 +2367,18 @@ async fn write_plan_review_pending_sidecar(
         .await
         .unwrap_or_default();
     meta.plan_review_pending = pending.then_some(true);
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+async fn write_plan_snapshot_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    snapshot: Option<serde_json::Value>,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.plan_snapshot = snapshot;
     pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
 }
 

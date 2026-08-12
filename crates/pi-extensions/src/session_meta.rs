@@ -38,6 +38,12 @@ pub struct SessionMeta {
     /// session last settled; a restarted session re-surfaces the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_review_pending: Option<bool>,
+    /// Last execution plan the model published via `UpdatePlan`, persisted so
+    /// it survives compaction (the transcript's tool calls are summarized
+    /// away) and restarts. Serialized `agent::plan::PlanSnapshot`; `None`
+    /// after the model clears its plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_snapshot: Option<serde_json::Value>,
     /// Active git-worktree binding (`EnterWorktree`/`ExitWorktree`): the
     /// session is a fork whose cwd is the worktree; the original session
     /// file + cwd are kept so `ExitWorktree` can return. Absent = not in a
@@ -135,6 +141,37 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("fix the widget"));
         assert_eq!(loaded.project.as_deref(), Some("/p/a"));
         assert!(loaded.pinned && loaded.unread && !loaded.archived && !loaded.errored);
+    }
+
+    #[tokio::test]
+    async fn plan_snapshot_round_trips_and_defaults_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+
+        // Fresh sidecar: no persisted plan.
+        let fresh = load(dir.path(), &session).await.unwrap();
+        assert!(fresh.plan_snapshot.is_none());
+
+        // Persist a snapshot (serialized `agent::plan::PlanSnapshot` shape).
+        let snapshot = serde_json::json!({
+            "explanation": null,
+            "steps": [
+                { "step": "investigate", "status": "completed" },
+                { "step": "implement", "status": "in_progress" }
+            ]
+        });
+        let mut meta = load(dir.path(), &session).await.unwrap();
+        meta.plan_snapshot = Some(snapshot.clone());
+        save(dir.path(), &session, &meta).await.unwrap();
+        let loaded = load(dir.path(), &session).await.unwrap();
+        assert_eq!(loaded.plan_snapshot, Some(snapshot));
+
+        // Clearing (the model dropped its plan) removes the field entirely.
+        let mut meta = loaded;
+        meta.plan_snapshot = None;
+        save(dir.path(), &session, &meta).await.unwrap();
+        let cleared = load(dir.path(), &session).await.unwrap();
+        assert!(cleared.plan_snapshot.is_none());
     }
 
     #[tokio::test]

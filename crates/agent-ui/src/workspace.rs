@@ -735,6 +735,13 @@ impl Workspace {
                     // Refresh the plan chip.
                     cx.notify();
                 }
+                ThreadEvent::PlanUpdated { snapshot } => {
+                    // Live plan progress: mirror onto the rail as the model
+                    // publishes it (an empty snapshot clears the section).
+                    let snapshot = snapshot.clone();
+                    this.context_rail
+                        .update(cx, |r, cx| r.set_plan(snapshot, cx));
+                }
                 ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + Danger badge; no conversation item.
                     cx.notify();
@@ -747,6 +754,18 @@ impl Workspace {
                 // to the authoritative active branch here.
                 ThreadEvent::HistoryRestored => {
                     this.rebuild_conversation_from_thread(cx);
+                    // Re-seed the rail's plan now that the authoritative
+                    // transcript has landed: the attach-time seed ran against
+                    // an empty transcript and an unfilled sidecar mirror
+                    // (`Ready` is async), so a restarted session's plan would
+                    // otherwise wait for a manual thread switch.
+                    let messages = this.thread.read(cx).messages().to_vec();
+                    if let Some(snapshot) = agent::plan::rebuild_from_messages(&messages)
+                        .or_else(|| this.thread.read(cx).persisted_plan().cloned())
+                    {
+                        this.context_rail
+                            .update(cx, |r, cx| r.set_plan(snapshot, cx));
+                    }
                 }
                 // A display-only preview batch landed while the authoritative
                 // restore is still running: append the newly available
@@ -2542,15 +2561,17 @@ impl Workspace {
         }
         // Cockpit state is per-thread: the outgoing thread's plan,
         // running-tool title, and per-model counter state do not apply to the
-        // incoming one. The execution plan, unlike the
-        // proposed-plan review, IS recoverable — each `UpdatePlan` call is an
-        // ordinary tool round-trip in history, so the rail's plan is re-derived
-        // from `messages` below. Refresh cached auto-compact knobs in case the
-        // user edited settings while viewing another thread — cheap, and keeps
-        // the budget accurate.
+        // incoming one. The execution plan, unlike the proposed-plan review,
+        // IS recoverable: re-derived from the transcript's `UpdatePlan` tool
+        // calls, falling back to the sidecar snapshot once compaction has
+        // summarized those calls away (the facade mirrors the persisted copy
+        // on every `PlanUpdated` / `Ready`). Refresh cached auto-compact
+        // knobs in case the user edited settings while viewing another
+        // thread — cheap, and keeps the budget accurate.
         let auto_compact = settings::load().auto_compact;
         let new_thread_for_rail = self.thread.clone();
-        let restored_plan = agent::plan::rebuild_from_messages(&messages);
+        let restored_plan = agent::plan::rebuild_from_messages(&messages)
+            .or_else(|| self.thread.read(cx).persisted_plan().cloned());
         self.context_rail.update(cx, |r, cx| {
             // Rebind the rail to the incoming thread. Without this the rail
             // keeps reading the construction-time thread's `per_model` usage /
