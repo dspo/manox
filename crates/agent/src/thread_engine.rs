@@ -105,6 +105,11 @@ pub trait ThreadEngine: Send + Sync {
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     fn set_plan_review_pending(&self, _pending: bool) {}
 
+    /// Persist the latest `UpdatePlan` snapshot so the rail's plan survives
+    /// compaction (the transcript's plan tool calls are summarized away).
+    /// `None` clears it. Backends without sidecar persistence no-op.
+    fn persist_plan_snapshot(&self, _snapshot: Option<serde_json::Value>) {}
+
     /// Execute an approved plan: optional compaction toward the plan file,
     /// then the execution seed turn.
     fn approve_plan(
@@ -154,6 +159,10 @@ pub enum BackendNotice {
         /// A plan review card was pending when the session last settled;
         /// the facade re-emits `PlanReady` so the card re-surfaces.
         plan_review_pending: bool,
+        /// Last `UpdatePlan` snapshot persisted in the sidecar; the facade
+        /// mirrors it as the rebuild fallback after compaction summarized
+        /// the transcript's plan tool calls away.
+        plan_snapshot: Option<serde_json::Value>,
     },
     /// The turn loop unwound and released the running slot.
     Settled {

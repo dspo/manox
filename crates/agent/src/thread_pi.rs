@@ -333,6 +333,10 @@ pub struct Thread {
     /// ride the `ProposePlan` tool. Mirrored from the engine on
     /// `PlanModeChanged`/`Ready`.
     plan_mode: bool,
+    /// Last `UpdatePlan` snapshot mirrored from the engine: the rail's
+    /// rebuild-after-compaction fallback (the transcript's plan tool calls
+    /// are summarized away, but this survives via the session sidecar).
+    persisted_plan: Option<crate::plan::PlanSnapshot>,
     /// Member label for team routing: `lead` for the main thread, the
     /// member name for team workers.
     label: String,
@@ -374,6 +378,7 @@ impl Thread {
             history_phase: HistoryPhase::Ready,
             approval_mode_explicitly_set: false,
             plan_mode: false,
+            persisted_plan: None,
             label: "lead".into(),
             team: None,
             goal_bridge: None,            worktree_path: None,
@@ -457,6 +462,7 @@ impl Thread {
                 },
                 approval_mode_explicitly_set: false,
             plan_mode: false,
+            persisted_plan: None,
                 label: "lead".into(),
                 team: None,
                 goal_bridge,            worktree_path: None,
@@ -515,6 +521,21 @@ impl Thread {
                 }
                 if let ThreadEvent::PlanModeChanged { enabled } = *event {
                     self.plan_mode = enabled;
+                }
+                if let ThreadEvent::PlanUpdated { snapshot } = &*event {
+                    // Mirror + persist: the sidecar copy is the rail's
+                    // rebuild source after compaction summarizes the
+                    // transcript's UpdatePlan calls away. Empty snapshot =
+                    // the model dropped its plan → clear the persisted copy.
+                    let persisted = (!snapshot.is_empty()).then(|| snapshot.clone());
+                    self.persisted_plan = persisted.clone();
+                    if let Some(engine) = &self.engine {
+                        engine.persist_plan_snapshot(
+                            persisted
+                                .as_ref()
+                                .and_then(|p| serde_json::to_value(p).ok()),
+                        );
+                    }
                 }
                 // Runs the actor starts on its own (monitor idle-wakeups,
                 // plan-approval seeds) announce themselves with `TurnStarted`;
@@ -603,7 +624,12 @@ impl Thread {
                 plan_mode,
                 plan_file,
                 plan_review_pending,
+                plan_snapshot,
             } => {
+                // Unconditional: a session switch must drop the previous
+                // session's plan when the opened session has none.
+                self.persisted_plan = plan_snapshot
+                    .and_then(|v| serde_json::from_value(v).ok());
                 self.restored = restored;
                 if let Some(m) = model {
                     self.model = Some(m);
@@ -1174,6 +1200,7 @@ impl Thread {
                 history_phase: HistoryPhase::Ready,
                 approval_mode_explicitly_set: true,
                 plan_mode: false,
+                persisted_plan: None,
                 goal_bridge: None,
                 label: name,
                 team: None,
@@ -1240,6 +1267,13 @@ impl Thread {
     /// Plan mode active for this thread (mirrored from the engine).
     pub fn plan_mode(&self) -> bool {
         self.plan_mode
+    }
+
+    /// Last `UpdatePlan` snapshot mirrored from the engine (sidecar-backed):
+    /// the rail's rebuild fallback once compaction has summarized the
+    /// transcript's plan tool calls away.
+    pub fn persisted_plan(&self) -> Option<&crate::plan::PlanSnapshot> {
+        self.persisted_plan.as_ref()
     }
 
     /// Active git-worktree path for this thread (mirrored from the engine);
@@ -1619,6 +1653,8 @@ pub(crate) mod tests {
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
         runs: Mutex<Vec<(String, Vec<pi::types::ContentBlock>)>>,
+        /// Recorded `persist_plan_snapshot` calls (serialized snapshots).
+        plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
     }
 
     impl FakeEngine {
@@ -1630,10 +1666,15 @@ pub(crate) mod tests {
                 approval_mode: Mutex::new(None),
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
+                plan_persists: Mutex::new(Vec::new()),
             }
         }
     }
     impl ThreadEngine for FakeEngine {
+        fn persist_plan_snapshot(&self, snapshot: Option<serde_json::Value>) {
+            self.plan_persists.lock().unwrap().push(snapshot);
+        }
+
         fn is_running(&self) -> bool {
             false
         }
@@ -1722,6 +1763,7 @@ pub(crate) mod tests {
                 history_phase: phase,
                 approval_mode_explicitly_set: false,
                 plan_mode: false,
+                persisted_plan: None,
                 label: "lead".into(),
                 team: None,
                 goal_bridge: None,            worktree_path: None,
@@ -1755,6 +1797,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
         thread.update(cx, |t, cx| {
@@ -1803,6 +1846,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
         thread.update(cx, |t, cx| {
@@ -1840,6 +1884,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
         thread.update(cx, |t, cx| {
@@ -1866,6 +1911,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
         thread.update(cx, |t, cx| t.run_turn(cx));
@@ -1886,6 +1932,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
         // Simulate a preview batch that landed before the authoritative sync.
@@ -1899,6 +1946,7 @@ pub(crate) mod tests {
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
+                    plan_snapshot: None,
                 },
                 cx,
             );
@@ -1935,6 +1983,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
         thread.update(cx, |t, cx| {
@@ -1959,6 +2008,7 @@ pub(crate) mod tests {
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
         thread.update(cx, |t, _cx| {
@@ -1975,10 +2025,111 @@ pub(crate) mod tests {
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
+                    plan_snapshot: None,
                 },
                 cx,
             );
         });
         assert_eq!(cx.read(|cx| thread.read(cx).approval_mode()), ApprovalMode::Danger);
+    }
+
+    /// P1: `PlanUpdated` mirrors onto the facade and persists through the
+    /// engine; an empty snapshot clears both (the model dropped its plan).
+    #[gpui::test]
+    fn plan_updated_mirrors_and_persists(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let engine_ref = Arc::clone(&engine);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+
+        let snapshot = crate::plan::PlanSnapshot {
+            explanation: None,
+            steps: vec![crate::plan::PlanStep {
+                step: "investigate".to_string(),
+                status: crate::plan::PlanStepStatus::InProgress,
+            }],
+        };
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
+                    snapshot: snapshot.clone(),
+                })),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        });
+        let persists = engine_ref.plan_persists.lock().unwrap();
+        assert_eq!(persists.len(), 1);
+        let stored: crate::plan::PlanSnapshot =
+            serde_json::from_value(persists[0].clone().unwrap()).unwrap();
+        assert_eq!(stored, snapshot);
+        drop(persists);
+
+        // Empty snapshot = the model cleared its plan → mirror + sidecar clear.
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
+                    snapshot: crate::plan::PlanSnapshot {
+                        explanation: None,
+                        steps: Vec::new(),
+                    },
+                })),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert_eq!(thread.read(cx).persisted_plan(), None);
+        });
+        let persists = engine_ref.plan_persists.lock().unwrap();
+        assert_eq!(persists.len(), 2);
+        assert!(persists[1].is_none());
+    }
+
+    /// P2: `Ready` restores the persisted plan snapshot (post-restart /
+    /// thread-switch source for the rail's fallback).
+    #[gpui::test]
+    fn ready_restores_persisted_plan_snapshot(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let snapshot = crate::plan::PlanSnapshot {
+            explanation: None,
+            steps: vec![crate::plan::PlanStep {
+                step: "implement".to_string(),
+                status: crate::plan::PlanStepStatus::Completed,
+            }],
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: true,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: Some(value),
+                },
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        });
     }
 }
