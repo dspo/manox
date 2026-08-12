@@ -521,6 +521,9 @@ impl SandboxedBashOperations {
     /// failure (or an allowlist with no valid entries) is an `Err` — the
     /// caller surfaces it instead of silently degrading `Restricted` to a
     /// half-broken deny.
+    // macOS-only like its callers (seatbelt wrap paths + their tests); other
+    // platforms compile it out so `-D warnings` stays clean under clippy.
+    #[cfg(target_os = "macos")]
     fn ensure_proxy(&self) -> Result<Option<u16>, ExecutionError> {
         let NetworkPolicy::Restricted { allowlist } = self.policy.network() else {
             return Ok(None);
@@ -880,6 +883,7 @@ mod tests {
         assert_eq!(args[5], "echo hi", "command is a single argv element");
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn restricted_policy_spawns_allowlist_proxy() {
         let root = project_root();
