@@ -243,6 +243,8 @@ pub enum ThreadEvent {
     ReasoningEffortChanged { effort: ReasoningEffort },
     /// Goal mode toggled on/off.
     GoalChanged { active: bool },
+    /// Git-worktree binding changed: entered (worktree path) or exited.
+    WorktreeChanged { active: bool, path: Option<String> },
     /// Auto-compaction summarization pass started.
     CompactionStarted { tokens_before: u64 },
     /// A compaction pass landed.
@@ -339,7 +341,7 @@ pub struct Thread {
     team: Option<Entity<Team>>,
     /// Shared goal state with the engine's goal tools; `None` only when the
     /// threads db is unavailable (goal features degrade off).
-    goal_bridge: Option<Arc<GoalBridge>>,
+    goal_bridge: Option<Arc<GoalBridge>>,    worktree_path: Option<String>,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -374,7 +376,7 @@ impl Thread {
             plan_mode: false,
             label: "lead".into(),
             team: None,
-            goal_bridge: None,
+            goal_bridge: None,            worktree_path: None,
         })
     }
 
@@ -457,7 +459,7 @@ impl Thread {
             plan_mode: false,
                 label: "lead".into(),
                 team: None,
-                goal_bridge,
+                goal_bridge,            worktree_path: None,
             }
         })
     }
@@ -521,7 +523,9 @@ impl Thread {
                 // facade's own `run_turn` (which emits `TurnStarted`
                 // synchronously before the engine picks up the prompt).
                 if matches!(&*event, ThreadEvent::TurnStarted) {
-                    self.running = true;
+                    self.running = true;                if let ThreadEvent::WorktreeChanged { active, path } = &*event {
+                    self.worktree_path = if *active { path.clone() } else { None };
+                }
                 }
                 cx.emit(*event);
             }
@@ -1173,6 +1177,7 @@ impl Thread {
                 goal_bridge: None,
                 label: name,
                 team: None,
+                worktree_path: None,
             }
         })
     }
@@ -1235,6 +1240,12 @@ impl Thread {
     /// Plan mode active for this thread (mirrored from the engine).
     pub fn plan_mode(&self) -> bool {
         self.plan_mode
+    }
+
+    /// Active git-worktree path for this thread (mirrored from the engine);
+    /// `None` when the session runs in its original directory.
+    pub fn worktree_path(&self) -> Option<&str> {
+        self.worktree_path.as_deref()
     }
 
     /// Persist whether a plan review card is pending, so a restarted
@@ -1713,7 +1724,7 @@ pub(crate) mod tests {
                 plan_mode: false,
                 label: "lead".into(),
                 team: None,
-                goal_bridge: None,
+                goal_bridge: None,            worktree_path: None,
             })
         })
     }

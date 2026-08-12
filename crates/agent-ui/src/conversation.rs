@@ -1010,6 +1010,9 @@ impl ConversationState {
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
             ThreadEvent::GoalChanged { .. } => ApplyOutcome::Unchanged,
+            // Worktree binding is session state (facade mirror), not a
+            // conversation item.
+            ThreadEvent::WorktreeChanged { .. } => ApplyOutcome::Unchanged,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(

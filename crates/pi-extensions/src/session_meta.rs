@@ -38,6 +38,12 @@ pub struct SessionMeta {
     /// session last settled; a restarted session re-surfaces the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_review_pending: Option<bool>,
+    /// Active git-worktree binding (`EnterWorktree`/`ExitWorktree`): the
+    /// session is a fork whose cwd is the worktree; the original session
+    /// file + cwd are kept so `ExitWorktree` can return. Absent = not in a
+    /// worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeMeta>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -53,6 +59,18 @@ pub struct SessionMeta {
     /// reload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub registry_displays: HashMap<usize, String>,
+}
+
+/// Active git-worktree binding persisted in the session sidecar (see
+/// `SessionMeta.worktree`). `original_session_path`/`original_cwd` are the
+/// pre-enter state `ExitWorktree` returns to; `worktree_path`/`branch` name
+/// the bound git worktree.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeMeta {
+    pub worktree_path: String,
+    pub branch: String,
+    pub original_session_path: String,
+    pub original_cwd: String,
 }
 
 /// The sidecar path for a session file: `<dir>/<id>.meta.json`.
