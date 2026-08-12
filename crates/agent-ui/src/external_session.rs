@@ -4,14 +4,25 @@
 //! An `ExternalSession` owns a `TerminalView` rendering the agent's TUI (driven
 //! through a `CxSessionSource` PTY source that wraps the shared
 //! `cx::SessionHandle`) plus the `Arc<SessionHandle>` itself, so the close path
-//! can `kill` the agent explicitly. Sessions live only in memory — they are not
-//! persisted and vanish from the sidebar on exit.
+//! can `kill` the agent explicitly.
+//!
+//! Agent-kind sessions survive an app exit as a [`ResumeSidecar`]: the sidecar
+//! is written at spawn, deleted only when the session is explicitly closed, and
+//! re-scanned at startup. A sidecar left on disk is therefore exactly an
+//! *unclosed* session — the user re-opens it from the sidebar and manox
+//! re-spawns the CLI with its resume flag (`claude --continue` / `codex resume
+//! --last` / `copilot --continue`), so the CLI's own on-disk conversation
+//! storage picks the conversation back up. Plain PTY shells are never
+//! persisted (nothing to resume).
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent::i18n;
+use anyhow::Result;
 use gpui::{Entity, SharedString, Subscription};
+use serde::{Deserialize, Serialize};
 
 use terminal_ui::TerminalView;
 
@@ -74,6 +85,18 @@ impl SessionKind {
             Self::Terminal => "icons/terminal.svg",
         }
     }
+
+    /// The agent kind named by a `ResumeSidecar`'s `agent_id`. `None` for the
+    /// plain PTY kind — terminal shells are never persisted, so a sidecar
+    /// never carries `terminal`.
+    pub fn from_agent_id(agent_id: &str) -> Option<Self> {
+        match agent_id {
+            "claude" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "copilot" => Some(Self::GithubCopilot),
+            _ => None,
+        }
+    }
 }
 
 /// A live external agent CLI session. The `TerminalView` renders the agent's
@@ -131,6 +154,10 @@ pub struct ExternalSession {
     /// tree, so no explicit kill reference is needed.
     pub handle: Option<Arc<cx::SessionHandle>>,
     pub _exit_sub: Subscription,
+    /// The durable record backing this session — written at spawn, kept in
+    /// sync (title) while live, deleted on close. `None` for plain PTY
+    /// sessions, which are never persisted.
+    pub sidecar: Option<ResumeSidecar>,
 }
 
 impl ExternalSession {
@@ -158,6 +185,8 @@ impl ExternalSession {
             title: self.title.clone(),
             cx_session_id: self.cx_session_id.clone(),
             socket_path: self.socket_path.clone(),
+            resumable: false,
+            resuming: false,
         }
     }
 }
@@ -167,6 +196,9 @@ impl ExternalSession {
 /// Workspace owns the canonical `Vec<ExternalSession>` and pushes a fresh
 /// `Vec<ExternalSessionSummary>` snapshot to the sidebar whenever the set
 /// changes (spawn/close) or a title updates.
+///
+/// `resumable` marks a row restored from a [`ResumeSidecar`]: no live process
+/// backs it, clicking re-spawns the CLI with the resume flag.
 #[derive(Debug, Clone)]
 pub struct ExternalSessionSummary {
     pub id: String,
@@ -176,10 +208,16 @@ pub struct ExternalSessionSummary {
     /// Mirrored OSC title — `display_title()` falls back to the kind label.
     pub title: Option<String>,
     /// cx session id backing `~/.config/cx/sessions/<id>.sock`. Surfaced in the
-    /// sidebar tag (short) + clipboard copy (full).
+    /// sidebar tag (short) + clipboard copy (full). Empty for a resumable row
+    /// (its cx id died with the previous process).
     pub cx_session_id: String,
     /// Absolute socket path, copied to the clipboard as a fallback identity.
     pub socket_path: Option<PathBuf>,
+    /// The row has no live process; clicking it resumes the CLI session.
+    pub resumable: bool,
+    /// A resume is in flight for this row (the CLI is being re-spawned); the
+    /// sidebar renders a loading indicator instead of the idle row.
+    pub resuming: bool,
 }
 
 impl ExternalSessionSummary {
@@ -216,6 +254,147 @@ pub(crate) fn cx_session_id_from_socket(path: &std::path::Path) -> Option<String
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The durable record of an unclosed external agent session. Written at spawn,
+/// deleted only when the session is explicitly closed (sidebar `×` or a
+/// natural CLI exit); a graceful quit or a crash leaves it on disk, so startup
+/// can offer exactly the sessions the user never closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeSidecar {
+    /// The `external:<agent>:<uuid>` session id — the sidebar row identity and
+    /// the sidecar filename base.
+    pub id: String,
+    /// `claude` / `codex` / `copilot` — the `SessionKind` is recovered via
+    /// [`SessionKind::from_agent_id`]; plain PTY sessions never write a sidecar.
+    pub agent_id: String,
+    /// The directory the CLI was launched in; `--continue`-style resume runs
+    /// there so the CLI picks the same project's conversation.
+    pub cwd: String,
+    /// The project folder the session was bound to at spawn (`+` button), if
+    /// any — the sidebar groups the resumable row under the same folder.
+    pub project: Option<PathBuf>,
+    /// Epoch seconds at spawn; the sidebar recency sort key.
+    pub created_at: i64,
+    /// The provider the session was launched under, replayed on resume (no
+    /// picker).
+    pub provider: String,
+    /// The model id the session was launched with, replayed on resume.
+    pub model: String,
+    /// The agent's last mirrored OSC title, if it ever set one.
+    pub title: Option<String>,
+}
+
+impl ResumeSidecar {
+    pub fn summary(&self) -> ExternalSessionSummary {
+        ExternalSessionSummary {
+            id: self.id.clone(),
+            kind: SessionKind::from_agent_id(&self.agent_id)
+                .expect("sidecar agent_id is always an agent kind"),
+            created_at: self.created_at,
+            project: self.project.clone(),
+            title: self.title.clone(),
+            cx_session_id: String::new(),
+            socket_path: None,
+            resumable: true,
+            resuming: false,
+        }
+    }
+}
+
+/// `~/.config/cx/manox/external-sessions` — one `<id>.json` per unclosed
+/// external agent session.
+pub(crate) fn resume_dir() -> PathBuf {
+    agent::paths::manox_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("external-sessions")
+}
+
+/// Persist a session sidecar (atomic write: temp file + rename, so a crash
+/// mid-write never leaves a half-written record the scanner would parse).
+pub(crate) fn write_sidecar(sidecar: &ResumeSidecar) -> Result<()> {
+    write_sidecar_in(&resume_dir(), sidecar)
+}
+
+/// Drop a session's sidecar — the explicit-close path. The session is then no
+/// longer offered for resume.
+pub(crate) fn remove_sidecar(id: &str) {
+    remove_sidecar_in(&resume_dir(), id);
+}
+
+/// Every unclosed session's sidecar, newest first. Unparsable files are
+/// skipped (a corrupt sidecar must not block the whole list).
+pub(crate) fn list_sidecars() -> Vec<ResumeSidecar> {
+    list_sidecars_in(&resume_dir())
+}
+
+/// [`write_sidecar`] against an explicit directory — the test seam so sidecar
+/// roundtrips run against a tempdir instead of the real config root.
+pub(crate) fn write_sidecar_in(dir: &Path, sidecar: &ResumeSidecar) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{}.json", sidecar.id));
+    let tmp = dir.join(format!("{}.json.tmp", sidecar.id));
+    let content = serde_json::to_vec_pretty(sidecar)?;
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// [`remove_sidecar`] against an explicit directory.
+pub(crate) fn remove_sidecar_in(dir: &Path, id: &str) {
+    let _ = fs::remove_file(dir.join(format!("{id}.json")));
+}
+
+/// [`list_sidecars`] against an explicit directory.
+pub(crate) fn list_sidecars_in(dir: &Path) -> Vec<ResumeSidecar> {
+    let entries = match fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<ResumeSidecar> = entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .filter_map(|s| serde_json::from_str(&s).ok())
+        // Unknown agent_ids (a manually-edited or future-build sidecar) are
+        // dropped here so `ResumeSidecar::summary`'s kind invariant holds and
+        // startup never panics on a foreign record.
+        .filter(|s: &ResumeSidecar| SessionKind::from_agent_id(&s.agent_id).is_some())
+        .collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+    out
+}
+
+/// CLI resume flags per agent, appended after the agent's configured args via
+/// `cx::AgentBuilder::passthrough`. All three resume the most recent
+/// conversation the CLI recorded for the launch cwd (claude / copilot) or the
+/// most recent recorded session (codex), which after an app exit is exactly the
+/// unclosed one.
+pub(crate) fn resume_args(agent_id: &str) -> Vec<String> {
+    match agent_id {
+        "claude" | "copilot" => vec!["--continue".into()],
+        "codex" => vec!["resume".into(), "--last".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Merge the live session summaries and the resumable sidecars into the single
+/// list the sidebar renders. A sidecar whose id now runs live (resumed this
+/// launch) is dropped so the row never appears twice. Live rows come first,
+/// then resumable ones, each group newest-first as produced by their sources.
+pub(crate) fn merge_external_summaries(
+    live: Vec<ExternalSessionSummary>,
+    resumable: Vec<ResumeSidecar>,
+) -> Vec<ExternalSessionSummary> {
+    let live_ids: std::collections::HashSet<String> = live.iter().map(|s| s.id.clone()).collect();
+    let mut out = live;
+    out.extend(
+        resumable
+            .into_iter()
+            .filter(|r| !live_ids.contains(&r.id))
+            .map(|r| r.summary()),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +408,8 @@ mod tests {
             title: None,
             cx_session_id: "deadbeef".into(),
             socket_path: Some(PathBuf::from("/h/u/.config/cx/sessions/deadbeef.sock")),
+            resumable: false,
+            resuming: false,
         }
     }
 
@@ -278,5 +459,150 @@ mod tests {
             None
         );
         assert_eq!(cx_session_id_from_socket(std::path::Path::new("")), None);
+    }
+
+    fn sample_sidecar() -> ResumeSidecar {
+        ResumeSidecar {
+            id: "external:claude:abc".into(),
+            agent_id: "claude".into(),
+            cwd: "/repo".into(),
+            project: Some(PathBuf::from("/repo")),
+            created_at: 42,
+            provider: "DeepSeek".into(),
+            model: "deepseek-v4-flash[1m]".into(),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn sidecar_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = sample_sidecar();
+        write_sidecar_in(dir.path(), &sidecar).expect("write");
+        let listed = list_sidecars_in(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, sidecar.id);
+        assert_eq!(listed[0].agent_id, "claude");
+        assert_eq!(listed[0].cwd, "/repo");
+        assert_eq!(listed[0].provider, "DeepSeek");
+        assert_eq!(listed[0].model, "deepseek-v4-flash[1m]");
+        remove_sidecar_in(dir.path(), &sidecar.id);
+        assert!(
+            list_sidecars_in(dir.path()).is_empty(),
+            "removed sidecar is gone"
+        );
+    }
+
+    #[test]
+    fn list_sidecars_skips_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sidecar_in(dir.path(), &sample_sidecar()).expect("write");
+        std::fs::write(dir.path().join("external:codex:garbage.json"), "not json").unwrap();
+        std::fs::write(dir.path().join("not-a-sidecar.txt"), "ignored").unwrap();
+        let listed = list_sidecars_in(dir.path());
+        assert_eq!(listed.len(), 1, "corrupt + non-json files are skipped");
+        assert_eq!(listed[0].id, "external:claude:abc");
+    }
+
+    /// A valid-JSON sidecar with an unknown agent_id (a manually-edited or
+    /// future-build record) must be dropped at list time — `ResumeSidecar::summary`
+    /// would otherwise panic on it at startup.
+    #[test]
+    fn list_sidecars_skips_unknown_agent_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sidecar_in(dir.path(), &sample_sidecar()).expect("write");
+        let mut alien = sample_sidecar();
+        alien.id = "external:gemini:xyz".into();
+        alien.agent_id = "gemini".into();
+        write_sidecar_in(dir.path(), &alien).expect("write");
+        let listed = list_sidecars_in(dir.path());
+        assert_eq!(
+            listed.len(),
+            1,
+            "unknown agent_id is dropped without panicking"
+        );
+        assert_eq!(listed[0].agent_id, "claude");
+    }
+
+    #[test]
+    fn list_sidecars_orders_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = sample_sidecar();
+        old.created_at = 1;
+        let mut new = sample_sidecar();
+        new.id = "external:codex:xyz".into();
+        new.agent_id = "codex".into();
+        new.created_at = 2;
+        write_sidecar_in(dir.path(), &old).expect("write");
+        write_sidecar_in(dir.path(), &new).expect("write");
+        let ids: Vec<_> = list_sidecars_in(dir.path())
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["external:codex:xyz", "external:claude:abc"]);
+    }
+
+    #[test]
+    fn sidecar_summary_is_resumable_and_preserves_identity() {
+        let s = sample_sidecar().summary();
+        assert!(s.resumable);
+        assert_eq!(s.id, "external:claude:abc");
+        assert_eq!(s.kind, SessionKind::ClaudeCode);
+        assert_eq!(s.created_at, 42);
+        assert_eq!(s.project.as_deref(), Some(std::path::Path::new("/repo")));
+        assert!(
+            s.cx_session_id.is_empty(),
+            "no live cx id on a resumable row"
+        );
+    }
+
+    #[test]
+    fn from_agent_id_rejects_plain_terminal() {
+        assert_eq!(
+            SessionKind::from_agent_id("claude"),
+            Some(SessionKind::ClaudeCode)
+        );
+        assert_eq!(
+            SessionKind::from_agent_id("codex"),
+            Some(SessionKind::Codex)
+        );
+        assert_eq!(
+            SessionKind::from_agent_id("copilot"),
+            Some(SessionKind::GithubCopilot)
+        );
+        assert_eq!(SessionKind::from_agent_id("terminal"), None);
+        assert_eq!(SessionKind::from_agent_id("other"), None);
+    }
+
+    #[test]
+    fn resume_args_map_per_agent() {
+        assert_eq!(resume_args("claude"), vec!["--continue"]);
+        assert_eq!(resume_args("copilot"), vec!["--continue"]);
+        assert_eq!(resume_args("codex"), vec!["resume", "--last"]);
+        assert!(resume_args("unknown").is_empty());
+    }
+
+    #[test]
+    fn merge_drops_sidecars_now_live() {
+        let mut live = sample_summary();
+        live.id = "external:claude:abc".into();
+        let mut other_live = sample_summary();
+        other_live.id = "external:codex:live".into();
+        other_live.kind = SessionKind::Codex;
+        let resumable = vec![
+            sample_sidecar(), // now live → dropped
+            {
+                let mut s = sample_sidecar();
+                s.id = "external:copilot:dead".into();
+                s.agent_id = "copilot".into();
+                s
+            },
+        ];
+        let merged = merge_external_summaries(vec![live, other_live], resumable);
+        assert_eq!(merged.len(), 3);
+        let resumable_rows: Vec<_> = merged.iter().filter(|s| s.resumable).collect();
+        assert_eq!(resumable_rows.len(), 1);
+        assert_eq!(resumable_rows[0].id, "external:copilot:dead");
+        assert_eq!(resumable_rows[0].kind, SessionKind::GithubCopilot);
     }
 }
