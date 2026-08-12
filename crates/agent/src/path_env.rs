@@ -62,9 +62,11 @@ pub fn install() {
             // moment (before any engine/runtime work is spawned by manox),
             // and the only readers of `PATH` afterwards are subprocess
             // spawn sites, which is the exact contract this install exists
-            // to serve. The practical race window is a few milliseconds at
-            // startup; accepting it is the trade for a single injection
-            // point instead of patching every spawn site in the workspace.
+            // to serve. The race window can reach [`RESOLVE_TIMEOUT`] when
+            // the login-shell probe is slow, but a concurrent `getenv` only
+            // observes the old PATH in the interim — never a torn value —
+            // so accepting it is the trade for a single injection point
+            // instead of patching every spawn site in the workspace.
             unsafe { std::env::set_var("PATH", path) };
             tracing::debug!(len = path.len(), "login shell PATH installed");
         })
