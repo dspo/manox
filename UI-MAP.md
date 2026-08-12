@@ -20,7 +20,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 会话持久化与重启恢复 | ✅ | pi jsonl + `session_meta` sidecar |
 | 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ | 共享渲染管线 |
 | 审批门控（ToolCallAuthorization / AskUserQuestion / AutoPilot reviewer） | ✅ | 宿主 `ApprovalGatedTool` wrapper；AccessChip 切 AutoPilot/Danger |
-| Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)；`/danger` `/plan` `/goal` 与 markdown/skill 适配器随 manox 移除 |
+| Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)、`/plan`、`/goal`；markdown/skill 适配器经共享 registry；`/danger` 随 manox 移除 |
 | 模型选择器 | ✅ | pi `ProviderRegistry`，按 provider 显示名分组 |
 | 项目（composer chip / 侧栏文件夹 / 绑定新会话） | ✅ | 共享 threads.db `projects` 表 |
 | Sidebar / 会话列表 / 新建切换归档 / LLM 标题 | ✅ | pi `SessionRepository` + sidecar；标题双模式语义移植自 manox |
@@ -36,7 +36,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | skill / subagent @mentions | ⏳ | pi 路径无注册表接线 |
 | Sub-agent 观察面板 / Agents 树 | ⏳ | pi-extensions SubagentTool 已装配，观察 UI 随 manox 移除 |
 | Plan 模式 / PlanReview / PlanPreview | ⏳ | manox 流程，随 harness 移除；rail 的 plan 节（`UpdatePlan`）保留 |
-| Goal | ⏳ | manox 目标体系，随 harness 移除 |
+| Goal | ✅ 部分 | facade+GoalBridge 共享快照、GetGoal/CreateGoal/UpdateGoal 工具、`/goal` 命令、composer chip+状态 popover；per-turn 记账/自动续跑/BudgetLimited 强制为后续项 |
 | Team | ✅ 部分 | 后端完整（Team/Member/TaskList 运行时 + 8 工具 + 同伴消息路由 + 授权气泡）；roster/MemberPanel UI 为后续项 |
 
 分层纪律：crates/pi 只做 TS Pi 对齐与扩展点；harness 能力扩展一律走

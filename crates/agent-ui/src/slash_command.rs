@@ -16,8 +16,8 @@
 //! [`ExitCommand`]), and `/new` (aliases `/clear`, `/archive`; archive the
 //! current thread and start a fresh one that keeps the project, approval
 //! mode, and model, see [`NewCommand`]). The retired manox harness
-//! additionally had `/danger`, `/plan`, `/goal` (see git history /
-//! `origin/Manox` backup branch); markdown prompt-macros and skills are
+//! additionally had `/danger` (see git history / `origin/Manox` backup
+//! branch); markdown prompt-macros and skills are
 //! mirrored into the registry at startup from the shared `agent::command` /
 //! `agent::skill` registries ([`MarkdownSlashCommand`] /
 //! [`SkillSlashCommand`]).
@@ -130,6 +130,7 @@ pub fn init(_cx: &mut App) {
         Box::new(CompactCommand),
         Box::new(ExitCommand),
         Box::new(NewCommand),
+        Box::new(GoalCommand),
     ];
     // Names already claimed by built-ins and (below) markdown macros, so a
     // skill sharing one is skipped — keeps one popover row per name and routes
@@ -139,6 +140,7 @@ pub fn init(_cx: &mut App) {
         "compact".to_string(),
         "exit".to_string(),
         "new".to_string(),
+        "goal".to_string(),
     ]);
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -385,6 +387,158 @@ impl SlashCommand for CompactCommand {
 /// `/exit` (alias `/quit`) — archive the current thread and start a fresh
 /// one.
 struct ExitCommand;
+
+/// `/goal` manages the durable Goal lifecycle (ported from the retired
+/// manox harness). Replacing an unfinished Goal requires the explicit
+/// `/goal replace <objective>` confirmation command; a bare `/goal` opens
+/// the status popover (existing goal) or prefills a new one.
+struct GoalCommand;
+
+impl SlashCommand for GoalCommand {
+    fn name(&self) -> &str {
+        "goal"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-goal-desc")
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        let thread = workspace.thread.clone();
+        let trimmed = args.trim();
+        if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                if let Err(error) =
+                    t.replace_goal(objective.to_string(), None, agent::db::GoalActor::User, cx)
+                {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                let budget = t.goal().and_then(|goal| goal.token_budget);
+                if let Err(error) = t.edit_goal(
+                    objective.to_string(),
+                    budget,
+                    agent::db::GoalActor::User,
+                    cx,
+                ) {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                let Some(goal) = t.goal() else {
+                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                        "thread has no Goal"
+                    )));
+                    return;
+                };
+                let budget = if matches!(value, "none" | "unlimited") {
+                    None
+                } else {
+                    match value.parse::<u64>() {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            return;
+                        }
+                    }
+                };
+                if let Err(error) =
+                    t.edit_goal(goal.objective, budget, agent::db::GoalActor::User, cx)
+                {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        match trimmed.to_lowercase().as_str() {
+            "" => {
+                if thread.read(cx).goal().is_some() {
+                    workspace.open_goal_popover(cx);
+                } else {
+                    workspace.begin_goal_new(window, cx);
+                }
+                SlashResult::Handled
+            }
+            "clear" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
+                cx.notify();
+                SlashResult::Handled
+            }
+            "pause" | "stop" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.set_goal_status(
+                        agent::goal::GoalStatus::Paused,
+                        Some("paused by user".into()),
+                        agent::db::GoalActor::User,
+                        cx,
+                    ) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
+                SlashResult::Handled
+            }
+            "resume" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.set_goal_status(
+                        agent::goal::GoalStatus::Active,
+                        None,
+                        agent::db::GoalActor::User,
+                        cx,
+                    ) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
+                SlashResult::Handled
+            }
+            "edit" => {
+                workspace.begin_goal_edit(window, cx);
+                SlashResult::Handled
+            }
+            "replace" => {
+                workspace.begin_goal_replace(window, cx);
+                SlashResult::Handled
+            }
+            _ => {
+                let needs_confirmation = thread
+                    .read(cx)
+                    .goal()
+                    .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
+                if needs_confirmation {
+                    workspace.begin_goal_replace_with_objective(trimmed, window, cx);
+                    return SlashResult::Handled;
+                }
+                let created =
+                    thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string(), cx) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            cx.emit(agent::ThreadEvent::Error(error));
+                            false
+                        }
+                    });
+                if !created {
+                    return SlashResult::Handled;
+                }
+                cx.notify();
+                SlashResult::InjectUserTurn(trimmed.to_string())
+            }
+        }
+    }
+}
 
 impl SlashCommand for ExitCommand {
     fn name(&self) -> &str {

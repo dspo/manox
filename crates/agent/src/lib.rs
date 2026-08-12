@@ -13,6 +13,7 @@ pub mod compact;
 pub mod db;
 pub mod frontmatter;
 pub mod goal;
+pub mod goal_tools;
 pub mod i18n;
 pub mod image;
 pub mod language;
