@@ -370,7 +370,7 @@ impl AgentTool for ProposePlanTool {
         Ok(AgentToolResult {
             content: vec![pi::types::ContentBlock::Text {
                 text: format!(
-                    "Plan submitted for review: {title} ({plan_file}). Wait for the user's                      verdict; do not implement before approval."
+                    "Plan submitted for review: {title} ({plan_file}). The turn ends here; wait for the user's verdict and do not implement before approval."
                 ),
                 signature: None,
             }],
@@ -381,7 +381,10 @@ impl AgentTool for ProposePlanTool {
             is_error: false,
             usage: None,
             added_tool_names: None,
-            terminate: false,
+            // End the turn at the proposal so the review card is the
+            // conversation's last item (parity with oh-my-pi): without this
+            // the model appends a trailing summary after the card.
+            terminate: true,
         })
     }
 }
