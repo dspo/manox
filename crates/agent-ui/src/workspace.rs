@@ -3606,12 +3606,22 @@ impl Workspace {
         self.subagent_panels.clear();
         self.subagent_transcripts.clear();
         let before = self.right_tabs.len();
+        // Bulk removal shifts surviving tabs left by the number of dropped
+        // tabs that sat before the active index; a plain OOB clamp would land
+        // on the wrong tab when several sub-agent tabs precede it.
+        let removed_before_active = self
+            .right_tabs
+            .iter()
+            .take(self.active_right_tab.min(before))
+            .filter(|t| matches!(t, RightTab::Subagent(_)))
+            .count();
         self.right_tabs
             .retain(|t| !matches!(t, RightTab::Subagent(_)));
         if self.right_tabs.len() != before {
-            if self.active_right_tab >= self.right_tabs.len() {
-                self.active_right_tab = self.right_tabs.len().saturating_sub(1);
-            }
+            self.active_right_tab = self
+                .active_right_tab
+                .saturating_sub(removed_before_active)
+                .min(self.right_tabs.len().saturating_sub(1));
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
