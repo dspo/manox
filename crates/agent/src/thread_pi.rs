@@ -904,13 +904,7 @@ impl Thread {
             })
             .map(|t| {
                 let flat: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                let mut chars = flat.chars();
-                let head: String = chars.by_ref().take(60).collect();
-                if chars.next().is_some() {
-                    format!("{head}…")
-                } else {
-                    head
-                }
+                crate::title::initial_title(&flat).unwrap_or_default()
             })
             .unwrap_or_else(|| "Manox Pi".to_string())
     }
@@ -1028,6 +1022,10 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.create_goal(objective, token_budget, actor)?;
+        self.ensure_engine(self.project.clone(), cx);
+        if let Some(engine) = &self.engine {
+            engine.goal_started();
+        }
         cx.emit(ThreadEvent::GoalChanged { active: true });
         Ok(())
     }
@@ -1065,6 +1063,10 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.replace_goal(objective, token_budget, actor)?;
+        self.ensure_engine(self.project.clone(), cx);
+        if let Some(engine) = &self.engine {
+            engine.goal_started();
+        }
         cx.emit(ThreadEvent::GoalChanged { active: true });
         Ok(())
     }
@@ -1261,10 +1263,15 @@ impl Thread {
     /// thread.
     pub fn seed_plan_execution(
         &mut self,
+        plan_file: String,
         seed_text: String,
         ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_engine(self.project.clone(), cx);
+        if let Some(engine) = &self.engine {
+            engine.start_plan_execution(plan_file);
+        }
         self.insert_user_message_with_ui_metadata(seed_text, ui, cx);
         self.run_turn(cx);
     }

@@ -269,23 +269,22 @@ pub struct LanguageModelRequest {
     pub tool_choice: Option<LanguageModelToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Advisory hint that non-interactive generation paths (title, compact,
-    /// goal, approval) would prefer the model not spend a thinking budget
+    /// Advisory hint that non-interactive generation paths (title, goal,
+    /// approval) would prefer the model not spend a thinking budget
     /// before its text reply. NOT translated to any provider's wire format
     /// here: there is no universal value. Anthropic's `thinking:{type:
     /// "disabled"}` 400s on adaptive-only models (Opus 4.7+ / Sonnet 5) which
     /// only accept `{type:"adaptive",effort}`, while that `adaptive` shape 400s
     /// on classic thinking models (3.7 / 4.0 / 4.6). Translating it correctly
     /// needs a per-model capability signal, which the provider layer does not
-    /// expose yet; until then the field is advisory-only and title-generation
-    /// failures are surfaced via `tracing::warn!` in `title_state`.
+    /// expose yet; until then this field remains advisory-only.
     #[serde(default)]
     pub thinking_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<RequestReasoningEffort>,
     /// Per-request output token cap. `None` means use the model's configured
     /// default. When set, the provider takes `min(request, model_max)`. Side
-    /// calls (title, goal, approval, compaction) use this to bound their
+    /// calls (title, goal, approval) use this to bound their
     /// responses; the main turn loop leaves it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
