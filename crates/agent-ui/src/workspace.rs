@@ -3905,7 +3905,7 @@ impl Workspace {
                 }
                 t.set_reasoning_effort(effort, cx);
                 t.set_approval_mode(approval, cx);
-                t.seed_plan_execution(seed_text, Some(ui), cx);
+                t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui), cx);
             });
             self.attach_thread(new, window, cx);
             save_thread(self.thread.clone(), true, cx);

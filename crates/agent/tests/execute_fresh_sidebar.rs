@@ -152,7 +152,12 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     });
     let new_id = cx.read(|cx| thread.read(cx).id.0.clone());
     thread.update(&mut cx, |t, cx| {
-        t.seed_plan_execution("Reply with just OK.".to_string(), None, cx);
+        t.seed_plan_execution(
+            "/tmp/test-plan.md".to_string(),
+            "Reply with just OK.".to_string(),
+            None,
+            cx,
+        );
     });
 
     // Wait for the seeded turn to settle (the actor streams through the fake

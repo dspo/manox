@@ -1,415 +1,722 @@
-//! LLM-based thread title generation for the pi harness.
+//! Host-private Title agent and its evidence shaping.
 //!
-//! Port of the retired manox harness's title lifecycle (two modes: first
-//! title + topic-shift re-eval), adapted to the pi kernel's wire messages
-//! and the runtime-resolver side-call seam (same pattern as the approval
-//! reviewer in `pi_approval`). Pure request-construction/sanitization logic
-//! lives here; the cadence state machine rides the pi actor (`pi_engine`).
-//!
-//! Layering (issue #483 adjudication): TS Pi has no native LLM title
-//! generation (verified against the upstream repo), so this is capability-
-//! layering class ③ (absent from TS, manox original) — host layer is the
-//! correct home, not the pi kernel parity surface.
+//! Title generation is a manox capability, not a Pi parity surface. Each run
+//! creates an ephemeral `pi::Agent` with exactly one terminating `Title` tool.
 
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use pi::agent::Agent;
 use pi::coding_agent::ModelRuntime;
-use pi::types::{AgentMessage, ContentBlock, Model as PiModel, StreamOptions};
-use tokio::sync::mpsc;
+use pi::tool::{AgentTool, AgentToolResult, LocalToolContext, ToolContext, ToolError, ToolState};
+use pi::types::{AgentMessage, ContentBlock, Model as PiModel, StopReason, StreamOptions};
+use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
-use crate::language::Language;
-use crate::prompt::{self, PromptTemplate};
+use crate::goal::{GoalStatus, ThreadGoal};
 
-/// Upper bound on raw streamed chars accumulated before stopping. Titles are
-/// short; this caps consumption so a chatty model cannot run on.
-pub const MAX_RAW_CHARS: usize = 120;
-
-/// Per-message char cap sent to the model. Keeps the title request tiny and
-/// cheap regardless of total conversation length.
+pub const TITLE_MAX_CHARS: usize = 40;
 pub const MESSAGE_SAMPLE_CHARS: usize = 800;
+pub const PLAN_SAMPLE_CHARS: usize = 16_000;
+const TITLE_TIMEOUT: Duration = Duration::from_secs(20);
+const OMITTED: &str = "\n\n[... omitted for safety ...]\n\n";
+const SYSTEM_PROMPT: &str = include_str!("title_agent_prompt.md");
 
-/// Sentinel the model emits when the latest message does NOT signal a new
-/// topic. Compared case-insensitively after stripping trailing punctuation.
-pub const UNCHANGED_SENTINEL: &str = "UNCHANGED";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleWakeReason {
+    FirstResponse,
+    ThirdResponse,
+    Stop,
+    ToolTerminate,
+    PlanStarted,
+    GoalStarted,
+}
 
-/// Whether a turn at `user_count` total user messages should re-evaluate the
-/// title. The first 3 user turns check every turn; thereafter every 5th
-/// (turns 8, 13, 18, …). The first-title path (`title` still `None`) bypasses
-/// this cadence and evaluates as soon as a reply exists.
-pub fn should_retitle(user_count: usize) -> bool {
-    if user_count <= 3 {
-        return true;
+#[derive(Debug, Default)]
+pub struct TitleWakeState {
+    provider_responses: usize,
+    suppress_run_stop: bool,
+    milestone_this_turn: bool,
+}
+
+impl TitleWakeState {
+    pub fn restore(provider_responses: usize, suppress_run_stop: bool) -> Self {
+        Self {
+            provider_responses,
+            suppress_run_stop,
+            milestone_this_turn: false,
+        }
     }
-    (user_count - 3).is_multiple_of(5)
+
+    pub fn persisted(&self) -> (usize, bool) {
+        (self.provider_responses, self.suppress_run_stop)
+    }
+
+    pub fn turn_start(&mut self) {
+        self.milestone_this_turn = false;
+    }
+
+    pub fn assistant_response(&mut self, stop_reason: Option<StopReason>) -> Vec<TitleWakeReason> {
+        if matches!(stop_reason, Some(StopReason::Error | StopReason::Aborted)) {
+            return Vec::new();
+        }
+        self.provider_responses += 1;
+        let milestone = match self.provider_responses {
+            1 => Some(TitleWakeReason::FirstResponse),
+            3 => Some(TitleWakeReason::ThirdResponse),
+            _ => None,
+        };
+        self.milestone_this_turn = milestone.is_some();
+        let stopped = stop_reason == Some(StopReason::Stop);
+        let suppress = stopped && self.suppress_run_stop;
+        if stopped {
+            self.suppress_run_stop = false;
+        }
+        milestone
+            .or_else(|| (stopped && !suppress).then_some(TitleWakeReason::Stop))
+            .into_iter()
+            .collect()
+    }
+
+    pub fn tool_terminated(&self) -> Option<TitleWakeReason> {
+        (!self.milestone_this_turn).then_some(TitleWakeReason::ToolTerminate)
+    }
+
+    pub fn start_execution(&mut self) {
+        self.suppress_run_stop = true;
+    }
 }
 
-/// Whether an already-sanitized title string is the "no change" sentinel.
-/// Accepts trailing punctuation (`UNCHANGED.` / `UNCHANGED。`) for robustness.
-pub fn is_unchanged(sanitized: &str) -> bool {
-    let trimmed = sanitized.trim_end_matches([
-        '.', '。', '!', '！', '?', '？', ',', '，', ';', '；', ':', '：',
-    ]);
-    trimmed.eq_ignore_ascii_case(UNCHANGED_SENTINEL)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleSource {
+    Goal(String),
+    Plan(String),
+    Conversation(Vec<TitleTurn>),
 }
 
-/// Trim, strip wrapping quotes and a leading `Title:`/`标题：` prefix, collapse
-/// internal whitespace to one line, and cap at the summary length.
-pub fn sanitize_title(raw: &str) -> String {
-    let mut s = raw.trim().to_string();
-    strip_wrapping_quotes(&mut s);
-    strip_title_prefix(&mut s);
-    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&collapsed, 60)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleTurn {
+    pub role: TitleRole,
+    pub text: String,
 }
 
-/// Build the title side-call conversation from the pi transcript. Two modes,
-/// mirroring the manox requests:
-/// - first title (`current_title` is `None`): first user message + latest
-///   assistant reply + the first-title instruction;
-/// - topic-shift re-eval: latest user message + latest assistant reply + the
-///   topic-shift instruction naming the current title.
-///
-/// `None` when the transcript lacks the assistant reply the request is
-/// built around (the caller gates on it anyway).
-pub fn build_title_messages(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone)]
+pub struct TitleRequest {
+    pub source: TitleSource,
+    pub current_title: Option<String>,
+    pub reason: TitleWakeReason,
+}
+
+pub fn initial_title(text: &str) -> Option<String> {
+    let collapsed = collapse_whitespace(text);
+    (!collapsed.is_empty()).then(|| truncate_with_ellipsis(&collapsed, TITLE_MAX_CHARS))
+}
+
+pub fn valid_title(raw: &str) -> Option<String> {
+    let title = raw.trim();
+    if title.is_empty()
+        || title.chars().count() > TITLE_MAX_CHARS
+        || title.contains(['\n', '\r'])
+        || title.starts_with('#')
+        || title.contains("**")
+        || title.starts_with('`')
+        || title.ends_with('`')
+    {
+        return None;
+    }
+    Some(title.to_string())
+}
+
+pub fn select_source(
+    goal: Option<&ThreadGoal>,
+    plan_file: Option<&str>,
     messages: &[AgentMessage],
-    current_title: Option<&str>,
-    lang: Language,
-) -> Option<Vec<AgentMessage>> {
-    let assistant = last_assistant_text(messages)?;
-    let mut out = Vec::with_capacity(3);
-    match current_title {
-        None => {
-            if let Some(text) = first_user_text(messages) {
-                out.push(user_message(truncate_chars(&text, MESSAGE_SAMPLE_CHARS)));
-            }
-            out.push(assistant_message(truncate_chars(
-                &assistant,
-                MESSAGE_SAMPLE_CHARS,
-            )));
-            out.push(user_message(
-                prompt::render_static(PromptTemplate::TitleFirstInstruction, lang)
-                    .expect("title first instruction render"),
-            ));
-        }
-        Some(title) => {
-            if let Some(text) = last_user_text(messages) {
-                out.push(user_message(truncate_chars(&text, MESSAGE_SAMPLE_CHARS)));
-            }
-            out.push(assistant_message(truncate_chars(
-                &assistant,
-                MESSAGE_SAMPLE_CHARS,
-            )));
-            out.push(user_message(
-                prompt::render(
-                    PromptTemplate::TitleTopicShiftInstruction,
-                    lang,
-                    &prompt::TopicShiftData {
-                        current_title: title.to_string(),
-                        unchanged_sentinel: UNCHANGED_SENTINEL,
-                    },
-                )
-                .expect("topic shift instruction render"),
-            ));
-        }
+) -> TitleSource {
+    if let Some(goal) = goal.filter(|goal| goal.status != GoalStatus::Complete) {
+        return TitleSource::Goal(goal.objective.clone());
     }
-    Some(out)
+    if let Some(plan) = plan_file
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .filter(|plan| !plan.trim().is_empty())
+    {
+        return TitleSource::Plan(truncate_head_tail(&plan, PLAN_SAMPLE_CHARS));
+    }
+    TitleSource::Conversation(sample_conversation(messages))
 }
 
-/// Stream a title through the session model's `StreamFn`: resolve via the
-/// runtime, run the side call (temperature 0.3, no tools, no thinking, the
-/// side-call output cap), then reduce the reply to its first line and
-/// sanitize. Returns an empty string when the model produced no usable text;
-/// the caller checks [`is_unchanged`] before adopting.
-pub async fn stream_title(
+pub fn sample_conversation(messages: &[AgentMessage]) -> Vec<TitleTurn> {
+    let turns: Vec<TitleTurn> = messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User { .. } => message_text(message).map(|text| TitleTurn {
+                role: TitleRole::User,
+                text: truncate_with_ellipsis(&collapse_whitespace(&text), MESSAGE_SAMPLE_CHARS),
+            }),
+            AgentMessage::Assistant {
+                stop_reason,
+                error_message,
+                ..
+            } if !matches!(stop_reason, Some(StopReason::Error | StopReason::Aborted))
+                && error_message.is_none() =>
+            {
+                message_text(message).map(|text| TitleTurn {
+                    role: TitleRole::Assistant,
+                    text: truncate_with_ellipsis(&collapse_whitespace(&text), MESSAGE_SAMPLE_CHARS),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if turns.len() <= 6 {
+        return turns;
+    }
+    turns[..3]
+        .iter()
+        .chain(turns[turns.len() - 3..].iter())
+        .cloned()
+        .collect()
+}
+
+pub fn request_prompt(request: &TitleRequest) -> String {
+    let current = request.current_title.as_deref().unwrap_or("(none)");
+    let evidence = match &request.source {
+        TitleSource::Goal(objective) => format!("SOURCE: ACTIVE GOAL\n{objective}"),
+        TitleSource::Plan(markdown) => format!("SOURCE: REVIEWED PLAN\n{markdown}"),
+        TitleSource::Conversation(turns) => {
+            let transcript = turns
+                .iter()
+                .map(|turn| {
+                    let role = match turn.role {
+                        TitleRole::User => "USER",
+                        TitleRole::Assistant => "ASSISTANT",
+                    };
+                    format!("{role}: {}", turn.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            format!("SOURCE: CONVERSATION SAMPLE\n{transcript}")
+        }
+    };
+    format!(
+        "Wake reason: {:?}\nCurrent display title (metadata only; never topic evidence): {current}\n\n<untrusted-evidence>\n{evidence}\n</untrusted-evidence>",
+        request.reason
+    )
+}
+
+pub async fn run_title_agent(
     runtime: &ModelRuntime,
-    model: &PiModel,
-    convo: Vec<AgentMessage>,
-) -> anyhow::Result<String> {
-    // The `side_calls.title.model` override wins when it resolves; an empty
-    // or unresolvable reference inherits the session model.
-    let effective_model =
-        crate::pi_providers::resolve_side_call_model(&crate::settings::side_calls().title_policy())
-            .unwrap_or_else(|| model.clone());
-    let stream_fn = (runtime.resolver())(&effective_model)?;
-    let context = pi::types::AgentContext {
-        system_prompt: String::new(),
-        messages: convo,
-        tools: std::sync::Arc::new([]),
-        model: effective_model,
-        thinking_level: None,
-        cache_retention: pi::types::CacheRetention::default(),
-        session_id: None,
-        stream_options: StreamOptions {
-            temperature: Some(0.3),
-            max_tokens: crate::settings::side_call_output_cap(
-                crate::settings::side_calls().title_policy(),
-            )
-            .map(|cap| cap as usize),
-            ..Default::default()
-        },
-        metadata: std::collections::HashMap::new(),
+    session_model: &PiModel,
+    cwd: &Path,
+    request: &TitleRequest,
+) -> anyhow::Result<Option<String>> {
+    let policy = crate::settings::side_calls().title_policy();
+    let model = crate::pi_providers::resolve_side_call_model(&policy)
+        .unwrap_or_else(|| session_model.clone());
+    let stream = (runtime.resolver())(&model)?;
+    let result = Arc::new(Mutex::new(None));
+    let calls = Arc::new(Mutex::new(0usize));
+    let tools = title_tools(Arc::clone(&result), Arc::clone(&calls));
+    let env: Arc<dyn pi::env::ExecutionEnv> =
+        Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf()));
+    let context: Arc<dyn ToolContext> = Arc::new(LocalToolContext::new(
+        env,
+        cwd.to_path_buf(),
+        Arc::new(ToolState::new()),
+    ));
+    let mut agent = Agent::new(SYSTEM_PROMPT, model, stream, context).with_tools(tools);
+    agent.set_stream_resolver(runtime.resolver());
+    agent.set_thinking_level(
+        crate::settings::side_call_effort(
+            &policy,
+            crate::language_model::RequestReasoningEffort::Low,
+        )
+        .map(|effort| effort.wire_value().to_string()),
+    );
+    agent.set_stream_options(StreamOptions {
+        temperature: Some(0.2),
+        max_tokens: crate::settings::side_call_output_cap(policy).map(|n| n as usize),
+        timeout: Some(TITLE_TIMEOUT),
+        ..Default::default()
+    });
+
+    tokio::time::timeout(TITLE_TIMEOUT, async {
+        agent.prompt(&request_prompt(request)).await?;
+        if result.lock().unwrap().is_none() {
+            agent
+                .prompt(
+                    "Repair the previous response. Call Title exactly once with a valid title; do not answer with prose.",
+                )
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Title agent timed out"))??;
+    let title = result.lock().unwrap().clone();
+    Ok(title)
+}
+
+struct TitleTool {
+    result: Arc<Mutex<Option<String>>>,
+    calls: Arc<Mutex<usize>>,
+}
+
+fn title_tools(
+    result: Arc<Mutex<Option<String>>>,
+    calls: Arc<Mutex<usize>>,
+) -> Arc<[Arc<dyn AgentTool>]> {
+    Arc::from(vec![
+        Arc::new(TitleTool { result, calls }) as Arc<dyn AgentTool>
+    ])
+}
+
+#[async_trait::async_trait]
+impl AgentTool for TitleTool {
+    fn name(&self) -> &str {
+        "Title"
+    }
+
+    fn description(&self) -> &str {
+        "Submit the final concise thread title and terminate the Title agent."
+    }
+
+    fn parameters_schema(&self) -> JsonValue {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": TITLE_MAX_CHARS,
+                    "description": "A single-line title with no Markdown, at most 40 Unicode characters"
+                }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: JsonValue,
+        _signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls > 2 || self.result.lock().unwrap().is_some() {
+            let mut response = AgentToolResult::error("Title has already been submitted.");
+            response.terminate = true;
+            return Ok(response);
+        }
+        let valid = params
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("title"))
+            .and_then(JsonValue::as_str)
+            .and_then(valid_title);
+        let mut response = match valid {
+            Some(title) => {
+                *self.result.lock().unwrap() = Some(title);
+                AgentToolResult::text("Title accepted.")
+            }
+            None => AgentToolResult::error(
+                "Invalid title. It must be non-empty, single-line, Markdown-free, and at most 40 Unicode characters.",
+            ),
+        };
+        response.terminate = true;
+        Ok(response)
+    }
+}
+
+fn message_text(message: &AgentMessage) -> Option<String> {
+    let content = match message {
+        AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => content,
+        _ => return None,
     };
-    let (tx, mut rx) = mpsc::channel(32);
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let message = stream_fn
-        .stream(&context, CancellationToken::new(), tx)
-        .await?;
-    let _ = drain.await;
-    let AgentMessage::Assistant { content, .. } = message else {
-        return Ok(String::new());
-    };
-    let text: String = content
+    let text = content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    format!("{}…", text.chars().take(keep).collect::<String>())
+}
+
+fn truncate_head_tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let marker = OMITTED.chars().count();
+    let available = max_chars.saturating_sub(marker);
+    let head = available / 2;
+    let tail = available - head;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
         .collect();
-    // Titles are one line: cut at the first newline, cap the raw chars, then
-    // sanitize (manox parity — the stream loop enforced the same bounds).
-    let first_line = text
-        .split(['\n', '\r'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let capped: String = first_line.chars().take(MAX_RAW_CHARS).collect();
-    Ok(sanitize_title(&capped))
-}
-
-// ── transcript sampling (pi wire messages) ──────────────────────────────────
-
-/// Count user messages carrying text — the title cadence's turn counter.
-pub fn count_user_messages(messages: &[AgentMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|m| matches!(m, AgentMessage::User { .. }) && message_text(m).is_some())
-        .count()
-}
-
-fn first_user_text(messages: &[AgentMessage]) -> Option<String> {
-    messages
-        .iter()
-        .filter(|m| matches!(m, AgentMessage::User { .. }))
-        .find_map(message_text)
-}
-
-fn last_user_text(messages: &[AgentMessage]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .filter(|m| matches!(m, AgentMessage::User { .. }))
-        .find_map(message_text)
-}
-
-fn last_assistant_text(messages: &[AgentMessage]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
-        .find_map(message_text)
-}
-
-/// Concatenate all `Text` blocks of a message into one trimmed string.
-fn message_text(m: &AgentMessage) -> Option<String> {
-    let content = match m {
-        AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => content,
-        _ => return None,
-    };
-    let mut buf = String::new();
-    for block in content {
-        if let ContentBlock::Text { text, .. } = block {
-            buf.push_str(text);
-        }
-    }
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn user_message(text: String) -> AgentMessage {
-    AgentMessage::User {
-        content: vec![ContentBlock::Text {
-            text,
-            signature: None,
-        }],
-        timestamp: chrono::Utc::now(),
-    }
-}
-
-fn assistant_message(text: String) -> AgentMessage {
-    AgentMessage::Assistant {
-        content: vec![ContentBlock::Text {
-            text,
-            signature: None,
-        }],
-        model: String::new(),
-        provider: String::new(),
-        api: String::new(),
-        response_model: None,
-        response_id: None,
-        diagnostics: None,
-        stop_reason: None,
-        raw_stop_reason: None,
-        usage: Box::new(pi::types::Usage::default()),
-        error_message: None,
-        timestamp: chrono::Utc::now(),
-    }
-}
-
-// ── sanitization helpers ────────────────────────────────────────────────────
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let one_line = s.replace('\n', " ");
-    if one_line.chars().count() > max_chars {
-        let t: String = one_line.chars().take(max_chars).collect();
-        format!("{t}…")
-    } else {
-        one_line
-    }
-}
-
-/// Repeatedly strip one matched wrapping pair until the ends no longer match.
-fn strip_wrapping_quotes(s: &mut String) {
-    const PAIRS: [(char, char); 5] = [
-        ('"', '"'),
-        ('\'', '\''),
-        ('「', '」'),
-        ('『', '』'),
-        ('《', '》'),
-    ];
-    loop {
-        let count = s.chars().count();
-        if count < 2 {
-            return;
-        }
-        let first = s.chars().next().unwrap();
-        let last = s.chars().last().unwrap();
-        if !PAIRS.iter().any(|(o, c)| first == *o && last == *c) {
-            return;
-        }
-        // Drop the first and last char (char-boundary safe).
-        let inner: String = s.chars().skip(1).take(count - 2).collect();
-        *s = inner.trim().to_string();
-    }
-}
-
-fn strip_title_prefix(s: &mut String) {
-    for prefix in ["Title:", "Title：", "标题：", "标题:"] {
-        if let Some(rest) = s.strip_prefix(prefix) {
-            *s = rest.trim_start().to_string();
-            return;
-        }
-    }
+    format!("{start}{OMITTED}{end}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi::agent_loop::StreamFn;
+    use pi::types::{AgentContext, AgentEvent, Usage};
+    use tokio::sync::mpsc;
 
-    #[test]
-    fn sanitize_strips_wrapping_quotes() {
-        assert_eq!(sanitize_title("\"Fix login bug\""), "Fix login bug");
-        assert_eq!(sanitize_title("'修复登录'"), "修复登录");
-        assert_eq!(sanitize_title("「修复登录」"), "修复登录");
+    fn context() -> LocalToolContext {
+        LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new("/tmp")),
+            "/tmp".into(),
+            Arc::new(ToolState::new()),
+        )
     }
 
-    #[test]
-    fn sanitize_strips_title_prefix() {
-        assert_eq!(sanitize_title("Title: 修复登录 bug"), "修复登录 bug");
-        assert_eq!(sanitize_title("标题：修复登录"), "修复登录");
-        assert_eq!(sanitize_title("Title：hello"), "hello");
-    }
+    struct InspectingTitleProvider;
 
-    #[test]
-    fn sanitize_collapses_newlines_and_caps_length() {
-        assert_eq!(sanitize_title("修复\n登录\n第二行"), "修复 登录 第二行");
-        let long = "x".repeat(80);
-        let out = sanitize_title(&long);
-        assert!(out.chars().count() <= 61);
-        assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn should_retitle_cadence() {
-        // First 3 user turns: every turn.
-        for n in [1, 2, 3] {
-            assert!(should_retitle(n), "turn {n} should re-eval");
+    #[async_trait::async_trait]
+    impl StreamFn for InspectingTitleProvider {
+        async fn stream(
+            &self,
+            context: &AgentContext,
+            _signal: CancellationToken,
+            _events: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            assert_eq!(context.tools.len(), 1);
+            assert_eq!(context.tools[0].name(), "Title");
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "title-1".into(),
+                    name: "Title".into(),
+                    input: serde_json::json!({"title": "专用 Title Agent"}),
+                    thought_signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::ToolUse),
+                raw_stop_reason: None,
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
         }
-        // Turns 4-7: skip.
-        for n in [4, 5, 6, 7] {
-            assert!(!should_retitle(n), "turn {n} should skip");
+    }
+
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            timestamp: chrono::Utc::now(),
         }
-        // Every 5th thereafter: 8, 13, 18.
-        for n in [8, 13, 18] {
-            assert!(should_retitle(n), "turn {n} should re-eval");
+    }
+
+    fn assistant(text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            model: String::new(),
+            provider: String::new(),
+            api: String::new(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            raw_stop_reason: None,
+            usage: Box::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
         }
     }
 
-    #[test]
-    fn unchanged_sentinel_detection() {
-        assert!(is_unchanged("UNCHANGED"));
-        assert!(is_unchanged("unchanged"));
-        assert!(is_unchanged("UNCHANGED."));
-        assert!(is_unchanged("UNCHANGED。"));
-        assert!(!is_unchanged("Fix login bug"));
-        assert!(!is_unchanged("UNCHANGED topic"));
+    fn assistant_with_blocks(content: Vec<ContentBlock>) -> AgentMessage {
+        let mut message = assistant("");
+        if let AgentMessage::Assistant {
+            content: target, ..
+        } = &mut message
+        {
+            *target = content;
+        }
+        message
     }
 
     #[test]
-    fn build_first_title_request_shape() {
-        let messages = vec![
-            user_message("first question".into()),
-            assistant_message("first answer".into()),
-            user_message("second question".into()),
-            assistant_message("second answer".into()),
-        ];
-        let convo = build_title_messages(&messages, None, Language::En).unwrap();
-        assert_eq!(convo.len(), 3);
-        // First user message (not the latest) seeds the first-title request.
-        assert!(matches!(&convo[0], AgentMessage::User { content, .. }
-            if matches!(&content[0], ContentBlock::Text { text, .. } if text == "first question")));
-        assert!(matches!(&convo[1], AgentMessage::Assistant { .. }));
-        assert!(matches!(&convo[2], AgentMessage::User { .. }));
+    fn initial_title_collapses_and_caps_unicode() {
+        assert_eq!(
+            initial_title("  hello\n world ").as_deref(),
+            Some("hello world")
+        );
+        let title = initial_title(&"界".repeat(50)).unwrap();
+        assert_eq!(title.chars().count(), 40);
+        assert!(title.ends_with('…'));
     }
 
     #[test]
-    fn build_topic_shift_request_shape() {
-        let messages = vec![
-            user_message("latest question".into()),
-            assistant_message("latest answer".into()),
-        ];
-        let convo = build_title_messages(&messages, Some("Old Title"), Language::En).unwrap();
-        assert_eq!(convo.len(), 3);
-        assert!(matches!(&convo[0], AgentMessage::User { content, .. }
-            if matches!(&content[0], ContentBlock::Text { text, .. } if text == "latest question")));
-        // The instruction names the current title.
-        let AgentMessage::User { content, .. } = &convo[2] else {
-            panic!("instruction must be a user message")
+    fn validation_rejects_multiline_markdown_and_overlong() {
+        assert!(valid_title("").is_none());
+        assert!(valid_title("a\nb").is_none());
+        assert!(valid_title("# heading").is_none());
+        assert!(valid_title(&"x".repeat(41)).is_none());
+        assert_eq!(valid_title("精炼标题").as_deref(), Some("精炼标题"));
+    }
+
+    #[test]
+    fn conversation_keeps_first_and_last_three_without_overlap() {
+        let messages = (0..8)
+            .map(|i| {
+                if i % 2 == 0 {
+                    user(&format!("u{i}"))
+                } else {
+                    assistant(&format!("a{i}"))
+                }
+            })
+            .collect::<Vec<_>>();
+        let sample = sample_conversation(&messages);
+        assert_eq!(sample.len(), 6);
+        assert_eq!(sample[0].text, "u0");
+        assert_eq!(sample[2].text, "u2");
+        assert_eq!(sample[3].text, "a5");
+        assert_eq!(sample[5].text, "a7");
+
+        let short = sample_conversation(&messages[..5]);
+        assert_eq!(short.len(), 5);
+    }
+
+    #[test]
+    fn conversation_excludes_images_thinking_tools_and_failed_responses() {
+        let image_only = AgentMessage::User {
+            content: vec![ContentBlock::Image {
+                data: "ignored".into(),
+                mime_type: "image/png".into(),
+            }],
+            timestamp: chrono::Utc::now(),
         };
-        let ContentBlock::Text { text, .. } = &content[0] else {
-            panic!("instruction must be text")
+        let thinking_only = assistant_with_blocks(vec![ContentBlock::Thinking {
+            thinking: "private reasoning".into(),
+            signature: None,
+            redacted: Some(false),
+        }]);
+        let mut failed = assistant("failed output");
+        if let AgentMessage::Assistant { stop_reason, .. } = &mut failed {
+            *stop_reason = Some(StopReason::Error);
+        }
+        let sample = sample_conversation(&[
+            image_only,
+            user("visible user text"),
+            thinking_only,
+            failed,
+            assistant("visible assistant text"),
+        ]);
+        assert_eq!(
+            sample,
+            vec![
+                TitleTurn {
+                    role: TitleRole::User,
+                    text: "visible user text".into(),
+                },
+                TitleTurn {
+                    role: TitleRole::Assistant,
+                    text: "visible assistant text".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_truncation_keeps_head_tail_and_marker() {
+        let plan = format!("HEAD{}TAIL", "x".repeat(PLAN_SAMPLE_CHARS));
+        let truncated = truncate_head_tail(&plan, PLAN_SAMPLE_CHARS);
+        assert_eq!(truncated.chars().count(), PLAN_SAMPLE_CHARS);
+        assert!(truncated.starts_with("HEAD"));
+        assert!(truncated.ends_with("TAIL"));
+        assert!(truncated.contains("omitted for safety"));
+    }
+
+    #[test]
+    fn source_priority_is_goal_then_plan_then_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Plan").unwrap();
+        let goal = ThreadGoal::new("thread".into(), "Ship Title Agent".into(), None).unwrap();
+        assert!(matches!(
+            select_source(Some(&goal), plan.to_str(), &[user("chat")]),
+            TitleSource::Goal(_)
+        ));
+        assert!(matches!(
+            select_source(None, plan.to_str(), &[user("chat")]),
+            TitleSource::Plan(_)
+        ));
+        assert!(matches!(
+            select_source(None, None, &[user("chat")]),
+            TitleSource::Conversation(_)
+        ));
+    }
+
+    #[test]
+    fn wake_state_handles_milestones_stop_failures_and_terminate() {
+        let mut state = TitleWakeState::default();
+        state.turn_start();
+        assert_eq!(
+            state.assistant_response(Some(StopReason::ToolUse)),
+            vec![TitleWakeReason::FirstResponse]
+        );
+        assert_eq!(state.tool_terminated(), None);
+        state.turn_start();
+        assert!(state.assistant_response(Some(StopReason::Error)).is_empty());
+        assert!(
+            state
+                .assistant_response(Some(StopReason::Aborted))
+                .is_empty()
+        );
+        assert!(
+            state
+                .assistant_response(Some(StopReason::ToolUse))
+                .is_empty()
+        );
+        assert_eq!(
+            state.tool_terminated(),
+            Some(TitleWakeReason::ToolTerminate)
+        );
+        state.turn_start();
+        assert_eq!(
+            state.assistant_response(Some(StopReason::Stop)),
+            vec![TitleWakeReason::ThirdResponse]
+        );
+    }
+
+    #[test]
+    fn execution_wake_suppresses_only_terminal_stop() {
+        let mut state = TitleWakeState::default();
+        state.start_execution();
+        state.turn_start();
+        assert_eq!(
+            state.assistant_response(Some(StopReason::Stop)),
+            vec![TitleWakeReason::FirstResponse]
+        );
+
+        state.start_execution();
+        state.turn_start();
+        assert!(state.assistant_response(Some(StopReason::Stop)).is_empty());
+        state.turn_start();
+        assert_eq!(
+            state.assistant_response(Some(StopReason::Stop)),
+            vec![TitleWakeReason::ThirdResponse]
+        );
+    }
+
+    #[test]
+    fn wake_state_restore_preserves_milestones_and_execution_suppression() {
+        let mut state = TitleWakeState::restore(2, true);
+        state.turn_start();
+        assert_eq!(
+            state.assistant_response(Some(StopReason::Stop)),
+            vec![TitleWakeReason::ThirdResponse]
+        );
+        assert_eq!(state.persisted(), (3, false));
+    }
+
+    #[test]
+    fn title_agent_exposes_only_title_tool() {
+        let tools = title_tools(Arc::new(Mutex::new(None)), Arc::new(Mutex::new(0)));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "Title");
+    }
+
+    #[tokio::test]
+    async fn provider_context_exposes_only_title_tool() {
+        let result = Arc::new(Mutex::new(None));
+        let tools = title_tools(Arc::clone(&result), Arc::new(Mutex::new(0)));
+        let env: Arc<dyn pi::env::ExecutionEnv> = Arc::new(pi::env::TokioExecutionEnv::new("/tmp"));
+        let context: Arc<dyn ToolContext> = Arc::new(LocalToolContext::new(
+            env,
+            "/tmp".into(),
+            Arc::new(ToolState::new()),
+        ));
+        let model = PiModel {
+            provider: "test".into(),
+            api: "test".into(),
+            id: "test".into(),
+            context_window: 8_192,
+            max_tokens: 128,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: Default::default(),
         };
-        assert!(text.contains("Old Title"));
-        assert!(text.contains(UNCHANGED_SENTINEL));
+        let mut agent = Agent::new(
+            SYSTEM_PROMPT,
+            model,
+            Arc::new(InspectingTitleProvider),
+            context,
+        )
+        .with_tools(tools);
+        agent.prompt("title this").await.unwrap();
+        assert_eq!(result.lock().unwrap().as_deref(), Some("专用 Title Agent"));
     }
 
-    #[test]
-    fn build_request_requires_assistant_reply() {
-        let messages = vec![user_message("only a question".into())];
-        assert!(build_title_messages(&messages, None, Language::En).is_none());
-    }
-
-    #[test]
-    fn count_user_messages_counts_text_only() {
-        let messages = vec![
-            user_message("one".into()),
-            assistant_message("reply".into()),
-            user_message("   ".into()),
-            user_message("two".into()),
-        ];
-        assert_eq!(count_user_messages(&messages), 2);
+    #[tokio::test]
+    async fn title_tool_allows_one_invalid_call_then_one_repair() {
+        let result = Arc::new(Mutex::new(None));
+        let tools = title_tools(Arc::clone(&result), Arc::new(Mutex::new(0)));
+        let ctx = context();
+        let invalid = tools[0]
+            .execute(
+                "bad",
+                serde_json::json!({"title": "# markdown"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(invalid.is_error && invalid.terminate);
+        let repaired = tools[0]
+            .execute(
+                "good",
+                serde_json::json!({"title": "Title Agent 状态机"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!repaired.is_error && repaired.terminate);
+        assert_eq!(
+            result.lock().unwrap().as_deref(),
+            Some("Title Agent 状态机")
+        );
     }
 }

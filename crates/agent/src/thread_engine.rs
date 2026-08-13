@@ -110,6 +110,13 @@ pub trait ThreadEngine: Send + Sync {
     /// `None` clears it. Backends without sidecar persistence no-op.
     fn persist_plan_snapshot(&self, _snapshot: Option<serde_json::Value>) {}
 
+    /// Mark an approved plan as the active execution title source and wake
+    /// the private Title agent immediately.
+    fn start_plan_execution(&self, _plan_file: String) {}
+
+    /// Wake the private Title agent after a user-created/replaced Goal starts.
+    fn goal_started(&self) {}
+
     /// Execute an approved plan: optional compaction toward the plan file,
     /// then the execution seed turn.
     fn approve_plan(
