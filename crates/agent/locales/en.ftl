@@ -66,6 +66,8 @@ status-cancelled = Cancelled
 ### views/message.rs — Thinking status row
 context-agents-title = Agents
 context-agents-captain = Captain
+subagent-panel-waiting = Waiting for sub-agent activity…
+subagent-panel-final-note = Live transcript is not retained across reloads; showing the sub-agent's final answer.
 plan-card-title = Plan
 plan-card-download = Download plan
 plan-card-copy = Copy plan

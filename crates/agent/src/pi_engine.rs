@@ -2761,19 +2761,10 @@ pub(crate) mod adapt {
                             .to_string(),
                         tool_uses: 0,
                         token_usage: crate::language_model::TokenUsage::default(),
-                        latest_activity: arguments.get("prompt").and_then(|v| v.as_str()).map(
-                            |prompt| {
-                                let flat: String =
-                                    prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-                                let mut chars = flat.chars();
-                                let head: String = chars.by_ref().take(60).collect();
-                                if chars.next().is_some() {
-                                    format!("{head}…")
-                                } else {
-                                    head
-                                }
-                            },
-                        ),
+                        latest_activity: arguments
+                            .get("prompt")
+                            .and_then(|v| v.as_str())
+                            .map(crate::tools::subagent_topic),
                         status: ToolCallStatus::Running,
                     });
                 }

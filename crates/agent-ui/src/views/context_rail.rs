@@ -23,7 +23,7 @@ use agent::i18n;
 use agent::{Thread, ThreadEvent};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
-    SharedString, Window, prelude::*, px,
+    SharedString, WeakEntity, Window, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
@@ -33,6 +33,7 @@ use std::path::PathBuf;
 
 use agent::{PlanSnapshot, PlanStepStatus};
 
+use crate::Workspace;
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
 use crate::views::subagents::{SubagentInfo, status_indicator, subagent_display_title};
@@ -84,6 +85,8 @@ pub(crate) struct ContextRail {
     /// first refresh completes; the changes/branch rows render placeholders
     /// until then.
     pub(crate) git_branch_display: Option<GitBranchDisplay>,
+    /// Reaches the workspace so agent rows can open their observation panel.
+    weak_workspace: WeakEntity<Workspace>,
 }
 
 impl ContextRail {
@@ -99,7 +102,14 @@ impl ContextRail {
             main_call: None,
             git_change_stats: None,
             git_branch_display: None,
+            weak_workspace: WeakEntity::new_invalid(),
         }
+    }
+
+    /// Injected by the owning workspace after construction so agent rows can
+    /// open their observation panel.
+    pub(crate) fn set_workspace(&mut self, weak: WeakEntity<Workspace>) {
+        self.weak_workspace = weak;
     }
 
     /// Whether the floating context card is shown at the given main-column
@@ -669,6 +679,11 @@ impl ContextRail {
         for info in &self.agents {
             let title = subagent_display_title(info);
             let tooltip_text = title.clone();
+            let weak = self.weak_workspace.clone();
+            let id = info.id.clone();
+            let subagent_type = info.subagent_type.clone();
+            let topic = info.description.clone();
+            let status = info.status;
             let row = h_flex()
                 .id(SharedString::from(format!("context-agent-{}", info.id)))
                 .w_full()
@@ -678,7 +693,15 @@ impl ContextRail {
                 .gap_1p5()
                 .items_center()
                 .rounded(px(4.))
+                .cursor_pointer()
                 .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+                .on_click(move |_, _window, cx| {
+                    if let Some(ws) = weak.upgrade() {
+                        ws.update(cx, |ws, cx| {
+                            ws.open_subagent_tab(&id, &subagent_type, &topic, status, cx);
+                        });
+                    }
+                })
                 .child(status_indicator(info.status, theme))
                 .child(
                     gpui::div()

@@ -516,11 +516,21 @@ pub(crate) fn agent_task_labels(input: &serde_json::Value) -> (String, String) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // `description` is a retired CC-era field; the pi Agent tool ships only
+    // `subagent_type` + `prompt`, so fall back to the shared topic derivation
+    // the rail uses — both surfaces show the same title.
     let description = input
         .get("description")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .filter(|d| !d.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(agent::tools::subagent_topic)
+        })
+        .unwrap_or_default();
     (subagent_type, description)
 }
 
@@ -1354,44 +1364,10 @@ impl ConversationState {
                     ApplyOutcome::Unchanged
                 }
             }
-            ThreadEvent::SubagentChild { id, child } => {
-                // The Agent tool call's drill-down transcript: child text /
-                // thinking deltas append verbatim; child tool lifecycle
-                // renders as activity lines (same live-output surface as
-                // bash streaming).
-                let chunk: Option<String> = match child {
-                    agent::SubagentChildEvent::Text(text) => Some(text.clone()),
-                    agent::SubagentChildEvent::Thinking(text) => Some(text.clone()),
-                    agent::SubagentChildEvent::ToolStart { name, summary } => {
-                        Some(match summary {
-                            Some(summary) => format!("\n▸ {name} {summary}\n"),
-                            None => format!("\n▸ {name}\n"),
-                        })
-                    }
-                    agent::SubagentChildEvent::ToolEnd { name, is_error } => Some(format!(
-                        "\n{} {name}\n",
-                        if *is_error { "✗" } else { "✓" }
-                    )),
-                };
-                if let Some(chunk) = chunk
-                    && let Some((cix, eix)) = self.find_thinking_entry(id, cx)
-                {
-                    self.items[cix].update(cx, |item, cx| {
-                        if let ConvItem::Thinking(t) = item.kind_mut() {
-                            if let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix) {
-                                entry.output.push_str(&chunk);
-                                entry.streaming = true;
-                            }
-                            t.streaming = true;
-                        }
-                        item.sync_tool_entry_panel(eix, cwd, cx);
-                        cx.notify();
-                    });
-                    ApplyOutcome::Remeasure(cix)
-                } else {
-                    ApplyOutcome::Unchanged
-                }
-            }
+            // Child-session transcripts are owned by the workspace's
+            // sub-agent observation panel; the conversation keeps only the
+            // compact Agent task row.
+            ThreadEvent::SubagentChild { .. } => ApplyOutcome::Unchanged,
             ThreadEvent::ToolResult {
                 id,
                 output,
@@ -3241,5 +3217,25 @@ mod tests {
                 _ => panic!("expected Thinking at index 1"),
             });
         });
+    }
+
+    #[test]
+    fn agent_task_labels_falls_back_to_prompt_topic() {
+        // The pi Agent tool ships only `subagent_type` + `prompt`; the row
+        // title must fall back to the shared topic derivation the rail uses.
+        let (subagent_type, description) = agent_task_labels(&serde_json::json!({
+            "subagent_type": "Explore",
+            "prompt": "  find   the\nauth module "
+        }));
+        assert_eq!(subagent_type, "Explore");
+        assert_eq!(description, "find the auth module");
+
+        // A legacy non-empty `description` still wins when present.
+        let (_, description) = agent_task_labels(&serde_json::json!({
+            "subagent_type": "Explore",
+            "description": "review PR",
+            "prompt": "ignored"
+        }));
+        assert_eq!(description, "review PR");
     }
 }
