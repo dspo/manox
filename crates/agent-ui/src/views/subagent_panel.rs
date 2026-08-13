@@ -122,9 +122,14 @@ impl SubagentPanel {
 
     pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
         push_line(&mut self.lines, child);
-        // New content arrives: resume tail-follow unless the user has
-        // scrolled up to inspect history.
-        self.stick_to_bottom = true;
+        // Re-arm tail-follow only while the viewport is still near the
+        // bottom; a user who scrolled up to read history must not be yanked
+        // back by the next delta.
+        let off = self.scroll_handle.offset().y;
+        let max = self.scroll_handle.max_offset().y;
+        if (max + off).abs() < px(20.) {
+            self.stick_to_bottom = true;
+        }
         cx.notify();
     }
 
