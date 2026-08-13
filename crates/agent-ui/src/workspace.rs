@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::views::vlist::{FollowMode, VListState, vlist};
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
@@ -24,8 +23,9 @@ use agent::{Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
-    MouseButton, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
-    anchored, deferred, ease_out_quint, prelude::*, px,
+    FollowMode, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Render, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_out_quint, prelude::*,
+    px,
 };
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// Shared across both harnesses: workspace struct fields hold
@@ -336,18 +336,18 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll/virtualization state for the message column. `views/vlist.rs`
-    /// wraps gpui-component's `v_virtual_list`: gpui-component owns the
-    /// virtualization Element, scroll handle, visible-range computation, and
-    /// content mask; manox owns per-item height measurement (each visible item
-    /// measured at the list's definite width, cached, fed back as `item_sizes`
-    /// next frame) and tail-follow arbitration. Unmeasured items carry a small
-    /// constant estimate, so height re-measurement never shifts the visible
-    /// content. Bottom alignment gives native chat-log semantics: short
-    /// histories sit at the bottom, long ones scroll, and `FollowMode::Tail`
-    /// re-pins to the end each layout while following (disengaging on upward
-    /// scroll, re-arming at the bottom). Only the visible items render.
-    list_state: VListState,
+    /// Scroll/virtualization state for the message column, held natively by
+    /// `gpui::ListState`. `ListAlignment::Bottom` gives chat-log semantics:
+    /// short histories sit at the bottom, long ones scroll. `FollowMode::Tail`
+    /// pins to the live end on each layout while following, disengages on an
+    /// upward user scroll, and re-arms when a scroll lands back at the bottom.
+    /// `MSG_LIST_OVERDRAW` rows below the viewport are pre-measured; a width
+    /// change invalidates every cached height, and visible rows re-measure
+    /// every frame (so a height change without an explicit signal self-
+    /// corrects). Count changes are reconciled via `splice`, in-place
+    /// mutations via `remeasure_items`, both driven by `ApplyOutcome`. Only
+    /// the visible items render.
+    list_state: ListState,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
@@ -450,6 +450,11 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the message column width when the right side view (editor
 /// pane) is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// Trailing overdraw for the message list: rows within this many pixels
+/// below the viewport are pre-measured so scrolling never pops an
+/// unmeasured row into view.
+const MSG_LIST_OVERDRAW: Pixels = px(2048.);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TurnNavigatorLayout {
@@ -614,7 +619,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state: VListState::new(0),
+            list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
             list_count: 0,
             history_rendered: 0,
             view_mode: ViewMode::default(),
@@ -678,7 +683,8 @@ impl Workspace {
         // The authoritative list is fully rendered now; future preview
         // batches append from here.
         self.history_rendered = messages.len();
-        self.list_state.scroll_to_end();
+        // `Tail` natively pins to the end and keeps following; an upward user
+        // scroll disengages it and landing back at the bottom re-arms it.
         self.list_state.set_follow_mode(FollowMode::Tail);
         cx.notify();
     }
@@ -2307,22 +2313,24 @@ impl Workspace {
         }
     }
 
-    /// Re-engage tail-follow: the list re-pins to the end on each layout while
-    /// following. This is the user-initiated "jump to live tail" path (submit,
-    /// slash command, thread open) — it always re-arms follow, even if the
-    /// user had scrolled up to read back.
+    /// Re-engage tail-follow. `FollowMode::Tail` pins to the end natively and
+    /// keeps following; an upward user scroll disengages it and landing back
+    /// at the bottom re-arms it. This is the user-initiated "jump to live
+    /// tail" path (submit, slash command, thread open) — it always re-arms
+    /// follow, even if the user had scrolled up to read back.
     fn follow_message_tail(&mut self) {
-        self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
-    /// Jump the viewport so the given conversation item is at the top. Index-
-    /// anchored, so it is a single atomic state change — no frame protection
-    /// needed against a stale `scroll_to_bottom` (there is no such flag on a
-    /// `VListState`).
+    /// Jump the viewport so the given conversation item is at the top. Native
+    /// `scroll_to` is a single atomic state change, so no frame protection is
+    /// needed against a stale tail re-pin.
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.list_state.set_follow_mode(FollowMode::Normal);
-        self.list_state.scroll_to(item_ix);
+        self.list_state.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: px(0.),
+        });
         cx.notify();
     }
 
@@ -2521,18 +2529,15 @@ impl Workspace {
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. Both running and completed threads arm `FollowMode::Tail`:
         // the list pins to the end on each layout while following, and GPUI
-        // auto-disengages follow the moment the user scrolls up — matching the
-        // old per-frame re-pin arbitration (pinned-at-bottom re-pinned every
-        // frame; the instant the user scrolled up, follow dropped). Using
-        // `Normal` here would leave a one-shot `scroll_to_end` that never
-        // re-pins if a late delta or notice lands after the user scrolls.
+        // auto-disengages follow the moment the user scrolls up. Using
+        // `Normal` here would leave a one-shot scroll that never re-pins if a
+        // late delta or notice lands after the user scrolls.
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
         // All of the thread's current messages are rendered (a restoring
         // thread has none yet — the preview batches append from here).
         self.history_rendered = messages.len();
-        self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any.
@@ -6217,72 +6222,64 @@ impl Workspace {
                             this.pr(px(crate::views::context_rail::ENV_CONTENT_INSET))
                         })
                         // Empty first screen shows the centered hero in place
-                        // of the (empty) message list; otherwise an
-                        // index-anchored, tail-following virtualized list.
+                        // of the (empty) message list; otherwise a bottom-
+                        // anchored, tail-following native list.
                         .children(hero)
-                        // Bottom-align for short histories: a top spacer of
-                        // `(viewport - content)` pushes the list to the viewport
-                        // bottom so a fresh chat logs against the composer (chat-
-                        // log semantics) instead of clinging to the title bar.
-                        // Both terms are one-frame cached (viewport updated by
-                        // the list's own prepaint, heights from last measure), so
-                        // the spacer self-corrects as items settle.
-                        .children((!first_screen).then(|| {
-                            let h = (self.list_state.viewport_h() - self.list_state.total_height())
-                                .max(px(0.));
-                            gpui::div().h(h).flex_shrink_0()
-                        }))
                         .children({
-                            let entity = cx.entity().clone();
+                            // `cx.processor` adapts the item closure to
+                            // `gpui::list`'s `FnMut(usize, &mut Window, &mut
+                            // App)` signature; it captures an `Entity<Workspace>`
+                            // internally, so it is built outside the frame
+                            // closure and moved in.
+                            let processor = cx.processor(|this, ix: usize, _window, cx| {
+                                let item = this.conversation.read(cx).items().get(ix).cloned();
+                                match item {
+                                    // `flex_shrink_0` guards against any
+                                    // available height leaking down the
+                                    // flex chain and compressing a row.
+                                    //
+                                    // Budget the ask-card snapshot before
+                                    // rendering: the list element leases
+                                    // the Workspace for the whole closure,
+                                    // so `MessageItem::render` must not
+                                    // read it back. `item` is a distinct
+                                    // entity, safe to lease here.
+                                    Some(item) => {
+                                        let ask = match item.read(cx).kind() {
+                                            ConvItem::ToolCall(t) => {
+                                                this.ask_card_snapshot(t.id.as_str(), cx)
+                                            }
+                                            _ => None,
+                                        };
+                                        item.update(cx, |it, _cx| it.ask_snapshot = ask);
+                                        v_flex()
+                                            .w_full()
+                                            .pt_1()
+                                            .pb_4()
+                                            .flex_shrink_0()
+                                            .min_w_0()
+                                            .child(item)
+                                            .into_any_element()
+                                    }
+                                    // Index out of range mid-splice (count
+                                    // changed between a layout pass and the
+                                    // render closure): render an empty row.
+                                    None => gpui::div().into_any_element(),
+                                }
+                            });
                             let list_state = self.list_state.clone();
                             let mono_family = theme.mono_font_family.clone();
                             (!first_screen).then(move || {
-                                // Backed by gpui-component's `v_virtual_list`: it
-                                // owns the virtualization Element, scroll handle,
-                                // visible-range computation, and content mask; manox
-                                // owns per-item height measurement (run inside the
-                                // render closure at the live content-mask width) and
-                                // the tail-follow arbitration. Item heights are
-                                // reconciled from the ThreadEvent handler via
+                                // Native `gpui::list`: it owns virtualization,
+                                // scroll, the per-item height cache, and tail-
+                                // follow. Visible rows re-measure every frame;
+                                // a width change invalidates every cached
+                                // height; `Tail` mode pins to the live end and
+                                // re-engages at the bottom after an upward
+                                // scroll. Item heights are reconciled from the
+                                // ThreadEvent handler via
                                 // `splice`/`remeasure_items`.
-                                let list_el =
-                                    vlist(entity, list_state, move |this, ix, _window, cx| {
-                                        let item =
-                                            this.conversation.read(cx).items().get(ix).cloned();
-                                        match item {
-                                            // `flex_shrink_0` guards against any
-                                            // available height leaking down the
-                                            // flex chain and compressing a row.
-                                            //
-                                            // Budget the ask-card snapshot before
-                                            // rendering: the list element leases
-                                            // the Workspace for the whole closure,
-                                            // so `MessageItem::render` must not
-                                            // read it back. `item` is a distinct
-                                            // entity, safe to lease here.
-                                            Some(item) => {
-                                                let ask = match item.read(cx).kind() {
-                                                    ConvItem::ToolCall(t) => {
-                                                        this.ask_card_snapshot(t.id.as_str(), cx)
-                                                    }
-                                                    _ => None,
-                                                };
-                                                item.update(cx, |it, _cx| it.ask_snapshot = ask);
-                                                v_flex()
-                                                    .w_full()
-                                                    .pt_1()
-                                                    .pb_4()
-                                                    .flex_shrink_0()
-                                                    .min_w_0()
-                                                    .child(item)
-                                                    .into_any_element()
-                                            }
-                                            // Index out of range mid-splice (count
-                                            // changed between a layout pass and the
-                                            // render closure): render an empty row.
-                                            None => gpui::div().into_any_element(),
-                                        }
-                                    })
+                                let list_el = gpui::list(list_state, processor)
                                     .w_full()
                                     .h_full()
                                     .min_h_0()

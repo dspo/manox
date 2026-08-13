@@ -542,8 +542,9 @@ pub struct ConversationState {
     history_builder: Option<crate::views::message::ItemBuilder>,
 }
 
-/// What `apply` did to the item list, so the caller can keep the `VListState`
-/// in sync (splice on append, remeasure on in-place mutation).
+/// What `apply` did to the item list, so the caller can keep the message
+/// list's `ListState` in sync (splice on append, remeasure on in-place
+/// mutation).
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// No item touched (e.g. `ToolCallAuthorization`).
@@ -1755,7 +1756,7 @@ impl ConversationState {
 
     /// Drop the trailing item if it is a stale `Retry` badge, so the real
     /// content event that follows pushes its own item into the freed slot.
-    /// Returns whether an item was actually removed (for the `VListState`
+    /// Returns whether an item was actually removed (for the list
     /// splice-down).
     fn pop_trailing_retry(&mut self, cx: &App) -> bool {
         if self
