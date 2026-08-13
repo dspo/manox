@@ -719,8 +719,10 @@ impl Thread {
     }
 
     /// Replace the mirrored history with the engine's authoritative transcript
-    /// and re-attach the last user turn's UI metadata. No-op while the engine
-    /// is not materialized (a landing thread has no backend history).
+    /// and re-attach the last user prompt's UI metadata. Tool results also use
+    /// the User role on the provider wire but must never inherit prompt chrome.
+    /// No-op while the engine is not materialized (a landing thread has no
+    /// backend history).
     fn refresh_history(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = &self.engine else {
             return;
@@ -730,7 +732,10 @@ impl Thread {
             && let Some(last_user) = mapped
                 .iter_mut()
                 .rev()
-                .find(|m| matches!(m.role, crate::language_model::Role::User))
+                .find(|m| {
+                    matches!(m.role, crate::language_model::Role::User)
+                        && m.provenance == crate::message::MessageProvenance::User
+                })
         {
             last_user.ui = Some(ui);
         }
@@ -1869,6 +1874,54 @@ pub(crate) mod tests {
                 cx,
             );
             assert!(!t.is_running());
+        });
+    }
+
+    #[gpui::test]
+    fn live_history_reattaches_ui_metadata_to_prompt_not_tool_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let engine = Arc::new(FakeEngine {
+            history: vec![
+                Message::user("expanded registry prompt".to_string()),
+                Message::user_with_content(vec![MessageContent::ToolResult(
+                    crate::language_model::LanguageModelToolResult {
+                        tool_use_id: "tu_1".into(),
+                        tool_name: "Read".into(),
+                        is_error: false,
+                        content: "done".into(),
+                    },
+                )]),
+            ],
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.insert_user_message_with_ui_metadata(
+                "expanded registry prompt".to_string(),
+                Some(MessageUiMetadata {
+                    display_text: Some("/gitwork:deliver fast".to_string()),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            t.handle_notice(BackendNotice::LiveHistory, cx);
+
+            assert_eq!(
+                t.messages[0]
+                    .ui
+                    .as_ref()
+                    .and_then(|ui| ui.display_text.as_deref()),
+                Some("/gitwork:deliver fast")
+            );
+            assert!(
+                t.messages[1].ui.is_none(),
+                "tool-result user messages must not inherit prompt UI metadata"
+            );
         });
     }
 

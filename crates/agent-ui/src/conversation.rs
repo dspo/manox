@@ -1969,7 +1969,8 @@ fn merge_ui_notes(
     // order. These align 1:1 with the User bubbles in `items` because
     // `build_items` pushes exactly one User bubble per such message and none
     // otherwise. The predicate mirrors `build_items` exactly: a bubble is
-    // pushed iff the message has a non-empty Text/Thinking join or any Image.
+    // pushed iff the message has a non-empty display form, a non-empty
+    // Text/Thinking join, or any Image.
     let segment_ids: Vec<&str> = messages
         .iter()
         .filter(|m| {
@@ -1983,10 +1984,16 @@ fn merge_ui_notes(
             {
                 return false;
             }
-            let has_text = m.content.iter().any(|c| match c {
-                MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => !t.is_empty(),
-                _ => false,
-            });
+            let has_text =
+                m.ui.as_ref()
+                    .and_then(|ui| ui.display_text.as_deref())
+                    .is_some_and(|text| !text.is_empty())
+                    || m.content.iter().any(|c| match c {
+                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
+                            !t.is_empty()
+                        }
+                        _ => false,
+                    });
             let has_image = m
                 .content
                 .iter()
@@ -2081,8 +2088,10 @@ fn merge_ui_notes(
         for it in items.iter().take(end).skip(start) {
             out.push(it.clone());
         }
-        for n in &buckets[k] {
-            out.push(note_to_item(n));
+        if let Some(bucket) = buckets.get(k) {
+            for n in bucket {
+                out.push(note_to_item(n));
+            }
         }
     }
     for n in &orphan {
@@ -2472,6 +2481,31 @@ mod tests {
             signature(&merged).last(),
             Some(&"N:mid".to_string()),
             "no-bubble anchor folds to the nearest preceding segment's tail"
+        );
+    }
+
+    #[test]
+    fn merge_ui_notes_counts_display_text_on_tool_result_bubbles() {
+        let mut tool_result = msg_with_id("u2", Role::User, "");
+        tool_result.content = vec![MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_1".to_string(),
+            tool_name: Arc::from("Read"),
+            is_error: false,
+            content: "done".to_string(),
+        })];
+        tool_result.ui = Some(agent::MessageUiMetadata {
+            display_text: Some("/gitwork:deliver fast".to_string()),
+            ..Default::default()
+        });
+        let messages = vec![msg_with_id("u1", Role::User, "plain turn"), tool_result];
+        let items = build_items(&messages, &HashMap::new(), false);
+        let notes = vec![note(1, UiNoteKind::Error, Some("u2"), "failed")];
+
+        let merged = merge_ui_notes(&messages, items, &notes);
+
+        assert_eq!(
+            signature(&merged),
+            vec!["U:plain turn", "U:/gitwork:deliver fast", "?", "E:failed",]
         );
     }
 
