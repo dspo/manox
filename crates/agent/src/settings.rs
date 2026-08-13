@@ -318,7 +318,7 @@ impl SideCallPolicy {
     pub fn approval_default() -> Self {
         Self {
             model: String::new(),
-            reasoning_effort: Some("low".into()),
+            reasoning_effort: Some("medium".into()),
             max_output_tokens: 2048,
             enabled: true,
         }
@@ -631,6 +631,12 @@ follow_up_behavior = "Steer"
     fn side_call_presets() {
         assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
         assert_eq!(SideCallPolicy::approval_default().max_output_tokens, 2048);
+        assert_eq!(
+            SideCallPolicy::approval_default()
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
     }
 
     #[test]

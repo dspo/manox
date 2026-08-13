@@ -563,10 +563,9 @@ fn build_tools(
         plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
         cwd: cwd.to_path_buf(),
     });
-    // Sandboxed bash rides the OS confinement and skips the gate in
-    // AutoPilot — the old-harness "sandboxed bash needs no approval"
-    // semantics. Escalated calls (`unsandboxed: true`) still gate; Danger
-    // already delegates; platforms without a seatbelt never auto-allow.
+    // Preserve the existing sandboxed Bash bypass in AutoPilot. The
+    // intelligent reviewer only sees actions that genuinely require approval
+    // (not confined, non-escalated shell calls).
     let bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> =
         sandbox_available.then(|| {
             let gate = Arc::clone(gate);
@@ -961,11 +960,13 @@ fn subscribe_session(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     live: Arc<Mutex<LiveTranscript>>,
     title: TitleScheduler,
+    gate: Arc<ApprovalGate>,
 ) -> pi::agent::Subscription {
     let event_tx = notice_tx.clone();
     // Seed the live mirror with the completed transcript so a mid-run tick
     // never drops restored history; the listener below appends from here.
     live.lock().unwrap().messages = session.harness_messages().to_vec();
+    gate.set_transcript(session.harness_messages());
     // A fresh session's jsonl file is deferred until the first assistant
     // message, so the sidebar only learns the thread exists once that file
     // materializes. The user MessageEnd fires before it; the first assistant
@@ -978,6 +979,7 @@ fn subscribe_session(
         let assistant_flag = std::sync::Arc::clone(&assistant_flag);
         let live = std::sync::Arc::clone(&live);
         let title = title.clone();
+        let gate = Arc::clone(&gate);
         Box::pin(async move {
             // Mirror the in-flight transcript for the live-history ticker:
             // completed messages accumulate, the streaming partial replaces
@@ -991,6 +993,7 @@ fn subscribe_session(
                     let mut guard = live.lock().unwrap();
                     guard.streaming = None;
                     guard.messages.push((**message).clone());
+                    gate.set_transcript(&guard.messages);
                 }
                 _ => {}
             }
@@ -1535,6 +1538,7 @@ async fn run_actor(
         &notice_tx,
         Arc::clone(&live_mirror),
         title_scheduler.clone(),
+        Arc::clone(&state.gate),
     );
     let mut _harness_subscription = subscribe_harness_events(
         &mut session,
@@ -1966,6 +1970,7 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
+                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -2058,6 +2063,7 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
+                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -2108,6 +2114,7 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
+                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -2181,6 +2188,7 @@ async fn run_actor(
                             &notice_tx,
                             Arc::clone(&live_mirror),
                             title_scheduler.clone(),
+                            Arc::clone(&state.gate),
                         );
                         _harness_subscription = subscribe_harness_events(
                             &mut session,

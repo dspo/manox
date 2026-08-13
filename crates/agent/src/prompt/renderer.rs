@@ -74,14 +74,6 @@ const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN: &str =
     include_str!("templates/en/wrapper/escalated_approval_question.tera.md");
 const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/escalated_approval_question.tera.md");
-const TPL_SIDECALL_APPROVAL_SYSTEM_EN: &str =
-    include_str!("templates/en/side_call/approval_system.tera.md");
-const TPL_SIDECALL_APPROVAL_SYSTEM_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/approval_system.tera.md");
-const TPL_SIDECALL_APPROVAL_USER_EN: &str =
-    include_str!("templates/en/side_call/approval_user.tera.md");
-const TPL_SIDECALL_APPROVAL_USER_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/approval_user.tera.md");
 const TPL_TITLE_FIRST_EN: &str = include_str!("templates/en/title/first.tera.md");
 const TPL_TITLE_FIRST_ZH_CN: &str = include_str!("templates/zh-CN/title/first.tera.md");
 const TPL_TITLE_TOPIC_SHIFT_EN: &str = include_str!("templates/en/title/topic_shift.tera.md");
@@ -161,16 +153,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperEscalatedApprovalQuestion,
         TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN,
         TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallApprovalSystem,
-        TPL_SIDECALL_APPROVAL_SYSTEM_EN,
-        TPL_SIDECALL_APPROVAL_SYSTEM_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallApprovalUser,
-        TPL_SIDECALL_APPROVAL_USER_EN,
-        TPL_SIDECALL_APPROVAL_USER_ZH_CN,
     ),
     (
         PromptTemplate::TitleFirstInstruction,
@@ -401,7 +383,6 @@ mod tests {
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
-            PromptTemplate::SideCallApprovalSystem,
             PromptTemplate::TitleFirstInstruction,
         ];
         for lang in [Language::En, Language::ZhCn] {
@@ -429,8 +410,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 20);
-        assert_eq!(REGISTRATIONS.len(), 20);
+        assert_eq!(template::ALL.len(), 18);
+        assert_eq!(REGISTRATIONS.len(), 18);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -608,22 +589,6 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperEscalatedApprovalQuestion,
-                lang,
-            );
-            // Side-call user prompts.
-            assert_clean(
-                &render(
-                    PromptTemplate::SideCallApprovalUser,
-                    lang,
-                    &crate::prompt::ApprovalReviewPromptData {
-                        cwd: "/c".to_string(),
-                        tool_name: "Bash".to_string(),
-                        tool_title: "Bash".to_string(),
-                        tool_input: "{}".to_string(),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::SideCallApprovalUser,
                 lang,
             );
             // Title topic-shift (uses a sentinel literal in data).
