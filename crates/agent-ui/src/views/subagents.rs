@@ -21,12 +21,18 @@ pub(crate) struct SubagentInfo {
 }
 
 pub(crate) fn subagent_display_title(info: &SubagentInfo) -> String {
-    if info.description.is_empty() {
-        info.subagent_type.clone()
-    } else if info.subagent_type.is_empty() {
-        info.description.clone()
+    task_display_title(&info.subagent_type, &info.description).unwrap_or_default()
+}
+
+/// `{type} · {topic}` with graceful one-sided fallbacks; `None` when both
+/// sides are empty (callers pick their own last resort, e.g. the call id).
+pub(crate) fn task_display_title(subagent_type: &str, description: &str) -> Option<String> {
+    if description.is_empty() {
+        (!subagent_type.is_empty()).then(|| subagent_type.to_string())
+    } else if subagent_type.is_empty() {
+        Some(description.to_string())
     } else {
-        format!("{} · {}", info.subagent_type, info.description)
+        Some(format!("{subagent_type} · {description}"))
     }
 }
 
@@ -49,5 +55,27 @@ pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElem
             .xsmall()
             .text_color(theme.muted_foreground)
             .into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_display_title_combines_type_and_topic() {
+        assert_eq!(
+            task_display_title("Explore", "find the auth module").as_deref(),
+            Some("Explore · find the auth module")
+        );
+        assert_eq!(
+            task_display_title("Explore", "").as_deref(),
+            Some("Explore")
+        );
+        assert_eq!(
+            task_display_title("", "topic only").as_deref(),
+            Some("topic only")
+        );
+        assert_eq!(task_display_title("", ""), None);
     }
 }

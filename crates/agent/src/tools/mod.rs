@@ -41,6 +41,43 @@ pub const TASK_STOP: &str = "TaskStop";
 
 pub const WRITE: &str = "Write";
 
+/// One-line observation title for a spawned sub-agent's task prompt:
+/// whitespace-flattened and capped at 60 chars with an ellipsis. Single
+/// source for both the rail's `latest_activity` and the conversation's Agent
+/// task rows, so every surface shows the same topic.
+pub fn subagent_topic(prompt: &str) -> String {
+    let flat: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(60).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 // The manox harness tool implementations were removed with the retired
 // manox harness; the constants above remain the shared wire-name source of
 // truth.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_topic_flattens_and_caps() {
+        assert_eq!(
+            subagent_topic("  find   the\nauth module "),
+            "find the auth module"
+        );
+        let long = "x ".repeat(40); // 80 chars
+        let topic = subagent_topic(&long);
+        assert!(topic.ends_with('…'));
+        assert_eq!(topic.chars().count(), 61);
+    }
+
+    #[test]
+    fn subagent_topic_short_prompt_unchanged() {
+        assert_eq!(subagent_topic("review PR #123"), "review PR #123");
+    }
+}

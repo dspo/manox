@@ -299,31 +299,43 @@ fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
             _ => return None,
         },
         AgentEvent::ToolExecutionStart {
+            tool_call_id,
             tool_name,
             arguments,
-            ..
         } => {
             // A one-field hint (path / command / pattern) keeps the rail
-            // activity line informative without shipping full arguments.
-            let summary = ["path", "command", "pattern", "query"]
+            // activity line informative without shipping full arguments;
+            // the child call id lets observers pair start/end under
+            // parallel child tool execution.
+            let (summary_key, summary) = ["path", "command", "pattern", "query"]
                 .iter()
-                .find_map(|key| arguments.get(*key).and_then(|v| v.as_str()))
-                .map(|s| {
-                    let trimmed = s.trim();
-                    if trimmed.len() > 80 {
-                        format!("{}…", &trimmed[..trimmed.floor_char_boundary(80)])
-                    } else {
-                        trimmed.to_string()
-                    }
-                });
-            serde_json::json!({ "kind": "tool_start", "tool": tool_name, "summary": summary })
+                .find_map(|key| {
+                    arguments.get(*key).and_then(|v| v.as_str()).map(|s| {
+                        let trimmed = s.trim();
+                        let value = if trimmed.len() > 80 {
+                            format!("{}…", &trimmed[..trimmed.floor_char_boundary(80)])
+                        } else {
+                            trimmed.to_string()
+                        };
+                        ((*key).to_string(), value)
+                    })
+                })
+                .unzip();
+            serde_json::json!({
+                "kind": "tool_start",
+                "id": tool_call_id,
+                "tool": tool_name,
+                "summary_key": summary_key,
+                "summary": summary
+            })
         }
         AgentEvent::ToolExecutionEnd {
+            tool_call_id,
             tool_name,
             is_error,
             ..
         } => {
-            serde_json::json!({ "kind": "tool_end", "tool": tool_name, "is_error": is_error })
+            serde_json::json!({ "kind": "tool_end", "id": tool_call_id, "tool": tool_name, "is_error": is_error })
         }
         _ => return None,
     };

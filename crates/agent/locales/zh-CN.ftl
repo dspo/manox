@@ -53,6 +53,10 @@ status-cancelled = 已取消
 ### views/message.rs — Thinking 状态行
 context-agents-title = 智能体
 context-agents-captain = 船长
+
+### views/subagent_panel.rs
+subagent-panel-waiting = 等待子代理活动…
+subagent-panel-final-note = 实时转录不跨重载保留；以下为子代理的最终回答。
 plan-card-title = 计划
 plan-card-download = 下载计划
 plan-card-copy = 复制计划

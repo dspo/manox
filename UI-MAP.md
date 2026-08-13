@@ -95,7 +95,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [BrowserView](#browserview)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [SubagentPanel](#subagentpanel) · [BrowserView](#browserview)
 
 ### ManagementShell
 
@@ -682,13 +682,13 @@ Right side view of the [MainView](#mainview), shown when any right-pane tab is o
 
 #### RightPane
 
-Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
+Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor, member/sub-agent observers, and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### RightTabBar
 
-Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Selecting a tab switches `active_right_tab`. Browser tabs carry a `×` suffix that closes the tab via `close_right_tab` → `close_browser_tab` (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Selecting a tab switches `active_right_tab`. Browser, member, and sub-agent tabs carry a `×` suffix that closes the tab via `close_right_tab` (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -703,6 +703,12 @@ Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-l
 Rendered markdown view (`Markdown`).
 
 > Source: `agent-ui/src/workspace.rs`
+
+#### SubagentPanel
+
+A right-pane read-only observation tab for one pi sub-agent run (`RightTab::Subagent(agent_tool_call_id)`, equal citizen of the right tab bar). Header: status indicator + `{type} · {topic}` mono title (the shared `task_display_title` composition, call id last resort, so the tab matches the rail row and the conversation's Agent task row). Body: the child run rendered through the **same `ConversationState` + message pipeline as the main conversation** — bridged child events are translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`), so the transcript reads as a miniature conversation (assistant bubbles, reasoning folds, tool cards) with tail-follow scrolling. Pi sub-agent sessions are ephemeral, so the live event accumulation lives in `Workspace::subagent_transcripts` (trimmed when a run reaches a terminal status with no panel open); opening mid-run replays the accumulation, and a panel opened after a reload falls back to the Agent tool result's final text replayed as a one-message conversation plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section or the Agent task row in the conversation; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
+
+> Source: `agent-ui/src/views/subagent_panel.rs`, `agent-ui/src/workspace.rs`
 
 #### BrowserView
 

@@ -89,6 +89,8 @@ enum RightTab {
     Browser(BrowserTabId),
     /// A team member's observation panel, keyed by member name.
     Member(String),
+    /// A pi sub-agent's observation panel, keyed by Agent tool-call id.
+    Subagent(String),
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -261,6 +263,11 @@ pub struct Workspace {
     /// Member observation panels keyed by member name; lifetime is the
     /// tab's (dropped when the tab closes).
     member_panels: HashMap<String, Entity<crate::views::member_panel::MemberPanel>>,
+    /// Live sub-agent observation panels keyed by Agent tool-call id.
+    subagent_panels: HashMap<String, Entity<crate::views::subagent_panel::SubagentPanel>>,
+    /// Accumulated child-session events per Agent tool-call id, so a panel
+    /// opened mid-run backfills from the start.
+    subagent_transcripts: HashMap<String, Vec<agent::SubagentChildEvent>>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -557,6 +564,8 @@ impl Workspace {
         let conversation = cx.new(|_| ConversationState::new());
         let context_rail =
             { cx.new(|_| crate::views::context_rail::ContextRail::new(thread.clone())) };
+        let weak_ws = cx.weak_entity();
+        context_rail.update(cx, |r, _| r.set_workspace(weak_ws));
 
         let mut ws = Self {
             cwd,
@@ -577,6 +586,8 @@ impl Workspace {
             active_right_tab: 0,
             team_chip_open: false,
             member_panels: HashMap::new(),
+            subagent_panels: HashMap::new(),
+            subagent_transcripts: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -1028,6 +1039,32 @@ impl Workspace {
                                 cx,
                             );
                         });
+                        if let Some(panel) = this.subagent_panels.get(&id) {
+                            panel.update(cx, |p, cx| p.set_status(*status, cx));
+                        }
+                        // A finished run needs no backfill for panels opened
+                        // later (they fall back to the final answer); drop the
+                        // accumulated transcript so long threads do not hold
+                        // every child delta until the thread switch.
+                        if matches!(
+                            *status,
+                            agent::ToolCallStatus::Success
+                                | agent::ToolCallStatus::Error
+                                | agent::ToolCallStatus::Denied
+                                | agent::ToolCallStatus::Cancelled
+                        ) && !this.subagent_panels.contains_key(&id)
+                        {
+                            this.subagent_transcripts.remove(&id);
+                        }
+                    }
+                    if let ThreadEvent::SubagentChild { id, child } = ev {
+                        this.subagent_transcripts
+                            .entry(id.clone())
+                            .or_default()
+                            .push(child.clone());
+                        if let Some(panel) = this.subagent_panels.get(id) {
+                            panel.update(cx, |p, cx| p.push(child, cx));
+                        }
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -2410,6 +2447,10 @@ impl Workspace {
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
 
+        // Sub-agent observation is per-thread ephemeral state; drop the
+        // outgoing thread's panels and transcripts before rebinding.
+        self.clear_subagent_observation();
+
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
         // thread that just submitted already cleared its input, storing "".
@@ -3462,6 +3503,12 @@ impl Workspace {
             self.reseat_active_after_close(ix);
             cx.notify();
         }
+        if let Some(RightTab::Subagent(id)) = self.right_tabs.get(ix).cloned() {
+            self.subagent_panels.remove(&id);
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix);
+            cx.notify();
+        }
     }
     /// Close the active right-pane tab if it is a browser tab. No-op
     /// otherwise (the keybinding is global; it should not close an Editor
@@ -3507,6 +3554,99 @@ impl Workspace {
         self.right_tabs.push(RightTab::Member(name.to_string()));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);
         cx.notify();
+    }
+    /// Open (or focus) a sub-agent observation panel in the right pane.
+    /// `topic` is the shared `subagent_topic` derivation so the tab title
+    /// matches the rail and conversation rows.
+    pub(crate) fn open_subagent_tab(
+        &mut self,
+        id: &str,
+        subagent_type: &str,
+        topic: &str,
+        status: agent::ToolCallStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Subagent(i) if i == id))
+        {
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
+        let backfill = self
+            .subagent_transcripts
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let final_text = if backfill.is_empty() {
+            self.agent_final_text(id, cx)
+        } else {
+            None
+        };
+        let title = crate::views::subagents::task_display_title(subagent_type, topic)
+            .unwrap_or_else(|| id.to_string());
+        let role = if subagent_type.is_empty() {
+            "sub-agent".to_string()
+        } else {
+            subagent_type.to_string()
+        };
+        let panel = crate::views::subagent_panel::SubagentPanel::new(
+            title,
+            role,
+            status,
+            &backfill,
+            final_text,
+            cx.weak_entity(),
+            cx,
+        );
+        self.subagent_panels.insert(id.to_string(), panel);
+        self.right_tabs.push(RightTab::Subagent(id.to_string()));
+        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+        cx.notify();
+    }
+
+    /// Final answer of a finished Agent call, for panels opened after a
+    /// reload when no live transcript was accumulated.
+    fn agent_final_text(&self, id: &str, cx: &App) -> Option<String> {
+        use agent::language_model::MessageContent;
+        self.thread
+            .read(cx)
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|c| match c {
+                MessageContent::ToolResult(r) if r.tool_use_id == id => Some(r.content.clone()),
+                _ => None,
+            })
+    }
+
+    /// Drop per-thread sub-agent observation state and close its tabs.
+    fn clear_subagent_observation(&mut self) {
+        self.subagent_panels.clear();
+        self.subagent_transcripts.clear();
+        let before = self.right_tabs.len();
+        // Bulk removal shifts surviving tabs left by the number of dropped
+        // tabs that sat before the active index; a plain OOB clamp would land
+        // on the wrong tab when several sub-agent tabs precede it.
+        let removed_before_active = self
+            .right_tabs
+            .iter()
+            .take(self.active_right_tab.min(before))
+            .filter(|t| matches!(t, RightTab::Subagent(_)))
+            .count();
+        self.right_tabs
+            .retain(|t| !matches!(t, RightTab::Subagent(_)));
+        if self.right_tabs.len() != before {
+            self.active_right_tab = self
+                .active_right_tab
+                .saturating_sub(removed_before_active)
+                .min(self.right_tabs.len().saturating_sub(1));
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+        }
     }
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
@@ -6030,29 +6170,38 @@ impl Workspace {
                             .unwrap_or_default();
                         Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
                     }
+                    RightTab::Subagent(id) => {
+                        let title = self
+                            .subagent_panels
+                            .get(id)
+                            .map(|p| p.read(cx).title().to_string())
+                            .unwrap_or_default();
+                        Tab::new().label(title)
+                    }
                 };
                 // Every observational/preview tab carries a close affordance;
                 // the Editor tab keeps its keyboard toggle (`ToggleEditor` /
                 // `CloseEditor`).
                 match tab {
-                    RightTab::Browser(_) | RightTab::Member(_) => base.suffix(
-                        gpui::div()
-                            .id(("right-tab-close", ix))
-                            .cursor_pointer()
-                            .child(
-                                Icon::new(IconName::Close)
-                                    .xsmall()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            // Stop the click from also selecting the tab
-                            // underneath the ×.
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_right_tab(ix, window, cx);
-                            })),
-                    ),
+                    RightTab::Browser(_) | RightTab::Member(_) | RightTab::Subagent(_) => base
+                        .suffix(
+                            gpui::div()
+                                .id(("right-tab-close", ix))
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(IconName::Close)
+                                        .xsmall()
+                                        .text_color(theme.muted_foreground),
+                                )
+                                // Stop the click from also selecting the tab
+                                // underneath the ×.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_right_tab(ix, window, cx);
+                                })),
+                        ),
                     RightTab::Editor => base,
                 }
             })
@@ -6167,6 +6316,11 @@ impl Workspace {
                         Some(RightTab::Member(name)) => self
                             .member_panels
                             .get(&name)
+                            .map(|p| p.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Subagent(id)) => self
+                            .subagent_panels
+                            .get(&id)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
                         None => gpui::div().into_any_element(),

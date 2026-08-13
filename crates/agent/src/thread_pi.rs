@@ -130,10 +130,20 @@ pub enum SubagentChildEvent {
     Text(String),
     /// Assistant thinking delta from the child.
     Thinking(String),
-    /// The child started a tool call (name + one-field argument hint).
-    ToolStart { name: String, summary: Option<String> },
+    /// The child started a tool call; `id` is the child session's tool-call
+    /// id so observers can pair start/end under parallel child execution.
+    ToolStart {
+        id: String,
+        name: String,
+        /// (argument key, truncated value) hint, e.g. `("path", "src/x.rs")`.
+        hint: Option<(String, String)>,
+    },
     /// The child's tool call finished.
-    ToolEnd { name: String, is_error: bool },
+    ToolEnd {
+        id: String,
+        name: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug)]

@@ -2542,33 +2542,34 @@ fn agent_status_indicator(status: ToolCallStatus, theme: &Theme) -> gpui::AnyEle
 
 /// Render a sub-agent task as a single-line clickable item:
 /// `[status_icon] {subagent_type} · {description}`.
-/// No expand/collapse, no inline body, no metrics chip. Clicking is a no-op
-/// today — the read-only sub-agent observation panel was retired with the
-/// manox harness and has not been re-wired for pi.
+/// No expand/collapse, no inline body, no metrics chip. Clicking opens the
+/// sub-agent's observation panel in the right pane (live transcript while
+/// running, final answer after a reload).
 pub fn render_agent_task(
     item: &AgentTaskItem,
     ix: usize,
     theme: &Theme,
-    _agent_ctx: Option<&AgentTaskCtx>,
+    agent_ctx: Option<&AgentTaskCtx>,
     _tool_ctx: Option<&ToolCallCtx>,
     _cx: &mut App,
 ) -> gpui::AnyElement {
     let icon_el = agent_status_indicator(item.status, theme);
 
-    // Build the display title: "Type · Description", falling back gracefully.
-    let display_title = if item.description.is_empty() {
-        if item.subagent_type.is_empty() {
-            item.id.clone()
-        } else {
-            item.subagent_type.clone()
-        }
-    } else if item.subagent_type.is_empty() {
-        item.description.clone()
-    } else {
-        format!("{} · {}", item.subagent_type, item.description)
-    };
+    // "Type · topic"; the call id is the last resort when both are empty.
+    let display_title =
+        crate::views::subagents::task_display_title(&item.subagent_type, &item.description)
+            .unwrap_or_else(|| item.id.clone());
 
     let tooltip_text = display_title.clone();
+    let open_target = agent_ctx.map(|ctx| {
+        (
+            ctx.weak.clone(),
+            item.id.clone(),
+            item.subagent_type.clone(),
+            item.description.clone(),
+            item.status,
+        )
+    });
     let row = h_flex()
         .id(("agent-row", ix))
         .debug_selector(move || format!("message-overflow-agent-row-{ix}"))
@@ -2582,7 +2583,16 @@ pub fn render_agent_task(
         .cursor_pointer()
         .hover(|s| s.bg(theme.secondary.opacity(0.5)))
         .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
-        .on_click(move |_, _window, _cx: &mut App| {});
+        .on_click(move |_, _window, cx| {
+            let Some((weak, id, subagent_type, topic, status)) = &open_target else {
+                return;
+            };
+            if let Some(ws) = weak.upgrade() {
+                ws.update(cx, |ws, cx| {
+                    ws.open_subagent_tab(id, subagent_type, topic, *status, cx);
+                });
+            }
+        });
 
     row.child(icon_el)
         .child(

@@ -113,9 +113,14 @@ impl MemberPanel {
                         cx,
                     )
                 });
-                // New content arrives: resume tail-follow unless the user has
-                // scrolled up to inspect history.
-                this.stick_to_bottom = true;
+                // Re-arm tail-follow only while the viewport is still near
+                // the bottom; a user who scrolled up to read history must not
+                // be yanked back by the next event.
+                let off = this.scroll_handle.offset().y;
+                let max = this.scroll_handle.max_offset().y;
+                if (max + off).abs() < px(20.) {
+                    this.stick_to_bottom = true;
+                }
                 cx.notify();
             });
             this.sub = Some(member_sub);
@@ -344,8 +349,8 @@ impl Render for MemberPanel {
                 .on_scroll_wheel(
                     cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
                         // An upward wheel breaks tail-follow so the user can
-                        // scroll back through history; re-arm by scrolling back
-                        // to the bottom.
+                        // scroll back through history; the next event re-arms
+                        // it once the viewport is back near the bottom.
                         let dy = ev.delta.pixel_delta(window.line_height()).y;
                         if dy > Pixels::ZERO {
                             this.stick_to_bottom = false;

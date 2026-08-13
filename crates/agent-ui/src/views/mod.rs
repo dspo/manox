@@ -12,6 +12,7 @@ pub mod plugin_manager;
 pub mod popup_menu;
 pub mod settings;
 pub mod sidebar;
+pub mod subagent_panel;
 pub mod subagents;
 pub mod title_menu;
 pub mod turn_navigator;
