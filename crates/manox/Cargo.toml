@@ -9,7 +9,9 @@ name = "manox"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["message-list-gpui-component"]
+message-list-gpui-component = ["agent-ui/message-list-gpui-component"]
+message-list-gpui-native = ["agent-ui/message-list-gpui-native"]
 
 [dependencies]
 gpui.workspace = true

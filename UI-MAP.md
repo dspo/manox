@@ -325,9 +325,9 @@ Wraps [MessageList](#messagelist).
 
 #### MessageList
 
-Virtual list backed by native `gpui::list` (`ListState` held directly on `Workspace`). GPUI owns virtualization, scroll, the per-item height cache, and tail-follow; `ListAlignment::Bottom` gives native chat-log semantics — short histories sit at the viewport bottom, long ones scroll — and `FollowMode::Tail` pins to the live end on each layout while following (disengaging on upward scroll, re-arming at the bottom). `MSG_LIST_OVERDRAW` pre-measures rows below the viewport; a width change invalidates every cached height, and visible rows re-measure every frame so a height that changed without a `remeasure` signal — async image load, font swap, lazy markdown reflow — self-corrects. Count changes are reconciled via `splice` and in-place mutations via `remeasure_items`, both driven from the `ThreadEvent` handler's `ApplyOutcome`. The row callback captures `Conversation` directly and must remain a read-only projection from item index to row; any Workspace-derived row data (currently the ask-card snapshot) is synchronized before constructing the list, never by leasing `Workspace` or updating `MessageItem` during GPUI's row measurement/prepaint pass. Only the visible items render.
+The virtual-list backend is selected at build time. `message-list-gpui-component` is the default and uses gpui-component's `v_virtual_list`; agent-ui measures rendered rows at the definite viewport width, feeds immutable height snapshots into the next frame, explicitly schedules convergence frames when height or viewport geometry changes, and maintains tail-follow without treating content growth as user scrolling. `message-list-gpui-native` retains native `gpui::list` as an A/B fallback. The features are mutually exclusive. Both backends share Workspace's `splice`, `remeasure_items`, jump, thread-switch, and tail-follow call sites, so conversation semantics do not fork. The row callback captures `Conversation` directly and remains a read-only projection from item index to row; Workspace-derived row data (currently the ask-card snapshot) is synchronized before list construction, never during row measurement/prepaint.
 
-> Source: `agent-ui/src/workspace.rs` (`ListState` wiring, `MSG_LIST_OVERDRAW`)
+> Source: `agent-ui/src/workspace.rs`, `agent-ui/src/views/vlist.rs`, `agent-ui/Cargo.toml`
 
 #### MessageItem
 

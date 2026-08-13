@@ -4,6 +4,18 @@
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
 //!
 
+#[cfg(all(
+    feature = "message-list-gpui-component",
+    feature = "message-list-gpui-native"
+))]
+compile_error!("message-list-gpui-component and message-list-gpui-native are mutually exclusive");
+
+#[cfg(not(any(
+    feature = "message-list-gpui-component",
+    feature = "message-list-gpui-native"
+)))]
+compile_error!("enable exactly one message-list backend feature");
+
 pub mod assets;
 pub mod browser_host;
 pub mod chatgpt_app;

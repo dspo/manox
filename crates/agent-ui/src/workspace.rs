@@ -23,11 +23,12 @@ use agent::{Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
-    FollowMode, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_out_quint, prelude::*,
-    px,
+    MouseButton, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
+    anchored, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
+#[cfg(feature = "message-list-gpui-native")]
+use gpui::{FollowMode, ListAlignment, ListOffset, ListState};
 /// Shared across both harnesses: workspace struct fields hold
 /// `Option<Entity<PopupMenu>>` regardless of feature.
 use gpui_component::menu::PopupMenu;
@@ -72,6 +73,8 @@ use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
+#[cfg(feature = "message-list-gpui-component")]
+use crate::views::vlist::{FollowMode, ListOffset, VListState};
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
     ToggleTurnNavigator,
@@ -341,18 +344,15 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll/virtualization state for the message column, held natively by
-    /// `gpui::ListState`. `ListAlignment::Bottom` gives chat-log semantics:
-    /// short histories sit at the bottom, long ones scroll. `FollowMode::Tail`
-    /// pins to the live end on each layout while following, disengages on an
-    /// upward user scroll, and re-arms when a scroll lands back at the bottom.
-    /// `MSG_LIST_OVERDRAW` rows below the viewport are pre-measured; a width
-    /// change invalidates every cached height, and visible rows re-measure
-    /// every frame (so a height change without an explicit signal self-
-    /// corrects). Count changes are reconciled via `splice`, in-place
-    /// mutations via `remeasure_items`, both driven by `ApplyOutcome`. Only
-    /// the visible items render.
+    /// Scroll/virtualization state for the message column. Its concrete type
+    /// is selected at build time: gpui-component is the default backend and
+    /// native `gpui::list` remains available as an A/B fallback. Both expose
+    /// the same count, invalidation, jump, and tail-follow operations to the
+    /// Workspace so conversation event semantics do not fork by backend.
+    #[cfg(feature = "message-list-gpui-native")]
     list_state: ListState,
+    #[cfg(feature = "message-list-gpui-component")]
+    list_state: VListState,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
@@ -459,6 +459,7 @@ const MAIN_MIN_WIDTH: f32 = 160.;
 /// Trailing overdraw for the message list: rows within this many pixels
 /// below the viewport are pre-measured so scrolling never pops an
 /// unmeasured row into view.
+#[cfg(feature = "message-list-gpui-native")]
 const MSG_LIST_OVERDRAW: Pixels = px(2048.);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -625,7 +626,10 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
+            #[cfg(feature = "message-list-gpui-native")]
             list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
+            #[cfg(feature = "message-list-gpui-component")]
+            list_state: VListState::new(0),
             list_count: 0,
             history_rendered: 0,
             view_mode: ViewMode::default(),
@@ -2325,6 +2329,8 @@ impl Workspace {
     /// tail" path (submit, slash command, thread open) — it always re-arms
     /// follow, even if the user had scrolled up to read back.
     fn follow_message_tail(&mut self) {
+        #[cfg(feature = "message-list-gpui-component")]
+        self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
@@ -6269,15 +6275,28 @@ impl Workspace {
                         })
                         // Empty first screen shows the centered hero in place
                         // of the (empty) message list; otherwise a bottom-
-                        // anchored, tail-following native list.
+                        // anchored, tail-following list selected by feature.
                         .children(hero)
                         .children({
-                            // Stable native-list shape: capture the Conversation
-                            // entity directly, as the pre-vlist implementation
-                            // did. The callback reads only the requested item and
-                            // constructs its row; it never leases Workspace and
-                            // never mutates an entity while list measurement is
-                            // in progress.
+                            #[cfg(feature = "message-list-gpui-component")]
+                            {
+                                (!first_screen).then(|| {
+                                    let height = (self.list_state.viewport_h()
+                                        - self.list_state.total_height())
+                                    .max(px(0.));
+                                    gpui::div().h(height).flex_shrink_0()
+                                })
+                            }
+                            #[cfg(feature = "message-list-gpui-native")]
+                            {
+                                None::<gpui::Div>
+                            }
+                        })
+                        .children({
+                            // Both backends share a read-only row factory that
+                            // captures Conversation directly. It never leases
+                            // Workspace or mutates an entity while the selected
+                            // list backend is measuring rows.
                             let conversation = self.conversation.clone();
                             let processor = move |ix: usize, _window: &mut Window, cx: &mut App| {
                                 let item = conversation.read(cx).items().get(ix).cloned();
@@ -6301,7 +6320,10 @@ impl Workspace {
                             };
                             let list_state = self.list_state.clone();
                             let mono_family = theme.mono_font_family.clone();
+                            #[cfg(feature = "message-list-gpui-component")]
+                            let workspace = cx.entity().clone();
                             (!first_screen).then(move || {
+                                #[cfg(feature = "message-list-gpui-native")]
                                 // Native `gpui::list`: it owns virtualization,
                                 // scroll, the per-item height cache, and tail-
                                 // follow. Visible rows re-measure every frame;
@@ -6316,6 +6338,16 @@ impl Workspace {
                                     .h_full()
                                     .min_h_0()
                                     .min_w_0();
+                                #[cfg(feature = "message-list-gpui-component")]
+                                let list_el = crate::views::vlist::vlist(
+                                    workspace,
+                                    list_state,
+                                    move |_workspace, ix, window, cx| processor(ix, window, cx),
+                                )
+                                .w_full()
+                                .h_full()
+                                .min_h_0()
+                                .min_w_0();
                                 // Body typeface: Lilex Light. Every message row
                                 // (assistant, user, reasoning, tool cards, notices)
                                 // inherits from this wrapper div: gpui's List applies

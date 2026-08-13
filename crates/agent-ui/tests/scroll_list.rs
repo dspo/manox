@@ -4,6 +4,8 @@
 //! scroll, and `FollowMode::Tail` re-pins to the end each layout while
 //! following. A regression in the list's scroll
 
+#![cfg(feature = "message-list-gpui-native")]
+
 use std::{cell::RefCell, rc::Rc};
 
 use agent_ui::{Workspace, conversation::ConvItem, views::message::MessageItem};

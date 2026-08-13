@@ -15,6 +15,8 @@ pub mod sidebar;
 pub mod subagents;
 pub mod title_menu;
 pub mod turn_navigator;
+#[cfg(feature = "message-list-gpui-component")]
+pub mod vlist;
 
 use gpui::prelude::*;
 use gpui::{Div, px};

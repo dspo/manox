@@ -8,6 +8,11 @@ publish.workspace = true
 name = "agent_ui"
 path = "src/lib.rs"
 
+[features]
+default = ["message-list-gpui-component"]
+message-list-gpui-component = []
+message-list-gpui-native = []
+
 
 [dependencies]
 anyhow.workspace = true
