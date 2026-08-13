@@ -433,8 +433,14 @@ mod tests {
     }
 
     fn list_md(dir: &str) -> HashSet<String> {
-        std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("read_dir {dir} failed: {e}"))
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            assert!(
+                !std::path::Path::new(dir).exists(),
+                "template path exists but is not a readable directory: {dir}"
+            );
+            return HashSet::new();
+        };
+        entries
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().into_owned())
