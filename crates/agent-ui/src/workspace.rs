@@ -67,6 +67,7 @@ use crate::views::completion::{
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::message::MessageItem;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
@@ -100,7 +101,7 @@ struct PendingAsk {
     selections: Vec<Vec<bool>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardSnapshot {
     pub id: String,
     pub step: usize,
@@ -110,7 +111,7 @@ pub(crate) struct AskCardSnapshot {
     pub selections: Vec<bool>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardQuestion {
     pub question: String,
     pub header: String,
@@ -118,7 +119,7 @@ pub(crate) struct AskCardQuestion {
     pub options: Vec<AskCardOption>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardOption {
     pub label: String,
     pub description: String,
@@ -275,6 +276,10 @@ pub struct Workspace {
     sidebar_width: Pixels,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
+    /// Tool row that currently owns the budgeted ask-card snapshot. Retaining
+    /// the entity lets snapshot synchronization touch at most the old and new
+    /// ask rows instead of scanning the full conversation on every render.
+    ask_snapshot_item: Option<Entity<MessageItem>>,
     /// A completed plan awaiting the user's implement / clear-context verdict,
     /// rendered as the inline plan-review drawer card.
     pending_plan_review: Option<PendingPlanReview>,
@@ -590,6 +595,7 @@ impl Workspace {
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_ask: None,
+            ask_snapshot_item: None,
             pending_plan_review: None,
             pending_plans: HashMap::new(),
             ask_step: 0,
@@ -3726,6 +3732,42 @@ impl Workspace {
         })
     }
 
+    /// Synchronize the one active ask-card snapshot before the native message
+    /// list begins its layout pass. In particular, this must not run from the
+    /// list's row callback: GPUI invokes that callback while measuring and
+    /// prepainting rows, so entity mutation there can dirty the same tree whose
+    /// height cache is currently being rebuilt.
+    fn sync_ask_card_snapshots(&mut self, cx: &mut App) {
+        let next = self.pending_ask.as_ref().and_then(|ask| {
+            let snapshot = self.ask_card_snapshot(&ask.id, cx)?;
+            let ix = self.conversation.read(cx).find_tool(&ask.id, cx)?;
+            let item = self.conversation.read(cx).items().get(ix)?.clone();
+            Some((item, snapshot))
+        });
+
+        if let Some(previous) = self.ask_snapshot_item.take()
+            && next
+                .as_ref()
+                .is_none_or(|(current, _)| current != &previous)
+            && previous.read(cx).ask_snapshot.is_some()
+        {
+            previous.update(cx, |item, cx| {
+                item.ask_snapshot = None;
+                cx.notify();
+            });
+        }
+
+        if let Some((item, snapshot)) = next {
+            if item.read(cx).ask_snapshot.as_ref() != Some(&snapshot) {
+                item.update(cx, |item, cx| {
+                    item.ask_snapshot = Some(snapshot);
+                    cx.notify();
+                });
+            }
+            self.ask_snapshot_item = Some(item);
+        }
+    }
+
     fn pending_ask_has_selection(&self) -> bool {
         self.pending_ask
             .as_ref()
@@ -6188,6 +6230,10 @@ impl Workspace {
                     }),
             );
 
+        // Snapshot Workspace-derived row data before constructing the native
+        // list. Its measurement callback below remains read-only.
+        self.sync_ask_card_snapshots(cx);
+
         // The shared shell provides the sidebar + draggable divider and the
         // mode-switching actions; this mode chains the conversation-only
         // actions and the turn-navigator overlay onto it. The shell's main
@@ -6226,47 +6272,33 @@ impl Workspace {
                         // anchored, tail-following native list.
                         .children(hero)
                         .children({
-                            // `cx.processor` adapts the item closure to
-                            // `gpui::list`'s `FnMut(usize, &mut Window, &mut
-                            // App)` signature; it captures an `Entity<Workspace>`
-                            // internally, so it is built outside the frame
-                            // closure and moved in.
-                            let processor = cx.processor(|this, ix: usize, _window, cx| {
-                                let item = this.conversation.read(cx).items().get(ix).cloned();
+                            // Stable native-list shape: capture the Conversation
+                            // entity directly, as the pre-vlist implementation
+                            // did. The callback reads only the requested item and
+                            // constructs its row; it never leases Workspace and
+                            // never mutates an entity while list measurement is
+                            // in progress.
+                            let conversation = self.conversation.clone();
+                            let processor = move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                let item = conversation.read(cx).items().get(ix).cloned();
                                 match item {
                                     // `flex_shrink_0` guards against any
                                     // available height leaking down the
                                     // flex chain and compressing a row.
-                                    //
-                                    // Budget the ask-card snapshot before
-                                    // rendering: the list element leases
-                                    // the Workspace for the whole closure,
-                                    // so `MessageItem::render` must not
-                                    // read it back. `item` is a distinct
-                                    // entity, safe to lease here.
-                                    Some(item) => {
-                                        let ask = match item.read(cx).kind() {
-                                            ConvItem::ToolCall(t) => {
-                                                this.ask_card_snapshot(t.id.as_str(), cx)
-                                            }
-                                            _ => None,
-                                        };
-                                        item.update(cx, |it, _cx| it.ask_snapshot = ask);
-                                        v_flex()
-                                            .w_full()
-                                            .pt_1()
-                                            .pb_4()
-                                            .flex_shrink_0()
-                                            .min_w_0()
-                                            .child(item)
-                                            .into_any_element()
-                                    }
+                                    Some(item) => v_flex()
+                                        .w_full()
+                                        .pt_1()
+                                        .pb_4()
+                                        .flex_shrink_0()
+                                        .min_w_0()
+                                        .child(item)
+                                        .into_any_element(),
                                     // Index out of range mid-splice (count
                                     // changed between a layout pass and the
                                     // render closure): render an empty row.
                                     None => gpui::div().into_any_element(),
                                 }
-                            });
+                            };
                             let list_state = self.list_state.clone();
                             let mono_family = theme.mono_font_family.clone();
                             (!first_screen).then(move || {
