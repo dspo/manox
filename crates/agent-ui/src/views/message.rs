@@ -2555,18 +2555,10 @@ pub fn render_agent_task(
 ) -> gpui::AnyElement {
     let icon_el = agent_status_indicator(item.status, theme);
 
-    // Build the display title: "Type · Description", falling back gracefully.
-    let display_title = if item.description.is_empty() {
-        if item.subagent_type.is_empty() {
-            item.id.clone()
-        } else {
-            item.subagent_type.clone()
-        }
-    } else if item.subagent_type.is_empty() {
-        item.description.clone()
-    } else {
-        format!("{} · {}", item.subagent_type, item.description)
-    };
+    // "Type · topic"; the call id is the last resort when both are empty.
+    let display_title =
+        crate::views::subagents::task_display_title(&item.subagent_type, &item.description)
+            .unwrap_or_else(|| item.id.clone());
 
     let tooltip_text = display_title.clone();
     let open_target = agent_ctx.map(|ctx| {
