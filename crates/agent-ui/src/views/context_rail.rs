@@ -74,11 +74,6 @@ pub(crate) struct ContextRail {
     /// snapshot auto-collapses when it is long enough; subsequent updates
     /// preserve whatever collapse state the user last chose.
     pub(crate) plan_seen: bool,
-    /// Cached `settings.auto_compact.{enabled,threshold}`, refreshed on
-    /// construction and when the user exits the Settings overlay. Avoids a
-    /// per-frame file read in the context-budget render.
-    pub(crate) cockpit_auto_compact_enabled: bool,
-    pub(crate) cockpit_auto_compact_threshold: f64,
     agents: Vec<SubagentInfo>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
@@ -92,19 +87,13 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(
-        thread: Entity<Thread>,
-        auto_compact_enabled: bool,
-        auto_compact_threshold: f64,
-    ) -> Self {
+    pub(crate) fn new(thread: Entity<Thread>) -> Self {
         Self {
             thread,
             cockpit_phase: CockpitPhase::Idle,
             plan: None,
             cockpit_hide_tasks: false,
             plan_seen: false,
-            cockpit_auto_compact_enabled: auto_compact_enabled,
-            cockpit_auto_compact_threshold: auto_compact_threshold,
             agents: Vec::new(),
             side_calls: Vec::new(),
             main_call: None,
@@ -375,11 +364,19 @@ impl ContextRail {
         let thread = self.thread.read(cx);
         let per_model = thread.per_model_token_usage();
         let per_model_cost = thread.per_model_cost();
-        let effective_tokens = agent::compact::effective_context_tokens(
-            thread.messages(),
-            thread.request_token_usage(),
-            thread.agent_language(),
-        );
+        let effective_tokens = thread
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|message| thread.request_token_usage().get(&message.id))
+            .map(|usage| {
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens)
+                    .saturating_add(usage.cache_read_input_tokens)
+                    .saturating_add(usage.output_tokens)
+            })
+            .unwrap_or(0);
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
