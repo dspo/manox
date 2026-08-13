@@ -154,16 +154,6 @@ pub struct RecoveryFailureData {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct EmptyTurnNudgeData {}
 
-// --- side-call prompts ---
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ApprovalReviewPromptData {
-    pub cwd: String,
-    pub tool_name: String,
-    pub tool_title: String,
-    pub tool_input: String,
-}
-
 // --- title ---
 
 #[derive(Debug, Clone, Serialize)]
