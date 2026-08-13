@@ -8,7 +8,7 @@
 //!
 //! Coordinate model: each selectable leaf block owns a sub-range of a virtual
 //! document built by concatenating leaf texts in paint order. A block reports
-//! its geometry (its `TextLayout` + painted bounds + doc-start offset) to the
+//! its geometry (its public shaped lines + bounds + doc-start offset) to the
 //! per-frame registry during paint; the container's mouse listeners hit-test a
 //! window point against that registry to resolve it to one document-wide byte
 //! index for the anchor/caret. Copy walks the registry entries in order,
@@ -20,7 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
-use gpui::{Bounds, ClipboardItem, Pixels, Point, TextLayout};
+use gpui::{Bounds, ClipboardItem, Pixels, Point, WrappedLine};
 
 use crate::markdown::ast::LinkSpan;
 
@@ -31,11 +31,9 @@ use crate::markdown::ast::LinkSpan;
 pub(crate) struct BlockHit {
     /// Virtual-document byte offset where this block's text begins.
     pub doc_start: usize,
-    /// Absolute-coordinate text layout (the block's `StyledText` layout). Carries
-    /// the exact laid-out text via `.text()`, so copy slices what was painted.
-    pub layout: TextLayout,
-    /// Painted bounds of the block's text run, in window coordinates.
-    pub bounds: Bounds<Pixels>,
+    /// Absolute-coordinate text layout. Carries the exact text and shaped lines
+    /// used for painting, so copy and hit-testing cannot observe stale geometry.
+    pub layout: BlockLayout,
     /// Separator prepended before this leaf when joining copied text across
     /// leaves: `"\n"` for a continuation line within one multi-line block (diff /
     /// conflict line index > 0), `"\n\n"` for a block boundary. The first
@@ -49,6 +47,87 @@ pub(crate) struct BlockHit {
     /// Local link spans within this block's text. A Cmd+click landing inside one
     /// opens the link target; a plain click starts text selection as usual.
     pub link_spans: Vec<LinkSpan>,
+}
+
+/// Public-API text geometry used for selection and link hit-testing. This is
+/// deliberately independent of GPUI's private `TextLayoutInner` cache.
+#[derive(Clone)]
+pub(crate) struct BlockLayout {
+    text: String,
+    lines: Rc<Vec<WrappedLine>>,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+}
+
+impl BlockLayout {
+    pub fn new(
+        text: String,
+        lines: Rc<Vec<WrappedLine>>,
+        line_height: Pixels,
+        bounds: Bounds<Pixels>,
+    ) -> Self {
+        Self {
+            text,
+            lines,
+            line_height,
+            bounds,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.text.clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    pub fn line_height(&self) -> Pixels {
+        self.line_height
+    }
+
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        self.bounds
+    }
+
+    pub fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        if position.y < self.bounds.top() {
+            return Err(0);
+        }
+        let mut origin = self.bounds.origin;
+        let mut start = 0;
+        for line in self.lines.iter() {
+            let bottom = origin.y + line.size(self.line_height).height;
+            if position.y > bottom {
+                origin.y = bottom;
+                start += line.len() + 1;
+            } else {
+                let local = position - origin;
+                return match line.index_for_position(local, self.line_height) {
+                    Ok(ix) => Ok(start + ix),
+                    Err(ix) => Err(start + ix),
+                };
+            }
+        }
+        Err(start.saturating_sub(1))
+    }
+
+    pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let mut origin = self.bounds.origin;
+        let mut start = 0;
+        for line in self.lines.iter() {
+            let end = start + line.len();
+            if index < start {
+                break;
+            } else if index > end {
+                origin.y += line.size(self.line_height).height;
+                start = end + 1;
+            } else {
+                return Some(origin + line.position_for_index(index - start, self.line_height)?);
+            }
+        }
+        None
+    }
 }
 
 /// Document-wide selection state, shared (via `Rc`) between the container
@@ -229,17 +308,17 @@ impl DocSelection {
         let mut best: Option<(usize, Pixels)> = None;
         for hit in blocks.iter() {
             // Inside a block: index_for_position yields the glyph byte index.
-            if hit.bounds.contains(&point) {
+            if hit.layout.bounds().contains(&point) {
                 let ix = index_in_layout(&hit.layout, point);
                 return Some(hit.doc_start + ix.min(layout_len(&hit.layout)));
             }
             // Otherwise track the nearest block boundary for snap-to behavior.
-            let dy = (hit.bounds.center().y - point.y).abs();
+            let dy = (hit.layout.bounds().center().y - point.y).abs();
             if best.map(|(_, d)| dy < d).unwrap_or(true) {
                 // Snap toward the block whose start/end the point is nearest: if
                 // the point is above this block, snap to its start; if below, to
                 // its end (clamped at copy time).
-                let snap = if point.y < hit.bounds.center().y {
+                let snap = if point.y < hit.layout.bounds().center().y {
                     hit.doc_start
                 } else {
                     hit.doc_start + layout_len(&hit.layout)
@@ -342,7 +421,7 @@ fn selected_text(ranges: &[DocRange], start: usize, end: usize) -> Option<String
 /// Byte index of the glyph under a window-coordinate point within one layout,
 /// clamped to the layout's text range. `index_for_position` returns `Ok` on a
 /// glyph and `Err` between glyphs; both carry the closest index.
-fn index_in_layout(layout: &TextLayout, point: Point<Pixels>) -> usize {
+fn index_in_layout(layout: &BlockLayout, point: Point<Pixels>) -> usize {
     match layout.index_for_position(point) {
         Ok(ix) | Err(ix) => ix,
     }
@@ -350,7 +429,7 @@ fn index_in_layout(layout: &TextLayout, point: Point<Pixels>) -> usize {
 
 /// Character count of a layout's text, used to clamp hit indices so a drag past
 /// the last glyph does not overshoot the document.
-fn layout_len(layout: &TextLayout) -> usize {
+fn layout_len(layout: &BlockLayout) -> usize {
     layout.len()
 }
 

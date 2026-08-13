@@ -6,11 +6,21 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use agent::ToolCallStatus;
+use agent_ui::{
+    Workspace,
+    conversation::{
+        ActivityEntry, ConvItem, ThinkingContainer, ToolCallItem, UserMessageDisplayState,
+    },
+    views::message::MessageItem,
+};
 use gpui::{
     AnyWindowHandle, AppContext as _, Context, FollowMode, InteractiveElement as _, IntoElement,
-    ListAlignment, ListState, ParentElement as _, Pixels, Render, Styled as _, TestAppContext,
-    Window, WindowHandle, div, list, px,
+    ListAlignment, ListState, Modifiers, MouseButton, ParentElement as _, Pixels, Render,
+    Styled as _, TestAppContext, VisualTestContext, Window, WindowHandle, div, list, px, size,
 };
+use gpui_component::ActiveTheme as _;
+use manox_components::markdown::{Markdown, PanelKind, TerminalPanel};
 
 struct ListProbe {
     state: ListState,
@@ -152,5 +162,510 @@ async fn list_remeasures_visible_rows_each_frame(cx: &mut TestAppContext) {
         state.max_offset_for_scrollbar().y,
         px(140.),
         "a visible row's height change must self-correct without remeasure"
+    );
+}
+
+#[gpui::test]
+async fn list_clamps_scroll_anchor_when_visible_row_shrinks(cx: &mut TestAppContext) {
+    let (window, body, state) = draw_list(cx, vec![px(800.), px(40.), px(40.)], px(100.));
+    state.set_follow_mode(FollowMode::Normal);
+    state.scroll_to(gpui::ListOffset {
+        item_ix: 0,
+        offset_in_item: px(700.),
+    });
+    redraw(cx, window.into());
+
+    body.borrow_mut()[0] = px(80.);
+    redraw(cx, window.into());
+
+    let top = state.logical_scroll_top();
+    assert!(
+        top.item_ix > 0 || top.offset_in_item <= px(80.),
+        "scroll anchor remained outside the shrunken row: {top:?}"
+    );
+}
+
+struct PersistentMarkdownRow {
+    markdown: gpui::Entity<Markdown>,
+}
+
+impl Render for PersistentMarkdownRow {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        agent_ui::views::centered(self.markdown.clone())
+    }
+}
+
+struct MarkdownListProbe {
+    state: ListState,
+    rows: Vec<gpui::Entity<PersistentMarkdownRow>>,
+}
+
+impl Render for MarkdownListProbe {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        list(self.state.clone(), move |ix, _window, _cx| {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex_shrink_0()
+                .debug_selector(move || format!("markdown-list-row-{ix}"))
+                .child(rows[ix].clone())
+                .into_any_element()
+        })
+        .w_full()
+        .h_full()
+        .min_h_0()
+        .min_w_0()
+    }
+}
+
+fn markdown_rows(
+    cx: &mut TestAppContext,
+    first: gpui::Entity<Markdown>,
+) -> (
+    gpui::Entity<PersistentMarkdownRow>,
+    gpui::Entity<PersistentMarkdownRow>,
+) {
+    let tail = cx.new(|cx| Markdown::new("markdown-tail", "tail message").theme(cx.theme()));
+    (
+        cx.new(|_| PersistentMarkdownRow { markdown: first }),
+        cx.new(|_| PersistentMarkdownRow { markdown: tail }),
+    )
+}
+
+#[gpui::test]
+async fn list_measures_persistent_wrapped_markdown_rows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let long = (0..80)
+        .map(|ix| format!("- item {ix}: 这是一段需要在确定宽度下换行的 markdown 内容。"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let markdown = cx.new(|cx| Markdown::new("long-markdown", long).theme(cx.theme()));
+    let (first, tail) = markdown_rows(cx, markdown);
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        move |_, _| MarkdownListProbe {
+            state,
+            rows: vec![first, tail],
+        }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let first = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("first row");
+    let tail = visual
+        .debug_bounds("markdown-list-row-1")
+        .expect("tail row");
+    assert!(
+        first.size.height > px(600.),
+        "long markdown was under-measured: {first:?}"
+    );
+    assert!(
+        first.bottom() <= tail.top(),
+        "markdown rows overlap: first={first:?}, tail={tail:?}"
+    );
+}
+
+#[gpui::test]
+async fn list_remeasures_streaming_markdown_child_growth(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let prefix = "# Plan\n\nInitial paragraph.\n".to_string();
+    let markdown = cx.new(|cx| {
+        Markdown::new("streaming-plan", prefix.clone())
+            .theme(cx.theme())
+            .streaming(true)
+    });
+    let (first, tail) = markdown_rows(cx, markdown.clone());
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        move |_, _| MarkdownListProbe {
+            state,
+            rows: vec![first, tail],
+        }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let suffix = (0..100)
+        .map(|ix| format!("\n## Section {ix}\n\n- streamed wrapped content {ix}\n"))
+        .collect::<String>();
+    markdown.update(&mut visual.cx, |markdown, cx| {
+        markdown.replace(format!("{prefix}{suffix}"), cx)
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let first = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("plan row");
+    let tail = visual
+        .debug_bounds("markdown-list-row-1")
+        .expect("tail row");
+    assert!(
+        first.size.height > px(600.),
+        "streamed markdown was under-measured: {first:?}"
+    );
+    assert!(
+        first.bottom() <= tail.top(),
+        "streamed markdown overlaps tail: first={first:?}, tail={tail:?}"
+    );
+}
+
+struct MessageItemListProbe {
+    state: ListState,
+    rows: Vec<gpui::Entity<MessageItem>>,
+}
+
+impl Render for MessageItemListProbe {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let mono_family = cx.theme().mono_font_family.clone();
+        list(self.state.clone(), move |ix, _window, _cx| {
+            div()
+                .w_full()
+                .pt_1()
+                .pb_4()
+                .min_w_0()
+                .flex_shrink_0()
+                .debug_selector(move || format!("message-item-list-row-{ix}"))
+                .child(rows[ix].clone())
+                .into_any_element()
+        })
+        .w_full()
+        .h_full()
+        .min_h_0()
+        .min_w_0()
+        .font_family(mono_family)
+        .font_weight(gpui::FontWeight::LIGHT)
+    }
+}
+
+#[gpui::test]
+async fn list_remeasures_real_message_item_when_markdown_child_grows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let prefix = "# Plan\n\nInitial paragraph.\n".to_string();
+    let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+    let plan = cx.new(|_| {
+        MessageItem::new(
+            ConvItem::Assistant {
+                text: prefix.clone(),
+                streaming: true,
+                token_usage: None,
+                activity_summary: None,
+            },
+            "DeepSeek".into(),
+            0,
+            weak.clone(),
+        )
+    });
+    let tail = cx.new(|_| {
+        MessageItem::new(
+            ConvItem::Assistant {
+                text: "tail message".into(),
+                streaming: false,
+                token_usage: None,
+                activity_summary: None,
+            },
+            "DeepSeek".into(),
+            1,
+            weak,
+        )
+    });
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        let plan = plan.clone();
+        move |_, _| MessageItemListProbe {
+            state,
+            rows: vec![plan, tail],
+        }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let suffix = (0..100)
+        .map(|ix| format!("\n## Section {ix}\n\n- streamed wrapped content for item {ix}\n"))
+        .collect::<String>();
+    let full = format!("{prefix}{suffix}");
+    plan.update(&mut visual.cx, |item, cx| {
+        if let ConvItem::Assistant { text, .. } = item.kind_mut() {
+            *text = full.clone();
+        }
+        // Only the persistent Markdown child is notified by `update_text`.
+        item.update_text(&full, cx);
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let plan = visual
+        .debug_bounds("message-item-list-row-0")
+        .expect("plan message row");
+    let tail = visual
+        .debug_bounds("message-item-list-row-1")
+        .expect("tail message row");
+    assert!(
+        plan.size.height > px(600.),
+        "plan row was under-measured: {plan:?}"
+    );
+    assert!(
+        plan.bottom() <= tail.top(),
+        "MessageItem rows overlap: plan={plan:?}, tail={tail:?}"
+    );
+}
+
+fn production_rows(cx: &mut TestAppContext) -> Vec<gpui::Entity<MessageItem>> {
+    let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+    let mut activity = ThinkingContainer::new();
+    activity.accepting_entries = false;
+    activity.streaming = false;
+    activity.collapsed = false;
+    activity.user_toggled = true;
+    activity.entries = vec![
+        ActivityEntry::Reasoning {
+            text: "我会先检查 tools_param 在 completions 和 responses 两条 wire 的实现。".repeat(8),
+            streaming: false,
+            collapsed: false,
+            user_toggled: true,
+            markdown: None,
+        },
+        ActivityEntry::Tool(ToolCallItem {
+            id: "grep-properties".into(),
+            name: "Bash".into(),
+            title: "$ grep -rn properties ~/projects/github/pi/packages/*/src/*.ts".into(),
+            status: ToolCallStatus::Success,
+            output: (0..30)
+                .map(|ix| format!("packages/protocol/src/schemas.ts:{ix}: Type.Object(properties)"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+            input: serde_json::json!({"command": "grep -rn properties"}),
+            streaming: false,
+            collapsed: false,
+            user_toggled: true,
+            panel: None,
+        }),
+    ];
+    vec![
+        ConvItem::Assistant {
+            text: "所以这不是模型能力问题，而是 responses wire 独享的端点校验差异。".repeat(18),
+            streaming: false,
+            token_usage: None,
+            activity_summary: None,
+        },
+        ConvItem::User {
+            text: "需要修本项目吗？".into(),
+            images: Vec::new(),
+            meta: None,
+            display_state: UserMessageDisplayState::Normal,
+        },
+        ConvItem::Thinking(activity),
+        ConvItem::Assistant {
+            text: "需要。这是 manox 自己的 bug，上游修不到也不该修。".repeat(20),
+            streaming: false,
+            token_usage: None,
+            activity_summary: None,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ix, kind)| {
+        cx.new(|_| MessageItem::new(kind, "deepseek-v4-flash".into(), ix, weak.clone()))
+    })
+    .collect()
+}
+
+#[gpui::test]
+async fn production_rows_do_not_overlap_on_consecutive_frames(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let rows = production_rows(cx);
+    let state = ListState::new(rows.len(), ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(4000.)), {
+        let state = state.clone();
+        move |_, _| MessageItemListProbe { state, rows }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+        let rows = (0..4)
+            .map(|ix| {
+                visual
+                    .debug_bounds(match ix {
+                        0 => "message-item-list-row-0",
+                        1 => "message-item-list-row-1",
+                        2 => "message-item-list-row-2",
+                        _ => "message-item-list-row-3",
+                    })
+                    .expect("production row")
+            })
+            .collect::<Vec<_>>();
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].bottom() <= pair[1].top(),
+                "production rows overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+}
+
+#[gpui::test]
+async fn production_list_recovers_after_narrow_width_without_blank_range(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let rows = production_rows(cx);
+    let state = ListState::new(rows.len(), ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        move |_, _| MessageItemListProbe { state, rows }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+    visual.simulate_resize(size(px(1.), px(600.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+    assert!(
+        state.max_offset_for_scrollbar().y < px(100_000.),
+        "narrow frame poisoned the list with an explosive scroll range"
+    );
+
+    visual.simulate_resize(size(px(760.), px(600.)));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+    let tail = visual
+        .debug_bounds("message-item-list-row-3")
+        .expect("tail row is visible after resize recovery");
+    assert!(tail.bottom() <= px(600.));
+    assert!(state.is_scrolled_to_end().unwrap_or(true));
+}
+
+struct TerminalListProbe {
+    state: ListState,
+    panel: gpui::Entity<TerminalPanel>,
+    tail: gpui::Entity<Markdown>,
+}
+
+impl Render for TerminalListProbe {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = self.panel.clone();
+        let tail = self.tail.clone();
+        list(self.state.clone(), move |ix, _window, _cx| {
+            div()
+                .w_full()
+                .min_w_0()
+                .flex_shrink_0()
+                .debug_selector(move || format!("terminal-list-row-{ix}"))
+                .child(if ix == 0 {
+                    panel.clone().into_any_element()
+                } else {
+                    tail.clone().into_any_element()
+                })
+                .into_any_element()
+        })
+        .w_full()
+        .h_full()
+        .min_h_0()
+        .min_w_0()
+    }
+}
+
+#[gpui::test]
+async fn list_measures_persistent_terminal_panel_rows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let output = (0..100)
+        .map(|ix| format!("line {ix}: terminal output with enough text to wrap at the list width"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let panel = cx.new(|cx| {
+        let mut panel = TerminalPanel::new(PanelKind::Plain, None, None, cx.theme());
+        panel.set_streaming(true, cx);
+        panel.set_output(output, cx);
+        panel
+    });
+    let tail = cx.new(|cx| Markdown::new("terminal-tail", "assistant tail").theme(cx.theme()));
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        move |_, _| TerminalListProbe { state, panel, tail }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let panel = visual
+        .debug_bounds("terminal-list-row-0")
+        .expect("terminal panel row");
+    let tail = visual
+        .debug_bounds("terminal-list-row-1")
+        .expect("terminal tail row");
+    assert!(
+        panel.size.height > px(600.),
+        "terminal panel was under-measured: {panel:?}"
+    );
+    assert!(
+        panel.bottom() <= tail.top(),
+        "terminal panel overlaps tail: panel={panel:?}, tail={tail:?}"
+    );
+}
+
+#[gpui::test]
+async fn terminal_load_more_remeasures_row_without_overlap(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let output = (0..100)
+        .map(|ix| format!("line {ix}: paginated terminal output"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let panel = cx.new(|cx| {
+        let mut panel = TerminalPanel::new(PanelKind::Plain, None, None, cx.theme());
+        panel.set_output(output, cx);
+        panel
+    });
+    let tail = cx.new(|cx| Markdown::new("load-more-tail", "assistant tail").theme(cx.theme()));
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(760.), px(600.)), {
+        let state = state.clone();
+        move |_, _| TerminalListProbe { state, panel, tail }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear());
+    let before = visual
+        .debug_bounds("terminal-list-row-0")
+        .expect("terminal row before load more");
+    let load_more = gpui::point(before.center().x, before.bottom() - px(10.));
+
+    visual.simulate_mouse_down(load_more, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_up(load_more, MouseButton::Left, Modifiers::none());
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear());
+
+    let after = visual
+        .debug_bounds("terminal-list-row-0")
+        .expect("terminal row after load more");
+    let tail = visual
+        .debug_bounds("terminal-list-row-1")
+        .expect("tail row after load more");
+    assert!(
+        after.size.height > before.size.height,
+        "load more did not grow the terminal row"
+    );
+    assert!(
+        after.bottom() <= tail.top(),
+        "expanded terminal row overlaps tail: panel={after:?}, tail={tail:?}"
     );
 }

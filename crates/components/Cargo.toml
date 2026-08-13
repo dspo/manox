@@ -8,6 +8,7 @@ publish.workspace = true
 gpui.workspace = true
 # Reuse the highlighter (SyntaxHighlighter + HighlightTheme) without buying into TextView.
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+log.workspace = true
 # mdast parsing (markdown-rs). Already in Cargo.lock via gpui-component; the
 # workspace declaration pins the same version.
 markdown.workspace = true
