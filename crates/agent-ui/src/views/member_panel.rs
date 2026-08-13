@@ -349,8 +349,8 @@ impl Render for MemberPanel {
                 .on_scroll_wheel(
                     cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
                         // An upward wheel breaks tail-follow so the user can
-                        // scroll back through history; re-arm by scrolling back
-                        // to the bottom.
+                        // scroll back through history; the next event re-arms
+                        // it once the viewport is back near the bottom.
                         let dy = ev.delta.pixel_delta(window.line_height()).y;
                         if dy > Pixels::ZERO {
                             this.stick_to_bottom = false;

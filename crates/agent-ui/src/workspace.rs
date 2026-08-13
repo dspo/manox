@@ -1042,6 +1042,20 @@ impl Workspace {
                         if let Some(panel) = this.subagent_panels.get(&id) {
                             panel.update(cx, |p, cx| p.set_status(*status, cx));
                         }
+                        // A finished run needs no backfill for panels opened
+                        // later (they fall back to the final answer); drop the
+                        // accumulated transcript so long threads do not hold
+                        // every child delta until the thread switch.
+                        if matches!(
+                            *status,
+                            agent::ToolCallStatus::Success
+                                | agent::ToolCallStatus::Error
+                                | agent::ToolCallStatus::Denied
+                                | agent::ToolCallStatus::Cancelled
+                        ) && !this.subagent_panels.contains_key(&id)
+                        {
+                            this.subagent_transcripts.remove(&id);
+                        }
                     }
                     if let ThreadEvent::SubagentChild { id, child } = ev {
                         this.subagent_transcripts
@@ -3560,13 +3574,6 @@ impl Workspace {
             self.set_active_right_tab(ix, cx);
             return;
         }
-        let title = if topic.is_empty() {
-            subagent_type.to_string()
-        } else if subagent_type.is_empty() {
-            topic.to_string()
-        } else {
-            format!("{subagent_type} · {topic}")
-        };
         let backfill = self
             .subagent_transcripts
             .get(id)
@@ -3577,9 +3584,22 @@ impl Workspace {
         } else {
             None
         };
-        let panel = cx.new(|_| {
-            crate::views::subagent_panel::SubagentPanel::new(title, status, &backfill, final_text)
-        });
+        let title = crate::views::subagents::task_display_title(subagent_type, topic)
+            .unwrap_or_else(|| id.to_string());
+        let role = if subagent_type.is_empty() {
+            "sub-agent".to_string()
+        } else {
+            subagent_type.to_string()
+        };
+        let panel = crate::views::subagent_panel::SubagentPanel::new(
+            title,
+            role,
+            status,
+            &backfill,
+            final_text,
+            cx.weak_entity(),
+            cx,
+        );
         self.subagent_panels.insert(id.to_string(), panel);
         self.right_tabs.push(RightTab::Subagent(id.to_string()));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);

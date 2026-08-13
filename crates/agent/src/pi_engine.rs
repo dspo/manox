@@ -2815,24 +2815,40 @@ pub(crate) mod adapt {
                         }
                         "tool_start" => {
                             let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-                            let summary = ev
-                                .get("summary")
+                            let child_id = ev
+                                .get("id")
                                 .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+                                .unwrap_or_default()
+                                .to_string();
+                            let hint = ev
+                                .get("summary_key")
+                                .and_then(|v| v.as_str())
+                                .map(|k| k.to_string())
+                                .zip(
+                                    ev.get("summary")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                );
                             events.push(ThreadEvent::SubagentChild {
                                 id: tool_call_id.clone(),
                                 child: crate::thread::SubagentChildEvent::ToolStart {
+                                    id: child_id,
                                     name: name.to_string(),
-                                    summary: summary.clone(),
+                                    hint: hint.clone(),
                                 },
                             });
-                            events.push(activity(match summary {
-                                Some(s) => format!("▸ {name} {s}"),
+                            events.push(activity(match hint {
+                                Some((_, s)) => format!("▸ {name} {s}"),
                                 None => format!("▸ {name}"),
                             }));
                         }
                         "tool_end" => {
                             let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
+                            let child_id = ev
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
                             let is_error = ev
                                 .get("is_error")
                                 .and_then(|v| v.as_bool())
@@ -2840,6 +2856,7 @@ pub(crate) mod adapt {
                             events.push(ThreadEvent::SubagentChild {
                                 id: tool_call_id.clone(),
                                 child: crate::thread::SubagentChildEvent::ToolEnd {
+                                    id: child_id,
                                     name: name.to_string(),
                                     is_error,
                                 },
@@ -3407,7 +3424,7 @@ mod tests {
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({}),
                 partial_result: serde_json::json!({
-                    "subagent_event": { "kind": "tool_start", "tool": "Read", "summary": "src/main.rs" }
+                    "subagent_event": { "kind": "tool_start", "id": "child-1", "tool": "Read", "summary_key": "path", "summary": "src/main.rs" }
                 }),
             },
         );
@@ -3426,15 +3443,16 @@ mod tests {
             other => panic!("expected SubagentProgress, got {other:?}"),
         }
 
-        let end =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+        let end = adapt::agent_event_to_thread_events(
+            &pi::types::AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({}),
                 partial_result: serde_json::json!({
-                    "subagent_event": { "kind": "tool_end", "tool": "Read", "is_error": true }
+                    "subagent_event": { "kind": "tool_end", "id": "child-1", "tool": "Read", "is_error": true }
                 }),
-            });
+            },
+        );
         assert_eq!(end.len(), 2);
         assert!(matches!(
             &end[0],

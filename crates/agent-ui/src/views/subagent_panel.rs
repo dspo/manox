@@ -1,96 +1,77 @@
 //! Read-only observation panel for a single pi sub-agent run.
 //!
+//! The panel renders through the same [`ConversationState`] + message
+//! pipeline as the main conversation: bridged child events are translated
+//! into the shared [`ThreadEvent`] contract (`AgentText` / `AgentThinking` /
+//! `ToolCall` / `ToolResult`), so a sub-agent run reads exactly like a
+//! miniature conversation (assistant bubbles, reasoning folds, tool cards).
+//!
 //! The workspace accumulates the child session's bridged events
-//! ([`agent::SubagentChildEvent`]) per Agent tool-call id and pushes them into
-//! the open panel; opening late backfills from that accumulation. Pi
-//! sub-agent sessions are ephemeral (no persisted child transcript), so a
+//! ([`agent::SubagentChildEvent`]) per Agent tool-call id; opening mid-run
+//! backfills from that accumulation by replaying the translated events.
+//! Pi sub-agent sessions are ephemeral (no persisted child transcript), so a
 //! panel opened after a reload falls back to the Agent tool result's final
 //! text plus a note.
 
-use agent::SubagentChildEvent;
+use std::collections::HashMap;
+
+use agent::Message;
 use agent::ToolCallStatus;
 use agent::i18n;
+use agent::language_model::{MessageContent, TokenUsage};
+use agent::thread::{SubagentChildEvent, ThreadEvent};
 use gpui::prelude::*;
-use gpui::{Context, Pixels, Render, ScrollHandle, Window, px};
-use gpui_component::{ActiveTheme as _, ElementExt as _, Theme, h_flex, v_flex};
+use gpui::{
+    AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, WeakEntity, Window, px,
+};
+use gpui_component::{ActiveTheme as _, ElementExt as _, h_flex, v_flex};
 
+use crate::Workspace;
+use crate::conversation::{ApplyCtx, ConversationState};
 use crate::views::subagents::status_indicator;
 
-/// One rendered transcript line. Text/thinking deltas accumulate into the
-/// trailing line of the same kind; tool lifecycle events are standalone.
-#[derive(Clone, Debug)]
-enum SubagentLine {
-    Text(String),
-    Thinking(String),
-    ToolStart {
-        name: String,
-        summary: Option<String>,
-    },
-    ToolEnd {
-        name: String,
-        is_error: bool,
-    },
-}
-
-/// Deltas append to the trailing line of the same kind so a streamed answer
-/// renders as one block; lifecycle events always start a fresh line.
-fn push_line(lines: &mut Vec<SubagentLine>, child: &SubagentChildEvent) {
+/// Translate one bridged child event into the shared [`ThreadEvent`]
+/// contract. Tool titles go through the same `tool_title` derivation as the
+/// main conversation, and the child call id pairs start/end under parallel
+/// child tool execution.
+fn thread_event_of(child: &SubagentChildEvent) -> ThreadEvent {
     match child {
-        SubagentChildEvent::Text(t) => {
-            if let Some(SubagentLine::Text(buf)) = lines.last_mut() {
-                buf.push_str(t);
-            } else {
-                lines.push(SubagentLine::Text(t.clone()));
+        SubagentChildEvent::Text(text) => ThreadEvent::AgentText(text.clone()),
+        SubagentChildEvent::Thinking(text) => ThreadEvent::AgentThinking(text.clone()),
+        SubagentChildEvent::ToolStart { id, name, hint } => {
+            let input = hint
+                .as_ref()
+                .map(|(key, value)| serde_json::json!({ key: value }));
+            let title_value = input.clone().unwrap_or_default();
+            ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: agent::thread::tool_title(name, &title_value, None),
+                status: ToolCallStatus::Running,
+                input,
             }
         }
-        SubagentChildEvent::Thinking(t) => {
-            if let Some(SubagentLine::Thinking(buf)) = lines.last_mut() {
-                buf.push_str(t);
-            } else {
-                lines.push(SubagentLine::Thinking(t.clone()));
-            }
-        }
-        SubagentChildEvent::ToolStart { name, summary } => lines.push(SubagentLine::ToolStart {
-            name: name.clone(),
-            summary: summary.clone(),
-        }),
-        SubagentChildEvent::ToolEnd { name, is_error } => lines.push(SubagentLine::ToolEnd {
-            name: name.clone(),
+        SubagentChildEvent::ToolEnd { id, is_error, .. } => ThreadEvent::ToolResult {
+            id: id.clone(),
+            output: String::new(),
             is_error: *is_error,
-        }),
+        },
     }
-}
-
-/// Multi-line plain text as one div per source line (gpui has no pre-wrap);
-/// blank lines keep their height via a nbsp.
-fn text_block(text: &str, thinking: bool, theme: &Theme) -> gpui::Div {
-    let mut col = gpui::div().w_full().min_w_0();
-    for line in text.split('\n') {
-        let styled = if thinking {
-            gpui::div()
-                .text_xs()
-                .italic()
-                .text_color(theme.muted_foreground)
-        } else {
-            gpui::div().text_sm().text_color(theme.foreground)
-        };
-        col = col.child(if line.is_empty() {
-            styled.child("\u{00A0}")
-        } else {
-            styled.child(line.to_string())
-        });
-    }
-    col
 }
 
 pub(crate) struct SubagentPanel {
-    /// `{type} · {topic}` display title, also used for the tab label.
+    /// `{type} · {topic}` display title (call id last resort), also the tab
+    /// label.
     title: String,
     status: ToolCallStatus,
-    lines: Vec<SubagentLine>,
-    /// Final-answer fallback for panels opened after a reload, when no live
-    /// transcript was accumulated.
-    final_text: Option<String>,
+    /// The child run rendered as a miniature conversation through the shared
+    /// message pipeline.
+    conversation: Entity<ConversationState>,
+    /// Rendered above the transcript when the panel fell back to the final
+    /// answer (no live transcript survives a reload).
+    final_note: bool,
+    role: String,
+    weak_workspace: WeakEntity<Workspace>,
     scroll_handle: ScrollHandle,
     stick_to_bottom: bool,
 }
@@ -98,22 +79,65 @@ pub(crate) struct SubagentPanel {
 impl SubagentPanel {
     pub(crate) fn new(
         title: String,
+        role: String,
         status: ToolCallStatus,
         backfill: &[SubagentChildEvent],
         final_text: Option<String>,
-    ) -> Self {
-        let mut lines = Vec::with_capacity(backfill.len());
-        for event in backfill {
-            push_line(&mut lines, event);
-        }
-        Self {
+        weak_workspace: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let ctx = ApplyCtx {
+            weak: weak_workspace.clone(),
+            cwd: None,
+        };
+        let final_note = backfill.is_empty() && final_text.is_some();
+        let role_for_conv = role.clone();
+        let conversation = if backfill.is_empty() {
+            match final_text {
+                // Replay the final answer as a one-message conversation so
+                // the fallback renders through the same pipeline.
+                Some(final_text) => {
+                    let messages = vec![Message::assistant(vec![MessageContent::Text(final_text)])];
+                    let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
+                    cx.new(|cx| {
+                        ConversationState::rebuild_from_messages(
+                            &messages,
+                            &empty_usage,
+                            &role_for_conv,
+                            false,
+                            &[],
+                            ctx,
+                            cx,
+                        )
+                    })
+                }
+                None => cx.new(|_| ConversationState::new()),
+            }
+        } else {
+            cx.new(|cx| {
+                let mut conversation = ConversationState::new();
+                for child in backfill {
+                    conversation.apply(
+                        &thread_event_of(child),
+                        &role_for_conv,
+                        None,
+                        ctx.clone(),
+                        cx,
+                    );
+                }
+                conversation
+            })
+        };
+        cx.new(|_| Self {
             title,
             status,
-            lines,
-            final_text,
+            conversation,
+            final_note,
+            role,
+            weak_workspace,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
-        }
+        })
     }
 
     pub(crate) fn title(&self) -> &str {
@@ -121,7 +145,14 @@ impl SubagentPanel {
     }
 
     pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
-        push_line(&mut self.lines, child);
+        let event = thread_event_of(child);
+        let role = self.role.clone();
+        let ctx = ApplyCtx {
+            weak: self.weak_workspace.clone(),
+            cwd: None,
+        };
+        self.conversation
+            .update(cx, |c, cx| c.apply(&event, &role, None, ctx, cx));
         // Re-arm tail-follow only while the viewport is still near the
         // bottom; a user who scrolled up to read history must not be yanked
         // back by the next delta.
@@ -164,6 +195,23 @@ impl Render for SubagentPanel {
                     .child(self.title.clone()),
             );
 
+        let items: Vec<AnyElement> = self
+            .conversation
+            .read(cx)
+            .items()
+            .iter()
+            .cloned()
+            .map(|item| {
+                v_flex()
+                    .pt_1()
+                    .pb_4()
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(item)
+                    .into_any_element()
+            })
+            .collect();
+
         let scroll = self.scroll_handle.clone();
         let weak = cx.weak_entity();
 
@@ -177,58 +225,26 @@ impl Render for SubagentPanel {
             .overflow_x_hidden()
             .track_scroll(&scroll)
             .px_3()
-            .py_2()
-            .gap_2();
+            .py_2();
 
-        if self.lines.is_empty() {
-            match &self.final_text {
-                Some(final_text) => {
-                    body = body
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t("subagent-panel-final-note")),
-                        )
-                        .child(text_block(final_text, false, theme));
-                }
-                None => {
-                    body = body.child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(i18n::t("subagent-panel-waiting")),
-                    );
-                }
-            }
-        } else {
-            for line in &self.lines {
-                body = body.child(match line {
-                    SubagentLine::Text(text) => text_block(text, false, theme),
-                    SubagentLine::Thinking(text) => text_block(text, true, theme),
-                    SubagentLine::ToolStart { name, summary } => {
-                        let label = match summary {
-                            Some(summary) => format!("▸ {name} {summary}"),
-                            None => format!("▸ {name}"),
-                        };
-                        gpui::div()
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground)
-                            .child(label)
-                    }
-                    SubagentLine::ToolEnd { name, is_error } => gpui::div()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(if *is_error {
-                            theme.danger
-                        } else {
-                            theme.success
-                        })
-                        .child(format!("{} {name}", if *is_error { "✗" } else { "✓" })),
-                });
-            }
+        if self.final_note {
+            body = body.child(
+                gpui::div()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("subagent-panel-final-note")),
+            );
         }
+        if items.is_empty() && !self.final_note {
+            body = body.child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("subagent-panel-waiting")),
+            );
+        }
+        body = body.children(items);
 
         let body = body
             .on_prepaint(move |_bounds, _window, cx| {
@@ -248,8 +264,8 @@ impl Render for SubagentPanel {
             .on_scroll_wheel(
                 cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
                     // An upward wheel breaks tail-follow so the user can
-                    // scroll back through history; re-arm by scrolling back
-                    // to the bottom.
+                    // scroll back through history; the next push re-arms it
+                    // once the viewport is back near the bottom.
                     let dy = ev.delta.pixel_delta(window.line_height()).y;
                     if dy > Pixels::ZERO {
                         this.stick_to_bottom = false;
@@ -265,5 +281,55 @@ impl Render for SubagentPanel {
             .text_color(theme.foreground)
             .child(header)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_events_translate_to_shared_thread_events() {
+        match thread_event_of(&SubagentChildEvent::ToolStart {
+            id: "c1".into(),
+            name: "Read".into(),
+            hint: Some(("path".into(), "src/x.rs".into())),
+        }) {
+            ThreadEvent::ToolCall {
+                id,
+                name,
+                title,
+                status,
+                input,
+            } => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "Read");
+                assert_eq!(status, ToolCallStatus::Running);
+                assert!(title.contains("src/x.rs"), "{title}");
+                assert_eq!(input.unwrap()["path"], "src/x.rs");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+
+        match thread_event_of(&SubagentChildEvent::ToolEnd {
+            id: "c1".into(),
+            name: "Read".into(),
+            is_error: true,
+        }) {
+            ThreadEvent::ToolResult { id, is_error, .. } => {
+                assert_eq!(id, "c1");
+                assert!(is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        assert!(matches!(
+            thread_event_of(&SubagentChildEvent::Text("hi".into())),
+            ThreadEvent::AgentText(t) if t == "hi"
+        ));
+        assert!(matches!(
+            thread_event_of(&SubagentChildEvent::Thinking("hmm".into())),
+            ThreadEvent::AgentThinking(t) if t == "hmm"
+        ));
     }
 }
