@@ -1580,17 +1580,7 @@ impl Thread {
         let Some(session_path) = self.active_session_path() else {
             return;
         };
-        tokio::spawn(async move {
-            let mut meta = pi_extensions::session_meta::load(&sessions_dir, &session_path)
-                .await
-                .unwrap_or_default();
-            meta.registry_displays.insert(ordinal, display);
-            if let Err(err) =
-                pi_extensions::session_meta::save(&sessions_dir, &session_path, &meta).await
-            {
-                tracing::warn!(error = %err, "failed to persist registry display text");
-            }
-        });
+        persist_registry_display_spawn(sessions_dir, session_path, ordinal, display);
     }
 
     /// Whether the pi backend restored an existing session at startup.
@@ -1625,6 +1615,25 @@ impl Thread {
     pub fn history_phase(&self) -> HistoryPhase {
         self.history_phase
     }
+}
+
+fn persist_registry_display_spawn(
+    sessions_dir: PathBuf,
+    session_path: PathBuf,
+    ordinal: usize,
+    display: String,
+) -> tokio::task::JoinHandle<()> {
+    crate::runtime::handle().spawn(async move {
+        let mut meta = pi_extensions::session_meta::load(&sessions_dir, &session_path)
+            .await
+            .unwrap_or_default();
+        meta.registry_displays.insert(ordinal, display);
+        if let Err(err) =
+            pi_extensions::session_meta::save(&sessions_dir, &session_path, &meta).await
+        {
+            tracing::warn!(error = %err, "failed to persist registry display text");
+        }
+    })
 }
 
 impl Drop for Thread {
@@ -1778,6 +1787,41 @@ pub(crate) mod tests {
         assert_eq!(ApprovalMode::from_i64(2), ApprovalMode::Danger);
         assert_eq!(ApprovalMode::AutoPilot.as_i64(), 0);
         assert_eq!(ApprovalMode::Danger.as_i64(), 1);
+    }
+
+    /// Registry turns originate on the GPUI main thread, outside Tokio's
+    /// entered context. Persistence must still dispatch through Manox's
+    /// process-global runtime instead of requiring a current reactor.
+    #[gpui::test]
+    fn registry_display_persistence_dispatches_off_runtime(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::runtime::init);
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("session.jsonl");
+        let sessions_dir = dir.path().to_path_buf();
+        let display = "/gitwork:deliver fast".to_string();
+
+        let result = std::panic::catch_unwind(|| {
+            persist_registry_display_spawn(
+                sessions_dir.clone(),
+                session_path.clone(),
+                0,
+                display,
+            )
+        });
+        let task = result.expect("dispatching from the GPUI thread must not require a reactor");
+        crate::runtime::handle().block_on(task).unwrap();
+
+        let meta = crate::runtime::handle()
+            .block_on(pi_extensions::session_meta::load(
+                &sessions_dir,
+                &session_path,
+            ))
+            .unwrap();
+        assert_eq!(
+            meta.registry_displays.get(&0).map(String::as_str),
+            Some("/gitwork:deliver fast")
+        );
     }
 
     /// `LiveHistory` re-mirrors the engine's live transcript into `messages`
