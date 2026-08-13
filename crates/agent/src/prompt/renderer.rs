@@ -74,10 +74,6 @@ const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN: &str =
     include_str!("templates/en/wrapper/escalated_approval_question.tera.md");
 const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/escalated_approval_question.tera.md");
-const TPL_WRAPPER_COMPACTION_PREAMBLE_EN: &str =
-    include_str!("templates/en/wrapper/compaction_preamble.tera.md");
-const TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/compaction_preamble.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM_EN: &str =
     include_str!("templates/en/side_call/approval_system.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM_ZH_CN: &str =
@@ -86,14 +82,6 @@ const TPL_SIDECALL_APPROVAL_USER_EN: &str =
     include_str!("templates/en/side_call/approval_user.tera.md");
 const TPL_SIDECALL_APPROVAL_USER_ZH_CN: &str =
     include_str!("templates/zh-CN/side_call/approval_user.tera.md");
-const TPL_SIDECALL_COMPACT_SYSTEM_EN: &str =
-    include_str!("templates/en/side_call/compact_system.tera.md");
-const TPL_SIDECALL_COMPACT_SYSTEM_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/compact_system.tera.md");
-const TPL_SIDECALL_COMPACT_FINAL_EN: &str =
-    include_str!("templates/en/side_call/compact_final.tera.md");
-const TPL_SIDECALL_COMPACT_FINAL_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/compact_final.tera.md");
 const TPL_TITLE_FIRST_EN: &str = include_str!("templates/en/title/first.tera.md");
 const TPL_TITLE_FIRST_ZH_CN: &str = include_str!("templates/zh-CN/title/first.tera.md");
 const TPL_TITLE_TOPIC_SHIFT_EN: &str = include_str!("templates/en/title/topic_shift.tera.md");
@@ -175,11 +163,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN,
     ),
     (
-        PromptTemplate::WrapperCompactionPreamble,
-        TPL_WRAPPER_COMPACTION_PREAMBLE_EN,
-        TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN,
-    ),
-    (
         PromptTemplate::SideCallApprovalSystem,
         TPL_SIDECALL_APPROVAL_SYSTEM_EN,
         TPL_SIDECALL_APPROVAL_SYSTEM_ZH_CN,
@@ -188,16 +171,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::SideCallApprovalUser,
         TPL_SIDECALL_APPROVAL_USER_EN,
         TPL_SIDECALL_APPROVAL_USER_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallCompactSystem,
-        TPL_SIDECALL_COMPACT_SYSTEM_EN,
-        TPL_SIDECALL_COMPACT_SYSTEM_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallCompactFinalInstruction,
-        TPL_SIDECALL_COMPACT_FINAL_EN,
-        TPL_SIDECALL_COMPACT_FINAL_ZH_CN,
     ),
     (
         PromptTemplate::TitleFirstInstruction,
@@ -429,8 +402,6 @@ mod tests {
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
             PromptTemplate::SideCallApprovalSystem,
-            PromptTemplate::SideCallCompactSystem,
-            PromptTemplate::SideCallCompactFinalInstruction,
             PromptTemplate::TitleFirstInstruction,
         ];
         for lang in [Language::En, Language::ZhCn] {
@@ -458,8 +429,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 23);
-        assert_eq!(REGISTRATIONS.len(), 23);
+        assert_eq!(template::ALL.len(), 20);
+        assert_eq!(REGISTRATIONS.len(), 20);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -639,19 +610,6 @@ mod tests {
                 PromptTemplate::WrapperEscalatedApprovalQuestion,
                 lang,
             );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperCompactionPreamble,
-                    lang,
-                    &crate::prompt::CompactionPreambleData {
-                        summary: "s".to_string(),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperCompactionPreamble,
-                lang,
-            );
-
             // Side-call user prompts.
             assert_clean(
                 &render(

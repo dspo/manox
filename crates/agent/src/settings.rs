@@ -88,14 +88,6 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claude_md_excludes: Vec<String>,
 
-    /// Auto-compaction: summarize older history into a handoff message when the
-    /// live context window fills, so long sessions keep going. The trigger
-    /// threshold is a fraction of the model's `max_token_count`; 0.8 leaves a
-    /// 20% headroom for the output turn that follows. Compaction also fires
-    /// when the estimated request body exceeds 6 MiB. See `compact`.
-    #[serde(default)]
-    pub auto_compact: AutoCompactSettings,
-
     /// Network allowlist for sandboxed bash. Read by
     /// `sandbox::NetworkPolicy::for_project` at registry-build time.
     #[serde(default, skip_serializing_if = "NetworkSettings::is_empty")]
@@ -107,8 +99,7 @@ pub struct Settings {
     #[serde(default)]
     pub context_optimization: ContextOptimizationSettings,
 
-    /// Per-purpose side-call policies: title, approval review, and compaction
-    /// summarization.
+    /// Per-purpose side-call policies: title and approval review.
     #[serde(default)]
     pub side_calls: SideCallsSettings,
 
@@ -252,8 +243,6 @@ pub struct SideCallsSettings {
     pub title: SideCallPolicy,
     #[serde(default)]
     pub approval: SideCallPolicy,
-    #[serde(default)]
-    pub compaction: SideCallPolicy,
 }
 
 /// A side-call policy: which model, reasoning effort, output cap, and
@@ -289,10 +278,6 @@ impl SideCallsSettings {
     /// Resolved approval-review policy.
     pub fn approval_policy(&self) -> SideCallPolicy {
         resolve_side_call_policy(&self.approval, SideCallPolicy::approval_default())
-    }
-    /// Resolved compaction-summarization policy.
-    pub fn compaction_policy(&self) -> SideCallPolicy {
-        resolve_side_call_policy(&self.compaction, SideCallPolicy::compaction_default())
     }
 }
 
@@ -335,15 +320,6 @@ impl SideCallPolicy {
             model: String::new(),
             reasoning_effort: Some("low".into()),
             max_output_tokens: 2048,
-            enabled: true,
-        }
-    }
-
-    pub fn compaction_default() -> Self {
-        Self {
-            model: String::new(),
-            reasoning_effort: Some("medium".into()),
-            max_output_tokens: 4096,
             enabled: true,
         }
     }
@@ -433,25 +409,6 @@ impl Settings {
                     Language::En
                 }
             },
-        }
-    }
-}
-
-/// Auto-compaction knobs. Read at the top of each turn loop iteration; a flip
-/// takes effect on the next turn.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-#[serde(default)]
-pub struct AutoCompactSettings {
-    pub enabled: bool,
-    /// Fraction of `max_token_count` at which a compaction pass fires.
-    pub threshold: f64,
-}
-
-impl Default for AutoCompactSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            threshold: 0.8,
         }
     }
 }
@@ -674,7 +631,6 @@ follow_up_behavior = "Steer"
     fn side_call_presets() {
         assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
         assert_eq!(SideCallPolicy::approval_default().max_output_tokens, 2048);
-        assert_eq!(SideCallPolicy::compaction_default().max_output_tokens, 4096);
     }
 
     #[test]
@@ -717,16 +673,9 @@ code_mode = "off"
 [side_calls.title]
 max_output_tokens = 128
 
-[side_calls.compaction]
-reasoning_effort = "medium"
-max_output_tokens = 4096
 "#;
         let s: Settings = toml::from_str(raw).unwrap();
         assert_eq!(s.context_optimization.tool_discovery, Toggle::Shadow);
         assert_eq!(s.side_calls.title.max_output_tokens, 128);
-        assert_eq!(
-            s.side_calls.compaction.reasoning_effort.as_deref(),
-            Some("medium")
-        );
     }
 }

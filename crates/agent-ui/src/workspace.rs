@@ -16,7 +16,6 @@ use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
 use agent::language_model::StopReason;
-use agent::settings;
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 use agent::{Thread, ThreadEvent, ThreadId, save_thread};
@@ -534,7 +533,6 @@ impl Workspace {
         if let Some(home) = agent::paths::home_dir() {
             cwd = home;
         }
-        let auto_compact = settings::load().auto_compact;
         let thread = { Thread::landing(cwd.clone(), cx) };
 
         let input_state = cx.new(|cx| {
@@ -557,15 +555,8 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
-        let context_rail = {
-            cx.new(|_| {
-                crate::views::context_rail::ContextRail::new(
-                    thread.clone(),
-                    auto_compact.enabled,
-                    auto_compact.threshold,
-                )
-            })
-        };
+        let context_rail =
+            { cx.new(|_| crate::views::context_rail::ContextRail::new(thread.clone())) };
 
         let mut ws = Self {
             cwd,
@@ -2568,12 +2559,8 @@ impl Workspace {
         // running-tool title, and per-model counter state do not apply to the
         // incoming one. The execution plan, unlike the proposed-plan review,
         // IS recoverable: re-derived from the transcript's `UpdatePlan` tool
-        // calls, falling back to the sidecar snapshot once compaction has
-        // summarized those calls away (the facade mirrors the persisted copy
-        // on every `PlanUpdated` / `Ready`). Refresh cached auto-compact
-        // knobs in case the user edited settings while viewing another
-        // thread — cheap, and keeps the budget accurate.
-        let auto_compact = settings::load().auto_compact;
+        // calls, falling back to the independent sidecar snapshot (the facade
+        // mirrors the persisted copy on every `PlanUpdated` / `Ready`).
         let new_thread_for_rail = self.thread.clone();
         let restored_plan = agent::plan::rebuild_from_messages(&messages)
             .or_else(|| self.thread.read(cx).persisted_plan().cloned());
@@ -2584,8 +2571,6 @@ impl Workspace {
             // usage data renders an empty "消费" section (no per-model tree).
             r.thread = new_thread_for_rail;
             r.reset_for_thread_switch(running, cx);
-            r.cockpit_auto_compact_enabled = auto_compact.enabled;
-            r.cockpit_auto_compact_threshold = auto_compact.threshold;
             if let Some(snapshot) = restored_plan {
                 r.set_plan(snapshot, cx);
             }

@@ -154,10 +154,6 @@ pub struct RecoveryFailureData {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct EmptyTurnNudgeData {}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CompactionPreambleData {
-    pub summary: String,
-}
 // --- side-call prompts ---
 
 #[derive(Debug, Clone, Serialize)]

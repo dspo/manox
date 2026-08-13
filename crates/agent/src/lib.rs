@@ -11,7 +11,6 @@ pub mod background_task;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
-pub mod compact;
 pub mod db;
 pub mod file_lock;
 pub mod frontmatter;
