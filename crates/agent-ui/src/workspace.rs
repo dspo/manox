@@ -6363,6 +6363,28 @@ impl Workspace {
                         // Approval overlay (if any)
                         .children(overlay)
                 })
+                // Jump-to-latest floating button, shown only once the viewport
+                // has scrolled away from the live end. `is_at_bottom()` is
+                // `None` before the first frame — count that as at the bottom
+                // so the button never flashes on first paint.
+                .when(self.chat_list.is_at_bottom() == Some(false), |this| {
+                    this.child(
+                        gpui::div()
+                            .absolute()
+                            .bottom(px(88.))
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                Button::new("jump-to-latest")
+                                    .label(i18n::t("message-list-jump-to-latest"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.chat_list.follow_tail();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
                 // Title-bar overlay: absolute top of the conversation column,
                 // painted after the body so the "..." menu isn't covered by
                 // the conversation list.

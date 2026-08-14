@@ -340,6 +340,7 @@ settings-tag-saas = saas
 settings-tag-dspo = dspo
 
 ### workspace.rs
+message-list-jump-to-latest = 回到底部
 slash-plan-desc = 切换 plan 模式（只读调研、plan 文件、结构化批准）；`/plan <提示>` 进入 plan 模式并开始规划该提示
 workspace-input-placeholder = 输入消息，点击发送以开始使用
 workspace-composer-placeholder = 编写 markdown…（Cmd-Enter 发送）

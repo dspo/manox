@@ -390,6 +390,7 @@ settings-tag-saas = saas
 settings-tag-dspo = dspo
 
 ### workspace.rs
+message-list-jump-to-latest = Jump to latest
 slash-plan-desc = Toggle plan mode (read-only research, plan file, structured approval); `/plan <prompt>` enters plan mode and starts planning the prompt
 workspace-input-placeholder = Type a message, then send to begin
 workspace-composer-placeholder = Write markdown… (Cmd-Enter to send)
