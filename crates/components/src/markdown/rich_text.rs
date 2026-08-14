@@ -172,22 +172,19 @@ pub struct RichTextState {
 /// inflating the probe height used by their parent row.
 fn min_content_width(lines: &[WrappedLine]) -> Pixels {
     lines.iter().fold(px(0.), |widest, line| {
-        let glyphs = line
+        let mut glyphs = line
             .unwrapped_layout
             .runs
             .iter()
             .flat_map(|run| run.glyphs.iter())
-            .collect::<Vec<_>>();
-        let mut segment_start = 0;
+            .peekable();
         unicode_linebreak::linebreaks(&line.text).fold(
             widest,
             |widest, (segment_end, _opportunity)| {
                 let mut first_x = None;
                 let mut end_x = None;
-                for (ix, glyph) in glyphs.iter().enumerate() {
-                    if !(segment_start..segment_end).contains(&glyph.index) {
-                        continue;
-                    }
+                while glyphs.peek().is_some_and(|glyph| glyph.index < segment_end) {
+                    let glyph = glyphs.next().unwrap();
                     let ch = line.text[glyph.index..].chars().next().unwrap();
                     if ch.is_whitespace() {
                         continue;
@@ -195,11 +192,10 @@ fn min_content_width(lines: &[WrappedLine]) -> Pixels {
                     first_x.get_or_insert(glyph.position.x);
                     end_x = Some(
                         glyphs
-                            .get(ix + 1)
+                            .peek()
                             .map_or(line.unwrapped_layout.width, |next| next.position.x),
                     );
                 }
-                segment_start = segment_end;
                 match (first_x, end_x) {
                     (Some(first_x), Some(end_x)) => widest.max(end_x - first_x),
                     _ => widest,
@@ -321,15 +317,21 @@ fn measure_shape(
         );
         let next = if is_min_content {
             let width = min_content_width(&unwrapped.lines);
-            shape(
-                text.clone(),
-                runs,
-                font_size,
-                line_height,
-                Some(width),
-                text_style.line_clamp,
-                window,
-            )
+            if width <= px(0.) {
+                let mut unwrapped = unwrapped;
+                unwrapped.size.width = px(0.);
+                unwrapped
+            } else {
+                shape(
+                    text.clone(),
+                    runs,
+                    font_size,
+                    line_height,
+                    Some(width.max(font_size.max(px(1.)))),
+                    text_style.line_clamp,
+                    window,
+                )
+            }
         } else {
             unwrapped
         };
@@ -711,9 +713,6 @@ mod tests {
         let window = cx.add_window(|_, _| Empty);
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.update(|window, _cx| {
-            let text: SharedString = "alpha beta gamma 你好世界 table-cell-content Cargo.toml"
-                .repeat(4)
-                .into();
             let text_style = window.text_style();
             let font_size = text_style.font_size.to_pixels(window.rem_size());
             let line_height = window.pixel_snap(
@@ -721,45 +720,33 @@ mod tests {
                     .line_height
                     .to_pixels(font_size.into(), window.rem_size()),
             );
-            let runs = vec![text_style.to_run(text.len())];
             let constraints = [
                 AvailableSpace::MinContent,
                 AvailableSpace::MaxContent,
                 AvailableSpace::Definite(px(80.)),
                 AvailableSpace::Definite(px(320.)),
             ];
+            let cases = [
+                (
+                    "mixed",
+                    "alpha beta gamma 你好世界 table-cell-content Cargo.toml".repeat(4),
+                ),
+                (
+                    "cjk",
+                    "连续中文内容用于验证确定宽度布局不受固有宽度探针历史影响".repeat(8),
+                ),
+                (
+                    "unbreakable",
+                    format!("https://example.com/{}", "long_segment_".repeat(24)),
+                ),
+            ];
 
-            for second in constraints {
-                let fresh = measure_shape(
-                    &Rc::new(RefCell::new(ShapeCache::default())),
-                    None,
-                    second,
-                    ShapeRequest {
-                        text: &text,
-                        runs: &runs,
-                        text_style: &text_style,
-                        font_size,
-                        line_height,
-                    },
-                    window,
-                );
-                for first in constraints {
-                    let cache = Rc::new(RefCell::new(ShapeCache::default()));
-                    measure_shape(
-                        &cache,
-                        None,
-                        first,
-                        ShapeRequest {
-                            text: &text,
-                            runs: &runs,
-                            text_style: &text_style,
-                            font_size,
-                            line_height,
-                        },
-                        window,
-                    );
-                    let with_history = measure_shape(
-                        &cache,
+            for (case, text) in cases {
+                let text: SharedString = text.into();
+                let runs = vec![text_style.to_run(text.len())];
+                for second in constraints {
+                    let fresh = measure_shape(
+                        &Rc::new(RefCell::new(ShapeCache::default())),
                         None,
                         second,
                         ShapeRequest {
@@ -771,12 +758,76 @@ mod tests {
                         },
                         window,
                     );
-                    assert_eq!(
-                        with_history, fresh,
-                        "measuring {second:?} after {first:?} changed the answer"
-                    );
+                    for first in constraints {
+                        let cache = Rc::new(RefCell::new(ShapeCache::default()));
+                        measure_shape(
+                            &cache,
+                            None,
+                            first,
+                            ShapeRequest {
+                                text: &text,
+                                runs: &runs,
+                                text_style: &text_style,
+                                font_size,
+                                line_height,
+                            },
+                            window,
+                        );
+                        let with_history = measure_shape(
+                            &cache,
+                            None,
+                            second,
+                            ShapeRequest {
+                                text: &text,
+                                runs: &runs,
+                                text_style: &text_style,
+                                font_size,
+                                line_height,
+                            },
+                            window,
+                        );
+                        assert_eq!(
+                            with_history, fresh,
+                            "{case}: measuring {second:?} after {first:?} changed the answer"
+                        );
+                    }
                 }
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn whitespace_min_content_probe_keeps_natural_height(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, _cx| {
+            let text: SharedString = " ".repeat(512).into();
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let line_height = window.pixel_snap(
+                text_style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            );
+            let runs = vec![text_style.to_run(text.len())];
+            let measured = measure_shape(
+                &Rc::new(RefCell::new(ShapeCache::default())),
+                None,
+                AvailableSpace::MinContent,
+                ShapeRequest {
+                    text: &text,
+                    runs: &runs,
+                    text_style: &text_style,
+                    font_size,
+                    line_height,
+                },
+                window,
+            );
+            assert_eq!(measured.width, px(0.));
+            assert!(
+                measured.height <= line_height + px(1.),
+                "whitespace min-content probe exploded vertically: {measured:?}"
+            );
         });
     }
 

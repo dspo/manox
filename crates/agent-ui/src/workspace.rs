@@ -154,11 +154,7 @@ enum ComposerPlacement {
     Footer,
 }
 
-fn composer_placement(
-    editor_open: bool,
-    first_screen: bool,
-    _history_loading: bool,
-) -> ComposerPlacement {
+fn composer_placement(editor_open: bool, first_screen: bool) -> ComposerPlacement {
     if editor_open {
         ComposerPlacement::Hidden
     } else if first_screen {
@@ -166,6 +162,15 @@ fn composer_placement(
     } else {
         ComposerPlacement::Footer
     }
+}
+
+fn editor_can_submit(
+    history_loading: bool,
+    running: bool,
+    has_pending_ask: bool,
+    text: &str,
+) -> bool {
+    !history_loading && !running && !has_pending_ask && !text.trim().is_empty()
 }
 
 struct DeferredUserTurn {
@@ -3702,12 +3707,14 @@ impl Workspace {
 
     /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
-    /// Submit the editor text to the thread, then close the panel and return
-    /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
-        if text.trim().is_empty() || self.pending_ask.is_some() || self.thread.read(cx).is_running()
-        {
+        if !editor_can_submit(
+            self.thread.read(cx).history_phase().is_loading(),
+            self.thread.read(cx).is_running(),
+            self.pending_ask.is_some(),
+            &text,
+        ) {
             return;
         }
         let meta = self.user_turn_meta(cx);
@@ -6060,7 +6067,7 @@ impl Workspace {
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
         let loading = self.thread.read(cx).history_phase().is_loading();
-        let composer_placement = composer_placement(editor_open, first_screen, loading);
+        let composer_placement = composer_placement(editor_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
             - px(SIDEBAR_DIVIDER_WIDTH)
@@ -7135,29 +7142,26 @@ fn truncate_follow_up(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerPlacement, composer_placement};
+    use super::{ComposerPlacement, composer_placement, editor_can_submit};
 
     #[test]
     fn history_restore_keeps_composer_mounted() {
-        assert_eq!(
-            composer_placement(false, true, true),
-            ComposerPlacement::Hero
-        );
-        assert_eq!(
-            composer_placement(false, false, true),
-            ComposerPlacement::Footer
-        );
+        assert_eq!(composer_placement(false, true), ComposerPlacement::Hero);
+        assert_eq!(composer_placement(false, false), ComposerPlacement::Footer);
     }
 
     #[test]
     fn editor_remains_the_only_composer_exclusion() {
-        assert_eq!(
-            composer_placement(true, true, false),
-            ComposerPlacement::Hidden
-        );
-        assert_eq!(
-            composer_placement(true, false, true),
-            ComposerPlacement::Hidden
-        );
+        assert_eq!(composer_placement(true, true), ComposerPlacement::Hidden);
+        assert_eq!(composer_placement(true, false), ComposerPlacement::Hidden);
+    }
+
+    #[test]
+    fn editor_submission_waits_for_authoritative_history() {
+        assert!(!editor_can_submit(true, false, false, "draft"));
+        assert!(editor_can_submit(false, false, false, "draft"));
+        assert!(!editor_can_submit(false, true, false, "draft"));
+        assert!(!editor_can_submit(false, false, true, "draft"));
+        assert!(!editor_can_submit(false, false, false, "   "));
     }
 }

@@ -694,7 +694,7 @@ Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Sel
 
 #### EditorWriteTab
 
-Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area.
+Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area. Cmd/Ctrl+Enter submits only after the active thread's authoritative history is ready; restoring sessions keep the draft intact and ignore the shortcut until then.
 
 > Source: `agent-ui/src/workspace.rs`
 
