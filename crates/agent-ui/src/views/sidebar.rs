@@ -19,7 +19,7 @@ use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, Transformation,
-    WeakEntity, Window, deferred, ease_in_out, percentage, prelude::*, px,
+    WeakEntity, Window, deferred, ease_in_out, linear, percentage, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -1298,7 +1298,7 @@ fn render_thread_item(
                         format!("thread-running-spin-{id}"),
                         Animation::new(Duration::from_millis(1600))
                             .repeat()
-                            .with_easing(gpui::linear),
+                            .with_easing(linear),
                         |el, delta| {
                             el.with_transformation(Transformation::rotate(percentage(delta)))
                         },
