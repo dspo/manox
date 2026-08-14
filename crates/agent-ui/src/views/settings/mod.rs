@@ -36,10 +36,10 @@ const CLICK_FLASH_MS: u64 = 280;
 #[derive(Clone)]
 struct SettingsItem {
     icon: IconName,
-    /// Brand SVG asset path (e.g. `"icons/chatgpt.svg"`). When set, rendered
+    /// Custom SVG asset path (e.g. `"icons/blocks.svg"`). When set, rendered
     /// via `Icon::default().path(...)` in preference to `icon` (same mechanism
     /// as the sidebar's external-session rows).
-    brand_icon: Option<&'static str>,
+    custom_icon: Option<&'static str>,
     label: &'static str,
     trailing: Option<IconName>,
 }
@@ -56,7 +56,8 @@ const GROUPS: &[SettingsGroup] = &[
             SettingsItem::new(IconName::Settings, "settings-item-general", None),
             SettingsItem::new(IconName::Sun, "settings-item-appearance", None),
             SettingsItem::new(IconName::Cpu, "settings-item-config", None),
-            SettingsItem::new(IconName::MemoryStick, "settings-item-models", None),
+            SettingsItem::new(IconName::MemoryStick, "settings-item-models", None)
+                .with_custom_icon("icons/blocks.svg"),
             SettingsItem::new(IconName::Star, "settings-item-personalization", None),
             SettingsItem::new(IconName::Heart, "settings-item-pets", None),
             SettingsItem::new(IconName::Frame, "settings-item-keyboard", None),
@@ -86,9 +87,9 @@ const GROUPS: &[SettingsGroup] = &[
         title: "settings-group-external-tools",
         items: &[
             SettingsItem::new(IconName::Bot, "settings-item-chatgpt-app", None)
-                .with_brand_icon("icons/chatgpt.svg"),
+                .with_custom_icon("icons/chatgpt.svg"),
             SettingsItem::new(IconName::Bot, "settings-item-vscode-app", None)
-                .with_brand_icon("icons/vscode.svg"),
+                .with_custom_icon("icons/vscode.svg"),
         ],
     },
     SettingsGroup {
@@ -108,15 +109,15 @@ impl SettingsItem {
     const fn new(icon: IconName, label: &'static str, trailing: Option<IconName>) -> Self {
         Self {
             icon,
-            brand_icon: None,
+            custom_icon: None,
             label,
             trailing,
         }
     }
 
-    /// Set a brand SVG asset path, rendered in preference to `icon`.
-    const fn with_brand_icon(mut self, path: &'static str) -> Self {
-        self.brand_icon = Some(path);
+    /// Set a custom SVG asset path, rendered in preference to `icon`.
+    const fn with_custom_icon(mut self, path: &'static str) -> Self {
+        self.custom_icon = Some(path);
         self
     }
 }
@@ -423,7 +424,7 @@ impl SettingsView {
                     .active(|s| s.bg(theme.accent.opacity(0.24)))
                     .cursor_pointer()
                     .on_click(on_click)
-                    .child(match it.brand_icon {
+                    .child(match it.custom_icon {
                         Some(path) => Icon::default()
                             .path(path)
                             .small()
