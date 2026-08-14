@@ -3,10 +3,12 @@
 
 import * as vscode from 'vscode';
 import { registerManoxParticipant } from './participant';
+import { registerManoxView } from './view';
 
 export function activate(context: vscode.ExtensionContext): void {
+  registerManoxView(context);
   registerManoxParticipant(context);
-  void vscode.window.showInformationMessage('manox activated — chat with @manox');
+  console.log('manox-vscode activated');
 }
 
 export function deactivate(): void {}

@@ -51,6 +51,20 @@ export function loadCore(): CoreBinding {
   throw lastErr instanceof Error ? lastErr : new Error('manox napi core not found');
 }
 
+let sessionStarted = false;
+
+/**
+ * Ensure the actor has been initialized and a session created. Idempotent
+ * across all entry points (chat participant, sidebar view) so exactly one
+ * session exists on the shared actor thread.
+ */
+export function ensureSession(cwd: string): void {
+  if (sessionStarted) return;
+  sendCommand({ cmd: 'init', cwd });
+  sendCommand({ cmd: 'create_session', cwd });
+  sessionStarted = true;
+}
+
 /**
  * Send a command to the agent actor thread. Returns false when the actor is
  * unavailable (e.g. the channel is closed) so callers can surface the failure

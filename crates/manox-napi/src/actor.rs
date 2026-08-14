@@ -169,6 +169,62 @@ fn handle_command(
                 emit(event_sink, &json.to_string());
             }
         }
+        "list_models" => {
+            let registry = agent::pi_providers::global();
+            let models: Vec<serde_json::Value> = registry
+                .models()
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "name": agent::pi_providers::display_name(m),
+                        "provider": m.provider,
+                    })
+                })
+                .collect();
+            let json = serde_json::json!({"type": "models", "models": models});
+            emit(event_sink, &json.to_string());
+        }
+        "current_model" => {
+            if let Some(thread) = state.thread.clone() {
+                let model = cx.update(|app| thread.read(app).model().cloned());
+                let json = match model {
+                    Some(m) => serde_json::json!({
+                        "type": "current_model",
+                        "id": m.id,
+                        "name": agent::pi_providers::display_name(&m),
+                    }),
+                    None => serde_json::json!({"type": "current_model", "id": null}),
+                };
+                emit(event_sink, &json.to_string());
+            }
+        }
+        "set_model" => {
+            let Some(thread) = state.thread.clone() else {
+                return true;
+            };
+            let Some(id) = cmd["id"].as_str() else {
+                return true;
+            };
+            let registry = agent::pi_providers::global();
+            match pi_extensions::model_ref::resolve_model_ref(&registry, id) {
+                Some(model) => {
+                    cx.update(|app| {
+                        thread.update(app, |t, cx| t.set_model(model.clone(), cx));
+                    });
+                    let json = serde_json::json!({
+                        "type": "model_set",
+                        "id": model.id,
+                        "name": agent::pi_providers::display_name(&model),
+                    });
+                    emit(event_sink, &json.to_string());
+                }
+                None => emit(
+                    event_sink,
+                    r#"{"type":"model_set","error":"unknown model"}"#,
+                ),
+            }
+        }
         "approve" => {
             let Some(thread) = state.thread.clone() else {
                 return true;

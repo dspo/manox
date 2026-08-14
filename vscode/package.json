@@ -12,7 +12,10 @@
     "AI",
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onView:manox.chatView",
+    "onChatParticipant:manox"
+  ],
   "contributes": {
     "chatParticipants": [
       {
@@ -22,7 +25,26 @@
         "description": "manox agent — ask anything, it runs on the native pi kernel",
         "isSticky": true
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "manox",
+          "title": "manox",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "manox": [
+        {
+          "type": "webview",
+          "id": "manox.chatView",
+          "name": "manox",
+          "contextualTitle": "manox"
+        }
+      ]
+    }
   },
   "main": "./out/extension.js",
   "scripts": {

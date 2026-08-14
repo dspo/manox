@@ -2,16 +2,7 @@
 // projecting actor events onto the native chat stream.
 
 import * as vscode from 'vscode';
-import { loadCore, onEvent, sendCommand, type ActorEvent } from './core';
-
-let initialized = false;
-
-function ensureSession(cwd: string): void {
-  if (initialized) return;
-  sendCommand({ cmd: 'init', cwd });
-  sendCommand({ cmd: 'create_session', cwd });
-  initialized = true;
-}
+import { ensureSession, loadCore, onEvent, sendCommand } from './core';
 
 function resolveCwd(): string {
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
