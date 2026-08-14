@@ -291,7 +291,7 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
 #### Body
 
-Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (or the [LoadingIndicator](#loadingindicator) while a session restores) or [MessageArea](#messagearea) + [Footer](#footer).
+Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (with the [LoadingIndicator](#loadingindicator) while an empty session restores) or [MessageArea](#messagearea) + [Footer](#footer).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -308,7 +308,7 @@ Vertically centered welcome area: logo/heading + inline [Composer](#composer).
 
 #### LoadingIndicator
 
-Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown in place of the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer is hidden while loading — input is gated on the thread's `HistoryPhase` until `Ready`; preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`).
+Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown inside the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer mounts immediately below it and accepts draft edits; send remains disabled and keyboard submission is gated on the thread's `HistoryPhase` until `Ready`. Preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`); once the first preview content lands, the composer moves to the [Footer](#footer) without waiting for the authoritative restore.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -325,9 +325,9 @@ Wraps [MessageList](#messagelist).
 
 #### MessageList
 
-Virtual list backed by native `gpui::list` (`gpui::list(list_state, cx.processor(render_item))`, `ListState` held directly on `Workspace`). GPUI owns virtualization, scroll, the per-item height cache, and tail-follow; `ListAlignment::Bottom` gives native chat-log semantics — short histories sit at the viewport bottom, long ones scroll — and `FollowMode::Tail` pins to the live end on each layout while following (disengaging on upward scroll, re-arming at the bottom). `MSG_LIST_OVERDRAW` pre-measures rows below the viewport; a width change invalidates every cached height, and visible rows re-measure every frame so a height that changed without a `remeasure` signal — async image load, font swap, lazy markdown reflow — self-corrects. Count changes are reconciled via `splice` and in-place mutations via `remeasure_items`, both driven from the `ThreadEvent` handler's `ApplyOutcome`. Only the visible items render.
+Virtual list backed by native `gpui::list` (`gpui::list(list_state, render_item)`, `ListState` held directly on `Workspace`). GPUI owns virtualization, scroll, the per-item height cache, and tail-follow; `ListAlignment::Bottom` gives native chat-log semantics — short histories sit at the viewport bottom, long ones scroll — and `FollowMode::Tail` pins to the live end on each layout while following (disengaging on upward scroll, re-arming at the bottom). The row factory captures `Conversation` directly and is strictly read-only during list measurement/prepaint; Workspace-derived ask-card snapshots are synchronized before list construction. `MSG_LIST_OVERDRAW` pre-measures rows below the viewport. Visible rows re-measure every frame, but the pinned official GPUI revision retains off-screen row heights across width changes, so `MessageListWidthInvalidator` observes the final positive list width after layout, invalidates the complete cache with `remeasure_items`, and requests a settling frame while preserving the logical item/offset anchor. Count changes are reconciled via `splice` and in-place mutations via `remeasure_items`, both driven from the `ThreadEvent` handler's `ApplyOutcome`. Only the visible items render. Markdown text rows use Manox's public-API `RichText` leaf rather than GPUI `StyledText`: every width constraint is shaped independently, widths narrower than one em are treated as intrinsic probes, and prepaint reconciles shaping with the final allocated width. This prevents zero-width explosion from entering the list cache and makes painted glyph height match the row allocation without a Zed fork.
 
-> Source: `agent-ui/src/workspace.rs` (`ListState` wiring, `MSG_LIST_OVERDRAW`)
+> Source: `agent-ui/src/workspace.rs` (`ListState` wiring, `MSG_LIST_OVERDRAW`), `components/src/markdown/rich_text.rs` (constraint-safe shaping and paint geometry)
 
 #### MessageItem
 
@@ -413,7 +413,7 @@ Amber badge, `bg:warning/0.12`, braille spinner + "Retry N/M (in Xs)" text. The 
 
 #### 3.2.3 Footer
 
-Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). Hidden entirely while history is loading — no input until the restore lands.
+Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). It remains mounted while non-empty history is restoring so drafting never waits for backend readiness; send stays disabled until the restore lands.
 
 #### Footer
 
@@ -694,7 +694,7 @@ Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Sel
 
 #### EditorWriteTab
 
-Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area.
+Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area. Cmd/Ctrl+Enter submits only after the active thread's authoritative history is ready; restoring sessions keep the draft intact and ignore the shortcut until then.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -892,7 +892,7 @@ First-party selectable text panel (`manox-components::markdown::TerminalPanel`, 
 
 #### Markdown
 
-Self-built stateful markdown renderer (`manox-components::markdown::Markdown`, an `Entity` + `Render`) replacing `gpui_component::TextView::markdown`. Owns the source + an `IncrementalParser` (parse-once: freezes the completed prefix so a streaming append only re-parses the growing tail) + a document-level `DocSelection`. The `Render` builds a focusable vertical flex root mounting a zero-size sentinel as the first child — the sentinel clears the per-frame block registry at paint start, then each block's `RichText` re-registers its geometry during paint; the root's mouse listeners hit-test that registry to drive one continuous selection across paragraph / code / list boundaries, and the key listener copies it on Cmd/Ctrl+C. Click semantics: single click places the anchor + starts a drag; double-click selects the word at the click (a click landing inside a registered inline-code span selects the whole span verbatim); triple-click selects the line. `RichText` composes `StyledText` for shaping/glyph-painting and overlays rounded inline-code washes + this block's slice of the shared selection. Block visuals: paragraphs/headings via `StyledText::with_highlights`; code blocks with line-number gutter + `overflow_x_scroll` + tree-sitter highlighting (highlight result cached per `(lang, content_hash)`); unified-diff blocks with accent wash + left bar; GFM tables with column alignment + horizontal scroll; task-list checkboxes; code/diff block hover copy button. Streaming bodies paint plain text + cursor; the full layout mounts once the stream ends.
+Self-built stateful markdown renderer (`manox-components::markdown::Markdown`, an `Entity` + `Render`) replacing `gpui_component::TextView::markdown`. Owns the source + an `IncrementalParser` (parse-once: freezes the completed prefix so a streaming append only re-parses the growing tail) + a document-level `DocSelection`. The `Render` builds a focusable vertical flex root mounting a zero-size sentinel as the first child — the sentinel clears the per-frame block registry at paint start, then each block's `RichText` re-registers its geometry during paint; the root's mouse listeners hit-test that registry to drive one continuous selection across paragraph / code / list boundaries, and the key listener copies it on Cmd/Ctrl+C. Click semantics: single click places the anchor + starts a drag; double-click selects the word at the click (a click landing inside a registered inline-code span selects the whole span verbatim); triple-click selects the line. `RichText` is a Manox-owned public-GPUI leaf using `shape_text` + `WrappedLine` for both measurement and paint; min-content and max-content probe answers live in dedicated cache slots and never replace the exact-width layout used for paint, and min-content width comes from shaped glyph segments partitioned by Unicode line-break opportunities. The same definite-width geometry drives selection/link hit testing; it does not use GPUI `StyledText`'s old constraint cache. Block visuals: paragraphs/headings use highlighted `RichText`; code blocks have a line-number gutter + `overflow_x_scroll` + tree-sitter highlighting (highlight result cached per `(lang, content_hash)`); unified-diff blocks have an accent wash + left bar; GFM tables have column alignment + horizontal scroll; task-list checkboxes; code/diff block hover copy button. Streaming bodies paint plain text + cursor; the full layout mounts once the stream ends.
 
 #### TurnFrame
 

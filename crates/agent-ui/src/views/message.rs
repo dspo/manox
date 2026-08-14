@@ -173,9 +173,9 @@ pub struct MessageItem {
     /// rows such as `AgentTask` to open their peer right-pane view.
     weak_workspace: WeakEntity<Workspace>,
     markdown: Option<Entity<Markdown>>,
-    /// Ask-card snapshot budgeted by the list render closure each frame so
-    /// `render` never reads the owning `Workspace` (the list element leases it
-    /// for the duration of the render). Written by `Workspace`'s list closure.
+    /// Ask-card snapshot budgeted by `Workspace` before the native list starts
+    /// measuring rows, so `render` never reads the owning `Workspace` and the
+    /// list callback remains read-only.
     pub(crate) ask_snapshot: Option<AskCardSnapshot>,
 }
 

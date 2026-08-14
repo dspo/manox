@@ -172,6 +172,7 @@ unic-langid = "0.9"
 # tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"
+unicode-linebreak = "0.1.5"
 
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
@@ -193,16 +194,6 @@ parking_lot = "0.12"
 # psm 用 stacker 的版本（对齐 gpui-component）
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
-
-# Fork of zed-industries/zed carrying the StyledText zero-width guard
-# (crates/gpui/src/elements/text.rs). Patching the upstream URL unifies
-# every gpui/gpui_platform resolution — including the ones gpui-component
-# re-declares from the same URL+rev — onto the fork, so no source split
-# between manox and gpui-component. Drop this patch once the guard lands
-# upstream at the rev manox pins.
-[patch."https://github.com/zed-industries/zed"]
-gpui = { git = "https://github.com/dspo/zed", rev = "15fae475322fcf4b688ef9fde9bbeb0064ed4e5c" }
-gpui_platform = { git = "https://github.com/dspo/zed", rev = "15fae475322fcf4b688ef9fde9bbeb0064ed4e5c" }
 
 # gpui 在 debug 下也需要 opt-level 3，否则渲染极慢（对齐 gpui-component）
 [profile.dev.package]

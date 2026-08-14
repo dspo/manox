@@ -13,11 +13,13 @@
 //! child — the sentinel clears the per-frame block registry at paint start, then
 //! each block's `RichText` re-registers its geometry during paint. The root's
 //! mouse listeners hit-test against that registry to drive the shared
-//! `DocSelection`; the key listener copies it. `RichText` composes `StyledText`
-//! for shaping/glyph-painting and overlays inline-code foreground colors + the
-//! document-selection slice for the block. The base font/color is inherited from
-//! `window.text_style()` (set by the parent `div`'s `.text_base()`/`.text_color()`/…)
-//! at layout time, so the renderer never constructs a `TextStyle`.
+//! `DocSelection`; the key listener copies it. `RichText` shapes and paints
+//! through public GPUI text APIs, keeping intrinsic probes separate from the
+//! definite-width layout while overlaying inline-code foreground colors + the
+//! document-selection slice for the block. The base font/color is inherited
+//! from `window.text_style()` (set by the parent `div`'s
+//! `.text_base()`/`.text_color()`/…) at layout time, so the renderer never
+//! constructs a `TextStyle`.
 
 pub mod ast;
 pub mod incremental;

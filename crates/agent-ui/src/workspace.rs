@@ -31,8 +31,8 @@ use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// `Option<Entity<PopupMenu>>` regardless of feature.
 use gpui_component::menu::PopupMenu;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, TITLE_BAR_HEIGHT,
-    Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
+    TITLE_BAR_HEIGHT, Theme, TitleBar,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
@@ -66,6 +66,7 @@ use crate::views::completion::{
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::message::MessageItem;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
@@ -101,7 +102,7 @@ struct PendingAsk {
     selections: Vec<Vec<bool>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardSnapshot {
     pub id: String,
     pub step: usize,
@@ -111,7 +112,7 @@ pub(crate) struct AskCardSnapshot {
     pub selections: Vec<bool>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardQuestion {
     pub question: String,
     pub header: String,
@@ -119,7 +120,7 @@ pub(crate) struct AskCardQuestion {
     pub options: Vec<AskCardOption>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct AskCardOption {
     pub label: String,
     pub description: String,
@@ -144,6 +145,32 @@ enum ComposerPlaceholderMode {
     Normal,
     FollowUp,
     Ask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerPlacement {
+    Hidden,
+    Hero,
+    Footer,
+}
+
+fn composer_placement(editor_open: bool, first_screen: bool) -> ComposerPlacement {
+    if editor_open {
+        ComposerPlacement::Hidden
+    } else if first_screen {
+        ComposerPlacement::Hero
+    } else {
+        ComposerPlacement::Footer
+    }
+}
+
+fn editor_can_submit(
+    history_loading: bool,
+    running: bool,
+    has_pending_ask: bool,
+    text: &str,
+) -> bool {
+    !history_loading && !running && !has_pending_ask && !text.trim().is_empty()
 }
 
 struct DeferredUserTurn {
@@ -281,6 +308,10 @@ pub struct Workspace {
     sidebar_width: Pixels,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
+    /// Tool row currently carrying the Workspace-derived ask snapshot. This is
+    /// synchronized before list construction; the row factory itself remains
+    /// a read-only projection during measurement and prepaint.
+    ask_snapshot_item: Option<Entity<MessageItem>>,
     /// A completed plan awaiting the user's implement / clear-context verdict,
     /// rendered as the inline plan-review drawer card.
     pending_plan_review: Option<PendingPlanReview>,
@@ -354,6 +385,10 @@ pub struct Workspace {
     /// mutations via `remeasure_items`, both driven by `ApplyOutcome`. Only
     /// the visible items render.
     list_state: ListState,
+    /// Exact width of the list child from the previous prepaint. Official GPUI
+    /// at the pinned revision does not invalidate off-screen row heights when
+    /// this changes, so the application explicitly remeasures the cache.
+    message_list_width: crate::views::MessageListWidthInvalidator,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
@@ -592,6 +627,7 @@ impl Workspace {
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_ask: None,
+            ask_snapshot_item: None,
             pending_plan_review: None,
             pending_plans: HashMap::new(),
             ask_step: 0,
@@ -622,6 +658,7 @@ impl Workspace {
             input_sub: None,
             editor_sub: None,
             list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
+            message_list_width: crate::views::MessageListWidthInvalidator::default(),
             list_count: 0,
             history_rendered: 0,
             view_mode: ViewMode::default(),
@@ -3670,12 +3707,14 @@ impl Workspace {
 
     /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
-    /// Submit the editor text to the thread, then close the panel and return
-    /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
-        if text.trim().is_empty() || self.pending_ask.is_some() || self.thread.read(cx).is_running()
-        {
+        if !editor_can_submit(
+            self.thread.read(cx).history_phase().is_loading(),
+            self.thread.read(cx).is_running(),
+            self.pending_ask.is_some(),
+            &text,
+        ) {
             return;
         }
         let meta = self.user_turn_meta(cx);
@@ -3851,6 +3890,41 @@ impl Workspace {
         })
     }
 
+    /// Synchronize Workspace-derived ask state before the native list starts
+    /// measuring. Updating a `MessageItem` from the row callback dirties the
+    /// same entity tree whose height GPUI is currently caching, which can make
+    /// the cached row and the painted subtree describe different layouts.
+    fn sync_ask_card_snapshots(&mut self, cx: &mut App) {
+        let next = self.pending_ask.as_ref().and_then(|ask| {
+            let snapshot = self.ask_card_snapshot(&ask.id, cx)?;
+            let ix = self.conversation.read(cx).find_tool(&ask.id, cx)?;
+            let item = self.conversation.read(cx).items().get(ix)?.clone();
+            Some((item, snapshot))
+        });
+
+        if let Some(previous) = self.ask_snapshot_item.take()
+            && next
+                .as_ref()
+                .is_none_or(|(current, _)| current != &previous)
+            && previous.read(cx).ask_snapshot.is_some()
+        {
+            previous.update(cx, |item, cx| {
+                item.ask_snapshot = None;
+                cx.notify();
+            });
+        }
+
+        if let Some((item, snapshot)) = next {
+            if item.read(cx).ask_snapshot.as_ref() != Some(&snapshot) {
+                item.update(cx, |item, cx| {
+                    item.ask_snapshot = Some(snapshot);
+                    cx.notify();
+                });
+            }
+            self.ask_snapshot_item = Some(item);
+        }
+    }
+
     fn pending_ask_has_selection(&self) -> bool {
         self.pending_ask
             .as_ref()
@@ -3858,6 +3932,9 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
+        if self.thread.read(cx).history_phase().is_loading() {
+            return false;
+        }
         if running {
             return true;
         }
@@ -5985,11 +6062,12 @@ impl Workspace {
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
-        // A restoring thread is neither hero nor conversation: it shows the
-        // loading indicator instead (and hides the composer — no input while
-        // history is loading).
+        // Restoring history keeps the composer mounted so the user can draft
+        // immediately, while submission remains gated until the transcript is
+        // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
         let loading = self.thread.read(cx).history_phase().is_loading();
+        let composer_placement = composer_placement(editor_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
             - px(SIDEBAR_DIVIDER_WIDTH)
@@ -6008,22 +6086,17 @@ impl Workspace {
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
-        // A loading thread hides it too — no input while history loads.
-        let footer = if editor_open || first_screen || loading {
-            None
-        } else {
-            Some(
-                v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .bg(theme.background)
-                    .py_2()
-                    .gap_2()
-                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
-                    .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, window, &theme, cx))),
-            )
-        };
+        let footer = (composer_placement == ComposerPlacement::Footer).then(|| {
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .bg(theme.background)
+                .py_2()
+                .gap_2()
+                .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
+                .children(self.render_attachments(&theme, cx))
+                .child(centered(self.render_composer(running, window, &theme, cx)))
+        });
 
         // Hero occupies the message-list region on the first screen.
         // Notice items on the first screen (e.g. Danger toggle acknowledgement).
@@ -6047,19 +6120,21 @@ impl Workspace {
         } else {
             None
         };
-        let hero = if editor_open || !first_screen {
+        let hero = if composer_placement != ComposerPlacement::Hero {
             None
         } else if loading {
-            // History is still restoring: a centered loading indicator in
-            // place of the hero. No composer — input is gated until `Ready`.
+            // History restore and drafting are independent: the progress label
+            // describes the transcript while the disabled send action makes the
+            // input gate explicit without delaying the editor itself.
             Some(
                 v_flex()
                     .flex_1()
                     .w_full()
                     .justify_center()
                     .items_center()
-                    .child(
+                    .child(centered(
                         v_flex()
+                            .w_full()
                             .gap_3()
                             .items_center()
                             .child(
@@ -6071,8 +6146,10 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(i18n::t("workspace-loading-history")),
-                            ),
-                    ),
+                            )
+                            .children(self.render_attachments(&theme, cx))
+                            .child(self.render_composer(running, window, &theme, cx)),
+                    )),
             )
         } else {
             Some(
@@ -6337,6 +6414,7 @@ impl Workspace {
         // builder borrows `self` (title-menu trigger, context rail), which
         // would collide with `shell_root`'s `&mut self` receiver inside a
         // single call expression.
+        self.sync_ask_card_snapshots(cx);
         let conversation_column = {
             v_flex()
                 .flex_1()
@@ -6365,55 +6443,42 @@ impl Workspace {
                         // anchored, tail-following native list.
                         .children(hero)
                         .children({
-                            // `cx.processor` adapts the item closure to
-                            // `gpui::list`'s `FnMut(usize, &mut Window, &mut
-                            // App)` signature; it captures an `Entity<Workspace>`
-                            // internally, so it is built outside the frame
-                            // closure and moved in.
-                            let processor = cx.processor(|this, ix: usize, _window, cx| {
-                                let item = this.conversation.read(cx).items().get(ix).cloned();
+                            // Keep the row factory a pure read-only projection.
+                            // GPUI invokes it while measuring and prepainting;
+                            // mutating a MessageItem here invalidates the same
+                            // entity tree whose height is being cached.
+                            let conversation = self.conversation.clone();
+                            let processor = move |ix: usize, _window: &mut Window, cx: &mut App| {
+                                let item = conversation.read(cx).items().get(ix).cloned();
                                 match item {
                                     // `flex_shrink_0` guards against any
                                     // available height leaking down the
                                     // flex chain and compressing a row.
-                                    //
-                                    // Budget the ask-card snapshot before
-                                    // rendering: the list element leases
-                                    // the Workspace for the whole closure,
-                                    // so `MessageItem::render` must not
-                                    // read it back. `item` is a distinct
-                                    // entity, safe to lease here.
-                                    Some(item) => {
-                                        let ask = match item.read(cx).kind() {
-                                            ConvItem::ToolCall(t) => {
-                                                this.ask_card_snapshot(t.id.as_str(), cx)
-                                            }
-                                            _ => None,
-                                        };
-                                        item.update(cx, |it, _cx| it.ask_snapshot = ask);
-                                        v_flex()
-                                            .w_full()
-                                            .pt_1()
-                                            .pb_4()
-                                            .flex_shrink_0()
-                                            .min_w_0()
-                                            .child(item)
-                                            .into_any_element()
-                                    }
+                                    Some(item) => v_flex()
+                                        .w_full()
+                                        .pt_1()
+                                        .pb_4()
+                                        .flex_shrink_0()
+                                        .min_w_0()
+                                        .child(item)
+                                        .into_any_element(),
                                     // Index out of range mid-splice (count
                                     // changed between a layout pass and the
                                     // render closure): render an empty row.
                                     None => gpui::div().into_any_element(),
                                 }
-                            });
+                            };
                             let list_state = self.list_state.clone();
+                            let width_state = self.list_state.clone();
+                            let message_list_width = self.message_list_width.clone();
                             let mono_family = theme.mono_font_family.clone();
                             (!first_screen).then(move || {
                                 // Native `gpui::list`: it owns virtualization,
                                 // scroll, the per-item height cache, and tail-
                                 // follow. Visible rows re-measure every frame;
-                                // a width change invalidates every cached
-                                // height; `Tail` mode pins to the live end and
+                                // the wrapper below explicitly invalidates all
+                                // cached heights after a width change. `Tail`
+                                // mode pins to the live end and
                                 // re-engages at the bottom after an upward
                                 // scroll. Item heights are reconciled from the
                                 // ThreadEvent handler via
@@ -6440,7 +6505,14 @@ impl Workspace {
                                     .min_w_0()
                                     .font_family(mono_family.clone())
                                     .font_weight(gpui::FontWeight::LIGHT)
-                                    .child(list_el);
+                                    .child(list_el)
+                                    .on_prepaint(move |bounds, window, _app| {
+                                        if message_list_width
+                                            .update(bounds.size.width, &width_state)
+                                        {
+                                            window.refresh();
+                                        }
+                                    });
                                 h_flex()
                                     .flex_1()
                                     .w_full()
@@ -7066,4 +7138,30 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComposerPlacement, composer_placement, editor_can_submit};
+
+    #[test]
+    fn history_restore_keeps_composer_mounted() {
+        assert_eq!(composer_placement(false, true), ComposerPlacement::Hero);
+        assert_eq!(composer_placement(false, false), ComposerPlacement::Footer);
+    }
+
+    #[test]
+    fn editor_remains_the_only_composer_exclusion() {
+        assert_eq!(composer_placement(true, true), ComposerPlacement::Hidden);
+        assert_eq!(composer_placement(true, false), ComposerPlacement::Hidden);
+    }
+
+    #[test]
+    fn editor_submission_waits_for_authoritative_history() {
+        assert!(!editor_can_submit(true, false, false, "draft"));
+        assert!(editor_can_submit(false, false, false, "draft"));
+        assert!(!editor_can_submit(false, true, false, "draft"));
+        assert!(!editor_can_submit(false, false, true, "draft"));
+        assert!(!editor_can_submit(false, false, false, "   "));
+    }
 }
