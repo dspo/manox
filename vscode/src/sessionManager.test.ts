@@ -179,6 +179,99 @@ describe('listModels', () => {
   });
 });
 
+describe('openThread', () => {
+  it('resolves on session_created without overriding the persisted approval mode', async () => {
+    const { transport, manager } = create();
+    const pending = manager.openThread('t1');
+    expect(transport.lastCommand()).toEqual({ cmd: 'open_thread', sessionId: 't1' });
+    transport.emit({ type: 'session_created', sessionId: 't1' });
+    await expect(pending).resolves.toBe('t1');
+    // Restored threads keep their persisted policy — no set_approval_mode.
+    expect(transport.sent).toHaveLength(1);
+  });
+
+  it('rejects and reclaims the actor-side session when the actor never confirms', async () => {
+    vi.useFakeTimers();
+    const { transport, manager } = create();
+    const pending = manager.openThread('t1');
+    const assertion = expect(pending).rejects.toThrow(
+      /timed out waiting for actor event: session_created/,
+    );
+    await vi.advanceTimersByTimeAsync(5_001);
+    await assertion;
+    expect(transport.lastCommand()).toEqual({ cmd: 'dispose_session', sessionId: 't1' });
+  });
+});
+
+describe('listThreads', () => {
+  it('resolves with the threads payload', async () => {
+    const { transport, manager } = create();
+    const pending = manager.listThreads();
+    expect(transport.lastCommand()).toEqual({ cmd: 'list_threads' });
+    transport.emit({
+      type: 'threads_updated',
+      threads: [
+        {
+          id: 't1',
+          title: 'Fix the bug',
+          updated_at: 1_700_000_000,
+          running: false,
+          unread: true,
+          errored: false,
+          pending_auth: false,
+          model_id: 'm',
+        },
+      ],
+    });
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ id: 't1', title: 'Fix the bug', unread: true }),
+    ]);
+  });
+});
+
+describe('listCommands', () => {
+  it('resolves with the commands payload', async () => {
+    const { transport, manager } = create();
+    const pending = manager.listCommands();
+    expect(transport.lastCommand()).toEqual({ cmd: 'list_commands' });
+    transport.emit({
+      type: 'commands',
+      commands: [
+        { name: 'deliver', description: 'Ship it', kind: 'command', argument_hint: null },
+      ],
+    });
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ name: 'deliver', kind: 'command' }),
+    ]);
+  });
+});
+
+describe('requestThreadInfo', () => {
+  it('resolves with the info snapshot', async () => {
+    const { transport, manager } = create();
+    // The session emitter must exist before awaiting on it.
+    const unsubscribe = manager.onSessionEvent('t1', () => {});
+    const pending = manager.requestThreadInfo('t1');
+    expect(transport.lastCommand()).toEqual({ cmd: 'thread_info', sessionId: 't1' });
+    transport.emit({
+      type: 'thread_info',
+      sessionId: 't1',
+      info: {
+        worktree_path: null,
+        plan: null,
+        usage: {},
+        cost: 0,
+        pending_auth_count: 0,
+        agents: [],
+      },
+    });
+    await expect(pending).resolves.toEqual(
+      expect.objectContaining({ worktree_path: null, cost: 0 }),
+    );
+    unsubscribe();
+  });
+});
+
 describe('setApprovalMode', () => {
   it('broadcasts the policy to every live session', async () => {
     const { transport, manager } = create();

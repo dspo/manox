@@ -1,20 +1,39 @@
 // postMessage protocol between the sidebar provider (host) and the webview
-// renderer. Actor payloads cross the boundary verbatim inside `event`.
+// renderer. Actor payloads cross the boundary verbatim inside `event`,
+// except the global snapshots unwrapped into their own messages. Per-thread
+// messages always carry their sessionId — view switching is pure webview
+// state, so the host routes by id and never infers a "current" session.
 
-import type { ActorEvent, ModelInfo } from '../protocol';
+import type {
+  ActorEvent,
+  ApprovalMode,
+  CommandEntry,
+  ImageAttachment,
+  ModelInfo,
+  ThreadInfoSnapshot,
+  ThreadListItem,
+} from '../protocol';
 
 export type WebviewToHost =
-  | { type: 'submit'; text: string }
-  | { type: 'approve'; id: string; allow: boolean }
-  | { type: 'cancel' }
-  | { type: 'set_model'; id: string }
+  | { type: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
+  | { type: 'approve'; sessionId: string; id: string; allow: boolean }
+  | { type: 'cancel'; sessionId: string }
+  | { type: 'set_model'; sessionId: string; id: string }
+  | { type: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
   | { type: 'request_models' }
-  | { type: 'request_usage' }
-  | { type: 'new_session' };
+  | { type: 'request_usage'; sessionId: string }
+  | { type: 'request_thread_info'; sessionId: string }
+  | { type: 'new_session' }
+  | { type: 'list_threads' }
+  | { type: 'open_thread'; sessionId: string }
+  | { type: 'focus_thread'; sessionId?: string }
+  | { type: 'list_commands' };
 
 export type HostToWebview =
-  | { type: 'session_ready'; sessionId: string; cwd: string }
-  | { type: 'session_reset' }
+  | { type: 'session_ready'; sessionId: string; cwd: string; kind: 'fresh' | 'restored' }
   | { type: 'event'; event: ActorEvent }
   | { type: 'models'; models: ModelInfo[] }
+  | { type: 'threads'; threads: ThreadListItem[] }
+  | { type: 'commands'; commands: CommandEntry[] }
+  | { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
   | { type: 'global_error'; message: string };

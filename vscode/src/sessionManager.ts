@@ -7,7 +7,15 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ApprovalMode, Command, ModelInfo } from './protocol';
+import type {
+  ActorEvent,
+  ApprovalMode,
+  Command,
+  CommandEntry,
+  ModelInfo,
+  ThreadInfoSnapshot,
+  ThreadListItem,
+} from './protocol';
 import { isSessionEvent } from './protocol';
 import type { Transport } from './transport/transport';
 import { NapiTransport } from './transport/napiTransport';
@@ -126,6 +134,30 @@ export class SessionManager {
     return sessionId;
   }
 
+  /** Open a persisted thread as a session and resolve once the actor
+   * confirms. The restored thread keeps its persisted approval mode. */
+  async openThread(sessionId: string): Promise<string> {
+    const emitter = new EventEmitter();
+    emitter.setMaxListeners(0);
+    this.sessions.set(sessionId, emitter);
+    const created = this.awaitSession(
+      sessionId,
+      (ev) => ev.type === 'session_created',
+      'session_created',
+    );
+    this.send({ cmd: 'open_thread', sessionId });
+    try {
+      await created;
+    } catch (e) {
+      this.sessions.delete(sessionId);
+      // Reclaim the actor-side session as well: the actor may still process
+      // the queued open_thread after this side has given up waiting.
+      this.send({ cmd: 'dispose_session', sessionId });
+      throw e;
+    }
+    return sessionId;
+  }
+
   /** Change the approval policy and push it to every live session. */
   setApprovalMode(mode: ApprovalMode): void {
     this.approvalMode = mode;
@@ -168,6 +200,37 @@ export class SessionManager {
     const models = this.awaitGlobal((ev) => ev.type === 'models', 'models');
     this.send({ cmd: 'list_models' });
     return models.then((ev) => (ev as Extract<ActorEvent, { type: 'models' }>).models);
+  }
+
+  /** Snapshot of this project's threads; the actor also pushes
+   * `threads_updated` on store mutations via the global event stream. */
+  listThreads(): Promise<ThreadListItem[]> {
+    const threads = this.awaitGlobal(
+      (ev) => ev.type === 'threads_updated',
+      'threads_updated',
+    );
+    this.send({ cmd: 'list_threads' });
+    return threads.then(
+      (ev) => (ev as Extract<ActorEvent, { type: 'threads_updated' }>).threads,
+    );
+  }
+
+  /** Slash-completion entries: prompt-macro commands plus skills. */
+  listCommands(): Promise<CommandEntry[]> {
+    const commands = this.awaitGlobal((ev) => ev.type === 'commands', 'commands');
+    this.send({ cmd: 'list_commands' });
+    return commands.then((ev) => (ev as Extract<ActorEvent, { type: 'commands' }>).commands);
+  }
+
+  /** On-demand conversation info snapshot (worktree, plan, usage, agents). */
+  requestThreadInfo(sessionId: string): Promise<ThreadInfoSnapshot> {
+    const info = this.awaitSession(
+      sessionId,
+      (ev) => ev.type === 'thread_info',
+      'thread_info',
+    );
+    this.send({ cmd: 'thread_info', sessionId });
+    return info.then((ev) => (ev as Extract<ActorEvent, { type: 'thread_info' }>).info);
   }
 
   /** Shut the actor down; `disposeShared` is the public entry point. */
