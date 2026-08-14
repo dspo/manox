@@ -552,32 +552,16 @@ pub struct ConversationState {
     history_builder: Option<crate::views::message::ItemBuilder>,
 }
 
-/// What `apply` did to the item list, so the caller can keep the message
-/// list's `ListState` in sync (splice on append, remeasure on in-place
-/// mutation).
+/// What `apply` did to the item list. The row renderer re-measures every
+/// visible row each frame, so the caller only needs to know whether anything
+/// changed at all — the per-index invalidation variants that used to drive
+/// `ListState` no longer exist.
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// No item touched (e.g. `ToolCallAuthorization`).
     Unchanged,
-    /// An existing item's content changed at the index; remeasure that item.
-    Remeasure(usize),
-    /// Every item may have changed height (terminal `Stop` collapses every
-    /// activity segment and tool card); remeasure the whole list.
-    RemeasureAll,
-    /// A new item was appended at the end; splice the list count up.
-    Appended,
-    /// A trailing transient item (a `Retry` badge) was popped without a
-    /// replacement pushed. Splice the list count down by one at the tail.
-    RemovedTail,
-    /// An existing item was mutated at `remeasure_ix` (dirtying its height
-    /// cache) AND a new item was appended at the tail. The `AgentText`
-    /// `needs_new` arm hits this whenever a live activity segment is closed
-    /// for the incoming reply: `close_segment_for_text` finalizes the segment
-    /// (freezing elapsed, possibly collapsing entries → height change) right
-    /// before the new assistant bubble is pushed. Remeasure the segment so its
-    /// cached height catches up to the finalized state, and splice the count
-    /// for the appended bubble.
-    RemeasureAndAppend { remeasure_ix: usize },
+    /// At least one item was added, removed, or mutated in place.
+    Changed,
 }
 
 impl Default for ConversationState {
@@ -905,16 +889,18 @@ impl ConversationState {
         // (Error). Pop the badge first so the arm below pushes its own item
         // into the freed slot. Non-item events (usage, mode change, …) and
         // the `Retry` event itself skip this.
-        let popped_retry = matches!(
+        if matches!(
             event,
             ThreadEvent::AgentText(_)
                 | ThreadEvent::AgentThinking(_)
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
                 | ThreadEvent::Compaction { .. }
-        ) && self.pop_trailing_retry(cx);
+        ) {
+            self.pop_trailing_retry(cx);
+        }
 
-        let outcome = match event {
+        match event {
             // A compaction landed — render the handoff summary as a Recap card.
             // The card is appended (never updated in place): a compaction is a
             // one-time boundary marker, and the summary text is final.
@@ -932,7 +918,7 @@ impl ConversationState {
                         weak,
                     )
                 }));
-                ApplyOutcome::Appended
+                ApplyOutcome::Changed
             }
 
             // Prompt-cache invalidation landed — insert a slim divider
@@ -952,7 +938,7 @@ impl ConversationState {
                         weak,
                     )
                 }));
-                ApplyOutcome::Appended
+                ApplyOutcome::Changed
             }
             // `<proposed_plan>` streaming + completion are owned by the
             // workspace's review overlay, not the conversation list — there is
@@ -1013,7 +999,7 @@ impl ConversationState {
                 // the `Stop` arm.
                 let changed = self.finalize_streaming_items(true, cx);
                 if changed {
-                    ApplyOutcome::RemeasureAll
+                    ApplyOutcome::Changed
                 } else {
                     ApplyOutcome::Unchanged
                 }
@@ -1045,25 +1031,19 @@ impl ConversationState {
                     // row *after* `close_segment_for_text` so `frozen_secs` is
                     // pinned — the row shows the segment's elapsed instead of a
                     // live timer that would keep growing on every re-render of
-                    // the reply. `close_segment_for_text` may also collapse
-                    // entries, dirtying the segment's height cache; carry the
-                    // index back so the caller remeasures it alongside splicing
-                    // in the new bubble (a bare `Appended` would only splice the
-                    // tail and leave the closed segment's height stale).
-                    let (activity_summary, closed_segment_ix) =
-                        if let Some(cix) = self.find_active_activity_segment(cx) {
-                            self.items[cix].update(cx, |item, cx| {
-                                item.close_segment_for_text(cx);
-                                cx.notify();
-                            });
-                            let summary = match self.items[cix].read(cx).kind() {
-                                ConvItem::Thinking(t) => t.activity_summary(),
-                                _ => None,
-                            };
-                            (summary, Some(cix))
-                        } else {
-                            (None, None)
-                        };
+                    // the reply.
+                    let activity_summary = if let Some(cix) = self.find_active_activity_segment(cx) {
+                        self.items[cix].update(cx, |item, cx| {
+                            item.close_segment_for_text(cx);
+                            cx.notify();
+                        });
+                        match self.items[cix].read(cx).kind() {
+                            ConvItem::Thinking(t) => t.activity_summary(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let id = self.items.len();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
@@ -1080,10 +1060,7 @@ impl ConversationState {
                         item.update_text(delta, cx);
                         item
                     }));
-                    match closed_segment_ix {
-                        Some(remeasure_ix) => ApplyOutcome::RemeasureAndAppend { remeasure_ix },
-                        None => ApplyOutcome::Appended,
-                    }
+                    ApplyOutcome::Changed
                 } else {
                     let ix = self.items.len() - 1;
                     self.items[ix].update(cx, |item, cx| {
@@ -1103,7 +1080,7 @@ impl ConversationState {
                         item.update_text(&full_text, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
@@ -1112,7 +1089,7 @@ impl ConversationState {
                 // a gap (interrupted by a tool call or new turn) starts a
                 // fresh round. If no segment exists yet, open one.
                 let turn_started_at = self.turn_started_at;
-                let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                let (cix, _pushed) = match self.find_active_activity_segment(cx) {
                     Some(i) => (i, false),
                     None => {
                         let i = self.items.len();
@@ -1165,11 +1142,7 @@ impl ConversationState {
                     }
                     cx.notify();
                 });
-                if pushed {
-                    ApplyOutcome::Appended
-                } else {
-                    ApplyOutcome::Remeasure(cix)
-                }
+                ApplyOutcome::Changed
             }
             ThreadEvent::ToolCall {
                 id,
@@ -1196,7 +1169,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        ApplyOutcome::Remeasure(ix)
+                        ApplyOutcome::Changed
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1213,7 +1186,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
-                        ApplyOutcome::Appended
+                        ApplyOutcome::Changed
                     }
                 } else if name == agent::tools::ASK_USER_QUESTION {
                     // Top-level card, never folded into an activity segment.
@@ -1229,7 +1202,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        ApplyOutcome::Remeasure(ix)
+                        ApplyOutcome::Changed
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1252,7 +1225,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
-                        ApplyOutcome::Appended
+                        ApplyOutcome::Changed
                     }
                 } else {
                     // Ordinary tool call: fold into the active activity
@@ -1275,10 +1248,10 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        ApplyOutcome::Remeasure(ix)
+                        ApplyOutcome::Changed
                     } else {
                         let turn_started_at = self.turn_started_at;
-                        let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                        let (cix, _pushed) = match self.find_active_activity_segment(cx) {
                             Some(i) => (i, false),
                             None => {
                                 let i = self.items.len();
@@ -1335,11 +1308,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        if pushed {
-                            ApplyOutcome::Appended
-                        } else {
-                            ApplyOutcome::Remeasure(cix)
-                        }
+                        ApplyOutcome::Changed
                     }
                 }
             }
@@ -1359,7 +1328,7 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(cix)
+                    ApplyOutcome::Changed
                 } else {
                     ApplyOutcome::Unchanged
                 }
@@ -1392,7 +1361,7 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     let entry_output = output.clone();
                     let entry_is_error = *is_error;
@@ -1415,7 +1384,7 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(cix)
+                    ApplyOutcome::Changed
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
@@ -1430,7 +1399,7 @@ impl ConversationState {
                         item.sync_tool_call_panel(cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 } else {
                     // No matching entry; insert as a finalized single-entry
                     // activity segment so the orphan result still renders as a
@@ -1467,7 +1436,7 @@ impl ConversationState {
                         item.sync_tool_entry_panel(0, cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Appended
+                    ApplyOutcome::Changed
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
@@ -1513,7 +1482,7 @@ impl ConversationState {
                 if self.items.is_empty() {
                     ApplyOutcome::Unchanged
                 } else {
-                    ApplyOutcome::RemeasureAll
+                    ApplyOutcome::Changed
                 }
             }
             ThreadEvent::Error(e) => {
@@ -1521,7 +1490,7 @@ impl ConversationState {
                 self.items.push(cx.new(|_| {
                     MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
                 }));
-                ApplyOutcome::Appended
+                ApplyOutcome::Changed
             }
             ThreadEvent::PeerMessage { from, content } => {
                 let ix = self.items.len();
@@ -1536,7 +1505,7 @@ impl ConversationState {
                         weak,
                     )
                 }));
-                ApplyOutcome::Appended
+                ApplyOutcome::Changed
             }
             ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
@@ -1560,7 +1529,6 @@ impl ConversationState {
                 if let Some(last) = self.items.last() {
                     let is_retry = matches!(last.read(cx).kind(), ConvItem::Retry { .. });
                     if is_retry {
-                        let ix = self.items.len() - 1;
                         let last = last.clone();
                         let attempt = *attempt;
                         let max_attempts = *max_attempts;
@@ -1585,7 +1553,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        return ApplyOutcome::Remeasure(ix);
+                        return ApplyOutcome::Changed;
                     }
                 }
                 let id = self.items.len();
@@ -1605,7 +1573,7 @@ impl ConversationState {
                         weak.clone(),
                     )
                 }));
-                ApplyOutcome::Appended
+                ApplyOutcome::Changed
             }
             ThreadEvent::SubagentProgress {
                 id,
@@ -1619,7 +1587,7 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 } else {
                     ApplyOutcome::Unchanged
                 }
@@ -1639,7 +1607,7 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 } else {
                     ApplyOutcome::Unchanged
                 }
@@ -1669,7 +1637,7 @@ impl ConversationState {
                             bt.recent_events = recent_background_task_output(&task_id);
                         }
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Changed
                 } else {
                     // New task card.
                     let recent_events = recent_background_task_output(&task_id);
@@ -1694,39 +1662,9 @@ impl ConversationState {
                         )
                     });
                     self.items.push(entity);
-                    ApplyOutcome::Appended
+                    ApplyOutcome::Changed
                 }
             }
-        };
-        if popped_retry {
-            match outcome {
-                // A `Remeasure(ix)` against a post-pop index is still valid —
-                // the pop was at the tail, so `ix` still points at the same
-                // item. The retry pop itself is covered by the count splice.
-                ApplyOutcome::Remeasure(ix) => ApplyOutcome::Remeasure(ix),
-                // `RemeasureAndAppend { remeasure_ix }` survives a tail retry
-                // pop unchanged: `remeasure_ix` points at a closed activity
-                // segment well before the tail, so the pop doesn't move it,
-                // and the appended bubble nets out against the popped retry
-                // (count splice in `sync_list_count` sees zero change). Keep
-                // the remeasure so the segment's stale height is corrected.
-                ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
-                    ApplyOutcome::RemeasureAndAppend { remeasure_ix }
-                }
-                // A plain `Appended` (no segment mutated) + a popped retry
-                // means the new tail item occupies the popped retry's slot
-                // (count net-0, no splice). Its cached height is the retry
-                // badge's, so remeasure the tail to correct it on this frame
-                // rather than leaving a one-frame vertical overlap until the
-                // next event's remeasure.
-                ApplyOutcome::Appended => {
-                    let tail = self.items.len().saturating_sub(1);
-                    ApplyOutcome::Remeasure(tail)
-                }
-                _ => ApplyOutcome::RemovedTail,
-            }
-        } else {
-            outcome
         }
     }
 
@@ -1842,7 +1780,7 @@ impl ConversationState {
                 cx,
             ));
         }
-        ApplyOutcome::Appended
+        ApplyOutcome::Changed
     }
 
     /// Rehydrate persisted background-task cards after rebuilding canonical
@@ -2168,15 +2106,9 @@ mod tests {
 
     /// When assistant text arrives while a live activity segment exists, the
     /// segment is closed in place (`close_segment_for_text` finalizes entries
-    /// and pins the elapsed timer — dirtying its height cache) and a new
-    /// assistant bubble is appended. The outcome must carry the closed
-    /// segment's index so the caller remeasures it; a bare `Appended` would
-    /// only splice the tail and leave the segment's cached height stale.
-    /// only splice the tail and leave the segment's cached height stale.
+    /// and pins the elapsed timer) and a new assistant bubble is appended.
     #[gpui::test]
-    fn agent_text_needs_new_with_live_segment_remeasures_closed_segment(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn agent_text_needs_new_closes_live_segment_and_appends(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
@@ -2201,13 +2133,12 @@ mod tests {
                     ctx.clone(),
                     cx,
                 );
-                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert!(matches!(outcome, ApplyOutcome::Changed));
                 assert_eq!(c.items().len(), 1);
 
                 // An assistant text delta with no prior streaming assistant
                 // bubble → `needs_new`. The live segment is closed, then a new
-                // assistant item is appended. The outcome must remeasure the
-                // closed segment (index 0) AND splice the new tail.
+                // assistant item is appended.
                 let outcome = c.apply(
                     &ThreadEvent::AgentText("hello".into()),
                     "model",
@@ -2215,17 +2146,7 @@ mod tests {
                     ctx.clone(),
                     cx,
                 );
-                match outcome {
-                    ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
-                        assert_eq!(
-                            remeasure_ix, 0,
-                            "remeasure the just-closed activity segment"
-                        );
-                    }
-                    other => panic!(
-                        "expected RemeasureAndAppend after closing a live segment, got {other:?}"
-                    ),
-                }
+                assert!(matches!(outcome, ApplyOutcome::Changed));
                 assert_eq!(c.items().len(), 2);
             });
         });
@@ -2277,7 +2198,7 @@ mod tests {
                     ctx.clone(),
                     cx,
                 );
-                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert!(matches!(outcome, ApplyOutcome::Changed));
                 assert_eq!(c.items().len(), 1);
             });
         });
@@ -2291,7 +2212,7 @@ mod tests {
     /// remeasured on this frame. Pinned because a regression here leaves a
     /// one-frame vertical overlap until the next event.
     #[gpui::test]
-    fn popped_retry_then_append_remeasures_reused_tail_slot(cx: &mut gpui::TestAppContext) {
+    fn popped_retry_then_append_reuses_tail_slot(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
         let ctx = ApplyCtx {
@@ -2315,15 +2236,12 @@ mod tests {
                     ctx.clone(),
                     cx,
                 );
-                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert!(matches!(outcome, ApplyOutcome::Changed));
                 assert_eq!(c.items().len(), 1);
 
                 // An AgentText delta with no prior segment: pop_trailing_retry
                 // removes the Retry (count 1→0), then needs_new pushes a new
-                // assistant bubble (count 0→1). Net count unchanged → no
-                // splice. Outcome must be Remeasure(tail=0) so the reused slot
-                // (now the assistant bubble, was the Retry badge) is
-                // remeasured instead of keeping the badge's cached height.
+                // assistant bubble (count 0→1). Net count unchanged.
                 let outcome = c.apply(
                     &ThreadEvent::AgentText("recovered".into()),
                     "model",
@@ -2331,14 +2249,7 @@ mod tests {
                     ctx.clone(),
                     cx,
                 );
-                match outcome {
-                    ApplyOutcome::Remeasure(ix) => {
-                        assert_eq!(ix, 0, "remeasure the reused tail slot");
-                    }
-                    other => panic!(
-                        "expected Remeasure(tail) after popped_retry + Appended, got {other:?}"
-                    ),
-                }
+                assert!(matches!(outcome, ApplyOutcome::Changed));
                 assert_eq!(c.items().len(), 1);
             });
         });
@@ -3202,8 +3113,8 @@ mod tests {
             })
         });
         assert!(
-            matches!(outcome, ApplyOutcome::RemeasureAll),
-            "sealing a stale segment must remeasure, got {outcome:?}"
+            matches!(outcome, ApplyOutcome::Changed),
+            "sealing a stale segment must report a change, got {outcome:?}"
         );
         cx.update(|cx| {
             conversation.read_with(cx, |c, cx| match c.items()[1].read(cx).kind() {
