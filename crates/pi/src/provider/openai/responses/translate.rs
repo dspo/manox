@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use serde_json::Value as JsonValue;
 
 use super::wire::*;
-use crate::provider::openai::clamp_cache_key;
+use crate::provider::openai::{clamp_cache_key, ensure_object_properties};
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
 };
@@ -96,7 +96,7 @@ fn tools_param(context: &AgentContext) -> Option<Vec<ToolParam>> {
                 kind: "function",
                 name: t.name().to_string(),
                 description: Some(t.description().to_string()),
-                parameters: t.parameters_schema(),
+                parameters: ensure_object_properties(t.parameters_schema()),
             })
             .collect(),
     )
