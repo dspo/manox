@@ -149,7 +149,9 @@ impl ChatListState {
         inner.state.pending = Some(PendingScroll::ToRow(key));
     }
 
-    /// Scroll to the live end without changing the tail-follow state.
+    /// Jump to the live end. Unlike `follow_tail`, the tail-follow flag is left
+    /// untouched — an event-driven re-pin that must not yank a scrolled-away
+    /// viewport back to following uses this.
     pub fn scroll_to_end(&self) {
         self.0.borrow_mut().state.pending = Some(PendingScroll::ToEnd);
     }
@@ -414,6 +416,12 @@ fn plan_frame_inner(
             budget,
             depth + 1,
         );
+        if plan.rows.is_empty() {
+            // A second budget exhaustion (e.g. hundreds of thousands of
+            // zero-height rows) still left nothing to paint; the anchor is now
+            // at a content edge, so the next frame recovers from there.
+            log::warn!("ChatList budget exhausted across a re-anchor; viewport empty");
+        }
         plan.budget_exhausted = true;
         return plan;
     }
@@ -518,7 +526,7 @@ fn plan_frame_inner(
         .iter()
         .find(|r| r.slot.top() <= view_top && r.slot.bottom() > view_top)
         .map(|r| {
-            let offset = view_top - r.slot.top();
+            let offset = (view_top - r.slot.top()).clamp(px(0.), r.slot.size.height);
             Anchor::Top {
                 key: keys[r.ix],
                 ix_hint: r.ix,
@@ -529,7 +537,7 @@ fn plan_frame_inner(
             rows.first().map(|r| Anchor::Top {
                 key: keys[r.ix],
                 ix_hint: r.ix,
-                offset: first_top.max(px(0.)),
+                offset: first_top.max(px(0.)).min(r.slot.size.height),
             })
         })
         .unwrap_or(state.anchor);
@@ -1089,8 +1097,9 @@ mod tests {
     fn ten_thousand_zero_height_rows_terminate() {
         let mut state = State::default();
         let plan = run(&mut state, &heights_n(10_000, 0.), 300., 512);
-        // Zero-height content still terminates and reports underflow; nothing
-        // is visible, but the plan is well-formed and no frame hangs.
+        // Zero-height rows all pile at the viewport bottom, so either the whole
+        // content fits (`underflow`) or the fill budget capped how far up the
+        // degenerate rows were walked (`budget_exhausted`) — both terminate.
         assert!(plan.report.underflow || plan.budget_exhausted);
     }
 
