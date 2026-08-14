@@ -135,7 +135,6 @@ fn compute_runs(
     runs
 }
 
-#[derive(Default)]
 struct ShapedText {
     lines: Rc<Vec<WrappedLine>>,
     size: Size<Pixels>,
@@ -144,18 +143,105 @@ struct ShapedText {
     bounds: Option<Bounds<Pixels>>,
 }
 
+#[derive(Default)]
+struct ShapeCache {
+    /// Layout selected by the most recent non-probe measurement. Intrinsic
+    /// min/max-content probes must never replace this: Taffy may issue them in
+    /// either order before resolving the width used for paint.
+    paint: Option<ShapedText>,
+    min_content_size: Option<Size<Pixels>>,
+    max_content_size: Option<Size<Pixels>>,
+}
+
 #[cfg(test)]
 thread_local! {
     static LAST_MEASURED_SIZE: RefCell<Option<Size<Pixels>>> = const { RefCell::new(None) };
 }
 
 pub struct RichTextState {
-    shaped: Rc<RefCell<ShapedText>>,
+    shaped: Rc<RefCell<ShapeCache>>,
     text: SharedString,
     runs: Vec<TextRun>,
     font_size: Pixels,
     line_height: Pixels,
     text_style: TextStyle,
+}
+
+/// Mirror GPUI's wrap-candidate classification at the pinned revision. It is
+/// intentionally local because `LineWrapper::is_word_char` is not public.
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '\u{00C0}'..='\u{00FF}')
+        || matches!(c, '\u{0100}'..='\u{017F}')
+        || matches!(c, '\u{0180}'..='\u{024F}')
+        || matches!(c, '\u{0400}'..='\u{04FF}')
+        || matches!(c, '\u{1E00}'..='\u{1EFF}')
+        || matches!(c, '\u{0300}'..='\u{036F}')
+        || matches!(c, '\u{0980}'..='\u{09FF}')
+        || matches!(
+            c,
+            '-' | '_'
+                | '.'
+                | '\''
+                | '’'
+                | '‘'
+                | '$'
+                | '%'
+                | '@'
+                | '#'
+                | '^'
+                | '~'
+                | ','
+                | '='
+                | ':'
+                | ';'
+                | '⋯'
+        )
+}
+
+/// Width of the widest segment that GPUI's line wrapper cannot break. This is
+/// the honest CSS min-content width used for intrinsic probes; returning the
+/// full unwrapped width here pins flex cells, while returning a tiny width
+/// inflates their probe height and can leave a large blank list row.
+fn min_content_width(lines: &[WrappedLine]) -> Pixels {
+    lines.iter().fold(px(0.), |widest, line| {
+        let mut max_segment_width = px(0.);
+        let mut segment_start_x = px(0.);
+        let mut first_non_whitespace_ix = None;
+        let mut prev_ch = '\0';
+        let mut glyphs = line
+            .unwrapped_layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .peekable();
+
+        while let Some(glyph) = glyphs.next() {
+            let ch = line.text[glyph.index..].chars().next().unwrap();
+            if ch == '\n' {
+                continue;
+            }
+            let is_break_candidate = if is_word_char(ch) {
+                prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some()
+            } else {
+                ch != ' ' && first_non_whitespace_ix.is_some()
+            };
+            if is_break_candidate {
+                segment_start_x = glyph.position.x;
+            }
+            if ch != ' ' && first_non_whitespace_ix.is_none() {
+                first_non_whitespace_ix = Some(glyph.index);
+            }
+            if ch != ' ' {
+                let glyph_end_x = glyphs
+                    .peek()
+                    .map_or(line.unwrapped_layout.width, |glyph| glyph.position.x);
+                max_segment_width = max_segment_width.max(glyph_end_x - segment_start_x);
+            }
+            prev_ch = ch;
+        }
+        widest.max(max_segment_width)
+    })
 }
 
 fn useful_wrap_width(
@@ -209,6 +295,114 @@ fn shape(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn measure_shape(
+    cache: &Rc<RefCell<ShapeCache>>,
+    known_width: Option<Pixels>,
+    available_width: AvailableSpace,
+    text: &SharedString,
+    runs: &[TextRun],
+    text_style: &TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+    window: &mut Window,
+) -> Size<Pixels> {
+    let wrap_width = useful_wrap_width(
+        known_width,
+        available_width,
+        font_size,
+        text_style.white_space,
+    );
+
+    // Taffy asks intrinsic min/max-content questions while flex widths are
+    // unresolved. Their answers participate in parent sizing, but must not
+    // replace the definite-width lines later used for paint. A sub-em definite
+    // probe is routed through the max-content slot for the same reason.
+    if text_style.white_space == WhiteSpace::Normal && wrap_width.is_none() {
+        let is_min_content =
+            known_width.is_none() && matches!(available_width, AvailableSpace::MinContent);
+        let cached = {
+            let cache = cache.borrow();
+            if is_min_content {
+                cache.min_content_size
+            } else {
+                cache.max_content_size
+            }
+        };
+        if let Some(size) = cached {
+            #[cfg(test)]
+            LAST_MEASURED_SIZE.with(|slot| slot.replace(Some(size)));
+            return size;
+        }
+
+        let unwrapped = shape(
+            text.clone(),
+            runs,
+            font_size,
+            line_height,
+            None,
+            text_style.line_clamp,
+            window,
+        );
+        let next = if is_min_content {
+            let width = min_content_width(&unwrapped.lines);
+            shape(
+                text.clone(),
+                runs,
+                font_size,
+                line_height,
+                Some(width),
+                text_style.line_clamp,
+                window,
+            )
+        } else {
+            unwrapped
+        };
+        let size = next.size;
+        let mut cache = cache.borrow_mut();
+        if is_min_content {
+            cache.min_content_size = Some(size);
+        } else {
+            cache.max_content_size = Some(size);
+        }
+        // An unconstrained element may never receive a definite measure. Keep
+        // the first probe as a paint fallback only; any later definite-width
+        // call replaces it.
+        if cache.paint.is_none() {
+            cache.paint = Some(next);
+        }
+        #[cfg(test)]
+        LAST_MEASURED_SIZE.with(|slot| slot.replace(Some(size)));
+        return size;
+    }
+
+    if let Some(size) = cache
+        .borrow()
+        .paint
+        .as_ref()
+        .filter(|layout| layout.wrap_width == wrap_width)
+        .map(|layout| layout.size)
+    {
+        #[cfg(test)]
+        LAST_MEASURED_SIZE.with(|slot| slot.replace(Some(size)));
+        return size;
+    }
+    let next = shape(
+        text.clone(),
+        runs,
+        font_size,
+        line_height,
+        wrap_width,
+        text_style.line_clamp,
+        window,
+    );
+    let size = next.size;
+    #[cfg(test)]
+    LAST_MEASURED_SIZE.with(|slot| slot.replace(Some(size)));
+    cache.borrow_mut().paint = Some(next);
+    size
+}
+
 impl IntoElement for RichText {
     type Element = Self;
 
@@ -250,31 +444,22 @@ impl Element for RichText {
         let measure_text = text.clone();
         let measure_runs = runs.clone();
         let measure_style = text_style.clone();
-        let shaped = Rc::new(RefCell::new(ShapedText::default()));
+        let shaped = Rc::new(RefCell::new(ShapeCache::default()));
         let measured = shaped.clone();
         let layout_id = window.request_measured_layout(
             Style::default(),
             move |known, available, window, _cx| {
-                let wrap_width = useful_wrap_width(
+                measure_shape(
+                    &measured,
                     known.width,
                     available.width,
-                    font_size,
-                    measure_style.white_space,
-                );
-                let next = shape(
-                    measure_text.clone(),
+                    &measure_text,
                     &measure_runs,
+                    &measure_style,
                     font_size,
                     line_height,
-                    wrap_width,
-                    measure_style.line_clamp,
                     window,
-                );
-                let size = next.size;
-                #[cfg(test)]
-                LAST_MEASURED_SIZE.with(|slot| slot.replace(Some(size)));
-                *measured.borrow_mut() = next;
-                size
+                )
             },
         );
         (
@@ -299,7 +484,12 @@ impl Element for RichText {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        let current_width = state.shaped.borrow().wrap_width;
+        let current_width = state
+            .shaped
+            .borrow()
+            .paint
+            .as_ref()
+            .and_then(|layout| layout.wrap_width);
         let final_width = useful_wrap_width(
             Some(bounds.size.width),
             AvailableSpace::Definite(bounds.size.width),
@@ -321,10 +511,16 @@ impl Element for RichText {
             // must never paint a taller layout into that already-allocated row.
             // The next frame will measure the definite width normally.
             if replacement.size.height <= bounds.size.height + px(1.) {
-                *state.shaped.borrow_mut() = replacement;
+                state.shaped.borrow_mut().paint = Some(replacement);
             }
         }
-        state.shaped.borrow_mut().bounds = Some(bounds);
+        state
+            .shaped
+            .borrow_mut()
+            .paint
+            .as_mut()
+            .expect("RichText measurement did not produce a paint layout")
+            .bounds = Some(bounds);
     }
 
     fn paint(
@@ -337,7 +533,11 @@ impl Element for RichText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let shaped = state.shaped.borrow();
+        let cache = state.shaped.borrow();
+        let shaped = cache
+            .paint
+            .as_ref()
+            .expect("RichText measurement did not produce a paint layout");
         debug_assert!(
             shaped.size.height <= bounds.size.height + px(1.),
             "RichText painted height {:?} exceeds its allocated bounds {:?}; this would overlap the next message row",
@@ -527,6 +727,74 @@ mod tests {
         assert_eq!(highlights.len(), 1);
         assert_eq!(highlights[0].1.color, Some(blue()));
         assert_eq!(highlights[0].1.font_weight, Some(gpui::FontWeight::BOLD));
+    }
+
+    #[gpui::test]
+    async fn measurement_answer_is_independent_of_prior_constraint(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, _cx| {
+            let text: SharedString = "alpha beta gamma 你好世界 table-cell-content Cargo.toml"
+                .repeat(4)
+                .into();
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let line_height = window.pixel_snap(
+                text_style
+                    .line_height
+                    .to_pixels(font_size.into(), window.rem_size()),
+            );
+            let runs = vec![text_style.to_run(text.len())];
+            let constraints = [
+                AvailableSpace::MinContent,
+                AvailableSpace::MaxContent,
+                AvailableSpace::Definite(px(80.)),
+                AvailableSpace::Definite(px(320.)),
+            ];
+
+            for second in constraints {
+                let fresh = measure_shape(
+                    &Rc::new(RefCell::new(ShapeCache::default())),
+                    None,
+                    second,
+                    &text,
+                    &runs,
+                    &text_style,
+                    font_size,
+                    line_height,
+                    window,
+                );
+                for first in constraints {
+                    let cache = Rc::new(RefCell::new(ShapeCache::default()));
+                    measure_shape(
+                        &cache,
+                        None,
+                        first,
+                        &text,
+                        &runs,
+                        &text_style,
+                        font_size,
+                        line_height,
+                        window,
+                    );
+                    let with_history = measure_shape(
+                        &cache,
+                        None,
+                        second,
+                        &text,
+                        &runs,
+                        &text_style,
+                        font_size,
+                        line_height,
+                        window,
+                    );
+                    assert_eq!(
+                        with_history, fresh,
+                        "measuring {second:?} after {first:?} changed the answer"
+                    );
+                }
+            }
+        });
     }
 
     #[gpui::test]

@@ -233,6 +233,114 @@ fn markdown_rows(
     )
 }
 
+const EXPLORE_SUMMARY_WITH_TABLE: &str = r#"3 个 Explore agent 全部成功完成，返回了结构化摘要。测试结果如下：
+
+## 测试结论
+
+**Explore agent 工作正常**——三个并行子代理均完整探索并返回了带文件路径/符号引用的结构化摘要。
+
+## 三个视角的产出对比
+
+| # | 探索角度 | 产出亮点 |
+|---|---|---|
+| 1 | **整体架构与 crate 布局** | 15 个 workspace 成员、三层主架构 + pi harness 层 + 终端栈 + 7 个支撑 crate 的完整职责表；构建入口（`manox` bin、`crates/manox/src/main.rs`）；GPUI 版本锁定与 patch 说明 |
+| 2 | **pi harness 分层**（内核/扩展边界） | 内核 8 大模块 + 8 个显式「缝隙」清单（`AgentTool::requires_approval`、`BashOperations`、`HookPoint`、`BackgroundTaskRegistry` 等）；扩展层 6 类实现如何经缝隙接入；宿主 `pi_engine.rs`/`pi_approval.rs` 的装配点；附 40+ 条符号索引表 |
+| 3 | **agent 宿主 + agent-ui UI** | agent 侧 12 大能力模块路径；UI 组件与文件映射；i18n 边界（`en.ftl`/`zh-CN.ftl` + `t()` 调用示例）；5 类运行时配置的读取位置；并指出 CLAUDE.md 与代码的一处偏差（`system_prompt.md` 已退役，现行是 `.tera.md` 双语言模板） |
+
+## 有价值的发现
+
+- 三个 agent 的结论**相互印证一致**：都确认了 `agent → pi-extensions → pi` 依赖链、`pi_engine.rs` 作为宿主装配核心、`ApprovalGatedTool` 为审批门控落点。
+- 第 3 个 agent 发现了 **CLAUDE.md 与代码的偏差**（提示词系统已从 `system_prompt.md` 迁移到 `.tera.md` 模板），这类「文档腐化」信号值得留意（按项目规则注释/文档错位即回归，可考虑后续修订 CLAUDE.md）。
+- 第 2 个 agent 产出最详尽（含符号索引表），适合作为后续深入阅读的导航。
+
+如需继续，可以再测某个特定视角（如审批链路、compaction、hashline 协议）或让某个 agent 深入跟进某一模块。"#;
+
+/// Real session 465a1ff0 regression. Its three-column GFM table forces flex
+/// cells to issue min-content, max-content and definite-width measurements in
+/// one layout. Intrinsic probes must not replace the definite shape used by
+/// paint or leave the message row at a probe-only height.
+#[gpui::test]
+async fn real_table_message_height_converges_across_width_changes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let markdown = cx.new(|cx| {
+        Markdown::new("explore-summary-table", EXPLORE_SUMMARY_WITH_TABLE).theme(cx.theme())
+    });
+    markdown.update(cx, |markdown, cx| markdown.finalize(cx));
+    let (first, tail) = markdown_rows(cx, markdown);
+    let state = ListState::new(2, ListAlignment::Bottom, px(2048.));
+    state.set_follow_mode(FollowMode::Tail);
+    let window = cx.open_window(size(px(520.), px(4_000.)), {
+        let state = state.clone();
+        move |_, _| MarkdownListProbe {
+            state,
+            rows: vec![first, tail],
+        }
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    let narrow = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("narrow real-session table row");
+
+    visual.simulate_resize(size(px(1_200.), px(4_000.)));
+    visual.run_until_parked();
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    let wide = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("wide real-session table row");
+    let tail = visual
+        .debug_bounds("markdown-list-row-1")
+        .expect("row following real-session table");
+
+    assert!(
+        wide.size.height <= narrow.size.height + px(1.),
+        "widening made the table message taller: narrow={narrow:?}, wide={wide:?}"
+    );
+    assert!(
+        wide.bottom() <= tail.top(),
+        "real-session table message overlaps its following row: wide={wide:?}, tail={tail:?}"
+    );
+
+    visual.simulate_resize(size(px(520.), px(4_000.)));
+    visual.run_until_parked();
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    let narrow_again = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("narrow real-session table row after round trip");
+
+    visual.simulate_resize(size(px(1_200.), px(4_000.)));
+    visual.run_until_parked();
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    let wide_again = visual
+        .debug_bounds("markdown-list-row-0")
+        .expect("wide real-session table row after round trip");
+    let tail_again = visual
+        .debug_bounds("markdown-list-row-1")
+        .expect("row following real-session table after round trip");
+
+    assert!(
+        (narrow_again.size.height - narrow.size.height).abs() <= px(1.),
+        "narrow height changed after a width round trip: first={narrow:?}, again={narrow_again:?}"
+    );
+    assert!(
+        (wide_again.size.height - wide.size.height).abs() <= px(1.),
+        "wide height changed after a width round trip: first={wide:?}, again={wide_again:?}"
+    );
+    assert!(
+        wide_again.bottom() <= tail_again.top(),
+        "round-tripped table message overlaps its following row: wide={wide_again:?}, tail={tail_again:?}"
+    );
+}
+
 #[gpui::test]
 async fn list_measures_persistent_wrapped_markdown_rows(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
