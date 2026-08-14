@@ -14,7 +14,8 @@
 
 use super::wire::*;
 use crate::provider::openai::{
-    clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens,
+    clamp_cache_key, ensure_object_properties, requires_reasoning_content_on_assistant,
+    uses_legacy_max_tokens,
 };
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
@@ -103,7 +104,7 @@ fn tools_param(context: &AgentContext) -> Option<Vec<ToolParam>> {
                 function: FunctionParam {
                     name: t.name().to_string(),
                     description: Some(t.description().to_string()),
-                    parameters: t.parameters_schema(),
+                    parameters: ensure_object_properties(t.parameters_schema()),
                 },
             })
             .collect(),

@@ -44,3 +44,43 @@ fn requires_reasoning_content_on_assistant(provider: &str, base_url: &str) -> bo
 fn clamp_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
 }
+
+/// Strict OpenAI-compatible endpoints (DashScope's Responses API among them)
+/// reject object schemas that omit `properties`, which schemars never emits
+/// for empty structs. Object schemas therefore always carry the key on the
+/// wire; the empty map preserves the declared semantics exactly.
+fn ensure_object_properties(mut schema: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = schema.as_object_mut()
+        && obj.get("type").and_then(|t| t.as_str()) == Some("object")
+        && !obj.contains_key("properties")
+    {
+        obj.insert("properties".into(), serde_json::Map::new().into());
+    }
+    schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_object_properties;
+    use serde_json::json;
+
+    #[test]
+    fn object_schema_without_properties_gains_empty_map() {
+        let schema = json!({ "type": "object", "additionalProperties": false });
+        let fixed = ensure_object_properties(schema);
+        assert_eq!(fixed["properties"], json!({}));
+        assert_eq!(fixed["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn declared_properties_pass_through_untouched() {
+        let schema = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
+        assert_eq!(ensure_object_properties(schema.clone()), schema);
+    }
+
+    #[test]
+    fn non_object_schemas_pass_through_untouched() {
+        let schema = json!({ "type": "string" });
+        assert_eq!(ensure_object_properties(schema.clone()), schema);
+    }
+}
