@@ -22,9 +22,8 @@ use agent::{Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
-    FollowMode, ListAlignment, ListOffset, ListState, MouseButton, Pixels, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_out_quint, prelude::*,
-    px,
+    MouseButton, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
+    anchored, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// Shared across both harnesses: workspace struct fields hold
@@ -47,12 +46,13 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification};
+use manox_components::chat_list::{ChatList, ChatListState, RowKey};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
-use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
+use crate::conversation::{ConversationState, UserImage, UserTurnMeta};
 use crate::external_session::{
     ExternalSession, ResumeSidecar, SessionKind, list_sidecars, merge_external_summaries,
     remove_sidecar, resume_args, write_sidecar,
@@ -342,21 +342,14 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll/virtualization state for the message column, held natively by
-    /// `gpui::ListState`. `ListAlignment::Bottom` gives chat-log semantics:
-    /// short histories sit at the bottom, long ones scroll. `FollowMode::Tail`
-    /// pins to the live end on each layout while following, disengages on an
-    /// upward user scroll, and re-arms when a scroll lands back at the bottom.
-    /// `MSG_LIST_OVERDRAW` rows below the viewport are pre-measured; a width
-    /// change invalidates every cached height, and visible rows re-measure
-    /// every frame (so a height change without an explicit signal self-
-    /// corrects). Count changes are reconciled via `splice`, in-place
-    /// mutations via `remeasure_items`, both driven by `ApplyOutcome`. Only
-    /// the visible items render.
-    list_state: ListState,
-    /// Cached `items().len()`; the event handler reconciles the list count via
-    /// `splice` whenever the conversation grows or shrinks.
-    list_count: usize,
+    /// Scroll/virtualization state for the message column. `ChatList` caches no
+    /// row heights — every visible row is measured at a definite width each
+    /// frame — so there is no `splice`/`remeasure`/width-invalidation surface
+    /// to keep honest. `Bottom` alignment gives chat-log semantics (short
+    /// histories sit at the bottom, long ones scroll); the tail-follow flag
+    /// pins to the live end while following, disengages on an upward user
+    /// scroll, and re-arms when a scroll lands back at the bottom.
+    chat_list: ChatListState,
     /// Messages from the thread's mirrored history already rendered into the
     /// conversation. The streaming preview (`ThreadEvent::HistoryProgress`)
     /// appends only `thread.messages()[history_rendered..]`; reset whenever
@@ -456,11 +449,6 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the message column width when the right side view (editor
 /// pane) is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
-
-/// Trailing overdraw for the message list: rows within this many pixels
-/// below the viewport are pre-measured so scrolling never pops an
-/// unmeasured row into view.
-const MSG_LIST_OVERDRAW: Pixels = px(2048.);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TurnNavigatorLayout {
@@ -621,8 +609,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
-            list_count: 0,
+            chat_list: ChatListState::bottom_aligned(),
             history_rendered: 0,
             view_mode: ViewMode::default(),
             exiting_settings: false,
@@ -647,6 +634,9 @@ impl Workspace {
         // The sidebar lists the restored resumable rows from the first frame;
         // nothing is resumed until the user clicks one.
         ws.sync_sidebar_external(cx);
+        // Point the message list at this workspace so scroll deltas can request
+        // a repaint from the shared handle.
+        ws.chat_list.set_view(cx.entity_id());
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
         ws
@@ -679,15 +669,11 @@ impl Workspace {
             )
         });
         self.conversation = new_conv;
-        let count = self.conversation.read(cx).items().len();
-        self.list_state.reset(count);
-        self.list_count = count;
         // The authoritative list is fully rendered now; future preview
         // batches append from here.
         self.history_rendered = messages.len();
-        // `Tail` natively pins to the end and keeps following; an upward user
-        // scroll disengages it and landing back at the bottom re-arms it.
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        // Re-engage tail-follow: a rebuilt conversation pins to the live end.
+        self.chat_list.follow_tail();
         cx.notify();
     }
 
@@ -733,10 +719,9 @@ impl Workspace {
                     // the card (the engine re-emits PlanReady on Ready).
                     this.thread
                         .update(cx, |t, cx| t.set_plan_review_pending(true, cx));
-                    this.sync_list_count(cx);
                     // The finalized plan surfaces at the tail; reveal it like any
                     // user-initiated jump to the live end.
-                    this.list_state.set_follow_mode(FollowMode::Tail);
+                    this.chat_list.follow_tail();
                     cx.notify();
                 }
                 ThreadEvent::PlanModeChanged { .. } => {
@@ -790,7 +775,7 @@ impl Workspace {
                             let role = this.model_label(cx);
                             let cwd = thread_cwd(&this.thread, cx);
                             let weak = cx.weak_entity();
-                            let outcome = this.conversation.update(cx, |c, cx| {
+                            this.conversation.update(cx, |c, cx| {
                                 c.append_history_messages(
                                     &new_messages,
                                     &usage,
@@ -800,7 +785,7 @@ impl Workspace {
                                 )
                             });
                             this.history_rendered = messages.len();
-                            this.apply_list_outcome(outcome, cx);
+                            cx.notify();
                         }
                     }
                 }
@@ -865,7 +850,7 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let cwd = thread_cwd(&this.thread, cx);
-                    let outcome = this.conversation.update(cx, |c, cx| {
+                    let _ = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
                             &role,
@@ -874,7 +859,6 @@ impl Workspace {
                             cx,
                         )
                     });
-                    this.apply_list_outcome(outcome, cx);
                     // This is the authoritative end-of-turn boundary: unlike a
                     // provider Stop event, `Thread::is_running()` is already
                     // false, so a queued follow-up can safely start a new turn.
@@ -898,7 +882,7 @@ impl Workspace {
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
                     let cwd = thread_cwd(&this.thread, cx);
-                    let outcome = this.conversation.update(cx, |c, cx| {
+                    let _ = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
                             &role,
@@ -907,12 +891,10 @@ impl Workspace {
                             cx,
                         )
                     });
-                    this.apply_list_outcome(outcome, cx);
                     // `Stop` flips streaming flags off, so finalized bodies switch
                     // to full `Markdown` layout and may grow a frame or two later;
-                    // the list's Absolute scroll anchor holds the viewport steady
-                    // across that growth, and `FollowMode::Tail` — if still
-                    // engaged — re-pins to the end on the next layout.
+                    // ChatList re-measures every visible row each frame, so the
+                    // growth is picked up without an invalidation signal.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), true, cx);
@@ -999,9 +981,7 @@ impl Workspace {
                             this.conversation
                                 .update(cx, |c, cx| c.consume_plan_review(cx));
                             // The demoted plan card stays in place but flips
-                            // inactive — remeasure so the list's cached height
-                            // for it stays honest.
-                            this.list_state.remeasure();
+                            // inactive; ChatList re-measures it next frame.
                         }
                         // The run task emits `TurnFinished` after it has cleared
                         // `running_turn`; queue recovery and follow-up dispatch
@@ -1070,7 +1050,7 @@ impl Workspace {
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
                     let cwd = thread_cwd(&this.thread, cx);
-                    let outcome = this.conversation.update(cx, |c, cx| {
+                    let _ = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
                             &role,
@@ -1079,7 +1059,6 @@ impl Workspace {
                             cx,
                         )
                     });
-                    this.apply_list_outcome(outcome, cx);
                     cx.notify();
                 }
             }
@@ -2283,82 +2262,28 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Reconcile the `list_state` item count with the live conversation length
-    /// via `splice`, which preserves scroll position. Append (the common case,
-    /// every user/assistant/tool item) splices new tail items in as Unmeasured;
-    /// a tail removal (a `Retry` badge popped without replacement) splices the
-    /// dangling slot out. Call after any direct conversation mutation that the
-    /// `ApplyOutcome` path does not already cover (e.g. `push_user`/`push_notice`,
-    /// which bypass `apply`).
-    fn sync_list_count(&mut self, cx: &App) -> bool {
-        let new_count = self.conversation.read(cx).items().len();
-        if new_count == self.list_count {
-            return false;
-        }
-        if new_count > self.list_count {
-            self.list_state.splice(
-                self.list_count..self.list_count,
-                new_count - self.list_count,
-            );
-        } else {
-            self.list_state.splice(new_count..self.list_count, 0);
-        }
-        self.list_count = new_count;
-        true
-    }
-
-    /// Reconcile the `list_state` with a conversation mutation: splice the
-    /// count (append/remove) and remeasure the affected index/indices. Call
-    /// after any `ConversationState::apply` (the outcome tells which path) so
-    /// the virtualized list's per-item height cache never goes stale.
-    fn apply_list_outcome(&mut self, outcome: ApplyOutcome, cx: &App) {
-        let count_changed = self.sync_list_count(cx);
-        match outcome {
-            ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
-            ApplyOutcome::RemeasureAll => self.list_state.remeasure(),
-            // Remeasure the just-mutated segment (e.g. an activity segment
-            // closed for an incoming reply) in addition to the append splice
-            // `sync_list_count` already performed. When the append was net-
-            // neutralized by a trailing `Retry` pop (count unchanged → no
-            // splice), the new assistant bubble occupies a reused `Measured`
-            // tail slot whose cached height is the popped retry badge's, so
-            // remeasure the tail too. (When `popped_retry` was false the push
-            // grew the count by one, `count_changed` is true, and the splice
-            // already inserted the new bubble as `Unmeasured` — so the tail
-            // remeasure is skipped as redundant, not because the branch is
-            // dead.)
-            ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
-                self.list_state
-                    .remeasure_items(remeasure_ix..remeasure_ix + 1);
-                if !count_changed {
-                    let tail = self.list_count.saturating_sub(1);
-                    self.list_state.remeasure_items(tail..tail + 1);
-                }
-            }
-            // `Unchanged` touched no item; `Appended`/`RemovedTail` only changed
-            // the count, which `sync_list_count` already spliced.
-            ApplyOutcome::Unchanged | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
-        }
-    }
-
-    /// Re-engage tail-follow. `FollowMode::Tail` pins to the end natively and
-    /// keeps following; an upward user scroll disengages it and landing back
-    /// at the bottom re-arms it. This is the user-initiated "jump to live
-    /// tail" path (submit, slash command, thread open) — it always re-arms
-    /// follow, even if the user had scrolled up to read back.
+    /// Re-engage tail-follow. `follow_tail` pins to the live end and keeps
+    /// following; an upward user scroll disengages it and landing back at the
+    /// bottom re-arms it. This is the user-initiated "jump to live tail" path
+    /// (submit, slash command, thread open) — it always re-arms follow, even if
+    /// the user had scrolled up to read back.
     fn follow_message_tail(&mut self) {
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list.follow_tail();
     }
 
-    /// Jump the viewport so the given conversation item is at the top. Native
-    /// `scroll_to` is a single atomic state change, so no frame protection is
-    /// needed against a stale tail re-pin.
+    /// Jump the viewport so the given conversation item is at the top. The row
+    /// is addressed by its `RowKey` (entity id), so a later insertion before it
+    /// still lands on the same message.
     fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
-        self.list_state.set_follow_mode(FollowMode::Normal);
-        self.list_state.scroll_to(ListOffset {
-            item_ix,
-            offset_in_item: px(0.),
-        });
+        if let Some(key) = self
+            .conversation
+            .read(cx)
+            .items()
+            .get(item_ix)
+            .map(|e| RowKey::from_entity_id(e.entity_id()))
+        {
+            self.chat_list.scroll_to_row(key);
+        }
         cx.notify();
     }
 
@@ -2557,20 +2482,14 @@ impl Workspace {
         let editor_saved = self.editor_drafts.remove(&new_id).unwrap_or_default();
         self.editor_state
             .update(cx, |s, cx| s.set_value(editor_saved, window, cx));
-        // Reveal the latest turn for the new thread: `reset` drops the old
-        // thread's measured heights and scroll position, then reveal the latest
-        // turn once. Both running and completed threads arm `FollowMode::Tail`:
-        // the list pins to the end on each layout while following, and GPUI
-        // auto-disengages follow the moment the user scrolls up. Using
-        // `Normal` here would leave a one-shot scroll that never re-pins if a
-        // late delta or notice lands after the user scrolls.
-        let count = self.conversation.read(cx).items().len();
-        self.list_state.reset(count);
-        self.list_count = count;
+        // Reveal the latest turn for the new thread: re-arm tail-follow so the
+        // list pins to the live end while following, disengaging the moment the
+        // user scrolls up. A one-shot scroll would never re-pin if a late delta
+        // or notice lands after the user scrolls.
         // All of the thread's current messages are rendered (a restoring
         // thread has none yet — the preview batches append from here).
         self.history_rendered = messages.len();
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list.follow_tail();
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any.
         self.pending_plan_review = self.pending_plans.remove(&new_id);
@@ -2582,10 +2501,8 @@ impl Workspace {
             self.conversation.update(cx, |c, cx| {
                 c.push_plan_review(title, content, role, weak, cx);
             });
-            // The card is appended after the earlier `reset`, so splice the
-            // list count and re-pin so the restored drawer is in view.
-            self.sync_list_count(cx);
-            self.list_state.set_follow_mode(FollowMode::Tail);
+            // Re-pin so the restored drawer is in view.
+            self.chat_list.follow_tail();
         }
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
@@ -2982,7 +2899,6 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
-        self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
         let hit = self.thread.update(cx, |thread, cx| match kind {
@@ -3045,9 +2961,8 @@ impl Workspace {
                 .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
-            // The demoted plan card stays in place but flips inactive —
-            // remeasure so the list's cached height for it stays honest.
-            self.list_state.remeasure();
+            // The demoted plan card stays in place but flips inactive;
+            // ChatList re-measures it next frame.
             // Persist the dismissed plan as a UI note so the collapsed record
             // survives a thread switch / reload — the live card is UI-only and
             // never enters `Thread::messages`. `record_ui_note` anchors to the
@@ -3082,7 +2997,6 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
         });
-        self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays pinned as it grows.
         if follow_tail {
             self.follow_message_tail();
@@ -3164,8 +3078,7 @@ impl Workspace {
                 cx,
             )
         });
-        self.sync_list_count(cx);
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list.follow_tail();
     }
 
     fn append_and_run_user_turn(
@@ -3199,7 +3112,7 @@ impl Workspace {
                     self.append_user_turn(
                         item.turn,
                         weak.clone(),
-                        self.list_state.is_following_tail(),
+                        self.chat_list.is_following_tail(),
                         cx,
                     );
                     drained = true;
@@ -3237,7 +3150,6 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(message_id, cx);
                 });
-                self.list_state.remeasure();
                 // Keep the id so a later `SteerInjected` can still heal this
                 // provisional rollback.
                 let message_id = message_id.clone();
@@ -3269,12 +3181,11 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.confirm_pending_steer(message_id, cx);
         });
-        self.list_state.remeasure();
         // Only re-engage tail-follow if the user hasn't scrolled away —
         // a steer injection is event-driven, not user-initiated, so it
         // should not yank the viewport back to the bottom.
-        if self.list_state.is_following_tail() {
-            self.list_state.scroll_to_end();
+        if self.chat_list.is_following_tail() {
+            self.chat_list.scroll_to_end();
         }
         cx.notify();
     }
@@ -3342,7 +3253,6 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
-                self.list_state.remeasure();
             }
             cx.notify();
         }
@@ -3361,7 +3271,6 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
-                self.list_state.remeasure();
             }
             cx.notify();
         }
@@ -3684,7 +3593,6 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
-        self.sync_list_count(cx);
         self.follow_message_tail();
         self.thread.update(cx, |thread, cx| {
             thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
@@ -3756,7 +3664,6 @@ impl Workspace {
             c.push_notice(text.clone(), weak, cx);
         });
         self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
-        self.sync_list_count(cx);
         // If tail-follow is engaged the list reveals the notice; if the user
         // scrolled up, `FollowMode::Tail` has already disengaged so the
         // viewport stays put.
@@ -4001,7 +3908,6 @@ impl Workspace {
             // model updates the plan file and proposes again (fresh card).
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
-            self.list_state.remeasure();
             self.add_info_message(i18n::t("plan-refine-notice").to_string(), cx);
             cx.notify();
             return;
@@ -4062,10 +3968,7 @@ impl Workspace {
             self.conversation.update(cx, |c, cx| {
                 c.push_user(seed_text.clone(), Vec::new(), meta, weak, cx);
             });
-            self.sync_list_count(cx);
-            let ix = self.conversation.read(cx).items().len().saturating_sub(1);
-            self.list_state.remeasure_items(ix..ix + 1);
-            self.list_state.set_follow_mode(FollowMode::Tail);
+            self.chat_list.follow_tail();
             let compact = matches!(choice, PlanReviewChoice::ExecuteCompact);
             let compact_instructions = compact.then(|| {
                 agent::collaboration_mode::plan_compact_instructions(lang, &review.plan_file)
@@ -6365,11 +6268,10 @@ impl Workspace {
                         // anchored, tail-following native list.
                         .children(hero)
                         .children({
-                            // `cx.processor` adapts the item closure to
-                            // `gpui::list`'s `FnMut(usize, &mut Window, &mut
-                            // App)` signature; it captures an `Entity<Workspace>`
-                            // internally, so it is built outside the frame
-                            // closure and moved in.
+                            // `cx.processor` adapts the item closure to the
+                            // row-renderer signature; it captures an
+                            // `Entity<Workspace>` internally, so it is built
+                            // outside the frame closure and moved in.
                             let processor = cx.processor(|this, ix: usize, _window, cx| {
                                 let item = this.conversation.read(cx).items().get(ix).cloned();
                                 match item {
@@ -6400,25 +6302,32 @@ impl Workspace {
                                             .child(item)
                                             .into_any_element()
                                     }
-                                    // Index out of range mid-splice (count
-                                    // changed between a layout pass and the
-                                    // render closure): render an empty row.
+                                    // `ChatList` only measures rows within
+                                    // `[0, count)`, so this arm is unreachable;
+                                    // kept as a safety net for out-of-range
+                                    // indices.
                                     None => gpui::div().into_any_element(),
                                 }
                             });
-                            let list_state = self.list_state.clone();
+                            let chat_list = self.chat_list.clone();
+                            let keys: Vec<RowKey> = self
+                                .conversation
+                                .read(cx)
+                                .items()
+                                .iter()
+                                .map(|e| RowKey::from_entity_id(e.entity_id()))
+                                .collect();
                             let mono_family = theme.mono_font_family.clone();
                             (!first_screen).then(move || {
-                                // Native `gpui::list`: it owns virtualization,
-                                // scroll, the per-item height cache, and tail-
-                                // follow. Visible rows re-measure every frame;
-                                // a width change invalidates every cached
-                                // height; `Tail` mode pins to the live end and
-                                // re-engages at the bottom after an upward
-                                // scroll. Item heights are reconciled from the
-                                // ThreadEvent handler via
-                                // `splice`/`remeasure_items`.
-                                let list_el = gpui::list(list_state, processor)
+                                // `ChatList`: anchor-only virtualization with
+                                // no cached heights. Every visible row is
+                                // measured at a definite width each frame, so
+                                // nothing needs `splice`/`remeasure`/width
+                                // invalidation to stay honest. `Bottom`
+                                // alignment pins short histories to the bottom;
+                                // tail-follow engages at the live end and
+                                // disengages on an upward scroll.
+                                let list_el = ChatList::new(chat_list, keys, processor)
                                     .w_full()
                                     .h_full()
                                     .min_h_0()
