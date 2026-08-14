@@ -271,6 +271,15 @@ impl Render for Markdown {
         // participate in the same shrink-safe width chain.
         let mut col = v_flex()
             .id(self.id.clone())
+            .debug_selector({
+                let id = format!("{:?}", self.id);
+                move || {
+                    // `("md", N)` → `md-root-N`, so tests can assert the
+                    // document root's geometry against its blocks.
+                    let n: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+                    format!("md-root-{n}")
+                }
+            })
             .w_full()
             .min_w_0()
             .overflow_hidden()

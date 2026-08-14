@@ -39,12 +39,20 @@ pub const CONTENT_MAX_W: f32 = 760.0;
 /// residual incompressible content at its own edge (`overflow_x_hidden`) so it
 /// never reaches the window as a horizontal scrollbar.
 pub fn centered(child: impl gpui::IntoElement) -> Div {
-    use gpui_component::{h_flex, v_flex};
-    h_flex().w_full().min_w_0().justify_center().px_4().child(
+    use gpui_component::v_flex;
+    // Centering is `margin: 0 auto` inside a column, not `justify_center` in a
+    // row. A row flex derives its own height from the cross-size the item
+    // reports at a *probe* width; with horizontal slack (viewport wider than
+    // `CONTENT_MAX_W`) that probe is the item's min-content width, so wrapped
+    // text reports a far taller height than it paints at the resolved width,
+    // and the surplus stays in the row as blank space. A column flex resolves
+    // the item's width first, so height is measured at the width it paints.
+    v_flex().w_full().min_w_0().px_4().child(
         v_flex()
             .w_full()
             .min_w_0()
             .max_w(px(CONTENT_MAX_W))
+            .mx_auto()
             .child(child),
     )
 }
