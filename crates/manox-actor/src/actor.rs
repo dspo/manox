@@ -67,7 +67,10 @@ pub fn start(sink: EventSink) -> Result<ActorHandle, std::io::Error> {
     let handle = thread::Builder::new()
         .name("manox-agent".into())
         .spawn(move || run_actor(rx, sink))?;
-    Ok(ActorHandle { tx, _thread: handle })
+    Ok(ActorHandle {
+        tx,
+        _thread: handle,
+    })
 }
 
 struct SessionState {
@@ -184,7 +187,8 @@ fn handle_command(
                             }
                             _ => {}
                         }
-                        if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id))
+                        if let Some(json) =
+                            crate::events::thread_event_to_json(ev, Some(&session_id))
                         {
                             sink.emit(json);
                         }
@@ -364,10 +368,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let home = std::env::temp_dir().join(format!(
-                "manox-actor-test-{}-{nanos}",
-                std::process::id()
-            ));
+            let home = std::env::temp_dir()
+                .join(format!("manox-actor-test-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&home).unwrap();
             // SAFETY: test setup, serialized behind GLOBALS_LOCK.
             unsafe { std::env::set_var("HOME", home) };
@@ -387,7 +389,10 @@ mod tests {
     fn collect_sink() -> (Arc<Mutex<Vec<String>>>, EventSink) {
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink_out = out.clone();
-        (out.clone(), EventSink::new(move |json| sink_out.lock().unwrap().push(json)))
+        (
+            out.clone(),
+            EventSink::new(move |json| sink_out.lock().unwrap().push(json)),
+        )
     }
 
     fn types(out: &Arc<Mutex<Vec<String>>>) -> Vec<String> {

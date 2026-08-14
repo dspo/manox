@@ -86,10 +86,10 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
         }),
         _ => return None,
     };
-    if let Some(id) = session_id {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("sessionId".to_string(), Value::String(id.to_string()));
-        }
+    if let Some(id) = session_id
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.insert("sessionId".to_string(), Value::String(id.to_string()));
     }
     Some(v.to_string())
 }
