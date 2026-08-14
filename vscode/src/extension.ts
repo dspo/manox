@@ -1,14 +1,17 @@
-// manox-vscode entry point: registers the @manox ChatParticipant that drives
-// the napi agent core (crates/manox-napi).
+// manox-vscode entry point: registers the sidebar conversation view and the
+// @manox ChatParticipant, both driving the shared napi agent actor
+// (crates/manox-napi via manox-actor) through session-scoped channels.
 
 import * as vscode from 'vscode';
 import { registerManoxParticipant } from './participant';
-import { registerManoxView } from './view';
+import { registerManoxSidebar } from './sidebar/sidebarProvider';
+import { SessionManager } from './sessionManager';
 
 export function activate(context: vscode.ExtensionContext): void {
-  registerManoxView(context);
+  registerManoxSidebar(context);
   registerManoxParticipant(context);
-  console.log('manox-vscode activated');
 }
 
-export function deactivate(): void {}
+export function deactivate(): Thenable<void> {
+  return SessionManager.disposeShared();
+}
