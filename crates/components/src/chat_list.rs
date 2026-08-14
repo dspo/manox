@@ -131,8 +131,7 @@ impl ChatListState {
 
     /// Point the list at the entity whose events drive it; scroll deltas notify
     /// it to request a repaint.
-    #[allow(dead_code)] // wired up when the workspace adopts ChatList
-    pub(crate) fn set_view(&self, view: gpui::EntityId) {
+    pub fn set_view(&self, view: gpui::EntityId) {
         self.0.borrow_mut().view = Some(view);
     }
 
