@@ -5417,6 +5417,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "manox-actor"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "gpui",
+ "pi-extensions",
+ "serde_json",
+]
+
+[[package]]
 name = "manox-components"
 version = "0.1.0"
 dependencies = [
@@ -5431,17 +5441,10 @@ dependencies = [
 name = "manox-napi"
 version = "0.1.0"
 dependencies = [
- "agent",
- "gpui",
+ "manox-actor",
  "napi",
  "napi-build",
  "napi-derive",
- "pi",
- "pi-extensions",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]
