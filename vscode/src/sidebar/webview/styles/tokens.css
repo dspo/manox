@@ -1,0 +1,49 @@
+@import "tw-animate-css";
+@import "tailwindcss";
+
+/*
+ * Design tokens for the manox sidebar. Every color references a VS Code
+ * theme variable, so light/dark switches propagate with no extra wiring.
+ * The four --font-* tokens are the single place to customize fonts per
+ * module; each backs a font-chrome / font-transcript / font-code /
+ * font-thinking utility.
+ */
+@theme {
+  --color-background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  --color-foreground: var(--vscode-foreground);
+  --color-muted: var(--vscode-textBlockQuote-background);
+  --color-muted-foreground: var(--vscode-descriptionForeground);
+  --color-border: var(--vscode-panel-border);
+  --color-primary: var(--vscode-button-background);
+  --color-primary-foreground: var(--vscode-button-foreground);
+  --color-destructive: var(--vscode-errorForeground);
+  --color-accent: var(--vscode-list-hoverBackground);
+  --color-accent-foreground: var(--vscode-list-hoverForeground, var(--vscode-foreground));
+  --color-secondary: var(--vscode-button-secondaryBackground, var(--vscode-textBlockQuote-background));
+  --color-secondary-foreground: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  --color-card: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  --color-card-foreground: var(--vscode-foreground);
+  --color-ring: var(--vscode-focusBorder);
+
+  --font-chrome: var(--vscode-font-family);
+  --font-transcript: var(--vscode-font-family);
+  --font-code: var(--vscode-editor-font-family);
+  --font-thinking: var(--vscode-font-family);
+
+  --animate-shimmer: shimmer 2s linear infinite;
+
+  @keyframes shimmer {
+    from {
+      background-position: 200% center;
+    }
+    to {
+      background-position: -200% center;
+    }
+  }
+}
+
+body {
+  margin: 0;
+  font-size: 13px;
+  color-scheme: light dark;
+}
