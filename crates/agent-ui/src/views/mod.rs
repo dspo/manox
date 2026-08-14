@@ -18,10 +18,41 @@ pub mod title_menu;
 pub mod turn_navigator;
 
 use gpui::prelude::*;
-use gpui::{Div, px};
+use std::{cell::Cell, rc::Rc};
+
+use gpui::{Div, ListState, Pixels, px};
 
 /// Max content width (centered, width-capped).
 pub const CONTENT_MAX_W: f32 = 760.0;
+
+/// Width-keyed invalidation for native message-list row heights.
+///
+/// The pinned official GPUI revision remeasures visible rows, but retains the
+/// cached heights of off-screen rows across a width change. A height measured
+/// at a narrow width can therefore survive after a resize and present as a
+/// large blank range. Keeping this tracker outside the list's row callback
+/// lets the application invalidate the entire cache after final layout has
+/// produced a positive, definite width.
+#[derive(Clone, Default)]
+pub struct MessageListWidthInvalidator {
+    last_width: Rc<Cell<Option<Pixels>>>,
+}
+
+impl MessageListWidthInvalidator {
+    /// Returns `true` when callers must schedule one more frame to consume the
+    /// invalidated cache. Sub-pixel jitter is ignored.
+    pub fn update(&self, width: Pixels, state: &ListState) -> bool {
+        if width <= px(0.) {
+            return false;
+        }
+        let previous = self.last_width.replace(Some(width));
+        let changed = previous.is_some_and(|previous| (previous - width).abs() > px(0.5));
+        if changed {
+            state.remeasure_items(0..state.item_count());
+        }
+        changed
+    }
+}
 
 /// Wrap content in a full-width, centered, width-capped container.
 ///

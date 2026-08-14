@@ -12,14 +12,14 @@ use agent_ui::{
     conversation::{
         ActivityEntry, ConvItem, ThinkingContainer, ToolCallItem, UserMessageDisplayState,
     },
-    views::message::MessageItem,
+    views::{MessageListWidthInvalidator, message::MessageItem},
 };
 use gpui::{
     AnyWindowHandle, AppContext as _, Context, FollowMode, InteractiveElement as _, IntoElement,
     ListAlignment, ListState, Modifiers, MouseButton, ParentElement as _, Pixels, Render,
     Styled as _, TestAppContext, VisualTestContext, Window, WindowHandle, div, list, px, size,
 };
-use gpui_component::ActiveTheme as _;
+use gpui_component::{ActiveTheme as _, ElementExt as _};
 use manox_components::markdown::{Markdown, PanelKind, TerminalPanel};
 
 struct ListProbe {
@@ -322,29 +322,54 @@ async fn list_remeasures_streaming_markdown_child_growth(cx: &mut TestAppContext
 struct MessageItemListProbe {
     state: ListState,
     rows: Vec<gpui::Entity<MessageItem>>,
+    width_invalidator: MessageListWidthInvalidator,
+}
+
+impl MessageItemListProbe {
+    fn new(state: ListState, rows: Vec<gpui::Entity<MessageItem>>) -> Self {
+        Self {
+            state,
+            rows,
+            width_invalidator: MessageListWidthInvalidator::default(),
+        }
+    }
 }
 
 impl Render for MessageItemListProbe {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let mono_family = cx.theme().mono_font_family.clone();
-        list(self.state.clone(), move |ix, _window, _cx| {
-            div()
+        let state = self.state.clone();
+        let width_state = state.clone();
+        let width_invalidator = self.width_invalidator.clone();
+        div()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                list(state, move |ix, _window, _cx| {
+                    div()
+                        .w_full()
+                        .pt_1()
+                        .pb_4()
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .debug_selector(move || format!("message-item-list-row-{ix}"))
+                        .child(rows[ix].clone())
+                        .into_any_element()
+                })
                 .w_full()
-                .pt_1()
-                .pb_4()
+                .h_full()
+                .min_h_0()
                 .min_w_0()
-                .flex_shrink_0()
-                .debug_selector(move || format!("message-item-list-row-{ix}"))
-                .child(rows[ix].clone())
-                .into_any_element()
-        })
-        .w_full()
-        .h_full()
-        .min_h_0()
-        .min_w_0()
-        .font_family(mono_family)
-        .font_weight(gpui::FontWeight::LIGHT)
+                .font_family(mono_family)
+                .font_weight(gpui::FontWeight::LIGHT),
+            )
+            .on_prepaint(move |bounds, window, _cx| {
+                if width_invalidator.update(bounds.size.width, &width_state) {
+                    window.refresh();
+                }
+            })
     }
 }
 
@@ -384,10 +409,7 @@ async fn list_remeasures_real_message_item_when_markdown_child_grows(cx: &mut Te
     let window = cx.open_window(size(px(760.), px(600.)), {
         let state = state.clone();
         let plan = plan.clone();
-        move |_, _| MessageItemListProbe {
-            state,
-            rows: vec![plan, tail],
-        }
+        move |_, _| MessageItemListProbe::new(state, vec![plan, tail])
     });
     cx.run_until_parked();
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -479,9 +501,45 @@ fn production_rows(cx: &mut TestAppContext) -> Vec<gpui::Entity<MessageItem>> {
     .into_iter()
     .enumerate()
     .map(|(ix, kind)| {
-        cx.new(|_| MessageItem::new(kind, "deepseek-v4-flash".into(), ix, weak.clone()))
+        let item = cx.new(|_| MessageItem::new(kind, "deepseek-v4-flash".into(), ix, weak.clone()));
+        item.update(cx, |item, cx| {
+            item.rebuild_activity_reasoning(cx);
+            item.rebuild_tool_panels(None, cx);
+        });
+        item
     })
     .collect()
+}
+
+fn assert_fixture_activity_is_contained(visual: &mut VisualTestContext) {
+    let row = visual
+        .debug_bounds("message-item-list-row-2")
+        .expect("thinking message row");
+    let tree = visual
+        .debug_bounds("message-overflow-activity-tree-2")
+        .expect("activity tree");
+    assert!(
+        tree.top() >= row.top() && tree.bottom() <= row.bottom(),
+        "painted activity escaped its cached list row: row={row:?}, tree={tree:?}"
+    );
+    let mut previous = None;
+    for selector in [
+        "message-overflow-activity-entry-2-0",
+        "message-overflow-activity-entry-2-1",
+    ] {
+        let entry = visual.debug_bounds(selector).expect("activity entry");
+        assert!(
+            entry.top() >= tree.top() && entry.bottom() <= tree.bottom(),
+            "activity entry escaped its tree: tree={tree:?}, entry={entry:?}"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                previous <= entry.top(),
+                "painted activity entries overlap: previous bottom={previous:?}, entry={entry:?}"
+            );
+        }
+        previous = Some(entry.bottom());
+    }
 }
 
 #[gpui::test]
@@ -492,7 +550,7 @@ async fn production_rows_do_not_overlap_on_consecutive_frames(cx: &mut TestAppCo
     state.set_follow_mode(FollowMode::Tail);
     let window = cx.open_window(size(px(760.), px(4000.)), {
         let state = state.clone();
-        move |_, _| MessageItemListProbe { state, rows }
+        move |_, _| MessageItemListProbe::new(state, rows)
     });
     cx.run_until_parked();
     let mut visual = VisualTestContext::from_window(window.into(), cx);
@@ -518,6 +576,7 @@ async fn production_rows_do_not_overlap_on_consecutive_frames(cx: &mut TestAppCo
                 pair[1]
             );
         }
+        assert_fixture_activity_is_contained(&mut visual);
     }
 }
 
@@ -527,28 +586,41 @@ async fn production_list_recovers_after_narrow_width_without_blank_range(cx: &mu
     let rows = production_rows(cx);
     let state = ListState::new(rows.len(), ListAlignment::Bottom, px(2048.));
     state.set_follow_mode(FollowMode::Tail);
-    let window = cx.open_window(size(px(760.), px(600.)), {
+    // First expose every row at a realistic narrow width so GPUI caches all
+    // narrow wrapped heights. Then reduce only the viewport height, moving the
+    // leading rows offscreen without changing those cached measurements.
+    let window = cx.open_window(size(px(320.), px(30_000.)), {
         let state = state.clone();
-        move |_, _| MessageItemListProbe { state, rows }
+        move |_, _| MessageItemListProbe::new(state, rows)
     });
     cx.run_until_parked();
     let mut visual = VisualTestContext::from_window(window.into(), cx);
-    visual.update(|window, cx| window.draw(cx).clear());
-    visual.simulate_resize(size(px(1.), px(600.)));
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    visual.simulate_resize(size(px(320.), px(600.)));
     visual.run_until_parked();
     visual.update(|window, cx| window.draw(cx).clear());
+    let narrow_scroll_range = state.max_offset_for_scrollbar().y;
     assert!(
-        state.max_offset_for_scrollbar().y < px(100_000.),
-        "narrow frame poisoned the list with an explosive scroll range"
+        narrow_scroll_range > px(1_000.),
+        "fixture was not tall enough"
     );
 
-    visual.simulate_resize(size(px(760.), px(600.)));
+    visual.simulate_resize(size(px(1_200.), px(600.)));
     visual.run_until_parked();
-    visual.update(|window, cx| window.draw(cx).clear());
+    for _ in 0..2 {
+        visual.update(|window, cx| window.draw(cx).clear());
+    }
+    let wide_scroll_range = state.max_offset_for_scrollbar().y;
+    assert!(
+        wide_scroll_range < narrow_scroll_range * 0.8,
+        "off-screen narrow-width heights survived widening: narrow={narrow_scroll_range:?}, wide={wide_scroll_range:?}"
+    );
     let tail = visual
         .debug_bounds("message-item-list-row-3")
         .expect("tail row is visible after resize recovery");
-    assert!(tail.bottom() <= px(600.));
+    assert!(tail.top() >= px(0.) && tail.bottom() <= px(600.));
     assert!(state.is_scrolled_to_end().unwrap_or(true));
 }
 
