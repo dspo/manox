@@ -167,80 +167,45 @@ pub struct RichTextState {
     text_style: TextStyle,
 }
 
-/// Mirror GPUI's wrap-candidate classification at the pinned revision. It is
-/// intentionally local because `LineWrapper::is_word_char` is not public.
-fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(c, '\u{00C0}'..='\u{00FF}')
-        || matches!(c, '\u{0100}'..='\u{017F}')
-        || matches!(c, '\u{0180}'..='\u{024F}')
-        || matches!(c, '\u{0400}'..='\u{04FF}')
-        || matches!(c, '\u{1E00}'..='\u{1EFF}')
-        || matches!(c, '\u{0300}'..='\u{036F}')
-        || matches!(c, '\u{0980}'..='\u{09FF}')
-        || matches!(
-            c,
-            '-' | '_'
-                | '.'
-                | '\''
-                | '’'
-                | '‘'
-                | '$'
-                | '%'
-                | '@'
-                | '#'
-                | '^'
-                | '~'
-                | ','
-                | '='
-                | ':'
-                | ';'
-                | '⋯'
-        )
-}
-
-/// Width of the widest segment that GPUI's line wrapper cannot break. This is
-/// the honest CSS min-content width used for intrinsic probes; returning the
-/// full unwrapped width here pins flex cells, while returning a tiny width
-/// inflates their probe height and can leave a large blank list row.
+/// Width of the widest non-whitespace segment between Unicode line-break
+/// opportunities. This intrinsic width lets table cells shrink without
+/// inflating the probe height used by their parent row.
 fn min_content_width(lines: &[WrappedLine]) -> Pixels {
     lines.iter().fold(px(0.), |widest, line| {
-        let mut max_segment_width = px(0.);
-        let mut segment_start_x = px(0.);
-        let mut first_non_whitespace_ix = None;
-        let mut prev_ch = '\0';
-        let mut glyphs = line
+        let glyphs = line
             .unwrapped_layout
             .runs
             .iter()
             .flat_map(|run| run.glyphs.iter())
-            .peekable();
-
-        while let Some(glyph) = glyphs.next() {
-            let ch = line.text[glyph.index..].chars().next().unwrap();
-            if ch == '\n' {
-                continue;
-            }
-            let is_break_candidate = if is_word_char(ch) {
-                prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some()
-            } else {
-                ch != ' ' && first_non_whitespace_ix.is_some()
-            };
-            if is_break_candidate {
-                segment_start_x = glyph.position.x;
-            }
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(glyph.index);
-            }
-            if ch != ' ' {
-                let glyph_end_x = glyphs
-                    .peek()
-                    .map_or(line.unwrapped_layout.width, |glyph| glyph.position.x);
-                max_segment_width = max_segment_width.max(glyph_end_x - segment_start_x);
-            }
-            prev_ch = ch;
-        }
-        widest.max(max_segment_width)
+            .collect::<Vec<_>>();
+        let mut segment_start = 0;
+        unicode_linebreak::linebreaks(&line.text).fold(
+            widest,
+            |widest, (segment_end, _opportunity)| {
+                let mut first_x = None;
+                let mut end_x = None;
+                for (ix, glyph) in glyphs.iter().enumerate() {
+                    if !(segment_start..segment_end).contains(&glyph.index) {
+                        continue;
+                    }
+                    let ch = line.text[glyph.index..].chars().next().unwrap();
+                    if ch.is_whitespace() {
+                        continue;
+                    }
+                    first_x.get_or_insert(glyph.position.x);
+                    end_x = Some(
+                        glyphs
+                            .get(ix + 1)
+                            .map_or(line.unwrapped_layout.width, |next| next.position.x),
+                    );
+                }
+                segment_start = segment_end;
+                match (first_x, end_x) {
+                    (Some(first_x), Some(end_x)) => widest.max(end_x - first_x),
+                    _ => widest,
+                }
+            },
+        )
     })
 }
 
@@ -295,18 +260,28 @@ fn shape(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ShapeRequest<'a> {
+    text: &'a SharedString,
+    runs: &'a [TextRun],
+    text_style: &'a TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+}
+
 fn measure_shape(
     cache: &Rc<RefCell<ShapeCache>>,
     known_width: Option<Pixels>,
     available_width: AvailableSpace,
-    text: &SharedString,
-    runs: &[TextRun],
-    text_style: &TextStyle,
-    font_size: Pixels,
-    line_height: Pixels,
+    request: ShapeRequest<'_>,
     window: &mut Window,
 ) -> Size<Pixels> {
+    let ShapeRequest {
+        text,
+        runs,
+        text_style,
+        font_size,
+        line_height,
+    } = request;
     let wrap_width = useful_wrap_width(
         known_width,
         available_width,
@@ -453,11 +428,13 @@ impl Element for RichText {
                     &measured,
                     known.width,
                     available.width,
-                    &measure_text,
-                    &measure_runs,
-                    &measure_style,
-                    font_size,
-                    line_height,
+                    ShapeRequest {
+                        text: &measure_text,
+                        runs: &measure_runs,
+                        text_style: &measure_style,
+                        font_size,
+                        line_height,
+                    },
                     window,
                 )
             },
@@ -757,11 +734,13 @@ mod tests {
                     &Rc::new(RefCell::new(ShapeCache::default())),
                     None,
                     second,
-                    &text,
-                    &runs,
-                    &text_style,
-                    font_size,
-                    line_height,
+                    ShapeRequest {
+                        text: &text,
+                        runs: &runs,
+                        text_style: &text_style,
+                        font_size,
+                        line_height,
+                    },
                     window,
                 );
                 for first in constraints {
@@ -770,22 +749,26 @@ mod tests {
                         &cache,
                         None,
                         first,
-                        &text,
-                        &runs,
-                        &text_style,
-                        font_size,
-                        line_height,
+                        ShapeRequest {
+                            text: &text,
+                            runs: &runs,
+                            text_style: &text_style,
+                            font_size,
+                            line_height,
+                        },
                         window,
                     );
                     let with_history = measure_shape(
                         &cache,
                         None,
                         second,
-                        &text,
-                        &runs,
-                        &text_style,
-                        font_size,
-                        line_height,
+                        ShapeRequest {
+                            text: &text,
+                            runs: &runs,
+                            text_style: &text_style,
+                            font_size,
+                            line_height,
+                        },
                         window,
                     );
                     assert_eq!(

@@ -147,6 +147,27 @@ enum ComposerPlaceholderMode {
     Ask,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposerPlacement {
+    Hidden,
+    Hero,
+    Footer,
+}
+
+fn composer_placement(
+    editor_open: bool,
+    first_screen: bool,
+    _history_loading: bool,
+) -> ComposerPlacement {
+    if editor_open {
+        ComposerPlacement::Hidden
+    } else if first_screen {
+        ComposerPlacement::Hero
+    } else {
+        ComposerPlacement::Footer
+    }
+}
+
 struct DeferredUserTurn {
     text: String,
     images: Vec<agent::language_model::MessageContent>,
@@ -3904,6 +3925,9 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
+        if self.thread.read(cx).history_phase().is_loading() {
+            return false;
+        }
         if running {
             return true;
         }
@@ -6031,11 +6055,12 @@ impl Workspace {
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
-        // A restoring thread is neither hero nor conversation: it shows the
-        // loading indicator instead (and hides the composer — no input while
-        // history is loading).
+        // Restoring history keeps the composer mounted so the user can draft
+        // immediately, while submission remains gated until the transcript is
+        // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
         let loading = self.thread.read(cx).history_phase().is_loading();
+        let composer_placement = composer_placement(editor_open, first_screen, loading);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
             - px(SIDEBAR_DIVIDER_WIDTH)
@@ -6054,22 +6079,17 @@ impl Workspace {
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
-        // A loading thread hides it too — no input while history loads.
-        let footer = if editor_open || first_screen || loading {
-            None
-        } else {
-            Some(
-                v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .bg(theme.background)
-                    .py_2()
-                    .gap_2()
-                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
-                    .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, window, &theme, cx))),
-            )
-        };
+        let footer = (composer_placement == ComposerPlacement::Footer).then(|| {
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .bg(theme.background)
+                .py_2()
+                .gap_2()
+                .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
+                .children(self.render_attachments(&theme, cx))
+                .child(centered(self.render_composer(running, window, &theme, cx)))
+        });
 
         // Hero occupies the message-list region on the first screen.
         // Notice items on the first screen (e.g. Danger toggle acknowledgement).
@@ -6093,19 +6113,21 @@ impl Workspace {
         } else {
             None
         };
-        let hero = if editor_open || !first_screen {
+        let hero = if composer_placement != ComposerPlacement::Hero {
             None
         } else if loading {
-            // History is still restoring: a centered loading indicator in
-            // place of the hero. No composer — input is gated until `Ready`.
+            // History restore and drafting are independent: the progress label
+            // describes the transcript while the disabled send action makes the
+            // input gate explicit without delaying the editor itself.
             Some(
                 v_flex()
                     .flex_1()
                     .w_full()
                     .justify_center()
                     .items_center()
-                    .child(
+                    .child(centered(
                         v_flex()
+                            .w_full()
                             .gap_3()
                             .items_center()
                             .child(
@@ -6117,8 +6139,10 @@ impl Workspace {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(i18n::t("workspace-loading-history")),
-                            ),
-                    ),
+                            )
+                            .children(self.render_attachments(&theme, cx))
+                            .child(self.render_composer(running, window, &theme, cx)),
+                    )),
             )
         } else {
             Some(
@@ -7107,4 +7131,33 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComposerPlacement, composer_placement};
+
+    #[test]
+    fn history_restore_keeps_composer_mounted() {
+        assert_eq!(
+            composer_placement(false, true, true),
+            ComposerPlacement::Hero
+        );
+        assert_eq!(
+            composer_placement(false, false, true),
+            ComposerPlacement::Footer
+        );
+    }
+
+    #[test]
+    fn editor_remains_the_only_composer_exclusion() {
+        assert_eq!(
+            composer_placement(true, true, false),
+            ComposerPlacement::Hidden
+        );
+        assert_eq!(
+            composer_placement(true, false, true),
+            ComposerPlacement::Hidden
+        );
+    }
 }

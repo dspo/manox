@@ -16,6 +16,7 @@ markdown.workspace = true
 ropey.workspace = true
 # vte::ansi::Processor + Handler — parse SGR/color escapes in tool output for the TerminalPanel.
 vte.workspace = true
+unicode-linebreak.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

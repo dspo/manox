@@ -169,6 +169,7 @@ unic-langid = "0.9"
 # tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"
+unicode-linebreak = "0.1.5"
 
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

@@ -291,7 +291,7 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
 #### Body
 
-Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (or the [LoadingIndicator](#loadingindicator) while a session restores) or [MessageArea](#messagearea) + [Footer](#footer).
+Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (with the [LoadingIndicator](#loadingindicator) while an empty session restores) or [MessageArea](#messagearea) + [Footer](#footer).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -308,7 +308,7 @@ Vertically centered welcome area: logo/heading + inline [Composer](#composer).
 
 #### LoadingIndicator
 
-Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown in place of the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer is hidden while loading — input is gated on the thread's `HistoryPhase` until `Ready`; preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`).
+Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown inside the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer mounts immediately below it and accepts draft edits; send remains disabled and keyboard submission is gated on the thread's `HistoryPhase` until `Ready`. Preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`); once the first preview content lands, the composer moves to the [Footer](#footer) without waiting for the authoritative restore.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -413,7 +413,7 @@ Amber badge, `bg:warning/0.12`, braille spinner + "Retry N/M (in Xs)" text. The 
 
 #### 3.2.3 Footer
 
-Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). Hidden entirely while history is loading — no input until the restore lands.
+Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero](#hero) on first screen). It remains mounted while non-empty history is restoring so drafting never waits for backend readiness; send stays disabled until the restore lands.
 
 #### Footer
 
@@ -892,7 +892,7 @@ First-party selectable text panel (`manox-components::markdown::TerminalPanel`, 
 
 #### Markdown
 
-Self-built stateful markdown renderer (`manox-components::markdown::Markdown`, an `Entity` + `Render`) replacing `gpui_component::TextView::markdown`. Owns the source + an `IncrementalParser` (parse-once: freezes the completed prefix so a streaming append only re-parses the growing tail) + a document-level `DocSelection`. The `Render` builds a focusable vertical flex root mounting a zero-size sentinel as the first child — the sentinel clears the per-frame block registry at paint start, then each block's `RichText` re-registers its geometry during paint; the root's mouse listeners hit-test that registry to drive one continuous selection across paragraph / code / list boundaries, and the key listener copies it on Cmd/Ctrl+C. Click semantics: single click places the anchor + starts a drag; double-click selects the word at the click (a click landing inside a registered inline-code span selects the whole span verbatim); triple-click selects the line. `RichText` is a Manox-owned public-GPUI leaf using `shape_text` + `WrappedLine` for both measurement and paint; min-content and max-content probe answers live in dedicated cache slots and never replace the exact-width layout used for paint, and min-content width comes from the widest unbreakable shaped-glyph segment. The same definite-width geometry drives selection/link hit testing; it does not use GPUI `StyledText`'s old constraint cache. Block visuals: paragraphs/headings use highlighted `RichText`; code blocks have a line-number gutter + `overflow_x_scroll` + tree-sitter highlighting (highlight result cached per `(lang, content_hash)`); unified-diff blocks have an accent wash + left bar; GFM tables have column alignment + horizontal scroll; task-list checkboxes; code/diff block hover copy button. Streaming bodies paint plain text + cursor; the full layout mounts once the stream ends.
+Self-built stateful markdown renderer (`manox-components::markdown::Markdown`, an `Entity` + `Render`) replacing `gpui_component::TextView::markdown`. Owns the source + an `IncrementalParser` (parse-once: freezes the completed prefix so a streaming append only re-parses the growing tail) + a document-level `DocSelection`. The `Render` builds a focusable vertical flex root mounting a zero-size sentinel as the first child — the sentinel clears the per-frame block registry at paint start, then each block's `RichText` re-registers its geometry during paint; the root's mouse listeners hit-test that registry to drive one continuous selection across paragraph / code / list boundaries, and the key listener copies it on Cmd/Ctrl+C. Click semantics: single click places the anchor + starts a drag; double-click selects the word at the click (a click landing inside a registered inline-code span selects the whole span verbatim); triple-click selects the line. `RichText` is a Manox-owned public-GPUI leaf using `shape_text` + `WrappedLine` for both measurement and paint; min-content and max-content probe answers live in dedicated cache slots and never replace the exact-width layout used for paint, and min-content width comes from shaped glyph segments partitioned by Unicode line-break opportunities. The same definite-width geometry drives selection/link hit testing; it does not use GPUI `StyledText`'s old constraint cache. Block visuals: paragraphs/headings use highlighted `RichText`; code blocks have a line-number gutter + `overflow_x_scroll` + tree-sitter highlighting (highlight result cached per `(lang, content_hash)`); unified-diff blocks have an accent wash + left bar; GFM tables have column alignment + horizontal scroll; task-list checkboxes; code/diff block hover copy button. Streaming bodies paint plain text + cursor; the full layout mounts once the stream ends.
 
 #### TurnFrame
 
