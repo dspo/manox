@@ -34,7 +34,7 @@ export const App = () => {
       </TopBar>
       <MessageList items={state.items} turnActive={state.turnActive} />
       <ErrorBanner message={state.error} />
-      <Composer turnActive={state.turnActive} />
+      <Composer ready={state.sessionId !== null} turnActive={state.turnActive} />
       <UsageBar usage={state.usage} />
     </div>
   );

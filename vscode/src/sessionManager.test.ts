@@ -99,16 +99,19 @@ describe('createSession', () => {
     });
   });
 
-  it('rejects and cleans up when the actor never confirms', async () => {
+  it('rejects and reclaims the actor-side session when the actor never confirms', async () => {
     vi.useFakeTimers();
     const { transport, manager } = create();
     const pending = manager.createSession('/w');
+    const sessionId = transport.lastCommand().sessionId as string;
     const assertion = expect(pending).rejects.toThrow(
       /timed out waiting for actor event: session_created/,
     );
     await vi.advanceTimersByTimeAsync(5_001);
     await assertion;
-    expect(transport.lastCommand().cmd).toBe('create_session');
+    // The timeout path disposes the actor-side session so a late
+    // create_session cannot leave an orphaned thread behind.
+    expect(transport.lastCommand()).toEqual({ cmd: 'dispose_session', sessionId });
   });
 });
 

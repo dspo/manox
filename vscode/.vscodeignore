@@ -1,0 +1,16 @@
+# Package only what the extension host loads at runtime: out/ JS, the
+# webview bundles, the napi binding, and marketplace metadata.
+.vscode/**
+src/**
+out/**/*.map
+out/**/*.test.js
+node_modules/**
+target/**
+dist/**/*.map
+*.vsix
+.gitignore
+build.sh
+esbuild.webview.mjs
+tsconfig.json
+tsconfig.webview.json
+vitest.config.mts

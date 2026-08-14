@@ -4,7 +4,8 @@
 //
 // Every event carries `sessionId` except the global ones (`ready`, `models`,
 // and errors raised before a session exists). Every command carries
-// `sessionId` except `init`, `list_models`, and `shutdown`.
+// `sessionId` except `init` and `list_models`. Actor shutdown does not go
+// over this protocol — the napi binding terminates the thread directly.
 //
 // [P2] deferred by design: list_sessions / restore_session,
 // set_reasoning_effort, image attachments, subagent_* and plan_* events.
@@ -20,8 +21,7 @@ export type Command =
 	| { cmd: 'set_model'; sessionId: string; id: string }
 	| { cmd: 'get_current_model'; sessionId: string }
 	| { cmd: 'list_models' }
-	| { cmd: 'get_usage'; sessionId: string }
-	| { cmd: 'shutdown' };
+	| { cmd: 'get_usage'; sessionId: string };
 
 /** Wire vocabulary emitted by the actor (agent::ToolCallStatus, kebab-case).
  * The webview store folds terminal values into UI semantics

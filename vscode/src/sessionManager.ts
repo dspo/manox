@@ -116,6 +116,9 @@ export class SessionManager {
       await created;
     } catch (e) {
       this.sessions.delete(sessionId);
+      // Reclaim the actor-side session as well: the actor may still process
+      // the queued create_session after this side has given up waiting.
+      this.send({ cmd: 'dispose_session', sessionId });
       throw e;
     }
     // Fresh threads start on the actor's default policy; enforce the host's.

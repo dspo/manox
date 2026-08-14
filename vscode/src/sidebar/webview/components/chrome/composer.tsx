@@ -9,20 +9,23 @@ import { Textarea } from '../ui/textarea';
 
 export type ComposerProps = {
   turnActive: boolean;
+  /** Session established and subscribed; input is collected but sending is
+   * blocked until the host can actually deliver it. */
+  ready: boolean;
 };
 
-export const Composer = ({ turnActive }: ComposerProps) => {
+export const Composer = ({ turnActive, ready }: ComposerProps) => {
   const [text, setText] = useState('');
 
   const submit = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed || turnActive) {
+    if (!trimmed || turnActive || !ready) {
       return;
     }
     store.echoUser(trimmed);
     api.submit(trimmed);
     setText('');
-  }, [text, turnActive]);
+  }, [text, turnActive, ready]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -37,7 +40,7 @@ export const Composer = ({ turnActive }: ComposerProps) => {
         className="min-h-[52px] flex-1 resize-none font-transcript"
         onChange={(e) => setText(e.target.value)}
         onKeyDown={handleKeyDown}
-        placeholder="Message manox"
+        placeholder={ready ? 'Message manox' : 'Starting session…'}
         rows={2}
         value={text}
       />
@@ -47,7 +50,7 @@ export const Composer = ({ turnActive }: ComposerProps) => {
         </Button>
       ) : (
         <Button
-          disabled={!text.trim()}
+          disabled={!ready || !text.trim()}
           onClick={submit}
           size="icon"
           title="Send"
