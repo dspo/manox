@@ -30,10 +30,12 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
       const done = new Promise<void>((resolve) => {
         let settled = false;
         let off: (() => void) | undefined;
+        let cancelSub: vscode.Disposable | undefined;
         const finish = () => {
           if (settled) return;
           settled = true;
           off?.();
+          cancelSub?.dispose();
           clearTimeout(timer);
           resolve();
         };
@@ -59,10 +61,13 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
           }
         });
         const timer = setTimeout(finish, 120_000);
-        token.onCancellationRequested(finish);
+        cancelSub = token.onCancellationRequested(finish);
       });
 
-      sendCommand({ cmd: 'submit', text: request.prompt });
+      if (!sendCommand({ cmd: 'submit', text: request.prompt })) {
+        stream.markdown('**Error:** agent core unavailable');
+        return { metadata: { error: 'core unavailable' } };
+      }
       await done;
       return { metadata: { participant: 'manox' } };
     },

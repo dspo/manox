@@ -13,7 +13,7 @@
     "Other"
   ],
   "activationEvents": [
-    "*"
+    "onChatParticipant:manox"
   ],
   "main": "./out/extension.js",
   "scripts": {

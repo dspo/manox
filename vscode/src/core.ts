@@ -34,7 +34,12 @@ export function loadCore(): CoreBinding {
       mod.start((err, batch) => {
         if (err) return;
         for (const raw of batch) {
-          eventBus.emit('event', JSON.parse(raw) as ActorEvent);
+          try {
+            eventBus.emit('event', JSON.parse(raw) as ActorEvent);
+          } catch (e) {
+            // A subscriber throwing must not drop the rest of the batch.
+            console.error('manox event handler error:', e);
+          }
         }
       });
       binding = mod;
@@ -46,9 +51,19 @@ export function loadCore(): CoreBinding {
   throw lastErr instanceof Error ? lastErr : new Error('manox napi core not found');
 }
 
-/** Send a command to the agent actor thread. */
-export function sendCommand(cmd: Record<string, unknown>): void {
-  loadCore().sendCommand(JSON.stringify(cmd));
+/**
+ * Send a command to the agent actor thread. Returns false when the actor is
+ * unavailable (e.g. the channel is closed) so callers can surface the failure
+ * instead of hanging on a missing turn.
+ */
+export function sendCommand(cmd: Record<string, unknown>): boolean {
+  try {
+    loadCore().sendCommand(JSON.stringify(cmd));
+    return true;
+  } catch (e) {
+    console.error('manox sendCommand error:', e);
+    return false;
+  }
 }
 
 /** Subscribe to actor events. Returns an unsubscribe function. */
