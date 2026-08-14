@@ -18,8 +18,8 @@ use agent::thread::ApprovalMode;
 use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
-    EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, WeakEntity, Window,
-    deferred, ease_in_out, prelude::*, px,
+    EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, Transformation,
+    WeakEntity, Window, deferred, ease_in_out, linear, percentage, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -1278,11 +1278,36 @@ fn render_thread_item(
             .into_any_element()
     } else {
         match icon {
-            RowIcon::Thread => gpui::svg()
-                .path("icons/manox.svg")
-                .size(px(16.))
-                .text_color(theme.muted_foreground)
-                .into_any_element(),
+            RowIcon::Thread => {
+                // ship-wheel tri-state: black at rest, green and spinning
+                // while the agent runs, blue while a finished turn awaits the
+                // user's view (`has_unread`).
+                let (color, spin) = if item.running {
+                    (theme.success, true)
+                } else if item.has_unread {
+                    (theme.info, false)
+                } else {
+                    (theme.foreground, false)
+                };
+                let icon = gpui::svg()
+                    .path("icons/ship-wheel.svg")
+                    .size(px(16.))
+                    .text_color(color);
+                if spin {
+                    icon.with_animation(
+                        format!("thread-running-spin-{id}"),
+                        Animation::new(Duration::from_millis(1600))
+                            .repeat()
+                            .with_easing(linear),
+                        |el, delta| {
+                            el.with_transformation(Transformation::rotate(percentage(delta)))
+                        },
+                    )
+                    .into_any_element()
+                } else {
+                    icon.into_any_element()
+                }
+            }
             RowIcon::External(path) => gpui::svg()
                 .path(path)
                 .size(px(16.))

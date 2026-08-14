@@ -338,7 +338,12 @@ impl ContextRail {
         let header = h_flex()
             .items_center()
             .gap_2()
-            .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+            .child(
+                Icon::default()
+                    .path("icons/zodiac-scorpio.svg")
+                    .xsmall()
+                    .text_color(muted),
+            )
             .child(
                 gpui::div()
                     .flex_1()

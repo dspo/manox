@@ -4565,11 +4565,16 @@ impl Workspace {
                 .gap_2()
                 .min_w_0()
                 .flex_1()
-                .child(Icon::new(IconName::Redo2).xsmall().text_color(if danger {
-                    theme.danger
-                } else {
-                    theme.muted_foreground
-                }))
+                .child(
+                    Icon::default()
+                        .path("icons/corner-right-up.svg")
+                        .xsmall()
+                        .text_color(if danger {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        }),
+                )
                 .child(
                     gpui::div()
                         .flex_1()
