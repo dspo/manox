@@ -28,6 +28,7 @@ members = [
     "crates/webview-macros",
     "crates/cx",
     "crates/cx-providers",
+    "crates/manox-napi",
 ]
 resolver = "2"
 
