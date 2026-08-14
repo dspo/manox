@@ -2,7 +2,7 @@
 // append-only transcript plus session chrome (model, usage, turn flag), and
 // a minimal store fans state changes out to the renderer.
 
-import type { ActorEvent, ModelInfo, TokenUsageSnapshot } from '../../../protocol';
+import type { ActorEvent, ApprovalMode, ModelInfo, TokenUsageSnapshot } from '../../../protocol';
 import type { HostToWebview } from '../../messages';
 
 export interface ToolCallState {
@@ -35,6 +35,7 @@ export interface ChatState {
   items: TranscriptItem[];
   models: ModelInfo[];
   currentModelId: string | null;
+  approvalMode: ApprovalMode;
   usage: TokenUsageSnapshot | null;
   error: string | null;
 }
@@ -47,6 +48,7 @@ export function initialState(): ChatState {
     items: [],
     models: [],
     currentModelId: null,
+    approvalMode: 'autopilot',
     usage: null,
     error: null,
   };
@@ -134,6 +136,8 @@ function reduceEvent(state: ChatState, ev: ActorEvent): ChatState {
       return { ...state, currentModelId: ev.to };
     case 'current_model':
       return { ...state, currentModelId: ev.id };
+    case 'approval_mode_changed':
+      return { ...state, approvalMode: ev.mode };
     case 'usage':
       return { ...state, usage: ev.usage };
     case 'error':

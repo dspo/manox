@@ -19,6 +19,7 @@ use std::time::Duration;
 use gpui::{App, Entity, HeadlessAppContext, Subscription};
 
 use agent::permission::{PermissionDecision, ToolAuthorizationResponse};
+use agent::thread::ApprovalMode;
 use agent::{Thread, ThreadEvent, ThreadId};
 
 /// Sentinel command terminating the actor thread; see `ActorHandle::shutdown`.
@@ -244,6 +245,17 @@ fn handle_command(
                     .update(app, |t, cx| t.respond_authorization(&id, response, cx));
             });
         }),
+        "set_approval_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let mode = match cmd["mode"].as_str() {
+                Some("danger") => ApprovalMode::Danger,
+                _ => ApprovalMode::AutoPilot,
+            };
+            cx.update(|app| {
+                session
+                    .thread
+                    .update(app, |t, cx| t.set_approval_mode(mode, cx));
+            });
+        }),
         "set_model" => with_session(state, session_id.as_deref(), sink, |session, sink| {
             let Some(id) = cmd["id"].as_str() else {
                 return;
@@ -413,6 +425,17 @@ mod tests {
         cx.run_until_parked();
         assert!(state.sessions.contains_key("s1"));
         assert!(types(&out).contains(&"session_created".to_string()));
+
+        // Switching the approval policy surfaces as an approval_mode_changed
+        // event for the session.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"danger"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"approval_mode_changed".to_string()));
 
         // A command for an unknown session surfaces as an error event.
         handle_command(

@@ -7,7 +7,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, Command, ModelInfo } from './protocol';
+import type { ActorEvent, ApprovalMode, Command, ModelInfo } from './protocol';
 import { isSessionEvent } from './protocol';
 import type { Transport } from './transport/transport';
 import { NapiTransport } from './transport/napiTransport';
@@ -21,6 +21,12 @@ const INIT_TIMEOUT_MS = 30_000;
 export function resolveWorkspaceCwd(): string {
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   return folder ?? process.env.HOME ?? process.cwd();
+}
+
+/** Configured tool-authorization policy; unset falls back to danger. */
+export function configuredApprovalMode(): ApprovalMode {
+  const value = vscode.workspace.getConfiguration('manox').get<string>('approvalMode');
+  return value === 'autopilot' ? 'autopilot' : 'danger';
 }
 
 export class SessionManager {
@@ -45,6 +51,7 @@ export class SessionManager {
   private readonly global = new EventEmitter();
   private initPhase: 'idle' | 'starting' | 'ready' = 'idle';
   private readyPromise: Promise<void> | null = null;
+  private approvalMode: ApprovalMode = configuredApprovalMode();
 
   private constructor(private readonly transport: Transport) {
     this.global.setMaxListeners(0);
@@ -111,7 +118,17 @@ export class SessionManager {
       this.sessions.delete(sessionId);
       throw e;
     }
+    // Fresh threads start on the actor's default policy; enforce the host's.
+    this.send({ cmd: 'set_approval_mode', sessionId, mode: this.approvalMode });
     return sessionId;
+  }
+
+  /** Change the approval policy and push it to every live session. */
+  setApprovalMode(mode: ApprovalMode): void {
+    this.approvalMode = mode;
+    for (const sessionId of this.sessions.keys()) {
+      this.send({ cmd: 'set_approval_mode', sessionId, mode });
+    }
   }
 
   /**

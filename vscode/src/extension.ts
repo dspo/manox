@@ -5,11 +5,18 @@
 import * as vscode from 'vscode';
 import { registerManoxParticipant } from './participant';
 import { registerManoxSidebar } from './sidebar/sidebarProvider';
-import { SessionManager } from './sessionManager';
+import { SessionManager, configuredApprovalMode } from './sessionManager';
 
 export function activate(context: vscode.ExtensionContext): void {
   registerManoxSidebar(context);
   registerManoxParticipant(context);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('manox.approvalMode')) {
+        SessionManager.shared().setApprovalMode(configuredApprovalMode());
+      }
+    }),
+  );
 }
 
 export function deactivate(): Thenable<void> {

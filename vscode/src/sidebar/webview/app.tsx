@@ -25,7 +25,7 @@ export const App = () => {
 
   return (
     <div className="font-chrome flex h-screen flex-col bg-background text-foreground">
-      <TopBar>
+      <TopBar approvalMode={state.approvalMode}>
         <ModelPicker
           currentModelId={state.currentModelId}
           disabled={state.turnActive || state.models.length === 0}

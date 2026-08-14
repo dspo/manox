@@ -26,6 +26,24 @@
         "isSticky": true
       }
     ],
+    "configuration": {
+      "title": "manox",
+      "properties": {
+        "manox.approvalMode": {
+          "type": "string",
+          "enum": [
+            "danger",
+            "autopilot"
+          ],
+          "enumDescriptions": [
+            "Run every tool call without authorization prompts",
+            "Gate authorization-required tool calls on the safety reviewer, escalating to an approval card when unsure"
+          ],
+          "default": "danger",
+          "markdownDescription": "Tool-authorization policy for manox sessions. `danger` runs everything without prompting; `autopilot` routes authorization-required tool calls through the safety reviewer with user escalation."
+        }
+      }
+    },
     "viewsContainers": {
       "secondarySidebar": [
         {

@@ -15,6 +15,7 @@ export type Command =
 	| { cmd: 'dispose_session'; sessionId: string }
 	| { cmd: 'submit'; sessionId: string; text: string }
 	| { cmd: 'approve'; sessionId: string; id: string; allow: boolean }
+	| { cmd: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
 	| { cmd: 'cancel_turn'; sessionId: string }
 	| { cmd: 'set_model'; sessionId: string; id: string }
 	| { cmd: 'get_current_model'; sessionId: string }
@@ -23,6 +24,10 @@ export type Command =
 	| { cmd: 'shutdown' };
 
 export type ToolCallStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string;
+
+/** Tool-authorization policy: autopilot gates on the safety reviewer with
+ * user escalation, danger runs every tool call without prompting. */
+export type ApprovalMode = 'autopilot' | 'danger';
 
 export interface ModelInfo {
 	id: string;
@@ -71,7 +76,7 @@ export type ActorEvent =
 	}
 	// state
 	| { type: 'model_changed'; sessionId: string; from: string | null; to: string }
-	| { type: 'approval_mode_changed'; sessionId: string; mode: string }
+	| { type: 'approval_mode_changed'; sessionId: string; mode: ApprovalMode }
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
 	| { type: 'usage'; sessionId: string; usage: TokenUsageSnapshot }
