@@ -2,7 +2,7 @@
   "name": "manox-vscode",
   "displayName": "manox",
   "description": "manox agent workbench inside VS Code — pi kernel via napi (crates/manox-napi), tools on the vscode API.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "dspo",
   "license": "MIT",
   "engines": {
@@ -12,9 +12,18 @@
     "AI",
     "Other"
   ],
-  "activationEvents": [
-    "onChatParticipant:manox"
-  ],
+  "activationEvents": [],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "manox",
+        "fullName": "manox",
+        "name": "manox",
+        "description": "manox agent — ask anything, it runs on the native pi kernel",
+        "isSticky": true
+      }
+    ]
+  },
   "main": "./out/extension.js",
   "scripts": {
     "compile": "tsc -p ./",
