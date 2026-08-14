@@ -27,6 +27,10 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   private sessionId: string | null = null;
   private unsubscribeSession: (() => void) | null = null;
   private unsubscribeGlobal: (() => void) | null = null;
+  /** Monotonic token invalidating in-flight session creation: teardown and
+   * every new ensureSession bump it, so a stale completion disposes its
+   * actor-side session instead of attaching to a dead or replaced view. */
+  private sessionGeneration = 0;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -58,11 +62,16 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private async ensureSession(): Promise<void> {
+    const generation = ++this.sessionGeneration;
     const manager = SessionManager.shared();
     const cwd = resolveWorkspaceCwd();
     try {
       await manager.init(cwd);
       const sessionId = await manager.createSession(cwd);
+      if (generation !== this.sessionGeneration) {
+        manager.disposeSession(sessionId);
+        return;
+      }
       this.sessionId = sessionId;
       this.unsubscribeSession = manager.onSessionEvent(sessionId, (ev: ActorEvent) =>
         this.post({ type: 'event', event: ev }),
@@ -114,6 +123,7 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private teardown(): void {
+    this.sessionGeneration++;
     this.teardownSession();
     this.unsubscribeGlobal?.();
     this.unsubscribeGlobal = null;

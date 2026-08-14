@@ -23,7 +23,18 @@ export type Command =
 	| { cmd: 'get_usage'; sessionId: string }
 	| { cmd: 'shutdown' };
 
-export type ToolCallStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | string;
+/** Wire vocabulary emitted by the actor (agent::ToolCallStatus, kebab-case).
+ * The webview store folds terminal values into UI semantics
+ * (success → completed, error → failed); the rest pass through. */
+export type ToolCallStatus =
+	| 'pending-approval'
+	| 'running'
+	| 'success'
+	| 'continued'
+	| 'error'
+	| 'denied'
+	| 'cancelled'
+	| (string & {});
 
 /** Tool-authorization policy: autopilot gates on the safety reviewer with
  * user escalation, danger runs every tool call without prompting. */
@@ -80,6 +91,14 @@ export type ActorEvent =
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
 	| { type: 'usage'; sessionId: string; usage: TokenUsageSnapshot }
+	| {
+			type: 'token_usage';
+			sessionId: string;
+			input: number;
+			output: number;
+			cache_creation: number;
+			cache_read: number;
+	  }
 	| { type: 'error'; sessionId?: string | null; message: string };
 
 /** Events routed per session; everything except the global few. */

@@ -1,11 +1,29 @@
-import { CheckCircle, ChevronDown, Circle, Clock, Wrench, XCircle } from 'lucide-react';
+import {
+  Ban,
+  CheckCircle,
+  ChevronDown,
+  Circle,
+  Clock,
+  MinusCircle,
+  Wrench,
+  XCircle,
+} from 'lucide-react';
 import type { ComponentProps, ReactNode } from 'react';
 
 import { cn } from '../../lib/utils';
 import { Badge } from '../ui/badge';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
 
-export type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+/** UI status vocabulary. Terminal wire statuses are folded in the store
+ * (success → completed, error → failed); authorization states pass through. */
+export type ToolStatus =
+  | 'pending-approval'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'denied'
+  | 'cancelled'
+  | 'continued';
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
 
@@ -17,19 +35,23 @@ export const Tool = ({ className, ...props }: ToolProps) => (
 );
 
 const statusLabels: Record<ToolStatus, string> = {
-  pending: 'Pending',
+  'pending-approval': 'Awaiting Approval',
   running: 'Running',
   completed: 'Completed',
   failed: 'Error',
+  denied: 'Denied',
   cancelled: 'Cancelled',
+  continued: 'Continued',
 };
 
 const statusIcons: Record<ToolStatus, ReactNode> = {
-  pending: <Circle className="size-4" />,
+  'pending-approval': <Clock className="size-4 text-amber-600" />,
   running: <Clock className="size-4 animate-pulse" />,
   completed: <CheckCircle className="size-4 text-green-600" />,
   failed: <XCircle className="size-4 text-red-600" />,
+  denied: <Ban className="size-4 text-orange-500" />,
   cancelled: <Circle className="size-4 text-muted-foreground" />,
+  continued: <MinusCircle className="size-4 text-muted-foreground" />,
 };
 
 export const getStatusBadge = (status: string) => {

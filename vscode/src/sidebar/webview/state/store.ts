@@ -54,6 +54,19 @@ export function initialState(): ChatState {
   };
 }
 
+/** Fold wire tool statuses into UI semantics; authorization states pass
+ * through verbatim (they carry their own labels in the UI vocabulary). */
+export function normalizeToolStatus(status: string): string {
+  switch (status) {
+    case 'success':
+      return 'completed';
+    case 'error':
+      return 'failed';
+    default:
+      return status;
+  }
+}
+
 export function reduce(state: ChatState, msg: HostToWebview): ChatState {
   switch (msg.type) {
     case 'session_ready':
@@ -84,7 +97,7 @@ function reduceEvent(state: ChatState, ev: ActorEvent): ChatState {
           kind: 'tool',
           call: {
             ...prev.call,
-            status: ev.status,
+            status: normalizeToolStatus(ev.status),
             title: ev.title || prev.call.title,
           },
         };
@@ -95,7 +108,7 @@ function reduceEvent(state: ChatState, ev: ActorEvent): ChatState {
             id: ev.id,
             name: ev.name,
             title: ev.title,
-            status: ev.status,
+            status: normalizeToolStatus(ev.status),
             output: '',
             result: null,
           },
@@ -110,7 +123,9 @@ function reduceEvent(state: ChatState, ev: ActorEvent): ChatState {
       return mapTool(state, ev.id, (call) => ({
         ...call,
         result: { output: ev.output, isError: ev.is_error },
-        status: ev.is_error ? 'failed' : call.status === 'running' ? 'completed' : call.status,
+        // The terminal tool_call already folds to completed/failed; this
+        // covers results racing ahead of their status update.
+        status: ev.is_error ? 'failed' : call.status,
       }));
     }
     case 'tool_call_authorization':
@@ -140,6 +155,16 @@ function reduceEvent(state: ChatState, ev: ActorEvent): ChatState {
       return { ...state, approvalMode: ev.mode };
     case 'usage':
       return { ...state, usage: ev.usage };
+    case 'token_usage':
+      return {
+        ...state,
+        usage: {
+          input_tokens: ev.input,
+          output_tokens: ev.output,
+          cache_creation_input_tokens: ev.cache_creation,
+          cache_read_input_tokens: ev.cache_read,
+        },
+      };
     case 'error':
       return { ...state, error: ev.message };
     default:
