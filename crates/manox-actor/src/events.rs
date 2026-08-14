@@ -5,15 +5,15 @@
 //! renderers get an explicit projection. Unknown variants yield `None` and
 //! are skipped by the caller.
 //!
-//! Variants intentionally not projected yet (silently dropped; surface them
-//! here when the host grows the matching UI): `SubagentStarted`,
-//! `SubagentProgress`, `SubagentChild`, `ApprovalDecision`, `Retry`,
-//! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
+//! Variants intentionally not projected (silently dropped; surface them here
+//! when the host grows the matching UI): `SubagentChild`, `ApprovalDecision`,
+//! `Retry`, `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
 //! `MainCallMetricsUpdated`, `ReasoningEffortChanged`, `GoalChanged`,
-//! `WorktreeChanged`, `CompactionStarted`, `Compaction`, `PlanReady`,
-//! `PlanUpdated`, `PlanModeChanged`, `PeerMessage`, `SteerInjected`,
+//! `CompactionStarted`, `Compaction`, `PeerMessage`, `SteerInjected`,
 //! `BrowserNotification`, `InboundAuthorization`, `BackgroundTaskUpdated`,
-//! `HistoryProgress`, `HistoryRestored`.
+//! `HistoryRestored`. `HistoryRestored` stays out of this pure projection:
+//! the actor pairs it with a full `thread_history` snapshot that needs
+//! `App` access to read the thread's messages.
 
 use agent::{ThreadEvent, ToolCallStatus};
 use serde_json::{Value, json};
@@ -84,6 +84,46 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             "cache_creation": u.cache_creation_input_tokens,
             "cache_read": u.cache_read_input_tokens,
         }),
+        ThreadEvent::SubagentStarted {
+            id,
+            subagent_type,
+            description,
+            ..
+        } => json!({
+            "type": "subagent_started",
+            "id": id,
+            "agent_type": subagent_type,
+            "description": description,
+        }),
+        ThreadEvent::SubagentProgress {
+            id,
+            subagent_type,
+            tool_uses,
+            latest_activity,
+            status,
+            ..
+        } => json!({
+            "type": "subagent_progress",
+            "id": id,
+            "agent_type": subagent_type,
+            "tool_uses": tool_uses,
+            "latest_activity": latest_activity,
+            "status": status_str(status),
+        }),
+        ThreadEvent::WorktreeChanged { active, path } => {
+            json!({"type": "worktree_changed", "active": active, "path": path})
+        }
+        ThreadEvent::PlanReady { plan_file, title } => {
+            json!({"type": "plan_ready", "plan_file": plan_file, "title": title})
+        }
+        ThreadEvent::PlanUpdated { snapshot } => json!({
+            "type": "plan_updated",
+            "snapshot": serde_json::to_value(snapshot).unwrap_or(Value::Null),
+        }),
+        ThreadEvent::PlanModeChanged { enabled } => {
+            json!({"type": "plan_mode_changed", "enabled": enabled})
+        }
+        ThreadEvent::HistoryProgress => json!({"type": "history_progress"}),
         _ => return None,
     };
     if let Some(id) = session_id
@@ -124,7 +164,88 @@ mod tests {
 
     #[test]
     fn drops_unprojected_variants() {
-        // HistoryRestored is on the documented drop list.
+        // HistoryRestored is handled by the actor (it needs `App` access to
+        // read messages), not by this pure projection.
         assert!(thread_event_to_json(&ThreadEvent::HistoryRestored, Some("s1")).is_none());
+    }
+
+    #[test]
+    fn projects_plan_events() {
+        let json = thread_event_to_json(
+            &ThreadEvent::PlanReady {
+                plan_file: "/tmp/plan.md".into(),
+                title: "Do things".into(),
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "plan_ready");
+        assert_eq!(v["title"], "Do things");
+
+        let snapshot = agent::plan::PlanSnapshot {
+            explanation: Some("explanation".into()),
+            steps: vec![agent::plan::PlanStep {
+                step: "one".into(),
+                status: agent::plan::PlanStepStatus::InProgress,
+            }],
+        };
+        let json =
+            thread_event_to_json(&ThreadEvent::PlanUpdated { snapshot }, Some("s1")).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "plan_updated");
+        assert_eq!(v["snapshot"]["steps"][0]["step"], "one");
+
+        let json =
+            thread_event_to_json(&ThreadEvent::PlanModeChanged { enabled: true }, Some("s1"))
+                .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "plan_mode_changed");
+        assert_eq!(v["enabled"], true);
+    }
+
+    #[test]
+    fn projects_worktree_changed() {
+        let json = thread_event_to_json(
+            &ThreadEvent::WorktreeChanged {
+                active: true,
+                path: Some("/repo/wt".into()),
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "worktree_changed");
+        assert_eq!(v["active"], true);
+        assert_eq!(v["path"], "/repo/wt");
+    }
+
+    #[test]
+    fn projects_subagent_progress() {
+        let json = thread_event_to_json(
+            &ThreadEvent::SubagentProgress {
+                id: "sub1".into(),
+                subagent_type: "explorer".into(),
+                tool_uses: 3,
+                token_usage: agent::TokenUsage::default(),
+                latest_activity: Some("reading files".into()),
+                status: agent::ToolCallStatus::Running,
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "subagent_progress");
+        assert_eq!(v["agent_type"], "explorer");
+        assert_eq!(v["tool_uses"], 3);
+        assert_eq!(v["status"], "running");
+    }
+
+    #[test]
+    fn projects_history_progress() {
+        let json = thread_event_to_json(&ThreadEvent::HistoryProgress, Some("s1")).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "history_progress");
+        assert_eq!(v["sessionId"], "s1");
     }
 }

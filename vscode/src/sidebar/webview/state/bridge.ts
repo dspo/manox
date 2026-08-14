@@ -18,4 +18,4 @@ export function useChatState(): ChatState {
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
-export type { ChatState, ToolCallState, TranscriptItem } from './store';
+export type { ChatState, ThreadState, ToolCallState, TranscriptItem, UserImage } from './store';

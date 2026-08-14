@@ -3,25 +3,36 @@
 // crates/manox-actor/src/{actor,events}.rs (exposed via manox-napi).
 //
 // Every event carries `sessionId` except the global ones (`ready`, `models`,
-// and errors raised before a session exists). Every command carries
-// `sessionId` except `init` and `list_models`. Actor shutdown does not go
-// over this protocol — the napi binding terminates the thread directly.
+// `threads_updated`, `commands`, and errors raised before a session exists).
+// Every command carries `sessionId` except `init`, `list_models`,
+// `list_threads`, and `list_commands`. Actor shutdown does not go over this
+// protocol — the napi binding terminates the thread directly.
 //
-// [P2] deferred by design: list_sessions / restore_session,
-// set_reasoning_effort, image attachments, subagent_* and plan_* events.
+// [P2] deferred by design: set_reasoning_effort.
 
 export type Command =
 	| { cmd: 'init'; cwd: string }
 	| { cmd: 'create_session'; sessionId: string; cwd: string }
 	| { cmd: 'dispose_session'; sessionId: string }
-	| { cmd: 'submit'; sessionId: string; text: string }
+	| { cmd: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
 	| { cmd: 'approve'; sessionId: string; id: string; allow: boolean }
 	| { cmd: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
 	| { cmd: 'cancel_turn'; sessionId: string }
 	| { cmd: 'set_model'; sessionId: string; id: string }
 	| { cmd: 'get_current_model'; sessionId: string }
 	| { cmd: 'list_models' }
-	| { cmd: 'get_usage'; sessionId: string };
+	| { cmd: 'get_usage'; sessionId: string }
+	| { cmd: 'list_threads' }
+	| { cmd: 'open_thread'; sessionId: string }
+	| { cmd: 'focus_thread'; sessionId?: string }
+	| { cmd: 'list_commands' }
+	| { cmd: 'thread_info'; sessionId: string };
+
+/** Base64-encoded image attachment (submit payload wire form). */
+export interface ImageAttachment {
+	data: string;
+	mimeType: string;
+}
 
 /** Wire vocabulary emitted by the actor (agent::ToolCallStatus, kebab-case).
  * The webview store folds terminal values into UI semantics
@@ -53,6 +64,100 @@ export interface TokenUsageSnapshot {
 	cache_read_input_tokens?: number;
 }
 
+/** One row in the threads list (snake_case wire form from the actor). */
+export interface ThreadListItem {
+	id: string;
+	title: string;
+	/** Unix seconds of the last interaction. */
+	updated_at: number;
+	running: boolean;
+	unread: boolean;
+	errored: boolean;
+	pending_auth: boolean;
+	model_id: string;
+}
+
+/** One slash-completion entry: a prompt-macro command or a skill. */
+export interface CommandEntry {
+	name: string;
+	description: string;
+	kind: 'command' | 'skill';
+	argument_hint: string | null;
+}
+
+/** Serde wire form of agent plan snapshots. */
+export interface PlanStepWire {
+	step: string;
+	status: 'pending' | 'in_progress' | 'completed';
+}
+
+export interface PlanSnapshotWire {
+	explanation: string | null;
+	steps: PlanStepWire[];
+}
+
+/** One sub-agent's aggregated progress inside a thread info snapshot. */
+export interface SubagentSnapshot {
+	id: string;
+	agent_type: string;
+	description: string;
+	tool_uses: number;
+	latest_activity: string | null;
+	status: ToolCallStatus;
+}
+
+/** Conversation info panel snapshot (thread_info event payload). */
+export interface ThreadInfoSnapshot {
+	worktree_path: string | null;
+	plan: PlanSnapshotWire | null;
+	usage: TokenUsageSnapshot;
+	cost: number;
+	pending_auth_count: number;
+	agents: SubagentSnapshot[];
+}
+
+/** Wire form of one restored-history message (serde shape of
+ * agent::message::Message). Content blocks are externally tagged; image
+ * blocks arrive deflated to `{mime_type, byte_len}` placeholders. */
+export interface WireMessage {
+	id: string;
+	/** Unix seconds. */
+	timestamp: number;
+	parent_id: string | null;
+	provenance:
+		| 'user'
+		| 'assistant'
+		| 'tool'
+		| 'goal_continuation'
+		| 'goal_objective_update';
+	role: 'user' | 'assistant' | 'system';
+	content: WireContentBlock[];
+	ui?: {
+		model_id?: string;
+		approval_mode?: number;
+		steered?: boolean;
+		external_event?: boolean;
+		display_text?: string;
+	};
+}
+
+export type WireContentBlock =
+	| { Text: string }
+	| { Thinking: { text: string; signature: string | null } }
+	| { Image: { mime_type: string; byte_len: number } }
+	| {
+			ToolUse: {
+				id: string;
+				name: string;
+				raw_input: string;
+				input: unknown;
+				is_input_complete: boolean;
+				thought_signature: string | null;
+			};
+	  }
+	| { ToolResult: { tool_use_id: string; tool_name: string; is_error: boolean; content: string } }
+	| { Compaction: string };
+
 export type ActorEvent =
 	// lifecycle
 	| { type: 'ready' }
@@ -67,30 +172,30 @@ export type ActorEvent =
 	| { type: 'agent_thinking'; sessionId: string; text: string }
 	// tools
 	| {
-		type: 'tool_call';
-		sessionId: string;
-		id: string;
-		name: string;
-		title: string;
-		status: ToolCallStatus;
-		input?: unknown;
-	}
+			type: 'tool_call';
+			sessionId: string;
+			id: string;
+			name: string;
+			title: string;
+			status: ToolCallStatus;
+			input?: unknown;
+	  }
 	| { type: 'tool_output'; sessionId: string; id: string; chunk: string }
 	| { type: 'tool_result'; sessionId: string; id: string; output: string; is_error: boolean }
 	| {
-		type: 'tool_call_authorization';
-		sessionId: string;
-		id: string;
-		tool_name: string;
-		summary: string;
-		input: unknown;
-	}
+			type: 'tool_call_authorization';
+			sessionId: string;
+			id: string;
+			tool_name: string;
+			summary: string;
+			input: unknown;
+	  }
 	// state
 	| { type: 'model_changed'; sessionId: string; from: string | null; to: string }
 	| { type: 'approval_mode_changed'; sessionId: string; mode: ApprovalMode }
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
-	| { type: 'usage'; sessionId: string; usage: TokenUsageSnapshot }
+	| { type: 'usage'; sessionId: string; usage: TokenUsageSnapshot; cost: number }
 	| {
 			type: 'token_usage';
 			sessionId: string;
@@ -98,6 +203,35 @@ export type ActorEvent =
 			output: number;
 			cache_creation: number;
 			cache_read: number;
+	  }
+	// threads / registry
+	| { type: 'threads_updated'; threads: ThreadListItem[] }
+	| { type: 'commands'; commands: CommandEntry[] }
+	// restored-history and info snapshots
+	| { type: 'thread_history'; sessionId: string; messages: WireMessage[] }
+	| { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
+	| { type: 'branch'; sessionId: string; branch: string }
+	| { type: 'history_progress'; sessionId: string }
+	// plan / worktree / sub-agents
+	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string }
+	| { type: 'plan_updated'; sessionId: string; snapshot: PlanSnapshotWire | null }
+	| { type: 'plan_mode_changed'; sessionId: string; enabled: boolean }
+	| { type: 'worktree_changed'; sessionId: string; active: boolean; path: string | null }
+	| {
+			type: 'subagent_started';
+			sessionId: string;
+			id: string;
+			agent_type: string;
+			description: string;
+	  }
+	| {
+			type: 'subagent_progress';
+			sessionId: string;
+			id: string;
+			agent_type: string;
+			tool_uses: number;
+			latest_activity: string | null;
+			status: ToolCallStatus;
 	  }
 	| { type: 'error'; sessionId?: string | null; message: string };
 

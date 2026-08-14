@@ -1,14 +1,15 @@
+import type { TranscriptItem } from '../../state/store';
 import { MarkdownContent } from '../ai/markdown-content';
 import { Message, MessageContent } from '../ai/message';
 
 export type AssistantMessageProps = {
-  text: string;
+  item: Extract<TranscriptItem, { kind: 'assistant' }>;
 };
 
-export const AssistantMessage = ({ text }: AssistantMessageProps) => (
+export const AssistantMessage = ({ item }: AssistantMessageProps) => (
   <Message from="assistant">
     <MessageContent>
-      <MarkdownContent content={text} />
+      <MarkdownContent content={item.text} />
     </MessageContent>
   </Message>
 );

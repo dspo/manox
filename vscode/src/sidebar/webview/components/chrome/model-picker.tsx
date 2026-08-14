@@ -1,6 +1,6 @@
 import { Check, ChevronsUpDown } from 'lucide-react';
 
-import { api } from '../../api/client';
+import { ThreadApi } from '../../api/client';
 import type { ModelInfo } from '../../../../protocol';
 import { Button } from '../ui/button';
 import {
@@ -17,9 +17,10 @@ export type ModelPickerProps = {
   models: ModelInfo[];
   currentModelId: string | null;
   disabled: boolean;
+  sessionId: string | null;
 };
 
-export const ModelPicker = ({ models, currentModelId, disabled }: ModelPickerProps) => {
+export const ModelPicker = ({ models, currentModelId, disabled, sessionId }: ModelPickerProps) => {
   const current = models.find((m) => m.id === currentModelId);
   const providers = [...new Set(models.map((m) => m.provider))];
 
@@ -48,7 +49,10 @@ export const ModelPicker = ({ models, currentModelId, disabled }: ModelPickerPro
               {models
                 .filter((m) => m.provider === provider)
                 .map((m) => (
-                  <DropdownMenuItem key={m.id} onSelect={() => api.setModel(m.id)}>
+                  <DropdownMenuItem
+                    key={m.id}
+                    onSelect={() => sessionId && new ThreadApi(sessionId).setModel(m.id)}
+                  >
                     <span className="flex-1 truncate">{m.name}</span>
                     {m.id === currentModelId && <Check className="size-4 shrink-0" />}
                   </DropdownMenuItem>

@@ -1,12 +1,10 @@
-import { api } from '../../api/client';
+import { ThreadApi } from '../../api/client';
 import { store } from '../../state/bridge';
 import type { TranscriptItem } from '../../state/store';
 import {
   Confirmation,
-  ConfirmationAccepted,
   ConfirmationAction,
   ConfirmationActions,
-  ConfirmationRejected,
   ConfirmationRequest,
   ConfirmationTitle,
 } from '../ai/confirmation';
@@ -31,22 +29,24 @@ function formatInput(input: unknown): string | null {
   return text.length > INPUT_CAP ? `${text.slice(0, INPUT_CAP)}…` : text;
 }
 
-const decide = (id: string, allow: boolean) => {
-  api.approve(id, allow);
-  store.decideApproval(id, allow);
-};
-
 export type ApprovalCardProps = {
   item: ApprovalItem;
+  sessionId: string;
 };
 
-export const ApprovalCard = ({ item }: ApprovalCardProps) => {
+// Deciding removes the card from the transcript; the resulting tool events
+// render as ordinary tool items.
+export const ApprovalCard = ({ item, sessionId }: ApprovalCardProps) => {
   const inputPreview = formatInput(item.input);
+  const decide = (allow: boolean) => {
+    new ThreadApi(sessionId).approve(item.id, allow);
+    store.decideApproval(sessionId, item.id);
+  };
 
   return (
     <Confirmation
-      approval={{ id: item.id, approved: item.decided === 'approved' }}
-      state={item.decided ? 'approval-responded' : 'approval-requested'}
+      approval={{ id: item.id, approved: false }}
+      state="approval-requested"
       variant="default"
     >
       <ConfirmationTitle>{item.toolName}</ConfirmationTitle>
@@ -58,17 +58,11 @@ export const ApprovalCard = ({ item }: ApprovalCardProps) => {
           </pre>
         )}
       </ConfirmationRequest>
-      <ConfirmationAccepted>
-        <div className="text-muted-foreground text-sm">Approved</div>
-      </ConfirmationAccepted>
-      <ConfirmationRejected>
-        <div className="text-muted-foreground text-sm">Denied</div>
-      </ConfirmationRejected>
       <ConfirmationActions>
-        <ConfirmationAction onClick={() => decide(item.id, false)} variant="outline">
+        <ConfirmationAction onClick={() => decide(false)} variant="outline">
           Deny
         </ConfirmationAction>
-        <ConfirmationAction onClick={() => decide(item.id, true)}>Approve</ConfirmationAction>
+        <ConfirmationAction onClick={() => decide(true)}>Approve</ConfirmationAction>
       </ConfirmationActions>
     </Confirmation>
   );
