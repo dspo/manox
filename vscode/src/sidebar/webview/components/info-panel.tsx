@@ -10,6 +10,8 @@ import {
   Circle,
   GitBranch,
   LoaderCircle,
+  Minus,
+  ShipWheel,
   TriangleAlert,
   XCircle,
 } from 'lucide-react';
@@ -70,26 +72,37 @@ const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => 
   if (status === 'success' || status === 'completed' || status === 'continued') {
     return <CheckCircle className="size-3.5 shrink-0 text-success" />;
   }
-  if (status === 'error' || status === 'failed' || status === 'denied' || status === 'cancelled') {
+  if (status === 'error' || status === 'failed' || status === 'denied') {
     return <XCircle className="size-3.5 shrink-0 text-danger" />;
+  }
+  if (status === 'cancelled') {
+    return <Minus className="text-muted-foreground size-3.5 shrink-0" />;
   }
   return <Circle className="text-muted-foreground size-3.5 shrink-0" />;
 };
 
-/** The main agent's own status, derived from the thread's live flags. */
+/** The main agent's own status, mirroring the host's captain indicator:
+ * ship-wheel on success (sub-agents get the plain check) and a red X on a
+ * failed turn. */
 const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
   if (thread.turnActive) {
     return <LoaderCircle className="size-3.5 shrink-0 animate-spin text-muted-foreground" />;
   }
+  if (thread.error !== null) {
+    return <XCircle className="size-3.5 shrink-0 text-danger" />;
+  }
   if ((thread.info?.pending_auth_count ?? 0) > 0) {
     return <TriangleAlert className="text-warning size-3.5 shrink-0" />;
   }
-  return <CheckCircle className="size-3.5 shrink-0 text-success" />;
+  return <ShipWheel className="size-3.5 shrink-0 text-success" />;
 };
 
 /** Occupied context for a usage row: live input plus everything cached. */
 const usedTokens = (u: TokenUsageSnapshot): number =>
   (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+
+/** Full lifetime total of a usage snapshot: occupied context plus output. */
+const totalTokens = (u: TokenUsageSnapshot): number => usedTokens(u) + (u.output_tokens ?? 0);
 
 const ModelUsageRow = ({
   modelKey,
@@ -128,20 +141,20 @@ const ModelUsageRow = ({
         )}
       </p>
       {cap !== undefined && (
-        <p className={cn(used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground')}>
-          {indent}├─ {((used / cap) * 100).toFixed(1)}% {formatTokensPi(used)}/
-          {formatTokensPi(cap)}
+        <p
+          className={cn(
+            'whitespace-pre overflow-hidden text-ellipsis',
+            used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground',
+          )}
+        >
+          {`${indent}├─ ${((used / cap) * 100).toFixed(1)}% ${formatTokensPi(used)}/${formatTokensPi(cap)}`}
         </p>
       )}
-      <p className="text-muted-foreground">
-        {indent}
-        {cost > 0 ? '├─' : '└─'} ↑{formatTokensPi(input)} ↓
-        {formatTokensPi(usage.output_tokens ?? 0)} R{formatTokensPi(cacheRead)} CH{hitRate}
+      <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">
+        {`${indent}${cost > 0 ? '├─' : '└─'} ↑${formatTokensPi(input)} ↓${formatTokensPi(usage.output_tokens ?? 0)} R${formatTokensPi(cacheRead)} CH${hitRate}`}
       </p>
       {cost > 0 && (
-        <p className="text-muted-foreground">
-          {indent}└─ {formatCost(cost)}
-        </p>
+        <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">{`${indent}└─ ${formatCost(cost)}`}</p>
       )}
     </div>
   );
@@ -156,14 +169,17 @@ export type InfoPanelProps = {
 export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   const info = thread.info;
   const usage = thread.usage;
-  const totalTokens = usage ? usedTokens(usage) + (usage.output_tokens ?? 0) : 0;
+  const total = usage ? totalTokens(usage) : 0;
   const gitStats = info?.git_stats;
-  const perModel = Object.entries(info?.per_model_usage ?? {});
+  // Same ordering as the host rail: heaviest spenders first.
+  const perModel = Object.entries(info?.per_model_usage ?? {}).sort(
+    ([, a], [, b]) => totalTokens(b) - totalTokens(a),
+  );
 
   return (
     <aside
       className={cn(
-        'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-foreground/10 p-3 text-xs',
+        'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-border p-3 text-xs',
         'shadow-[-3px_6px_10px_rgba(0,0,0,0.22)]',
         className,
       )}
@@ -214,7 +230,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         title={t('spend')}
         trailing={
           <>
-            {formatTokens(totalTokens)}
+            {formatTokens(total)}
             {thread.cost > 0 && ` · ${formatCost(thread.cost)}`}
           </>
         }
@@ -235,7 +251,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         )}
       </Section>
 
-      <div className="border-foreground/10 border-t" />
+      <div className="border-border border-t" />
 
       <Section title={t('sources')}>
         <p className="text-muted-foreground">{t('no_sources')}</p>

@@ -493,9 +493,9 @@ describe('global folds', () => {
       info: {
         worktree_path: null,
         plan: null,
-        usage: {},
+        usage: { input_tokens: 10, output_tokens: 4 },
         per_model_usage: { 'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 } },
-        cost: 0,
+        cost: 2.5,
         pending_auth_count: 0,
         agents: [],
       },
@@ -503,6 +503,10 @@ describe('global folds', () => {
     expect(thread(store)?.info?.per_model_usage).toEqual({
       'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 },
     });
+    // The info snapshot seeds the spend header so a late push corrects the
+    // zeroed pre-materialization usage reply.
+    expect(thread(store)?.usage).toEqual({ input_tokens: 10, output_tokens: 4 });
+    expect(thread(store)?.cost).toBe(2.5);
 
     store.dispatch(
       event({ type: 'git_stats', sessionId: 's', stats: { added: 3, deleted: 1, untracked: 2 } }),

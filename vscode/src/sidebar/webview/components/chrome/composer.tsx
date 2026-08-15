@@ -323,7 +323,7 @@ export const Composer = ({
         <div className="flex items-center gap-2">
           <ModelPicker
             currentModelId={currentModelId}
-            disabled={!ready || turnActive || models.length === 0}
+            disabled={!ready || creating}
             models={models}
             onSelect={draft ? onModelChange : undefined}
             sessionId={sessionId}
