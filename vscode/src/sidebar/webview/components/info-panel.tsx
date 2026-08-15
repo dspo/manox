@@ -1,12 +1,14 @@
 // Conversation info card: agents, branch with pending-change counts, a
-// spend tree broken down per model, and a static sources section — shown
-// beside the transcript when the container is wide enough.
+// spend tree broken down per model, and a static sources section. Rendered
+// as a floating card over the transcript's top-right corner on wide
+// containers; positioning belongs to the caller.
 
 import { CheckCircle, Circle, GitBranch, LoaderCircle, XCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 
 import type { ModelInfo, SubagentSnapshot, TokenUsageSnapshot } from '../../../protocol';
 import { t } from '../lib/i18n';
+import { cn } from '../lib/utils';
 import type { ThreadState } from '../state/bridge';
 
 const formatTokens = (n: number): string =>
@@ -77,82 +79,85 @@ const ModelUsageRow = ({
 export type InfoPanelProps = {
   thread: ThreadState;
   models: ModelInfo[];
+  className?: string;
 };
 
-export const InfoPanel = ({ thread, models }: InfoPanelProps) => {
+export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   const info = thread.info;
   const usage = thread.usage;
-  const totalTokens = usage
-    ? usedTokens(usage) + (usage.output_tokens ?? 0)
-    : 0;
+  const totalTokens = usage ? usedTokens(usage) + (usage.output_tokens ?? 0) : 0;
   const gitStats = info?.git_stats;
   const perModel = Object.entries(info?.per_model_usage ?? {});
 
   return (
-    <aside className="font-chrome w-[260px] shrink-0 overflow-y-auto p-2">
-      <div className="bg-card flex flex-col gap-3 rounded-lg border p-3 text-xs shadow-md">
-        <h2 className="font-medium text-sm">{t('conversation_info')}</h2>
+    <aside
+      className={cn(
+        'font-chrome bg-card flex flex-col gap-3 rounded-lg border p-3 text-xs',
+        'shadow-[-3px_6px_10px_rgba(0,0,0,0.22)]',
+        className,
+      )}
+    >
+      <h2 className="font-medium text-sm">{t('conversation_info')}</h2>
 
-        <Section title={t('agents')}>
-          {!info || info.agents.length === 0 ? (
-            <p className="text-muted-foreground">{t('agents_none')}</p>
-          ) : (
-            <ul className="space-y-1.5">
-              {info.agents.map((agent) => (
-                <li className="flex items-start gap-1.5" key={agent.id}>
-                  <AgentStatusIcon status={agent.status} />
-                  <div className="min-w-0">
-                    <p className="truncate font-medium">{agent.agent_type}</p>
-                    {agent.latest_activity && (
-                      <p className="text-muted-foreground truncate">{agent.latest_activity}</p>
-                    )}
-                  </div>
-                </li>
-              ))}
-            </ul>
+      <Section title={t('agents')}>
+        {!info || info.agents.length === 0 ? (
+          <p className="text-muted-foreground">{t('agents_none')}</p>
+        ) : (
+          <ul className="space-y-1.5">
+            {info.agents.map((agent) => (
+              <li className="flex items-start gap-1.5" key={agent.id}>
+                <AgentStatusIcon status={agent.status} />
+                <div className="min-w-0">
+                  <p className="truncate font-medium">{agent.agent_type}</p>
+                  {agent.latest_activity && (
+                    <p className="text-muted-foreground truncate">{agent.latest_activity}</p>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+
+      <Section title={t('branch')}>
+        <div className="flex items-center gap-1.5">
+          <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="min-w-0 truncate">{thread.branch ?? '…'}</span>
+          {gitStats && (
+            <span className="font-code ml-auto flex shrink-0 gap-1.5">
+              <span className="text-success">+{gitStats.added}</span>
+              <span className="text-danger">-{gitStats.deleted}</span>
+              <span className="text-muted-foreground">?{gitStats.untracked}</span>
+            </span>
           )}
-        </Section>
+        </div>
+      </Section>
 
-        <Section title={t('branch')}>
-          <div className="flex items-center gap-1.5">
-            <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="min-w-0 truncate">{thread.branch ?? '…'}</span>
-            {gitStats && (
-              <span className="font-code ml-auto flex shrink-0 gap-1.5">
-                <span className="text-success">+{gitStats.added}</span>
-                <span className="text-danger">-{gitStats.deleted}</span>
-                <span className="text-muted-foreground">?{gitStats.untracked}</span>
-              </span>
-            )}
+      <Section title={t('spend')}>
+        <div className="flex items-baseline justify-between">
+          <span className="text-muted-foreground">${thread.cost.toFixed(2)}</span>
+          <span>{formatTokens(totalTokens)}</span>
+        </div>
+        {perModel.length > 0 && (
+          <div className="space-y-1">
+            {perModel.map(([modelKey, modelUsage], index) => (
+              <ModelUsageRow
+                key={modelKey}
+                last={index === perModel.length - 1}
+                models={models}
+                modelKey={modelKey}
+                usage={modelUsage}
+              />
+            ))}
           </div>
-        </Section>
+        )}
+      </Section>
 
-        <Section title={t('spend')}>
-          <div className="flex items-baseline justify-between">
-            <span className="text-muted-foreground">${thread.cost.toFixed(2)}</span>
-            <span>{formatTokens(totalTokens)}</span>
-          </div>
-          {perModel.length > 0 && (
-            <div className="space-y-1">
-              {perModel.map(([modelKey, modelUsage], index) => (
-                <ModelUsageRow
-                  key={modelKey}
-                  last={index === perModel.length - 1}
-                  models={models}
-                  modelKey={modelKey}
-                  usage={modelUsage}
-                />
-              ))}
-            </div>
-          )}
-        </Section>
+      <div className="border-border border-t" />
 
-        <div className="border-border border-t" />
-
-        <Section title={t('sources')}>
-          <p className="text-muted-foreground">{t('no_sources')}</p>
-        </Section>
-      </div>
+      <Section title={t('sources')}>
+        <p className="text-muted-foreground">{t('no_sources')}</p>
+      </Section>
     </aside>
   );
 };

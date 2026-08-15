@@ -1,8 +1,10 @@
-// Home screen: a sessions list styled after the native chat view. Rows show
-// a status dot, the title, and the relative last-activity time, with
+// Home screen styled after the native chat sessions view. Rows show a
+// status dot, the title, and the relative last-activity time, with
 // pin/archive actions appearing on hover; archived rows collapse behind a
-// "More" row. The composer underneath creates a thread on its first send,
-// and wide containers split into a list column plus a composer column.
+// "More" row. The composer creates a thread on its first send. Wide
+// containers split into a sessions column and a composer column joined by a
+// draggable sash — the composer pinned to the bottom of its column, like
+// the workbench's side-by-side layout.
 
 import {
   Archive,
@@ -13,7 +15,7 @@ import {
   Pin,
   TriangleAlert,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
@@ -26,6 +28,10 @@ import { Composer } from './chrome/composer';
 import { ErrorBanner } from './chrome/error-banner';
 
 const WIDE_BREAKPOINT_PX = 600;
+const SIDEBAR_MIN_PX = 200;
+const SIDEBAR_DEFAULT_PX = 300;
+const COMPOSER_COLUMN_MIN_PX = 300;
+const SIDEBAR_WIDTH_KEY = 'manox.sessions-sidebar-width';
 
 const openThread = (item: ThreadListItem) => {
   // Threads with live local state switch instantly and only refocus the
@@ -135,8 +141,18 @@ export type ThreadsViewProps = {
 
 export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewProps) => {
   const { ref, width } = useContainerWidth();
-  const wide = width >= WIDE_BREAKPOINT_PX;
+  const wide = width !== null && width >= WIDE_BREAKPOINT_PX;
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+    return saved >= SIDEBAR_MIN_PX ? saved : SIDEBAR_DEFAULT_PX;
+  });
+  const [sashActive, setSashActive] = useState(false);
+  const sashDrag = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+  }, [sidebarWidth]);
 
   // Relative times age on their own; tick once a minute to keep them honest.
   const [, setTick] = useState(0);
@@ -146,6 +162,27 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
   }, []);
 
   const { active, archived } = partitionSessions(threads);
+
+  const maxSidebar = Math.max(
+    SIDEBAR_MIN_PX,
+    (width ?? WIDE_BREAKPOINT_PX) - COMPOSER_COLUMN_MIN_PX,
+  );
+  const listWidth = Math.min(sidebarWidth, maxSidebar);
+
+  const onSashPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    sashDrag.current = { startX: e.clientX, startWidth: listWidth };
+    setSashActive(true);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onSashPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!sashDrag.current) return;
+    const next = sashDrag.current.startWidth + e.clientX - sashDrag.current.startX;
+    setSidebarWidth(Math.max(SIDEBAR_MIN_PX, Math.min(next, maxSidebar)));
+  };
+  const onSashPointerUp = () => {
+    sashDrag.current = null;
+    setSashActive(false);
+  };
 
   const createSession = useCallback(
     (text: string, images: { data: string; mimeType: string }[]) => {
@@ -178,8 +215,10 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
 
   const listPanel = (
     <>
-      <div className="flex items-center gap-1 border-b px-3 py-1.5">
-        <span className="min-w-0 flex-1 font-medium text-sm">{t('sessions')}</span>
+      <div className="flex items-center gap-1 px-3 py-2">
+        <span className="min-w-0 flex-1 text-[11px] font-bold uppercase tracking-wide">
+          {t('sessions')}
+        </span>
       </div>
       <ErrorBanner message={error} />
       {active.length === 0 && archived.length === 0 ? (
@@ -220,8 +259,26 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
     <div ref={ref} className="font-chrome flex h-screen flex-col bg-background text-foreground">
       {wide ? (
         <div className="flex min-h-0 flex-1">
-          <div className="flex w-1/2 min-w-0 flex-col border-r">{listPanel}</div>
-          <div className="flex w-1/2 min-w-0 flex-col justify-center">{composer}</div>
+          <div className="flex min-w-0 flex-col" style={{ width: listWidth }}>
+            {listPanel}
+          </div>
+          <div
+            aria-orientation="vertical"
+            className="relative z-10 w-1 shrink-0 cursor-col-resize touch-none"
+            onDoubleClick={() => setSidebarWidth(SIDEBAR_DEFAULT_PX)}
+            onPointerDown={onSashPointerDown}
+            onPointerMove={onSashPointerMove}
+            onPointerUp={onSashPointerUp}
+            role="separator"
+          >
+            <div
+              className={cn(
+                'bg-border absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors',
+                sashActive ? 'bg-ring' : 'hover:bg-ring',
+              )}
+            />
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col justify-end">{composer}</div>
         </div>
       ) : (
         <>

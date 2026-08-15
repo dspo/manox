@@ -33,6 +33,8 @@ export type MessageListProps = {
   lastTurnDurationSec: number | null;
   cwd: string;
   branch: string | null;
+  /** Right gutter reserved for the floating info card on wide containers. */
+  rightInsetPx?: number;
 };
 
 interface TurnGroup {
@@ -70,6 +72,7 @@ export const MessageList = ({
   lastTurnDurationSec,
   cwd,
   branch,
+  rightInsetPx,
 }: MessageListProps) => {
   // Only the trailing item can be mid-stream.
   const lastItem = items[items.length - 1];
@@ -149,7 +152,9 @@ export const MessageList = ({
 
   return (
     <Conversation>
-      <ConversationContent>
+      <ConversationContent
+        style={rightInsetPx ? { paddingRight: rightInsetPx } : undefined}
+      >
         <div className="mx-auto w-full max-w-[760px]">{groups.map(renderGroup)}</div>
       </ConversationContent>
       {items.length === 0 && (
