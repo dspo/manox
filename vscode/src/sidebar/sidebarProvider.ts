@@ -79,6 +79,7 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     sessionId?: string;
     text?: string;
     images?: ImageAttachment[];
+    modelId?: string;
   }): Promise<void> {
     const generation = ++this.sessionGeneration;
     const manager = SessionManager.shared();
@@ -91,6 +92,9 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
       this.registerSession(sessionId, 'fresh', cwd);
+      if (opts?.modelId) {
+        manager.send({ cmd: 'set_model', sessionId, id: opts.modelId });
+      }
       if (opts?.text || opts?.images?.length) {
         manager.send({ cmd: 'submit', sessionId, text: opts.text ?? '', images: opts.images });
       }
@@ -224,6 +228,7 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
           sessionId: msg.sessionId,
           text: msg.text,
           images: msg.images,
+          modelId: msg.modelId,
         });
         return;
     }

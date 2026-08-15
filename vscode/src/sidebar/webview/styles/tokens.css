@@ -13,7 +13,7 @@
   --color-foreground: var(--vscode-foreground);
   --color-muted: var(--vscode-textBlockQuote-background);
   --color-muted-foreground: var(--vscode-descriptionForeground);
-  --color-border: var(--vscode-panel-border);
+  --color-border: var(--vscode-panel-border, var(--vscode-sideBar-border, rgba(127, 127, 127, 0.3)));
   --color-primary: var(--vscode-button-background);
   --color-primary-foreground: var(--vscode-button-foreground);
   --color-destructive: var(--vscode-errorForeground);

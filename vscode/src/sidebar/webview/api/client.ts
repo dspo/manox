@@ -75,8 +75,13 @@ export const api = {
   },
   /** Optional payload = home-composer first message: the caller picks the id
    * so an optimistic draft can render before the session exists. */
-  newSession(sessionId?: string, text?: string, images?: ImageAttachment[]): void {
-    post({ type: 'new_session', sessionId, text, images });
+  newSession(opts: {
+    sessionId?: string;
+    text?: string;
+    images?: ImageAttachment[];
+    modelId?: string;
+  }): void {
+    post({ type: 'new_session', ...opts });
   },
   listThreads(): void {
     post({ type: 'list_threads' });

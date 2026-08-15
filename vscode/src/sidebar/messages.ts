@@ -30,6 +30,7 @@ export type WebviewToHost =
       sessionId?: string;
       text?: string;
       images?: ImageAttachment[];
+      modelId?: string;
     }
   | { type: 'archive_thread'; sessionId: string; archived: boolean }
   | { type: 'pin_thread'; sessionId: string; pinned: boolean }

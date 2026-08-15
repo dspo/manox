@@ -92,7 +92,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   return (
     <aside
       className={cn(
-        'font-chrome bg-card flex flex-col gap-3 rounded-lg border p-3 text-xs',
+        'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-foreground/10 p-3 text-xs',
         'shadow-[-3px_6px_10px_rgba(0,0,0,0.22)]',
         className,
       )}
@@ -153,7 +153,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         )}
       </Section>
 
-      <div className="border-border border-t" />
+      <div className="border-foreground/10 border-t" />
 
       <Section title={t('sources')}>
         <p className="text-muted-foreground">{t('no_sources')}</p>

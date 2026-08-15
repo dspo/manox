@@ -32,6 +32,7 @@ const SIDEBAR_MIN_PX = 200;
 const SIDEBAR_DEFAULT_PX = 300;
 const COMPOSER_COLUMN_MIN_PX = 300;
 const SIDEBAR_WIDTH_KEY = 'manox.sessions-sidebar-width';
+const DRAFT_MODEL_KEY = 'manox.draft-model-id';
 
 const openThread = (item: ThreadListItem) => {
   // Threads with live local state switch instantly and only refocus the
@@ -149,10 +150,18 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
   });
   const [sashActive, setSashActive] = useState(false);
   const sashDrag = useRef<{ startX: number; startWidth: number } | null>(null);
+  const [draftModelId, setDraftModelId] = useState<string | null>(
+    () => localStorage.getItem(DRAFT_MODEL_KEY) ?? null,
+  );
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
   }, [sidebarWidth]);
+
+  const pickDraftModel = useCallback((modelId: string) => {
+    setDraftModelId(modelId);
+    localStorage.setItem(DRAFT_MODEL_KEY, modelId);
+  }, []);
 
   // Relative times age on their own; tick once a minute to keep them honest.
   const [, setTick] = useState(0);
@@ -196,18 +205,24 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
           byteLen: null,
         })),
       );
-      api.newSession(id, text, images.length ? images : undefined);
+      api.newSession({
+        sessionId: id,
+        text,
+        images: images.length ? images : undefined,
+        modelId: draftModelId ?? undefined,
+      });
     },
-    [],
+    [draftModelId],
   );
 
   const composer = (
     <Composer
       approvalMode="autopilot"
       commands={commands}
-      currentModelId={null}
+      currentModelId={draftModelId}
       models={models}
       onCreateSession={createSession}
+      onModelChange={pickDraftModel}
       sessionId={null}
       turnActive={false}
     />

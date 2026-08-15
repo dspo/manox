@@ -57,7 +57,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
         </Button>
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{thread.title}</span>
       </div>
-      <div className="relative min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1 flex-col">
         <MessageList
           approvalMode={thread.approvalMode}
           branch={thread.branch}

@@ -29,11 +29,27 @@ export type ModelPickerProps = {
   currentModelId: string | null;
   disabled: boolean;
   sessionId: string | null;
+  /** Selection without a live session (a draft thread's first send applies
+   * the model at creation time). Takes precedence over the sessionId path. */
+  onSelect?: (modelId: string) => void;
 };
 
-export const ModelPicker = ({ models, currentModelId, disabled, sessionId }: ModelPickerProps) => {
+export const ModelPicker = ({
+  models,
+  currentModelId,
+  disabled,
+  sessionId,
+  onSelect,
+}: ModelPickerProps) => {
   const current = models.find((m) => m.id === currentModelId);
   const providers = [...new Set(models.map((m) => m.provider))];
+  const select = (modelId: string) => {
+    if (onSelect) {
+      onSelect(modelId);
+    } else if (sessionId) {
+      new ThreadApi(sessionId).setModel(modelId);
+    }
+  };
 
   return (
     <DropdownMenu>
@@ -73,7 +89,7 @@ export const ModelPicker = ({ models, currentModelId, disabled, sessionId }: Mod
                   <DropdownMenuItem
                     className="gap-2"
                     key={m.id}
-                    onSelect={() => sessionId && new ThreadApi(sessionId).setModel(m.id)}
+                    onSelect={() => select(m.id)}
                   >
                     <Badge className="px-1 text-[10px] font-normal" variant="outline">
                       {m.api}

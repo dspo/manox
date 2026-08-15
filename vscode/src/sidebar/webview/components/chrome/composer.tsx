@@ -134,6 +134,8 @@ export type ComposerProps = {
   creating?: boolean;
   /** Draft-mode send: creates the session and delivers the first message. */
   onCreateSession?: (text: string, images: { data: string; mimeType: string }[]) => void;
+  /** Draft-mode model selection; the chosen id rides along on creation. */
+  onModelChange?: (modelId: string) => void;
 };
 
 export const Composer = ({
@@ -145,6 +147,7 @@ export const Composer = ({
   commands,
   creating = false,
   onCreateSession,
+  onModelChange,
 }: ComposerProps) => {
   const [text, setText] = useState('');
   const [images, setImages] = useState<PastedImage[]>([]);
@@ -307,8 +310,9 @@ export const Composer = ({
           draft ? 'justify-end' : 'justify-between',
         )}
       >
-        {/* Approval policy and model selection need a live session; the
-         * draft's first send creates one with the host's defaults. */}
+        {/* Approval policy needs a live session; the draft's first send
+         * creates one with the host's defaults. Model selection works for
+         * drafts too: the choice rides along on creation. */}
         {!draft && (
           <ApprovalChip
             disabled={!ready}
@@ -317,14 +321,13 @@ export const Composer = ({
           />
         )}
         <div className="flex items-center gap-2">
-          {!draft && (
-            <ModelPicker
-              currentModelId={currentModelId}
-              disabled={!ready || turnActive || models.length === 0}
-              models={models}
-              sessionId={sessionId}
-            />
-          )}
+          <ModelPicker
+            currentModelId={currentModelId}
+            disabled={!ready || turnActive || models.length === 0}
+            models={models}
+            onSelect={draft ? onModelChange : undefined}
+            sessionId={sessionId}
+          />
           {turnActive && sessionId ? (
             <button
               className="bg-danger/20 text-danger hover:bg-danger/30 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
