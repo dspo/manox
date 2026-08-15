@@ -260,6 +260,33 @@ describe('provideLanguageModelChatInformation', () => {
     ]);
   });
 
+  it('passes a reported zero context window through instead of masking it', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation(
+      { silent: false },
+      fakeToken(),
+    );
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        {
+          id: 'anthropic/x',
+          name: 'X',
+          provider: 'anthropic',
+          api: 'anthropic',
+          context_window: 0,
+        },
+      ],
+    });
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ maxInputTokens: 0 }),
+    ]);
+  });
+
   it('stays silent for silent resolution', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
