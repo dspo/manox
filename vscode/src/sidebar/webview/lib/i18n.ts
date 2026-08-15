@@ -11,7 +11,7 @@ type Entry = {
 const DICT = {
   conversation_info: { en: 'Conversation info', zh: '对话信息' },
   agents: { en: 'Agents', zh: '智能体' },
-  agents_none: { en: 'None', zh: '暂无' },
+  captain: { en: 'Captain', zh: '船长' },
   branch: { en: 'Branch', zh: '分支' },
   spend: { en: 'Spend', zh: '消费' },
   sources: { en: 'Sources', zh: '来源' },

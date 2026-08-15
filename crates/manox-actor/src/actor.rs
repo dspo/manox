@@ -725,6 +725,7 @@ fn emit_thread_info(
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
                 "usage": t.cumulative_token_usage(),
                 "per_model_usage": t.per_model_token_usage(),
+                "per_model_cost": t.per_model_cost(),
                 "cost": t.cumulative_cost(),
                 "pending_auth_count": t.pending_auth_entries().len(),
                 "agents": agents,
@@ -986,6 +987,7 @@ fn model_json(model: &pi::types::Model) -> Value {
         "id": model.id,
         "name": agent::pi_providers::display_name(model),
         "provider": model.provider,
+        "provider_name": agent::pi_providers::display_provider_name(model),
         "api": model.api,
         "context_window": model.context_window,
     })
@@ -1760,6 +1762,7 @@ mod tests {
         let value = model_json(&model);
         assert_eq!(value["id"], "claude-sonnet-4-6");
         assert_eq!(value["provider"], "anthropic");
+        assert_eq!(value["provider_name"], "anthropic");
         assert_eq!(value["api"], "anthropic");
         assert_eq!(value["context_window"], 200_000);
         assert!(value["name"].is_string());

@@ -4164,8 +4164,9 @@ impl Workspace {
         }
     }
 
-    /// Wire api string → text color for the pi composer model label.
-    fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
+    /// Wire api string → text color for the pi composer model label and the
+    /// context rail's per-model usage rows.
+    pub(crate) fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
         match api {
             "anthropic" => theme.primary,
             "openai_responses" => theme.info,

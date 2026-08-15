@@ -57,6 +57,9 @@ export interface ModelInfo {
 	id: string;
 	name: string;
 	provider: string;
+	/** Provider display name (e.g. "DeepSeek" for the "DeepSeek-anthropic"
+	 * registration id). Absent only from older actors. */
+	provider_name?: string;
 	/** Wire API shape ("anthropic", "openai_responses", …); drives the
 	 * cascade menu's badge and tint. */
 	api: string;
@@ -128,6 +131,8 @@ export interface ThreadInfoSnapshot {
 	usage: TokenUsageSnapshot;
 	/** Token usage keyed by "{provider}/{model_id}". */
 	per_model_usage?: Record<string, TokenUsageSnapshot>;
+	/** Per-model spend keyed like `per_model_usage`. */
+	per_model_cost?: Record<string, number>;
 	cost: number;
 	pending_auth_count: number;
 	agents: SubagentSnapshot[];

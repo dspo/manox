@@ -407,16 +407,49 @@ impl ContextRail {
                 let branch = if is_last_model { "└─" } else { "├─" };
                 let indent = if is_last_model { "    " } else { "│   " };
 
-                // Model row shows only the display name (which already carries
-                // the `[1m]` window suffix); the cache rate and window label
-                // are deliberately omitted — the rate moves to the CH field.
-                section = section.child(
-                    gpui::div()
+                // Model row: "{provider display}/{model display}" with the
+                // model segment tinted by its wire api; the raw composite key
+                // renders verbatim when the registry cannot resolve it.
+                let model_row = match model_name.split_once('/').and_then(|(provider, id)| {
+                    agent::pi_providers::global().resolve_model(provider, id)
+                }) {
+                    Some(m) => h_flex()
+                        .text_xs()
+                        .min_w_0()
+                        .child(
+                            gpui::div()
+                                .flex_none()
+                                .text_color(theme.foreground)
+                                .child(format!("{branch} ")),
+                        )
+                        .child(
+                            gpui::div()
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child(agent::pi_providers::display_provider_name(&m)),
+                        )
+                        .child(
+                            gpui::div()
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child("/"),
+                        )
+                        .child(
+                            gpui::div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(Workspace::pi_wire_text_color(&m.api, theme))
+                                .child(agent::pi_providers::display_name(&m)),
+                        )
+                        .into_any_element(),
+                    None => gpui::div()
                         .text_xs()
                         .text_color(theme.foreground)
                         .truncate()
-                        .child(SharedString::from(format!("{branch} {model_name}"))),
-                );
+                        .child(SharedString::from(format!("{branch} {model_name}")))
+                        .into_any_element(),
+                };
+                section = section.child(model_row);
 
                 // Context budget row — first tree child, only when the model is
                 // registered (so its window size is resolvable).
