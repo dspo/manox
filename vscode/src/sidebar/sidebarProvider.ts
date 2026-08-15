@@ -101,8 +101,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   private async openThread(sessionId: string): Promise<void> {
     const manager = SessionManager.shared();
     if (this.sessions.has(sessionId)) {
-      // Already live: the actor replays its history/info snapshots on a
-      // repeat open, and no second subscription is needed.
+      // Already live: re-announce the session so a reloaded webview can
+      // rebuild its state from scratch, then have the actor replay its
+      // history/info snapshots through the existing subscription.
+      this.post({ type: 'session_ready', sessionId, cwd: resolveWorkspaceCwd(), kind: 'restored' });
+      manager.send({ cmd: 'get_current_model', sessionId });
       manager.send({ cmd: 'open_thread', sessionId });
       return;
     }

@@ -58,7 +58,9 @@ describe('thread routing', () => {
       cwd: '/w',
       items: [],
       loading: false,
-      approvalMode: 'danger',
+      // Matches the thread-side default; restored threads get their
+      // persisted mode replayed by the actor.
+      approvalMode: 'autopilot',
     });
   });
 
@@ -215,18 +217,39 @@ describe('transcript folding', () => {
     expect(thread(store)?.items.find((i) => i.kind === 'approval')).toBeUndefined();
   });
 
-  it('drives the turn flag and clears errors on session_ready', () => {
+  it('drives the turn flag', () => {
     const store = startSession();
-    store.dispatch(event({ type: 'error', sessionId: 's', message: 'bad' }));
-    expect(store.get().error).toBe('bad');
     store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
     expect(thread(store)?.turnActive).toBe(true);
     store.dispatch(
       event({ type: 'turn_finished', sessionId: 's', cancelled: false, failed: false }),
     );
     expect(thread(store)?.turnActive).toBe(false);
+  });
 
-    store.dispatch(ready('s2'));
+  it('routes session errors to their own thread only', () => {
+    const store = startSession('a');
+    store.dispatch(ready('b'));
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    // A background thread's failure must not surface in another
+    // conversation's banner.
+    expect(thread(store, 'a')?.error).toBe('boom');
+    expect(thread(store, 'b')?.error).toBeNull();
+    expect(store.get().error).toBeNull();
+  });
+
+  it('clears a thread error when its next turn starts', () => {
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    store.dispatch(event({ type: 'turn_started', sessionId: 'a' }));
+    expect(thread(store, 'a')?.error).toBeNull();
+  });
+
+  it('keeps session-less errors global and clears them on session_ready', () => {
+    const store = new Store();
+    store.dispatch(event({ type: 'error', sessionId: null, message: 'core hiccup' }));
+    expect(store.get().error).toBe('core hiccup');
+    store.dispatch(ready('s'));
     expect(store.get().error).toBeNull();
   });
 

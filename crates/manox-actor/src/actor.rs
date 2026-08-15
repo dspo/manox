@@ -195,6 +195,10 @@ fn handle_command(
                 sink.emit(error_json(None, "create_session requires sessionId"));
                 return true;
             };
+            // The surface switches to the new conversation immediately, so it
+            // counts as focused; otherwise its first finished turn would mark
+            // it unread.
+            *state.focused.lock().unwrap() = Some(id.clone());
             let cwd = cmd["cwd"]
                 .as_str()
                 .map(PathBuf::from)
@@ -218,6 +222,7 @@ fn handle_command(
                     thread.update(app, |t, cx| t.set_model(model, cx));
                 });
             }
+            let persisted_mode = cx.update(|app| thread.read(app).approval_mode());
             state.sessions.insert(
                 id.clone(),
                 SessionState {
@@ -228,6 +233,7 @@ fn handle_command(
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
+            emit_persisted_approval_mode(persisted_mode, &id, sink);
         }
         "open_thread" => {
             let Some(id) = session_id.clone() else {
@@ -938,6 +944,20 @@ mod tests {
         assert!(state.sessions.contains_key("s1"));
         assert!(types(&out).contains(&"session_created".to_string()));
 
+        // A fresh session opens focused and replays its approval policy, so
+        // the surface's toggle starts on the thread's actual mode and the
+        // first finished turn does not badge the thread unread.
+        assert_eq!(state.focused.lock().unwrap().as_deref(), Some("s1"));
+        let modes: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "approval_mode_changed")
+            .map(|v| v["mode"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(modes, vec!["autopilot".to_string()]);
+
         // Switching the approval policy surfaces as an approval_mode_changed
         // event for the session.
         handle_command(
@@ -947,7 +967,15 @@ mod tests {
             r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"danger"}"#,
         );
         cx.run_until_parked();
-        assert!(types(&out).contains(&"approval_mode_changed".to_string()));
+        let modes: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "approval_mode_changed")
+            .map(|v| v["mode"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(modes, vec!["autopilot".to_string(), "danger".to_string()]);
 
         // A command for an unknown session surfaces as an error event.
         handle_command(
