@@ -2410,10 +2410,15 @@ impl TitleScheduler {
             } => {
                 if tool_name == crate::tools::CREATE_GOAL && !is_error {
                     self.start_execution(crate::title::TitleWakeReason::GoalStarted);
-                } else if result.terminate
-                    && let Some(reason) = self.state.lock().unwrap().wake.tool_terminated()
-                {
-                    self.wake(reason);
+                } else if result.terminate {
+                    // `wake` re-locks the scheduler state, so the guard from
+                    // the scrutinee must drop first: an `if let` scrutinee
+                    // guard stays alive through the block and would
+                    // self-deadlock the non-reentrant std mutex.
+                    let reason = self.state.lock().unwrap().wake.tool_terminated();
+                    if let Some(reason) = reason {
+                        self.wake(reason);
+                    }
                 }
             }
             _ => {}
@@ -2510,6 +2515,58 @@ mod title_scheduler_tests {
         assert!(!state.begin(TitleWakeReason::GoalStarted));
         assert_eq!(state.finish(), Some(TitleWakeReason::GoalStarted));
         assert!(!state.in_flight);
+    }
+
+    #[test]
+    fn tool_terminate_observe_releases_state_guard_before_wake() {
+        // Regression: the `if let` scrutinee guard from `state.lock()` stays
+        // alive through the block, so a `wake` call inside it self-deadlocked
+        // the non-reentrant std mutex when a terminate tool ended the turn.
+        let (tx, _rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let resolver: pi::agent_loop::StreamResolver = Arc::new(
+            |_model: &PiModel| -> Result<Arc<dyn pi::agent_loop::StreamFn>, anyhow::Error> {
+                Err(anyhow::anyhow!("unused in this test"))
+            },
+        );
+        let scheduler = TitleScheduler::new(
+            ModelRuntime::new(resolver),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(LiveTranscript::default())),
+            None,
+            crate::plan_mode::PlanSessionState::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+            tx,
+            PersistedTitleScheduler::default(),
+        );
+        // Park `wake` at the begin gate so the fixed code returns without
+        // spawning a title run; the buggy code deadlocks on the re-lock
+        // before it ever reaches that gate.
+        scheduler.state.lock().unwrap().in_flight = true;
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: crate::plan_mode::PROPOSE_PLAN.into(),
+            result: pi::tool::AgentToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "plan submitted".into(),
+                    signature: None,
+                }],
+                details: None,
+                is_error: false,
+                usage: None,
+                added_tool_names: None,
+                terminate: true,
+            },
+            is_error: false,
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            scheduler.observe(&event);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("observe deadlocked on a terminate tool result");
     }
 }
 
