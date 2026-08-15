@@ -106,7 +106,7 @@ pub enum MonitorEvent {
 }
 
 /// What a monitor watches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MonitorKind {
     Command,
     WebSocket,
@@ -120,6 +120,133 @@ struct MonitorTask {
     /// then suppresses its own terminal event and steer — the teardown
     /// already reported `Killed`, and the bound session is going away.
     kill_initiated: Arc<AtomicBool>,
+}
+
+/// Terminal/live status of a monitor, projected for UI consumers. Mirrors the
+/// agent-side `TaskStatus` vocabulary the host bridge maps into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MonitorStatus {
+    Running,
+    Completed,
+    TimedOut,
+    Stopped,
+    Failed,
+}
+
+impl MonitorStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MonitorStatus::Running => "Running",
+            MonitorStatus::Completed => "Completed",
+            MonitorStatus::TimedOut => "Timed out",
+            MonitorStatus::Stopped => "Stopped",
+            MonitorStatus::Failed => "Failed",
+        }
+    }
+}
+
+/// Live snapshot of one monitor: identity, kind, lifecycle, and a bounded
+/// tail of its accumulated output. Grows monotonically until the terminal
+/// state is set; after that the snapshot is frozen.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonitorSnapshot {
+    pub task_id: String,
+    pub kind: MonitorKind,
+    pub description: String,
+    pub status: MonitorStatus,
+    pub created_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub failure_summary: Option<String>,
+    pub event_count: u64,
+    pub total_bytes: u64,
+    pub output_tail: String,
+}
+
+impl MonitorSnapshot {
+    fn new(id: String, kind: MonitorKind, description: String) -> Self {
+        Self {
+            task_id: id,
+            kind,
+            description,
+            status: MonitorStatus::Running,
+            created_at_ms: chrono::Utc::now().timestamp_millis() as u64,
+            ended_at_ms: None,
+            exit_code: None,
+            failure_summary: None,
+            event_count: 0,
+            total_bytes: 0,
+            output_tail: String::new(),
+        }
+    }
+}
+
+/// One raw output line/frame from a monitor, broadcast to UI consumers on top
+/// of the batched steer path.
+#[derive(Debug, Clone)]
+pub struct MonitorOutput {
+    pub id: String,
+    pub line: String,
+}
+
+/// Cap on the accumulated `output_tail` bytes retained per snapshot.
+const MAX_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
+
+/// Append a line to the ring tail, evicting from the front once over the cap.
+fn push_output_tail(tail: &str, line: &str) -> String {
+    let mut combined = if tail.is_empty() {
+        line.to_string()
+    } else {
+        format!("{tail}\n{line}")
+    };
+    if combined.len() > MAX_OUTPUT_TAIL_BYTES {
+        combined.split_off(combined.len() - MAX_OUTPUT_TAIL_BYTES)
+    } else {
+        combined
+    }
+}
+
+/// Record one output line into the task's snapshot and broadcast it to UI
+/// consumers.
+fn record_output(
+    snapshots: &Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    output_tx: &broadcast::Sender<MonitorOutput>,
+    id: &str,
+    line: &str,
+) {
+    let _ = output_tx.send(MonitorOutput {
+        id: id.to_string(),
+        line: line.to_string(),
+    });
+    if let Some(snapshot) = snapshots
+        .lock()
+        .expect("snapshots lock poisoned")
+        .get_mut(id)
+    {
+        snapshot.event_count += 1;
+        snapshot.total_bytes += line.len() as u64;
+        snapshot.output_tail = push_output_tail(&snapshot.output_tail, line);
+    }
+}
+
+/// Set a monitor's terminal state on its snapshot.
+fn record_terminal(
+    snapshots: &Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    id: &str,
+    status: MonitorStatus,
+    exit_code: Option<i32>,
+    reason: Option<String>,
+) {
+    if let Some(snapshot) = snapshots
+        .lock()
+        .expect("snapshots lock poisoned")
+        .get_mut(id)
+    {
+        snapshot.status = status;
+        snapshot.ended_at_ms = Some(chrono::Utc::now().timestamp_millis() as u64);
+        snapshot.exit_code = exit_code;
+        snapshot.failure_summary = reason;
+    }
 }
 
 // ── Input schema ───────────────────────────────────────────────────────────
@@ -177,17 +304,25 @@ pub struct MonitorManager {
     /// Active monitors keyed by task id; the kind routes `kill_all_sync` to
     /// the right registry. Entries leave when their monitor terminates.
     tasks: Arc<Mutex<HashMap<String, MonitorTask>>>,
+    /// Per-task snapshots (lifecycle + bounded output tail), for UI consumers
+    /// that render background-task cards.
+    snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    /// Raw output lines/frames, broadcast on top of the batched steer path.
+    output_tx: broadcast::Sender<MonitorOutput>,
 }
 
 impl MonitorManager {
     pub fn new(bg_registry: Arc<BackgroundRegistry>) -> Self {
         let (event_tx, _) = broadcast::channel(64);
+        let (output_tx, _) = broadcast::channel(256);
         MonitorManager {
             bg_registry,
             ws_registry: Arc::new(WsMonitorRegistry::new()),
             steerer: Arc::new(Mutex::new(None)),
             event_tx,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            output_tx,
         }
     }
 
@@ -208,6 +343,57 @@ impl MonitorManager {
     /// `ws_N` ids stop through the same tool).
     pub fn ws_registry(&self) -> Arc<WsMonitorRegistry> {
         Arc::clone(&self.ws_registry)
+    }
+
+    /// Subscribe to raw output lines/frames (the batched steer path stays the
+    /// model-facing channel; this one feeds UI consumers).
+    pub fn subscribe_output(&self) -> broadcast::Receiver<MonitorOutput> {
+        self.output_tx.subscribe()
+    }
+
+    /// Live snapshot of one monitor, if it is still known.
+    pub fn snapshot(&self, id: &str) -> Option<MonitorSnapshot> {
+        self.snapshots
+            .lock()
+            .expect("snapshots lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// Live snapshots of every monitor tracked so far, newest first.
+    pub fn snapshots(&self) -> Vec<MonitorSnapshot> {
+        let mut out: Vec<MonitorSnapshot> = self
+            .snapshots
+            .lock()
+            .expect("snapshots lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at_ms));
+        out
+    }
+
+    /// Stop one monitor synchronously by task id. Unlike `kill_all_sync`, the
+    /// terminal `Stopped` event still fires: this is a user-facing stop, not a
+    /// session teardown.
+    pub fn stop(&self, id: &str) {
+        let kind = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(id)
+            .map(|t| t.kind);
+        match kind {
+            Some(MonitorKind::Command) => {
+                let _ = self.bg_registry.kill_sync(&pi::TaskId(id.to_string()));
+            }
+            Some(MonitorKind::WebSocket) => {
+                let ws_id = WsTaskId(id.to_string());
+                self.ws_registry.abort(&ws_id);
+                self.ws_registry.set_status(&ws_id, WsTaskStatus::Stopped);
+            }
+            None => {}
+        }
     }
 
     /// Spawn a command monitor.
@@ -239,8 +425,11 @@ impl MonitorManager {
             let steerer = Arc::clone(&steerer);
             let batcher = Arc::clone(&batcher);
             let desc = desc.clone();
+            let snapshots = Arc::clone(&self.snapshots);
+            let output_tx = self.output_tx.clone();
             move |task_id: &pi::TaskId, line: String| {
                 let tid = task_id.0.clone();
+                record_output(&snapshots, &output_tx, &tid, &line);
                 let batch = batcher.lock().expect("batcher lock poisoned").push(line);
                 if let Some(batch) = batch {
                     steer_batch(&steerer, &tid, &desc, batch);
@@ -255,6 +444,7 @@ impl MonitorManager {
             let batcher = Arc::clone(&batcher);
             let timed_out = Arc::clone(&timed_out);
             let kill_initiated = Arc::clone(&kill_initiated);
+            let snapshots = Arc::clone(&self.snapshots);
             let desc = desc.clone();
             move |task_id: &pi::TaskId, exit_code: Option<Option<i32>>| {
                 let tid = task_id.0.clone();
@@ -272,17 +462,21 @@ impl MonitorManager {
                     steer_batch(&steerer, &tid, &desc, residual);
                 }
 
-                let (text, event) = if timed_out.load(Ordering::Relaxed) {
+                let (text, status, snapshot_exit, event) = if timed_out.load(Ordering::Relaxed) {
                     (
                         format!(
                             "[Monitor: {tid}] ({desc}) timed out after {timeout_secs}s and was terminated"
                         ),
+                        MonitorStatus::TimedOut,
+                        None,
                         MonitorEvent::TimedOut { id: tid.clone() },
                     )
                 } else {
                     match exit_code {
                         Some(Some(code)) => (
                             format!("[Monitor: {tid}] ({desc}) exited with code {code}"),
+                            MonitorStatus::Completed,
+                            Some(code),
                             MonitorEvent::Completed {
                                 id: tid.clone(),
                                 exit_code: Some(code),
@@ -290,11 +484,14 @@ impl MonitorManager {
                         ),
                         Some(None) => (
                             format!("[Monitor: {tid}] ({desc}) terminated by signal"),
+                            MonitorStatus::Stopped,
+                            None,
                             MonitorEvent::Stopped { id: tid.clone() },
                         ),
                         None => return,
                     }
                 };
+                record_terminal(&snapshots, &tid, status, snapshot_exit, None);
                 if let Some(steer) = steerer.lock().expect("steerer lock poisoned").as_ref() {
                     steer(AgentMessage::user(text));
                 }
@@ -315,6 +512,13 @@ impl MonitorManager {
                 kill_initiated: Arc::clone(&kill_initiated),
             },
         );
+        self.snapshots
+            .lock()
+            .expect("snapshots lock poisoned")
+            .insert(
+                tid.clone(),
+                MonitorSnapshot::new(tid.clone(), MonitorKind::Command, description.clone()),
+            );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description,
@@ -367,6 +571,13 @@ impl MonitorManager {
                 kill_initiated: Arc::clone(&kill_initiated),
             },
         );
+        self.snapshots
+            .lock()
+            .expect("snapshots lock poisoned")
+            .insert(
+                tid.clone(),
+                MonitorSnapshot::new(tid.clone(), MonitorKind::WebSocket, description.clone()),
+            );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description: description.clone(),
@@ -377,6 +588,8 @@ impl MonitorManager {
         let ws_registry = Arc::clone(&self.ws_registry);
         let event_tx = self.event_tx.clone();
         let tasks = Arc::clone(&self.tasks);
+        let snapshots = Arc::clone(&self.snapshots);
+        let output_tx = self.output_tx.clone();
         let desc = description;
         let ws_url = url;
 
@@ -393,6 +606,8 @@ impl MonitorManager {
                 &desc,
                 &steerer,
                 &kill_initiated,
+                &snapshots,
+                &output_tx,
             )
             .await;
             tasks
@@ -404,9 +619,11 @@ impl MonitorManager {
                 // tearing down — no duplicate terminal bookkeeping.
                 return;
             }
-            let (status, event) = match reason {
+            let (status, monitor_status, reason, event) = match reason {
                 WsExit::Closed => (
                     WsTaskStatus::Completed,
+                    MonitorStatus::Completed,
+                    None,
                     MonitorEvent::Completed {
                         id: driver_tid.clone(),
                         exit_code: None,
@@ -414,24 +631,31 @@ impl MonitorManager {
                 ),
                 WsExit::Cancelled => (
                     WsTaskStatus::Stopped,
+                    MonitorStatus::Stopped,
+                    None,
                     MonitorEvent::Stopped {
                         id: driver_tid.clone(),
                     },
                 ),
                 WsExit::TimedOut => (
                     WsTaskStatus::TimedOut,
+                    MonitorStatus::TimedOut,
+                    None,
                     MonitorEvent::TimedOut {
                         id: driver_tid.clone(),
                     },
                 ),
-                WsExit::Failed(ref e) => (
+                WsExit::Failed(e) => (
                     WsTaskStatus::Failed,
+                    MonitorStatus::Failed,
+                    Some(e.clone()),
                     MonitorEvent::Failed {
                         id: driver_tid.clone(),
-                        reason: e.clone(),
+                        reason: e,
                     },
                 ),
             };
+            record_terminal(&snapshots, &driver_tid, monitor_status, None, reason);
             ws_registry.set_status(&driver_task_id, status);
             let _ = event_tx.send(event);
         });
@@ -466,6 +690,7 @@ impl MonitorManager {
                     self.ws_registry.set_status(&ws_id, WsTaskStatus::Stopped);
                 }
             }
+            record_terminal(&self.snapshots, &id, MonitorStatus::Stopped, None, None);
             let _ = self.event_tx.send(MonitorEvent::Killed { id });
         }
     }
@@ -786,6 +1011,8 @@ async fn run_ws_monitor(
     description: &str,
     steerer: &Arc<Mutex<Option<Steerer>>>,
     kill_initiated: &AtomicBool,
+    snapshots: &Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    output_tx: &broadcast::Sender<MonitorOutput>,
 ) -> WsExit {
     let mut stream = match websocket::connect_pinned(url, addrs, cancel.clone()).await {
         Ok(stream) => stream,
@@ -856,6 +1083,7 @@ async fn run_ws_monitor(
             frame = websocket::read_frame(&mut stream) => {
                 match frame {
                     Ok(websocket::WsFrame::Text(text)) => {
+                        record_output(snapshots, output_tx, task_id, &text);
                         if let Some(batch) = batcher.push(text) {
                             steer_batch(steerer, task_id, description, batch);
                         }
@@ -1243,6 +1471,9 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let kill_initiated = AtomicBool::new(false);
+        let snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (output_tx, _) = broadcast::channel::<MonitorOutput>(16);
         let url = format!("ws://{addr}");
 
         // Watcher: observe the interval flush, then cancel (TaskStop-style)
@@ -1280,6 +1511,8 @@ mod tests {
             "sparse stream",
             &steerer,
             &kill_initiated,
+            &snapshots,
+            &output_tx,
         )
         .await;
         assert!(
@@ -1294,5 +1527,85 @@ mod tests {
                 .any(|t| t.contains("[monitor stopped]")),
             "cancelled ws monitor steers terminal text"
         );
+    }
+
+    /// Output broadcast + snapshot accumulation track a command monitor's
+    /// lifecycle and every raw line.
+    #[tokio::test]
+    async fn command_monitor_broadcasts_output_and_snapshots() {
+        let manager = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        *manager.steerer.lock().unwrap() = Some(Arc::new(|_| {}));
+        let mut output_rx = manager.subscribe_output();
+        let tid = manager
+            .spawn_command(
+                "echo watcher".into(),
+                "echo hello; echo world".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(30),
+                false,
+            )
+            .unwrap();
+
+        let mut lines = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), output_rx.recv()).await {
+                Ok(Ok(out)) if out.id == tid => lines.push(out.line),
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+            if let Some(snap) = manager.snapshot(&tid)
+                && snap.status == MonitorStatus::Completed
+            {
+                break;
+            }
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("hello")),
+            "output broadcast carries the line: {lines:?}"
+        );
+        let snap = manager.snapshot(&tid).expect("snapshot present");
+        assert_eq!(snap.status, MonitorStatus::Completed);
+        assert!(snap.output_tail.contains("hello"));
+        assert!(snap.output_tail.contains("world"));
+        assert!(snap.event_count >= 2);
+        assert!(snap.ended_at_ms.is_some());
+    }
+
+    /// A user-facing `stop` terminates one command monitor and reports the
+    /// terminal `Stopped` state (unlike `kill_all_sync`'s `Killed`).
+    #[tokio::test]
+    async fn stop_single_command_monitor_terminates() {
+        let manager = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        *manager.steerer.lock().unwrap() = Some(Arc::new(|_| {}));
+        let mut events = manager.subscribe();
+        let tid = manager
+            .spawn_command(
+                "long watcher".into(),
+                "sleep 30".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(60),
+                false,
+            )
+            .unwrap();
+        assert!(manager.snapshot(&tid).is_some(), "snapshot on spawn");
+
+        manager.stop(&tid);
+
+        let mut stopped = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
+                Ok(Ok(MonitorEvent::Stopped { id })) if id == tid => {
+                    stopped = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        assert!(stopped, "Stopped event after user stop");
+        let snap = manager.snapshot(&tid).expect("snapshot present");
+        assert_eq!(snap.status, MonitorStatus::Stopped);
     }
 }

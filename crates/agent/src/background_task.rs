@@ -213,6 +213,9 @@ struct TaskState {
     /// their cancellation branch so archive/shutdown become SessionEnded while
     /// an explicit TaskStop becomes Stopped.
     requested_stop_status: TaskStatus,
+    /// Optional hook the lifecycle owner registers to actually stop the
+    /// underlying process (pi-side kill) when the legacy stop path runs.
+    on_stop: Option<OnStopHook>,
 }
 
 impl TaskState {
@@ -247,9 +250,13 @@ impl TaskState {
             failure_summary: None,
             anchor_message_id: None,
             requested_stop_status: TaskStatus::Stopped,
+            on_stop: None,
         }
     }
 }
+
+/// The hook that actually stops a proxy's underlying process (pi-side kill).
+pub type OnStopHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A registered background task.
 pub struct BackgroundTask {
@@ -389,6 +396,22 @@ impl BackgroundTask {
             .lock()
             .expect("task state poisoned")
             .anchor_message_id = Some(id);
+    }
+
+    /// Register the hook that actually stops the underlying process (the
+    /// pi-side kill) when this task's stop path runs. Called once by the
+    /// owner that created the proxy.
+    pub fn set_on_stop(&self, on_stop: OnStopHook) {
+        self.state.lock().expect("task state poisoned").on_stop = Some(on_stop);
+    }
+
+    /// The registered stop hook, if any.
+    pub fn on_stop(&self) -> Option<OnStopHook> {
+        self.state
+            .lock()
+            .expect("task state poisoned")
+            .on_stop
+            .clone()
     }
 
     pub fn anchor_message_id(&self) -> Option<String> {
@@ -610,6 +633,7 @@ impl BackgroundTask {
             exit_code: s.exit_code,
             failure_summary: s.failure_summary.clone(),
             anchor_message_id: s.anchor_message_id.clone(),
+            output_tail: output_tail_from_ring(&s),
         }
     }
 }
@@ -632,6 +656,31 @@ pub struct TaskSnapshot {
     pub failure_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_message_id: Option<String>,
+    /// Bounded tail of accumulated output (newest bytes), for wire projection
+    /// to UI cards without a registry round-trip.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_tail: String,
+}
+
+/// Cap on the `output_tail` bytes carried in a snapshot.
+const SNAPSHOT_TAIL_BYTES: usize = 8 * 1024;
+
+/// Rebuild a bounded output tail from the task's event ring.
+fn output_tail_from_ring(s: &TaskState) -> String {
+    let mut tail = String::new();
+    for ev in &s.events {
+        if let TaskEventKind::Output(text) = &ev.event {
+            if !tail.is_empty() {
+                tail.push('\n');
+            }
+            tail.push_str(text);
+        }
+    }
+    if tail.len() > SNAPSHOT_TAIL_BYTES {
+        tail.split_off(tail.len() - SNAPSHOT_TAIL_BYTES)
+    } else {
+        tail
+    }
 }
 
 impl TaskSnapshot {
@@ -892,6 +941,34 @@ pub fn register_for_goal(
     (id, task)
 }
 
+/// Register a proxy task under a caller-chosen id (the pi-side task id the
+/// bridge mirrors). Used by the monitor bridge so `stop`/`snapshots_for_thread`
+/// see the same id as the underlying pi task. Idempotent: an existing entry
+/// with the id is returned untouched.
+pub fn register_with_id(
+    id: TaskId,
+    kind: TaskKind,
+    owner_thread_id: String,
+    description: String,
+    cancel: CancellationToken,
+) -> Arc<BackgroundTask> {
+    let mut reg = registry().lock().expect("registry poisoned");
+    if let Some(existing) = reg.tasks.get(&id.0) {
+        return Arc::clone(existing);
+    }
+    let task = Arc::new(BackgroundTask::new(
+        kind,
+        owner_thread_id,
+        None,
+        description,
+        cancel,
+    ));
+    reg.tasks.insert(id.0.clone(), Arc::clone(&task));
+    drop(reg);
+    task.push_state_changed(&id);
+    task
+}
+
 /// Look up a task by id.
 pub fn get(id: &TaskId) -> Option<Arc<BackgroundTask>> {
     registry()
@@ -948,6 +1025,12 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
     }
     task.push_state_changed(&TaskId(id.to_string()));
     task.cancel();
+
+    // Bridge proxies own no driver/managed proc; the registered hook is the
+    // actual process kill (pi-side). Fire it before the terminal push below.
+    if let Some(on_stop) = task.on_stop() {
+        on_stop(id);
+    }
 
     if let Some(proc) = task.managed_proc() {
         proc.close().await;
@@ -1429,10 +1512,58 @@ mod tests {
             exit_code: None,
             failure_summary: None,
             anchor_message_id: None,
+            output_tail: String::new(),
         }
         .normalize_after_restore();
         assert_eq!(snapshot.status, TaskStatus::SessionEnded);
         assert!(snapshot.ended_at_ms.is_some());
         assert!(snapshot.failure_summary.is_some());
+    }
+
+    #[test]
+    fn register_with_id_is_idempotent() {
+        let id = TaskId("custom_42".into());
+        let a = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "thread-id".into(),
+            "custom".into(),
+            CancellationToken::new(),
+        );
+        let b = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "thread-id".into(),
+            "custom".into(),
+            CancellationToken::new(),
+        );
+        // The second registration returns the same live registry entry.
+        assert!(Arc::ptr_eq(&a, &b));
+        let from_registry = get(&id).expect("id present in registry");
+        assert!(Arc::ptr_eq(&a, &from_registry));
+        let _ = drain_thread_events("thread-id");
+        remove(&id);
+        remove_thread_mailbox("thread-id");
+    }
+
+    #[tokio::test]
+    async fn stop_invokes_on_stop_hook() {
+        let id = TaskId("hook_task".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "thread-hook".into(),
+            "hook".into(),
+            CancellationToken::new(),
+        );
+        let called: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let called2 = Arc::clone(&called);
+        proxy.set_on_stop(Arc::new(move |id| {
+            *called2.lock().unwrap() = Some(id.to_string());
+        }));
+        stop(&id.0).await.expect("stop should succeed");
+        assert_eq!(called.lock().unwrap().as_deref(), Some(id.0.as_str()));
+        assert!(proxy.status().is_terminal());
+        remove(&id);
     }
 }

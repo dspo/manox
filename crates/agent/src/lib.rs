@@ -53,6 +53,7 @@ pub mod thread;
 pub mod thread_engine;
 pub mod thread_store;
 
+pub mod monitor_bridge;
 pub mod pi_approval;
 pub mod pi_engine;
 use gpui::App;

@@ -172,6 +172,7 @@ mod tests {
                 exit_code: Some(0),
                 failure_summary: None,
                 anchor_message_id: None,
+                output_tail: String::new(),
             }],
             always_allowed_tools: vec!["Bash".to_string()],
         }

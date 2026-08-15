@@ -252,7 +252,9 @@ pub enum ThreadEvent {
     /// Reasoning effort changed.
     ReasoningEffortChanged { effort: ReasoningEffort },
     /// Goal mode toggled on/off.
-    GoalChanged { active: bool },
+    GoalChanged {
+        goal: Option<crate::goal::ThreadGoal>,
+    },
     /// Git-worktree binding changed: entered (worktree path) or exited.
     WorktreeChanged { active: bool, path: Option<String> },
     /// Auto-compaction summarization pass started.
@@ -1036,7 +1038,9 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged { active: true });
+        cx.emit(ThreadEvent::GoalChanged {
+            goal: self.goal(),
+        });
         Ok(())
     }
 
@@ -1056,9 +1060,7 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let goal = bridge.edit_goal(objective, token_budget, actor)?;
-        cx.emit(ThreadEvent::GoalChanged {
-            active: !goal.status.is_terminal(),
-        });
+        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
@@ -1077,7 +1079,9 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged { active: true });
+        cx.emit(ThreadEvent::GoalChanged {
+            goal: self.goal(),
+        });
         Ok(())
     }
 
@@ -1091,9 +1095,7 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let goal = bridge.set_goal_status(status, reason, actor)?;
-        cx.emit(ThreadEvent::GoalChanged {
-            active: !goal.status.is_terminal(),
-        });
+        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
@@ -1105,7 +1107,7 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.clear_goal(actor)?;
-        cx.emit(ThreadEvent::GoalChanged { active: false });
+        cx.emit(ThreadEvent::GoalChanged { goal: None });
         Ok(())
     }
 

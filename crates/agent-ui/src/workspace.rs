@@ -964,11 +964,15 @@ impl Workspace {
                     // emitted for any future telemetry/debug subscriber.
                     cx.notify();
                 }
-                ThreadEvent::GoalChanged { active } => {
+                ThreadEvent::GoalChanged { goal } => {
                     // Bump the ticker generation so any prior ticker
                     // self-terminates; start a fresh ticker only on activation.
+                    let active = goal
+                        .as_ref()
+                        .map(|g| !g.status.is_terminal())
+                        .unwrap_or(false);
                     this.goal_ticker_gen = this.goal_ticker_gen.wrapping_add(1);
-                    if *active {
+                    if active {
                         let entity = cx.entity().clone();
                         let ticker_gen = this.goal_ticker_gen;
                         cx.spawn(async move |_this, cx| {
