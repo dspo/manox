@@ -6,15 +6,16 @@
 //! are skipped by the caller.
 //!
 //! Variants intentionally not projected (silently dropped; surface them here
-//! when the host grows the matching UI): `SubagentChild`, `ApprovalDecision`,
-//! `Retry`, `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
-//! `MainCallMetricsUpdated`, `ReasoningEffortChanged`, `GoalChanged`,
-//! `CompactionStarted`, `PeerMessage`, `SteerInjected`,
-//! `BrowserNotification`, `InboundAuthorization`, `BackgroundTaskUpdated`,
-//! `HistoryRestored`. `HistoryRestored` stays out of this pure projection:
-//! the actor pairs it with a full `thread_history` snapshot that needs
-//! `App` access to read the thread's messages. `GoalChanged` likewise pairs
-//! with a rich `goal_changed` snapshot emitted by the actor's subscription.
+//! when the host grows the matching UI): `ApprovalDecision`, `Retry`,
+//! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
+//! `MainCallMetricsUpdated`, `ReasoningEffortChanged`, `CompactionStarted`,
+//! `PeerMessage`, `SteerInjected`, `BrowserNotification`,
+//! `InboundAuthorization`, `HistoryRestored`. `HistoryRestored` stays out of
+//! this pure projection: the actor pairs it with a full `thread_history`
+//! snapshot that needs `App` access to read the thread's messages.
+//! `GoalChanged` likewise pairs with a rich `goal_changed` snapshot emitted by
+//! the actor's subscription. `BackgroundTaskUpdated` and `SubagentChild` are
+//! projected here (the mini-panel and task cards consume them).
 
 use agent::{ThreadEvent, ToolCallStatus};
 use serde_json::{Value, json};
@@ -114,9 +115,9 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
         ThreadEvent::WorktreeChanged { active, path } => {
             json!({"type": "worktree_changed", "active": active, "path": path})
         }
-        ThreadEvent::PlanReady { plan_file, title } => {
-            json!({"type": "plan_ready", "plan_file": plan_file, "title": title})
-        }
+        // `PlanReady` is enriched (with the plan body) by the actor's
+        // subscription; the pure projection would duplicate it bare.
+        ThreadEvent::PlanReady { .. } => return None,
         ThreadEvent::PlanUpdated { snapshot } => json!({
             "type": "plan_updated",
             "snapshot": serde_json::to_value(snapshot).unwrap_or(Value::Null),
@@ -127,6 +128,33 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
         ThreadEvent::HistoryProgress => json!({"type": "history_progress"}),
         ThreadEvent::Compaction { summary, .. } => {
             json!({"type": "compaction", "summary": summary})
+        }
+        ThreadEvent::BackgroundTaskUpdated { snapshot } => json!({
+            "type": "background_task_updated",
+            "snapshot": serde_json::to_value(snapshot).unwrap_or(Value::Null),
+        }),
+        ThreadEvent::SubagentChild { id, child } => {
+            let event = match child {
+                agent::SubagentChildEvent::Text(text) => json!({"kind": "text", "text": text}),
+                agent::SubagentChildEvent::Thinking(text) => {
+                    json!({"kind": "thinking", "text": text})
+                }
+                agent::SubagentChildEvent::ToolStart { id, name, hint } => json!({
+                    "kind": "tool_start",
+                    "id": id,
+                    "name": name,
+                    "hint": hint
+                        .as_ref()
+                        .map(|(k, v)| json!({"key": k, "value": v})),
+                }),
+                agent::SubagentChildEvent::ToolEnd { id, name, is_error } => json!({
+                    "kind": "tool_end",
+                    "id": id,
+                    "name": name,
+                    "is_error": is_error,
+                }),
+            };
+            json!({"type": "subagent_child", "id": id, "event": event})
         }
         _ => return None,
     };
@@ -175,17 +203,18 @@ mod tests {
 
     #[test]
     fn projects_plan_events() {
-        let json = thread_event_to_json(
-            &ThreadEvent::PlanReady {
-                plan_file: "/tmp/plan.md".into(),
-                title: "Do things".into(),
-            },
-            Some("s1"),
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "plan_ready");
-        assert_eq!(v["title"], "Do things");
+        // PlanReady is enriched (with the plan body) by the actor's
+        // subscription; the pure projection drops it to avoid a duplicate.
+        assert!(
+            thread_event_to_json(
+                &ThreadEvent::PlanReady {
+                    plan_file: "/tmp/plan.md".into(),
+                    title: "Do things".into(),
+                },
+                Some("s1"),
+            )
+            .is_none()
+        );
 
         let snapshot = agent::plan::PlanSnapshot {
             explanation: Some("explanation".into()),
@@ -268,5 +297,80 @@ mod tests {
         assert_eq!(v["type"], "compaction");
         assert_eq!(v["summary"], "older context");
         assert_eq!(v["sessionId"], "s1");
+    }
+
+    #[test]
+    fn projects_background_task_updated() {
+        let snapshot = agent::background_task::TaskSnapshot {
+            task_id: "mon_1".into(),
+            kind: agent::background_task::TaskKind::MonitorCommand,
+            owner_thread_id: "s1".into(),
+            description: "watch build".into(),
+            status: agent::background_task::TaskStatus::Completed,
+            created_at_ms: 1_700_000_000_000,
+            ended_at_ms: Some(1_700_000_001_000),
+            event_count: 2,
+            total_bytes: 42,
+            exit_code: Some(0),
+            failure_summary: None,
+            anchor_message_id: None,
+            output_tail: "hello\nworld".into(),
+        };
+        let json = thread_event_to_json(
+            &ThreadEvent::BackgroundTaskUpdated { snapshot },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "background_task_updated");
+        assert_eq!(v["snapshot"]["task_id"], "mon_1");
+        assert_eq!(v["snapshot"]["status"], "Completed");
+        assert_eq!(v["snapshot"]["output_tail"], "hello\nworld");
+        assert_eq!(v["sessionId"], "s1");
+    }
+
+    #[test]
+    fn projects_subagent_child_variants() {
+        let cases = [
+            (
+                agent::SubagentChildEvent::Text("reading files".into()),
+                "text",
+            ),
+            (
+                agent::SubagentChildEvent::Thinking("planning".into()),
+                "thinking",
+            ),
+            (
+                agent::SubagentChildEvent::ToolStart {
+                    id: "t1".into(),
+                    name: "Grep".into(),
+                    hint: Some(("query".into(), "auth".into())),
+                },
+                "tool_start",
+            ),
+            (
+                agent::SubagentChildEvent::ToolEnd {
+                    id: "t1".into(),
+                    name: "Grep".into(),
+                    is_error: false,
+                },
+                "tool_end",
+            ),
+        ];
+        for (child, kind) in cases {
+            let json = thread_event_to_json(
+                &ThreadEvent::SubagentChild {
+                    id: "sub1".into(),
+                    child,
+                },
+                Some("s1"),
+            )
+            .unwrap();
+            let v: Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["type"], "subagent_child");
+            assert_eq!(v["id"], "sub1");
+            assert_eq!(v["event"]["kind"], kind);
+            assert_eq!(v["sessionId"], "s1");
+        }
     }
 }
