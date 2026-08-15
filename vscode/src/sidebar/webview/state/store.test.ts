@@ -168,6 +168,27 @@ describe('home-composer drafts', () => {
     expect(store.get().activeThreadId).toBe('a');
     expect(store.get().error).toBe('boom');
   });
+
+  it('drops every pending draft, not just the one in view', () => {
+    const store = new Store();
+    store.draftThread('d1', 'one');
+    store.draftThread('d2', 'two');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().perThread.d2).toBeUndefined();
+    expect(store.get().view).toBe('threads');
+    expect(store.get().activeThreadId).toBeNull();
+  });
+
+  it('a global error during a pending draft keeps a viewed live thread', () => {
+    const store = startSession('live');
+    store.draftThread('d1', 'hello');
+    store.openLocal('live');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('live');
+  });
 });
 
 describe('info snapshots', () => {

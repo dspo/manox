@@ -128,16 +128,21 @@ export class Store {
     } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
       this.creating.delete(msg.event.sessionId);
     } else if (msg.type === 'global_error' && this.creating.size > 0) {
-      // A failed draft creation surfaces only as a global error. Release the
-      // send guard and drop back to the list; otherwise the draft would sit
-      // disabled forever.
-      const stuck = this.state.activeThreadId;
+      // A failed draft creation surfaces only as a global error. Release
+      // every pending draft's send guard and drop the orphans; only fall
+      // back to the list when the view was showing one of them.
+      const stuck = [...this.creating];
       this.creating.clear();
-      if (stuck) {
-        const perThread = { ...this.state.perThread };
-        delete perThread[stuck];
-        this.patch({ ...this.state, view: 'threads', activeThreadId: null, perThread });
-      }
+      const perThread = { ...this.state.perThread };
+      for (const id of stuck) delete perThread[id];
+      const active = this.state.activeThreadId;
+      this.patch({
+        ...this.state,
+        perThread,
+        ...(active !== null && stuck.includes(active)
+          ? { view: 'threads' as const, activeThreadId: null }
+          : {}),
+      });
     }
     this.patch(foldMessage(this.state, msg));
   }

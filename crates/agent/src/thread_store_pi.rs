@@ -406,9 +406,9 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
 
 /// Split a loaded session list into the id→path map (every session — an
 /// archived session must stay addressable so archive/unarchive and the
-/// unread/error flags can still reach its sidecar) and the active list the
-/// sidebar renders (archived sessions are hidden, matching the retired
-/// SQLite store's `list(false)` default).
+/// unread/error flags can still reach its sidecar), the active list the
+/// sidebar renders, and the archived list kept separately so surfaces that
+/// offer an archive view can still reach it.
 fn project_session_lists(
     list: Vec<(ThreadSummary, PathBuf)>,
 ) -> (

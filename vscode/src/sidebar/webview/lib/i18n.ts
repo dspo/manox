@@ -33,7 +33,6 @@ const DICT = {
   you: { en: 'You', zh: '你' },
   no_messages_title: { en: 'No messages yet', zh: '暂无消息' },
   no_messages_desc: { en: 'Send a message to start', zh: '发送消息以开始' },
-  threads: { en: 'Threads', zh: '对话' },
   threads_empty: { en: 'No conversations yet', zh: '暂无对话' },
   sessions: { en: 'Sessions', zh: '会话' },
   archive: { en: 'Archive', zh: '归档' },
@@ -41,14 +40,11 @@ const DICT = {
   pin: { en: 'Pin', zh: '置顶' },
   unpin: { en: 'Unpin', zh: '取消置顶' },
   more: { en: 'More', zh: '更多' },
-  new_conversation: { en: 'New conversation', zh: '新对话' },
   back_to_threads: { en: 'Back to threads', zh: '返回对话列表' },
   copy: { en: 'Copy', zh: '复制' },
   send: { en: 'Send', zh: '发送' },
   stop: { en: 'Stop', zh: '停止' },
   remove_attachment: { en: 'Remove attachment', zh: '移除附件' },
-  result: { en: 'Result', zh: '结果' },
-  error: { en: 'Error', zh: '错误' },
   context_compacted: { en: 'context compacted', zh: '上下文已压缩' },
   thinking: { en: 'Thinking…', zh: '思考中…' },
   thought_seconds: {
@@ -107,11 +103,6 @@ export function formatRelativeTime(unixSeconds: number): string {
   if (abs < 3_600) return rtf.format(Math.round(diff / 60), 'minute');
   if (abs < 86_400) return rtf.format(Math.round(diff / 3_600), 'hour');
   return rtf.format(Math.round(diff / 86_400), 'day');
-}
-
-/** Test seam: reset the cached display language. */
-export function resetLanguageForTest(): void {
-  language = null;
 }
 
 /** Test seam: pin the display language without a meta tag. */
