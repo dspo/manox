@@ -91,6 +91,9 @@ const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
 const usedTokens = (u: TokenUsageSnapshot): number =>
   (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
 
+/** Full lifetime total of a usage snapshot: occupied context plus output. */
+const totalTokens = (u: TokenUsageSnapshot): number => usedTokens(u) + (u.output_tokens ?? 0);
+
 const ModelUsageRow = ({
   modelKey,
   usage,
@@ -128,20 +131,20 @@ const ModelUsageRow = ({
         )}
       </p>
       {cap !== undefined && (
-        <p className={cn(used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground')}>
-          {indent}├─ {((used / cap) * 100).toFixed(1)}% {formatTokensPi(used)}/
-          {formatTokensPi(cap)}
+        <p
+          className={cn(
+            'whitespace-pre',
+            used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground',
+          )}
+        >
+          {`${indent}├─ ${((used / cap) * 100).toFixed(1)}% ${formatTokensPi(used)}/${formatTokensPi(cap)}`}
         </p>
       )}
-      <p className="text-muted-foreground">
-        {indent}
-        {cost > 0 ? '├─' : '└─'} ↑{formatTokensPi(input)} ↓
-        {formatTokensPi(usage.output_tokens ?? 0)} R{formatTokensPi(cacheRead)} CH{hitRate}
+      <p className="text-muted-foreground whitespace-pre">
+        {`${indent}${cost > 0 ? '├─' : '└─'} ↑${formatTokensPi(input)} ↓${formatTokensPi(usage.output_tokens ?? 0)} R${formatTokensPi(cacheRead)} CH${hitRate}`}
       </p>
       {cost > 0 && (
-        <p className="text-muted-foreground">
-          {indent}└─ {formatCost(cost)}
-        </p>
+        <p className="text-muted-foreground whitespace-pre">{`${indent}└─ ${formatCost(cost)}`}</p>
       )}
     </div>
   );
@@ -156,9 +159,12 @@ export type InfoPanelProps = {
 export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   const info = thread.info;
   const usage = thread.usage;
-  const totalTokens = usage ? usedTokens(usage) + (usage.output_tokens ?? 0) : 0;
+  const total = usage ? totalTokens(usage) : 0;
   const gitStats = info?.git_stats;
-  const perModel = Object.entries(info?.per_model_usage ?? {});
+  // Same ordering as the host rail: heaviest spenders first.
+  const perModel = Object.entries(info?.per_model_usage ?? {}).sort(
+    ([, a], [, b]) => totalTokens(b) - totalTokens(a),
+  );
 
   return (
     <aside
@@ -214,7 +220,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         title={t('spend')}
         trailing={
           <>
-            {formatTokens(totalTokens)}
+            {formatTokens(total)}
             {thread.cost > 0 && ` · ${formatCost(thread.cost)}`}
           </>
         }

@@ -1,8 +1,9 @@
-import { Check, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
+import { useState } from 'react';
 
 import type { ModelInfo } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
-import { apiTint } from '../../lib/api-tint';
+import { apiTag, apiTint } from '../../lib/api-tint';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { Badge } from '../ui/badge';
@@ -10,6 +11,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -33,8 +35,20 @@ export const ModelPicker = ({
   sessionId,
   onSelect,
 }: ModelPickerProps) => {
+  const [open, setOpen] = useState(false);
   const current = models.find((m) => m.id === currentModelId);
-  const providers = [...new Set(models.map((m) => m.provider))];
+  // Group by provider DISPLAY name with same-name registrations merged into
+  // one submenu, mirroring the host's popup grouping.
+  const groups: { name: string; models: ModelInfo[] }[] = [];
+  for (const m of models) {
+    const name = m.provider_name ?? m.provider;
+    const group = groups.find((g) => g.name === name);
+    if (group) {
+      group.models.push(m);
+    } else {
+      groups.push({ name, models: [m] });
+    }
+  }
   const select = (modelId: string) => {
     if (onSelect) {
       onSelect(modelId);
@@ -44,11 +58,11 @@ export const ModelPicker = ({
   };
 
   return (
-    <DropdownMenu>
+    <DropdownMenu onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <button
           className={cn(
-            'flex cursor-pointer items-center gap-1 text-xs',
+            'hover:bg-accent/10 flex cursor-pointer items-center gap-1 rounded px-2 py-1 text-xs',
             disabled && 'pointer-events-none opacity-50',
           )}
           disabled={disabled}
@@ -56,43 +70,60 @@ export const ModelPicker = ({
         >
           {current ? (
             <>
-              <span className="shrink-0">{current.provider}</span>
+              <span className="shrink-0">{current.provider_name ?? current.provider}</span>
               <span className="text-muted-foreground shrink-0">·</span>
               <span className={cn('max-w-40 truncate', apiTint(current.api))}>
                 {current.name}
               </span>
             </>
           ) : (
-            <span className="text-muted-foreground">{t('select_model')}</span>
+            <span className="text-muted-foreground">{t('no_model_configured')}</span>
           )}
-          <ChevronUp className="text-muted-foreground size-3 shrink-0" />
+          {open ? (
+            <ChevronUp className="text-muted-foreground size-3 shrink-0" />
+          ) : (
+            <ChevronDown className="text-muted-foreground size-3 shrink-0" />
+          )}
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="max-h-[320px] w-52 overflow-y-auto">
-        {providers.map((provider) => (
-          <DropdownMenuSub key={provider}>
-            <DropdownMenuSubTrigger>
-              <span className="truncate text-sm font-medium">{provider}</span>
-            </DropdownMenuSubTrigger>
-            <DropdownMenuSubContent className="max-h-[320px] w-64 overflow-y-auto">
-              {models
-                .filter((m) => m.provider === provider)
-                .map((m) => (
-                  <DropdownMenuItem
-                    className="gap-2"
-                    key={m.id}
-                    onSelect={() => select(m.id)}
-                  >
-                    <Badge className="px-1 text-[10px] font-normal" variant="outline">
-                      {m.api}
-                    </Badge>
-                    <span className="flex-1 truncate">{m.name}</span>
-                    {m.id === currentModelId && <Check className="size-4 shrink-0" />}
-                  </DropdownMenuItem>
-                ))}
-            </DropdownMenuSubContent>
-          </DropdownMenuSub>
-        ))}
+      <DropdownMenuContent
+        align="end"
+        className="max-h-[320px] w-52 overflow-y-auto"
+        side="top"
+      >
+        {groups.length === 0 ? (
+          <DropdownMenuLabel className="text-muted-foreground font-normal">
+            {t('no_models_configured')}
+          </DropdownMenuLabel>
+        ) : (
+          groups.map((group) => (
+            <DropdownMenuSub key={group.name}>
+              <DropdownMenuSubTrigger>
+                <span className="truncate text-sm font-medium">{group.name}</span>
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="max-h-[320px] w-64 overflow-y-auto">
+                {group.models.map((m) => {
+                  const tag = apiTag(m.api);
+                  return (
+                    <DropdownMenuItem
+                      className="gap-2"
+                      key={m.id}
+                      onSelect={() => select(m.id)}
+                    >
+                      <Badge
+                        className={cn('px-1 text-[10px] font-normal', tag.className)}
+                        variant="outline"
+                      >
+                        {tag.label}
+                      </Badge>
+                      <span className="flex-1 truncate">{m.name}</span>
+                    </DropdownMenuItem>
+                  );
+                })}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+          ))
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
