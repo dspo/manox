@@ -792,10 +792,18 @@ fn repo_identity_cached(
     path: &Path,
     cache: &mut HashMap<PathBuf, Option<PathBuf>>,
 ) -> Option<PathBuf> {
-    cache
-        .entry(path.to_path_buf())
-        .or_insert_with(|| repo_identity(path))
-        .clone()
+    if let Some(identity @ Some(_)) = cache.get(path) {
+        // A confirmed repository identity is stable for the actor's
+        // lifetime.
+        return identity.clone();
+    }
+    // A miss may just predate a `git init` in the workspace, so it is
+    // rechecked on every call instead of caching the negative.
+    let identity = repo_identity(path);
+    if identity.is_some() {
+        cache.insert(path.to_path_buf(), identity.clone());
+    }
+    identity
 }
 
 /// The canonical git common directory of the repository owning `path` —
@@ -1440,6 +1448,24 @@ mod tests {
             &child,
             &mut cache
         ));
+    }
+
+    /// A non-git path may become a repository while the actor lives (the
+    /// user runs `git init` in the workspace), so a miss must not be cached
+    /// forever.
+    #[test]
+    fn repo_identity_rechecks_a_formerly_non_git_path() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("late-init");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = HashMap::new();
+        assert_eq!(repo_identity_cached(&dir, &mut cache), None);
+        run_git(&dir, &["init"]);
+        let identity = repo_identity_cached(&dir, &mut cache);
+        assert!(identity.is_some());
+        // Once confirmed, the identity is served from the cache.
+        assert_eq!(cache.get(&dir), Some(&identity));
     }
 
     #[test]

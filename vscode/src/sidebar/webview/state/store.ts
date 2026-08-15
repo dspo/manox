@@ -97,6 +97,13 @@ const emptyInfo = (): ThreadInfoSnapshot => ({
   agents: [],
 });
 
+/** git_stats arrives on its own event channel, so a whole-snapshot replace
+ * must keep whatever stats were already merged into the thread. */
+const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
+  ...t,
+  info: { ...info, git_stats: info.git_stats ?? t.info?.git_stats },
+});
+
 const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelled', 'continued']);
 
 let echoCounter = 0;
@@ -120,6 +127,17 @@ export class Store {
       this.creating.delete(msg.sessionId);
     } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
       this.creating.delete(msg.event.sessionId);
+    } else if (msg.type === 'global_error' && this.creating.size > 0) {
+      // A failed draft creation surfaces only as a global error. Release the
+      // send guard and drop back to the list; otherwise the draft would sit
+      // disabled forever.
+      const stuck = this.state.activeThreadId;
+      this.creating.clear();
+      if (stuck) {
+        const perThread = { ...this.state.perThread };
+        delete perThread[stuck];
+        this.patch({ ...this.state, view: 'threads', activeThreadId: null, perThread });
+      }
     }
     this.patch(foldMessage(this.state, msg));
   }
@@ -237,7 +255,7 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
     case 'commands':
       return { ...state, commands: msg.commands };
     case 'thread_info':
-      return updateThread(state, msg.sessionId, (t) => ({ ...t, info: msg.info }));
+      return updateThread(state, msg.sessionId, (t) => mergeInfo(t, msg.info));
     case 'global_error':
       return { ...state, error: msg.message };
     case 'event':
@@ -370,7 +388,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
     case 'thread_history':
       return { ...t, items: wireMessagesToTranscriptItems(ev.messages), loading: false };
     case 'thread_info':
-      return { ...t, info: ev.info };
+      return mergeInfo(t, ev.info);
     case 'branch':
       return { ...t, branch: ev.branch };
     case 'git_stats':

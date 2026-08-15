@@ -149,6 +149,53 @@ describe('home-composer drafts', () => {
     store.dispatch(event({ type: 'session_disposed', sessionId: 'd1' }));
     expect(store.isCreating('d1')).toBe(false);
   });
+
+  it('a failed draft creation clears the guard and returns to the list', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.isCreating('d1')).toBe(false);
+    expect(store.get().view).toBe('threads');
+    expect(store.get().activeThreadId).toBeNull();
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().error).toBe('boom');
+  });
+
+  it('a global error without a pending draft leaves the view alone', () => {
+    const store = startSession('a');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('a');
+    expect(store.get().error).toBe('boom');
+  });
+});
+
+describe('info snapshots', () => {
+  it('thread_info keeps git stats merged in from their own event', () => {
+    const store = startSession('a');
+    store.dispatch(
+      event({
+        type: 'git_stats',
+        sessionId: 'a',
+        stats: { added: 1, deleted: 2, untracked: 3 },
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'thread_info',
+        sessionId: 'a',
+        info: {
+          worktree_path: null,
+          plan: null,
+          usage: {},
+          cost: 0,
+          pending_auth_count: 0,
+          agents: [],
+        },
+      }),
+    );
+    expect(thread(store, 'a')?.info?.git_stats).toEqual({ added: 1, deleted: 2, untracked: 3 });
+  });
 });
 
 describe('transcript folding', () => {
