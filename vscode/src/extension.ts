@@ -3,6 +3,7 @@
 // (crates/manox-napi via manox-actor) through session-scoped channels.
 
 import * as vscode from 'vscode';
+import { ManoxModelProvider } from './modelProvider';
 import { registerManoxParticipant } from './participant';
 import { registerManoxSidebar } from './sidebar/sidebarProvider';
 import { SessionManager, configuredApprovalMode } from './sessionManager';
@@ -10,6 +11,12 @@ import { SessionManager, configuredApprovalMode } from './sessionManager';
 export function activate(context: vscode.ExtensionContext): void {
   registerManoxSidebar(context);
   registerManoxParticipant(context);
+  context.subscriptions.push(
+    vscode.lm.registerLanguageModelChatProvider(
+      'manox',
+      new ManoxModelProvider(SessionManager.shared()),
+    ),
+  );
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('manox.approvalMode')) {

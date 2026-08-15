@@ -8,15 +8,29 @@
   "engines": {
     "vscode": "^1.98.0"
   },
+  "enabledApiProposals": [
+    "chatProvider",
+    "languageModelThinkingPart"
+  ],
+  "keywords": [
+    "language-models"
+  ],
   "categories": [
     "AI",
     "Other"
   ],
   "activationEvents": [
     "onView:manox.chatView",
-    "onChatParticipant:manox"
+    "onChatParticipant:manox",
+    "onLanguageModelChatProvider:manox"
   ],
   "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "manox",
+        "displayName": "manox"
+      }
+    ],
     "chatParticipants": [
       {
         "id": "manox",
