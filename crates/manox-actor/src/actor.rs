@@ -152,14 +152,18 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
             thread::sleep(Duration::from_millis(5));
             continue;
         }
-        // Idle: block until the host delivers a command.
-        match rx.recv() {
+        // Idle: wait for the next command, but wake periodically so parked
+        // async work (the thread-directory scan behind list_threads and its
+        // follow-up snapshot push) still lands — an unconditional recv()
+        // would freeze those events until a command happens to arrive.
+        match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(cmd) => {
                 if !handle_command(cx, &mut state, sink, &cmd) {
                     return;
                 }
             }
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -1202,6 +1206,59 @@ mod tests {
 
         drop(state);
         agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn idle_loop_drives_the_async_thread_scan() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        // A session population large enough that the directory scan outlives
+        // the command-processing pumps; its follow-up snapshot then lands
+        // only if the idle loop keeps driving the executor. A distinct cwd
+        // keeps other tests' project-scoped snapshots empty.
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for i in 0..1000 {
+            std::fs::write(
+                sessions.join(format!("idle-scan-{i}.jsonl")),
+                format!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"idle-scan-{i}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"/idle/pump/project\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let (out, sink) = collect_sink();
+        let (tx, rx) = mpsc::channel::<String>();
+        let actor = thread::spawn(move || {
+            let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+            cx.allow_parking();
+            init_globals(&mut cx);
+            cx.update(agent::thread_store::init);
+            run_command_loop(&mut cx, rx, &sink);
+            agent::thread_store::drop_global_for_test();
+        });
+        tx.send(r#"{"cmd":"list_threads"}"#.to_string()).unwrap();
+        // The immediate snapshot precedes the scan; the follow-up push only
+        // lands if the idle loop keeps pumping instead of blocking on recv().
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pushed = types(&out)
+                .iter()
+                .filter(|t| t.as_str() == "threads_updated")
+                .count();
+            if pushed >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follow-up threads_updated never arrived while the loop sat idle"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx); // disconnect ends the loop
+        actor.join().unwrap();
     }
 
     #[test]
