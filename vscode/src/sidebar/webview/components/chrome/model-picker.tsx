@@ -2,6 +2,7 @@ import { Check, ChevronUp } from 'lucide-react';
 
 import type { ModelInfo } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
+import { apiTint } from '../../lib/api-tint';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { Badge } from '../ui/badge';
@@ -14,15 +15,6 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
-
-// Model names take the tint of their wire api, mirroring the host's picker.
-const API_TINTS: Record<string, string> = {
-  anthropic: 'text-primary',
-  openai_responses: 'text-info',
-  openai_completions: 'text-warning',
-};
-
-const apiTint = (api: string): string => API_TINTS[api] ?? 'text-foreground';
 
 export type ModelPickerProps = {
   models: ModelInfo[];
