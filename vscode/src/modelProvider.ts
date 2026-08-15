@@ -1,65 +1,25 @@
-// LanguageModelChatProvider that exposes manox as a chat model in the
-// native chat. Each request drives one agent turn on a persistent actor
-// session; the cache keys sessions by the conversation's first user message
-// so follow-up turns continue the same transcript. Tool calls stay inside
-// the agent loop and never surface as response parts.
+// LanguageModelChatProvider that exposes manox as a bare chat model in the
+// native chat. Each request is one stateless completion over the actor's
+// provider layer (`model_chat`): wire messages and tool definitions go to the
+// pi provider runtime, text/thinking deltas stream back as response parts,
+// and tool calls the model emits are relayed as `LanguageModelToolCallPart`s
+// for VS Code to execute — their results arrive on the next request as
+// `tool_result` blocks. No agent session, approval, or manox tooling is
+// involved.
 
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ImageAttachment } from './protocol';
+import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool } from './protocol';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
-const MAX_SESSIONS = 16;
-const SESSION_IDLE_TTL_MS = 30 * 60_000;
 
-interface SessionEntry {
-  sessionId: string;
-  lastUsed: number;
-  /** A turn is in flight; running entries are exempt from eviction. */
-  running: boolean;
-}
-
-/** Role ordinal → label used in the transcript seed projection. */
-const ROLE_NAMES: Record<number, string> = { 1: 'User', 2: 'Assistant', 3: 'System' };
-
-/**
- * Conversation identity: a hash of the first user message's text parts.
- * Appended turns keep the key stable; editing that first message starts a
- * fresh conversation (and loses the cached session's memory). The provider
- * API exposes no conversation id, so conversations that open with identical
- * text (or with an image-only first message, which hashes as empty) share
- * one session — a documented limitation.
- */
-export function conversationKey(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): string {
-  const firstUser = messages.find(
-    (m) => m.role === vscode.LanguageModelChatMessageRole.User,
-  );
-  const source = firstUser
-    ? firstUser.content
-        .map((part) => {
-          const text = (part as { value?: unknown }).value;
-          return typeof text === 'string' ? text : '';
-        })
-        .join(' ')
-    : '<empty>';
-  return createHash('sha256').update(source).digest('hex').slice(0, 16);
-}
-
-/** Stable text projection of one message part. */
-export function partToString(part: unknown): string {
+/** Stable text projection of one message part (tool results, unknown parts). */
+export function partToText(part: unknown): string {
   if (part instanceof vscode.LanguageModelTextPart) return part.value;
-  if (part instanceof vscode.LanguageModelToolCallPart) {
-    return `Tool call [${part.name}](${part.callId}): ${JSON.stringify(part.input)}`;
-  }
   if (part instanceof vscode.LanguageModelToolResultPart) {
-    return `Tool result (${part.callId}): ${part.content.map(partToString).join('')}`;
-  }
-  if (part instanceof vscode.LanguageModelDataPart) {
-    if (part.mimeType.startsWith('image/')) return `<image ${part.mimeType}>`;
+    return part.content.map(partToText).join('');
   }
   try {
     const json = JSON.stringify(part);
@@ -69,78 +29,67 @@ export function partToString(part: unknown): string {
   }
 }
 
-/** Index of the last user message, or -1 when none exists. */
-function lastUserIndex(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): number {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === vscode.LanguageModelChatMessageRole.User) return i;
+/** One VS Code message part → a wire block for `model_chat`. */
+function partToWire(part: unknown): ModelChatBlock {
+  if (part instanceof vscode.LanguageModelTextPart) {
+    return { type: 'text', text: part.value };
   }
-  return -1;
-}
-
-/** Full transcript projection: every message as `Role: <parts>`. */
-export function serializeTranscript(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): string {
-  return messages
-    .map((m) => {
-      const role = ROLE_NAMES[m.role] ?? String(m.role);
-      return `Role: ${role}: ${m.content.map(partToString).join('')}`;
-    })
-    .join('\n\n');
-}
-
-/**
- * Split the last user message into plain text (text and non-image parts) and
- * base64 images for the submit channel.
- */
-export function extractDelta(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): { text: string; images: ImageAttachment[] } {
-  const index = lastUserIndex(messages);
-  if (index < 0) return { text: '', images: [] };
-  const text: string[] = [];
-  const images: ImageAttachment[] = [];
-  for (const part of messages[index].content) {
-    if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith('image/')) {
-      images.push({
+  if (part instanceof vscode.LanguageModelThinkingPart) {
+    const value = Array.isArray(part.value) ? part.value.join('') : part.value;
+    return { type: 'thinking', text: value };
+  }
+  if (part instanceof vscode.LanguageModelToolCallPart) {
+    return { type: 'tool_call', id: part.callId, name: part.name, input: part.input };
+  }
+  if (part instanceof vscode.LanguageModelToolResultPart) {
+    // isError is not yet in the stable typings; read it defensively so a
+    // failed tool execution is not relayed to the model as a success.
+    const isError = (part as unknown as { isError?: boolean }).isError;
+    return {
+      type: 'tool_result',
+      id: part.callId,
+      content: partToText(part),
+      ...(isError ? { isError } : {}),
+    };
+  }
+  if (part instanceof vscode.LanguageModelDataPart) {
+    if (part.mimeType.startsWith('image/')) {
+      return {
+        type: 'image',
         data: Buffer.from(part.data).toString('base64'),
         mimeType: part.mimeType,
-      });
-    } else {
-      text.push(partToString(part));
+      };
     }
   }
-  return { text: text.join(''), images };
+  return { type: 'text', text: partToText(part) };
 }
 
-/**
- * Stream one thinking chunk. The thinking part is a proposed API that only
- * hosts declaring the proposal inject; stable hosts fall back to a text part
- * so reasoning still streams instead of throwing in the event callback.
- */
-export function reportThinking(
-  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-  text: string,
-): void {
-  const ThinkingPart = (
-    vscode as unknown as {
-      LanguageModelThinkingPart?: new (value: string) => vscode.LanguageModelResponsePart;
-    }
-  ).LanguageModelThinkingPart;
-  progress.report(ThinkingPart ? new ThinkingPart(text) : new vscode.LanguageModelTextPart(text));
+/** Full conversation → wire messages for `model_chat`. */
+export function toWireMessages(
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+): ModelChatMessage[] {
+  // The stable role enum exposes User/Assistant only; a hypothetical third
+  // role value (the host's System) maps to the wire's system role.
+  const roles: Record<number, ModelChatMessage['role']> = {
+    [vscode.LanguageModelChatMessageRole.User]: 'user',
+    [vscode.LanguageModelChatMessageRole.Assistant]: 'assistant',
+    3: 'system',
+  };
+  return messages.map((m) => ({
+    role: roles[m.role] ?? 'user',
+    content: m.content.map(partToWire),
+  }));
 }
 
 export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
-  private readonly sessions = new Map<string, SessionEntry>();
-
   constructor(private readonly manager: SessionManager) {}
 
   async provideLanguageModelChatInformation(
     options: vscode.PrepareLanguageModelChatModelOptions,
     _token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelChatInformation[]> {
+    // The silent resolution path (default-model lookup) must not boot the
+    // actor; the picker's explicit listing does.
     if (options.silent) return [];
     try {
       await this.manager.init(resolveWorkspaceCwd());
@@ -150,12 +99,10 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
         name: m.name,
         family: m.provider,
         version: '1.0.0',
-        // The actor reports the provider's real context window; only a
-        // missing value falls back to the placeholder — a reported 0 stays
-        // 0 so a broken declaration is visible rather than masked.
-        maxInputTokens: m.context_window ?? DEFAULT_MAX_INPUT_TOKENS,
-        // The wire shape carries no per-model output budget yet.
-        maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        // The actor reports the provider's real context window; a missing
+        // value falls back to the placeholder.
+        maxInputTokens: m.context_window || DEFAULT_MAX_INPUT_TOKENS,
+        maxOutputTokens: m.max_tokens || DEFAULT_MAX_OUTPUT_TOKENS,
         capabilities: { toolCalling: true, imageInput: true },
         isUserSelectable: true,
       }));
@@ -169,60 +116,19 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
   async provideLanguageModelChatResponse(
     model: vscode.LanguageModelChatInformation,
     messages: readonly vscode.LanguageModelChatRequestMessage[],
-    _options: vscode.ProvideLanguageModelChatResponseOptions,
+    options: vscode.ProvideLanguageModelChatResponseOptions,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken,
   ): Promise<void> {
-    const cwd = resolveWorkspaceCwd();
-    await this.manager.init(cwd);
+    await this.manager.init(resolveWorkspaceCwd());
     if (token.isCancellationRequested) return;
 
-    this.evictStale();
-    const key = conversationKey(messages);
-    const existing = this.sessions.get(key);
-    const isNewSession = !existing;
-    let sessionId: string;
-    let entry: SessionEntry;
-    if (existing) {
-      if (existing.running) {
-        // The host serializes same-conversation requests, so an in-flight
-        // hit means two conversations collided on one key. Fail loudly
-        // instead of queueing into the actor's running-turn no-op.
-        throw new Error(
-          'manox session busy: another conversation opened with the same first message',
-        );
-      }
-      existing.lastUsed = Date.now();
-      sessionId = existing.sessionId;
-      entry = existing;
-    } else {
-      sessionId = await this.manager.createSession(cwd);
-      if (token.isCancellationRequested) {
-        this.manager.disposeSession(sessionId);
-        return;
-      }
-      entry = { sessionId, lastUsed: Date.now(), running: false };
-      this.sessions.set(key, entry);
-    }
-
-    const lastIdx = lastUserIndex(messages);
-    const { text: deltaText, images } = extractDelta(messages);
-    if (deltaText === '' && images.length === 0) {
-      // The actor drops empty submits without a turn_finished; reject
-      // instead of leaving the request hanging.
-      if (isNewSession) {
-        this.manager.disposeSession(sessionId);
-        this.sessions.delete(key);
-      }
-      throw new Error('empty agent request: the last user message has no text or image');
-    }
-    let text = deltaText;
-    if (isNewSession && lastIdx > 0) {
-      // Seed the fresh session with everything before the last user message
-      // so the agent knows the conversation that led here; later turns only
-      // send their delta and continue on the session transcript.
-      text = serializeTranscript(messages.slice(0, lastIdx)) + '\n\n---\n\n' + deltaText;
-    }
+    const requestId = randomUUID();
+    const tools: ModelChatTool[] = (options.tools ?? []).map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
+    }));
 
     let settled = false;
     let resolveDone!: () => void;
@@ -231,50 +137,50 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
       resolveDone = resolve;
       rejectDone = reject;
     });
-    const off = this.manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
+    const off = this.manager.onGlobalEvent((ev: ActorEvent) => {
+      if (!('requestId' in ev) || ev.requestId !== requestId) return;
       switch (ev.type) {
-        case 'agent_text':
+        case 'model_text':
           progress.report(new vscode.LanguageModelTextPart(ev.text));
           break;
-        case 'agent_thinking':
-          reportThinking(progress, ev.text);
+        case 'model_thinking':
+          // The thinking part is a proposed type kept out of the stable
+          // `LanguageModelResponsePart` union; the report target accepts it
+          // on hosts that declare the proposal.
+          progress.report(
+            new vscode.LanguageModelThinkingPart(
+              ev.text,
+            ) as unknown as vscode.LanguageModelResponsePart,
+          );
           break;
-        case 'turn_finished':
+        case 'model_tool_call':
+          progress.report(
+            new vscode.LanguageModelToolCallPart(ev.id, ev.name, ev.input as object),
+          );
+          break;
+        case 'model_chat_done':
           if (settled) return;
           settled = true;
           off();
           cancelSub.dispose();
-          // A cancelled turn is a normal end; a failed turn carries no
-          // error event of its own in every path, so reject on the flag.
-          if (ev.failed) rejectDone(new Error('agent turn failed'));
+          // A tool-use stop is a normal end: VS Code executes the relayed
+          // tools and calls back with their results on the next request.
+          if (ev.error !== null) rejectDone(new Error(ev.error));
           else resolveDone();
-          break;
-        case 'error':
-          if (settled) return;
-          settled = true;
-          off();
-          cancelSub.dispose();
-          rejectDone(new Error(ev.message));
           break;
       }
     });
     const cancelSub = token.onCancellationRequested(() => {
-      this.manager.send({ cmd: 'cancel_turn', sessionId });
+      this.manager.send({ cmd: 'cancel_model_chat', requestId });
     });
 
-    entry.running = true;
     try {
-      // The user may switch models mid-conversation; re-assert each turn.
-      this.manager.send({ cmd: 'set_model', sessionId, id: model.id });
-      // The config listener broadcasts the approval mode to every session;
-      // re-assert danger so a switch to autopilot cannot stall a turn on an
-      // approval the native chat cannot answer.
-      this.manager.send({ cmd: 'set_approval_mode', sessionId, mode: 'danger' });
       this.manager.send({
-        cmd: 'submit',
-        sessionId,
-        text,
-        ...(images.length > 0 ? { images } : {}),
+        cmd: 'model_chat',
+        requestId,
+        model: model.id,
+        messages: toWireMessages(messages),
+        tools,
       });
       await done;
     } finally {
@@ -283,8 +189,6 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
         off();
         cancelSub.dispose();
       }
-      entry.running = false;
-      entry.lastUsed = Date.now();
     }
   }
 
@@ -293,33 +197,9 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     text: string | vscode.LanguageModelChatRequestMessage,
     _token: vscode.CancellationToken,
   ): Promise<number> {
-    const source = typeof text === 'string' ? text : serializeTranscript([text]);
-    return Math.ceil(source.length / 4);
-  }
-
-  /** Drop idle sessions past the TTL, then evict least-recently-used entries
-   * down to the cap; sessions with an in-flight turn are never evicted. */
-  private evictStale(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.sessions) {
-      if (!entry.running && now - entry.lastUsed > SESSION_IDLE_TTL_MS) {
-        this.manager.disposeSession(entry.sessionId);
-        this.sessions.delete(key);
-      }
-    }
-    while (this.sessions.size >= MAX_SESSIONS) {
-      let oldestKey: string | null = null;
-      let oldestUsed = Infinity;
-      for (const [key, entry] of this.sessions) {
-        if (!entry.running && entry.lastUsed < oldestUsed) {
-          oldestUsed = entry.lastUsed;
-          oldestKey = key;
-        }
-      }
-      if (oldestKey === null) break;
-      const evicted = this.sessions.get(oldestKey)!;
-      this.manager.disposeSession(evicted.sessionId);
-      this.sessions.delete(oldestKey);
-    }
+    // Heuristic (chars/4): the actor exposes no standalone tokenizer; the
+    // approximation is only consumed by UI affordances.
+    const value = typeof text === 'string' ? text : text.content.map(partToText).join('');
+    return Math.ceil(value.length / 4);
   }
 }
