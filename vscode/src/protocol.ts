@@ -3,12 +3,12 @@
 // crates/manox-actor/src/{actor,events}.rs (exposed via manox-napi).
 //
 // Every event carries `sessionId` except the global ones (`ready`, `models`,
-// `threads_updated`, `commands`, and errors raised before a session exists).
+// `threads_updated`, `commands`, `model_*`, and errors raised before a
+// session exists).
 // Every command carries `sessionId` except `init`, `list_models`,
-// `list_threads`, and `list_commands`. Actor shutdown does not go over this
+// `list_threads`, `list_commands`, `model_chat`, and `cancel_model_chat`.
+// Actor shutdown does not go over this
 // protocol — the napi binding terminates the thread directly.
-//
-// [P2] deferred by design: set_reasoning_effort.
 
 export type Command =
 	| { cmd: 'init'; cwd: string }
@@ -28,7 +28,30 @@ export type Command =
 	| { cmd: 'open_thread'; sessionId: string }
 	| { cmd: 'focus_thread'; sessionId?: string }
 	| { cmd: 'list_commands' }
-	| { cmd: 'thread_info'; sessionId: string };
+	| { cmd: 'thread_info'; sessionId: string }
+	| { cmd: 'model_chat'; requestId: string; model: string; messages: ModelChatMessage[]; tools: ModelChatTool[] }
+	| { cmd: 'cancel_model_chat'; requestId: string };
+
+/** One block inside a `model_chat` message (bare-model completion). */
+export type ModelChatBlock =
+	| { type: 'text'; text: string }
+	| { type: 'thinking'; text: string }
+	| { type: 'tool_call'; id: string; name: string; input: unknown }
+	| { type: 'tool_result'; id: string; content: string }
+	| { type: 'image'; data: string; mimeType: string };
+
+/** One conversation message relayed to the model via `model_chat`. */
+export interface ModelChatMessage {
+	role: 'system' | 'user' | 'assistant';
+	content: ModelChatBlock[];
+}
+
+/** A tool definition relayed to the model; execution stays in VS Code. */
+export interface ModelChatTool {
+	name: string;
+	description: string;
+	inputSchema: Record<string, unknown>;
+}
 
 /** Base64-encoded image attachment (submit payload wire form). */
 export interface ImageAttachment {
@@ -64,6 +87,8 @@ export interface ModelInfo {
 	 * cascade menu's badge and tint. */
 	api: string;
 	context_window: number;
+	/** Per-model output budget; absent from older actors. */
+	max_tokens?: number;
 }
 
 export interface TokenUsageSnapshot {
@@ -220,6 +245,11 @@ export type ActorEvent =
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
 	| { type: 'usage'; sessionId: string; usage: TokenUsageSnapshot; cost: number }
+	// bare-model completion (stateless; keyed by requestId, no sessionId)
+	| { type: 'model_text'; requestId: string; text: string }
+	| { type: 'model_thinking'; requestId: string; text: string }
+	| { type: 'model_tool_call'; requestId: string; id: string; name: string; input: unknown }
+	| { type: 'model_chat_done'; requestId: string; stop: string | null; error: string | null }
 	| {
 			type: 'token_usage';
 			sessionId: string;

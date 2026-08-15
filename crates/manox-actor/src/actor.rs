@@ -112,6 +112,9 @@ struct ActorState {
     /// Memoized git-repository identity per path, so the workspace filter
     /// resolves each distinct project directory at most once.
     repo_ids: Arc<Mutex<HashMap<PathBuf, Option<PathBuf>>>>,
+    /// In-flight stateless model completions keyed by request id; cancel
+    /// signals the matching provider stream.
+    model_chats: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 impl ActorState {
@@ -139,6 +142,7 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
         focused: Arc::new(Mutex::new(None)),
         store_subscription: None,
         repo_ids: Arc::new(Mutex::new(HashMap::new())),
+        model_chats: Arc::new(Mutex::new(HashMap::new())),
     };
 
     loop {
@@ -530,6 +534,40 @@ fn handle_command(
             sink.emit(json.to_string());
         }),
         "list_models" => sink.emit(models_snapshot().to_string()),
+        "model_chat" => {
+            let Some(request_id) = cmd["requestId"].as_str().map(str::to_string) else {
+                return true;
+            };
+            let Some(model_id) = cmd["model"].as_str() else {
+                sink.emit(model_chat_done_error(&request_id, "model_chat requires a model id"));
+                return true;
+            };
+            let registry = agent::pi_providers::global();
+            let Some(model) = pi_extensions::model_ref::resolve_model_ref(&registry, model_id) else {
+                sink.emit(model_chat_done_error(&request_id, "unknown model"));
+                return true;
+            };
+            let stream = match registry.resolve_stream(&model) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    sink.emit(model_chat_done_error(&request_id, &err.to_string()));
+                    return true;
+                }
+            };
+            let ctx = crate::model_chat::build_context(&model, &cmd["messages"], &cmd["tools"]);
+            crate::model_chat::start(
+                request_id,
+                stream,
+                ctx,
+                sink.clone(),
+                state.model_chats.clone(),
+            );
+        }
+        "cancel_model_chat" => {
+            if let Some(request_id) = cmd["requestId"].as_str() {
+                crate::model_chat::cancel(&state.model_chats, request_id);
+            }
+        }
         _ => {}
     }
     true
@@ -990,7 +1028,20 @@ fn model_json(model: &pi::types::Model) -> Value {
         "provider_name": agent::pi_providers::display_provider_name(model),
         "api": model.api,
         "context_window": model.context_window,
+        "max_tokens": model.max_tokens,
     })
+}
+
+/// Error settlement for a `model_chat` that never started streaming (missing
+/// model id, unknown model, unresolvable provider runtime).
+fn model_chat_done_error(request_id: &str, error: &str) -> String {
+    json!({
+        "type": "model_chat_done",
+        "requestId": request_id,
+        "stop": null,
+        "error": error,
+    })
+    .to_string()
 }
 
 fn models_snapshot() -> Value {
@@ -1110,6 +1161,7 @@ mod tests {
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
             repo_ids: Arc::new(Mutex::new(HashMap::new())),
+            model_chats: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
 
@@ -1189,6 +1241,7 @@ mod tests {
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
             repo_ids: Arc::new(Mutex::new(HashMap::new())),
+            model_chats: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
         // A command for an unknown session is handled (error event) and
@@ -1229,6 +1282,7 @@ mod tests {
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
             repo_ids: Arc::new(Mutex::new(HashMap::new())),
+            model_chats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
