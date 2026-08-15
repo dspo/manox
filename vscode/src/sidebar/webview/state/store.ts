@@ -28,6 +28,8 @@ export interface ThreadState {
    * threads before the agent names them. */
   title: string;
   turnActive: boolean;
+  /** Plan mode (read-only research) — mirrors the engine's sidecar. */
+  planMode: boolean;
   items: TranscriptItem[];
   currentModelId: string | null;
   /** Model the in-flight turn started with; stamps assistant items. */
@@ -72,6 +74,7 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   cwd,
   title: 'New conversation',
   turnActive: false,
+  planMode: false,
   items: [],
   currentModelId: null,
   turnModelId: null,
@@ -91,6 +94,7 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
 const emptyInfo = (): ThreadInfoSnapshot => ({
   worktree_path: null,
   plan: null,
+  goal: null,
   usage: {},
   cost: 0,
   pending_auth_count: 0,
@@ -232,8 +236,12 @@ function foldThreads(state: ChatState, threads: ThreadListItem[]): ChatState {
   let perThread = state.perThread;
   for (const item of threads) {
     const t = perThread[item.id];
-    if (t && t.title !== item.title) {
-      perThread = { ...perThread, [item.id]: { ...t, title: item.title } };
+    // `running` mirrors the same ThreadEvents that drive `turn_started` /
+    // `turn_finished`, and the store mutation precedes the event emission,
+    // so syncing from it keeps the stop button correct even when the event
+    // stream was missed (webview reload while a turn was in flight).
+    if (t && (t.title !== item.title || t.turnActive !== item.running)) {
+      perThread = { ...perThread, [item.id]: { ...t, title: item.title, turnActive: item.running } };
     }
   }
   return { ...state, threads, perThread };
@@ -245,11 +253,18 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
       // Merge-safe: an optimistic draft (or a live thread being re-announced)
       // keeps its accumulated items, and only the session's origin metadata
       // changes. A restored replay still replaces the items wholesale when
-      // its thread_history snapshot lands.
+      // its thread_history snapshot lands. A restored thread that is still
+      // running never re-emits `turn_started`, so seed `turnActive` from the
+      // thread list's `running` flag (reload recovery).
       const existing = state.perThread[msg.sessionId];
+      const row = state.threads.find((x) => x.id === msg.sessionId);
+      const running =
+        msg.kind === 'restored'
+          ? (row?.running ?? existing?.turnActive ?? false)
+          : (existing?.turnActive ?? false);
       const thread = existing
-        ? { ...existing, cwd: msg.cwd, loading: msg.kind === 'restored' }
-        : { ...initThread(msg.sessionId, msg.cwd), loading: msg.kind === 'restored' };
+        ? { ...existing, cwd: msg.cwd, loading: msg.kind === 'restored', turnActive: running }
+        : { ...initThread(msg.sessionId, msg.cwd), loading: msg.kind === 'restored', turnActive: running };
       return {
         ...state,
         view: 'conversation',
@@ -272,6 +287,7 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
       return foldEvent(state, msg.event);
   }
 }
+
 
 function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
   // Session-scoped errors stay with their thread so a background failure
@@ -405,12 +421,24 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       return { ...t, info: { ...(t.info ?? emptyInfo()), git_stats: ev.stats } };
     case 'history_progress':
       return { ...t, loading: true };
+    case 'plan_mode_changed':
+      return { ...t, planMode: ev.enabled };
     case 'plan_updated':
       return { ...t, info: { ...(t.info ?? emptyInfo()), plan: ev.snapshot } };
+    case 'goal_changed':
+      return { ...t, info: { ...(t.info ?? emptyInfo()), goal: ev.snapshot } };
     case 'worktree_changed':
       return {
         ...t,
         info: { ...(t.info ?? emptyInfo()), worktree_path: ev.active ? ev.path : null },
+      };
+    case 'compaction':
+      return {
+        ...t,
+        items: [
+          ...t.items,
+          { kind: 'compaction', id: `compaction-${t.items.length}`, summary: ev.summary },
+        ],
       };
     case 'subagent_started': {
       const info = t.info ?? emptyInfo();
@@ -453,8 +481,8 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       };
     }
     // Covered elsewhere or not surfaced: session_created (host handshake),
-    // plan_ready / plan_mode_changed (the snapshot arrives via plan_updated),
-    // token_usage (fine-grained), models/threads_updated/commands (global).
+    // plan_ready (the snapshot arrives via plan_updated), token_usage
+    // (fine-grained), models/threads_updated/commands (global).
     default:
       return t;
   }

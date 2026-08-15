@@ -135,15 +135,14 @@ pub fn init(_cx: &mut App) {
     ];
     // Names already claimed by built-ins and (below) markdown macros, so a
     // skill sharing one is skipped — keeps one popover row per name and routes
-    // dispatch to the higher-priority command/built-in.
-    let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
-        "danger".to_string(),
-        "plan".to_string(),
-        "compact".to_string(),
-        "exit".to_string(),
-        "new".to_string(),
-        "goal".to_string(),
-    ]);
+    // dispatch to the higher-priority command/built-in. The built-in set is
+    // shared with the headless actor's surface via
+    // `agent::slash_builtins`, so the two hosts enumerate the same commands.
+    let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
+        agent::slash_builtins::BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|meta| meta.name.to_string()),
+    );
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
     // The adapter delegates to `Workspace::run_command_turn` →
@@ -313,6 +312,12 @@ impl SlashCommand for SkillSlashCommand {
     }
 }
 
+/// The shared built-in metadata for a command by canonical name. Panics on a
+/// miss so a typo in a command impl is caught at startup, never at runtime.
+fn builtin_meta(name: &str) -> &'static agent::slash_builtins::BuiltinSlashMeta {
+    agent::slash_builtins::canonical_builtin(name).expect("registered built-in command")
+}
+
 /// `/plan` — toggle plan mode. Entering wires the read-only gate and the
 /// plan-mode research instructions; `/plan <prompt>` also starts planning
 /// the prompt immediately. Running `/plan` again exits plan mode (full
@@ -327,10 +332,10 @@ struct DangerCommand;
 
 impl SlashCommand for DangerCommand {
     fn name(&self) -> &str {
-        "danger"
+        builtin_meta("danger").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-danger-desc")
+        i18n::t(builtin_meta("danger").description_key)
     }
     fn execute(
         &self,
@@ -352,10 +357,10 @@ struct PlanCommand;
 
 impl SlashCommand for PlanCommand {
     fn name(&self) -> &str {
-        "plan"
+        builtin_meta("plan").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-plan-desc")
+        i18n::t(builtin_meta("plan").description_key)
     }
     fn execute(
         &self,
@@ -391,10 +396,10 @@ struct CompactCommand;
 
 impl SlashCommand for CompactCommand {
     fn name(&self) -> &str {
-        "compact"
+        builtin_meta("compact").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-compact-desc")
+        i18n::t(builtin_meta("compact").description_key)
     }
     fn execute(
         &self,
@@ -428,10 +433,10 @@ struct GoalCommand;
 
 impl SlashCommand for GoalCommand {
     fn name(&self) -> &str {
-        "goal"
+        builtin_meta("goal").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-goal-desc")
+        i18n::t(builtin_meta("goal").description_key)
     }
     fn execute(
         &self,
@@ -574,13 +579,13 @@ impl SlashCommand for GoalCommand {
 
 impl SlashCommand for ExitCommand {
     fn name(&self) -> &str {
-        "exit"
+        builtin_meta("exit").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-exit-desc")
+        i18n::t(builtin_meta("exit").description_key)
     }
     fn aliases(&self) -> &[&str] {
-        &["quit"]
+        builtin_meta("exit").aliases
     }
     fn execute(
         &self,
@@ -598,16 +603,15 @@ impl SlashCommand for ExitCommand {
 /// the outgoing thread's project, approval mode, and model: the conversation
 /// starts empty but keeps the working context.
 struct NewCommand;
-
 impl SlashCommand for NewCommand {
     fn name(&self) -> &str {
-        "new"
+        builtin_meta("new").name
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-new-desc")
+        i18n::t(builtin_meta("new").description_key)
     }
     fn aliases(&self) -> &[&str] {
-        &["clear", "archive"]
+        builtin_meta("new").aliases
     }
     fn execute(
         &self,

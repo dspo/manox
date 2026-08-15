@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 
-import type { ModelInfo, SubagentSnapshot, TokenUsageSnapshot } from '../../../protocol';
+import type { GoalSnapshotWire, ModelInfo, SubagentSnapshot, TokenUsageSnapshot } from '../../../protocol';
 import { apiTint } from '../lib/api-tint';
 import { t } from '../lib/i18n';
 import { formatCost, formatTokens, formatTokensPi } from '../lib/usage-format';
@@ -80,6 +80,18 @@ const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => 
   }
   return <Circle className="text-muted-foreground size-3.5 shrink-0" />;
 };
+
+/** Localized label for the Goal's status enum (serde PascalCase wire form). */
+const goalStatusLabel = (status: GoalSnapshotWire['status']): string =>
+  t(
+    ({
+      Active: 'goal_active',
+      Paused: 'goal_paused',
+      Blocked: 'goal_blocked',
+      BudgetLimited: 'goal_budget_limited',
+      Complete: 'goal_complete',
+    } as const)[status],
+  );
 
 /** The main agent's own status, mirroring the host's captain indicator:
  * ship-wheel on success (sub-agents get the plain check) and a red X on a
@@ -224,6 +236,49 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
           )}
         </div>
       </Section>
+
+      {info?.worktree_path && (
+        <div className="text-muted-foreground flex items-center gap-1.5">
+          <GitBranch className="size-3.5 shrink-0 opacity-50" />
+          <span className="min-w-0 truncate" title={t('worktree')}>
+            {info.worktree_path}
+          </span>
+        </div>
+      )}
+
+      {(thread.planMode || info?.plan) && (
+        <Section title={t('plan')}>
+          <p className="flex items-center gap-1.5">
+            <span className="text-muted-foreground">{t('plan_mode')}</span>
+            <span className={cn('ml-auto font-medium', thread.planMode ? 'text-info' : '')}>
+              {t(thread.planMode ? 'plan_mode_on' : 'plan_mode_off')}
+            </span>
+          </p>
+          {info?.plan && (
+            <p className="text-muted-foreground">
+              {info.plan.explanation}
+              <span className="font-code ml-1">
+                {info.plan.steps.filter((s) => s.status === 'completed').length}/
+                {info.plan.steps.length}
+              </span>
+            </p>
+          )}
+        </Section>
+      )}
+
+      {info?.goal && (
+        <Section title={t('goal')}>
+          <p className="flex items-start gap-1.5">
+            <span className="min-w-0 flex-1">{info.goal.objective}</span>
+            <span className="text-muted-foreground shrink-0">{goalStatusLabel(info.goal.status)}</span>
+          </p>
+          {info.goal.token_budget !== null && (
+            <p className="text-muted-foreground">
+              {formatTokensPi(info.goal.token_budget)}
+            </p>
+          )}
+        </Section>
+      )}
 
       <Section
         icon={<ScorpioIcon className="size-3.5" />}

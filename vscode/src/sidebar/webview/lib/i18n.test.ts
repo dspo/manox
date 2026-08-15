@@ -8,6 +8,17 @@ describe('i18n', () => {
     vi.useRealTimers();
   });
 
+  it('translates built-in slash descriptions and info labels in both locales', () => {
+    setLanguageForTest('zh-cn');
+    expect(t('slash-plan-desc')).toContain('plan');
+    expect(t('slash-danger-desc')).toContain('危险');
+    expect(t('goal_complete')).toBe('已完成');
+    setLanguageForTest('en');
+    expect(t('slash-plan-desc')).toContain('plan mode');
+    expect(t('slash-new-desc')).toContain('fresh one');
+    expect(t('goal_paused')).toBe('Paused');
+  });
+
   it('serves Chinese for zh display languages', () => {
     setLanguageForTest('zh-cn');
     expect(t('conversation_info')).toBe('对话信息');

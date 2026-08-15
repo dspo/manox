@@ -286,6 +286,7 @@ describe('requestThreadInfo', () => {
       info: {
         worktree_path: null,
         plan: null,
+        goal: null,
         usage: {},
         cost: 0,
         pending_auth_count: 0,

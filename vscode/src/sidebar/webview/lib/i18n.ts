@@ -63,6 +63,43 @@ const DICT = {
   },
   duration_seconds: { en: (s: number) => `${s}s`, zh: (s: number) => `${s} 秒` },
   show_n_more: { en: (n: number) => `+${n} more`, zh: (n: number) => `还有 ${n} 行` },
+  // Built-in slash-command descriptions, keyed by the agent locales' fluent
+  // keys so the actor's `CommandEntry.i18n_key` maps straight into the dict.
+  'slash-danger-desc': {
+    en: 'Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately',
+    zh: '切换到危险驾驶（免审批 + bash 沙箱外）；带提示词则切换后直接开工',
+  },
+  'slash-plan-desc': {
+    en: 'Toggle plan mode (read-only research, plan file, structured approval); `/plan <prompt>` enters plan mode and starts planning the prompt',
+    zh: '切换 plan 模式（只读调研、plan 文件、结构化批准）；`/plan <提示>` 进入 plan 模式并开始规划该提示',
+  },
+  'slash-compact-desc': {
+    en: 'Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit',
+    zh: '压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行',
+  },
+  'slash-exit-desc': {
+    en: 'Archive the current thread and start a fresh one',
+    zh: '归档当前会话并开始一个新会话',
+  },
+  'slash-new-desc': {
+    en: 'Archive the current thread and start a fresh one that keeps the project, approval mode, and model',
+    zh: '归档当前会话并开始新会话，保留项目、驾驶模式与模型',
+  },
+  'slash-goal-desc': {
+    en: 'Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)',
+    zh: '创建或管理持久目标（`/goal <目标>`、pause、resume、edit、clear）',
+  },
+  plan: { en: 'Plan', zh: '计划' },
+  plan_mode: { en: 'Plan mode', zh: '计划模式' },
+  plan_mode_on: { en: 'On', zh: '已开启' },
+  plan_mode_off: { en: 'Off', zh: '已关闭' },
+  worktree: { en: 'Worktree', zh: '工作树' },
+  goal: { en: 'Goal', zh: '目标' },
+  goal_active: { en: 'Active', zh: '进行中' },
+  goal_paused: { en: 'Paused', zh: '已暂停' },
+  goal_blocked: { en: 'Blocked', zh: '受阻' },
+  goal_budget_limited: { en: 'Budget limited', zh: '预算受限' },
+  goal_complete: { en: 'Complete', zh: '已完成' },
 } satisfies Record<string, Entry>;
 
 export type I18nKey = keyof typeof DICT;
@@ -85,6 +122,13 @@ export function t(key: I18nKey, ...args: number[]): string {
   return typeof value === 'function'
     ? (value as (...a: number[]) => string)(...args)
     : value;
+}
+
+/** Whether a key exists in the dict — unknown actor-shipped keys (a built-in
+ * added on the Rust side before this webview build) fall back to the raw
+ * description instead of throwing. */
+export function hasCommandKey(key: string): boolean {
+  return key in DICT;
 }
 
 const relativeFormatters = new Map<string, Intl.RelativeTimeFormat>();

@@ -208,6 +208,7 @@ describe('info snapshots', () => {
         info: {
           worktree_path: null,
           plan: null,
+          goal: null,
           usage: {},
           cost: 0,
           pending_auth_count: 0,
@@ -461,6 +462,7 @@ describe('global folds', () => {
       info: {
         worktree_path: '/w',
         plan: null,
+        goal: null,
         usage: {},
         cost: 1,
         pending_auth_count: 0,
@@ -493,6 +495,7 @@ describe('global folds', () => {
       info: {
         worktree_path: null,
         plan: null,
+        goal: null,
         usage: { input_tokens: 10, output_tokens: 4 },
         per_model_usage: { 'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 } },
         cost: 2.5,
@@ -540,6 +543,75 @@ describe('global folds', () => {
     );
     expect(thread(store)?.info?.agents).toEqual([
       expect.objectContaining({ id: 'ag1', tool_uses: 3, latest_activity: 'grep', status: 'success' }),
+    ]);
+  });
+});
+
+describe('turn-active recovery', () => {
+  it('syncs turnActive from the thread list running flag', () => {
+    const store = startSession();
+    store.dispatch({ type: 'threads', threads: [listItem({ id: 's', running: true })] });
+    expect(thread(store)?.turnActive).toBe(true);
+    store.dispatch({ type: 'threads', threads: [listItem({ id: 's', running: false })] });
+    expect(thread(store)?.turnActive).toBe(false);
+  });
+
+  it('seeds a restored running session with turnActive from the list', () => {
+    // A webview reload while a turn was in flight never re-emits
+    // `turn_started`; the threads list's running flag restores the stop
+    // button instead.
+    const store = new Store();
+    store.dispatch({
+      type: 'threads',
+      threads: [listItem({ id: 's', running: true })],
+    });
+    store.dispatch(ready('s', 'restored'));
+    expect(thread(store)?.turnActive).toBe(true);
+  });
+
+  it('keeps turn_started authoritative for live fresh sessions', () => {
+    const store = startSession();
+    store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
+    store.dispatch({ type: 'threads', threads: [listItem({ id: 's', running: true })] });
+    expect(thread(store)?.turnActive).toBe(true);
+  });
+});
+
+describe('plan, goal, and compaction events', () => {
+  it('folds plan mode changes into the thread state', () => {
+    const store = startSession();
+    store.dispatch(event({ type: 'plan_mode_changed', sessionId: 's', enabled: true }));
+    expect(thread(store)?.planMode).toBe(true);
+  });
+
+  it('folds goal snapshots into the info card', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'goal_changed',
+        sessionId: 's',
+        snapshot: {
+          thread_id: 's',
+          goal_id: 'g1',
+          objective: 'Ship it',
+          status: 'Active',
+          token_budget: 1000,
+          tokens_used: 10,
+          time_used_seconds: 5,
+          status_reason: null,
+          created_at: 1,
+          updated_at: 2,
+        },
+      }),
+    );
+    expect(thread(store)?.info?.goal).toMatchObject({ objective: 'Ship it', status: 'Active' });
+  });
+
+  it('renders a live compaction as a transcript recap item', () => {
+    const store = startSession();
+    store.dispatch(event({ type: 'compaction', sessionId: 's', summary: 'older context' }));
+    expect(thread(store)?.items).toEqual([
+      expect.objectContaining({ kind: 'compaction', summary: 'older context' }),
     ]);
   });
 });
