@@ -82,6 +82,14 @@ describe('init', () => {
 });
 
 describe('createSession', () => {
+  it('reuses a caller-supplied session id', async () => {
+    const { transport, manager } = create();
+    const pending = manager.createSession('/w', 'draft-1');
+    expect(transport.lastCommand()).toEqual({ cmd: 'create_session', sessionId: 'draft-1', cwd: '/w' });
+    transport.emit({ type: 'session_created', sessionId: 'draft-1' });
+    await expect(pending).resolves.toBe('draft-1');
+  });
+
   it('resolves on session_created and enforces the configured approval mode', async () => {
     const { transport, manager } = create();
     const pending = manager.createSession('/w');
@@ -224,6 +232,8 @@ describe('listThreads', () => {
           unread: true,
           errored: false,
           pending_auth: false,
+          pinned: false,
+          archived: false,
           model_id: 'm',
         },
       ],
@@ -231,6 +241,18 @@ describe('listThreads', () => {
     await expect(pending).resolves.toEqual([
       expect.objectContaining({ id: 't1', title: 'Fix the bug', unread: true }),
     ]);
+  });
+});
+
+describe('archiveThread / pinThread', () => {
+  it('sends the store-mutation commands through the transport', () => {
+    const { transport, manager } = create();
+    manager.archiveThread('t1', true);
+    expect(transport.lastCommand()).toEqual({ cmd: 'archive_thread', sessionId: 't1', archived: true });
+    manager.archiveThread('t1', false);
+    expect(transport.lastCommand()).toEqual({ cmd: 'archive_thread', sessionId: 't1', archived: false });
+    manager.pinThread('t2', true);
+    expect(transport.lastCommand()).toEqual({ cmd: 'pin_thread', sessionId: 't2', pinned: true });
   });
 });
 

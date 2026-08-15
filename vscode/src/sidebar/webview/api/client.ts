@@ -73,11 +73,19 @@ export const api = {
   requestModels(): void {
     post({ type: 'request_models' });
   },
-  newSession(): void {
-    post({ type: 'new_session' });
+  /** Optional payload = home-composer first message: the caller picks the id
+   * so an optimistic draft can render before the session exists. */
+  newSession(sessionId?: string, text?: string, images?: ImageAttachment[]): void {
+    post({ type: 'new_session', sessionId, text, images });
   },
   listThreads(): void {
     post({ type: 'list_threads' });
+  },
+  archiveThread(sessionId: string, archived: boolean): void {
+    post({ type: 'archive_thread', sessionId, archived });
+  },
+  pinThread(sessionId: string, pinned: boolean): void {
+    post({ type: 'pin_thread', sessionId, pinned });
   },
   openThread(sessionId: string): void {
     post({ type: 'open_thread', sessionId });

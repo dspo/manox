@@ -104,6 +104,9 @@ let echoCounter = 0;
 export class Store {
   private state: ChatState = initialState;
   private readonly listeners = new Set<() => void>();
+  /** Drafted sessions not yet confirmed by `session_ready`; kept outside the
+   * observable state because it gates input rather than rendering. */
+  private readonly creating = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -113,7 +116,27 @@ export class Store {
   get = (): ChatState => this.state;
 
   dispatch(msg: HostToWebview): void {
+    if (msg.type === 'session_ready') {
+      this.creating.delete(msg.sessionId);
+    } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
+      this.creating.delete(msg.event.sessionId);
+    }
     this.patch(foldMessage(this.state, msg));
+  }
+
+  /** Seed a fresh thread optimistically from the home composer: switch the
+   * view, echo the first message, and remember the id until `session_ready`
+   * confirms the host side. */
+  draftThread(sessionId: string, text: string, images?: UserImage[]): void {
+    this.creating.add(sessionId);
+    this.patch({ ...this.state, view: 'conversation', activeThreadId: sessionId });
+    this.echoUser(sessionId, text, images);
+  }
+
+  /** Whether a drafted session is still waiting for the host's
+   * `session_ready`; sending must stay blocked until it lands. */
+  isCreating(sessionId: string): boolean {
+    return this.creating.has(sessionId);
   }
 
   /** Optimistic echo of a submission; the actor never replays user
@@ -190,20 +213,23 @@ function foldThreads(state: ChatState, threads: ThreadListItem[]): ChatState {
 
 function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
   switch (msg.type) {
-    case 'session_ready':
+    case 'session_ready': {
+      // Merge-safe: an optimistic draft (or a live thread being re-announced)
+      // keeps its accumulated items, and only the session's origin metadata
+      // changes. A restored replay still replaces the items wholesale when
+      // its thread_history snapshot lands.
+      const existing = state.perThread[msg.sessionId];
+      const thread = existing
+        ? { ...existing, cwd: msg.cwd, loading: msg.kind === 'restored' }
+        : { ...initThread(msg.sessionId, msg.cwd), loading: msg.kind === 'restored' };
       return {
         ...state,
         view: 'conversation',
         activeThreadId: msg.sessionId,
         error: null,
-        perThread: {
-          ...state.perThread,
-          [msg.sessionId]: {
-            ...initThread(msg.sessionId, msg.cwd),
-            loading: msg.kind === 'restored',
-          },
-        },
+        perThread: { ...state.perThread, [msg.sessionId]: thread },
       };
+    }
     case 'models':
       return { ...state, models: msg.models };
     case 'threads':

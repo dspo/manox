@@ -6,7 +6,7 @@
 
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent } from '../protocol';
+import type { ActorEvent, ImageAttachment } from '../protocol';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
 import type { HostToWebview, WebviewToHost } from './messages';
 
@@ -71,19 +71,29 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     void this.initActor();
   }
 
-  /** Create a fresh thread and hand it to the webview (manox.newSession). */
-  async newSession(): Promise<void> {
+  /** Create a fresh thread and hand it to the webview (manox.newSession).
+   * A payload turns this into the home-composer flow: the webview picks the
+   * id so its optimistic draft and the actor session agree, and the first
+   * message is submitted right after creation. */
+  async newSession(opts?: {
+    sessionId?: string;
+    text?: string;
+    images?: ImageAttachment[];
+  }): Promise<void> {
     const generation = ++this.sessionGeneration;
     const manager = SessionManager.shared();
     const cwd = resolveWorkspaceCwd();
     try {
       await manager.init(cwd);
-      const sessionId = await manager.createSession(cwd);
+      const sessionId = await manager.createSession(cwd, opts?.sessionId);
       if (generation !== this.sessionGeneration) {
         manager.disposeSession(sessionId);
         return;
       }
       this.registerSession(sessionId, 'fresh', cwd);
+      if (opts?.text || opts?.images?.length) {
+        manager.send({ cmd: 'submit', sessionId, text: opts.text ?? '', images: opts.images });
+      }
     } catch (e) {
       this.post({
         type: 'global_error',
@@ -203,8 +213,18 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'open_thread':
         await this.openThread(msg.sessionId);
         return;
+      case 'archive_thread':
+        manager.archiveThread(msg.sessionId, msg.archived);
+        return;
+      case 'pin_thread':
+        manager.pinThread(msg.sessionId, msg.pinned);
+        return;
       case 'new_session':
-        await this.newSession();
+        await this.newSession({
+          sessionId: msg.sessionId,
+          text: msg.text,
+          images: msg.images,
+        });
         return;
     }
   }

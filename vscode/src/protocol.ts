@@ -23,6 +23,8 @@ export type Command =
 	| { cmd: 'list_models' }
 	| { cmd: 'get_usage'; sessionId: string }
 	| { cmd: 'list_threads' }
+	| { cmd: 'archive_thread'; sessionId: string; archived: boolean }
+	| { cmd: 'pin_thread'; sessionId: string; pinned: boolean }
 	| { cmd: 'open_thread'; sessionId: string }
 	| { cmd: 'focus_thread'; sessionId?: string }
 	| { cmd: 'list_commands' }
@@ -79,6 +81,8 @@ export interface ThreadListItem {
 	errored: boolean;
 	pending_auth: boolean;
 	model_id: string;
+	pinned: boolean;
+	archived: boolean;
 }
 
 /** One slash-completion entry: a prompt-macro command or a skill. */

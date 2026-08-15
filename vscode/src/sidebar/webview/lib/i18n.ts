@@ -35,6 +35,12 @@ const DICT = {
   no_messages_desc: { en: 'Send a message to start', zh: '发送消息以开始' },
   threads: { en: 'Threads', zh: '对话' },
   threads_empty: { en: 'No conversations yet', zh: '暂无对话' },
+  sessions: { en: 'Sessions', zh: '会话' },
+  archive: { en: 'Archive', zh: '归档' },
+  unarchive: { en: 'Unarchive', zh: '取消归档' },
+  pin: { en: 'Pin', zh: '置顶' },
+  unpin: { en: 'Unpin', zh: '取消置顶' },
+  more: { en: 'More', zh: '更多' },
   new_conversation: { en: 'New conversation', zh: '新对话' },
   back_to_threads: { en: 'Back to threads', zh: '返回对话列表' },
   copy: { en: 'Copy', zh: '复制' },
@@ -82,6 +88,25 @@ export function t(key: I18nKey, ...args: number[]): string {
   return typeof value === 'function'
     ? (value as (...a: number[]) => string)(...args)
     : value;
+}
+
+const relativeFormatters = new Map<string, Intl.RelativeTimeFormat>();
+
+/** Relative wall-clock distance ("3 minutes ago" / "3 分钟前"), following
+ * the display language. */
+export function formatRelativeTime(unixSeconds: number): string {
+  const locale = detectLanguage().startsWith('zh') ? 'zh' : 'en';
+  let rtf = relativeFormatters.get(locale);
+  if (!rtf) {
+    rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    relativeFormatters.set(locale, rtf);
+  }
+  const diff = unixSeconds - Date.now() / 1000;
+  const abs = Math.abs(diff);
+  if (abs < 60) return rtf.format(Math.round(diff), 'second');
+  if (abs < 3_600) return rtf.format(Math.round(diff / 60), 'minute');
+  if (abs < 86_400) return rtf.format(Math.round(diff / 3_600), 'hour');
+  return rtf.format(Math.round(diff / 86_400), 'day');
 }
 
 /** Test seam: reset the cached display language. */

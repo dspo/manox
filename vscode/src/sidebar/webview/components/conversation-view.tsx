@@ -3,11 +3,12 @@
 // conversation info card.
 
 import { ArrowLeft } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect } from 'react';
 
 import type { CommandEntry, ModelInfo } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
+import { useContainerWidth } from '../lib/use-container-width';
 import type { ThreadState } from '../state/bridge';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
@@ -26,20 +27,8 @@ export type ConversationViewProps = {
 };
 
 export const ConversationView = ({ thread, models, commands, error }: ConversationViewProps) => {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [wide, setWide] = useState(false);
-
-  // Container-width breakpoint: sidebar width depends on the panel layout,
-  // not the viewport, so a ResizeObserver stands in for container queries.
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver(() => {
-      setWide(el.clientWidth >= WIDE_BREAKPOINT_PX);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
+  const { ref: containerRef, width } = useContainerWidth();
+  const wide = width >= WIDE_BREAKPOINT_PX;
 
   // Restore the info snapshot whenever a thread comes into view; live
   // plan/worktree/sub-agent events keep it fresh afterwards.
@@ -81,6 +70,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
       <Composer
         approvalMode={thread.approvalMode}
         commands={commands}
+        creating={store.isCreating(thread.sessionId)}
         currentModelId={thread.currentModelId}
         models={models}
         sessionId={thread.sessionId}

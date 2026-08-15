@@ -3,12 +3,25 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ActorEvent, WireMessage } from '../../../protocol';
+import type { ActorEvent, ThreadListItem, WireMessage } from '../../../protocol';
 import type { HostToWebview } from '../../messages';
 import { Store, wireMessagesToTranscriptItems } from './store';
 import { foldToolStatus } from './transcript';
 
 const event = (ev: ActorEvent): HostToWebview => ({ type: 'event', event: ev });
+
+const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadListItem => ({
+  title: 't',
+  updated_at: 1,
+  running: false,
+  unread: false,
+  errored: false,
+  pending_auth: false,
+  model_id: 'm',
+  pinned: false,
+  archived: false,
+  ...partial,
+});
 
 const ready = (sessionId: string, kind: 'fresh' | 'restored' = 'fresh'): HostToWebview => ({
   type: 'session_ready',
@@ -106,6 +119,35 @@ describe('thread routing', () => {
     expect(store.get().view).toBe('conversation');
     expect(store.get().activeThreadId).toBe('a');
     expect(thread(store, 'a')?.items).toHaveLength(1);
+  });
+});
+
+describe('home-composer drafts', () => {
+  it('draftThread opens the conversation view with the echoed first message', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('d1');
+    expect(thread(store, 'd1')?.items[0]).toMatchObject({ kind: 'user', text: 'hello' });
+    expect(store.isCreating('d1')).toBe(true);
+  });
+
+  it('session_ready merges into a draft instead of resetting it', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch(ready('d1'));
+    // The optimistic echo survives; only the origin metadata lands.
+    expect(thread(store, 'd1')?.items).toHaveLength(1);
+    expect(thread(store, 'd1')?.cwd).toBe('/w');
+    expect(thread(store, 'd1')?.loading).toBe(false);
+    expect(store.isCreating('d1')).toBe(false);
+  });
+
+  it('session_disposed clears the creating guard as well', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch(event({ type: 'session_disposed', sessionId: 'd1' }));
+    expect(store.isCreating('d1')).toBe(false);
   });
 });
 
@@ -328,21 +370,19 @@ describe('global folds', () => {
     const store = startSession('t1');
     store.dispatch({
       type: 'threads',
-      threads: [
-        {
-          id: 't1',
-          title: 'Fix the bug',
-          updated_at: 1,
-          running: false,
-          unread: false,
-          errored: false,
-          pending_auth: false,
-          model_id: 'm',
-        },
-      ],
+      threads: [listItem({ id: 't1', title: 'Fix the bug' })],
     });
     expect(store.get().threads).toHaveLength(1);
     expect(thread(store, 't1')?.title).toBe('Fix the bug');
+  });
+
+  it('threads snapshots keep archived rows for the more section', () => {
+    const store = new Store();
+    store.dispatch({
+      type: 'threads',
+      threads: [listItem({ id: 'a' }), listItem({ id: 'b', archived: true })],
+    });
+    expect(store.get().threads.map((item) => item.id)).toEqual(['a', 'b']);
   });
 
   it('thread_info, branch, and plan events land on the thread', () => {

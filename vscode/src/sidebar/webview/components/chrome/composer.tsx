@@ -120,14 +120,20 @@ const ApprovalChip = ({
 };
 
 export type ComposerProps = {
-  /** Owning thread; null until a session is established — input is
-   * collected but sending is blocked until the host can deliver it. */
+  /** Owning thread; null until a session is established. With an
+   * `onCreateSession` callback the composer works as a draft input whose
+   * first send creates the thread; without it, input is collected but
+   * sending is blocked until the host can deliver it. */
   sessionId: string | null;
   turnActive: boolean;
   models: ModelInfo[];
   currentModelId: string | null;
   approvalMode: ApprovalMode;
   commands: CommandEntry[];
+  /** Drafted session still waiting for the host's confirmation. */
+  creating?: boolean;
+  /** Draft-mode send: creates the session and delivers the first message. */
+  onCreateSession?: (text: string, images: { data: string; mimeType: string }[]) => void;
 };
 
 export const Composer = ({
@@ -137,13 +143,16 @@ export const Composer = ({
   currentModelId,
   approvalMode,
   commands,
+  creating = false,
+  onCreateSession,
 }: ComposerProps) => {
   const [text, setText] = useState('');
   const [images, setImages] = useState<PastedImage[]>([]);
   const [activeMatch, setActiveMatch] = useState(0);
   const [typeaheadDismissed, setTypeaheadDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const ready = sessionId !== null;
+  const draft = sessionId === null && onCreateSession !== undefined;
+  const ready = sessionId !== null || draft;
 
   // The typeahead is live only while the leading token is an unfinished
   // slash invocation; the actor does the actual routing on submit.
@@ -167,22 +176,28 @@ export const Composer = ({
 
   const submit = useCallback(() => {
     const trimmed = text.trim();
-    if ((!trimmed && images.length === 0) || turnActive || !sessionId) {
+    if ((!trimmed && images.length === 0) || turnActive || creating) {
       return;
     }
-    const api = new ThreadApi(sessionId);
-    store.echoUser(
-      sessionId,
-      trimmed,
-      images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
-    );
-    api.submit(
-      trimmed,
-      images.length ? images.map((img) => ({ data: img.data, mimeType: img.mimeType })) : undefined,
-    );
+    const wireImages = images.length
+      ? images.map((img) => ({ data: img.data, mimeType: img.mimeType }))
+      : undefined;
+    if (sessionId) {
+      const api = new ThreadApi(sessionId);
+      store.echoUser(
+        sessionId,
+        trimmed,
+        images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
+      );
+      api.submit(trimmed, wireImages);
+    } else if (onCreateSession) {
+      onCreateSession(trimmed, wireImages ?? []);
+    } else {
+      return;
+    }
     setText('');
     setImages([]);
-  }, [text, images, turnActive, sessionId]);
+  }, [text, images, turnActive, creating, sessionId, onCreateSession]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (showTypeahead) {
@@ -223,7 +238,7 @@ export const Composer = ({
     if (pasted.length > 0) setImages((prev) => [...prev, ...pasted]);
   };
 
-  const canSend = ready && (text.trim() !== '' || images.length > 0);
+  const canSend = ready && !creating && (text.trim() !== '' || images.length > 0);
 
   return (
     <div className="border-t border-border">
@@ -286,19 +301,30 @@ export const Composer = ({
           value={text}
         />
       </div>
-      <div className="flex items-center justify-between px-3 pb-2">
-        <ApprovalChip
-          disabled={!ready}
-          mode={approvalMode}
-          onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
-        />
-        <div className="flex items-center gap-2">
-          <ModelPicker
-            currentModelId={currentModelId}
-            disabled={!ready || turnActive || models.length === 0}
-            models={models}
-            sessionId={sessionId}
+      <div
+        className={cn(
+          'flex items-center px-3 pb-2',
+          draft ? 'justify-end' : 'justify-between',
+        )}
+      >
+        {/* Approval policy and model selection need a live session; the
+         * draft's first send creates one with the host's defaults. */}
+        {!draft && (
+          <ApprovalChip
+            disabled={!ready}
+            mode={approvalMode}
+            onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
           />
+        )}
+        <div className="flex items-center gap-2">
+          {!draft && (
+            <ModelPicker
+              currentModelId={currentModelId}
+              disabled={!ready || turnActive || models.length === 0}
+              models={models}
+              sessionId={sessionId}
+            />
+          )}
           {turnActive && sessionId ? (
             <button
               className="bg-danger/20 text-danger hover:bg-danger/30 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"

@@ -108,9 +108,10 @@ export class SessionManager {
     return this.readyPromise;
   }
 
-  /** Create a session and resolve once the actor confirms it. */
-  async createSession(cwd: string): Promise<string> {
-    const sessionId = randomUUID();
+  /** Create a session and resolve once the actor confirms it. The id is
+   * generated unless the caller already chose one (a surface rendering an
+   * optimistic draft before the session exists). */
+  async createSession(cwd: string, sessionId: string = randomUUID()): Promise<string> {
     const emitter = new EventEmitter();
     emitter.setMaxListeners(0);
     this.sessions.set(sessionId, emitter);
@@ -213,6 +214,18 @@ export class SessionManager {
     return threads.then(
       (ev) => (ev as Extract<ActorEvent, { type: 'threads_updated' }>).threads,
     );
+  }
+
+  /** Archive/unarchive a thread; the store mutation pushes an updated
+   * `threads_updated` snapshot through the global stream. */
+  archiveThread(sessionId: string, archived: boolean): void {
+    this.send({ cmd: 'archive_thread', sessionId, archived });
+  }
+
+  /** Pin/unpin a thread; the store mutation pushes an updated
+   * `threads_updated` snapshot through the global stream. */
+  pinThread(sessionId: string, pinned: boolean): void {
+    this.send({ cmd: 'pin_thread', sessionId, pinned });
   }
 
   /** Slash-completion entries: prompt-macro commands plus skills. */

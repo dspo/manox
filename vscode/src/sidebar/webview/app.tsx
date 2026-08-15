@@ -45,5 +45,12 @@ export const App = () => {
       />
     );
   }
-  return <ThreadsView error={state.error} threads={state.threads} />;
+  return (
+    <ThreadsView
+      commands={state.commands}
+      error={state.error}
+      models={state.models}
+      threads={state.threads}
+    />
+  );
 };

@@ -26,6 +26,9 @@ pub enum ThreadStoreEvent {
 
 pub struct ThreadStore {
     summaries: Vec<ThreadSummary>,
+    /// Archived rows kept addressable so a surface can list them behind a
+    /// "more" affordance; the main sidebar list renders `summaries` only.
+    archived_summaries: Vec<ThreadSummary>,
     /// Session file path per summary id, for sidecar writes and reopen.
     session_paths: HashMap<String, PathBuf>,
     known_projects: Vec<String>,
@@ -72,6 +75,7 @@ pub fn init(cx: &mut App) {
     let known_projects = db.list_projects().unwrap_or_default();
     let entity = cx.new(|_| ThreadStore {
         summaries: Vec::new(),
+        archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects,
         running: HashSet::new(),
@@ -107,6 +111,28 @@ pub fn drop_global_for_test() {
 impl ThreadStore {
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
+    }
+
+    /// Archived rows, partitioned out of `summaries` so the sidebar list
+    /// stays clean while surfaces can still render them on demand.
+    pub fn archived_summaries(&self) -> &[ThreadSummary] {
+        &self.archived_summaries
+    }
+
+    /// Mutable lookup across both partitions by id.
+    fn summary_mut(&mut self, id: &str) -> Option<&mut ThreadSummary> {
+        self.summaries
+            .iter_mut()
+            .find(|s| s.id == id)
+            .or_else(|| self.archived_summaries.iter_mut().find(|s| s.id == id))
+    }
+
+    /// Immutable lookup across both partitions by id.
+    fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
+        self.summaries
+            .iter()
+            .find(|s| s.id == id)
+            .or_else(|| self.archived_summaries.iter().find(|s| s.id == id))
     }
 
     /// All registered project paths. The sidebar renders a folder for every
@@ -152,12 +178,12 @@ impl ThreadStore {
 
     /// Set the unread flag on a session (persisted in its sidecar).
     pub fn set_unread(&mut self, id: &str, unread: bool, cx: &mut Context<Self>) {
-        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id)
+        if let Some(s) = self.summary_mut(id)
             && s.has_unread == unread
         {
             return;
         }
-        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.summary_mut(id) {
             s.has_unread = unread;
         }
         self.write_meta(id, move |meta| meta.unread = unread, cx);
@@ -186,12 +212,12 @@ impl ThreadStore {
 
     /// Set the errored flag on a session (persisted in its sidecar).
     pub fn set_errored(&mut self, id: &str, errored: bool, cx: &mut Context<Self>) {
-        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id)
+        if let Some(s) = self.summary_mut(id)
             && s.errored == errored
         {
             return;
         }
-        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.summary_mut(id) {
             s.errored = errored;
         }
         self.write_meta(id, move |meta| meta.errored = errored, cx);
@@ -211,9 +237,10 @@ impl ThreadStore {
                 .await
                 .unwrap_or_default();
             this.update(cx, |s, cx| {
-                let (session_paths, summaries) = project_session_lists(list);
+                let (session_paths, summaries, archived) = project_session_lists(list);
                 s.session_paths = session_paths;
                 s.summaries = summaries;
+                s.archived_summaries = archived;
                 cx.emit(ThreadStoreEvent::SummariesUpdated);
                 cx.notify();
             })
@@ -229,14 +256,12 @@ impl ThreadStore {
         }
         let path = self.session_paths.get(id)?.clone();
         let cwd = self
-            .summaries
-            .iter()
-            .find(|s| s.id == id)
+            .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
         let entity = Thread::open_existing(ThreadId(id.to_string()), cwd, path, cx);
         // Re-surface the bound project from the sidecar so the chip shows it.
-        if let Some(sum) = self.summaries.iter().find(|s| s.id == id)
+        if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
         {
             let dir = PathBuf::from(&sum.project);
@@ -246,15 +271,20 @@ impl ThreadStore {
         Some(entity)
     }
 
-    /// Archive (or unarchive) a session. Archiving removes the row from the
-    /// sidebar list immediately; the post-write refresh in `write_meta`
-    /// re-syncs the list from disk (an unarchived session returns to the
-    /// list on the next refresh).
+    /// Archive (or unarchive) a session. The row moves between the active
+    /// and archived partitions immediately; the post-write refresh in
+    /// `write_meta` re-syncs both partitions from disk.
     pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
         if archived {
-            self.summaries.retain(|s| s.id != id);
-        } else if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
-            s.archived = false;
+            if let Some(pos) = self.summaries.iter().position(|s| s.id == id) {
+                let mut summary = self.summaries.swap_remove(pos);
+                summary.archived = true;
+                self.archived_summaries.push(summary);
+            }
+        } else if let Some(pos) = self.archived_summaries.iter().position(|s| s.id == id) {
+            let mut summary = self.archived_summaries.swap_remove(pos);
+            summary.archived = false;
+            self.summaries.push(summary);
         }
         self.write_meta(id, move |meta| meta.archived = archived, cx);
         if archived {
@@ -271,7 +301,7 @@ impl ThreadStore {
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
     pub fn pin_thread(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
-        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
         self.write_meta(id, move |meta| meta.pinned = pinned, cx);
@@ -381,17 +411,25 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
 /// SQLite store's `list(false)` default).
 fn project_session_lists(
     list: Vec<(ThreadSummary, PathBuf)>,
-) -> (HashMap<String, PathBuf>, Vec<ThreadSummary>) {
+) -> (
+    HashMap<String, PathBuf>,
+    Vec<ThreadSummary>,
+    Vec<ThreadSummary>,
+) {
     let paths = list
         .iter()
         .map(|(sum, path)| (sum.id.clone(), path.clone()))
         .collect();
-    let active = list
-        .into_iter()
-        .filter(|(sum, _)| !sum.archived)
-        .map(|(sum, _)| sum)
-        .collect();
-    (paths, active)
+    let mut active = Vec::new();
+    let mut archived = Vec::new();
+    for (sum, _) in list {
+        if sum.archived {
+            archived.push(sum);
+        } else {
+            active.push(sum);
+        }
+    }
+    (paths, active, archived)
 }
 
 /// Map a pi session info + sidecar onto the sidebar summary shape.
@@ -431,6 +469,7 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
     let entity = cx.new(|_| ThreadStore {
         summaries: Vec::new(),
+        archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects: Vec::new(),
         db: db.clone(),
@@ -470,6 +509,7 @@ mod tests {
         cx.update(|cx| {
             cx.new(|_| ThreadStore {
                 summaries: Vec::new(),
+                archived_summaries: Vec::new(),
                 session_paths: HashMap::new(),
                 known_projects,
                 db,
@@ -574,17 +614,28 @@ mod tests {
     }
 
     #[test]
-    fn project_session_lists_hides_archived_keeps_paths() {
-        let (paths, active) = project_session_lists(vec![
-            (sample_summary("active", false), PathBuf::from("active.jsonl")),
-            (sample_summary("archived", true), PathBuf::from("archived.jsonl")),
+    fn project_session_lists_partitions_archived_keeps_paths() {
+        let (paths, active, archived) = project_session_lists(vec![
+            (
+                sample_summary("active", false),
+                PathBuf::from("active.jsonl"),
+            ),
+            (
+                sample_summary("archived", true),
+                PathBuf::from("archived.jsonl"),
+            ),
         ]);
         let ids: Vec<&str> = active.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["active"]);
-        // The archived session stays addressable (unarchive / unread / pin
-        // still reach its sidecar) even though the sidebar no longer lists it.
+        let archived_ids: Vec<&str> = archived.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(archived_ids, vec!["archived"]);
+        // Both partitions stay addressable (unarchive / unread / pin still
+        // reach their sidecars); only the active one feeds the sidebar list.
         assert_eq!(paths.len(), 2);
         assert!(paths.contains_key("archived"));
-        assert_eq!(paths.get("active").unwrap().file_name().unwrap(), "active.jsonl");
+        assert_eq!(
+            paths.get("active").unwrap().file_name().unwrap(),
+            "active.jsonl"
+        );
     }
 }

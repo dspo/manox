@@ -313,6 +313,30 @@ fn handle_command(
                 });
             }
         }
+        "archive_thread" => {
+            let Some(id) = session_id.clone() else {
+                sink.emit(error_json(None, "archive_thread requires sessionId"));
+                return true;
+            };
+            let archived = cmd["archived"].as_bool().unwrap_or(true);
+            ensure_store_subscription(cx, state, sink);
+            cx.update(|app| {
+                let store = agent::thread_store::global();
+                store.update(app, |s, cx| s.archive_thread(&id, archived, cx));
+            });
+        }
+        "pin_thread" => {
+            let Some(id) = session_id.clone() else {
+                sink.emit(error_json(None, "pin_thread requires sessionId"));
+                return true;
+            };
+            let pinned = cmd["pinned"].as_bool().unwrap_or(true);
+            ensure_store_subscription(cx, state, sink);
+            cx.update(|app| {
+                let store = agent::thread_store::global();
+                store.update(app, |s, cx| s.pin_thread(&id, pinned, cx));
+            });
+        }
         "list_threads" => {
             ensure_store_subscription(cx, state, sink);
             cx.update(|app| {
@@ -723,25 +747,29 @@ fn threads_snapshot(
 ) -> Value {
     let store = store.read(app);
     let mut cache = repo_ids.lock().unwrap();
-    Value::Array(
-        store
-            .summaries()
-            .iter()
-            .filter(|s| !s.archived && matches_workspace(&s.project, cwd, &mut cache))
-            .map(|s| {
-                json!({
-                    "id": s.id,
-                    "title": s.display_title(),
-                    "updated_at": s.interacted_at,
-                    "running": store.is_running(&s.id),
-                    "unread": s.has_unread,
-                    "errored": s.errored,
-                    "pending_auth": store.pending_auth_contains(&s.id),
-                    "model_id": s.model_id,
-                })
+    let rows = store
+        .summaries()
+        .iter()
+        .chain(store.archived_summaries())
+        // Archived rows stay in the snapshot so the surface can render them
+        // behind its "more" affordance instead of dropping them.
+        .filter(|s| matches_workspace(&s.project, cwd, &mut cache))
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.display_title(),
+                "updated_at": s.interacted_at,
+                "running": store.is_running(&s.id),
+                "unread": s.has_unread,
+                "errored": s.errored,
+                "pending_auth": store.pending_auth_contains(&s.id),
+                "model_id": s.model_id,
+                "pinned": s.pinned,
+                "archived": s.archived,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    Value::Array(rows)
 }
 
 /// Whether a session's `project` directory belongs to the workspace rooted
@@ -1468,6 +1496,99 @@ mod tests {
             !ids.contains(&"wt-other".to_string()),
             "sessions from an unrelated repo must stay hidden"
         );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn archive_and_pin_commands_flag_the_snapshot_rows() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "ap-plain", "/archive/pin/project");
+        seed_session_file(&sessions, "ap-pin", "/archive/pin/project");
+        seed_session_file(&sessions, "ap-archive", "/archive/pin/project");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/pin/project"));
+        let (out, sink) = collect_sink();
+
+        let latest_rows = |cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        // The mutations resolve ids through the scan's path table, so they
+        // must wait for the seeded sessions to land in a snapshot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids: Vec<String> = latest_rows(&mut cx)
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids
+                .iter()
+                .all(|id| ["ap-plain", "ap-pin", "ap-archive"].contains(&id.as_str()))
+                && ids.len() == 3
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded sessions never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"pin_thread","sessionId":"ap-pin","pinned":true}"#,
+        );
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"ap-archive","archived":true}"#,
+        );
+
+        // The meta writes land asynchronously; the settled snapshot keeps
+        // every row — archived flagged instead of dropped, pinned flagged
+        // for the surface's sort, and plain rows explicitly unflagged.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let rows = latest_rows(&mut cx);
+            let by_id = |id: &str| rows.iter().find(|t| t["id"] == id).cloned();
+            let settled = by_id("ap-pin").is_some_and(|t| t["pinned"].as_bool() == Some(true))
+                && by_id("ap-archive").is_some_and(|t| t["archived"].as_bool() == Some(true))
+                && by_id("ap-plain").is_some_and(|t| {
+                    t["pinned"].as_bool() == Some(false) && t["archived"].as_bool() == Some(false)
+                });
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "archive/pin flags never settled in the snapshot; last rows: {rows:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         drop(state);
         agent::thread_store::drop_global_for_test();
