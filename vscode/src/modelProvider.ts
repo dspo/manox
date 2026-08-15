@@ -150,7 +150,9 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
         name: m.name,
         family: m.provider,
         version: '1.0.0',
-        maxInputTokens: DEFAULT_MAX_INPUT_TOKENS,
+        // The actor reports the provider's real context window; a provider
+        // declaring none falls back to the placeholder.
+        maxInputTokens: m.context_window || DEFAULT_MAX_INPUT_TOKENS,
         maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
         capabilities: { toolCalling: true, imageInput: true },
         isUserSelectable: true,
