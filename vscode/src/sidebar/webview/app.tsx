@@ -36,7 +36,7 @@ export const App = () => {
     return (
       <ConversationView
         commands={state.commands}
-        error={state.error}
+        error={thread.error ?? state.error}
         models={state.models}
         thread={thread}
       />

@@ -39,6 +39,8 @@ export interface ThreadState {
   branch: string | null;
   /** Restored history still loading. */
   loading: boolean;
+  /** Last error emitted for this thread; cleared when a new turn starts. */
+  error: string | null;
 }
 
 export interface ChatState {
@@ -69,12 +71,15 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   items: [],
   currentModelId: null,
   turnModelId: null,
-  approvalMode: 'danger',
+  // Matches the thread-side default; the actor replays the persisted mode
+  // on open, correcting this value for restored threads.
+  approvalMode: 'autopilot',
   usage: null,
   cost: 0,
   info: null,
   branch: null,
   loading: false,
+  error: null,
 });
 
 const emptyInfo = (): ThreadInfoSnapshot => ({
@@ -209,7 +214,17 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
 }
 
 function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
-  if (ev.type === 'error') return { ...state, error: ev.message };
+  // Session-scoped errors stay with their thread so a background failure
+  // never surfaces in another conversation's banner.
+  if (ev.type === 'error') {
+    if (typeof ev.sessionId === 'string') {
+      // Sessions without local state would materialize a ghost thread via
+      // updateThread's init fallback; their errors are dropped instead.
+      if (!state.perThread[ev.sessionId]) return state;
+      return updateThread(state, ev.sessionId, (t) => ({ ...t, error: ev.message }));
+    }
+    return { ...state, error: ev.message };
+  }
   if (!isSessionEvent(ev)) {
     switch (ev.type) {
       case 'models':
@@ -239,7 +254,8 @@ function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
 function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string }): ThreadState {
   switch (ev.type) {
     case 'turn_started':
-      return { ...t, turnActive: true, turnModelId: t.currentModelId };
+      // A fresh turn supersedes any stale error from the previous one.
+      return { ...t, turnActive: true, turnModelId: t.currentModelId, error: null };
     case 'turn_finished':
     case 'stop':
       return { ...t, turnActive: false };
