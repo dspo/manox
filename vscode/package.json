@@ -6,17 +6,31 @@
   "publisher": "dspo",
   "license": "MIT",
   "engines": {
-    "vscode": "^1.98.0"
+    "vscode": "^1.104.0"
   },
+  "enabledApiProposals": [
+    "chatProvider",
+    "languageModelThinkingPart"
+  ],
+  "keywords": [
+    "language-models"
+  ],
   "categories": [
     "AI",
     "Other"
   ],
   "activationEvents": [
     "onView:manox.chatView",
-    "onChatParticipant:manox"
+    "onChatParticipant:manox",
+    "onLanguageModelChatProvider:manox"
   ],
   "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "manox",
+        "displayName": "manox"
+      }
+    ],
     "chatParticipants": [
       {
         "id": "manox",
