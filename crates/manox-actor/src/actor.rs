@@ -7,7 +7,8 @@
 //! projected event carries its session id, so multiple host surfaces (chat
 //! participant, sidebar) share the actor without cross-talk. The foreground
 //! executor is driven with `run_until_parked` while any session's turn is
-//! active, and the thread blocks on the command channel when idle.
+//! active, and the thread waits on the command channel when idle, waking
+//! periodically so parked async work still lands.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,9 @@ struct ActorState {
     /// Keeps the `ThreadStoreEvent` subscription alive for the actor's
     /// lifetime; established on the first `list_threads`.
     store_subscription: Option<Subscription>,
+    /// Memoized git-repository identity per path, so the workspace filter
+    /// resolves each distinct project directory at most once.
+    repo_ids: Arc<Mutex<HashMap<PathBuf, Option<PathBuf>>>>,
 }
 
 impl ActorState {
@@ -134,6 +138,7 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         focused: Arc::new(Mutex::new(None)),
         store_subscription: None,
+        repo_ids: Arc::new(Mutex::new(HashMap::new())),
     };
 
     loop {
@@ -316,7 +321,7 @@ fn handle_command(
             });
             let threads = cx.update(|app| {
                 let store = agent::thread_store::global();
-                threads_snapshot(app, &store, &state.cwd)
+                threads_snapshot(app, &store, &state.cwd, &state.repo_ids)
             });
             sink.emit(json!({"type": "threads_updated", "threads": threads}).to_string());
         }
@@ -707,15 +712,22 @@ fn emit_thread_info(
     spawn_git_stats(session_id.to_string(), branch_dir, sink.clone());
 }
 
-/// `threads_updated` item list, scoped to this project's live sessions.
-fn threads_snapshot(app: &App, store: &Entity<ThreadStore>, cwd: &Path) -> Value {
+/// `threads_updated` item list, scoped to the workspace's live sessions:
+/// the workspace directory itself plus every worktree of the same git
+/// repository.
+fn threads_snapshot(
+    app: &App,
+    store: &Entity<ThreadStore>,
+    cwd: &Path,
+    repo_ids: &Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+) -> Value {
     let store = store.read(app);
-    let cwd = cwd.to_string_lossy();
+    let mut cache = repo_ids.lock().unwrap();
     Value::Array(
         store
             .summaries()
             .iter()
-            .filter(|s| !s.archived && s.project == cwd.as_ref())
+            .filter(|s| !s.archived && matches_workspace(&s.project, cwd, &mut cache))
             .map(|s| {
                 json!({
                     "id": s.id,
@@ -732,6 +744,54 @@ fn threads_snapshot(app: &App, store: &Entity<ThreadStore>, cwd: &Path) -> Value
     )
 }
 
+/// Whether a session's `project` directory belongs to the workspace rooted
+/// at `cwd`: the same path, or a worktree of the same git repository.
+fn matches_workspace(
+    project: &str,
+    cwd: &Path,
+    cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> bool {
+    if project == cwd.to_string_lossy().as_ref() {
+        return true;
+    }
+    let Some(cwd_id) = repo_identity_cached(cwd, cache) else {
+        return false;
+    };
+    repo_identity_cached(&PathBuf::from(project), cache).is_some_and(|id| id == cwd_id)
+}
+
+fn repo_identity_cached(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> Option<PathBuf> {
+    cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| repo_identity(path))
+        .clone()
+}
+
+/// The canonical git common directory of the repository owning `path` —
+/// shared by every worktree of that repository — or `None` outside git.
+fn repo_identity(path: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    // Relative output resolves against the queried directory; an absolute
+    // common dir (linked worktrees) replaces the base outright.
+    let joined = path.join(dir);
+    Some(std::fs::canonicalize(&joined).unwrap_or(joined))
+}
+
 /// Subscribe once to store updates so list mutations (title generation,
 /// unread sidecars, running flips) push fresh snapshots without polling.
 fn ensure_store_subscription(
@@ -743,13 +803,14 @@ fn ensure_store_subscription(
         return;
     }
     let cwd = state.cwd.clone();
+    let repo_ids = state.repo_ids.clone();
     let sink = sink.clone();
     state.store_subscription = Some(cx.update(|app| {
         let store = agent::thread_store::global();
         app.subscribe(
             &store,
             move |store: Entity<ThreadStore>, _ev: &ThreadStoreEvent, app: &mut App| {
-                let threads = threads_snapshot(app, &store, &cwd);
+                let threads = threads_snapshot(app, &store, &cwd, &repo_ids);
                 sink.emit(json!({"type": "threads_updated", "threads": threads}).to_string());
             },
         )
@@ -1010,6 +1071,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
 
@@ -1088,6 +1150,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
         // A command for an unknown session is handled (error event) and
@@ -1127,6 +1190,7 @@ mod tests {
             cwd,
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1259,6 +1323,154 @@ mod tests {
         }
         drop(tx); // disconnect ends the loop
         actor.join().unwrap();
+    }
+
+    /// Session files the store scan picks up: one header line per session.
+    fn seed_session_file(dir: &Path, id: &str, cwd: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\"}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A main checkout, a linked worktree of it, and an unrelated repo.
+    /// Idempotent: the fixture survives across tests in the same process.
+    fn git_worktree_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let fixtures = PathBuf::from(std::env::var("HOME").unwrap()).join("worktree-fixtures");
+        let main = fixtures.join("main");
+        let wt = fixtures.join("wt");
+        let other = fixtures.join("other");
+        if main.join(".git").exists() {
+            return (main, wt, other);
+        }
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&main, &["init"]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&main, &["worktree", "add", wt.to_str().unwrap()]);
+        run_git(&other, &["init"]);
+        (main, wt, other)
+    }
+
+    #[test]
+    fn worktree_paths_share_one_repo_identity() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let (main, wt, other) = git_worktree_fixture();
+        let mut cache = HashMap::new();
+        assert!(matches_workspace(wt.to_str().unwrap(), &main, &mut cache));
+        assert!(matches_workspace(main.to_str().unwrap(), &wt, &mut cache));
+        assert!(!matches_workspace(
+            other.to_str().unwrap(),
+            &main,
+            &mut cache
+        ));
+        // A directory outside git matches only itself.
+        let bare = main.parent().unwrap().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(matches_workspace(bare.to_str().unwrap(), &bare, &mut cache));
+        assert!(!matches_workspace(
+            bare.to_str().unwrap(),
+            &main,
+            &mut cache
+        ));
+        // A non-git workspace only ever matches its exact full path: a
+        // subdirectory of the workspace is not the workspace.
+        let child = bare.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(!matches_workspace(
+            child.to_str().unwrap(),
+            &bare,
+            &mut cache
+        ));
+        assert!(!matches_workspace(
+            bare.to_str().unwrap(),
+            &child,
+            &mut cache
+        ));
+    }
+
+    #[test]
+    fn list_threads_includes_worktrees_of_the_workspace_repo() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let (main, wt, other) = git_worktree_fixture();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "wt-main", main.to_str().unwrap());
+        seed_session_file(&sessions, "wt-linked", wt.to_str().unwrap());
+        seed_session_file(&sessions, "wt-other", other.to_str().unwrap());
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(main.clone());
+        let (out, sink) = collect_sink();
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+
+        // The scan is async; wait for a snapshot that has absorbed the
+        // seeded sessions.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let ids = loop {
+            cx.run_until_parked();
+            let snapshot = out
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated");
+            let ids: Vec<String> = snapshot
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids.iter().any(|id| id == "wt-linked") {
+                break ids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(ids.contains(&"wt-main".to_string()));
+        assert!(
+            !ids.contains(&"wt-other".to_string()),
+            "sessions from an unrelated repo must stay hidden"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
     }
 
     #[test]
