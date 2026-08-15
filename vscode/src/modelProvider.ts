@@ -42,7 +42,15 @@ function partToWire(part: unknown): ModelChatBlock {
     return { type: 'tool_call', id: part.callId, name: part.name, input: part.input };
   }
   if (part instanceof vscode.LanguageModelToolResultPart) {
-    return { type: 'tool_result', id: part.callId, content: partToText(part) };
+    // isError is not yet in the stable typings; read it defensively so a
+    // failed tool execution is not relayed to the model as a success.
+    const isError = (part as unknown as { isError?: boolean }).isError;
+    return {
+      type: 'tool_result',
+      id: part.callId,
+      content: partToText(part),
+      ...(isError ? { isError } : {}),
+    };
   }
   if (part instanceof vscode.LanguageModelDataPart) {
     if (part.mimeType.startsWith('image/')) {

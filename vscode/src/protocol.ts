@@ -37,7 +37,7 @@ export type ModelChatBlock =
 	| { type: 'text'; text: string }
 	| { type: 'thinking'; text: string }
 	| { type: 'tool_call'; id: string; name: string; input: unknown }
-	| { type: 'tool_result'; id: string; content: string }
+	| { type: 'tool_result'; id: string; content: string; isError?: boolean }
 	| { type: 'image'; data: string; mimeType: string };
 
 /** One conversation message relayed to the model via `model_chat`. */

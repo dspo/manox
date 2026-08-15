@@ -133,7 +133,7 @@ pub fn build_context(model: &Model, messages: &Value, tools: &Value) -> AgentCon
                                             text: text.to_string(),
                                             signature: None,
                                         }],
-                                        is_error: false,
+                                        is_error: block["isError"].as_bool().unwrap_or(false),
                                         details: None,
                                         usage: None,
                                         added_tool_names: None,
@@ -367,6 +367,20 @@ pub fn start(
                         .to_string(),
                 );
             }
+            Err(_) if token.is_cancelled() => {
+                // The provider streams return Err(ProviderError::Aborted) on
+                // signal; user cancellation is a normal end, so settle the
+                // request with the aborted stop label instead of an error.
+                sink.emit(
+                    json!({
+                        "type": "model_chat_done",
+                        "requestId": rid,
+                        "stop": "aborted",
+                        "error": null,
+                    })
+                    .to_string(),
+                );
+            }
             Err(err) => {
                 sink.emit(
                     json!({
@@ -452,12 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_becomes_its_own_message() {
+    fn tool_result_becomes_its_own_message_and_keeps_the_error_flag() {
         let model = test_model();
         let messages = json!([
             {"role": "user", "content": [
                 {"type": "text", "text": "now what"},
-                {"type": "tool_result", "id": "t1", "content": "42"}
+                {"type": "tool_result", "id": "t1", "content": "42", "isError": true}
             ]}
         ]);
         let ctx = build_context(&model, &messages, &json!([]));
@@ -466,9 +480,11 @@ mod tests {
             AgentMessage::ToolResult {
                 tool_call_id,
                 content,
+                is_error,
                 ..
             } => {
                 assert_eq!(tool_call_id, "t1");
+                assert!(*is_error);
                 assert!(matches!(
                     content[0],
                     ContentBlock::Text { ref text, .. } if text == "42"
@@ -477,6 +493,18 @@ mod tests {
             other => panic!("expected tool result first, got {other:?}"),
         }
         assert!(matches!(ctx.messages[1], AgentMessage::User { .. }));
+
+        // A result without the flag stays a success.
+        let plain = json!([
+            {"role": "user", "content": [
+                {"type": "tool_result", "id": "t2", "content": "ok"}
+            ]}
+        ]);
+        let ctx = build_context(&model, &plain, &json!([]));
+        match &ctx.messages[0] {
+            AgentMessage::ToolResult { is_error, .. } => assert!(!*is_error),
+            other => panic!("expected tool result first, got {other:?}"),
+        }
     }
 
     #[test]

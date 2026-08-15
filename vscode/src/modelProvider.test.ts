@@ -33,6 +33,7 @@ vi.mock('vscode', () => {
     constructor(
       public callId: string,
       public content: unknown[],
+      public isError?: boolean,
     ) {}
   }
   return {
@@ -334,6 +335,8 @@ describe('provideLanguageModelChatResponse', () => {
     );
     token.cancel();
     expect(transport.lastCommand()).toEqual({ cmd: 'cancel_model_chat', requestId });
+    // The actor settles a cancelled stream with stop "aborted" and no error
+    // (the provider returns Err(ProviderError::Aborted) on signal).
     transport.emit({ type: 'model_chat_done', requestId, stop: 'aborted', error: null });
     await expect(pending).resolves.toBeUndefined();
   });
@@ -380,6 +383,21 @@ describe('toWireMessages', () => {
           { type: 'tool_result', id: 'c1', content: 'out more' },
           { type: 'image', data: Buffer.from([1, 2]).toString('base64'), mimeType: 'image/png' },
         ],
+      },
+    ]);
+  });
+
+  it('relays a failed tool result with the error flag', () => {
+    // isError is not in the stable typings; set it on a constructed part.
+    const failed = new vscode.LanguageModelToolResultPart('c1', [textPart('boom')]);
+    (failed as unknown as { isError: boolean }).isError = true;
+    const messages = [
+      msg(vscode.LanguageModelChatMessageRole.User, [failed]),
+    ];
+    expect(toWireMessages(messages)).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', id: 'c1', content: 'boom', isError: true }],
       },
     ]);
   });
