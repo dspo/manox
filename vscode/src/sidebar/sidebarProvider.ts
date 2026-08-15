@@ -54,6 +54,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         case 'error':
           this.post({ type: 'global_error', message: ev.message });
           return;
+        case 'models':
+          // The actor pushes a snapshot once provider registration lands;
+          // relays keep the picker live without a re-request.
+          this.post({ type: 'models', models: ev.models });
+          return;
         case 'threads_updated':
           this.post({ type: 'threads', threads: ev.threads });
           return;
@@ -234,6 +239,7 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="vscode-language" content="${vscode.env.language}">
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
   <link rel="stylesheet" href="${styleUri}">

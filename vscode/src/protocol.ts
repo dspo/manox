@@ -55,6 +55,10 @@ export interface ModelInfo {
 	id: string;
 	name: string;
 	provider: string;
+	/** Wire API shape ("anthropic", "openai_responses", …); drives the
+	 * cascade menu's badge and tint. */
+	api: string;
+	context_window: number;
 }
 
 export interface TokenUsageSnapshot {
@@ -106,14 +110,25 @@ export interface SubagentSnapshot {
 	status: ToolCallStatus;
 }
 
+/** Working-tree change counts for the info card's branch row. */
+export interface GitStats {
+	added: number;
+	deleted: number;
+	untracked: number;
+}
+
 /** Conversation info panel snapshot (thread_info event payload). */
 export interface ThreadInfoSnapshot {
 	worktree_path: string | null;
 	plan: PlanSnapshotWire | null;
 	usage: TokenUsageSnapshot;
+	/** Token usage keyed by "{provider}/{model_id}". */
+	per_model_usage?: Record<string, TokenUsageSnapshot>;
 	cost: number;
 	pending_auth_count: number;
 	agents: SubagentSnapshot[];
+	/** Arrives via the separate async git_stats event. */
+	git_stats?: GitStats;
 }
 
 /** Wire form of one restored-history message (serde shape of
@@ -211,6 +226,7 @@ export type ActorEvent =
 	| { type: 'thread_history'; sessionId: string; messages: WireMessage[] }
 	| { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
 	| { type: 'branch'; sessionId: string; branch: string }
+	| { type: 'git_stats'; sessionId: string; stats: GitStats }
 	| { type: 'history_progress'; sessionId: string }
 	// plan / worktree / sub-agents
 	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string }

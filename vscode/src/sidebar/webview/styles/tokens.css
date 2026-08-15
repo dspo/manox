@@ -24,6 +24,10 @@
   --color-card: var(--vscode-sideBar-background, var(--vscode-editor-background));
   --color-card-foreground: var(--vscode-foreground);
   --color-ring: var(--vscode-focusBorder);
+  --color-info: var(--vscode-charts-green, #34d058);
+  --color-danger: var(--vscode-charts-red, var(--vscode-errorForeground, #f85149));
+  --color-warning: var(--vscode-charts-yellow, #e3b341);
+  --color-success: var(--vscode-charts-green, #34d058);
 
   --font-chrome: var(--vscode-font-family);
   --font-transcript: var(--vscode-font-family);

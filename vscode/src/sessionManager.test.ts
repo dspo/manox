@@ -165,8 +165,13 @@ describe('listModels', () => {
     const { transport, manager } = create();
     const pending = manager.listModels();
     expect(transport.lastCommand()).toEqual({ cmd: 'list_models' });
-    transport.emit({ type: 'models', models: [{ id: 'm', name: 'M', provider: 'p' }] });
-    await expect(pending).resolves.toEqual([{ id: 'm', name: 'M', provider: 'p' }]);
+    transport.emit({
+      type: 'models',
+      models: [{ id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 200000 }],
+    });
+    await expect(pending).resolves.toEqual([
+      { id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 200000 },
+    ]);
   });
 
   it('rejects after the response timeout', async () => {

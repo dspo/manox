@@ -189,6 +189,7 @@ fn handle_command(
             }
             cx.update(agent::init);
             sink.emit(r#"{"type":"ready"}"#.to_string());
+            spawn_models_push(sink.clone());
         }
         "create_session" => {
             let Some(id) = session_id.clone() else {
@@ -495,21 +496,7 @@ fn handle_command(
             });
             sink.emit(json.to_string());
         }),
-        "list_models" => {
-            let registry = agent::pi_providers::global();
-            let models: Vec<serde_json::Value> = registry
-                .models()
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "id": m.id,
-                        "name": agent::pi_providers::display_name(m),
-                        "provider": m.provider,
-                    })
-                })
-                .collect();
-            sink.emit(serde_json::json!({"type": "models", "models": models}).to_string());
-        }
+        "list_models" => sink.emit(models_snapshot().to_string()),
         _ => {}
     }
     true
@@ -704,6 +691,7 @@ fn emit_thread_info(
                 "worktree_path": worktree_path,
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
                 "usage": t.cumulative_token_usage(),
+                "per_model_usage": t.per_model_token_usage(),
                 "cost": t.cumulative_cost(),
                 "pending_auth_count": t.pending_auth_entries().len(),
                 "agents": agents,
@@ -711,7 +699,8 @@ fn emit_thread_info(
         })
         .to_string(),
     );
-    spawn_branch_lookup(session_id.to_string(), branch_dir, sink.clone());
+    spawn_branch_lookup(session_id.to_string(), branch_dir.clone(), sink.clone());
+    spawn_git_stats(session_id.to_string(), branch_dir, sink.clone());
 }
 
 /// `threads_updated` item list, scoped to this project's live sessions.
@@ -831,6 +820,92 @@ fn spawn_branch_lookup(session_id: String, dir: String, sink: EventSink) {
                 json!({"type": "branch", "sessionId": session_id, "branch": branch}).to_string(),
             );
         }
+    });
+}
+
+/// Working-tree change counts for the info card's branch row; every failure
+/// mode degrades to zeros rather than blocking the snapshot.
+fn spawn_git_stats(session_id: String, dir: String, sink: EventSink) {
+    agent::runtime::handle().spawn_blocking(move || {
+        sink.emit(
+            json!({
+                "type": "git_stats",
+                "sessionId": session_id,
+                "stats": git_stats(&dir),
+            })
+            .to_string(),
+        );
+    });
+}
+
+fn git_stats(dir: &str) -> Value {
+    let (mut added, mut deleted) = (0u64, 0u64);
+    if let Some(out) = std::process::Command::new("git")
+        .args(["diff", "--numstat", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((a, d)) = parse_numstat_line(line) {
+                added += a;
+                deleted += d;
+            }
+        }
+    }
+    let untracked = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    json!({ "added": added, "deleted": deleted, "untracked": untracked })
+}
+
+/// One `git diff --numstat` line: "added<TAB>deleted<TAB>path"; binary
+/// files report "-" in both count columns and contribute nothing.
+fn parse_numstat_line(line: &str) -> Option<(u64, u64)> {
+    let mut parts = line.splitn(3, '\t');
+    let added = parts.next()?.parse().ok()?;
+    let deleted = parts.next()?.parse().ok()?;
+    Some((added, deleted))
+}
+
+/// Wire shape shared by the `list_models` response and the post-init push.
+fn model_json(model: &pi::types::Model) -> Value {
+    json!({
+        "id": model.id,
+        "name": agent::pi_providers::display_name(model),
+        "provider": model.provider,
+        "api": model.api,
+        "context_window": model.context_window,
+    })
+}
+
+fn models_snapshot() -> Value {
+    let models: Vec<Value> = agent::pi_providers::global()
+        .models()
+        .iter()
+        .map(model_json)
+        .collect();
+    json!({ "type": "models", "models": models })
+}
+
+/// Push a `models` snapshot once the one-shot provider registration
+/// completes: surfaces that listed before then saw an empty registry and
+/// never retried, leaving the model picker permanently disabled.
+fn spawn_models_push(sink: EventSink) {
+    agent::runtime::handle().spawn(async move {
+        agent::pi_providers::wait_ready().await;
+        sink.emit(models_snapshot().to_string());
     });
 }
 
@@ -1235,5 +1310,61 @@ mod tests {
         cx.run_until_parked();
         drop(state);
         agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn pushes_models_snapshot_after_provider_registration() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let (out, sink) = collect_sink();
+
+        spawn_models_push(sink);
+        assert!(pump_until(&out, &mut cx, "models", 1));
+        let event: Value =
+            serde_json::from_str(&out.lock().unwrap()[0]).expect("models event is valid json");
+        // The hermetic home registers no providers; the snapshot still lands
+        // so waiting surfaces can leave their disabled state.
+        assert!(event["models"].is_array());
+    }
+
+    #[test]
+    fn model_json_exposes_wire_fields() {
+        let model = pi::types::Model {
+            provider: "anthropic".into(),
+            api: "anthropic".into(),
+            id: "claude-sonnet-4-6".into(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: HashMap::new(),
+        };
+        let value = model_json(&model);
+        assert_eq!(value["id"], "claude-sonnet-4-6");
+        assert_eq!(value["provider"], "anthropic");
+        assert_eq!(value["api"], "anthropic");
+        assert_eq!(value["context_window"], 200_000);
+        assert!(value["name"].is_string());
+    }
+
+    #[test]
+    fn parses_numstat_lines() {
+        assert_eq!(parse_numstat_line("12\t3\tsrc/main.rs"), Some((12, 3)));
+        assert_eq!(parse_numstat_line("0\t0\tnew.rs"), Some((0, 0)));
+        // Binary files report "-" counts.
+        assert_eq!(parse_numstat_line("-\t-\tlogo.png"), None);
+        assert_eq!(parse_numstat_line(""), None);
+    }
+
+    #[test]
+    fn git_stats_outside_a_repo_is_zero() {
+        let dir = std::env::temp_dir().join(format!("manox-git-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats = git_stats(dir.to_str().unwrap());
+        assert_eq!(stats["added"], 0);
+        assert_eq!(stats["deleted"], 0);
+        assert_eq!(stats["untracked"], 0);
     }
 }

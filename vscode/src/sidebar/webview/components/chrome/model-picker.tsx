@@ -1,17 +1,28 @@
-import { Check, ChevronsUpDown } from 'lucide-react';
+import { Check, ChevronUp } from 'lucide-react';
 
-import { ThreadApi } from '../../api/client';
 import type { ModelInfo } from '../../../../protocol';
-import { Button } from '../ui/button';
+import { ThreadApi } from '../../api/client';
+import { t } from '../../lib/i18n';
+import { cn } from '../../lib/utils';
+import { Badge } from '../ui/badge';
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuGroup,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
+
+// Model names take the tint of their wire api, mirroring the host's picker.
+const API_TINTS: Record<string, string> = {
+  anthropic: 'text-primary',
+  openai_responses: 'text-info',
+  openai_completions: 'text-warning',
+};
+
+const apiTint = (api: string): string => API_TINTS[api] ?? 'text-foreground';
 
 export type ModelPickerProps = {
   models: ModelInfo[];
@@ -27,38 +38,52 @@ export const ModelPicker = ({ models, currentModelId, disabled, sessionId }: Mod
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button
-          className="h-7 w-full justify-between gap-1 px-2 font-normal text-xs"
+        <button
+          className={cn(
+            'flex cursor-pointer items-center gap-1 text-xs',
+            disabled && 'pointer-events-none opacity-50',
+          )}
           disabled={disabled}
-          size="sm"
-          variant="ghost"
+          type="button"
         >
-          <span className="truncate">{current?.name ?? 'Select model'}</span>
-          <ChevronsUpDown className="size-3 shrink-0 text-muted-foreground" />
-        </Button>
+          {current ? (
+            <>
+              <span className="shrink-0">{current.provider}</span>
+              <span className="text-muted-foreground shrink-0">·</span>
+              <span className={cn('max-w-40 truncate', apiTint(current.api))}>
+                {current.name}
+              </span>
+            </>
+          ) : (
+            <span className="text-muted-foreground">{t('select_model')}</span>
+          )}
+          <ChevronUp className="text-muted-foreground size-3 shrink-0" />
+        </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="start"
-        className="max-h-[320px] w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
-      >
-        {providers.map((provider, index) => (
-          <div key={provider}>
-            {index > 0 && <DropdownMenuSeparator />}
-            <DropdownMenuGroup>
-              <DropdownMenuLabel>{provider}</DropdownMenuLabel>
+      <DropdownMenuContent align="end" className="max-h-[320px] w-52 overflow-y-auto">
+        {providers.map((provider) => (
+          <DropdownMenuSub key={provider}>
+            <DropdownMenuSubTrigger>
+              <span className="truncate text-sm font-medium">{provider}</span>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="max-h-[320px] w-64 overflow-y-auto">
               {models
                 .filter((m) => m.provider === provider)
                 .map((m) => (
                   <DropdownMenuItem
+                    className="gap-2"
                     key={m.id}
                     onSelect={() => sessionId && new ThreadApi(sessionId).setModel(m.id)}
                   >
+                    <Badge className="px-1 text-[10px] font-normal" variant="outline">
+                      {m.api}
+                    </Badge>
                     <span className="flex-1 truncate">{m.name}</span>
                     {m.id === currentModelId && <Check className="size-4 shrink-0" />}
                   </DropdownMenuItem>
                 ))}
-            </DropdownMenuGroup>
-          </div>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
         ))}
       </DropdownMenuContent>
     </DropdownMenu>

@@ -1,22 +1,22 @@
 // Conversation view: header with back arrow and thread title, transcript,
-// error banner, composer, usage. A wide container additionally shows the
-// conversation info panel.
+// error banner, composer. A wide container additionally shows the
+// conversation info card.
 
 import { ArrowLeft } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import type { CommandEntry, ModelInfo } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
+import { t } from '../lib/i18n';
 import type { ThreadState } from '../state/bridge';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
 import { ErrorBanner } from './chrome/error-banner';
-import { UsageBar } from './chrome/usage-bar';
 import { InfoPanel } from './info-panel';
 import { MessageList } from './transcript/message-list';
 import { Button } from './ui/button';
 
-const WIDE_BREAKPOINT_PX = 560;
+const WIDE_BREAKPOINT_PX = 760;
 
 export type ConversationViewProps = {
   thread: ThreadState;
@@ -57,7 +57,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
   return (
     <div ref={containerRef} className="font-chrome flex h-screen flex-col bg-background text-foreground">
       <div className="flex items-center gap-1 border-b px-2 py-1.5">
-        <Button onClick={backToList} size="icon-sm" title="Back to threads" variant="ghost">
+        <Button onClick={backToList} size="icon-sm" title={t('back_to_threads')} variant="ghost">
           <ArrowLeft className="size-4" />
         </Button>
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{thread.title}</span>
@@ -65,13 +65,17 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
       <div className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
           <MessageList
+            approvalMode={thread.approvalMode}
+            branch={thread.branch}
+            cwd={thread.cwd}
             items={thread.items}
+            lastTurnDurationSec={thread.lastTurnDurationSec}
             models={models}
             sessionId={thread.sessionId}
             turnActive={thread.turnActive}
           />
         </div>
-        {wide && <InfoPanel thread={thread} />}
+        {wide && <InfoPanel models={models} thread={thread} />}
       </div>
       <ErrorBanner message={error} />
       <Composer
@@ -82,7 +86,6 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
         sessionId={thread.sessionId}
         turnActive={thread.turnActive}
       />
-      <UsageBar usage={thread.usage} />
     </div>
   );
 };

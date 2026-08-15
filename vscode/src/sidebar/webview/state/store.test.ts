@@ -1,7 +1,7 @@
 // Store behaviour: per-thread event routing, tool-card folding, restored
 // history mapping, and the view/thread bookkeeping around them.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ActorEvent, WireMessage } from '../../../protocol';
 import type { HostToWebview } from '../../messages';
@@ -227,6 +227,21 @@ describe('transcript folding', () => {
     expect(thread(store)?.turnActive).toBe(false);
   });
 
+  it('times turns for the meta line', () => {
+    const store = startSession();
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(100_000);
+    store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
+    expect(thread(store)?.turnStartedAt).toBe(100_000);
+    now.mockReturnValue(103_000);
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 's', cancelled: false, failed: false }),
+    );
+    expect(thread(store)?.turnStartedAt).toBeNull();
+    expect(thread(store)?.lastTurnDurationSec).toBe(3);
+    now.mockRestore();
+  });
+
   it('routes session errors to their own thread only', () => {
     const store = startSession('a');
     store.dispatch(ready('b'));
@@ -295,7 +310,10 @@ describe('transcript folding', () => {
 describe('global folds', () => {
   it('stores models, commands, and surfaces errors', () => {
     const store = new Store();
-    store.dispatch({ type: 'models', models: [{ id: 'm', name: 'M', provider: 'p' }] });
+    store.dispatch({
+      type: 'models',
+      models: [{ id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 200000 }],
+    });
     store.dispatch({
       type: 'commands',
       commands: [{ name: 'deliver', description: 'Ship', kind: 'command', argument_hint: null }],
@@ -357,6 +375,33 @@ describe('global folds', () => {
 
     store.dispatch(event({ type: 'worktree_changed', sessionId: 's', active: false, path: null }));
     expect(thread(store)?.info?.worktree_path).toBeNull();
+  });
+
+  it('carries per-model usage in thread_info and merges async git_stats', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'thread_info',
+      sessionId: 's',
+      info: {
+        worktree_path: null,
+        plan: null,
+        usage: {},
+        per_model_usage: { 'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 } },
+        cost: 0,
+        pending_auth_count: 0,
+        agents: [],
+      },
+    });
+    expect(thread(store)?.info?.per_model_usage).toEqual({
+      'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 },
+    });
+
+    store.dispatch(
+      event({ type: 'git_stats', sessionId: 's', stats: { added: 3, deleted: 1, untracked: 2 } }),
+    );
+    const info = thread(store)?.info;
+    expect(info?.git_stats).toEqual({ added: 3, deleted: 1, untracked: 2 });
+    expect(info?.per_model_usage).toBeDefined();
   });
 
   it('aggregates sub-agent start and progress into the info snapshot', () => {

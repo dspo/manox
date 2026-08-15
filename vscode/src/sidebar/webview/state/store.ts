@@ -41,6 +41,10 @@ export interface ThreadState {
   loading: boolean;
   /** Last error emitted for this thread; cleared when a new turn starts. */
   error: string | null;
+  /** Wall-clock start of the in-flight turn; null when idle. */
+  turnStartedAt: number | null;
+  /** Duration of the most recent finished turn, for the meta line. */
+  lastTurnDurationSec: number | null;
 }
 
 export interface ChatState {
@@ -80,6 +84,8 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   branch: null,
   loading: false,
   error: null,
+  turnStartedAt: null,
+  lastTurnDurationSec: null,
 });
 
 const emptyInfo = (): ThreadInfoSnapshot => ({
@@ -255,10 +261,24 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
   switch (ev.type) {
     case 'turn_started':
       // A fresh turn supersedes any stale error from the previous one.
-      return { ...t, turnActive: true, turnModelId: t.currentModelId, error: null };
+      return {
+        ...t,
+        turnActive: true,
+        turnModelId: t.currentModelId,
+        turnStartedAt: Date.now(),
+        error: null,
+      };
     case 'turn_finished':
     case 'stop':
-      return { ...t, turnActive: false };
+      return {
+        ...t,
+        turnActive: false,
+        lastTurnDurationSec:
+          t.turnStartedAt === null
+            ? t.lastTurnDurationSec
+            : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
+        turnStartedAt: null,
+      };
     case 'agent_text':
       return appendAssistantText(t, ev.text);
     case 'agent_thinking':
@@ -327,6 +347,8 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       return { ...t, info: ev.info };
     case 'branch':
       return { ...t, branch: ev.branch };
+    case 'git_stats':
+      return { ...t, info: { ...(t.info ?? emptyInfo()), git_stats: ev.stats } };
     case 'history_progress':
       return { ...t, loading: true };
     case 'plan_updated':

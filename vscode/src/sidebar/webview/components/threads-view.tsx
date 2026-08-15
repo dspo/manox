@@ -6,7 +6,9 @@ import { LoaderCircle, MessageSquare, Plus, TriangleAlert } from 'lucide-react';
 
 import type { ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
+import { t } from '../lib/i18n';
 import { store } from '../state/bridge';
+import { ErrorBanner } from './chrome/error-banner';
 import { Button } from './ui/button';
 
 const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
@@ -46,20 +48,29 @@ const StatusIcon = ({ item }: { item: ThreadListItem }) => {
 
 export type ThreadsViewProps = {
   threads: ThreadListItem[];
+  /** Global error surfaced above the list (per-thread errors stay in the
+   * conversation view). */
+  error: string | null;
 };
 
-export const ThreadsView = ({ threads }: ThreadsViewProps) => (
+export const ThreadsView = ({ threads, error }: ThreadsViewProps) => (
   <div className="font-chrome flex h-screen flex-col bg-background text-foreground">
     <div className="flex items-center gap-1 border-b px-3 py-1.5">
-      <span className="min-w-0 flex-1 font-medium text-sm">Threads</span>
-      <Button onClick={() => api.newSession()} size="icon-sm" title="New conversation" variant="ghost">
+      <span className="min-w-0 flex-1 font-medium text-sm">{t('threads')}</span>
+      <Button
+        onClick={() => api.newSession()}
+        size="icon-sm"
+        title={t('new_conversation')}
+        variant="ghost"
+      >
         <Plus className="size-4" />
       </Button>
     </div>
+    <ErrorBanner message={error} />
     {threads.length === 0 ? (
       <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 text-sm">
         <MessageSquare className="size-6" />
-        <p>No conversations yet</p>
+        <p>{t('threads_empty')}</p>
       </div>
     ) : (
       <ul className="flex-1 overflow-y-auto py-1">

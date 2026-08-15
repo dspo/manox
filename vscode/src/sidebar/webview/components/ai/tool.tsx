@@ -1,17 +1,9 @@
-import {
-  Ban,
-  CheckCircle,
-  ChevronDown,
-  Circle,
-  Clock,
-  MinusCircle,
-  Wrench,
-  XCircle,
-} from 'lucide-react';
+import { Ban, Check, ChevronRight, Circle, Clock, MinusCircle, X } from 'lucide-react';
 import type { ComponentProps, ReactNode } from 'react';
+import { useEffect, useState } from 'react';
 
+import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
-import { Badge } from '../ui/badge';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
 
 /** UI status vocabulary. Terminal wire statuses are folded in the store
@@ -29,46 +21,30 @@ export type ToolProps = ComponentProps<typeof Collapsible>;
 
 export const Tool = ({ className, ...props }: ToolProps) => (
   <Collapsible
-    className={cn('group not-prose mb-4 w-full rounded-md border', className)}
+    className={cn('group not-prose mb-4 w-full overflow-hidden rounded-lg border', className)}
     {...props}
   />
 );
 
-const statusLabels: Record<ToolStatus, string> = {
-  'pending-approval': 'Awaiting Approval',
-  running: 'Running',
-  completed: 'Completed',
-  failed: 'Error',
-  denied: 'Denied',
-  cancelled: 'Cancelled',
-  continued: 'Continued',
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const BrailleSpinner = ({ className }: { className?: string }) => {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 80);
+    return () => clearInterval(timer);
+  }, []);
+  return <span className={cn('inline-block leading-none', className)}>{SPINNER_FRAMES[frame]}</span>;
 };
 
 const statusIcons: Record<ToolStatus, ReactNode> = {
-  'pending-approval': <Clock className="size-4 text-amber-600" />,
-  running: <Clock className="size-4 animate-pulse" />,
-  completed: <CheckCircle className="size-4 text-green-600" />,
-  failed: <XCircle className="size-4 text-red-600" />,
-  denied: <Ban className="size-4 text-orange-500" />,
-  cancelled: <Circle className="size-4 text-muted-foreground" />,
-  continued: <MinusCircle className="size-4 text-muted-foreground" />,
-};
-
-export const getStatusBadge = (status: string) => {
-  if (status in statusLabels) {
-    const known = status as ToolStatus;
-    return (
-      <Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
-        {statusIcons[known]}
-        {statusLabels[known]}
-      </Badge>
-    );
-  }
-  return (
-    <Badge className="gap-1.5 rounded-full text-xs" variant="outline">
-      {status}
-    </Badge>
-  );
+  'pending-approval': <Clock className="size-3.5 shrink-0 text-warning" />,
+  running: <BrailleSpinner className="text-muted-foreground" />,
+  completed: <Check className="size-3.5 shrink-0 text-success" />,
+  failed: <X className="size-3.5 shrink-0 text-danger" />,
+  denied: <Ban className="size-3.5 shrink-0 text-warning" />,
+  cancelled: <Circle className="size-3.5 shrink-0 text-muted-foreground" />,
+  continued: <MinusCircle className="size-3.5 shrink-0 text-muted-foreground" />,
 };
 
 export type ToolHeaderProps = ComponentProps<typeof CollapsibleTrigger> & {
@@ -78,15 +54,15 @@ export type ToolHeaderProps = ComponentProps<typeof CollapsibleTrigger> & {
 
 export const ToolHeader = ({ className, title, status, ...props }: ToolHeaderProps) => (
   <CollapsibleTrigger
-    className={cn('flex w-full items-center justify-between gap-4 p-3', className)}
+    className={cn(
+      'font-code text-muted-foreground hover:bg-accent/50 flex w-full cursor-pointer items-center gap-1.5 px-2 py-1 text-[13px] italic transition-colors',
+      className,
+    )}
     {...props}
   >
-    <div className="flex min-w-0 items-center gap-2">
-      <Wrench className="size-4 shrink-0 text-muted-foreground" />
-      <span className="truncate font-medium text-sm">{title}</span>
-      {getStatusBadge(status)}
-    </div>
-    <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+    <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
+    <span className="min-w-0 flex-1 truncate text-left">{title}</span>
+    {(statusIcons as Record<string, ReactNode>)[status] ?? null}
   </CollapsibleTrigger>
 );
 
@@ -95,12 +71,21 @@ export type ToolContentProps = ComponentProps<typeof CollapsibleContent>;
 export const ToolContent = ({ className, ...props }: ToolContentProps) => (
   <CollapsibleContent
     className={cn(
-      'data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 space-y-4 p-4 outline-none data-[state=closed]:animate-out data-[state=open]:animate-in',
+      'data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 px-3 py-2 outline-none data-[state=closed]:animate-out data-[state=open]:animate-in',
       className,
     )}
     {...props}
   />
 );
+
+const MAX_VISIBLE_LINES = 20;
+
+const lineClass = (line: string, isError: boolean): string => {
+  if (isError) return 'text-danger whitespace-pre-wrap break-all';
+  if (line.startsWith('+')) return 'text-success whitespace-pre-wrap break-all';
+  if (line.startsWith('-')) return 'text-danger whitespace-pre-wrap break-all';
+  return 'text-muted-foreground whitespace-pre-wrap break-all';
+};
 
 export type ToolOutputProps = ComponentProps<'div'> & {
   output?: string;
@@ -108,23 +93,28 @@ export type ToolOutputProps = ComponentProps<'div'> & {
 };
 
 export const ToolOutput = ({ className, output, errorText, ...props }: ToolOutputProps) => {
-  if (!(output || errorText)) {
-    return null;
-  }
-
+  const [expanded, setExpanded] = useState(false);
+  const text = errorText ?? output;
+  if (!text) return null;
+  const lines = text.replace(/\n$/, '').split('\n');
+  const hidden = lines.length - MAX_VISIBLE_LINES;
+  const visible = hidden <= 0 || expanded ? lines : lines.slice(0, MAX_VISIBLE_LINES);
   return (
-    <div className={cn('space-y-2', className)} {...props}>
-      <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {errorText ? 'Error' : 'Result'}
-      </h4>
-      <pre
-        className={cn(
-          'font-code max-h-[180px] overflow-auto whitespace-pre-wrap break-all rounded-md p-3 text-xs',
-          errorText ? 'bg-destructive/10 text-destructive' : 'bg-muted/50 text-foreground',
-        )}
-      >
-        {errorText ?? output}
-      </pre>
+    <div className={cn('font-code text-xs italic', className)} {...props}>
+      {visible.map((line, index) => (
+        <div className={lineClass(line, Boolean(errorText))} key={index}>
+          {line || ' '}
+        </div>
+      ))}
+      {hidden > 0 && !expanded && (
+        <button
+          className="text-primary cursor-pointer not-italic"
+          onClick={() => setExpanded(true)}
+          type="button"
+        >
+          {t('show_n_more', hidden)}
+        </button>
+      )}
     </div>
   );
 };
