@@ -539,11 +539,15 @@ fn handle_command(
                 return true;
             };
             let Some(model_id) = cmd["model"].as_str() else {
-                sink.emit(model_chat_done_error(&request_id, "model_chat requires a model id"));
+                sink.emit(model_chat_done_error(
+                    &request_id,
+                    "model_chat requires a model id",
+                ));
                 return true;
             };
             let registry = agent::pi_providers::global();
-            let Some(model) = pi_extensions::model_ref::resolve_model_ref(&registry, model_id) else {
+            let Some(model) = pi_extensions::model_ref::resolve_model_ref(&registry, model_id)
+            else {
                 sink.emit(model_chat_done_error(&request_id, "unknown model"));
                 return true;
             };
