@@ -5411,6 +5411,7 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "gpui",
+ "pi",
  "pi-extensions",
  "serde_json",
 ]

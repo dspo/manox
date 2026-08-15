@@ -13,7 +13,7 @@
   --color-foreground: var(--vscode-foreground);
   --color-muted: var(--vscode-textBlockQuote-background);
   --color-muted-foreground: var(--vscode-descriptionForeground);
-  --color-border: var(--vscode-panel-border);
+  --color-border: var(--vscode-panel-border, var(--vscode-sideBar-border, rgba(127, 127, 127, 0.3)));
   --color-primary: var(--vscode-button-background);
   --color-primary-foreground: var(--vscode-button-foreground);
   --color-destructive: var(--vscode-errorForeground);
@@ -24,6 +24,10 @@
   --color-card: var(--vscode-sideBar-background, var(--vscode-editor-background));
   --color-card-foreground: var(--vscode-foreground);
   --color-ring: var(--vscode-focusBorder);
+  --color-info: var(--vscode-charts-green, #34d058);
+  --color-danger: var(--vscode-charts-red, var(--vscode-errorForeground, #f85149));
+  --color-warning: var(--vscode-charts-yellow, #e3b341);
+  --color-success: var(--vscode-charts-green, #34d058);
 
   --font-chrome: var(--vscode-font-family);
   --font-transcript: var(--vscode-font-family);

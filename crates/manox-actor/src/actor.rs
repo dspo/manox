@@ -7,7 +7,8 @@
 //! projected event carries its session id, so multiple host surfaces (chat
 //! participant, sidebar) share the actor without cross-talk. The foreground
 //! executor is driven with `run_until_parked` while any session's turn is
-//! active, and the thread blocks on the command channel when idle.
+//! active, and the thread waits on the command channel when idle, waking
+//! periodically so parked async work still lands.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,9 @@ struct ActorState {
     /// Keeps the `ThreadStoreEvent` subscription alive for the actor's
     /// lifetime; established on the first `list_threads`.
     store_subscription: Option<Subscription>,
+    /// Memoized git-repository identity per path, so the workspace filter
+    /// resolves each distinct project directory at most once.
+    repo_ids: Arc<Mutex<HashMap<PathBuf, Option<PathBuf>>>>,
 }
 
 impl ActorState {
@@ -134,6 +138,7 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         focused: Arc::new(Mutex::new(None)),
         store_subscription: None,
+        repo_ids: Arc::new(Mutex::new(HashMap::new())),
     };
 
     loop {
@@ -152,14 +157,18 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
             thread::sleep(Duration::from_millis(5));
             continue;
         }
-        // Idle: block until the host delivers a command.
-        match rx.recv() {
+        // Idle: wait for the next command, but wake periodically so parked
+        // async work (the thread-directory scan behind list_threads and its
+        // follow-up snapshot push) still lands — an unconditional recv()
+        // would freeze those events until a command happens to arrive.
+        match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(cmd) => {
                 if !handle_command(cx, &mut state, sink, &cmd) {
                     return;
                 }
             }
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -189,6 +198,7 @@ fn handle_command(
             }
             cx.update(agent::init);
             sink.emit(r#"{"type":"ready"}"#.to_string());
+            spawn_models_push(sink.clone());
         }
         "create_session" => {
             let Some(id) = session_id.clone() else {
@@ -303,6 +313,30 @@ fn handle_command(
                 });
             }
         }
+        "archive_thread" => {
+            let Some(id) = session_id.clone() else {
+                sink.emit(error_json(None, "archive_thread requires sessionId"));
+                return true;
+            };
+            let archived = cmd["archived"].as_bool().unwrap_or(true);
+            ensure_store_subscription(cx, state, sink);
+            cx.update(|app| {
+                let store = agent::thread_store::global();
+                store.update(app, |s, cx| s.archive_thread(&id, archived, cx));
+            });
+        }
+        "pin_thread" => {
+            let Some(id) = session_id.clone() else {
+                sink.emit(error_json(None, "pin_thread requires sessionId"));
+                return true;
+            };
+            let pinned = cmd["pinned"].as_bool().unwrap_or(true);
+            ensure_store_subscription(cx, state, sink);
+            cx.update(|app| {
+                let store = agent::thread_store::global();
+                store.update(app, |s, cx| s.pin_thread(&id, pinned, cx));
+            });
+        }
         "list_threads" => {
             ensure_store_subscription(cx, state, sink);
             cx.update(|app| {
@@ -311,7 +345,7 @@ fn handle_command(
             });
             let threads = cx.update(|app| {
                 let store = agent::thread_store::global();
-                threads_snapshot(app, &store, &state.cwd)
+                threads_snapshot(app, &store, &state.cwd, &state.repo_ids)
             });
             sink.emit(json!({"type": "threads_updated", "threads": threads}).to_string());
         }
@@ -495,21 +529,7 @@ fn handle_command(
             });
             sink.emit(json.to_string());
         }),
-        "list_models" => {
-            let registry = agent::pi_providers::global();
-            let models: Vec<serde_json::Value> = registry
-                .models()
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "id": m.id,
-                        "name": agent::pi_providers::display_name(m),
-                        "provider": m.provider,
-                    })
-                })
-                .collect();
-            sink.emit(serde_json::json!({"type": "models", "models": models}).to_string());
-        }
+        "list_models" => sink.emit(models_snapshot().to_string()),
         _ => {}
     }
     true
@@ -704,6 +724,7 @@ fn emit_thread_info(
                 "worktree_path": worktree_path,
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
                 "usage": t.cumulative_token_usage(),
+                "per_model_usage": t.per_model_token_usage(),
                 "cost": t.cumulative_cost(),
                 "pending_auth_count": t.pending_auth_entries().len(),
                 "agents": agents,
@@ -711,32 +732,100 @@ fn emit_thread_info(
         })
         .to_string(),
     );
-    spawn_branch_lookup(session_id.to_string(), branch_dir, sink.clone());
+    spawn_branch_lookup(session_id.to_string(), branch_dir.clone(), sink.clone());
+    spawn_git_stats(session_id.to_string(), branch_dir, sink.clone());
 }
 
-/// `threads_updated` item list, scoped to this project's live sessions.
-fn threads_snapshot(app: &App, store: &Entity<ThreadStore>, cwd: &Path) -> Value {
+/// `threads_updated` item list, scoped to the workspace's live sessions:
+/// the workspace directory itself plus every worktree of the same git
+/// repository.
+fn threads_snapshot(
+    app: &App,
+    store: &Entity<ThreadStore>,
+    cwd: &Path,
+    repo_ids: &Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+) -> Value {
     let store = store.read(app);
-    let cwd = cwd.to_string_lossy();
-    Value::Array(
-        store
-            .summaries()
-            .iter()
-            .filter(|s| !s.archived && s.project == cwd.as_ref())
-            .map(|s| {
-                json!({
-                    "id": s.id,
-                    "title": s.display_title(),
-                    "updated_at": s.interacted_at,
-                    "running": store.is_running(&s.id),
-                    "unread": s.has_unread,
-                    "errored": s.errored,
-                    "pending_auth": store.pending_auth_contains(&s.id),
-                    "model_id": s.model_id,
-                })
+    let mut cache = repo_ids.lock().unwrap();
+    let rows = store
+        .summaries()
+        .iter()
+        .chain(store.archived_summaries())
+        // Archived rows stay in the snapshot so the surface can render them
+        // behind its "more" affordance instead of dropping them.
+        .filter(|s| matches_workspace(&s.project, cwd, &mut cache))
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "title": s.display_title(),
+                "updated_at": s.interacted_at,
+                "running": store.is_running(&s.id),
+                "unread": s.has_unread,
+                "errored": s.errored,
+                "pending_auth": store.pending_auth_contains(&s.id),
+                "model_id": s.model_id,
+                "pinned": s.pinned,
+                "archived": s.archived,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    Value::Array(rows)
+}
+
+/// Whether a session's `project` directory belongs to the workspace rooted
+/// at `cwd`: the same path, or a worktree of the same git repository.
+fn matches_workspace(
+    project: &str,
+    cwd: &Path,
+    cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> bool {
+    if project == cwd.to_string_lossy().as_ref() {
+        return true;
+    }
+    let Some(cwd_id) = repo_identity_cached(cwd, cache) else {
+        return false;
+    };
+    repo_identity_cached(&PathBuf::from(project), cache).is_some_and(|id| id == cwd_id)
+}
+
+fn repo_identity_cached(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> Option<PathBuf> {
+    if let Some(identity @ Some(_)) = cache.get(path) {
+        // A confirmed repository identity is stable for the actor's
+        // lifetime.
+        return identity.clone();
+    }
+    // A miss may just predate a `git init` in the workspace, so it is
+    // rechecked on every call instead of caching the negative.
+    let identity = repo_identity(path);
+    if identity.is_some() {
+        cache.insert(path.to_path_buf(), identity.clone());
+    }
+    identity
+}
+
+/// The canonical git common directory of the repository owning `path` —
+/// shared by every worktree of that repository — or `None` outside git.
+fn repo_identity(path: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if dir.is_empty() {
+        return None;
+    }
+    // Relative output resolves against the queried directory; an absolute
+    // common dir (linked worktrees) replaces the base outright.
+    let joined = path.join(dir);
+    Some(std::fs::canonicalize(&joined).unwrap_or(joined))
 }
 
 /// Subscribe once to store updates so list mutations (title generation,
@@ -750,13 +839,14 @@ fn ensure_store_subscription(
         return;
     }
     let cwd = state.cwd.clone();
+    let repo_ids = state.repo_ids.clone();
     let sink = sink.clone();
     state.store_subscription = Some(cx.update(|app| {
         let store = agent::thread_store::global();
         app.subscribe(
             &store,
             move |store: Entity<ThreadStore>, _ev: &ThreadStoreEvent, app: &mut App| {
-                let threads = threads_snapshot(app, &store, &cwd);
+                let threads = threads_snapshot(app, &store, &cwd, &repo_ids);
                 sink.emit(json!({"type": "threads_updated", "threads": threads}).to_string());
             },
         )
@@ -831,6 +921,92 @@ fn spawn_branch_lookup(session_id: String, dir: String, sink: EventSink) {
                 json!({"type": "branch", "sessionId": session_id, "branch": branch}).to_string(),
             );
         }
+    });
+}
+
+/// Working-tree change counts for the info card's branch row; every failure
+/// mode degrades to zeros rather than blocking the snapshot.
+fn spawn_git_stats(session_id: String, dir: String, sink: EventSink) {
+    agent::runtime::handle().spawn_blocking(move || {
+        sink.emit(
+            json!({
+                "type": "git_stats",
+                "sessionId": session_id,
+                "stats": git_stats(&dir),
+            })
+            .to_string(),
+        );
+    });
+}
+
+fn git_stats(dir: &str) -> Value {
+    let (mut added, mut deleted) = (0u64, 0u64);
+    if let Some(out) = std::process::Command::new("git")
+        .args(["diff", "--numstat", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((a, d)) = parse_numstat_line(line) {
+                added += a;
+                deleted += d;
+            }
+        }
+    }
+    let untracked = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    json!({ "added": added, "deleted": deleted, "untracked": untracked })
+}
+
+/// One `git diff --numstat` line: "added<TAB>deleted<TAB>path"; binary
+/// files report "-" in both count columns and contribute nothing.
+fn parse_numstat_line(line: &str) -> Option<(u64, u64)> {
+    let mut parts = line.splitn(3, '\t');
+    let added = parts.next()?.parse().ok()?;
+    let deleted = parts.next()?.parse().ok()?;
+    Some((added, deleted))
+}
+
+/// Wire shape shared by the `list_models` response and the post-init push.
+fn model_json(model: &pi::types::Model) -> Value {
+    json!({
+        "id": model.id,
+        "name": agent::pi_providers::display_name(model),
+        "provider": model.provider,
+        "api": model.api,
+        "context_window": model.context_window,
+    })
+}
+
+fn models_snapshot() -> Value {
+    let models: Vec<Value> = agent::pi_providers::global()
+        .models()
+        .iter()
+        .map(model_json)
+        .collect();
+    json!({ "type": "models", "models": models })
+}
+
+/// Push a `models` snapshot once the one-shot provider registration
+/// completes: surfaces that listed before then saw an empty registry and
+/// never retried, leaving the model picker permanently disabled.
+fn spawn_models_push(sink: EventSink) {
+    agent::runtime::handle().spawn(async move {
+        agent::pi_providers::wait_ready().await;
+        sink.emit(models_snapshot().to_string());
     });
 }
 
@@ -931,6 +1107,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
 
@@ -1009,6 +1186,7 @@ mod tests {
             cwd: PathBuf::from("/"),
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         };
         let (out, sink) = collect_sink();
         // A command for an unknown session is handled (error event) and
@@ -1048,6 +1226,7 @@ mod tests {
             cwd,
             focused: Arc::new(Mutex::new(None)),
             store_subscription: None,
+            repo_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1124,6 +1303,318 @@ mod tests {
             .find(|e| e["type"] == "threads_updated")
             .expect("threads_updated emitted");
         assert_eq!(snapshot["threads"], Value::Array(Vec::new()));
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn idle_loop_drives_the_async_thread_scan() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        // A session population large enough that the directory scan outlives
+        // the command-processing pumps; its follow-up snapshot then lands
+        // only if the idle loop keeps driving the executor. A distinct cwd
+        // keeps other tests' project-scoped snapshots empty.
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for i in 0..1000 {
+            std::fs::write(
+                sessions.join(format!("idle-scan-{i}.jsonl")),
+                format!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"idle-scan-{i}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"/idle/pump/project\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let (out, sink) = collect_sink();
+        let (tx, rx) = mpsc::channel::<String>();
+        let actor = thread::spawn(move || {
+            let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+            cx.allow_parking();
+            init_globals(&mut cx);
+            cx.update(agent::thread_store::init);
+            run_command_loop(&mut cx, rx, &sink);
+            agent::thread_store::drop_global_for_test();
+        });
+        tx.send(r#"{"cmd":"list_threads"}"#.to_string()).unwrap();
+        // The immediate snapshot precedes the scan; the follow-up push only
+        // lands if the idle loop keeps pumping instead of blocking on recv().
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let pushed = types(&out)
+                .iter()
+                .filter(|t| t.as_str() == "threads_updated")
+                .count();
+            if pushed >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "follow-up threads_updated never arrived while the loop sat idle"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx); // disconnect ends the loop
+        actor.join().unwrap();
+    }
+
+    /// Session files the store scan picks up: one header line per session.
+    fn seed_session_file(dir: &Path, id: &str, cwd: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\"}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    /// A main checkout, a linked worktree of it, and an unrelated repo.
+    /// Idempotent: the fixture survives across tests in the same process.
+    fn git_worktree_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let fixtures = PathBuf::from(std::env::var("HOME").unwrap()).join("worktree-fixtures");
+        let main = fixtures.join("main");
+        let wt = fixtures.join("wt");
+        let other = fixtures.join("other");
+        if main.join(".git").exists() {
+            return (main, wt, other);
+        }
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&main, &["init"]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&main, &["worktree", "add", wt.to_str().unwrap()]);
+        run_git(&other, &["init"]);
+        (main, wt, other)
+    }
+
+    #[test]
+    fn worktree_paths_share_one_repo_identity() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let (main, wt, other) = git_worktree_fixture();
+        let mut cache = HashMap::new();
+        assert!(matches_workspace(wt.to_str().unwrap(), &main, &mut cache));
+        assert!(matches_workspace(main.to_str().unwrap(), &wt, &mut cache));
+        assert!(!matches_workspace(
+            other.to_str().unwrap(),
+            &main,
+            &mut cache
+        ));
+        // A directory outside git matches only itself.
+        let bare = main.parent().unwrap().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(matches_workspace(bare.to_str().unwrap(), &bare, &mut cache));
+        assert!(!matches_workspace(
+            bare.to_str().unwrap(),
+            &main,
+            &mut cache
+        ));
+        // A non-git workspace only ever matches its exact full path: a
+        // subdirectory of the workspace is not the workspace.
+        let child = bare.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(!matches_workspace(
+            child.to_str().unwrap(),
+            &bare,
+            &mut cache
+        ));
+        assert!(!matches_workspace(
+            bare.to_str().unwrap(),
+            &child,
+            &mut cache
+        ));
+    }
+
+    /// A non-git path may become a repository while the actor lives (the
+    /// user runs `git init` in the workspace), so a miss must not be cached
+    /// forever.
+    #[test]
+    fn repo_identity_rechecks_a_formerly_non_git_path() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("late-init");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cache = HashMap::new();
+        assert_eq!(repo_identity_cached(&dir, &mut cache), None);
+        run_git(&dir, &["init"]);
+        let identity = repo_identity_cached(&dir, &mut cache);
+        assert!(identity.is_some());
+        // Once confirmed, the identity is served from the cache.
+        assert_eq!(cache.get(&dir), Some(&identity));
+    }
+
+    #[test]
+    fn list_threads_includes_worktrees_of_the_workspace_repo() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let (main, wt, other) = git_worktree_fixture();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "wt-main", main.to_str().unwrap());
+        seed_session_file(&sessions, "wt-linked", wt.to_str().unwrap());
+        seed_session_file(&sessions, "wt-other", other.to_str().unwrap());
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(main.clone());
+        let (out, sink) = collect_sink();
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+
+        // The scan is async; wait for a snapshot that has absorbed the
+        // seeded sessions.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let ids = loop {
+            cx.run_until_parked();
+            let snapshot = out
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated");
+            let ids: Vec<String> = snapshot
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids.iter().any(|id| id == "wt-linked") {
+                break ids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(ids.contains(&"wt-main".to_string()));
+        assert!(
+            !ids.contains(&"wt-other".to_string()),
+            "sessions from an unrelated repo must stay hidden"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn archive_and_pin_commands_flag_the_snapshot_rows() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "ap-plain", "/archive/pin/project");
+        seed_session_file(&sessions, "ap-pin", "/archive/pin/project");
+        seed_session_file(&sessions, "ap-archive", "/archive/pin/project");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/pin/project"));
+        let (out, sink) = collect_sink();
+
+        let latest_rows = |cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        // The mutations resolve ids through the scan's path table, so they
+        // must wait for the seeded sessions to land in a snapshot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids: Vec<String> = latest_rows(&mut cx)
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids
+                .iter()
+                .all(|id| ["ap-plain", "ap-pin", "ap-archive"].contains(&id.as_str()))
+                && ids.len() == 3
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded sessions never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"pin_thread","sessionId":"ap-pin","pinned":true}"#,
+        );
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"ap-archive","archived":true}"#,
+        );
+
+        // The meta writes land asynchronously; the settled snapshot keeps
+        // every row — archived flagged instead of dropped, pinned flagged
+        // for the surface's sort, and plain rows explicitly unflagged.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let rows = latest_rows(&mut cx);
+            let by_id = |id: &str| rows.iter().find(|t| t["id"] == id).cloned();
+            let settled = by_id("ap-pin").is_some_and(|t| t["pinned"].as_bool() == Some(true))
+                && by_id("ap-archive").is_some_and(|t| t["archived"].as_bool() == Some(true))
+                && by_id("ap-plain").is_some_and(|t| {
+                    t["pinned"].as_bool() == Some(false) && t["archived"].as_bool() == Some(false)
+                });
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "archive/pin flags never settled in the snapshot; last rows: {rows:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         drop(state);
         agent::thread_store::drop_global_for_test();
@@ -1235,5 +1726,61 @@ mod tests {
         cx.run_until_parked();
         drop(state);
         agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn pushes_models_snapshot_after_provider_registration() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let (out, sink) = collect_sink();
+
+        spawn_models_push(sink);
+        assert!(pump_until(&out, &mut cx, "models", 1));
+        let event: Value =
+            serde_json::from_str(&out.lock().unwrap()[0]).expect("models event is valid json");
+        // The hermetic home registers no providers; the snapshot still lands
+        // so waiting surfaces can leave their disabled state.
+        assert!(event["models"].is_array());
+    }
+
+    #[test]
+    fn model_json_exposes_wire_fields() {
+        let model = pi::types::Model {
+            provider: "anthropic".into(),
+            api: "anthropic".into(),
+            id: "claude-sonnet-4-6".into(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: HashMap::new(),
+        };
+        let value = model_json(&model);
+        assert_eq!(value["id"], "claude-sonnet-4-6");
+        assert_eq!(value["provider"], "anthropic");
+        assert_eq!(value["api"], "anthropic");
+        assert_eq!(value["context_window"], 200_000);
+        assert!(value["name"].is_string());
+    }
+
+    #[test]
+    fn parses_numstat_lines() {
+        assert_eq!(parse_numstat_line("12\t3\tsrc/main.rs"), Some((12, 3)));
+        assert_eq!(parse_numstat_line("0\t0\tnew.rs"), Some((0, 0)));
+        // Binary files report "-" counts.
+        assert_eq!(parse_numstat_line("-\t-\tlogo.png"), None);
+        assert_eq!(parse_numstat_line(""), None);
+    }
+
+    #[test]
+    fn git_stats_outside_a_repo_is_zero() {
+        let dir = std::env::temp_dir().join(format!("manox-git-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stats = git_stats(dir.to_str().unwrap());
+        assert_eq!(stats["added"], 0);
+        assert_eq!(stats["deleted"], 0);
+        assert_eq!(stats["untracked"], 0);
     }
 }

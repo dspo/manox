@@ -23,7 +23,17 @@ export type WebviewToHost =
   | { type: 'request_models' }
   | { type: 'request_usage'; sessionId: string }
   | { type: 'request_thread_info'; sessionId: string }
-  | { type: 'new_session' }
+  // Optional fields carry the home-composer first message: the webview
+  // generates the id so it can render the draft before the session exists.
+  | {
+      type: 'new_session';
+      sessionId?: string;
+      text?: string;
+      images?: ImageAttachment[];
+      modelId?: string;
+    }
+  | { type: 'archive_thread'; sessionId: string; archived: boolean }
+  | { type: 'pin_thread'; sessionId: string; pinned: boolean }
   | { type: 'list_threads' }
   | { type: 'open_thread'; sessionId: string }
   | { type: 'focus_thread'; sessionId?: string }

@@ -41,6 +41,10 @@ export interface ThreadState {
   loading: boolean;
   /** Last error emitted for this thread; cleared when a new turn starts. */
   error: string | null;
+  /** Wall-clock start of the in-flight turn; null when idle. */
+  turnStartedAt: number | null;
+  /** Duration of the most recent finished turn, for the meta line. */
+  lastTurnDurationSec: number | null;
 }
 
 export interface ChatState {
@@ -80,6 +84,8 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   branch: null,
   loading: false,
   error: null,
+  turnStartedAt: null,
+  lastTurnDurationSec: null,
 });
 
 const emptyInfo = (): ThreadInfoSnapshot => ({
@@ -91,6 +97,13 @@ const emptyInfo = (): ThreadInfoSnapshot => ({
   agents: [],
 });
 
+/** git_stats arrives on its own event channel, so a whole-snapshot replace
+ * must keep whatever stats were already merged into the thread. */
+const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
+  ...t,
+  info: { ...info, git_stats: info.git_stats ?? t.info?.git_stats },
+});
+
 const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelled', 'continued']);
 
 let echoCounter = 0;
@@ -98,6 +111,9 @@ let echoCounter = 0;
 export class Store {
   private state: ChatState = initialState;
   private readonly listeners = new Set<() => void>();
+  /** Drafted sessions not yet confirmed by `session_ready`; kept outside the
+   * observable state because it gates input rather than rendering. */
+  private readonly creating = new Set<string>();
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -107,7 +123,43 @@ export class Store {
   get = (): ChatState => this.state;
 
   dispatch(msg: HostToWebview): void {
+    if (msg.type === 'session_ready') {
+      this.creating.delete(msg.sessionId);
+    } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
+      this.creating.delete(msg.event.sessionId);
+    } else if (msg.type === 'global_error' && this.creating.size > 0) {
+      // A failed draft creation surfaces only as a global error. Release
+      // every pending draft's send guard and drop the orphans; only fall
+      // back to the list when the view was showing one of them.
+      const stuck = [...this.creating];
+      this.creating.clear();
+      const perThread = { ...this.state.perThread };
+      for (const id of stuck) delete perThread[id];
+      const active = this.state.activeThreadId;
+      this.patch({
+        ...this.state,
+        perThread,
+        ...(active !== null && stuck.includes(active)
+          ? { view: 'threads' as const, activeThreadId: null }
+          : {}),
+      });
+    }
     this.patch(foldMessage(this.state, msg));
+  }
+
+  /** Seed a fresh thread optimistically from the home composer: switch the
+   * view, echo the first message, and remember the id until `session_ready`
+   * confirms the host side. */
+  draftThread(sessionId: string, text: string, images?: UserImage[]): void {
+    this.creating.add(sessionId);
+    this.patch({ ...this.state, view: 'conversation', activeThreadId: sessionId });
+    this.echoUser(sessionId, text, images);
+  }
+
+  /** Whether a drafted session is still waiting for the host's
+   * `session_ready`; sending must stay blocked until it lands. */
+  isCreating(sessionId: string): boolean {
+    return this.creating.has(sessionId);
   }
 
   /** Optimistic echo of a submission; the actor never replays user
@@ -184,20 +236,23 @@ function foldThreads(state: ChatState, threads: ThreadListItem[]): ChatState {
 
 function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
   switch (msg.type) {
-    case 'session_ready':
+    case 'session_ready': {
+      // Merge-safe: an optimistic draft (or a live thread being re-announced)
+      // keeps its accumulated items, and only the session's origin metadata
+      // changes. A restored replay still replaces the items wholesale when
+      // its thread_history snapshot lands.
+      const existing = state.perThread[msg.sessionId];
+      const thread = existing
+        ? { ...existing, cwd: msg.cwd, loading: msg.kind === 'restored' }
+        : { ...initThread(msg.sessionId, msg.cwd), loading: msg.kind === 'restored' };
       return {
         ...state,
         view: 'conversation',
         activeThreadId: msg.sessionId,
         error: null,
-        perThread: {
-          ...state.perThread,
-          [msg.sessionId]: {
-            ...initThread(msg.sessionId, msg.cwd),
-            loading: msg.kind === 'restored',
-          },
-        },
+        perThread: { ...state.perThread, [msg.sessionId]: thread },
       };
+    }
     case 'models':
       return { ...state, models: msg.models };
     case 'threads':
@@ -205,7 +260,7 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
     case 'commands':
       return { ...state, commands: msg.commands };
     case 'thread_info':
-      return updateThread(state, msg.sessionId, (t) => ({ ...t, info: msg.info }));
+      return updateThread(state, msg.sessionId, (t) => mergeInfo(t, msg.info));
     case 'global_error':
       return { ...state, error: msg.message };
     case 'event':
@@ -255,10 +310,24 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
   switch (ev.type) {
     case 'turn_started':
       // A fresh turn supersedes any stale error from the previous one.
-      return { ...t, turnActive: true, turnModelId: t.currentModelId, error: null };
+      return {
+        ...t,
+        turnActive: true,
+        turnModelId: t.currentModelId,
+        turnStartedAt: Date.now(),
+        error: null,
+      };
     case 'turn_finished':
     case 'stop':
-      return { ...t, turnActive: false };
+      return {
+        ...t,
+        turnActive: false,
+        lastTurnDurationSec:
+          t.turnStartedAt === null
+            ? t.lastTurnDurationSec
+            : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
+        turnStartedAt: null,
+      };
     case 'agent_text':
       return appendAssistantText(t, ev.text);
     case 'agent_thinking':
@@ -324,9 +393,11 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
     case 'thread_history':
       return { ...t, items: wireMessagesToTranscriptItems(ev.messages), loading: false };
     case 'thread_info':
-      return { ...t, info: ev.info };
+      return mergeInfo(t, ev.info);
     case 'branch':
       return { ...t, branch: ev.branch };
+    case 'git_stats':
+      return { ...t, info: { ...(t.info ?? emptyInfo()), git_stats: ev.stats } };
     case 'history_progress':
       return { ...t, loading: true };
     case 'plan_updated':

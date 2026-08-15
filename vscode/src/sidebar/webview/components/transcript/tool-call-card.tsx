@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import type { ToolCallState } from '../../state/store';
 import { Tool, ToolContent, ToolHeader, ToolOutput } from '../ai/tool';
+import { CopyOnHover } from './copy-on-hover';
 
 const OUTPUT_CAP = 32_000;
 const AUTO_CLOSE_DELAY = 1000;
@@ -17,12 +18,14 @@ function clip(text: string): string {
 
 export type ToolCallCardProps = {
   call: ToolCallState;
+  cwd: string;
+  branch: string | null;
 };
 
 // Open while the call is in flight, collapse once shortly after it reaches
 // a terminal status; restored-history cards mount terminal and stay
 // collapsed. After the one-shot auto-close the card is fully user-driven.
-export const ToolCallCard = ({ call }: ToolCallCardProps) => {
+export const ToolCallCard = ({ call, cwd, branch }: ToolCallCardProps) => {
   const isTerminal = TERMINAL_STATUSES.has(call.status);
   const [open, setOpen] = useState(!isTerminal);
   const [hasAutoClosed, setHasAutoClosed] = useState(false);
@@ -45,13 +48,27 @@ export const ToolCallCard = ({ call }: ToolCallCardProps) => {
 
   const output = clip(call.output);
   const errorText = call.isError ? output : undefined;
+  const dir = cwd.split('/').filter(Boolean).pop() ?? cwd;
 
   return (
-    <Tool onOpenChange={handleOpenChange} open={open}>
-      <ToolHeader status={call.status} title={call.title || call.name} />
-      <ToolContent>
-        <ToolOutput errorText={errorText} output={output} />
-      </ToolContent>
-    </Tool>
+    <div className="group relative">
+      <CopyOnHover className="absolute top-0.5 right-7 z-10" text={output || call.title} />
+      <Tool onOpenChange={handleOpenChange} open={open}>
+        <ToolHeader status={call.status} title={call.title || call.name} />
+        <ToolContent>
+          {call.name === 'bash' && (
+            <div className="font-code mb-1 text-xs italic">
+              <span className="text-muted-foreground">
+                {dir}
+                {branch ? ` (${branch})` : ''}
+              </span>{' '}
+              <span className="text-[hsl(145,63%,47%)]">❯</span>{' '}
+              <span className="text-foreground">{call.title || call.name}</span>
+            </div>
+          )}
+          <ToolOutput errorText={errorText} output={errorText ? undefined : output} />
+        </ToolContent>
+      </Tool>
+    </div>
   );
 };

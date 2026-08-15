@@ -1,17 +1,25 @@
-// Composer: textarea with pasted-image chips, a slash-command typeahead,
-// and a bottom row carrying the approval-mode toggle and model picker.
+// Composer: borderless input under a 1px hairline, pasted-image chips, a
+// slash-command typeahead, and a bottom row carrying the approval-mode
+// dropdown on the left and the model picker plus send button on the right.
 
-import { ArrowUp, Square, X } from 'lucide-react';
+import { ArrowUp, Bot, Check, ChevronDown, Pause, TriangleAlert, X } from 'lucide-react';
 import type { ClipboardEvent, KeyboardEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ApprovalMode, CommandEntry, ModelInfo } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
-import { store } from '../../state/bridge';
+import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
-import { ModelPicker } from './model-picker';
-import { Button } from '../ui/button';
+import { store } from '../../state/bridge';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '../ui/dropdown-menu';
 import { Textarea } from '../ui/textarea';
+import { ModelPicker } from './model-picker';
 
 const MAX_IMAGE_EDGE_PX = 1568;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -53,7 +61,17 @@ async function fileToImage(file: File): Promise<PastedImage | null> {
   return { data: base64, dataUrl: encoded, mimeType: 'image/png' };
 }
 
-const ApprovalToggle = ({
+const APPROVAL_META = {
+  autopilot: { icon: Bot, tint: 'text-info', labelKey: 'autopilot', descKey: 'autopilot_desc' },
+  danger: {
+    icon: TriangleAlert,
+    tint: 'text-danger',
+    labelKey: 'danger',
+    descKey: 'danger_desc',
+  },
+} as const;
+
+const ApprovalChip = ({
   mode,
   disabled,
   onChange,
@@ -61,34 +79,63 @@ const ApprovalToggle = ({
   mode: ApprovalMode;
   disabled: boolean;
   onChange: (mode: ApprovalMode) => void;
-}) => (
-  <div className="border-muted-foreground/20 flex overflow-hidden rounded-md border text-xs">
-    {(['autopilot', 'danger'] as const).map((m) => (
-      <button
-        className={cn(
-          'px-2 py-1 capitalize transition-colors',
-          mode === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted',
-        )}
-        disabled={disabled}
-        key={m}
-        onClick={() => onChange(m)}
-        type="button"
-      >
-        {m}
-      </button>
-    ))}
-  </div>
-);
+}) => {
+  const { icon: Icon, tint, labelKey } = APPROVAL_META[mode];
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className={cn(
+            'hover:bg-accent flex min-w-24 cursor-pointer items-center gap-1.5 rounded-full border border-border px-2 py-1 text-xs transition-colors',
+            disabled && 'pointer-events-none opacity-50',
+          )}
+          disabled={disabled}
+          type="button"
+        >
+          <Icon className={cn('size-3.5', tint)} />
+          <span>{t(labelKey)}</span>
+          <ChevronDown className="text-muted-foreground size-3" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-[360px]">
+        <div className="px-2 py-1.5 text-sm font-medium">{t('approval_mode')}</div>
+        <DropdownMenuSeparator />
+        {(['autopilot', 'danger'] as const).map((m) => {
+          const option = APPROVAL_META[m];
+          const OptionIcon = option.icon;
+          return (
+            <DropdownMenuItem className="gap-2.5" key={m} onSelect={() => onChange(m)}>
+              <OptionIcon className={cn('size-4 shrink-0', option.tint)} />
+              <div className="min-w-0 flex-1">
+                <p className={cn('text-xs font-medium', option.tint)}>{t(option.labelKey)}</p>
+                <p className="text-muted-foreground text-xs">{t(option.descKey)}</p>
+              </div>
+              {mode === m && <Check className="size-4 shrink-0" />}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+};
 
 export type ComposerProps = {
-  /** Owning thread; null until a session is established — input is
-   * collected but sending is blocked until the host can deliver it. */
+  /** Owning thread; null until a session is established. With an
+   * `onCreateSession` callback the composer works as a draft input whose
+   * first send creates the thread; without it, input is collected but
+   * sending is blocked until the host can deliver it. */
   sessionId: string | null;
   turnActive: boolean;
   models: ModelInfo[];
   currentModelId: string | null;
   approvalMode: ApprovalMode;
   commands: CommandEntry[];
+  /** Drafted session still waiting for the host's confirmation. */
+  creating?: boolean;
+  /** Draft-mode send: creates the session and delivers the first message. */
+  onCreateSession?: (text: string, images: { data: string; mimeType: string }[]) => void;
+  /** Draft-mode model selection; the chosen id rides along on creation. */
+  onModelChange?: (modelId: string) => void;
 };
 
 export const Composer = ({
@@ -98,13 +145,17 @@ export const Composer = ({
   currentModelId,
   approvalMode,
   commands,
+  creating = false,
+  onCreateSession,
+  onModelChange,
 }: ComposerProps) => {
   const [text, setText] = useState('');
   const [images, setImages] = useState<PastedImage[]>([]);
   const [activeMatch, setActiveMatch] = useState(0);
   const [typeaheadDismissed, setTypeaheadDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const ready = sessionId !== null;
+  const draft = sessionId === null && onCreateSession !== undefined;
+  const ready = sessionId !== null || draft;
 
   // The typeahead is live only while the leading token is an unfinished
   // slash invocation; the actor does the actual routing on submit.
@@ -128,22 +179,28 @@ export const Composer = ({
 
   const submit = useCallback(() => {
     const trimmed = text.trim();
-    if ((!trimmed && images.length === 0) || turnActive || !sessionId) {
+    if ((!trimmed && images.length === 0) || turnActive || creating) {
       return;
     }
-    const api = new ThreadApi(sessionId);
-    store.echoUser(
-      sessionId,
-      trimmed,
-      images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
-    );
-    api.submit(
-      trimmed,
-      images.length ? images.map((img) => ({ data: img.data, mimeType: img.mimeType })) : undefined,
-    );
+    const wireImages = images.length
+      ? images.map((img) => ({ data: img.data, mimeType: img.mimeType }))
+      : undefined;
+    if (sessionId) {
+      const api = new ThreadApi(sessionId);
+      store.echoUser(
+        sessionId,
+        trimmed,
+        images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
+      );
+      api.submit(trimmed, wireImages);
+    } else if (onCreateSession) {
+      onCreateSession(trimmed, wireImages ?? []);
+    } else {
+      return;
+    }
     setText('');
     setImages([]);
-  }, [text, images, turnActive, sessionId]);
+  }, [text, images, turnActive, creating, sessionId, onCreateSession]);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (showTypeahead) {
@@ -184,10 +241,12 @@ export const Composer = ({
     if (pasted.length > 0) setImages((prev) => [...prev, ...pasted]);
   };
 
+  const canSend = ready && !creating && (text.trim() !== '' || images.length > 0);
+
   return (
-    <div className="border-t p-2">
+    <div className="border-t border-border">
       {images.length > 0 && (
-        <div className="mb-2 flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 px-3 pt-2">
           {images.map((img, index) => (
             <div className="bg-muted relative rounded-md border" key={index}>
               <img
@@ -196,9 +255,9 @@ export const Composer = ({
                 src={img.dataUrl}
               />
               <button
-                className="bg-background/90 absolute -top-1.5 -right-1.5 rounded-full border p-0.5"
+                className="bg-background/90 absolute -top-1.5 -right-1.5 cursor-pointer rounded-full border p-0.5"
                 onClick={() => setImages((prev) => prev.filter((_, i) => i !== index))}
-                title="Remove attachment"
+                title={t('remove_attachment')}
                 type="button"
               >
                 <X className="size-3" />
@@ -209,7 +268,7 @@ export const Composer = ({
       )}
       <div className="relative">
         {showTypeahead && (
-          <div className="bg-popover absolute right-0 bottom-full left-0 z-10 mb-1 max-h-48 overflow-y-auto rounded-md border shadow-md">
+          <div className="bg-card absolute right-2 bottom-full left-2 z-10 mb-1 max-h-48 overflow-y-auto rounded-md border shadow-md">
             {matches.map((entry, index) => (
               <button
                 className={cn(
@@ -234,51 +293,64 @@ export const Composer = ({
             ))}
           </div>
         )}
-        <div className="flex items-end gap-2">
-          <Textarea
-            className="min-h-[52px] flex-1 resize-none font-transcript"
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            placeholder={ready ? 'Message manox' : 'Starting session…'}
-            ref={textareaRef}
-            rows={2}
-            value={text}
-          />
-          {turnActive && sessionId ? (
-            <Button
-              onClick={() => new ThreadApi(sessionId).cancel()}
-              size="icon"
-              title="Stop"
-              variant="secondary"
-            >
-              <Square className="size-4" />
-            </Button>
-          ) : (
-            <Button
-              disabled={!ready || (!text.trim() && images.length === 0)}
-              onClick={submit}
-              size="icon"
-              title="Send"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          )}
-        </div>
-      </div>
-      <div className="mt-1.5 flex items-center gap-2">
-        <ApprovalToggle
-          disabled={!ready}
-          mode={approvalMode}
-          onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
+        <Textarea
+          className="font-code min-h-[52px] resize-none border-0 bg-transparent px-3 py-2 text-[13px] font-light shadow-none focus-visible:ring-0"
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          placeholder={ready ? t('composer_placeholder') : t('starting_session')}
+          ref={textareaRef}
+          rows={2}
+          value={text}
         />
-        <div className="min-w-0 flex-1">
+      </div>
+      <div
+        className={cn(
+          'flex items-center px-3 pb-2',
+          draft ? 'justify-end' : 'justify-between',
+        )}
+      >
+        {/* Approval policy needs a live session; the draft's first send
+         * creates one with the host's defaults. Model selection works for
+         * drafts too: the choice rides along on creation. */}
+        {!draft && (
+          <ApprovalChip
+            disabled={!ready}
+            mode={approvalMode}
+            onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
+          />
+        )}
+        <div className="flex items-center gap-2">
           <ModelPicker
             currentModelId={currentModelId}
             disabled={!ready || turnActive || models.length === 0}
             models={models}
+            onSelect={draft ? onModelChange : undefined}
             sessionId={sessionId}
           />
+          {turnActive && sessionId ? (
+            <button
+              className="bg-danger/20 text-danger hover:bg-danger/30 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors"
+              onClick={() => new ThreadApi(sessionId).cancel()}
+              title={t('stop')}
+              type="button"
+            >
+              <Pause className="size-3.5" />
+            </button>
+          ) : (
+            <button
+              className={cn(
+                'bg-primary/20 text-primary hover:bg-primary/30 flex size-6 shrink-0 items-center justify-center rounded-full transition-colors',
+                canSend ? 'cursor-pointer' : 'pointer-events-none opacity-40',
+              )}
+              disabled={!canSend}
+              onClick={submit}
+              title={t('send')}
+              type="button"
+            >
+              <ArrowUp className="size-3.5" />
+            </button>
+          )}
         </div>
       </div>
     </div>

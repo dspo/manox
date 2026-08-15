@@ -2896,12 +2896,20 @@ fn request_attribution(session: &AgentSession) -> HashMap<String, TokenUsage> {
 }
 
 /// Fallback aggregation when `session_stats()` is unavailable: assistant
-/// usage only, keyed by model id (the pre-stats mechanism).
+/// usage only. Keys keep the stats path's "{provider}/{model}" shape so
+/// consumers can resolve the model regardless of which path produced them.
 fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
     let mut cumulative = TokenUsage::default();
     let mut per_model: HashMap<String, TokenUsage> = HashMap::new();
     for m in session.harness_messages() {
-        let AgentMessage::Assistant { usage, model, .. } = m else {
+        let AgentMessage::Assistant {
+            usage,
+            model,
+            provider,
+            response_model,
+            ..
+        } = m
+        else {
             continue;
         };
         let u = to_token_usage(usage);
@@ -2909,8 +2917,12 @@ fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
             continue;
         }
         cumulative = cumulative + u;
+        let key = format!(
+            "{provider}/{}",
+            response_model.as_deref().unwrap_or(model.as_str())
+        );
         per_model
-            .entry(model.clone())
+            .entry(key)
             .and_modify(|acc| *acc = *acc + u)
             .or_insert(u);
     }

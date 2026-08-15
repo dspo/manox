@@ -24,10 +24,13 @@ export const App = () => {
     api.listCommands();
   }, []);
 
-  // The active turn flag's falling edge requests a usage snapshot.
+  // The active turn flag's falling edge refreshes usage and the info
+  // snapshot (spend tree, git stats) for the finished turn.
   useEffect(() => {
     if (prevTurnActive.current && !turnActive && thread) {
-      new ThreadApi(thread.sessionId).requestUsage();
+      const threadApi = new ThreadApi(thread.sessionId);
+      threadApi.requestUsage();
+      threadApi.requestThreadInfo();
     }
     prevTurnActive.current = turnActive;
   }, [turnActive, thread]);
@@ -42,5 +45,12 @@ export const App = () => {
       />
     );
   }
-  return <ThreadsView threads={state.threads} />;
+  return (
+    <ThreadsView
+      commands={state.commands}
+      error={state.error}
+      models={state.models}
+      threads={state.threads}
+    />
+  );
 };

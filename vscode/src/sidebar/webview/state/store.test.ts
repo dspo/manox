@@ -1,14 +1,27 @@
 // Store behaviour: per-thread event routing, tool-card folding, restored
 // history mapping, and the view/thread bookkeeping around them.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import type { ActorEvent, WireMessage } from '../../../protocol';
+import type { ActorEvent, ThreadListItem, WireMessage } from '../../../protocol';
 import type { HostToWebview } from '../../messages';
 import { Store, wireMessagesToTranscriptItems } from './store';
 import { foldToolStatus } from './transcript';
 
 const event = (ev: ActorEvent): HostToWebview => ({ type: 'event', event: ev });
+
+const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadListItem => ({
+  title: 't',
+  updated_at: 1,
+  running: false,
+  unread: false,
+  errored: false,
+  pending_auth: false,
+  model_id: 'm',
+  pinned: false,
+  archived: false,
+  ...partial,
+});
 
 const ready = (sessionId: string, kind: 'fresh' | 'restored' = 'fresh'): HostToWebview => ({
   type: 'session_ready',
@@ -106,6 +119,103 @@ describe('thread routing', () => {
     expect(store.get().view).toBe('conversation');
     expect(store.get().activeThreadId).toBe('a');
     expect(thread(store, 'a')?.items).toHaveLength(1);
+  });
+});
+
+describe('home-composer drafts', () => {
+  it('draftThread opens the conversation view with the echoed first message', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('d1');
+    expect(thread(store, 'd1')?.items[0]).toMatchObject({ kind: 'user', text: 'hello' });
+    expect(store.isCreating('d1')).toBe(true);
+  });
+
+  it('session_ready merges into a draft instead of resetting it', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch(ready('d1'));
+    // The optimistic echo survives; only the origin metadata lands.
+    expect(thread(store, 'd1')?.items).toHaveLength(1);
+    expect(thread(store, 'd1')?.cwd).toBe('/w');
+    expect(thread(store, 'd1')?.loading).toBe(false);
+    expect(store.isCreating('d1')).toBe(false);
+  });
+
+  it('session_disposed clears the creating guard as well', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch(event({ type: 'session_disposed', sessionId: 'd1' }));
+    expect(store.isCreating('d1')).toBe(false);
+  });
+
+  it('a failed draft creation clears the guard and returns to the list', () => {
+    const store = new Store();
+    store.draftThread('d1', 'hello');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.isCreating('d1')).toBe(false);
+    expect(store.get().view).toBe('threads');
+    expect(store.get().activeThreadId).toBeNull();
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().error).toBe('boom');
+  });
+
+  it('a global error without a pending draft leaves the view alone', () => {
+    const store = startSession('a');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('a');
+    expect(store.get().error).toBe('boom');
+  });
+
+  it('drops every pending draft, not just the one in view', () => {
+    const store = new Store();
+    store.draftThread('d1', 'one');
+    store.draftThread('d2', 'two');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().perThread.d2).toBeUndefined();
+    expect(store.get().view).toBe('threads');
+    expect(store.get().activeThreadId).toBeNull();
+  });
+
+  it('a global error during a pending draft keeps a viewed live thread', () => {
+    const store = startSession('live');
+    store.draftThread('d1', 'hello');
+    store.openLocal('live');
+    store.dispatch({ type: 'global_error', message: 'boom' });
+    expect(store.get().perThread.d1).toBeUndefined();
+    expect(store.get().view).toBe('conversation');
+    expect(store.get().activeThreadId).toBe('live');
+  });
+});
+
+describe('info snapshots', () => {
+  it('thread_info keeps git stats merged in from their own event', () => {
+    const store = startSession('a');
+    store.dispatch(
+      event({
+        type: 'git_stats',
+        sessionId: 'a',
+        stats: { added: 1, deleted: 2, untracked: 3 },
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'thread_info',
+        sessionId: 'a',
+        info: {
+          worktree_path: null,
+          plan: null,
+          usage: {},
+          cost: 0,
+          pending_auth_count: 0,
+          agents: [],
+        },
+      }),
+    );
+    expect(thread(store, 'a')?.info?.git_stats).toEqual({ added: 1, deleted: 2, untracked: 3 });
   });
 });
 
@@ -227,6 +337,21 @@ describe('transcript folding', () => {
     expect(thread(store)?.turnActive).toBe(false);
   });
 
+  it('times turns for the meta line', () => {
+    const store = startSession();
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(100_000);
+    store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
+    expect(thread(store)?.turnStartedAt).toBe(100_000);
+    now.mockReturnValue(103_000);
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 's', cancelled: false, failed: false }),
+    );
+    expect(thread(store)?.turnStartedAt).toBeNull();
+    expect(thread(store)?.lastTurnDurationSec).toBe(3);
+    now.mockRestore();
+  });
+
   it('routes session errors to their own thread only', () => {
     const store = startSession('a');
     store.dispatch(ready('b'));
@@ -295,7 +420,10 @@ describe('transcript folding', () => {
 describe('global folds', () => {
   it('stores models, commands, and surfaces errors', () => {
     const store = new Store();
-    store.dispatch({ type: 'models', models: [{ id: 'm', name: 'M', provider: 'p' }] });
+    store.dispatch({
+      type: 'models',
+      models: [{ id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 200000 }],
+    });
     store.dispatch({
       type: 'commands',
       commands: [{ name: 'deliver', description: 'Ship', kind: 'command', argument_hint: null }],
@@ -310,21 +438,19 @@ describe('global folds', () => {
     const store = startSession('t1');
     store.dispatch({
       type: 'threads',
-      threads: [
-        {
-          id: 't1',
-          title: 'Fix the bug',
-          updated_at: 1,
-          running: false,
-          unread: false,
-          errored: false,
-          pending_auth: false,
-          model_id: 'm',
-        },
-      ],
+      threads: [listItem({ id: 't1', title: 'Fix the bug' })],
     });
     expect(store.get().threads).toHaveLength(1);
     expect(thread(store, 't1')?.title).toBe('Fix the bug');
+  });
+
+  it('threads snapshots keep archived rows for the more section', () => {
+    const store = new Store();
+    store.dispatch({
+      type: 'threads',
+      threads: [listItem({ id: 'a' }), listItem({ id: 'b', archived: true })],
+    });
+    expect(store.get().threads.map((item) => item.id)).toEqual(['a', 'b']);
   });
 
   it('thread_info, branch, and plan events land on the thread', () => {
@@ -357,6 +483,33 @@ describe('global folds', () => {
 
     store.dispatch(event({ type: 'worktree_changed', sessionId: 's', active: false, path: null }));
     expect(thread(store)?.info?.worktree_path).toBeNull();
+  });
+
+  it('carries per-model usage in thread_info and merges async git_stats', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'thread_info',
+      sessionId: 's',
+      info: {
+        worktree_path: null,
+        plan: null,
+        usage: {},
+        per_model_usage: { 'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 } },
+        cost: 0,
+        pending_auth_count: 0,
+        agents: [],
+      },
+    });
+    expect(thread(store)?.info?.per_model_usage).toEqual({
+      'anthropic/claude-x': { input_tokens: 10, output_tokens: 4 },
+    });
+
+    store.dispatch(
+      event({ type: 'git_stats', sessionId: 's', stats: { added: 3, deleted: 1, untracked: 2 } }),
+    );
+    const info = thread(store)?.info;
+    expect(info?.git_stats).toEqual({ added: 3, deleted: 1, untracked: 2 });
+    expect(info?.per_model_usage).toBeDefined();
   });
 
   it('aggregates sub-agent start and progress into the info snapshot', () => {
