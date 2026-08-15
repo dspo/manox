@@ -1446,6 +1446,12 @@ async fn run_actor(
         match builder.open(info.path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
+                crate::monitor_bridge::spawn(
+                    Arc::clone(&orchestrators.monitor),
+                    Arc::clone(&orchestrators.background),
+                    notice_tx.clone(),
+                    thread_id.clone(),
+                );
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
                 attach_path_policy_hooks(&mut s, &tool_cwd, &state.gate);
                 attach_plugin_hooks(&mut s, &tool_cwd);
@@ -1482,6 +1488,12 @@ async fn run_actor(
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
+                    crate::monitor_bridge::spawn(
+                        Arc::clone(&orchestrators.monitor),
+                        Arc::clone(&orchestrators.background),
+                        notice_tx.clone(),
+                        thread_id.clone(),
+                    );
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
                     attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                     attach_plugin_hooks(&mut s, &cwd);
@@ -1953,6 +1965,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2046,6 +2059,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2097,6 +2111,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2154,6 +2169,12 @@ async fn run_actor(
                 match builder.with_session_id(thread_id.clone()).build().await {
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
+                        crate::monitor_bridge::spawn(
+                            Arc::clone(&orchestrators.monitor),
+                            Arc::clone(&orchestrators.background),
+                            notice_tx.clone(),
+                            thread_id.clone(),
+                        );
                         attach_plan_hooks(&mut s, &state.plan, &cwd);
                         attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                         attach_plugin_hooks(&mut s, &cwd);
@@ -2238,6 +2259,7 @@ async fn rebuild_session(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    thread_id: &str,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -2274,6 +2296,12 @@ async fn rebuild_session(
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
+            crate::monitor_bridge::spawn(
+                Arc::clone(&orchestrators.monitor),
+                Arc::clone(&orchestrators.background),
+                notice_tx.clone(),
+                thread_id.to_string(),
+            );
             attach_plan_hooks(&mut s, plan, &cwd);
             // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
             // the same path policy as fresh builds — without it the
