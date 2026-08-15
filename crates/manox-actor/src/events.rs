@@ -9,11 +9,12 @@
 //! when the host grows the matching UI): `SubagentChild`, `ApprovalDecision`,
 //! `Retry`, `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
 //! `MainCallMetricsUpdated`, `ReasoningEffortChanged`, `GoalChanged`,
-//! `CompactionStarted`, `Compaction`, `PeerMessage`, `SteerInjected`,
+//! `CompactionStarted`, `PeerMessage`, `SteerInjected`,
 //! `BrowserNotification`, `InboundAuthorization`, `BackgroundTaskUpdated`,
 //! `HistoryRestored`. `HistoryRestored` stays out of this pure projection:
 //! the actor pairs it with a full `thread_history` snapshot that needs
-//! `App` access to read the thread's messages.
+//! `App` access to read the thread's messages. `GoalChanged` likewise pairs
+//! with a rich `goal_changed` snapshot emitted by the actor's subscription.
 
 use agent::{ThreadEvent, ToolCallStatus};
 use serde_json::{Value, json};
@@ -124,6 +125,9 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             json!({"type": "plan_mode_changed", "enabled": enabled})
         }
         ThreadEvent::HistoryProgress => json!({"type": "history_progress"}),
+        ThreadEvent::Compaction { summary, .. } => {
+            json!({"type": "compaction", "summary": summary})
+        }
         _ => return None,
     };
     if let Some(id) = session_id
@@ -246,6 +250,23 @@ mod tests {
         let json = thread_event_to_json(&ThreadEvent::HistoryProgress, Some("s1")).unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "history_progress");
+        assert_eq!(v["sessionId"], "s1");
+    }
+
+    #[test]
+    fn projects_compaction_summary() {
+        let json = thread_event_to_json(
+            &ThreadEvent::Compaction {
+                summary: "older context".into(),
+                messages_compacted: 12,
+                tokens_before: 100_000,
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "compaction");
+        assert_eq!(v["summary"], "older context");
         assert_eq!(v["sessionId"], "s1");
     }
 }

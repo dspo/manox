@@ -350,9 +350,35 @@ fn handle_command(
             sink.emit(json!({"type": "threads_updated", "threads": threads}).to_string());
         }
         "list_commands" => {
+            // The built-in set is shared with the gpui host via
+            // `agent::slash_builtins`; descriptions ship as `i18n_key` and the
+            // webview translates them in its own chrome locale. Ordering
+            // mirrors the gpui popover: built-ins, then markdown macros, then
+            // skills.
             let mut commands = Vec::new();
+            for meta in agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
+                commands.push(json!({
+                    "name": meta.name,
+                    "description": null,
+                    "kind": "command",
+                    "argument_hint": null,
+                    "i18n_key": meta.description_key,
+                }));
+            }
+            let mut command_names: std::collections::HashSet<String> =
+                std::collections::HashSet::from_iter(
+                    agent::slash_builtins::BUILTIN_SLASH_COMMANDS
+                        .iter()
+                        .map(|meta| meta.name.to_string()),
+                );
             if let Some(registry) = agent::command::try_global() {
                 for (key, def) in registry.entries() {
+                    // A macro sharing a built-in name is shadowed, matching
+                    // the gpui registry's precedence.
+                    if command_names.contains(key.as_str()) {
+                        continue;
+                    }
+                    command_names.insert(key.clone());
                     commands.push(json!({
                         "name": key,
                         "description": def.description,
@@ -363,6 +389,9 @@ fn handle_command(
             }
             if let Some(registry) = agent::skill::try_global() {
                 for (key, def) in registry.entries() {
+                    if command_names.contains(key.as_str()) {
+                        continue;
+                    }
                     commands.push(json!({
                         "name": key,
                         "description": def.description,
@@ -399,7 +428,7 @@ fn handle_command(
                 );
             }
         }
-        "submit" => with_session(state, session_id.as_deref(), sink, |session, _| {
+        "submit" => {
             let text = cmd["text"].as_str().unwrap_or_default().to_string();
             let images: Vec<(String, String)> = cmd["images"]
                 .as_array()
@@ -414,49 +443,92 @@ fn handle_command(
                         .collect()
                 })
                 .unwrap_or_default();
-            cx.update(|app| {
-                session.thread.update(app, |t, cx| {
-                    let ui = MessageUiMetadata {
-                        model_id: t.model().map(|m| m.id.clone()),
-                        approval_mode: Some(t.approval_mode().as_i64()),
-                        ..Default::default()
-                    };
-                    // Slash turns ride the registry; the bubble keeps the
-                    // compact `/name args` form while the model sees the
-                    // expanded body. Unmatched names fall through to a
-                    // plain turn with the raw text.
-                    if images.is_empty()
-                        && let Some((name, args)) = parse_slash(&text)
-                    {
-                        let slash_ui = MessageUiMetadata {
-                            display_text: Some(text.clone()),
-                            ..ui.clone()
+            let slash: Option<(String, String)> = (images.is_empty())
+                .then(|| parse_slash(&text))
+                .flatten()
+                .map(|(name, args)| (name.to_string(), args.to_string()));
+            // Navigation built-ins (`/exit` / `/new` and aliases) are
+            // session-level: archive the thread and dispose the session so
+            // the webview returns to its home composer, mirroring the gpui
+            // host's archive-and-fresh flow. No-op while a turn is running.
+            if let Some((name, _)) = slash.as_ref()
+                && let Some(builtin) = agent::slash_builtins::canonical_builtin(name)
+                && matches!(builtin.name, "exit" | "new")
+            {
+                let Some(id) = session_id.clone() else {
+                    return true;
+                };
+                let running = state
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+                if running {
+                    return true;
+                }
+                ensure_store_subscription(cx, state, sink);
+                cx.update(|app| {
+                    let store = agent::thread_store::global();
+                    store.update(app, |s, cx| s.archive_thread(&id, true, cx));
+                });
+                {
+                    let mut focused = state.focused.lock().unwrap();
+                    if focused.as_deref() == Some(id.as_str()) {
+                        *focused = None;
+                    }
+                }
+                state.sessions.remove(&id);
+                sink.emit(
+                    serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
+                );
+                return true;
+            }
+            with_session(state, session_id.as_deref(), sink, |session, _| {
+                cx.update(|app| {
+                    session.thread.update(app, |t, cx| {
+                        let ui = MessageUiMetadata {
+                            model_id: t.model().map(|m| m.id.clone()),
+                            approval_mode: Some(t.approval_mode().as_i64()),
+                            ..Default::default()
                         };
-                        let command_hit = agent::command::try_global().is_some()
-                            && t.submit_command(name, args, Some(slash_ui.clone()), cx);
-                        let skill_hit = agent::skill::try_global().is_some()
-                            && t.submit_skill(name, args, Some(slash_ui), cx);
-                        if command_hit || skill_hit {
+                        // Slash turns ride the registry (built-ins first,
+                        // then markdown macros, then skills — the gpui
+                        // registry's precedence); the bubble keeps the
+                        // compact `/name args` form while the model sees the
+                        // expanded body. Unmatched names fall through to a
+                        // plain turn with the raw text.
+                        if let Some((name, args)) = slash {
+                            let slash_ui = MessageUiMetadata {
+                                display_text: Some(text.clone()),
+                                ..ui.clone()
+                            };
+                            let builtin_hit =
+                                t.run_slash_builtin(&name, &args, Some(slash_ui.clone()), cx);
+                            let command_hit = agent::command::try_global().is_some()
+                                && t.submit_command(&name, &args, Some(slash_ui.clone()), cx);
+                            let skill_hit = agent::skill::try_global().is_some()
+                                && t.submit_skill(&name, &args, Some(slash_ui), cx);
+                            if builtin_hit || command_hit || skill_hit {
+                                return;
+                            }
+                        }
+                        let mut content = Vec::new();
+                        if !text.trim().is_empty() {
+                            content.push(MessageContent::Text(text));
+                        }
+                        content.extend(
+                            images
+                                .into_iter()
+                                .map(|(data, mime_type)| MessageContent::Image { data, mime_type }),
+                        );
+                        if content.is_empty() {
                             return;
                         }
-                    }
-                    let mut content = Vec::new();
-                    if !text.trim().is_empty() {
-                        content.push(MessageContent::Text(text));
-                    }
-                    content.extend(
-                        images
-                            .into_iter()
-                            .map(|(data, mime_type)| MessageContent::Image { data, mime_type }),
-                    );
-                    if content.is_empty() {
-                        return;
-                    }
-                    t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
-                    t.run_turn(cx);
+                        t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                        t.run_turn(cx);
+                    });
                 });
             });
-        }),
+        }
         "cancel_turn" => with_session(state, session_id.as_deref(), sink, |session, _| {
             cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
         }),
@@ -657,6 +729,21 @@ fn subscribe_thread(
                 ThreadEvent::HistoryRestored => {
                     emit_history_and_info(app, &entity, &session_id, &subagents, &sink);
                 }
+                ThreadEvent::GoalChanged { .. } => {
+                    // The wire event carries the full snapshot (the pure
+                    // projection only knows the active flag), mirroring the
+                    // HistoryRestored pairing with `thread_history`.
+                    let snapshot = entity.read(app).goal();
+                    let id = session_id.clone();
+                    sink.emit(
+                        json!({
+                            "type": "goal_changed",
+                            "sessionId": id,
+                            "snapshot": serde_json::to_value(snapshot).unwrap_or(Value::Null),
+                        })
+                        .to_string(),
+                    );
+                }
                 _ => {}
             }
             if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id)) {
@@ -723,6 +810,7 @@ fn emit_thread_info(
             "info": {
                 "worktree_path": worktree_path,
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
+                "goal": serde_json::to_value(t.goal()).unwrap_or(Value::Null),
                 "usage": t.cumulative_token_usage(),
                 "per_model_usage": t.per_model_token_usage(),
                 "per_model_cost": t.per_model_cost(),
@@ -906,8 +994,9 @@ fn base64_byte_len(b64: &str) -> u64 {
 }
 
 /// Split a `/name args` invocation; an empty name is not a slash turn.
+/// Leading whitespace is tolerated, matching the gpui host's `parse`.
 fn parse_slash(text: &str) -> Option<(&str, &str)> {
-    let body = text.strip_prefix('/')?;
+    let body = text.trim_start().strip_prefix('/')?;
     let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
     let name = name.trim();
     (!name.is_empty()).then(|| (name, args.trim_start()))
@@ -1647,7 +1736,32 @@ mod tests {
             .iter()
             .find(|e| e["type"] == "commands")
             .expect("commands event emitted");
-        assert!(payload["commands"].is_array());
+        let commands = payload["commands"].as_array().expect("commands array");
+        // The shared built-in set leads the list (the hermetic registries
+        // still carry the compiled-in `healthz` markdown macro afterwards),
+        // each entry with a null description and an i18n_key the webview
+        // translates.
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|c| c["name"].as_str().expect("command name"))
+            .collect();
+        let expected: Vec<&str> = agent::slash_builtins::BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|meta| meta.name)
+            .collect();
+        assert_eq!(&names[..expected.len()], expected.as_slice());
+        for command in commands.iter().take(expected.len()) {
+            assert_eq!(command["kind"], "command");
+            assert!(command["description"].is_null());
+            assert_eq!(
+                command["i18n_key"],
+                agent::slash_builtins::canonical_builtin(
+                    command["name"].as_str().expect("command name"),
+                )
+                .expect("builtin metadata")
+                .description_key
+            );
+        }
         drop(state);
     }
 
@@ -1726,6 +1840,148 @@ mod tests {
             r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
         );
         cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Create one session (plus store + globals) and return the sink state
+    /// borrowed for the test body.
+    fn with_session_for_submit(
+        cx: &mut HeadlessAppContext,
+        state: &mut ActorState,
+    ) -> Arc<Mutex<Vec<String>>> {
+        init_globals(cx);
+        cx.update(agent::thread_store::init);
+        let (out, sink) = collect_sink();
+        handle_command(
+            cx,
+            state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        out
+    }
+
+    #[test]
+    fn submit_routes_builtin_plan_and_danger() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink_out = out.clone();
+        let sink = EventSink::new(move |json| sink_out.lock().unwrap().push(json));
+
+        // `/plan <prompt>` enters plan mode and starts a planning turn whose
+        // user message carries the compact display form.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/plan fix the auth flow"}"#,
+        );
+        cx.run_until_parked();
+        assert!(cx.update(|app| state.sessions["s1"].thread.read(app).plan_mode()));
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        let last = messages.last().expect("plan prompt inserted");
+        assert!(
+            last.content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Text(t) if t == "fix the auth flow"))
+        );
+        assert_eq!(
+            last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
+            Some("/plan fix the auth flow")
+        );
+
+        // Bare `/plan` toggles plan mode back off without starting a turn.
+        // (The engine is absent in the hermetic test env — no provider — so
+        // the async `plan_mode_changed` notice never lands here; its
+        // projection is covered by the events module tests.)
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/plan"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!cx.update(|app| state.sessions["s1"].thread.read(app).plan_mode()));
+        // Still exactly one turn (from the prompt form above): the bare
+        // toggle must not start another.
+        assert_eq!(
+            types(&out)
+                .iter()
+                .filter(|t| t.as_str() == "turn_started")
+                .count(),
+            1
+        );
+
+        // Bare `/danger` toggles the approval mode and pushes the change.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/danger"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|app| state.sessions["s1"].thread.read(app).approval_mode()),
+            ApprovalMode::Danger
+        );
+        assert!(types(&out).contains(&"approval_mode_changed".to_string()));
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn submit_routes_builtin_exit_and_goal() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink_out = out.clone();
+        let sink = EventSink::new(move |json| sink_out.lock().unwrap().push(json));
+
+        // `/exit` archives the thread and disposes the session so the
+        // webview returns to its home composer.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/exit"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+
+        // A goal on a fresh session may be unavailable (no db), but the
+        // routing must never fall through to a plain message: `/goal clear`
+        // is a handled no-op even with no goal store.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s2"}"#,
+        );
+        cx.run_until_parked();
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s2","text":"/goal clear"}"#,
+        );
+        cx.run_until_parked();
+        let messages = cx.update(|app| state.sessions["s2"].thread.read(app).messages().to_vec());
+        assert!(
+            messages.is_empty(),
+            "a handled slash turn must not insert the raw invocation"
+        );
+
         drop(state);
         agent::thread_store::drop_global_for_test();
     }

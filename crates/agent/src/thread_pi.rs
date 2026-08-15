@@ -1529,12 +1529,7 @@ impl Thread {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
         };
-        let rendered = cmd.render(args);
-        let ordinal = self.user_prompt_ordinal();
-        let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
-        self.insert_user_message_with_ui_metadata(rendered, ui, cx);
-        self.persist_registry_display(ordinal, display);
-        self.run_turn(cx);
+        self.insert_slash_turn(cmd.render(args), ui, cx);
         true
     }
 
@@ -1561,12 +1556,155 @@ impl Thread {
             },
         )
         .expect("skill body render");
+        self.insert_slash_turn(rendered, ui, cx);
+        true
+    }
+
+    /// Run a built-in slash command (`/danger`, `/plan`, `/compact`,
+    /// `/goal`) at the thread level — the headless twin of the gpui host's
+    /// built-in command impls, sharing the name/alias set via
+    /// [`crate::slash_builtins`]. Returns `false` for names this layer does
+    /// not own (`exit`/`new` are session-level and handled by the host).
+    /// Prompt forms insert `args` as a user turn carrying the raw
+    /// `/name args` display form, mirroring [`Self::submit_command`].
+    pub fn run_slash_builtin(
+        &mut self,
+        name: &str,
+        args: &str,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match crate::slash_builtins::canonical_builtin(name).map(|meta| meta.name) {
+            Some("danger") => {
+                if args.trim().is_empty() {
+                    let next = match self.approval_mode() {
+                        ApprovalMode::Danger => ApprovalMode::AutoPilot,
+                        _ => ApprovalMode::Danger,
+                    };
+                    self.set_approval_mode(next, cx);
+                } else {
+                    if self.approval_mode() != ApprovalMode::Danger {
+                        self.set_approval_mode(ApprovalMode::Danger, cx);
+                    }
+                    self.insert_slash_turn(args.to_string(), ui, cx);
+                }
+                true
+            }
+            Some("plan") => {
+                if self.plan_mode() {
+                    self.set_plan_mode(false, cx);
+                } else {
+                    self.set_plan_mode(true, cx);
+                    if !args.trim().is_empty() {
+                        self.insert_slash_turn(args.to_string(), ui, cx);
+                    }
+                }
+                true
+            }
+            Some("compact") => {
+                let trimmed = args.trim();
+                let instructions = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                self.compact(instructions, cx);
+                true
+            }
+            Some("goal") => {
+                self.run_goal_slash(args, ui, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `/goal` subcommand dispatch. Thread-state transitions mirror the gpui
+    /// host's `GoalCommand`; the popover-only forms (bare `/goal`, bare
+    /// `edit`/`replace`) are no-ops here — the webview surfaces goal state
+    /// through its info card instead.
+    fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>, cx: &mut Context<Self>) {
+        let trimmed = args.trim();
+        if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
+            if let Err(error) = self.replace_goal(objective.to_string(), None, crate::db::GoalActor::User, cx)
+            {
+                cx.emit(ThreadEvent::Error(error));
+            }
+            return;
+        }
+        if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
+            let budget = self.goal().and_then(|goal| goal.token_budget);
+            if let Err(error) = self.edit_goal(objective.to_string(), budget, crate::db::GoalActor::User, cx)
+            {
+                cx.emit(ThreadEvent::Error(error));
+            }
+            return;
+        }
+        if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
+            let Some(goal) = self.goal() else {
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                return;
+            };
+            let budget = if matches!(value, "none" | "unlimited") {
+                None
+            } else {
+                match value.parse::<u64>() {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        cx.emit(ThreadEvent::Error(error.into()));
+                        return;
+                    }
+                }
+            };
+            if let Err(error) = self.edit_goal(goal.objective, budget, crate::db::GoalActor::User, cx)
+            {
+                cx.emit(ThreadEvent::Error(error));
+            }
+            return;
+        }
+        match trimmed.to_lowercase().as_str() {
+            "" | "edit" | "replace" => {}
+            "clear" => {
+                if let Err(error) = self.clear_goal(crate::db::GoalActor::User, cx) {
+                    cx.emit(ThreadEvent::Error(error));
+                }
+            }
+            "pause" | "stop" => {
+                if let Err(error) = self.set_goal_status(
+                    crate::goal::GoalStatus::Paused,
+                    Some("paused by user".into()),
+                    crate::db::GoalActor::User,
+                    cx,
+                ) {
+                    cx.emit(ThreadEvent::Error(error));
+                }
+            }
+            "resume" => {
+                if let Err(error) = self.set_goal_status(
+                    crate::goal::GoalStatus::Active,
+                    None,
+                    crate::db::GoalActor::User,
+                    cx,
+                ) {
+                    cx.emit(ThreadEvent::Error(error));
+                }
+            }
+            _ => match self.set_goal(trimmed.to_string(), cx) {
+                Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui, cx),
+                Err(error) => cx.emit(ThreadEvent::Error(error)),
+            },
+        }
+    }
+
+    /// Insert a user turn and run it, persisting the compact `/name args`
+    /// display form — the shared tail of registry and built-in slash turns.
+    fn insert_slash_turn(
+        &mut self,
+        text: String,
+        ui: Option<MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
         let ordinal = self.user_prompt_ordinal();
         let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
-        self.insert_user_message_with_ui_metadata(rendered, ui, cx);
+        self.insert_user_message_with_ui_metadata(text, ui, cx);
         self.persist_registry_display(ordinal, display);
         self.run_turn(cx);
-        true
     }
 
     /// The ordinal the next inserted user prompt will occupy among user-role
@@ -1891,6 +2029,57 @@ pub(crate) mod tests {
                 cx,
             );
             assert!(!t.is_running());
+        });
+    }
+
+    /// The headless slash router drives the same thread state the gpui host
+    /// toggles: plan mode, approval mode, compact, and goal lifecycle.
+    #[gpui::test]
+    fn run_slash_builtin_plan_danger_compact_and_unowned(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| {
+            // The prompt form enters plan mode and runs the turn with the
+            // compact display form.
+            let ui = MessageUiMetadata {
+                display_text: Some("/plan fix it".into()),
+                ..Default::default()
+            };
+            assert!(t.run_slash_builtin("plan", "fix it", Some(ui.clone()), cx));
+            assert!(t.plan_mode(), "/plan <prompt> enters plan mode");
+            let runs = engine.runs.lock().unwrap();
+            assert_eq!(runs.len(), 1, "prompt form runs a turn");
+            assert_eq!(runs[0].0, "fix it");
+            drop(runs);
+            let last = t.messages().last().expect("turn message inserted");
+            assert_eq!(
+                last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
+                Some("/plan fix it")
+            );
+
+            // A second invocation toggles plan mode back off, no new turn.
+            assert!(t.run_slash_builtin("plan", "", None, cx));
+            assert!(!t.plan_mode(), "/plan bare exits plan mode");
+            assert_eq!(engine.runs.lock().unwrap().len(), 1);
+
+            assert!(t.run_slash_builtin("danger", "", None, cx));
+            assert_eq!(t.approval_mode(), ApprovalMode::Danger);
+
+            assert!(t.run_slash_builtin("compact", "focus", None, cx));
+            assert!(t.run_slash_builtin("goal", "clear", None, cx));
+
+            // Session-level commands and unknowns are not owned here.
+            assert!(!t.run_slash_builtin("exit", "", None, cx));
+            assert!(!t.run_slash_builtin("quit", "", None, cx));
+            assert!(!t.run_slash_builtin("new", "", None, cx));
+            assert!(!t.run_slash_builtin("nope", "", None, cx));
         });
     }
 

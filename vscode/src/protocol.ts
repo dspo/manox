@@ -88,12 +88,16 @@ export interface ThreadListItem {
 	archived: boolean;
 }
 
-/** One slash-completion entry: a prompt-macro command or a skill. */
+/** One slash-completion entry: a built-in/prompt-macro command or a skill. */
 export interface CommandEntry {
 	name: string;
-	description: string;
+	/** Null for built-ins; the webview translates them via `i18n_key`. */
+	description: string | null;
 	kind: 'command' | 'skill';
 	argument_hint: string | null;
+	/** Fluent key (agent locales) for built-in commands; the webview's own
+	 * i18n dict carries the copy. Null for markdown commands and skills. */
+	i18n_key?: string | null;
 }
 
 /** Serde wire form of agent plan snapshots. */
@@ -105,6 +109,20 @@ export interface PlanStepWire {
 export interface PlanSnapshotWire {
 	explanation: string | null;
 	steps: PlanStepWire[];
+}
+
+/** Serde wire form of the thread's persistent Goal (agent::goal::ThreadGoal). */
+export interface GoalSnapshotWire {
+	thread_id: string;
+	goal_id: string;
+	objective: string;
+	status: 'Active' | 'Paused' | 'Blocked' | 'BudgetLimited' | 'Complete';
+	token_budget: number | null;
+	tokens_used: number;
+	time_used_seconds: number;
+	status_reason: string | null;
+	created_at: number;
+	updated_at: number;
 }
 
 /** One sub-agent's aggregated progress inside a thread info snapshot. */
@@ -128,6 +146,7 @@ export interface GitStats {
 export interface ThreadInfoSnapshot {
 	worktree_path: string | null;
 	plan: PlanSnapshotWire | null;
+	goal: GoalSnapshotWire | null;
 	usage: TokenUsageSnapshot;
 	/** Token usage keyed by "{provider}/{model_id}". */
 	per_model_usage?: Record<string, TokenUsageSnapshot>;
@@ -139,7 +158,6 @@ export interface ThreadInfoSnapshot {
 	/** Arrives via the separate async git_stats event. */
 	git_stats?: GitStats;
 }
-
 /** Wire form of one restored-history message (serde shape of
  * agent::message::Message). Content blocks are externally tagged; image
  * blocks arrive deflated to `{mime_type, byte_len}` placeholders. */
@@ -237,11 +255,13 @@ export type ActorEvent =
 	| { type: 'branch'; sessionId: string; branch: string }
 	| { type: 'git_stats'; sessionId: string; stats: GitStats }
 	| { type: 'history_progress'; sessionId: string }
-	// plan / worktree / sub-agents
+	// plan / goal / worktree / sub-agents
 	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string }
 	| { type: 'plan_updated'; sessionId: string; snapshot: PlanSnapshotWire | null }
 	| { type: 'plan_mode_changed'; sessionId: string; enabled: boolean }
+	| { type: 'goal_changed'; sessionId: string; snapshot: GoalSnapshotWire | null }
 	| { type: 'worktree_changed'; sessionId: string; active: boolean; path: string | null }
+	| { type: 'compaction'; sessionId: string; summary: string }
 	| {
 			type: 'subagent_started';
 			sessionId: string;

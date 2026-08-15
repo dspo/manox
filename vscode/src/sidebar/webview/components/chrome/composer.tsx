@@ -8,7 +8,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ApprovalMode, CommandEntry, ModelInfo } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
-import { t } from '../../lib/i18n';
+import { hasCommandKey, t, type I18nKey } from '../../lib/i18n';
+import { enterAction } from '../../lib/ime';
 import { cn } from '../../lib/utils';
 import { store } from '../../state/bridge';
 import {
@@ -20,8 +21,10 @@ import {
 } from '../ui/dropdown-menu';
 import { Textarea } from '../ui/textarea';
 import { ModelPicker } from './model-picker';
-
 const MAX_IMAGE_EDGE_PX = 1568;
+// Trailing-key window after `compositionend`: only an Enter landing this
+// fast is the engine's post-composition echo, never a deliberate send.
+const COMPOSITION_TRAIL_WINDOW_MS = 300;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
@@ -154,12 +157,18 @@ export const Composer = ({
   const [activeMatch, setActiveMatch] = useState(0);
   const [typeaheadDismissed, setTypeaheadDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // IME composition state: while composing, and for the trailing Enter some
+  // engines fire right after `compositionend`, the key is deferred to the
+  // IME. The timestamp window keeps the deferral tight so a later genuine
+  // Enter (e.g. after a click-committed composition) still sends.
+  const compositionEndedAtRef = useRef(0);
   const draft = sessionId === null && onCreateSession !== undefined;
   const ready = sessionId !== null || draft;
 
   // The typeahead is live only while the leading token is an unfinished
-  // slash invocation; the actor does the actual routing on submit.
-  const slashPrefix = /^\/(\S*)$/.exec(text)?.[1]?.toLowerCase();
+  // slash invocation; the actor does the actual routing on submit. Leading
+  // whitespace is tolerated, matching the gpui host's parser.
+  const slashPrefix = /^\s*\/(\S*)$/.exec(text)?.[1]?.toLowerCase();
   const matches =
     slashPrefix === undefined || typeaheadDismissed
       ? []
@@ -176,6 +185,14 @@ export const Composer = ({
     setTypeaheadDismissed(true);
     textareaRef.current?.focus();
   }, []);
+
+  /** One-line typeahead description: built-ins translate through the
+   * webview's own chrome locale; unknown keys fall back to the raw
+   * description the actor shipped. */
+  const describe = (entry: CommandEntry): string =>
+    entry.i18n_key && hasCommandKey(entry.i18n_key)
+      ? t(entry.i18n_key as I18nKey)
+      : (entry.description ?? `/${entry.name}`);
 
   const submit = useCallback(() => {
     const trimmed = text.trim();
@@ -202,7 +219,33 @@ export const Composer = ({
     setImages([]);
   }, [text, images, turnActive, creating, sessionId, onCreateSession]);
 
+  const handleCompositionEnd = () => {
+    compositionEndedAtRef.current = Date.now();
+  };
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter') {
+      const trailingComposition =
+        Date.now() - compositionEndedAtRef.current < COMPOSITION_TRAIL_WINDOW_MS;
+      compositionEndedAtRef.current = 0;
+      const action = enterAction(
+        {
+          key: e.key,
+          shiftKey: e.shiftKey,
+          isComposing: e.nativeEvent.isComposing,
+          keyCode: e.nativeEvent.keyCode,
+        },
+        trailingComposition,
+      );
+      // Deferred keys (IME commit, shift+Enter newline, trailing composition
+      // key) keep the browser's default behavior.
+      if (action === 'defer') return;
+      e.preventDefault();
+      submit();
+      return;
+    }
+    // Any other key clears the composition trail and drives the typeahead.
+    compositionEndedAtRef.current = 0;
     if (showTypeahead) {
       if (e.key === 'Tab') {
         e.preventDefault();
@@ -224,10 +267,6 @@ export const Composer = ({
         setTypeaheadDismissed(true);
         return;
       }
-    }
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      submit();
     }
   };
 
@@ -287,7 +326,7 @@ export const Composer = ({
                   {entry.kind}
                 </span>
                 <span className="text-muted-foreground min-w-0 flex-1 truncate">
-                  {entry.description}
+                  {describe(entry)}
                 </span>
               </button>
             ))}
@@ -296,6 +335,7 @@ export const Composer = ({
         <Textarea
           className="font-code min-h-[52px] resize-none border-0 bg-transparent px-3 py-2 text-[13px] font-light shadow-none focus-visible:ring-0"
           onChange={(e) => setText(e.target.value)}
+          onCompositionEnd={handleCompositionEnd}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           placeholder={ready ? t('composer_placeholder') : t('starting_session')}
