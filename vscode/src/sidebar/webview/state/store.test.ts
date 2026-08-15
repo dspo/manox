@@ -245,6 +245,13 @@ describe('transcript folding', () => {
     expect(thread(store, 'a')?.error).toBeNull();
   });
 
+  it('drops session errors for unknown sessions instead of spawning ghost threads', () => {
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'ghost', message: 'boom' }));
+    expect(Object.keys(store.get().perThread)).toEqual(['a']);
+    expect(store.get().error).toBeNull();
+  });
+
   it('keeps session-less errors global and clears them on session_ready', () => {
     const store = new Store();
     store.dispatch(event({ type: 'error', sessionId: null, message: 'core hiccup' }));

@@ -218,6 +218,9 @@ function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
   // never surfaces in another conversation's banner.
   if (ev.type === 'error') {
     if (typeof ev.sessionId === 'string') {
+      // Sessions without local state would materialize a ghost thread via
+      // updateThread's init fallback; their errors are dropped instead.
+      if (!state.perThread[ev.sessionId]) return state;
       return updateThread(state, ev.sessionId, (t) => ({ ...t, error: ev.message }));
     }
     return { ...state, error: ev.message };
