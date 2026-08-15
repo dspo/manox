@@ -102,9 +102,14 @@ const emptyInfo = (): ThreadInfoSnapshot => ({
 });
 
 /** git_stats arrives on its own event channel, so a whole-snapshot replace
- * must keep whatever stats were already merged into the thread. */
+ * must keep whatever stats were already merged into the thread. The usage
+ * pair rides along too: thread_info carries the same cumulative snapshot
+ * the host renders, so a late push (engine materialization on restore)
+ * corrects the zeroed pre-materialization `get_usage` reply. */
 const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
   ...t,
+  usage: info.usage,
+  cost: info.cost,
   info: { ...info, git_stats: info.git_stats ?? t.info?.git_stats },
 });
 
