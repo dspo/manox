@@ -236,7 +236,15 @@ describe('provideLanguageModelChatInformation', () => {
     expect(transport.lastCommand()).toEqual({ cmd: 'list_models' });
     transport.emit({
       type: 'models',
-      models: [{ id: 'anthropic/x', name: 'X', provider: 'anthropic' }],
+      models: [
+        {
+          id: 'anthropic/x',
+          name: 'X',
+          provider: 'anthropic',
+          api: 'anthropic',
+          context_window: 131_072,
+        },
+      ],
     });
     await expect(pending).resolves.toEqual([
       expect.objectContaining({
@@ -244,11 +252,38 @@ describe('provideLanguageModelChatInformation', () => {
         name: 'X',
         family: 'anthropic',
         version: '1.0.0',
-        maxInputTokens: 200_000,
+        maxInputTokens: 131_072,
         maxOutputTokens: 32_000,
         capabilities: { toolCalling: true, imageInput: true },
         isUserSelectable: true,
       }),
+    ]);
+  });
+
+  it('passes a reported zero context window through instead of masking it', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation(
+      { silent: false },
+      fakeToken(),
+    );
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        {
+          id: 'anthropic/x',
+          name: 'X',
+          provider: 'anthropic',
+          api: 'anthropic',
+          context_window: 0,
+        },
+      ],
+    });
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ maxInputTokens: 0 }),
     ]);
   });
 
