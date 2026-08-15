@@ -19,15 +19,14 @@ use tokio_util::sync::CancellationToken;
 use pi::agent_loop::StreamFn;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use pi::types::{
-    AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, Model,
-    StopReason, StreamOptions,
+    AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, Model, StopReason,
+    StreamOptions,
 };
 
 use crate::actor::EventSink;
 
 /// Default system prompt used when the request carries no system-role text.
-const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are manox, a coding assistant running inside VS Code. Use the provided tools when they help answer the request.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are manox, a coding assistant running inside VS Code. Use the provided tools when they help answer the request.";
 
 /// A tool definition relayed from the native chat. The model may emit a call
 /// for it, but execution happens in VS Code — the actor never runs it.
@@ -114,10 +113,9 @@ pub fn build_context(model: &Model, messages: &Value, tools: &Value) -> AgentCon
                                     }
                                 }
                                 Some("image") => {
-                                    let (Some(data), Some(mime_type)) = (
-                                        block["data"].as_str(),
-                                        block["mimeType"].as_str(),
-                                    ) else {
+                                    let (Some(data), Some(mime_type)) =
+                                        (block["data"].as_str(), block["mimeType"].as_str())
+                                    else {
                                         continue;
                                     };
                                     content.push(ContentBlock::Image {
@@ -260,37 +258,42 @@ pub fn build_context(model: &Model, messages: &Value, tools: &Value) -> AgentCon
 
 /// Emit one relayed delta as a wire event.
 fn forward(sink: &EventSink, request_id: &str, ev: AgentEvent) {
-    match ev {
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
-            ..
-        } => match assistant_message_event {
-            AssistantMessageEvent::TextDelta { delta, .. } => {
-                sink.emit(json!({"type": "model_text", "requestId": request_id, "text": delta}).to_string());
-            }
-            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                sink.emit(
-                    json!({"type": "model_thinking", "requestId": request_id, "text": delta})
-                        .to_string(),
-                );
-            }
-            AssistantMessageEvent::ToolCallEnd {
-                tool_call: ContentBlock::ToolUse { id, name, input, .. },
-                ..
-            } => {
-                sink.emit(
-                    json!({
-                        "type": "model_tool_call",
-                        "requestId": request_id,
-                        "id": id,
-                        "name": name,
-                        "input": input,
-                    })
+    let AgentEvent::MessageUpdate {
+        assistant_message_event,
+        ..
+    } = ev
+    else {
+        return;
+    };
+    match assistant_message_event {
+        AssistantMessageEvent::TextDelta { delta, .. } => {
+            sink.emit(
+                json!({"type": "model_text", "requestId": request_id, "text": delta}).to_string(),
+            );
+        }
+        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+            sink.emit(
+                json!({"type": "model_thinking", "requestId": request_id, "text": delta})
                     .to_string(),
-                );
-            }
-            _ => {}
-        },
+            );
+        }
+        AssistantMessageEvent::ToolCallEnd {
+            tool_call: ContentBlock::ToolUse {
+                id, name, input, ..
+            },
+            ..
+        } => {
+            sink.emit(
+                json!({
+                    "type": "model_tool_call",
+                    "requestId": request_id,
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                })
+                .to_string(),
+            );
+        }
         _ => {}
     }
 }
@@ -502,7 +505,13 @@ mod tests {
                 assert_eq!(provider, "anthropic");
                 assert_eq!(api, "anthropic");
                 assert_eq!(stop_reason, &Some(StopReason::Stop));
-                assert!(matches!(usage.as_ref(), Usage { total_tokens: 0, .. }));
+                assert!(matches!(
+                    usage.as_ref(),
+                    Usage {
+                        total_tokens: 0,
+                        ..
+                    }
+                ));
                 assert_eq!(content.len(), 3);
                 assert!(matches!(
                     content[2],
