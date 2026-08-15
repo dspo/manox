@@ -62,7 +62,7 @@ export const ModelPicker = ({
       <DropdownMenuTrigger asChild>
         <button
           className={cn(
-            'hover:bg-accent/10 flex cursor-pointer items-center gap-1 rounded px-2 py-1 text-xs',
+            'hover:bg-accent/8 flex cursor-pointer items-center gap-1 rounded px-2 py-1 text-xs',
             disabled && 'pointer-events-none opacity-50',
           )}
           disabled={disabled}
@@ -77,7 +77,7 @@ export const ModelPicker = ({
               </span>
             </>
           ) : (
-            <span className="text-muted-foreground">{t('no_model_configured')}</span>
+            <span>{t('no_model_configured')}</span>
           )}
           {open ? (
             <ChevronUp className="text-muted-foreground size-3 shrink-0" />

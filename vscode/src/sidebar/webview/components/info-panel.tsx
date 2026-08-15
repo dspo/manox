@@ -10,6 +10,8 @@ import {
   Circle,
   GitBranch,
   LoaderCircle,
+  Minus,
+  ShipWheel,
   TriangleAlert,
   XCircle,
 } from 'lucide-react';
@@ -70,21 +72,29 @@ const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => 
   if (status === 'success' || status === 'completed' || status === 'continued') {
     return <CheckCircle className="size-3.5 shrink-0 text-success" />;
   }
-  if (status === 'error' || status === 'failed' || status === 'denied' || status === 'cancelled') {
+  if (status === 'error' || status === 'failed' || status === 'denied') {
     return <XCircle className="size-3.5 shrink-0 text-danger" />;
+  }
+  if (status === 'cancelled') {
+    return <Minus className="text-muted-foreground size-3.5 shrink-0" />;
   }
   return <Circle className="text-muted-foreground size-3.5 shrink-0" />;
 };
 
-/** The main agent's own status, derived from the thread's live flags. */
+/** The main agent's own status, mirroring the host's captain indicator:
+ * ship-wheel on success (sub-agents get the plain check) and a red X on a
+ * failed turn. */
 const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
   if (thread.turnActive) {
     return <LoaderCircle className="size-3.5 shrink-0 animate-spin text-muted-foreground" />;
   }
+  if (thread.error !== null) {
+    return <XCircle className="size-3.5 shrink-0 text-danger" />;
+  }
   if ((thread.info?.pending_auth_count ?? 0) > 0) {
     return <TriangleAlert className="text-warning size-3.5 shrink-0" />;
   }
-  return <CheckCircle className="size-3.5 shrink-0 text-success" />;
+  return <ShipWheel className="size-3.5 shrink-0 text-success" />;
 };
 
 /** Occupied context for a usage row: live input plus everything cached. */
@@ -133,18 +143,18 @@ const ModelUsageRow = ({
       {cap !== undefined && (
         <p
           className={cn(
-            'whitespace-pre',
+            'whitespace-pre overflow-hidden text-ellipsis',
             used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground',
           )}
         >
           {`${indent}├─ ${((used / cap) * 100).toFixed(1)}% ${formatTokensPi(used)}/${formatTokensPi(cap)}`}
         </p>
       )}
-      <p className="text-muted-foreground whitespace-pre">
+      <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">
         {`${indent}${cost > 0 ? '├─' : '└─'} ↑${formatTokensPi(input)} ↓${formatTokensPi(usage.output_tokens ?? 0)} R${formatTokensPi(cacheRead)} CH${hitRate}`}
       </p>
       {cost > 0 && (
-        <p className="text-muted-foreground whitespace-pre">{`${indent}└─ ${formatCost(cost)}`}</p>
+        <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">{`${indent}└─ ${formatCost(cost)}`}</p>
       )}
     </div>
   );
@@ -169,7 +179,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   return (
     <aside
       className={cn(
-        'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-foreground/10 p-3 text-xs',
+        'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-border p-3 text-xs',
         'shadow-[-3px_6px_10px_rgba(0,0,0,0.22)]',
         className,
       )}
@@ -241,7 +251,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         )}
       </Section>
 
-      <div className="border-foreground/10 border-t" />
+      <div className="border-border border-t" />
 
       <Section title={t('sources')}>
         <p className="text-muted-foreground">{t('no_sources')}</p>
