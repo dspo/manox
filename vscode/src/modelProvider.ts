@@ -17,6 +17,8 @@ const SESSION_IDLE_TTL_MS = 30 * 60_000;
 interface SessionEntry {
   sessionId: string;
   lastUsed: number;
+  /** A turn is in flight; running entries are exempt from eviction. */
+  running: boolean;
 }
 
 /** Role ordinal → label used in the transcript seed projection. */
@@ -25,7 +27,10 @@ const ROLE_NAMES: Record<number, string> = { 1: 'User', 2: 'Assistant', 3: 'Syst
 /**
  * Conversation identity: a hash of the first user message's text parts.
  * Appended turns keep the key stable; editing that first message starts a
- * fresh conversation (and loses the cached session's memory).
+ * fresh conversation (and loses the cached session's memory). The provider
+ * API exposes no conversation id, so conversations that open with identical
+ * text (or with an image-only first message, which hashes as empty) share
+ * one session — a documented limitation.
  */
 export function conversationKey(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -64,6 +69,16 @@ export function partToString(part: unknown): string {
   }
 }
 
+/** Index of the last user message, or -1 when none exists. */
+function lastUserIndex(
+  messages: readonly vscode.LanguageModelChatRequestMessage[],
+): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === vscode.LanguageModelChatMessageRole.User) return i;
+  }
+  return -1;
+}
+
 /** Full transcript projection: every message as `Role: <parts>`. */
 export function serializeTranscript(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -83,13 +98,11 @@ export function serializeTranscript(
 export function extractDelta(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
 ): { text: string; images: ImageAttachment[] } {
-  const lastUser = [...messages].reverse().find(
-    (m) => m.role === vscode.LanguageModelChatMessageRole.User,
-  );
-  if (!lastUser) return { text: '', images: [] };
+  const index = lastUserIndex(messages);
+  if (index < 0) return { text: '', images: [] };
   const text: string[] = [];
   const images: ImageAttachment[] = [];
-  for (const part of lastUser.content) {
+  for (const part of messages[index].content) {
     if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith('image/')) {
       images.push({
         data: Buffer.from(part.data).toString('base64'),
@@ -100,6 +113,23 @@ export function extractDelta(
     }
   }
   return { text: text.join(''), images };
+}
+
+/**
+ * Stream one thinking chunk. The thinking part is a proposed API that only
+ * hosts declaring the proposal inject; stable hosts fall back to a text part
+ * so reasoning still streams instead of throwing in the event callback.
+ */
+export function reportThinking(
+  progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  text: string,
+): void {
+  const ThinkingPart = (
+    vscode as unknown as {
+      LanguageModelThinkingPart?: new (value: string) => vscode.LanguageModelResponsePart;
+    }
+  ).LanguageModelThinkingPart;
+  progress.report(ThinkingPart ? new ThinkingPart(text) : new vscode.LanguageModelTextPart(text));
 }
 
 export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
@@ -122,7 +152,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
         version: '1.0.0',
         maxInputTokens: DEFAULT_MAX_INPUT_TOKENS,
         maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
-        capabilities: { toolCalling: true },
+        capabilities: { toolCalling: true, imageInput: true },
         isUserSelectable: true,
       }));
     } catch {
@@ -141,30 +171,53 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
   ): Promise<void> {
     const cwd = resolveWorkspaceCwd();
     await this.manager.init(cwd);
+    if (token.isCancellationRequested) return;
 
     this.evictStale();
     const key = conversationKey(messages);
     const existing = this.sessions.get(key);
     const isNewSession = !existing;
     let sessionId: string;
+    let entry: SessionEntry;
     if (existing) {
+      if (existing.running) {
+        // The host serializes same-conversation requests, so an in-flight
+        // hit means two conversations collided on one key. Fail loudly
+        // instead of queueing into the actor's running-turn no-op.
+        throw new Error(
+          'manox session busy: another conversation opened with the same first message',
+        );
+      }
       existing.lastUsed = Date.now();
       sessionId = existing.sessionId;
+      entry = existing;
     } else {
       sessionId = await this.manager.createSession(cwd);
-      // Native chat has no approval surface, so autopilot would stall a turn
-      // on a reviewer round-trip; force danger on fresh sessions.
-      this.manager.send({ cmd: 'set_approval_mode', sessionId, mode: 'danger' });
-      this.sessions.set(key, { sessionId, lastUsed: Date.now() });
+      if (token.isCancellationRequested) {
+        this.manager.disposeSession(sessionId);
+        return;
+      }
+      entry = { sessionId, lastUsed: Date.now(), running: false };
+      this.sessions.set(key, entry);
     }
 
+    const lastIdx = lastUserIndex(messages);
     const { text: deltaText, images } = extractDelta(messages);
+    if (deltaText === '' && images.length === 0) {
+      // The actor drops empty submits without a turn_finished; reject
+      // instead of leaving the request hanging.
+      if (isNewSession) {
+        this.manager.disposeSession(sessionId);
+        this.sessions.delete(key);
+      }
+      throw new Error('empty agent request: the last user message has no text or image');
+    }
     let text = deltaText;
-    if (isNewSession && messages.length > 1) {
-      // Seed the fresh session with everything before the last message so
-      // the agent knows the conversation that led here; later turns only
+    if (isNewSession && lastIdx > 0) {
+      // Seed the fresh session with everything before the last user message
+      // so the agent knows the conversation that led here; later turns only
       // send their delta and continue on the session transcript.
-      text = serializeTranscript(messages.slice(0, -1)) + '\n\n---\n\n' + deltaText;
+      text = serializeTranscript(messages.slice(0, lastIdx)) + '\n\n---\n\n' + deltaText;
     }
 
     let settled = false;
@@ -180,19 +233,17 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
           progress.report(new vscode.LanguageModelTextPart(ev.text));
           break;
         case 'agent_thinking':
-          // The stable response-part union predates the thinking proposal;
-          // the proposed part is streamed through the same report channel.
-          progress.report(
-            new vscode.LanguageModelThinkingPart(ev.text) as unknown as vscode.LanguageModelResponsePart,
-          );
+          reportThinking(progress, ev.text);
           break;
         case 'turn_finished':
-          // A cancelled turn is a normal end: the user asked to stop.
           if (settled) return;
           settled = true;
           off();
           cancelSub.dispose();
-          resolveDone();
+          // A cancelled turn is a normal end; a failed turn carries no
+          // error event of its own in every path, so reject on the flag.
+          if (ev.failed) rejectDone(new Error('agent turn failed'));
+          else resolveDone();
           break;
         case 'error':
           if (settled) return;
@@ -207,9 +258,14 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
       this.manager.send({ cmd: 'cancel_turn', sessionId });
     });
 
+    entry.running = true;
     try {
       // The user may switch models mid-conversation; re-assert each turn.
       this.manager.send({ cmd: 'set_model', sessionId, id: model.id });
+      // The config listener broadcasts the approval mode to every session;
+      // re-assert danger so a switch to autopilot cannot stall a turn on an
+      // approval the native chat cannot answer.
+      this.manager.send({ cmd: 'set_approval_mode', sessionId, mode: 'danger' });
       this.manager.send({
         cmd: 'submit',
         sessionId,
@@ -223,8 +279,8 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
         off();
         cancelSub.dispose();
       }
-      // The session stays cached for the next turn; eviction or extension
-      // shutdown releases it.
+      entry.running = false;
+      entry.lastUsed = Date.now();
     }
   }
 
@@ -238,11 +294,11 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
   }
 
   /** Drop idle sessions past the TTL, then evict least-recently-used entries
-   * down to the cap. */
+   * down to the cap; sessions with an in-flight turn are never evicted. */
   private evictStale(): void {
     const now = Date.now();
     for (const [key, entry] of this.sessions) {
-      if (now - entry.lastUsed > SESSION_IDLE_TTL_MS) {
+      if (!entry.running && now - entry.lastUsed > SESSION_IDLE_TTL_MS) {
         this.manager.disposeSession(entry.sessionId);
         this.sessions.delete(key);
       }
@@ -251,7 +307,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
       let oldestKey: string | null = null;
       let oldestUsed = Infinity;
       for (const [key, entry] of this.sessions) {
-        if (entry.lastUsed < oldestUsed) {
+        if (!entry.running && entry.lastUsed < oldestUsed) {
           oldestUsed = entry.lastUsed;
           oldestKey = key;
         }

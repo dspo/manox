@@ -1,10 +1,13 @@
 // ManoxModelProvider behaviour against an in-memory transport: model
 // information mapping, session-key caching, delta/seed submission, thinking
-// streaming, cancellation, and part serialization.
+// streaming, cancellation, eviction, and part serialization.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('vscode', () => {
+  let approvalMode: string | undefined;
+  let thinkingAvailable = true;
+
   class LanguageModelTextPart {
     constructor(public value: string) {}
   }
@@ -37,20 +40,30 @@ vi.mock('vscode', () => {
   return {
     workspace: {
       workspaceFolders: undefined,
-      getConfiguration: () => ({ get: () => undefined }),
+      getConfiguration: () => ({ get: () => approvalMode }),
     },
     LanguageModelChatMessageRole: { User: 1, Assistant: 2, System: 3 },
+    get LanguageModelThinkingPart() {
+      return thinkingAvailable ? LanguageModelThinkingPart : undefined;
+    },
     LanguageModelTextPart,
-    LanguageModelThinkingPart,
     LanguageModelDataPart,
     LanguageModelToolCallPart,
     LanguageModelToolResultPart,
+    /** Test hook: configure the reported manox.approvalMode. */
+    setApprovalModeConfig: (mode: string | undefined) => {
+      approvalMode = mode;
+    },
+    /** Test hook: simulate a host that does not inject the thinking part. */
+    setThinkingPartAvailable: (available: boolean) => {
+      thinkingAvailable = available;
+    },
   };
 });
 
 import * as vscode from 'vscode';
 import type { ActorEvent } from './protocol';
-import { ManoxModelProvider, partToString, serializeTranscript } from './modelProvider';
+import { ManoxModelProvider, partToString, reportThinking, serializeTranscript } from './modelProvider';
 import { SessionManager } from './sessionManager';
 import type { Transport } from './transport/transport';
 
@@ -108,7 +121,7 @@ const modelInfo = (id: string): vscode.LanguageModelChatInformation => ({
   version: '1.0.0',
   maxInputTokens: 200_000,
   maxOutputTokens: 32_000,
-  capabilities: { toolCalling: true },
+  capabilities: { toolCalling: true, imageInput: true },
 });
 
 const progress = {
@@ -117,14 +130,26 @@ const progress = {
   report: ReturnType<typeof vi.fn>;
 };
 
-const fakeToken = (cancelFns: Array<(e?: unknown) => void> = []) =>
-  ({
-    isCancellationRequested: false,
+const emptyOptions = {} as vscode.ProvideLanguageModelChatResponseOptions;
+
+/** Cancellation token whose flag flips when `cancel()` runs the callbacks. */
+const fakeToken = () => {
+  let cancelled = false;
+  const cancelFns: Array<(e?: unknown) => void> = [];
+  return {
+    get isCancellationRequested() {
+      return cancelled;
+    },
     onCancellationRequested: vi.fn((f: (e?: unknown) => void) => {
       cancelFns.push(f);
       return { dispose: () => {} };
     }),
-  }) as unknown as vscode.CancellationToken;
+    cancel: () => {
+      cancelled = true;
+      for (const f of cancelFns) f();
+    },
+  } as unknown as vscode.CancellationToken & { cancel(): void };
+};
 
 /** Drain the microtask queue so actor responses propagate. */
 const flush = async (times = 5) => {
@@ -150,15 +175,50 @@ async function openTurn(
   return { sessionId };
 }
 
+/** Run one complete turn (fresh session per distinct first message). */
+async function runTurn(
+  provider: ManoxModelProvider,
+  transport: FakeTransport,
+  text: string,
+): Promise<string> {
+  const pending = provider.provideLanguageModelChatResponse(
+    modelInfo('anthropic/x'),
+    [userMsg(text)],
+    emptyOptions,
+    progress,
+    fakeToken(),
+  );
+  await flush();
+  if (transport.lastCommand().cmd === 'init') {
+    transport.emit({ type: 'ready' });
+    await flush();
+  }
+  const createCmd = transport.lastCommand();
+  expect(createCmd.cmd).toBe('create_session');
+  const sessionId = createCmd.sessionId as string;
+  transport.emit({ type: 'session_created', sessionId });
+  await flush();
+  finishTurn(transport, sessionId);
+  await pending;
+  return sessionId;
+}
+
 const finishTurn = (transport: FakeTransport, sessionId: string) =>
   transport.emit({ type: 'turn_finished', sessionId, cancelled: false, failed: false });
 
 const lastSubmit = (transport: FakeTransport) =>
   transport.commands().reverse().find((c) => c.cmd === 'submit') as Record<string, unknown>;
 
+const setApprovalModeConfig = (mode: string | undefined) =>
+  (vscode as unknown as { setApprovalModeConfig(m: string | undefined): void }).setApprovalModeConfig(mode);
+const setThinkingPartAvailable = (available: boolean) =>
+  (vscode as unknown as { setThinkingPartAvailable(a: boolean): void }).setThinkingPartAvailable(available);
+
 afterEach(() => {
   vi.useRealTimers();
   progress.report.mockClear();
+  setApprovalModeConfig(undefined);
+  setThinkingPartAvailable(true);
 });
 
 describe('provideLanguageModelChatInformation', () => {
@@ -186,7 +246,7 @@ describe('provideLanguageModelChatInformation', () => {
         version: '1.0.0',
         maxInputTokens: 200_000,
         maxOutputTokens: 32_000,
-        capabilities: { toolCalling: true },
+        capabilities: { toolCalling: true, imageInput: true },
         isUserSelectable: true,
       }),
     ]);
@@ -223,7 +283,7 @@ describe('provideLanguageModelChatResponse', () => {
     const pending = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       [userMsg('hello')],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
@@ -234,11 +294,12 @@ describe('provideLanguageModelChatResponse', () => {
       'init',
       'create_session',
       'set_approval_mode',
-      'set_approval_mode',
       'set_model',
+      'set_approval_mode',
       'submit',
     ]);
-    // Native chat has no approval surface: every session runs in danger.
+    // The default config (danger) is asserted at creation and re-asserted
+    // with the per-turn model switch.
     expect(commands.filter((c) => c.cmd === 'set_approval_mode')).toEqual([
       { cmd: 'set_approval_mode', sessionId, mode: 'danger' },
       { cmd: 'set_approval_mode', sessionId, mode: 'danger' },
@@ -266,19 +327,20 @@ describe('provideLanguageModelChatResponse', () => {
     await expect(pending).resolves.toBeUndefined();
   });
 
-  it('reuses the cached session and submits only the delta on follow-ups', async () => {
+  it('reuses the cached session and re-asserts model and danger on follow-ups', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
     const first = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       [userMsg('first question')],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
     const { sessionId } = await openTurn(transport, first);
     finishTurn(transport, sessionId);
     await first;
+    const firstCount = transport.commands().length;
 
     const second = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
@@ -287,13 +349,21 @@ describe('provideLanguageModelChatResponse', () => {
         assistantMsg([textPart('answer')]),
         userMsg('follow-up'),
       ],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
     await flush();
-    // Same conversation key: no new session, no seed prefix, delta only.
+    // Same conversation key: no new session, delta only, and the per-turn
+    // model/approval re-assertion still fires.
     expect(transport.commands().filter((c) => c.cmd === 'create_session')).toHaveLength(1);
+    const secondPhase = transport.commands().slice(firstCount);
+    expect(secondPhase.map((c) => c.cmd)).toEqual([
+      'set_model',
+      'set_approval_mode',
+      'submit',
+    ]);
+    expect(secondPhase[1]).toEqual({ cmd: 'set_approval_mode', sessionId, mode: 'danger' });
     const submit = lastSubmit(transport);
     expect(submit).toMatchObject({ cmd: 'submit', sessionId, text: 'follow-up' });
     finishTurn(transport, sessionId);
@@ -308,15 +378,13 @@ describe('provideLanguageModelChatResponse', () => {
     const pending = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       messages,
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
     const { sessionId } = await openTurn(transport, pending);
     const submit = lastSubmit(transport);
-    expect(submit.text).toBe(
-      serializeTranscript(prior) + '\n\n---\n\nquestion',
-    );
+    expect(submit.text).toBe(serializeTranscript(prior) + '\n\n---\n\nquestion');
     finishTurn(transport, sessionId);
     await pending;
   });
@@ -324,17 +392,16 @@ describe('provideLanguageModelChatResponse', () => {
   it('sends cancel_turn on cancellation and resolves on the cancelled finish', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
-    const cancelFns: Array<(e?: unknown) => void> = [];
+    const token = fakeToken();
     const pending = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       [userMsg('hi')],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
-      fakeToken(cancelFns),
+      token,
     );
     const { sessionId } = await openTurn(transport, pending);
-    expect(cancelFns).toHaveLength(1);
-    cancelFns[0]();
+    token.cancel();
     expect(transport.lastCommand()).toEqual({ cmd: 'cancel_turn', sessionId });
     transport.emit({ type: 'turn_finished', sessionId, cancelled: true, failed: false });
     await expect(pending).resolves.toBeUndefined();
@@ -346,7 +413,7 @@ describe('provideLanguageModelChatResponse', () => {
     const pending = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       [userMsg('hi')],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
@@ -355,13 +422,71 @@ describe('provideLanguageModelChatResponse', () => {
     await expect(pending).rejects.toThrow('boom');
   });
 
+  it('rejects when the turn reports failure without an error event', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hi')],
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    const { sessionId } = await openTurn(transport, pending);
+    transport.emit({ type: 'turn_finished', sessionId, cancelled: false, failed: true });
+    await expect(pending).rejects.toThrow('agent turn failed');
+  });
+
+  it('rejects a request that collides with an in-flight session', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const first = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hello')],
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    const { sessionId } = await openTurn(transport, first);
+    const second = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hello')],
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    await expect(second).rejects.toThrow(/busy/);
+    finishTurn(transport, sessionId);
+    await first;
+  });
+
+  it('rejects an empty delta and reclaims the fresh session', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const messages = [
+      assistantMsg([textPart('prior')]),
+      msg(vscode.LanguageModelChatMessageRole.User, []),
+    ];
+    const pending = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      messages,
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    const { sessionId } = await openTurn(transport, pending);
+    await expect(pending).rejects.toThrow(/empty agent request/);
+    const disposed = transport.commands().filter((c) => c.cmd === 'dispose_session');
+    expect(disposed.map((c) => c.sessionId)).toContain(sessionId);
+  });
+
   it('sends base64 images from the last user message', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
     const first = provider.provideLanguageModelChatResponse(
       modelInfo('anthropic/x'),
       [userMsg('look')],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
@@ -380,7 +505,7 @@ describe('provideLanguageModelChatResponse', () => {
           new vscode.LanguageModelDataPart(data, 'image/png'),
         ]),
       ],
-      {} as vscode.ProvideLanguageModelChatResponseOptions,
+      emptyOptions,
       progress,
       fakeToken(),
     );
@@ -393,6 +518,130 @@ describe('provideLanguageModelChatResponse', () => {
     finishTurn(transport, sessionId);
     await second;
   });
+
+  it('aborts during actor init before any session is created', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const token = fakeToken();
+    const pending = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hi')],
+      emptyOptions,
+      progress,
+      token,
+    );
+    await flush();
+    expect(transport.lastCommand()).toEqual(expect.objectContaining({ cmd: 'init' }));
+    token.cancel();
+    transport.emit({ type: 'ready' });
+    await flush();
+    await expect(pending).resolves.toBeUndefined();
+    expect(transport.commands().filter((c) => c.cmd === 'create_session')).toHaveLength(0);
+  });
+
+  it('aborts during session creation and reclaims the session', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const token = fakeToken();
+    const pending = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hi')],
+      emptyOptions,
+      progress,
+      token,
+    );
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    const createCmd = transport.lastCommand();
+    expect(createCmd.cmd).toBe('create_session');
+    const sessionId = createCmd.sessionId as string;
+    token.cancel();
+    transport.emit({ type: 'session_created', sessionId });
+    await flush();
+    await expect(pending).resolves.toBeUndefined();
+    expect(transport.commands().filter((c) => c.cmd === 'submit')).toHaveLength(0);
+    expect(
+      transport.commands().filter((c) => c.cmd === 'dispose_session').map((c) => c.sessionId),
+    ).toContain(sessionId);
+  });
+
+  it('overrides an autopilot config with danger on every turn', async () => {
+    setApprovalModeConfig('autopilot');
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const first = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hi')],
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    const { sessionId } = await openTurn(transport, first);
+    // createSession inherits autopilot from the config; the provider's
+    // re-assertion converges the session to danger.
+    const approvals = transport.commands().filter((c) => c.cmd === 'set_approval_mode');
+    expect(approvals.map((c) => c.mode)).toEqual(['autopilot', 'danger']);
+    finishTurn(transport, sessionId);
+    await first;
+
+    const second = provider.provideLanguageModelChatResponse(
+      modelInfo('anthropic/x'),
+      [userMsg('hi'), assistantMsg([textPart('a')]), userMsg('again')],
+      emptyOptions,
+      progress,
+      fakeToken(),
+    );
+    await flush();
+    const lastApproval = transport
+      .commands()
+      .filter((c) => c.cmd === 'set_approval_mode')
+      .at(-1);
+    expect(lastApproval).toEqual({ cmd: 'set_approval_mode', sessionId, mode: 'danger' });
+    finishTurn(transport, sessionId);
+    await second;
+  });
+});
+
+describe('eviction', () => {
+  it('evicts idle sessions past the TTL', async () => {
+    vi.useFakeTimers();
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const idle = await runTurn(provider, transport, 'a');
+    await vi.advanceTimersByTimeAsync(30 * 60_000 + 1);
+    await runTurn(provider, transport, 'b');
+    const disposed = transport
+      .commands()
+      .filter((c) => c.cmd === 'dispose_session')
+      .map((c) => c.sessionId);
+    expect(disposed).toContain(idle);
+  });
+
+  it('evicts least-recently-used sessions past the cap', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const ids: string[] = [];
+    for (let i = 0; i < 17; i++) {
+      ids.push(await runTurn(provider, transport, `seed ${i}`));
+    }
+    const disposed = transport
+      .commands()
+      .filter((c) => c.cmd === 'dispose_session')
+      .map((c) => c.sessionId);
+    expect(disposed).toContain(ids[0]);
+    expect(disposed).not.toContain(ids[ids.length - 1]);
+  });
+});
+
+describe('thinking fallback', () => {
+  it('streams a text part when the host lacks the thinking part', () => {
+    setThinkingPartAvailable(false);
+    const p = { report: vi.fn() } as unknown as vscode.Progress<vscode.LanguageModelResponsePart>;
+    reportThinking(p, 'reasoning');
+    expect(p.report).toHaveBeenCalledTimes(1);
+    expect(p.report).toHaveBeenCalledWith(expect.any(vscode.LanguageModelTextPart));
+  });
 });
 
 describe('part serialization', () => {
@@ -402,9 +651,7 @@ describe('part serialization', () => {
       partToString(new vscode.LanguageModelToolCallPart('c1', 'read_file', { path: '/x' })),
     ).toBe('Tool call [read_file](c1): {"path":"/x"}');
     expect(
-      partToString(
-        new vscode.LanguageModelToolResultPart('c1', [textPart('output')]),
-      ),
+      partToString(new vscode.LanguageModelToolResultPart('c1', [textPart('output')])),
     ).toBe('Tool result (c1): output');
     expect(
       partToString(new vscode.LanguageModelDataPart(new Uint8Array([1, 2]), 'image/png')),
