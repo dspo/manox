@@ -408,10 +408,16 @@ mod tests {
 
     use super::*;
 
+    /// The legacy background-task registry is process-global while monitor
+    /// task ids are per-manager counters (`mon_1`, …), so concurrent
+    /// real-spawn tests would collide inside `register_with_id`.
+    static REAL_SPAWN_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A real command monitor surfaces in the legacy registry with its pi task
     /// id, and the bridge emits running → completed snapshots carrying output.
     #[tokio::test]
     async fn monitor_spawn_bridges_snapshots() {
+        let _guard = REAL_SPAWN_GUARD.lock().await;
         let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
         let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
@@ -477,6 +483,7 @@ mod tests {
     /// arrives. A Lagged-as-fatal regression dies silently on the first flood.
     #[tokio::test]
     async fn bridge_survives_output_flood_past_broadcast_capacity() {
+        let _guard = REAL_SPAWN_GUARD.lock().await;
         let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
         let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
