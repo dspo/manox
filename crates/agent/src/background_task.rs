@@ -673,11 +673,15 @@ fn output_tail_from_ring(s: &TaskState) -> String {
             if !tail.is_empty() {
                 tail.push('\n');
             }
-            tail.push_str(text);
+            // Lines usually arrive with their own trailing newline; strip it
+            // so the joined tail has no blank lines.
+            tail.push_str(text.trim_end_matches(['\r', '\n']));
         }
     }
     if tail.len() > SNAPSHOT_TAIL_BYTES {
-        tail.split_off(tail.len() - SNAPSHOT_TAIL_BYTES)
+        // ceil_char_boundary keeps the cut on a UTF-8 char boundary within
+        // the cap; a raw byte split can land mid-character and panic.
+        tail.split_off(tail.ceil_char_boundary(tail.len() - SNAPSHOT_TAIL_BYTES))
     } else {
         tail
     }
@@ -1565,5 +1569,29 @@ mod tests {
         assert_eq!(called.lock().unwrap().as_deref(), Some(id.0.as_str()));
         assert!(proxy.status().is_terminal());
         remove(&id);
+    }
+
+    /// The 8KB tail cut must land on a UTF-8 char boundary: CJK output past
+    /// the cap used to panic split_off's is_char_boundary assertion and kill
+    /// the bridge task emitting snapshots.
+    #[test]
+    fn snapshot_tail_truncates_multibyte_output_on_char_boundary() {
+        let id = TaskId("utf8_tail".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "thread-utf8".into(),
+            "utf8".into(),
+            CancellationToken::new(),
+        );
+        // Two 15KB CJK lines: the raw 8KB cut lands inside a 3-byte char.
+        let line = "中".repeat(5000);
+        proxy.push_event(&id, line.clone());
+        proxy.push_event(&id, line);
+        let tail = proxy.snapshot(&id).output_tail;
+        assert!(tail.len() <= SNAPSHOT_TAIL_BYTES);
+        assert!(tail.ends_with('中'));
+        remove(&id);
+        remove_thread_mailbox("thread-utf8");
     }
 }

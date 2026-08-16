@@ -194,15 +194,46 @@ const MAX_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
 /// Append a line to the ring tail, evicting from the front once over the cap.
 fn push_output_tail(tail: &str, line: &str) -> String {
+    // Lines usually arrive with their own trailing newline; strip both ends so
+    // the joined tail has no blank lines regardless of the input shape.
+    let tail = tail.trim_end_matches(['\r', '\n']);
+    let line = line.trim_end_matches(['\r', '\n']);
     let mut combined = if tail.is_empty() {
         line.to_string()
     } else {
         format!("{tail}\n{line}")
     };
     if combined.len() > MAX_OUTPUT_TAIL_BYTES {
-        combined.split_off(combined.len() - MAX_OUTPUT_TAIL_BYTES)
+        // ceil_char_boundary keeps the cut on a UTF-8 char boundary within
+        // the cap; a raw byte split can land mid-character and panic.
+        combined.split_off(combined.ceil_char_boundary(combined.len() - MAX_OUTPUT_TAIL_BYTES))
     } else {
         combined
+    }
+}
+
+/// Bound on retained snapshots; past it the oldest terminal entry is evicted
+/// so live monitors never lose theirs and memory stays bounded no matter how
+/// many monitors a session runs.
+const SNAPSHOT_CAP: usize = 64;
+
+/// Insert a snapshot, evicting the oldest terminal entry past the cap.
+fn insert_snapshot(
+    snapshots: &Arc<Mutex<HashMap<String, MonitorSnapshot>>>,
+    snap: MonitorSnapshot,
+) {
+    let mut map = snapshots.lock().expect("snapshots lock poisoned");
+    map.insert(snap.task_id.clone(), snap);
+    if map.len() > SNAPSHOT_CAP {
+        let victim = map
+            .values()
+            .filter(|s| s.status != MonitorStatus::Running)
+            .min_by_key(|s| s.created_at_ms)
+            .or_else(|| map.values().min_by_key(|s| s.created_at_ms))
+            .map(|s| s.task_id.clone());
+        if let Some(id) = victim {
+            map.remove(&id);
+        }
     }
 }
 
@@ -512,13 +543,10 @@ impl MonitorManager {
                 kill_initiated: Arc::clone(&kill_initiated),
             },
         );
-        self.snapshots
-            .lock()
-            .expect("snapshots lock poisoned")
-            .insert(
-                tid.clone(),
-                MonitorSnapshot::new(tid.clone(), MonitorKind::Command, description.clone()),
-            );
+        insert_snapshot(
+            &self.snapshots,
+            MonitorSnapshot::new(tid.clone(), MonitorKind::Command, description.clone()),
+        );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description,
@@ -571,13 +599,10 @@ impl MonitorManager {
                 kill_initiated: Arc::clone(&kill_initiated),
             },
         );
-        self.snapshots
-            .lock()
-            .expect("snapshots lock poisoned")
-            .insert(
-                tid.clone(),
-                MonitorSnapshot::new(tid.clone(), MonitorKind::WebSocket, description.clone()),
-            );
+        insert_snapshot(
+            &self.snapshots,
+            MonitorSnapshot::new(tid.clone(), MonitorKind::WebSocket, description.clone()),
+        );
         let _ = self.event_tx.send(MonitorEvent::Spawned {
             id: tid.clone(),
             description: description.clone(),
@@ -1607,5 +1632,44 @@ mod tests {
         assert!(stopped, "Stopped event after user stop");
         let snap = manager.snapshot(&tid).expect("snapshot present");
         assert_eq!(snap.status, MonitorStatus::Stopped);
+    }
+
+    /// Tail truncation must land on a UTF-8 char boundary and stripped line
+    /// endings must not leave blank lines in the joined tail.
+    #[test]
+    fn push_output_tail_truncates_on_char_boundary_and_trims_newlines() {
+        let tail = push_output_tail(&"中".repeat(3000), "中\n");
+        assert!(tail.len() <= MAX_OUTPUT_TAIL_BYTES);
+        // Both ends land on whole characters (a mid-char cut would panic).
+        assert_eq!(tail.chars().next(), Some('中'));
+        assert!(tail.ends_with('中'));
+        // Stripped line endings leave no blank lines in the joined tail.
+        assert_eq!(push_output_tail("a\n", "b\r\n"), "a\nb");
+    }
+
+    /// Past the cap the oldest terminal snapshots are evicted while live
+    /// snapshots survive.
+    #[test]
+    fn insert_snapshot_evicts_oldest_terminal_past_the_cap() {
+        let snapshots: Arc<Mutex<HashMap<String, MonitorSnapshot>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        for i in 0..SNAPSHOT_CAP {
+            let mut snap = MonitorSnapshot::new(format!("t{i}"), MonitorKind::Command, "d".into());
+            snap.status = MonitorStatus::Completed;
+            snap.created_at_ms = 1000 + i as u64;
+            insert_snapshot(&snapshots, snap);
+        }
+        insert_snapshot(
+            &snapshots,
+            MonitorSnapshot::new("live".into(), MonitorKind::Command, "d".into()),
+        );
+        let mut extra = MonitorSnapshot::new("extra".into(), MonitorKind::Command, "d".into());
+        extra.status = MonitorStatus::Completed;
+        extra.created_at_ms = 9999;
+        insert_snapshot(&snapshots, extra);
+        let map = snapshots.lock().unwrap();
+        assert_eq!(map.len(), SNAPSHOT_CAP);
+        assert!(!map.contains_key("t0") && !map.contains_key("t1"));
+        assert!(map.contains_key("live") && map.contains_key("extra"));
     }
 }
