@@ -7,8 +7,11 @@
 import type {
   ActorEvent,
   ApprovalMode,
+  BackgroundTaskSnapshotWire,
   CommandEntry,
+  GoalSnapshotWire,
   ModelInfo,
+  SubagentChildWire,
   ThreadInfoSnapshot,
   ThreadListItem,
   TokenUsageSnapshot,
@@ -39,6 +42,12 @@ export interface ThreadState {
   cost: number;
   info: ThreadInfoSnapshot | null;
   branch: string | null;
+  /** Plan review awaiting a verdict (PlanReady), for the review card. */
+  pendingPlan: { planFile: string; title: string; content: string } | null;
+  /** Live background-task snapshots keyed by task id. */
+  backgroundTasks: Record<string, BackgroundTaskSnapshotWire>;
+  /** Streamed child-session events per sub-agent (for the mini-panel). */
+  subagentChildren: Record<string, SubagentChildWire[]>;
   /** Restored history still loading. */
   loading: boolean;
   /** Last error emitted for this thread; cleared when a new turn starts. */
@@ -85,6 +94,9 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   cost: 0,
   info: null,
   branch: null,
+  pendingPlan: null,
+  backgroundTasks: {},
+  subagentChildren: {},
   loading: false,
   error: null,
   turnStartedAt: null,
@@ -192,13 +204,27 @@ export class Store {
     );
   }
 
-  /** Drop an authorization prompt from the transcript; the caller posts the
-   * actual decision to the host. */
+  /** Drop a pending authorization card (approval or AskUserQuestion) from
+   * the transcript; the caller posts the actual verdict to the host. */
   decideApproval(sessionId: string, id: string): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
-        items: t.items.filter((i) => !(i.kind === 'approval' && i.id === id)),
+        items: t.items.filter(
+          (i) => !((i.kind === 'approval' || i.kind === 'ask_question') && i.id === id),
+        ),
+      })),
+    );
+  }
+
+  /** Consume a plan review card (any verdict path) and clear the pending
+   * review state. */
+  clearPlanReview(sessionId: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        pendingPlan: null,
+        items: t.items.filter((i) => i.kind !== 'plan_review'),
       })),
     );
   }
@@ -394,13 +420,15 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         ...t,
         items: [
           ...t.items,
-          {
-            kind: 'approval',
-            id: ev.id,
-            toolName: ev.tool_name,
-            summary: ev.summary,
-            input: ev.input,
-          },
+          ev.tool_name === 'AskUserQuestion'
+            ? { kind: 'ask_question', id: ev.id, summary: ev.summary, input: ev.input }
+            : {
+                kind: 'approval',
+                id: ev.id,
+                toolName: ev.tool_name,
+                summary: ev.summary,
+                input: ev.input,
+              },
         ],
       };
     case 'model_changed':
@@ -463,11 +491,11 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
     }
     case 'subagent_progress': {
       const info = t.info ?? emptyInfo();
-      return {
-        ...t,
-        info: {
-          ...info,
-          agents: info.agents.map((a) =>
+      // The pi backend emits no SubagentStarted, so the first progress
+      // sighting creates the row (upsert).
+      const exists = info.agents.some((a) => a.id === ev.id);
+      const updated = exists
+        ? info.agents.map((a) =>
             a.id === ev.id
               ? {
                   ...a,
@@ -476,13 +504,58 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
                   status: ev.status,
                 }
               : a,
-          ),
+          )
+        : [
+            ...info.agents,
+            {
+              id: ev.id,
+              agent_type: ev.agent_type,
+              description: '',
+              tool_uses: ev.tool_uses,
+              latest_activity: ev.latest_activity,
+              status: ev.status,
+            },
+          ];
+      return { ...t, info: { ...info, agents: updated } };
+    }
+    case 'plan_ready':
+      return {
+        ...t,
+        pendingPlan: {
+          planFile: ev.plan_file,
+          title: ev.title,
+          content: ev.content ?? '',
         },
+        items: [
+          ...t.items,
+          {
+            kind: 'plan_review',
+            id: `plan-review-${t.items.length}`,
+            planFile: ev.plan_file,
+            title: ev.title,
+            content: ev.content ?? '',
+          },
+        ],
       };
+    case 'background_task_updated': {
+      const task = ev.snapshot;
+      // The card is appended once; later snapshots only touch the map and the
+      // render layer reads the live snapshot from it — streaming updates stay
+      // O(1) instead of scanning the transcript per snapshot.
+      const known = task.task_id in t.backgroundTasks;
+      const backgroundTasks = { ...t.backgroundTasks, [task.task_id]: task };
+      const items: TranscriptItem[] = known
+        ? t.items
+        : [...t.items, { kind: 'background_task', id: `bg-${task.task_id}`, task }];
+      return { ...t, backgroundTasks, items };
+    }
+    case 'subagent_child': {
+      const prior = t.subagentChildren[ev.id] ?? [];
+      const next = [...prior, ev.event].slice(-200);
+      return { ...t, subagentChildren: { ...t.subagentChildren, [ev.id]: next } };
     }
     // Covered elsewhere or not surfaced: session_created (host handshake),
-    // plan_ready (the snapshot arrives via plan_updated), token_usage
-    // (fine-grained), models/threads_updated/commands (global).
+    // token_usage (fine-grained), models/threads_updated/commands (global).
     default:
       return t;
   }

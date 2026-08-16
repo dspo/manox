@@ -91,6 +91,13 @@ struct SubagentInfo {
     status: Value,
 }
 
+/// Plan-file identity recorded from a `PlanReady`, so a later `plan_verdict`
+/// can seed execution without a round-trip.
+#[derive(Clone)]
+struct PendingPlan {
+    plan_file: String,
+}
+
 struct SessionState {
     thread: Entity<Thread>,
     /// Keeps the `ThreadEvent` subscription alive for the session's lifetime.
@@ -98,6 +105,8 @@ struct SessionState {
     turn_active: Arc<AtomicBool>,
     /// Sub-agent progress mirrored by the session's event subscription.
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
+    /// Latest plan submitted for review (PlanReady), for `plan_verdict`.
+    pending_plan: Arc<Mutex<Option<PendingPlan>>>,
 }
 
 struct ActorState {
@@ -219,6 +228,7 @@ fn handle_command(
                 .unwrap_or_else(|| state.cwd.clone());
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
+            let pending_plan = Arc::new(Mutex::new(None));
             let thread = cx.update(|app| Thread::new_fresh(ThreadId(id.clone()), cwd, app));
             let subscription = cx.update(|app| {
                 subscribe_thread(
@@ -227,6 +237,7 @@ fn handle_command(
                     id.clone(),
                     turn_active.clone(),
                     subagents.clone(),
+                    pending_plan.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -244,6 +255,7 @@ fn handle_command(
                     _subscription: subscription,
                     turn_active,
                     subagents,
+                    pending_plan,
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
@@ -281,6 +293,7 @@ fn handle_command(
             });
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
+            let pending_plan = Arc::new(Mutex::new(None));
             let subscription = cx.update(|app| {
                 subscribe_thread(
                     app,
@@ -288,6 +301,7 @@ fn handle_command(
                     id.clone(),
                     turn_active.clone(),
                     subagents.clone(),
+                    pending_plan.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -300,6 +314,7 @@ fn handle_command(
                     _subscription: subscription,
                     turn_active,
                     subagents,
+                    pending_plan,
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
@@ -550,6 +565,33 @@ fn handle_command(
                     .update(app, |t, cx| t.respond_authorization(&id, response, cx));
             });
         }),
+        "answer_question" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let id = cmd["id"].as_str().unwrap_or_default().to_string();
+            let answers: Vec<(String, String)> = cmd["answers"]
+                .as_array()
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter_map(|pair| {
+                            Some((
+                                pair.get(0)?.as_str()?.to_string(),
+                                pair.get(1)?.as_str().unwrap_or_default().to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let response = cmd["response"].as_str().map(str::to_string);
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    t.respond_authorization(
+                        &id,
+                        ToolAuthorizationResponse::AskUserQuestion { answers, response },
+                        cx,
+                    );
+                });
+            });
+        }),
         "set_approval_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
             let mode = match cmd["mode"].as_str() {
                 Some("danger") => ApprovalMode::Danger,
@@ -559,6 +601,111 @@ fn handle_command(
                 session
                     .thread
                     .update(app, |t, cx| t.set_approval_mode(mode, cx));
+            });
+        }),
+        "set_plan_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let enabled = cmd["enabled"].as_bool().unwrap_or(false);
+            cx.update(|app| {
+                session
+                    .thread
+                    .update(app, |t, cx| t.set_plan_mode(enabled, cx));
+            });
+        }),
+        "plan_verdict" => with_session(state, session_id.as_deref(), sink, |session, sink| {
+            let choice = cmd["choice"].as_str().unwrap_or_default();
+            let pending = session.pending_plan.lock().unwrap().as_ref().cloned();
+            let Some(pending) = pending else {
+                sink.emit(error_json(session_id.as_deref(), "no pending plan review"));
+                return;
+            };
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    t.set_plan_review_pending(false, cx);
+                    if choice == "refine" {
+                        return;
+                    }
+                    let compact = choice == "execute_compact";
+                    let lang = t.agent_language();
+                    let seed_text = match agent::collaboration_mode::render_plan_mode_approved(
+                        lang,
+                        &pending.plan_file,
+                    ) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            cx.emit(agent::ThreadEvent::Error(e));
+                            return;
+                        }
+                    };
+                    let compact_instructions = compact.then(|| {
+                        agent::collaboration_mode::plan_compact_instructions(
+                            lang,
+                            &pending.plan_file,
+                        )
+                    });
+                    t.approve_plan(compact, compact_instructions, seed_text, cx);
+                });
+            });
+        }),
+        "plan_seed_execution" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let Some(plan_file) = cmd["planFile"].as_str() else {
+                return;
+            };
+            let plan_file = plan_file.to_string();
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    let ui = MessageUiMetadata {
+                        model_id: t.model().map(|m| m.id.clone()),
+                        approval_mode: Some(t.approval_mode().as_i64()),
+                        ..Default::default()
+                    };
+                    let lang = t.agent_language();
+                    // Fail-closed like `plan_verdict`: seeding execution with
+                    // an empty plan context is never a silent fallback.
+                    let seed_text = match agent::collaboration_mode::render_plan_mode_approved(
+                        lang, &plan_file,
+                    ) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            cx.emit(agent::ThreadEvent::Error(e));
+                            return;
+                        }
+                    };
+                    t.seed_plan_execution(plan_file, seed_text, Some(ui), cx);
+                });
+            });
+        }),
+        "goal" => with_session(state, session_id.as_deref(), sink, |session, sink| {
+            let action = cmd["action"].as_str().unwrap_or_default();
+            let objective = cmd["objective"].as_str().unwrap_or_default().to_string();
+            let budget = cmd["budget"].as_u64();
+            let actor = agent::db::GoalActor::User;
+            let result = cx.update(|app| {
+                session.thread.update(app, |t, cx| match action {
+                    "create" => t.set_goal(objective, cx),
+                    "edit" => t.edit_goal(objective, budget, actor, cx),
+                    "replace" => t.replace_goal(objective, budget, actor, cx),
+                    "clear" => t.clear_goal(actor, cx),
+                    "pause" => t.set_goal_status(
+                        agent::goal::GoalStatus::Paused,
+                        Some("paused by user".into()),
+                        actor,
+                        cx,
+                    ),
+                    "resume" => t.set_goal_status(agent::goal::GoalStatus::Active, None, actor, cx),
+                    _ => Ok(()),
+                })
+            });
+            if let Err(e) = result {
+                sink.emit(error_json(session_id.as_deref(), &e.to_string()));
+            }
+        }),
+        "stop_background_task" => with_session(state, session_id.as_deref(), sink, |_, _| {
+            let Some(task_id) = cmd["taskId"].as_str() else {
+                return;
+            };
+            let task_id = task_id.to_string();
+            agent::runtime::handle().spawn(async move {
+                let _ = agent::background_task::stop(&task_id).await;
             });
         }),
         "set_model" => with_session(state, session_id.as_deref(), sink, |session, sink| {
@@ -694,12 +841,14 @@ fn emit_persisted_approval_mode(mode: ApprovalMode, session_id: &str, sink: &Eve
 /// bookkeeping (running / unread / pending-auth / errored), aggregates
 /// sub-agent progress for the info panel, and answers `HistoryRestored` with
 /// a full history snapshot.
+#[allow(clippy::too_many_arguments)] // subscription setup: each input is a distinct owner/handle
 fn subscribe_thread(
     app: &mut App,
     thread: &Entity<Thread>,
     session_id: String,
     turn_active: Arc<AtomicBool>,
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
+    pending_plan: Arc<Mutex<Option<PendingPlan>>>,
     focused: Arc<Mutex<Option<String>>>,
     sink: EventSink,
 ) -> Subscription {
@@ -756,16 +905,28 @@ fn subscribe_thread(
                 }
                 ThreadEvent::SubagentProgress {
                     id,
+                    subagent_type,
                     tool_uses,
                     latest_activity,
                     status,
                     ..
                 } => {
-                    if let Some(entry) = subagents.lock().unwrap().iter_mut().find(|a| &a.id == id)
-                    {
+                    let mut list = subagents.lock().unwrap();
+                    if let Some(entry) = list.iter_mut().find(|a| &a.id == id) {
                         entry.tool_uses = *tool_uses;
                         entry.latest_activity = latest_activity.clone();
                         entry.status = serde_json::to_value(status).unwrap_or(Value::Null);
+                    } else {
+                        // The pi backend emits no SubagentStarted, so the
+                        // first progress sighting creates the row.
+                        list.push(SubagentInfo {
+                            id: id.clone(),
+                            agent_type: subagent_type.clone(),
+                            description: String::new(),
+                            tool_uses: *tool_uses,
+                            latest_activity: latest_activity.clone(),
+                            status: serde_json::to_value(status).unwrap_or(Value::Null),
+                        });
                     }
                 }
                 ThreadEvent::HistoryRestored => {
@@ -782,6 +943,28 @@ fn subscribe_thread(
                             "type": "goal_changed",
                             "sessionId": id,
                             "snapshot": serde_json::to_value(snapshot).unwrap_or(Value::Null),
+                        })
+                        .to_string(),
+                    );
+                }
+                ThreadEvent::PlanReady { plan_file, title } => {
+                    // Record the review card identity so a later
+                    // `plan_verdict` can seed execution without a round-trip,
+                    // and enrich the wire event with the plan body for the
+                    // review card. The projection also emits a bare
+                    // `plan_ready`; the enriched one carries `content`.
+                    *pending_plan.lock().unwrap() = Some(PendingPlan {
+                        plan_file: plan_file.clone(),
+                    });
+                    let content = std::fs::read_to_string(plan_file).unwrap_or_default();
+                    let id = session_id.clone();
+                    sink.emit(
+                        json!({
+                            "type": "plan_ready",
+                            "sessionId": id,
+                            "plan_file": plan_file,
+                            "title": title,
+                            "content": content,
                         })
                         .to_string(),
                     );
@@ -2099,5 +2282,85 @@ mod tests {
         assert_eq!(stats["added"], 0);
         assert_eq!(stats["deleted"], 0);
         assert_eq!(stats["untracked"], 0);
+    }
+
+    #[test]
+    fn plan_and_goal_commands_route_on_a_session() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+
+        // set_plan_mode flips the thread's plan-mode flag.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"set_plan_mode","sessionId":"s1","enabled":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(cx.update(|app| state.sessions["s1"].thread.read(app).plan_mode()));
+
+        // plan_verdict without a pending review surfaces a clear error.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"plan_verdict","sessionId":"s1","choice":"execute_keep"}"#,
+        );
+        cx.run_until_parked();
+        assert!(out.lock().unwrap().iter().any(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
+                == "no pending plan review"
+        }));
+
+        // plan_seed_execution with an unreadable plan file fails explicitly
+        // instead of seeding an empty plan context.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"plan_seed_execution","sessionId":"s1","planFile":"/nonexistent/manox-plan.md"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"error".to_string()));
+
+        // goal create on a thread without a goal store surfaces an error
+        // (the hermetic env has no db); the command never panics.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"goal","sessionId":"s1","action":"create","objective":"ship it"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"error".to_string()));
+
+        // Unknown session for the new commands still reports an error.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"stop_background_task","sessionId":"nope","taskId":"mon_1"}"#,
+        );
+        assert!(types(&out).contains(&"error".to_string()));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A sink that feeds an already-collected `out` buffer.
+    fn sink_for(out: &Arc<Mutex<Vec<String>>>) -> EventSink {
+        let out = Arc::clone(out);
+        EventSink::new(move |json| out.lock().unwrap().push(json))
     }
 }

@@ -8,8 +8,10 @@ import type {
   ActorEvent,
   ApprovalMode,
   CommandEntry,
+  GoalAction,
   ImageAttachment,
   ModelInfo,
+  PlanVerdictChoice,
   ThreadInfoSnapshot,
   ThreadListItem,
 } from '../protocol';
@@ -20,6 +22,18 @@ export type WebviewToHost =
   | { type: 'cancel'; sessionId: string }
   | { type: 'set_model'; sessionId: string; id: string }
   | { type: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
+  | { type: 'set_plan_mode'; sessionId: string; enabled: boolean }
+  | { type: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }
+  | { type: 'plan_execute_fresh'; sessionId: string; planFile: string; cwd: string }
+  | { type: 'goal'; sessionId: string; action: GoalAction; objective?: string; budget?: number }
+  | { type: 'stop_background_task'; sessionId: string; taskId: string }
+  | {
+      type: 'answer_question';
+      sessionId: string;
+      id: string;
+      answers: [string, string][];
+      response: string | null;
+    }
   | { type: 'request_models' }
   | { type: 'request_usage'; sessionId: string }
   | { type: 'request_thread_info'; sessionId: string }

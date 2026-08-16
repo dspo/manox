@@ -2,7 +2,7 @@
 // message list regroups them into turns (a user item opens a turn, the
 // assistant/thinking/tool items after it belong to that turn's reply).
 
-import type { ToolCallStatus } from '../../../protocol';
+import type { BackgroundTaskSnapshotWire, ToolCallStatus } from '../../../protocol';
 
 /** UI status vocabulary (matches the tool card's label/icon tables). Wire
  * statuses fold into it; authorization states pass through. */
@@ -65,4 +65,13 @@ export type TranscriptItem =
   | { kind: 'thinking'; id: string; text: string }
   | { kind: 'tool'; id: string; tool: ToolCallState }
   | { kind: 'approval'; id: string; toolName: string; summary: string; input?: unknown }
-  | { kind: 'compaction'; id: string; summary: string };
+  | { kind: 'compaction'; id: string; summary: string }
+  | {
+      kind: 'plan_review';
+      id: string;
+      planFile: string;
+      title: string;
+      content: string;
+    }
+  | { kind: 'background_task'; id: string; task: BackgroundTaskSnapshotWire }
+  | { kind: 'ask_question'; id: string; summary: string; input: unknown };
