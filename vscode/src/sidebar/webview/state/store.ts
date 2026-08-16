@@ -539,18 +539,14 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       };
     case 'background_task_updated': {
       const task = ev.snapshot;
+      // The card is appended once; later snapshots only touch the map and the
+      // render layer reads the live snapshot from it — streaming updates stay
+      // O(1) instead of scanning the transcript per snapshot.
+      const known = task.task_id in t.backgroundTasks;
       const backgroundTasks = { ...t.backgroundTasks, [task.task_id]: task };
-      const existing = t.items.findIndex(
-        (i) => i.kind === 'background_task' && i.task.task_id === task.task_id,
-      );
-      const items: TranscriptItem[] =
-        existing >= 0
-          ? t.items.map((i, idx) =>
-              idx === existing
-                ? { kind: 'background_task', id: `bg-${task.task_id}`, task }
-                : i,
-            )
-          : [...t.items, { kind: 'background_task', id: `bg-${task.task_id}`, task }];
+      const items: TranscriptItem[] = known
+        ? t.items
+        : [...t.items, { kind: 'background_task', id: `bg-${task.task_id}`, task }];
       return { ...t, backgroundTasks, items };
     }
     case 'subagent_child': {

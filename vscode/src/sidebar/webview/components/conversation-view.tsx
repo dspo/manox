@@ -60,6 +60,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
       <div className="relative flex min-h-0 flex-1 flex-col">
         <MessageList
           approvalMode={thread.approvalMode}
+          backgroundTasks={thread.backgroundTasks}
           branch={thread.branch}
           cwd={thread.cwd}
           items={thread.items}

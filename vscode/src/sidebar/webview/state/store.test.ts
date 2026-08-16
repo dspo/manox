@@ -829,10 +829,9 @@ describe('plan / goal / task folding', () => {
     );
     const cards = thread(store)?.items.filter((i) => i.kind === 'background_task');
     expect(cards).toHaveLength(1);
-    const updated = cards?.[0];
-    expect(updated && updated.kind === 'background_task' ? updated.task.output_tail : null).toBe(
-      'hi\ndone',
-    );
+    // The transcript card is append-once; the live tail rides the map the
+    // render layer reads from.
+    expect(thread(store)?.backgroundTasks.t1.output_tail).toBe('hi\ndone');
   });
 
   it('background_task_updated tolerates a missing output_tail (empty-output spawn)', () => {

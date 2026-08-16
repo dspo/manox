@@ -6,7 +6,7 @@
 
 import type { ReactNode } from 'react';
 
-import type { ApprovalMode, ModelInfo } from '../../../../protocol';
+import type { ApprovalMode, BackgroundTaskSnapshotWire, ModelInfo } from '../../../../protocol';
 import { t } from '../../lib/i18n';
 import type { TranscriptItem } from '../../state/store';
 import {
@@ -38,6 +38,9 @@ export type MessageListProps = {
   branch: string | null;
   /** Right gutter reserved for the floating info card on wide containers. */
   rightInsetPx?: number;
+  /** Live background-task snapshots; cards render the map entry so streaming
+   * updates never rewrite the transcript items. */
+  backgroundTasks: Record<string, BackgroundTaskSnapshotWire>;
 };
 
 interface TurnGroup {
@@ -76,6 +79,7 @@ export const MessageList = ({
   cwd,
   branch,
   rightInsetPx,
+  backgroundTasks,
 }: MessageListProps) => {
   // Only the trailing item can be mid-stream.
   const lastItem = items[items.length - 1];
@@ -108,7 +112,13 @@ export const MessageList = ({
       case 'plan_review':
         return <PlanReviewCard cwd={cwd} item={item} key={item.id} sessionId={sessionId} />;
       case 'background_task':
-        return <BackgroundTaskCard key={item.id} sessionId={sessionId} task={item.task} />;
+        return (
+          <BackgroundTaskCard
+            key={item.id}
+            sessionId={sessionId}
+            task={backgroundTasks[item.task.task_id] ?? item.task}
+          />
+        );
       case 'ask_question':
         return <AskQuestionCard item={item} key={item.id} sessionId={sessionId} />;
     }
