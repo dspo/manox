@@ -650,6 +650,7 @@ fn handle_command(
             let Some(plan_file) = cmd["planFile"].as_str() else {
                 return;
             };
+            let plan_file = plan_file.to_string();
             cx.update(|app| {
                 session.thread.update(app, |t, cx| {
                     let ui = MessageUiMetadata {
@@ -658,10 +659,18 @@ fn handle_command(
                         ..Default::default()
                     };
                     let lang = t.agent_language();
-                    let seed_text =
-                        agent::collaboration_mode::render_plan_mode_approved(lang, plan_file)
-                            .unwrap_or_default();
-                    t.seed_plan_execution(plan_file.to_string(), seed_text, Some(ui), cx);
+                    // Fail-closed like `plan_verdict`: seeding execution with
+                    // an empty plan context is never a silent fallback.
+                    let seed_text = match agent::collaboration_mode::render_plan_mode_approved(
+                        lang, &plan_file,
+                    ) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            cx.emit(agent::ThreadEvent::Error(e));
+                            return;
+                        }
+                    };
+                    t.seed_plan_execution(plan_file, seed_text, Some(ui), cx);
                 });
             });
         }),
@@ -2306,6 +2315,17 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
                 == "no pending plan review"
         }));
+
+        // plan_seed_execution with an unreadable plan file fails explicitly
+        // instead of seeding an empty plan context.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"plan_seed_execution","sessionId":"s1","planFile":"/nonexistent/manox-plan.md"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"error".to_string()));
 
         // goal create on a thread without a goal store surfaces an error
         // (the hermetic env has no db); the command never panics.

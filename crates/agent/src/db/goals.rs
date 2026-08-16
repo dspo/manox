@@ -410,7 +410,10 @@ fn append_event(
 /// `thread_events` FK `threads(id)`, but pi sessions are file-persisted and
 /// never upsert `threads`; an id-only stub (metadata stays DEFAULT) keeps
 /// those writes self-contained. Every other Goal op presupposes a Goal row,
-/// hence a parent row created here.
+/// hence a parent row created here. No production surface lists threads from
+/// SQLite (the sidebars scan the session repository); if one ever does,
+/// id-only stubs would surface as empty rows — filter them or keep the
+/// session repository the list source.
 fn ensure_thread_row(tx: &Transaction<'_>, thread_id: &str) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO threads (id) VALUES (?1)",
