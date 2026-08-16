@@ -30,7 +30,18 @@ export type Command =
 	| { cmd: 'list_commands' }
 	| { cmd: 'thread_info'; sessionId: string }
 	| { cmd: 'model_chat'; requestId: string; model: string; messages: ModelChatMessage[]; tools: ModelChatTool[] }
-	| { cmd: 'cancel_model_chat'; requestId: string };
+	| { cmd: 'cancel_model_chat'; requestId: string }
+	| { cmd: 'set_plan_mode'; sessionId: string; enabled: boolean }
+	| { cmd: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }
+	| { cmd: 'plan_seed_execution'; sessionId: string; planFile: string }
+	| { cmd: 'goal'; sessionId: string; action: GoalAction; objective?: string; budget?: number }
+	| { cmd: 'stop_background_task'; sessionId: string; taskId: string };
+
+/** How the user resolves a submitted plan review. */
+export type PlanVerdictChoice = 'execute_keep' | 'execute_compact' | 'refine';
+
+/** User-side Goal lifecycle action (mirrors the gpui host's `/goal` verbs). */
+export type GoalAction = 'create' | 'edit' | 'replace' | 'clear' | 'pause' | 'resume';
 
 /** One block inside a `model_chat` message (bare-model completion). */
 export type ModelChatBlock =
@@ -225,6 +236,31 @@ export type WireContentBlock =
 	| { ToolResult: { tool_use_id: string; tool_name: string; is_error: boolean; content: string } }
 	| { Compaction: string };
 
+/** Wire form of a background-task snapshot (agent::background_task::TaskSnapshot). */
+export interface BackgroundTaskSnapshotWire {
+	task_id: string;
+	kind: 'MonitorCommand' | 'MonitorWebSocket' | 'BackgroundBash';
+	owner_thread_id: string;
+	description: string;
+	status: 'Running' | 'Stopping' | 'Completed' | 'Failed' | 'TimedOut' | 'Stopped' | 'SessionEnded';
+	created_at_ms: number;
+	ended_at_ms: number | null;
+	event_count: number;
+	total_bytes: number;
+	exit_code: number | null;
+	failure_summary: string | null;
+	anchor_message_id: string | null;
+	/** Bounded tail of accumulated output (newest bytes). */
+	output_tail: string;
+}
+
+/** One streamed child-session event from a running sub-agent. */
+export type SubagentChildWire =
+	| { kind: 'text'; text: string }
+	| { kind: 'thinking'; text: string }
+	| { kind: 'tool_start'; id: string; name: string; hint?: { key: string; value: string } | null }
+	| { kind: 'tool_end'; id: string; name: string; is_error: boolean };
+
 export type ActorEvent =
 	// lifecycle
 	| { type: 'ready' }
@@ -286,12 +322,14 @@ export type ActorEvent =
 	| { type: 'git_stats'; sessionId: string; stats: GitStats }
 	| { type: 'history_progress'; sessionId: string }
 	// plan / goal / worktree / sub-agents
-	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string }
+	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string; content?: string }
 	| { type: 'plan_updated'; sessionId: string; snapshot: PlanSnapshotWire | null }
 	| { type: 'plan_mode_changed'; sessionId: string; enabled: boolean }
 	| { type: 'goal_changed'; sessionId: string; snapshot: GoalSnapshotWire | null }
 	| { type: 'worktree_changed'; sessionId: string; active: boolean; path: string | null }
 	| { type: 'compaction'; sessionId: string; summary: string }
+	| { type: 'background_task_updated'; sessionId: string; snapshot: BackgroundTaskSnapshotWire }
+	| { type: 'subagent_child'; sessionId: string; id: string; event: SubagentChildWire }
 	| {
 			type: 'subagent_started';
 			sessionId: string;

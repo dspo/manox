@@ -3,7 +3,12 @@
 // address any live thread; view switching stays inside the webview and never
 // crosses this boundary.
 
-import type { ApprovalMode, ImageAttachment } from '../../../protocol';
+import type {
+  ApprovalMode,
+  GoalAction,
+  ImageAttachment,
+  PlanVerdictChoice,
+} from '../../../protocol';
 import type { HostToWebview, WebviewToHost } from '../../messages';
 
 interface HostApi {
@@ -53,6 +58,26 @@ export class ThreadApi {
 
   setApprovalMode(mode: ApprovalMode): void {
     post({ type: 'set_approval_mode', sessionId: this.sessionId, mode });
+  }
+
+  setPlanMode(enabled: boolean): void {
+    post({ type: 'set_plan_mode', sessionId: this.sessionId, enabled });
+  }
+
+  planVerdict(choice: PlanVerdictChoice): void {
+    post({ type: 'plan_verdict', sessionId: this.sessionId, choice });
+  }
+
+  planSeedExecution(planFile: string): void {
+    post({ type: 'plan_seed_execution', sessionId: this.sessionId, planFile });
+  }
+
+  goal(action: GoalAction, objective?: string, budget?: number): void {
+    post({ type: 'goal', sessionId: this.sessionId, action, objective, budget });
+  }
+
+  stopBackgroundTask(taskId: string): void {
+    post({ type: 'stop_background_task', sessionId: this.sessionId, taskId });
   }
 
   requestUsage(): void {

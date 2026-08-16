@@ -180,6 +180,27 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'set_approval_mode':
         manager.send({ cmd: 'set_approval_mode', sessionId: msg.sessionId, mode: msg.mode });
         return;
+      case 'set_plan_mode':
+        manager.send({ cmd: 'set_plan_mode', sessionId: msg.sessionId, enabled: msg.enabled });
+        return;
+      case 'plan_verdict':
+        manager.send({ cmd: 'plan_verdict', sessionId: msg.sessionId, choice: msg.choice });
+        return;
+      case 'plan_seed_execution':
+        manager.send({ cmd: 'plan_seed_execution', sessionId: msg.sessionId, planFile: msg.planFile });
+        return;
+      case 'goal':
+        manager.send({
+          cmd: 'goal',
+          sessionId: msg.sessionId,
+          action: msg.action,
+          objective: msg.objective,
+          budget: msg.budget,
+        });
+        return;
+      case 'stop_background_task':
+        manager.send({ cmd: 'stop_background_task', sessionId: msg.sessionId, taskId: msg.taskId });
+        return;
       case 'request_usage':
         manager.send({ cmd: 'get_usage', sessionId: msg.sessionId });
         return;

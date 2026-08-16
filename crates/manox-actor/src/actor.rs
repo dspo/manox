@@ -631,11 +631,9 @@ fn handle_command(
                         ..Default::default()
                     };
                     let lang = t.agent_language();
-                    let seed_text = agent::collaboration_mode::render_plan_mode_approved(
-                        lang,
-                        plan_file,
-                    )
-                    .unwrap_or_default();
+                    let seed_text =
+                        agent::collaboration_mode::render_plan_mode_approved(lang, plan_file)
+                            .unwrap_or_default();
                     t.seed_plan_execution(plan_file.to_string(), seed_text, Some(ui), cx);
                 });
             });
@@ -807,6 +805,7 @@ fn emit_persisted_approval_mode(mode: ApprovalMode, session_id: &str, sink: &Eve
 /// bookkeeping (running / unread / pending-auth / errored), aggregates
 /// sub-agent progress for the info panel, and answers `HistoryRestored` with
 /// a full history snapshot.
+#[allow(clippy::too_many_arguments)] // subscription setup: each input is a distinct owner/handle
 fn subscribe_thread(
     app: &mut App,
     thread: &Entity<Thread>,

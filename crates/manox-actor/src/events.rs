@@ -316,11 +316,9 @@ mod tests {
             anchor_message_id: None,
             output_tail: "hello\nworld".into(),
         };
-        let json = thread_event_to_json(
-            &ThreadEvent::BackgroundTaskUpdated { snapshot },
-            Some("s1"),
-        )
-        .unwrap();
+        let json =
+            thread_event_to_json(&ThreadEvent::BackgroundTaskUpdated { snapshot }, Some("s1"))
+                .unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "background_task_updated");
         assert_eq!(v["snapshot"]["task_id"], "mon_1");
