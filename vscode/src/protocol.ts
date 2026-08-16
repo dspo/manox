@@ -176,7 +176,8 @@ export interface GoalSnapshotWire {
 	thread_id: string;
 	goal_id: string;
 	objective: string;
-	status: 'Active' | 'Paused' | 'Blocked' | 'BudgetLimited' | 'Complete';
+	/** serde snake_case wire form of GoalStatus. */
+	status: 'active' | 'paused' | 'blocked' | 'budget_limited' | 'complete';
 	token_budget: number | null;
 	tokens_used: number;
 	time_used_seconds: number;

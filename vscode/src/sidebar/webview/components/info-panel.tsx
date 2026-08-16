@@ -88,22 +88,22 @@ const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => 
   return <Circle className="text-muted-foreground size-3.5 shrink-0" />;
 };
 
-/** Localized label for the Goal's status enum (serde PascalCase wire form). */
+/** Localized label for the Goal's status enum (serde snake_case wire form). */
 const goalStatusLabel = (status: GoalSnapshotWire['status']): string =>
   t(
     ({
-      Active: 'goal_active',
-      Paused: 'goal_paused',
-      Blocked: 'goal_blocked',
-      BudgetLimited: 'goal_budget_limited',
-      Complete: 'goal_complete',
+      active: 'goal_active',
+      paused: 'goal_paused',
+      blocked: 'goal_blocked',
+      budget_limited: 'goal_budget_limited',
+      complete: 'goal_complete',
     } as const)[status],
   );
 
 /** Small inline actions for the Goal card: pause/resume, clear, edit. */
 const GoalActions = ({ goal, sessionId }: { goal: GoalSnapshotWire; sessionId: string }) => {
   const api = new ThreadApi(sessionId);
-  const running = goal.status === 'Active';
+  const running = goal.status === 'active';
   const edit = () => {
     const objective = window.prompt('Objective', goal.objective);
     if (objective) api.goal('edit', objective, goal.token_budget ?? undefined);

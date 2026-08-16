@@ -594,7 +594,7 @@ describe('plan, goal, and compaction events', () => {
           thread_id: 's',
           goal_id: 'g1',
           objective: 'Ship it',
-          status: 'Active',
+          status: 'active',
           token_budget: 1000,
           tokens_used: 10,
           time_used_seconds: 5,
@@ -604,7 +604,7 @@ describe('plan, goal, and compaction events', () => {
         },
       }),
     );
-    expect(thread(store)?.info?.goal).toMatchObject({ objective: 'Ship it', status: 'Active' });
+    expect(thread(store)?.info?.goal).toMatchObject({ objective: 'Ship it', status: 'active' });
   });
 
   it('renders a live compaction as a transcript recap item', () => {

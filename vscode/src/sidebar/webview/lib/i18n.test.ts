@@ -34,6 +34,12 @@ describe('i18n', () => {
     expect(t('conversation_info')).toBe('Conversation info');
   });
 
+  it('degrades unknown keys to the raw key instead of throwing', () => {
+    // Wire-driven lookups can name keys this build never shipped; the
+    // render tree must survive them.
+    expect(t('not_a_real_key' as never)).toBe('not_a_real_key');
+  });
+
   it('interpolates numeric arguments', () => {
     setLanguageForTest('zh-cn');
     expect(t('thought_n_turns', 3)).toBe('思考了 3 轮次');

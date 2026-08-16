@@ -154,10 +154,14 @@ function detectLanguage(): string {
   return language;
 }
 
-/** Translate a dictionary key; numeric arguments feed interpolation. */
+/** Translate a dictionary key; numeric arguments feed interpolation. Wire-driven
+ * lookups can resolve to keys the dict never shipped; degrade to the raw key
+ * instead of crashing the render tree. */
 export function t(key: I18nKey, ...args: number[]): string {
   const variant = detectLanguage().startsWith('zh') ? 'zh' : 'en';
-  const value = DICT[key][variant];
+  const entry = DICT[key];
+  if (!entry) return String(key);
+  const value = entry[variant];
   return typeof value === 'function'
     ? (value as (...a: number[]) => string)(...args)
     : value;
