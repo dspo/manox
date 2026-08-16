@@ -290,17 +290,17 @@ impl SandboxPolicy {
             NetworkPolicy::Restricted { .. } => {
                 // Deny all network, then re-allow outbound to the local
                 // proxy port only. The proxy (running outside the sandbox)
-                // enforces the hostname allowlist. `network-bind` is
-                // re-allowed for localhost so TCP connect() (which
-                // implicitly binds an ephemeral port) works inside the
-                // sandbox.
+                // enforces the hostname allowlist. Seatbelt network
+                // filters accept only `*` or `localhost` as the host, so
+                // the rule names `localhost`; it matches connections to
+                // 127.0.0.1 (an IP literal is rejected at compile time).
+                // `network-bind` is re-allowed for localhost so TCP
+                // connect() (which implicitly binds an ephemeral port)
+                // works inside the sandbox.
                 let port = proxy_port.unwrap_or(0);
                 s.push_str("(deny network*)\n");
                 s.push_str(&format!(
                     "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
-                ));
-                s.push_str(&format!(
-                    "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))\n"
                 ));
                 s.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
             }
@@ -830,8 +830,12 @@ mod tests {
         let sb = policy.render_seatbelt(Some(43210));
         assert!(sb.contains("(deny network*)\n"));
         assert!(
-            sb.contains("(allow network-outbound (remote tcp \"127.0.0.1:43210\"))"),
+            sb.contains("(allow network-outbound (remote tcp \"localhost:43210\"))"),
             "outbound narrowed to the local proxy port"
+        );
+        assert!(
+            !sb.contains("127.0.0.1"),
+            "seatbelt rejects IP literals; the localhost rule covers loopback"
         );
         assert!(sb.contains("(allow network-bind (local ip \"localhost:*\"))"));
         // The allowlist itself is NOT in the seatbelt — the proxy enforces it.
