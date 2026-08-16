@@ -17,7 +17,9 @@ import {
 } from '../ai/conversation';
 import { ApprovalCard } from './approval-card';
 import { AssistantMessage } from './assistant-message';
+import { BackgroundTaskCard } from './background-task-card';
 import { CopyOnHover } from './copy-on-hover';
+import { PlanReviewCard } from './plan-review-card';
 import { ThinkingBlock } from './thinking-block';
 import { ToolCallCard } from './tool-call-card';
 import { UserMessage } from './user-message';
@@ -102,6 +104,10 @@ export const MessageList = ({
             {t('context_compacted')}
           </div>
         );
+      case 'plan_review':
+        return <PlanReviewCard cwd={cwd} item={item} key={item.id} sessionId={sessionId} />;
+      case 'background_task':
+        return <BackgroundTaskCard key={item.id} sessionId={sessionId} task={item.task} />;
     }
   };
 

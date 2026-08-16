@@ -765,3 +765,116 @@ describe('Store notifications', () => {
     expect(calls).toBe(0);
   });
 });
+
+describe('plan / goal / task folding', () => {
+  const task = (id: string) => ({
+    task_id: id,
+    kind: 'MonitorCommand' as const,
+    owner_thread_id: 's',
+    description: 'watch build',
+    status: 'Running' as const,
+    created_at_ms: 1,
+    ended_at_ms: null,
+    event_count: 1,
+    total_bytes: 4,
+    exit_code: null,
+    failure_summary: null,
+    anchor_message_id: null,
+    output_tail: 'hi',
+  });
+
+  it('plan_ready appends a review card and records pendingPlan', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'plan_ready',
+        sessionId: 's',
+        plan_file: '/tmp/plan.md',
+        title: 'Do things',
+        content: '# Plan',
+      }),
+    );
+    expect(thread(store)?.pendingPlan).toMatchObject({ planFile: '/tmp/plan.md' });
+    expect(thread(store)?.items.some((i) => i.kind === 'plan_review')).toBe(true);
+  });
+
+  it('clearPlanReview removes the card and pending state', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'plan_ready',
+        sessionId: 's',
+        plan_file: '/tmp/plan.md',
+        title: 'Do things',
+      }),
+    );
+    store.clearPlanReview('s');
+    expect(thread(store)?.pendingPlan).toBeNull();
+    expect(thread(store)?.items.some((i) => i.kind === 'plan_review')).toBe(false);
+  });
+
+  it('background_task_updated upserts a task card, then updates it', () => {
+    const store = startSession();
+    store.dispatch(event({ type: 'background_task_updated', sessionId: 's', snapshot: task('t1') }));
+    let card = thread(store)?.items.find((i) => i.kind === 'background_task');
+    expect(card && card.kind === 'background_task' ? card.task.output_tail : null).toBe('hi');
+    expect(thread(store)?.backgroundTasks.t1).toMatchObject({ task_id: 't1' });
+
+    store.dispatch(
+      event({
+        type: 'background_task_updated',
+        sessionId: 's',
+        snapshot: { ...task('t1'), status: 'Completed', output_tail: 'hi\ndone' },
+      }),
+    );
+    const cards = thread(store)?.items.filter((i) => i.kind === 'background_task');
+    expect(cards).toHaveLength(1);
+    const updated = cards?.[0];
+    expect(updated && updated.kind === 'background_task' ? updated.task.output_tail : null).toBe(
+      'hi\ndone',
+    );
+  });
+
+  it('subagent_progress upserts a row on first sighting and updates after', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'subagent_progress',
+        sessionId: 's',
+        id: 'sub1',
+        agent_type: 'Explore',
+        tool_uses: 1,
+        latest_activity: 'reading',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.info?.agents).toHaveLength(1);
+    expect(thread(store)?.info?.agents[0]).toMatchObject({ id: 'sub1', agent_type: 'Explore' });
+
+    store.dispatch(
+      event({
+        type: 'subagent_progress',
+        sessionId: 's',
+        id: 'sub1',
+        agent_type: 'Explore',
+        tool_uses: 2,
+        latest_activity: 'grep',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.info?.agents).toHaveLength(1);
+    expect(thread(store)?.info?.agents[0].tool_uses).toBe(2);
+  });
+
+  it('subagent_child accumulates a bounded stream per agent', () => {
+    const store = startSession();
+    for (let i = 0; i < 5; i++) {
+      store.dispatch(
+        event({ type: 'subagent_child', sessionId: 's', id: 'sub1', event: { kind: 'text', text: `line${i}` } }),
+      );
+    }
+    const stream = thread(store)?.subagentChildren.sub1;
+    expect(stream).toHaveLength(5);
+    expect(stream?.[4]).toMatchObject({ text: 'line4' });
+  });
+});

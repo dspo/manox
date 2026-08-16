@@ -186,9 +186,23 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'plan_verdict':
         manager.send({ cmd: 'plan_verdict', sessionId: msg.sessionId, choice: msg.choice });
         return;
-      case 'plan_seed_execution':
-        manager.send({ cmd: 'plan_seed_execution', sessionId: msg.sessionId, planFile: msg.planFile });
+      case 'plan_execute_fresh': {
+        // Execute-fresh orchestration: archive the reviewing session, spin a
+        // new one in the same cwd, then seed it with the plan so it starts
+        // executing immediately.
+        void (async () => {
+          try {
+            await manager.init(resolveWorkspaceCwd());
+            manager.archiveThread(msg.sessionId, true);
+            const freshId = crypto.randomUUID();
+            await manager.createSession(msg.cwd, freshId);
+            manager.send({ cmd: 'plan_seed_execution', sessionId: freshId, planFile: msg.planFile });
+          } catch (e) {
+            this.post({ type: 'global_error', message: String(e) });
+          }
+        })();
         return;
+      }
       case 'goal':
         manager.send({
           cmd: 'goal',

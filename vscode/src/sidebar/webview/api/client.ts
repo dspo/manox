@@ -68,8 +68,10 @@ export class ThreadApi {
     post({ type: 'plan_verdict', sessionId: this.sessionId, choice });
   }
 
-  planSeedExecution(planFile: string): void {
-    post({ type: 'plan_seed_execution', sessionId: this.sessionId, planFile });
+  /** Execute-fresh: the host archives this session and seeds a new one with
+   * the plan (host-side orchestration via `plan_execute_fresh`). */
+  planExecuteFresh(planFile: string, cwd: string): void {
+    post({ type: 'plan_execute_fresh', sessionId: this.sessionId, planFile, cwd });
   }
 
   goal(action: GoalAction, objective?: string, budget?: number): void {

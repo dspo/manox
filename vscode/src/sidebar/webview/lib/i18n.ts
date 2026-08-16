@@ -100,6 +100,38 @@ const DICT = {
   goal_blocked: { en: 'Blocked', zh: '受阻' },
   goal_budget_limited: { en: 'Budget limited', zh: '预算受限' },
   goal_complete: { en: 'Complete', zh: '已完成' },
+  goal_edit: { en: 'Edit', zh: '编辑' },
+  goal_pause: { en: 'Pause', zh: '暂停' },
+  goal_resume: { en: 'Resume', zh: '恢复' },
+  goal_clear: { en: 'Clear', zh: '清除' },
+  plan_execute: { en: 'Execute', zh: '执行' },
+  plan_execute_compact: { en: 'Execute (compact)', zh: '执行（压缩）' },
+  plan_execute_fresh: { en: 'Execute fresh', zh: '新建会话执行' },
+  plan_refine: { en: 'Refine', zh: '继续完善' },
+  plan_review_empty: {
+    en: 'Plan submitted for review.',
+    zh: '已提交计划供审阅。',
+  },
+  task_running: { en: 'Running', zh: '运行中' },
+  task_stopping: { en: 'Stopping', zh: '停止中' },
+  task_completed: { en: 'Completed', zh: '已完成' },
+  task_failed: { en: 'Failed', zh: '失败' },
+  task_timed_out: { en: 'Timed out', zh: '超时' },
+  task_stopped: { en: 'Stopped', zh: '已停止' },
+  task_session_ended: { en: 'Session ended', zh: '会话已结束' },
+  task_stop: { en: 'Stop', zh: '停止' },
+  task_output_lines: {
+    en: (n: number) => `${n} line${n === 1 ? '' : 's'}`,
+    zh: (n: number) => `${n} 行`,
+  },
+  subagent_activity: {
+    en: 'Show sub-agent activity',
+    zh: '查看子智能体活动',
+  },
+  subagent_hide_activity: {
+    en: 'Hide sub-agent activity',
+    zh: '收起子智能体活动',
+  },
 } satisfies Record<string, Entry>;
 
 export type I18nKey = keyof typeof DICT;

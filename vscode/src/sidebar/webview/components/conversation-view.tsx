@@ -86,6 +86,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
         creating={store.isCreating(thread.sessionId)}
         currentModelId={thread.currentModelId}
         models={models}
+        planMode={thread.planMode}
         sessionId={thread.sessionId}
         turnActive={thread.turnActive}
       />

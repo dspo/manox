@@ -24,7 +24,7 @@ export type WebviewToHost =
   | { type: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
   | { type: 'set_plan_mode'; sessionId: string; enabled: boolean }
   | { type: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }
-  | { type: 'plan_seed_execution'; sessionId: string; planFile: string }
+  | { type: 'plan_execute_fresh'; sessionId: string; planFile: string; cwd: string }
   | { type: 'goal'; sessionId: string; action: GoalAction; objective?: string; budget?: number }
   | { type: 'stop_background_task'; sessionId: string; taskId: string }
   | { type: 'request_models' }
