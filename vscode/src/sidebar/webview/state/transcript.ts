@@ -73,4 +73,5 @@ export type TranscriptItem =
       title: string;
       content: string;
     }
-  | { kind: 'background_task'; id: string; task: BackgroundTaskSnapshotWire };
+  | { kind: 'background_task'; id: string; task: BackgroundTaskSnapshotWire }
+  | { kind: 'ask_question'; id: string; summary: string; input: unknown };

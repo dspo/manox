@@ -565,6 +565,33 @@ fn handle_command(
                     .update(app, |t, cx| t.respond_authorization(&id, response, cx));
             });
         }),
+        "answer_question" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let id = cmd["id"].as_str().unwrap_or_default().to_string();
+            let answers: Vec<(String, String)> = cmd["answers"]
+                .as_array()
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter_map(|pair| {
+                            Some((
+                                pair.get(0)?.as_str()?.to_string(),
+                                pair.get(1)?.as_str().unwrap_or_default().to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let response = cmd["response"].as_str().map(str::to_string);
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    t.respond_authorization(
+                        &id,
+                        ToolAuthorizationResponse::AskUserQuestion { answers, response },
+                        cx,
+                    );
+                });
+            });
+        }),
         "set_approval_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
             let mode = match cmd["mode"].as_str() {
                 Some("danger") => ApprovalMode::Danger,

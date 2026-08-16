@@ -35,13 +35,37 @@ export type Command =
 	| { cmd: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }
 	| { cmd: 'plan_seed_execution'; sessionId: string; planFile: string }
 	| { cmd: 'goal'; sessionId: string; action: GoalAction; objective?: string; budget?: number }
-	| { cmd: 'stop_background_task'; sessionId: string; taskId: string };
+	| { cmd: 'stop_background_task'; sessionId: string; taskId: string }
+	| {
+			cmd: 'answer_question';
+			sessionId: string;
+			id: string;
+			/** (question text, selected labels joined by ", " or free-form text). */
+			answers: [string, string][];
+			/** Free-form note that dismisses the whole card; overrides answers. */
+			response: string | null;
+	  };
 
 /** How the user resolves a submitted plan review. */
 export type PlanVerdictChoice = 'execute_keep' | 'execute_compact' | 'refine';
 
 /** User-side Goal lifecycle action (mirrors the gpui host's `/goal` verbs). */
 export type GoalAction = 'create' | 'edit' | 'replace' | 'clear' | 'pause' | 'resume';
+
+/** One selectable choice inside an `AskUserQuestion` question. */
+export interface AskOptionWire {
+	label: string;
+	description?: string;
+	recommended?: boolean;
+}
+
+/** One question step of an `AskUserQuestion` input payload. */
+export interface AskQuestionWire {
+	question: string;
+	header?: string;
+	multiSelect?: boolean;
+	options: AskOptionWire[];
+}
 
 /** One block inside a `model_chat` message (bare-model completion). */
 export type ModelChatBlock =

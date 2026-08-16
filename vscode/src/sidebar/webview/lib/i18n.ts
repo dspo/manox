@@ -132,6 +132,13 @@ const DICT = {
     en: 'Hide sub-agent activity',
     zh: '收起子智能体活动',
   },
+  ask_recommended: { en: 'recommended', zh: '推荐' },
+  ask_cancel: { en: 'Cancel', zh: '取消' },
+  ask_submit: { en: 'Submit', zh: '提交' },
+  ask_note_placeholder: {
+    en: 'Optional note (overrides the selections)…',
+    zh: '可选补充说明（将覆盖所选选项）…',
+  },
 } satisfies Record<string, Entry>;
 
 export type I18nKey = keyof typeof DICT;

@@ -16,6 +16,7 @@ import {
   ConversationScrollButton,
 } from '../ai/conversation';
 import { ApprovalCard } from './approval-card';
+import { AskQuestionCard } from './ask-question-card';
 import { AssistantMessage } from './assistant-message';
 import { BackgroundTaskCard } from './background-task-card';
 import { CopyOnHover } from './copy-on-hover';
@@ -108,6 +109,8 @@ export const MessageList = ({
         return <PlanReviewCard cwd={cwd} item={item} key={item.id} sessionId={sessionId} />;
       case 'background_task':
         return <BackgroundTaskCard key={item.id} sessionId={sessionId} task={item.task} />;
+      case 'ask_question':
+        return <AskQuestionCard item={item} key={item.id} sessionId={sessionId} />;
     }
   };
 

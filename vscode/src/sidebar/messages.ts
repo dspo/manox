@@ -27,6 +27,13 @@ export type WebviewToHost =
   | { type: 'plan_execute_fresh'; sessionId: string; planFile: string; cwd: string }
   | { type: 'goal'; sessionId: string; action: GoalAction; objective?: string; budget?: number }
   | { type: 'stop_background_task'; sessionId: string; taskId: string }
+  | {
+      type: 'answer_question';
+      sessionId: string;
+      id: string;
+      answers: [string, string][];
+      response: string | null;
+    }
   | { type: 'request_models' }
   | { type: 'request_usage'; sessionId: string }
   | { type: 'request_thread_info'; sessionId: string }

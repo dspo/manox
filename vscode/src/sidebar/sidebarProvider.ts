@@ -215,6 +215,15 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'stop_background_task':
         manager.send({ cmd: 'stop_background_task', sessionId: msg.sessionId, taskId: msg.taskId });
         return;
+      case 'answer_question':
+        manager.send({
+          cmd: 'answer_question',
+          sessionId: msg.sessionId,
+          id: msg.id,
+          answers: msg.answers,
+          response: msg.response,
+        });
+        return;
       case 'request_usage':
         manager.send({ cmd: 'get_usage', sessionId: msg.sessionId });
         return;

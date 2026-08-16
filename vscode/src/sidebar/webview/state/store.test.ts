@@ -894,4 +894,42 @@ describe('plan / goal / task folding', () => {
     expect(stream).toHaveLength(5);
     expect(stream?.[4]).toMatchObject({ text: 'line4' });
   });
+
+  it('tool_call_authorization folds AskUserQuestion into an ask_question card', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ask1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Clarify',
+        input: {
+          questions: [
+            { question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] },
+          ],
+        },
+      }),
+    );
+    const item = thread(store)?.items.find((i) => i.kind === 'ask_question');
+    expect(item?.id).toBe('ask1');
+    store.decideApproval('s', 'ask1');
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+  });
+
+  it('tool_call_authorization keeps non-ask tools as approval cards', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ap1',
+        tool_name: 'Bash',
+        summary: 'run it',
+        input: { command: 'ls' },
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'approval' && i.id === 'ap1')).toBe(true);
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+  });
 });

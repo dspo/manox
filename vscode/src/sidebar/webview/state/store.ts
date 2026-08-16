@@ -204,13 +204,15 @@ export class Store {
     );
   }
 
-  /** Drop an authorization prompt from the transcript; the caller posts the
-   * actual decision to the host. */
+  /** Drop a pending authorization card (approval or AskUserQuestion) from
+   * the transcript; the caller posts the actual verdict to the host. */
   decideApproval(sessionId: string, id: string): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
-        items: t.items.filter((i) => !(i.kind === 'approval' && i.id === id)),
+        items: t.items.filter(
+          (i) => !((i.kind === 'approval' || i.kind === 'ask_question') && i.id === id),
+        ),
       })),
     );
   }
@@ -418,13 +420,15 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         ...t,
         items: [
           ...t.items,
-          {
-            kind: 'approval',
-            id: ev.id,
-            toolName: ev.tool_name,
-            summary: ev.summary,
-            input: ev.input,
-          },
+          ev.tool_name === 'AskUserQuestion'
+            ? { kind: 'ask_question', id: ev.id, summary: ev.summary, input: ev.input }
+            : {
+                kind: 'approval',
+                id: ev.id,
+                toolName: ev.tool_name,
+                summary: ev.summary,
+                input: ev.input,
+              },
         ],
       };
     case 'model_changed':
