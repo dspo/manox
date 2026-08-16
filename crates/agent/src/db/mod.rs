@@ -509,6 +509,22 @@ mod tests {
     }
 
     #[test]
+    fn goal_persists_for_file_backed_session_without_threads_row() {
+        // Pi sessions never upsert `threads`; the Goal write must seed its
+        // own parent row or the FK rejects every lifecycle op.
+        let db = open_mem();
+        let goal =
+            crate::goal::ThreadGoal::new("pi-1".into(), "Ship Goal".into(), Some(10)).unwrap();
+        db.create_goal(&goal, GoalActor::User).unwrap();
+        assert_eq!(db.load_goal("pi-1").unwrap(), Some(goal.clone()));
+        // The audit event rides the same transaction's parent row.
+        assert_eq!(db.query_events("pi-1", None).unwrap().len(), 1);
+        // Restart restore pauses the Active snapshot instead of failing.
+        let restored = db.restore_goal("pi-1").unwrap().unwrap();
+        assert_eq!(restored.status, crate::goal::GoalStatus::Paused);
+    }
+
+    #[test]
     fn goal_cas_rejects_stale_callbacks_without_mutation() {
         let db = open_mem();
         db.upsert(&sample_record("t1"), true).unwrap();
