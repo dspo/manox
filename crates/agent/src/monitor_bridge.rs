@@ -19,6 +19,7 @@ use pi_extensions::bash::orchestration::{BackgroundEvent, BackgroundManager};
 use pi_extensions::monitor::{
     MonitorEvent, MonitorKind, MonitorManager, MonitorOutput, MonitorStatus,
 };
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -73,16 +74,28 @@ async fn run(
     loop {
         tokio::select! {
             ev = lifecycle.recv() => {
-                let Ok(ev) = ev else { break };
-                handle_monitor_event(ev, &monitor, &state, &notice_tx, &owner_thread_id);
+                // Lagged (the consumer fell behind an output flood) must not
+                // kill the bridge: skip the missed window and keep draining;
+                // only a closed sender ends the session's bridge.
+                match ev {
+                    Ok(ev) => handle_monitor_event(ev, &monitor, &state, &notice_tx, &owner_thread_id),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
             }
             out = output.recv() => {
-                let Ok(out) = out else { break };
-                handle_monitor_output(out, &state, &notice_tx);
+                match out {
+                    Ok(out) => handle_monitor_output(out, &state, &notice_tx),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
             }
             ev = bg.recv() => {
-                let Ok(ev) = ev else { break };
-                handle_background_event(ev, &background, &state, &notice_tx, &owner_thread_id);
+                match ev {
+                    Ok(ev) => handle_background_event(ev, &background, &state, &notice_tx, &owner_thread_id),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
             }
         }
     }
@@ -457,5 +470,59 @@ mod tests {
         assert_eq!(proxy.owner_thread_id(), "t1");
         background_task::stop(&tid).await.ok();
         background_task::remove(&TaskId(tid.clone()));
+    }
+
+    /// An output flood past the output broadcast capacity (256) must not kill
+    /// the bridge: Lagged windows are skipped and the terminal snapshot still
+    /// arrives. A Lagged-as-fatal regression dies silently on the first flood.
+    #[tokio::test]
+    async fn bridge_survives_output_flood_past_broadcast_capacity() {
+        let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        tokio::spawn(run(
+            Arc::clone(&monitor),
+            Arc::clone(&background),
+            notice_tx,
+            "t-flood".into(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 500 lines > the output channel capacity.
+        let tid = monitor
+            .spawn_command(
+                "flood watcher".into(),
+                "seq 1 500".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(30),
+                false,
+            )
+            .unwrap();
+
+        let mut saw_completed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(notice)) =
+                tokio::time::timeout(Duration::from_millis(500), notice_rx.recv()).await
+            else {
+                continue;
+            };
+            let BackendNotice::Event(ev) = notice else {
+                continue;
+            };
+            let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev else {
+                continue;
+            };
+            if snapshot.task_id == tid && snapshot.status == TaskStatus::Completed {
+                saw_completed = true;
+                break;
+            }
+        }
+        assert!(
+            saw_completed,
+            "bridge stays alive across the flood and delivers the terminal snapshot"
+        );
+        background_task::remove(&TaskId(tid.clone()));
+        background_task::remove_thread_mailbox("t-flood");
     }
 }

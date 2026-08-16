@@ -296,7 +296,12 @@ impl SandboxPolicy {
                 // 127.0.0.1 (an IP literal is rejected at compile time).
                 // `network-bind` is re-allowed for localhost so TCP
                 // connect() (which implicitly binds an ephemeral port)
-                // works inside the sandbox.
+                // works inside the sandbox. The wildcard port is broader
+                // than ephemeral-only on purpose and safe in scope:
+                // `(deny network*)` still denies network-inbound, so a
+                // bound listener cannot accept connections, and outbound
+                // stays limited to the proxy port — the bind right cannot
+                // be turned into a working localhost server.
                 let port = proxy_port.unwrap_or(0);
                 s.push_str("(deny network*)\n");
                 s.push_str(&format!(
