@@ -835,6 +835,23 @@ describe('plan / goal / task folding', () => {
     );
   });
 
+  it('background_task_updated tolerates a missing output_tail (empty-output spawn)', () => {
+    // The first Running snapshot of a fresh monitor has no output yet; the
+    // sender omits the empty tail, so the card must render with an empty
+    // output instead of crashing on a missing field.
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'background_task_updated',
+        sessionId: 's',
+        snapshot: { ...task('t1'), output_tail: undefined },
+      }),
+    );
+    const card = thread(store)?.items.find((i) => i.kind === 'background_task');
+    expect(card && card.kind === 'background_task' ? card.task.output_tail : 'missing').toBeUndefined();
+    expect(thread(store)?.backgroundTasks.t1).toMatchObject({ task_id: 't1' });
+  });
+
   it('subagent_progress upserts a row on first sighting and updates after', () => {
     const store = startSession();
     store.dispatch(

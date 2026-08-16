@@ -249,9 +249,9 @@ export interface BackgroundTaskSnapshotWire {
 	total_bytes: number;
 	exit_code: number | null;
 	failure_summary: string | null;
-	anchor_message_id: string | null;
-	/** Bounded tail of accumulated output (newest bytes). */
-	output_tail: string;
+	/** Bounded tail of accumulated output (newest bytes). Omitted by the
+	 * sender when empty, so consumers must treat it as optional. */
+	output_tail?: string;
 }
 
 /** One streamed child-session event from a running sub-agent. */

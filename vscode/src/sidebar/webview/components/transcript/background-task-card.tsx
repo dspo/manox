@@ -30,7 +30,9 @@ export const BackgroundTaskCard = ({ task, sessionId }: BackgroundTaskCardProps)
   const [expanded, setExpanded] = useState(false);
   const running = task.status === 'Running' || task.status === 'Stopping';
   const statusColor = running ? RUNNING_COLOR : TERMINAL_COLOR;
-  const output = task.output_tail.trim();
+  // `output_tail` is absent from snapshots with no output yet (the sender
+  // skips empty tails), so the card must tolerate a missing field.
+  const output = (task.output_tail ?? '').trim();
 
   return (
     <div className="my-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
