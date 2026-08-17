@@ -56,7 +56,12 @@ export const ConversationView = ({
   }, [thread.sessionId]);
 
   const [navigatorOpen, setNavigatorOpen] = useState(false);
-  const turns = useMemo(() => collectUserTurns(thread.items), [thread.items]);
+  // The collect pass only matters while the overlay is open; the transcript
+  // streams a new item reference on every token during a turn.
+  const turns = useMemo(
+    () => (navigatorOpen ? collectUserTurns(thread.items) : []),
+    [navigatorOpen, thread.items],
+  );
 
   const navigateToTurn = (id: string) => {
     setNavigatorOpen(false);
