@@ -135,6 +135,11 @@ type AskQuestionTranscriptItem = Extract<TranscriptItem, { kind: 'ask_question' 
 
 let echoCounter = 0;
 
+/** Local stand-in for a steer awaiting the actor's `steer_pending`
+ * confirmation; kernel message ids are UUIDs, so the literal never
+ * collides. */
+const STEER_PENDING_SENTINEL = 'pending';
+
 export class Store {
   private state: ChatState = initialState;
   private readonly listeners = new Set<() => void>();
@@ -226,6 +231,22 @@ export class Store {
         ...t,
         items: t.items.filter(
           (i) => !(i.kind === 'user' && i.clientId === clientId),
+        ),
+      })),
+    );
+  }
+
+  /** Optimistic flip of a queued bubble into the pending-steer state, so a
+   * double-click cannot enqueue the steer twice; the actor's
+   * `steer_pending` replaces the sentinel with the kernel message id. */
+  markSteerPending(sessionId: string, clientId: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.clientId === clientId
+            ? { ...i, steerPendingId: STEER_PENDING_SENTINEL }
+            : i,
         ),
       })),
     );

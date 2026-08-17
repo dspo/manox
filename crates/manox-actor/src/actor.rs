@@ -1027,16 +1027,20 @@ fn subscribe_thread(
                         }
                     });
                     // A settled (non-cancelled) run drains the parked
-                    // submissions into one follow-up turn; the nested
-                    // `run_turn` is the same re-entrancy the gpui host uses
-                    // when flushing queued follow-ups on `TurnFinished`.
+                    // submissions into one follow-up turn. The follow-up
+                    // starts deferred so the current turn's `turn_finished`
+                    // wire event lands before the re-entrant
+                    // `turn_started` — the webview keys turnActive off
+                    // those events, and the gpui host gets the same order
+                    // by flushing last.
                     if !cancelled {
                         let drained = pending_submits
                             .lock()
                             .unwrap()
                             .drain(..)
                             .collect::<Vec<_>>();
-                        if !drained.is_empty() {
+                        let drained_any = !drained.is_empty();
+                        if drained_any {
                             entity.update(app, |t, cx| {
                                 for q in drained {
                                     let mut content = Vec::new();
@@ -1055,11 +1059,16 @@ fn subscribe_thread(
                                         cx,
                                     );
                                 }
-                                if t.has_pending_prompts() {
+                            });
+                        }
+                        let follow_up = entity.clone();
+                        app.defer(move |app| {
+                            follow_up.update(app, |t, cx| {
+                                if drained_any || t.has_pending_prompts() {
                                     t.run_turn(cx);
                                 }
                             });
-                        }
+                        });
                     }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
@@ -2796,6 +2805,61 @@ mod tests {
                 .content
                 .iter()
                 .any(|c| matches!(c, MessageContent::Text(t) if t == "follow up"))
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn follow_up_turn_emits_turn_finished_before_turn_started() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"follow up","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        assert!(pump_until(&out, &mut cx, "turn_started", 1));
+
+        // The drained follow-up must surface as a turn whose start lands
+        // after the previous turn's wire finish, so the webview never
+        // renders the running follow-up as idle.
+        let order: Vec<String> = types(&out)
+            .into_iter()
+            .filter(|t| t == "turn_finished" || t == "turn_started")
+            .collect();
+        assert_eq!(order, ["turn_finished", "turn_started"]);
+        assert!(
+            state.sessions["s1"].turn_active.load(Ordering::SeqCst),
+            "the follow-up turn keeps the session turn-active"
         );
 
         drop(state);

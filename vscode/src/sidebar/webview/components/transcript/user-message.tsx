@@ -51,7 +51,10 @@ export const UserMessage = ({ item, approvalMode, sessionId }: UserMessageProps)
     <>
       <button
         className={actionClass}
-        onClick={() => new ThreadApi(sessionId).steer(item.clientId!, item.text)}
+        onClick={() => {
+          store.markSteerPending(sessionId, item.clientId!);
+          new ThreadApi(sessionId).steer(item.clientId!, item.text);
+        }}
         title={t('steer_now')}
         type="button"
       >

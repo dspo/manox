@@ -1149,6 +1149,17 @@ describe('queued-message lifecycle', () => {
     expect(thread(store)?.items[0]).toMatchObject({ kind: 'user', queued: false });
   });
 
+  it('markSteerPending flips the bubble optimistically, replaced by the real id', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.markSteerPending('s', 'c1');
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'pending' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'm1' });
+  });
+
   it('tracks steer_pending and steer_injected on the matching bubble', () => {
     const store = startSession();
     store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
