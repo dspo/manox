@@ -764,14 +764,10 @@ fn handle_command(
         }),
         "list_models" => {
             // Registration runs on a background thread (keychain/shell); a
-            // reply must not race it with an empty snapshot — surface that
-            // lists before the build lands would never retry. Answer only
-            // once the one-shot registration completes.
-            let sink = sink.clone();
-            agent::runtime::handle().spawn(async move {
-                agent::pi_providers::wait_ready().await;
-                sink.emit(models_snapshot().to_string());
-            });
+            // reply must not race it with an empty snapshot — surfaces that
+            // list before the build lands would never retry. Reuse the shared
+            // push so the answer lands only once registration completes.
+            spawn_models_push(sink.clone());
         }
         "model_chat" => {
             let Some(request_id) = cmd["requestId"].as_str().map(str::to_string) else {
