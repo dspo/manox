@@ -206,11 +206,47 @@ pub fn display_provider_name(model: &pi::types::Model) -> String {
         .unwrap_or_else(|| model.provider.clone())
 }
 
+/// Config-level identity of a registered model (metadata `config_id`,
+/// else the registration id). Host model lists key rows by this so a model
+/// registered through several wire apis appears once.
+pub fn config_id(model: &pi::types::Model) -> String {
+    model
+        .metadata
+        .get("config_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model.id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pi::coding_agent::model_runtime::ModelCatalog;
     use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
+
+    #[test]
+    fn config_id_prefers_metadata_over_registration_id() {
+        let model = |metadata| pi::types::Model {
+            provider: "bailian-a".into(),
+            api: "anthropic".into(),
+            id: "deepseek-v4-flash".into(),
+            context_window: 200_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata,
+        };
+        assert_eq!(
+            config_id(&model(std::collections::HashMap::new())),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            config_id(&model(std::collections::HashMap::from([(
+                "config_id".to_string(),
+                serde_json::json!("bailian:deepseek-v4-flash"),
+            )]))),
+            "bailian:deepseek-v4-flash"
+        );
+    }
 
     #[test]
     fn legacy_alias_catalog_resolves_old_provider_ids() {
