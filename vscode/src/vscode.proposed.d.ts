@@ -23,4 +23,13 @@ declare module 'vscode' {
      */
     readonly isUserSelectable?: boolean;
   }
+
+  export interface PrepareLanguageModelChatModelOptions {
+    /**
+     * Per-group configuration resolved from the language models config file
+     * (the group's own properties, minus reserved keys). Present only on the
+     * per-group resolution calls, absent on the initial groupless listing.
+     */
+    readonly configuration?: { readonly [key: string]: any };
+  }
 }

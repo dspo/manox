@@ -9,7 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool } from './protocol';
+import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool, ModelInfo } from './protocol';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;
@@ -81,6 +81,120 @@ export function toWireMessages(
   }));
 }
 
+/** A manox group declared in the language models config file. */
+export interface ManoxGroup {
+  name: string;
+  provider: string;
+}
+
+/** Candidate paths for VS Code's language models config file (user-data dir,
+ * default profile) across platforms and builds. */
+export function manoxConfigCandidates(): string[] {
+  const appDir = (() => {
+    switch (vscode.env.uriScheme) {
+      case 'vscode-insiders':
+        return 'Code - Insiders';
+      case 'vscode-oss':
+        return process.platform === 'darwin' ? 'Code - OSS' : 'code-oss';
+      default:
+        return 'Code';
+    }
+  })();
+  const root =
+    process.platform === 'darwin'
+      ? `${process.env.HOME}/Library/Application Support`
+      : process.platform === 'linux'
+        ? `${process.env.HOME}/.config`
+        : process.platform === 'win32'
+          ? (process.env.APPDATA ?? '')
+          : '';
+  return root ? [`${root}/${appDir}/User/chatLanguageModels.json`] : [];
+}
+
+/** Parse the config file into manox's groups (vendor === 'manox'). */
+export function parseManoxGroups(json: string): ManoxGroup[] {
+  try {
+    const groups: unknown = JSON.parse(json);
+    if (!Array.isArray(groups)) return [];
+    const out: ManoxGroup[] = [];
+    for (const g of groups) {
+      if (g && typeof g === 'object' && (g as { vendor?: unknown }).vendor === 'manox') {
+        const { name, provider } = g as { name?: unknown; provider?: unknown };
+        if (typeof name === 'string' && typeof provider === 'string') {
+          out.push({ name, provider });
+        }
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Read manox's groups from the config file; empty when the file is absent,
+ * unreadable, or declares no manox groups. */
+async function readManoxGroups(): Promise<ManoxGroup[]> {
+  for (const path of manoxConfigCandidates()) {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(path));
+      return parseManoxGroups(bytes.toString());
+    } catch {
+      // try the next candidate
+    }
+  }
+  return [];
+}
+
+/** One actor model → picker-visible model information. */
+function toModelInfo(m: ModelInfo): vscode.LanguageModelChatInformation {
+  return {
+    id: m.id,
+    name: m.name,
+    family: m.provider,
+    version: '1.0.0',
+    // The actor reports the provider's real context window; a missing
+    // value falls back to the placeholder.
+    maxInputTokens: m.context_window || DEFAULT_MAX_INPUT_TOKENS,
+    maxOutputTokens: m.max_tokens || DEFAULT_MAX_OUTPUT_TOKENS,
+    capabilities: { toolCalling: true, imageInput: true },
+    isUserSelectable: true,
+  };
+}
+
+/** Derive a manox group per cx provider and persist it into the language
+ * models config file, preserving every existing entry. The workbench watches
+ * the file and re-resolves the vendor on change, which turns the flat
+ * listing into named groups. Idempotent: the caller only invokes this when
+ * the file declares no manox groups yet. */
+async function createManoxGroups(models: ModelInfo[]): Promise<void> {
+  const providers = Array.from(
+    new Set(models.map((m) => m.provider_name ?? m.provider)),
+  )
+    .filter((p): p is string => typeof p === 'string' && p.length > 0)
+    .sort();
+  if (providers.length === 0) return;
+  const configFile = manoxConfigCandidates()[0];
+  if (!configFile) return;
+  const uri = vscode.Uri.file(configFile);
+  let allGroups: unknown[] = [];
+  try {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const parsed: unknown = JSON.parse(bytes.toString());
+    if (Array.isArray(parsed)) allGroups = parsed;
+  } catch {
+    // absent or unparseable — start from an empty list
+  }
+  allGroups.push(...providers.map((provider) => ({ vendor: 'manox', name: `Manox-${provider}`, provider })));
+  try {
+    await vscode.workspace.fs.writeFile(
+      uri,
+      Buffer.from(JSON.stringify(allGroups, undefined, '\t'), 'utf8'),
+    );
+  } catch {
+    // A failed write degrades to the flat listing for this session.
+  }
+}
+
 export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
   constructor(private readonly manager: SessionManager) {}
 
@@ -88,25 +202,40 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     options: vscode.PrepareLanguageModelChatModelOptions,
     _token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelChatInformation[]> {
-    // VS Code enumerates vendor models with silent=true on the picker and the
-    // Manage Models table; manox needs no user interaction to list its
-    // models, so silent must still return them (init is idempotent and the
-    // actor boot is one-time).
+    // VS Code enumerates a vendor's models with silent=true (picker and the
+    // Manage Models table), and does two shapes of call: an initial groupless
+    // listing (configuration absent) plus one call per group declared in the
+    // language models config file (configuration carries the group's own
+    // properties). manox needs no user interaction to list models, so both
+    // paths resolve them.
+    if (options.configuration !== undefined) {
+      // Per-group call: configuration.provider names the cx provider this
+      // group exposes; serve only that provider's models so the group bucket
+      // is not polluted by every other provider.
+      const providerName = options.configuration.provider;
+      if (typeof providerName !== 'string') return [];
+      try {
+        await this.manager.init(resolveWorkspaceCwd());
+        const models = await this.manager.listModels();
+        return models
+          .filter((m) => (m.provider_name ?? m.provider) === providerName)
+          .map(toModelInfo);
+      } catch {
+        return [];
+      }
+    }
+    // Groupless call. When manox groups exist in the config file, the
+    // per-group calls above serve the models and an ungrouped bucket would
+    // duplicate them — return nothing. Without groups, derive one group per
+    // cx provider, persist it (the workbench's file watch re-resolves the
+    // vendor into named groups), and keep the flat listing for this call.
+    const groups = await readManoxGroups();
+    if (groups.length > 0) return [];
     try {
       await this.manager.init(resolveWorkspaceCwd());
       const models = await this.manager.listModels();
-      return models.map((m) => ({
-        id: m.id,
-        name: m.name,
-        family: m.provider,
-        version: '1.0.0',
-        // The actor reports the provider's real context window; a missing
-        // value falls back to the placeholder.
-        maxInputTokens: m.context_window || DEFAULT_MAX_INPUT_TOKENS,
-        maxOutputTokens: m.max_tokens || DEFAULT_MAX_OUTPUT_TOKENS,
-        capabilities: { toolCalling: true, imageInput: true },
-        isUserSelectable: true,
-      }));
+      await createManoxGroups(models);
+      return models.map(toModelInfo);
     } catch {
       // A failing actor must not break the model picker; the vendor simply
       // does not show up until the actor responds.

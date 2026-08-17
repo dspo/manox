@@ -36,10 +36,22 @@ vi.mock('vscode', () => {
       public isError?: boolean,
     ) {}
   }
+  let manoxConfigJson: string | undefined;
+  const fsReadFile = vi.fn(async (uri: { fsPath: string }) => {
+    if (manoxConfigJson !== undefined) return Buffer.from(manoxConfigJson, 'utf8');
+    throw new Error('ENOENT: ' + uri.fsPath);
+  });
   return {
     workspace: {
       workspaceFolders: undefined,
       getConfiguration: () => ({ get: () => undefined }),
+      fs: { readFile: fsReadFile, writeFile: vi.fn(async () => {}) },
+    },
+    env: { uriScheme: 'vscode' },
+    Uri: { file: (p: string) => ({ fsPath: p }) },
+    /** Test hook: seed the language models config file content. */
+    setManoxConfigJson: (text: string | undefined) => {
+      manoxConfigJson = text;
     },
     LanguageModelChatMessageRole: { User: 1, Assistant: 2, System: 3 },
     LanguageModelTextPart,
@@ -168,6 +180,7 @@ async function openChat(
 
 afterEach(() => {
   progress.report.mockClear();
+  (vscode as unknown as { setManoxConfigJson(t: string | undefined): void }).setManoxConfigJson(undefined);
 });
 
 describe('provideLanguageModelChatInformation', () => {
@@ -258,6 +271,81 @@ describe('provideLanguageModelChatInformation', () => {
     // listModels budgets the cold-boot registration (INIT_TIMEOUT_MS).
     await vi.advanceTimersByTimeAsync(30_001);
     await expect(pending).resolves.toEqual([]);
+  });
+
+  it('keeps the flat fallback and derives manox groups when none are configured', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        { id: 'a', name: 'A', provider: 'p1', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
+        { id: 'b', name: 'B', provider: 'p2', api: 'anthropic', context_window: 100000, provider_name: 'BaiLian' },
+      ],
+    });
+    await expect(pending).resolves.toHaveLength(2);
+    // One manox group per cx provider, appended to the config file.
+    const writeArgs = (vscode.workspace.fs.writeFile as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+    const written = JSON.parse(Buffer.from(writeArgs[1] as Uint8Array).toString());
+    expect(written).toEqual(
+      expect.arrayContaining([
+        { vendor: 'manox', name: 'Manox-DeepSeek', provider: 'DeepSeek' },
+        { vendor: 'manox', name: 'Manox-BaiLian', provider: 'BaiLian' },
+      ]),
+    );
+  });
+
+  it('serves no ungrouped models once manox groups exist', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    (vscode as unknown as { setManoxConfigJson(t: string | undefined): void }).setManoxConfigJson(
+      JSON.stringify([
+        { vendor: 'manox', name: 'Manox-DeepSeek', provider: 'DeepSeek' },
+        { vendor: 'manox', name: 'Manox-BaiLian', provider: 'BaiLian' },
+      ]),
+    );
+    await expect(
+      provider.provideLanguageModelChatInformation({ silent: true }, fakeToken()),
+    ).resolves.toEqual([]);
+    expect(transport.sent).toHaveLength(0);
+  });
+
+  it('filters a group call to its cx provider', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation(
+      { silent: false, configuration: { provider: 'DeepSeek' } } as unknown as vscode.PrepareLanguageModelChatModelOptions,
+      fakeToken(),
+    );
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        { id: 'a', name: 'A', provider: 'p1', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
+        { id: 'b', name: 'B', provider: 'p2', api: 'anthropic', context_window: 100000, provider_name: 'BaiLian' },
+      ],
+    });
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ id: 'a', isUserSelectable: true }),
+    ]);
+  });
+
+  it('returns no models for a group call without a provider filter', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    await expect(
+      provider.provideLanguageModelChatInformation(
+        { silent: false, configuration: {} } as unknown as vscode.PrepareLanguageModelChatModelOptions,
+        fakeToken(),
+      ),
+    ).resolves.toEqual([]);
+    expect(transport.sent).toHaveLength(0);
   });
 });
 
