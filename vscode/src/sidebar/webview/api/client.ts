@@ -33,6 +33,20 @@ export function onHostMessage(listener: (message: HostToWebview) => void): () =>
   return () => listeners.delete(listener);
 }
 
+const navigatorListeners = new Set<() => void>();
+onHostMessage((message) => {
+  if (message.type === 'open_turn_navigator') {
+    for (const listener of navigatorListeners) listener();
+  }
+});
+
+/** Subscribe to host-requested turn-navigator toggles (macOS cmd+m, where
+ * the OS minimize accelerator would swallow the key before the DOM). */
+export function onOpenTurnNavigator(listener: () => void): () => void {
+  navigatorListeners.add(listener);
+  return () => navigatorListeners.delete(listener);
+}
+
 function post(message: WebviewToHost): void {
   host.postMessage(message);
 }

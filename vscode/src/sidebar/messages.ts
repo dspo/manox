@@ -72,4 +72,8 @@ export type HostToWebview =
   | { type: 'threads'; threads: ThreadListItem[] }
   | { type: 'commands'; commands: CommandEntry[] }
   | { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
-  | { type: 'global_error'; message: string };
+  | { type: 'global_error'; message: string }
+  /** macOS cmd+m lands here via the manox.openTurnNavigator command (the
+   * OS minimize accelerator would otherwise swallow the key before the
+   * webview DOM sees it); the webview toggles the turn navigator. */
+  | { type: 'open_turn_navigator' };

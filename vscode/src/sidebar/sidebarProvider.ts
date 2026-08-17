@@ -20,6 +20,12 @@ export function registerManoxSidebar(context: vscode.ExtensionContext): void {
       vscode.commands.executeCommand('manox.chatView.focus'),
     ),
     vscode.commands.registerCommand('manox.newSession', () => provider.newSession()),
+    // macOS cmd+m is a minimize accelerator; the extension keybinding
+    // contribution routes it here instead, since the webview DOM would
+    // never receive the key.
+    vscode.commands.registerCommand('manox.openTurnNavigator', () =>
+      provider.openTurnNavigator(),
+    ),
   );
 }
 
@@ -35,6 +41,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   private sessionGeneration = 0;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
+
+  /** Toggle the turn navigator from the host (macOS cmd+m path). */
+  openTurnNavigator(): void {
+    this.post({ type: 'open_turn_navigator' });
+  }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
