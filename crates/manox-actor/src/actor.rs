@@ -10,7 +10,7 @@
 //! active, and the thread waits on the command channel when idle, waking
 //! periodically so parked async work still lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -1581,9 +1581,27 @@ fn model_chat_done_error(request_id: &str, error: &str) -> String {
     .to_string()
 }
 
+/// Collapse models the host would register under an identical identity: the
+/// VS Code model picker buckets by provider display name and registers each
+/// bucket's models by id, so two endpoints exposing the same
+/// (display name, id) pair collide ("already registered"). The first entry
+/// wins; the registry listing is sorted by provider then id, so the survivor
+/// is deterministic.
+fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
+    let mut seen = HashSet::new();
+    models
+        .into_iter()
+        .filter(|model| {
+            seen.insert((
+                agent::pi_providers::display_provider_name(model),
+                model.id.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn models_snapshot() -> Value {
-    let models: Vec<Value> = agent::pi_providers::global()
-        .models()
+    let models: Vec<Value> = deduped_models(agent::pi_providers::global().models())
         .iter()
         .map(model_json)
         .collect();
@@ -3381,6 +3399,49 @@ mod tests {
         assert_eq!(value["api"], "anthropic");
         assert_eq!(value["context_window"], 200_000);
         assert!(value["name"].is_string());
+    }
+
+    #[test]
+    fn deduped_models_collapses_same_display_name_and_id() {
+        let model = |provider: &str, display: Option<&str>, id: &str| {
+            let mut metadata = HashMap::new();
+            if let Some(display) = display {
+                metadata.insert("provider_display_name".to_string(), json!(display));
+            }
+            pi::types::Model {
+                provider: provider.into(),
+                api: "anthropic".into(),
+                id: id.into(),
+                context_window: 200_000,
+                max_tokens: 8192,
+                thinking: pi::types::ThinkingKind::None,
+                metadata,
+            }
+        };
+        let deduped = deduped_models(vec![
+            // Same display name + id from two endpoints: collapses to the first.
+            model("bailian-a", Some("百炼"), "deepseek-v4-flash"),
+            model("bailian-b", Some("百炼"), "deepseek-v4-flash"),
+            // Same display name, distinct id: kept.
+            model("bailian-a", Some("百炼"), "qwen3-max"),
+            // Same id under a different display name: kept.
+            model("deepseek", Some("DeepSeek"), "deepseek-v4-flash"),
+            // No display metadata: identity falls back to the provider name.
+            model("openai", None, "gpt-5"),
+        ]);
+        let identities: Vec<(String, String)> = deduped
+            .iter()
+            .map(|m| (agent::pi_providers::display_provider_name(m), m.id.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("百炼".to_string(), "deepseek-v4-flash".to_string()),
+                ("百炼".to_string(), "qwen3-max".to_string()),
+                ("DeepSeek".to_string(), "deepseek-v4-flash".to_string()),
+                ("openai".to_string(), "gpt-5".to_string()),
+            ]
+        );
     }
 
     #[test]
