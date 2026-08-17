@@ -93,6 +93,12 @@ const DICT = {
   plan_mode: { en: 'Plan mode', zh: '计划模式' },
   plan_mode_on: { en: 'On', zh: '已开启' },
   plan_mode_off: { en: 'Off', zh: '已关闭' },
+  plan_mode_banner: { en: 'Plan mode is on', zh: '计划模式已开启' },
+  plan_mode_banner_desc: {
+    en: 'Research only — the working tree stays read-only until the plan is approved.',
+    zh: '仅调研——计划获批前工作区保持只读。',
+  },
+  plan_mode_exit: { en: 'Exit plan mode', zh: '退出计划模式' },
   worktree: { en: 'Worktree', zh: '工作树' },
   goal: { en: 'Goal', zh: '目标' },
   goal_active: { en: 'Active', zh: '进行中' },

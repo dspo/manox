@@ -38,7 +38,10 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
       const timer = setTimeout(finish, TURN_TIMEOUT_MS);
       // The participant has no interactive approval surface: authorizations
       // are denied at once with a pointer to the sidebar, where approval
-      // cards can be decided interactively.
+      // cards can be decided interactively. Plans submitted through
+      // ProposePlan follow the same rule — the native chat cannot render
+      // the review card, so the body streams here and the verdict happens
+      // in the sidebar.
       const off = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
         switch (ev.type) {
           case 'agent_text':
@@ -54,6 +57,19 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
             manager.send({ cmd: 'approve', sessionId, id: ev.id, allow: false });
             stream.markdown(
               `_${ev.tool_name} requires approval — denied in chat. Use the manox sidebar to approve interactively._`,
+            );
+            break;
+          case 'plan_ready':
+            stream.markdown(`### ${ev.title}\n\n${ev.content}`);
+            stream.markdown(
+              `_The plan is awaiting your verdict. Open the **manox sidebar**, select this conversation, and choose Execute / Refine there — plan mode stays on until then._`,
+            );
+            break;
+          case 'plan_mode_changed':
+            stream.markdown(
+              ev.enabled
+                ? `_Plan mode is on: research is read-only until the submitted plan is approved._`
+                : `_Plan mode off._`,
             );
             break;
           case 'error':
