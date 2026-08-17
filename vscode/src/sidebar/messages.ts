@@ -18,7 +18,17 @@ import type {
 } from '../protocol';
 
 export type WebviewToHost =
-  | { type: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
+  | {
+      type: 'submit';
+      sessionId: string;
+      text: string;
+      images?: ImageAttachment[];
+      /** Echo identifier for the queued-bubble lifecycle (`steer` /
+       * `drop_queued` target the same id the host relayed back). */
+      clientId?: string;
+    }
+  | { type: 'steer'; sessionId: string; clientId: string; text: string; images?: ImageAttachment[] }
+  | { type: 'drop_queued'; sessionId: string; clientId: string }
   | { type: 'approve'; sessionId: string; id: string; allow: boolean }
   | { type: 'cancel'; sessionId: string }
   | { type: 'set_model'; sessionId: string; id: string }

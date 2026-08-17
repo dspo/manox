@@ -85,7 +85,14 @@ export const MessageList = ({
   const renderItem = (item: TranscriptItem): ReactNode => {
     switch (item.kind) {
       case 'user':
-        return <UserMessage approvalMode={approvalMode} item={item} key={item.id} />;
+        return (
+          <UserMessage
+            approvalMode={approvalMode}
+            item={item}
+            key={item.id}
+            sessionId={sessionId}
+          />
+        );
       case 'assistant':
         return <AssistantMessage item={item} key={item.id} />;
       case 'thinking':
