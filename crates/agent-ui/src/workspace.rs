@@ -792,21 +792,6 @@ impl Workspace {
                     this.context_rail
                         .update(cx, |r, cx| r.set_plan(snapshot, cx));
                 }
-                ThreadEvent::BackgroundTaskUpdated { .. } => {
-                    // Live monitors / background bash keep the loop able to
-                    // self-advance; mirror the per-thread running-task check
-                    // into the store so the sidebar keeps the row spinning
-                    // even with no turn in flight.
-                    let thread_id = this.thread.read(cx).id.0.clone();
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_background_work(
-                            &thread_id,
-                            agent::background_task::thread_has_running_tasks(&thread_id),
-                            cx,
-                        );
-                    });
-                }
                 ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + Danger badge; no conversation item.
                     cx.notify();
@@ -1039,6 +1024,22 @@ impl Workspace {
                     this.consume_steered_follow_up(message_id, cx);
                 }
                 _ => {
+                    // Live monitors / background bash keep the loop able to
+                    // self-advance; mirror the per-thread running-task check
+                    // into the store so the sidebar keeps the row spinning
+                    // even with no turn in flight. The event still falls
+                    // through to the conversation's task-card dispatch below.
+                    if let ThreadEvent::BackgroundTaskUpdated { .. } = ev {
+                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| {
+                            s.mark_background_work(
+                                &thread_id,
+                                agent::background_task::thread_has_running_tasks(&thread_id),
+                                cx,
+                            );
+                        });
+                    }
                     // Tool traffic past a pending authorization proves the
                     // verdict resolved (the call resumed or settled); drop
                     // the sidebar badge. The `PendingApproval` card itself
