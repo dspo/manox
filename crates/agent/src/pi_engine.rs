@@ -3198,7 +3198,13 @@ async fn refresh_session_list(
     *state.sessions.lock().unwrap() = out;
 }
 
-/// Map a pi session info onto the sidebar summary shape.
+/// Map a pi session info onto the actor's mirrored session list.
+///
+/// A flat mirror of the sidebar store (the sidebar itself renders
+/// `ThreadStore::summaries()` with team depth resolution); rows here stay
+/// depth 0 because the mirror is never rendered as a tree. `parent_id`
+/// still resolves the team affiliation via the shared helper so any reader
+/// sees the same edge the sidebar does.
 fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> ThreadSummary {
     ThreadSummary {
         id: info.id.clone(),
@@ -3214,7 +3220,8 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
             info.cwd.clone()
         },
         depth: 0,
-        parent_id: info.parent_session_path.clone(),
+        parent_id: crate::thread_store::team_parent_id(info)
+            .or_else(|| info.parent_session_path.clone()),
         archived: false,
         pinned: false,
         has_unread: false,

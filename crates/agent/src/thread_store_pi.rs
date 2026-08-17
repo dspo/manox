@@ -535,6 +535,18 @@ fn project_session_lists(
     (paths, active, archived)
 }
 
+
+/// The team leader's session id from a session header's `team.parent`, when
+/// present. Shared by the sidebar store and the actor's mirrored session
+/// list so both resolve the affiliation identically.
+pub(crate) fn team_parent_id(info: &pi::session::repository::SessionInfo) -> Option<String> {
+    info.metadata
+        .as_ref()
+        .and_then(|m| m.get("team"))
+        .and_then(|t| t.get("parent"))
+        .and_then(|p| p.as_str())
+        .map(str::to_string)
+}
 /// Map a pi session info + sidecar onto the sidebar summary shape.
 fn session_info_to_summary(
     info: &pi::session::repository::SessionInfo,
@@ -545,12 +557,6 @@ fn session_info_to_summary(
     } else {
         info.first_message.clone()
     };
-    let team_parent = info
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("team"))
-        .and_then(|t| t.get("parent"))
-        .and_then(|p| p.as_str());
     ThreadSummary {
         id: info.id.clone(),
         summary: summary.clone(),
@@ -563,9 +569,10 @@ fn session_info_to_summary(
         depth: 0,
         // Team affiliation wins over a fork lineage when both are present:
         // the fork link is history, the team link is the live hierarchy.
-        parent_id: team_parent
-            .map(str::to_string)
-            .or_else(|| info.parent_session_path.clone()),
+        // A fork lineage alone also nests under its fork source when both
+        // rows share a list (the tree renderer treats any parent_id as a
+        // hierarchy edge).
+        parent_id: team_parent_id(info).or_else(|| info.parent_session_path.clone()),
         archived: meta.archived,
         pinned: meta.pinned,
         has_unread: meta.unread,

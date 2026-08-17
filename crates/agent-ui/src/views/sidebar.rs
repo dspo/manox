@@ -184,6 +184,7 @@ fn team_forest(
     externals: &[crate::external_session::ExternalSessionSummary],
 ) -> Vec<ThreadRender> {
     let mut members: HashMap<&str, Vec<&agent::ThreadSummary>> = HashMap::new();
+    let ids: HashSet<&str> = threads.iter().map(|s| s.id.as_str()).collect();
     for s in threads {
         if s.depth > 0
             && let Some(parent) = s.parent_id.as_deref()
@@ -193,7 +194,12 @@ fn team_forest(
     }
     let mut top: Vec<SidebarRow> = threads
         .iter()
-        .filter(|s| s.depth == 0)
+        .filter(|s| {
+            // A member whose leader lives in another partition (e.g. an
+            // archived leader) cannot nest here: emit it top-level like the
+            // webview forest, so archiving a leader never hides its members.
+            s.depth == 0 || !s.parent_id.as_deref().is_some_and(|p| ids.contains(p))
+        })
         .cloned()
         .map(SidebarRow::Thread)
         .chain(externals.iter().cloned().map(SidebarRow::External))
@@ -203,7 +209,11 @@ fn team_forest(
     let mut out = Vec::new();
     for row in top {
         let id = row.id().to_string();
-        let team_leader = members.contains_key(id.as_str());
+        // Only threads can lead a team; external CLI sessions never do.
+        let team_leader = match &row {
+            SidebarRow::Thread(s) => members.contains_key(s.id.as_str()),
+            SidebarRow::External(_) => false,
+        };
         out.push(ThreadRender {
             row,
             indent: 0.0,
@@ -1721,6 +1731,30 @@ mod tests {
             resumable: false,
             resuming: false,
         }
+    }
+
+    /// A member whose leader is not in the current partition (e.g. an
+    /// archived leader) must not disappear: the row degrades to top-level,
+    /// matching the webview forest.
+    #[test]
+    fn team_forest_keeps_members_when_leader_is_in_another_partition() {
+        let thread = |id: &str, parent: Option<&str>, depth: i32, at: i64| {
+            let mut s = sample_thread();
+            s.id = id.into();
+            s.parent_id = parent.map(str::to_string);
+            s.depth = depth;
+            s.interacted_at = at;
+            s
+        };
+        // Only the active partition is handed to the forest; the leader sits
+        // in the archived partition, so its depth-1 member must surface as a
+        // top-level row instead of vanishing.
+        let threads = vec![thread("member", Some("leader"), 1, 100)];
+        let rows = team_forest(&HashSet::new(), &threads, &[]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.row.id()).collect();
+        assert_eq!(ids, vec!["member"]);
+        assert_eq!(rows[0].indent, 0.0);
+        assert!(!rows[0].team_leader);
     }
 
     /// The team forest orders top-level rows by recency with members nested
