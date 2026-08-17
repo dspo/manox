@@ -184,6 +184,7 @@ pub fn spawn_engine(
     project: Option<PathBuf>,
     thread_id: String,
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
+    parent_session: Option<String>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -221,6 +222,7 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&state),
         thread_id,
+        parent_session,
     ));
     // Display-only streaming preview: while the actor's eager restore reads
     // the whole session file, stream its transcript into the mirrored history
@@ -1130,6 +1132,17 @@ fn subscribe_harness_events(
     }))
 }
 
+/// Session header metadata: the creating host's identity, plus (for a team
+/// worker) the leader's session id. The team link persists with the jsonl
+/// file, so the affiliation survives restarts and outlives the team.
+fn session_metadata(parent_session: Option<&str>) -> serde_json::Value {
+    let mut metadata = serde_json::json!({ "host": crate::host::current().slug() });
+    if let Some(parent) = parent_session {
+        metadata["team"] = serde_json::json!({ "parent": parent });
+    }
+    metadata
+}
+
 /// Build the session builder against the given project dir, using the shared
 /// runtime and model.
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
@@ -1144,6 +1157,7 @@ fn session_builder(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    parent_session: Option<&str>,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
     let (tools, orchestrators) = build_tools(
         cwd,
@@ -1164,14 +1178,16 @@ fn session_builder(
         .with_resources(instruction_resources(cwd))
         .with_tools(tools);
     // Every session a host creates is tagged with its identity so each
-    // host's session list stays disjoint.
-    builder = builder.with_metadata(serde_json::json!({ "host": crate::host::current().slug() }));
+    // host's session list stays disjoint. A team worker additionally carries
+    // its leader's session id: the link persists with the jsonl file, so the
+    // affiliation survives restarts and outlives the in-memory team.
+    builder = builder.with_metadata(session_metadata(parent_session));
+
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
     (builder, orchestrators)
 }
-
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
 /// model plus the shared slot must follow so `Ready`, the approval
@@ -1392,6 +1408,7 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
     thread_id: String,
+    parent_session: Option<String>,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -1481,6 +1498,7 @@ async fn run_actor(
             state.goal_bridge.as_ref(),
             &cmd_tx,
             &state.worktree,
+            None,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -1521,6 +1539,7 @@ async fn run_actor(
                 state.goal_bridge.as_ref(),
                 &cmd_tx,
                 &state.worktree,
+                parent_session.as_deref(),
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -2224,6 +2243,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    parent_session.as_deref(),
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -2363,6 +2383,7 @@ async fn rebuild_session(
         goal_bridge,
         cmd_tx,
         worktree,
+        None,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
@@ -3177,7 +3198,13 @@ async fn refresh_session_list(
     *state.sessions.lock().unwrap() = out;
 }
 
-/// Map a pi session info onto the sidebar summary shape.
+/// Map a pi session info onto the actor's mirrored session list.
+///
+/// A flat mirror of the sidebar store (the sidebar itself renders
+/// `ThreadStore::summaries()` with team depth resolution); rows here stay
+/// depth 0 because the mirror is never rendered as a tree. `parent_id`
+/// still resolves the team affiliation via the shared helper so any reader
+/// sees the same edge the sidebar does.
 fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> ThreadSummary {
     ThreadSummary {
         id: info.id.clone(),
@@ -3193,7 +3220,8 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
             info.cwd.clone()
         },
         depth: 0,
-        parent_id: info.parent_session_path.clone(),
+        parent_id: crate::thread_store::team_parent_id(info)
+            .or_else(|| info.parent_session_path.clone()),
         archived: false,
         pinned: false,
         has_unread: false,
@@ -3666,6 +3694,17 @@ pub(crate) mod adapt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_metadata_tags_host_and_optional_team_parent() {
+        let tagged = session_metadata(Some("leader-1"));
+        assert_eq!(tagged["host"], crate::host::current().slug());
+        assert_eq!(tagged["team"]["parent"], "leader-1");
+
+        let plain = session_metadata(None);
+        assert_eq!(plain["host"], crate::host::current().slug());
+        assert!(plain.get("team").is_none(), "no team key without a parent");
+    }
 
     #[tokio::test]
     async fn approval_mode_sidecar_round_trips() {

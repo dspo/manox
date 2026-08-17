@@ -238,6 +238,8 @@ describe('listThreads', () => {
           background_work: false,
           pinned: false,
           archived: false,
+          parent_id: null,
+          depth: 0,
           model_id: 'm',
         },
       ],

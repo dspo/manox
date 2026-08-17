@@ -19,6 +19,8 @@ const item = (partial: Partial<ThreadListItem>): ThreadListItem => ({
   model_id: 'm',
   pinned: false,
   archived: false,
+  parent_id: null,
+  depth: 0,
   ...partial,
 });
 

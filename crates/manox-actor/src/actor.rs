@@ -1353,6 +1353,8 @@ fn threads_snapshot(
                 "model_id": s.model_id,
                 "pinned": s.pinned,
                 "archived": s.archived,
+                "parent_id": s.parent_id,
+                "depth": s.depth,
             })
         })
         .collect();
@@ -2266,6 +2268,17 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed a session file whose header records a team parent link.
+    fn seed_session_file_team(dir: &Path, id: &str, cwd: &str, parent: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"team\":{{\"parent\":\"{parent}\"}}}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     /// Restore the process host identity on drop so a panicking test cannot
     /// leak a switched host into later tests.
     struct HostGuard(agent::host::Host);
@@ -2779,6 +2792,62 @@ mod tests {
             Some(true),
             "a failed finish must keep the errored flag"
         );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A team worker's session header carries its leader's id; the snapshot
+    /// surfaces it as `parent_id` with a computed `depth` (1 under a
+    /// top-level leader), so the sidebar can nest the member row.
+    #[test]
+    fn threads_snapshot_carries_team_parent_and_depth() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "leader-1", "/team/project");
+        seed_session_file_team(&sessions, "member-1", "/team/project", "leader-1");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/team/project"));
+        let (out, sink) = collect_sink();
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let rows = loop {
+            cx.run_until_parked();
+            let rows = out
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default();
+            let ids: Vec<&str> = rows.iter().filter_map(|t| t["id"].as_str()).collect();
+            if ids.contains(&"member-1") {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded team session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let member = rows.iter().find(|t| t["id"] == "member-1").unwrap();
+        assert_eq!(member["parent_id"], "leader-1");
+        assert_eq!(member["depth"], 1);
+        let leader = rows.iter().find(|t| t["id"] == "leader-1").unwrap();
+        assert!(leader["parent_id"].is_null());
+        assert_eq!(leader["depth"], 0);
 
         drop(state);
         agent::thread_store::drop_global_for_test();

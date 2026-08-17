@@ -449,6 +449,7 @@ impl Thread {
             project.clone(),
             id.0.clone(),
             goal_bridge.clone(),
+            None,
         );
 
         cx.new(|cx| {
@@ -516,6 +517,7 @@ impl Thread {
             project,
             self.id.0.clone(),
             self.goal_bridge.clone(),
+            None,
         );
         if self.approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(self.approval_mode);
@@ -1201,7 +1203,9 @@ impl Thread {
     /// (leader) thread's cwd / model / approval mode / reasoning effort,
     /// labeled with the member name. Engine spawned eagerly (members always
     /// run). Members carry no goal bridge: the goal contract belongs to the
-    /// leader's user-facing conversation.
+    /// leader's user-facing conversation. The member session header records
+    /// this leader's session id (`team.parent`), persisting the affiliation
+    /// with the jsonl file so it survives restarts and team disband.
     pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
@@ -1220,6 +1224,7 @@ impl Thread {
             None,
             id.0.clone(),
             None,
+            Some(self.id.0.clone()),
         );
         if approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(approval_mode);

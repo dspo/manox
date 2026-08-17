@@ -44,6 +44,8 @@ const DICT = {
   pin: { en: 'Pin', zh: '置顶' },
   unpin: { en: 'Unpin', zh: '取消置顶' },
   more: { en: 'More', zh: '更多' },
+  collapse_team: { en: 'Collapse team members', zh: '收起团队成员' },
+  expand_team: { en: 'Expand team members', zh: '展开团队成员' },
   back_to_threads: { en: 'Back to threads', zh: '返回对话列表' },
   turn_navigator_title: { en: 'Search user messages', zh: '搜索用户消息' },
   turn_navigator_search_placeholder: { en: 'Search user messages…', zh: '搜索用户消息…' },
