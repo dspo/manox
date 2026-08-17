@@ -14,6 +14,11 @@ import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
+// Groupless (silent) enumerations run on every picker open / default-model
+// lookup; re-booting the actor each time has real cost. Reuse the last sync
+// within this window — cx providers added afterwards are picked up on the next
+// window, an acceptable delay for the silent path.
+const SYNC_TTL_MS = 60_000;
 
 /** Stable text projection of one message part (tool results, unknown parts). */
 export function partToText(part: unknown): string {
@@ -178,7 +183,9 @@ function toModelInfo(m: ModelInfo): vscode.LanguageModelChatInformation {
  * append one `Manox-<provider>` group for every provider not yet covered,
  * preserving existing entries. Idempotent — providers already covered are
  * never duplicated, so later enumerations pick up providers added to
- * cx.providers.config.yaml after the first run. Never writes on a remote
+ * cx.providers.config.yaml after the first run. Remote degradation target:
+ * the picker shows the flat listing; named groups remain a local-session
+ * feature. Never writes on a remote
  * host: chatLanguageModels.json lives on the local side where the workbench
  * watches it, and `workspace.fs` would target the remote FS there. */
 async function syncManoxGroups(
@@ -193,7 +200,8 @@ async function syncManoxGroups(
     // does not show up until the actor responds.
     return { models: [], grouped: false };
   }
-  const existing = manoxGroupsOf(await readConfigGroups());
+  const all = await readConfigGroups();
+  const existing = manoxGroupsOf(all);
   const providers = Array.from(new Set(models.map((m) => m.provider_name ?? m.provider)))
     .filter((p): p is string => typeof p === 'string' && p.length > 0)
     .sort();
@@ -207,7 +215,6 @@ async function syncManoxGroups(
   const path = manoxConfigFile();
   if (!path) return { models, grouped: existing.length > 0 };
   const uri = vscode.Uri.file(path);
-  const all = await readConfigGroups();
   all.push(...missing.map((provider) => ({ vendor: 'manox', name: `Manox-${provider}`, provider })));
   try {
     await vscode.workspace.fs.writeFile(
@@ -222,7 +229,19 @@ async function syncManoxGroups(
 }
 
 export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
+  private syncCache: { at: number; models: ModelInfo[]; grouped: boolean } | undefined;
+
   constructor(private readonly manager: SessionManager) {}
+
+  /** Groupless resolution with a short-lived in-memory cache so repeated
+   * silent enumerations do not re-init the actor (see SYNC_TTL_MS). */
+  private async resolveGroupless(): Promise<{ models: ModelInfo[]; grouped: boolean }> {
+    const now = Date.now();
+    if (this.syncCache && now - this.syncCache.at < SYNC_TTL_MS) return this.syncCache;
+    const result = await syncManoxGroups(this.manager);
+    this.syncCache = { at: now, ...result };
+    return result;
+  }
 
   async provideLanguageModelChatInformation(
     options: vscode.PrepareLanguageModelChatModelOptions,
@@ -255,7 +274,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     // exist they serve the models via the per-group calls above, so an
     // ungrouped bucket would duplicate them — return nothing. Only when no
     // cx provider exists at all do we fall back to the flat listing.
-    const { models, grouped } = await syncManoxGroups(this.manager);
+    const { models, grouped } = await this.resolveGroupless();
     if (grouped) return [];
     return models.map(toModelInfo);
   }

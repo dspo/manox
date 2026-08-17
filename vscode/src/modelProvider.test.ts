@@ -348,6 +348,36 @@ describe('provideLanguageModelChatInformation', () => {
     ).resolves.toEqual([]);
     expect(transport.sent).toHaveLength(0);
   });
+
+  it('returns no models when silent and the actor never responds', async () => {
+    vi.useFakeTimers();
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
+    await flush();
+    // init never emits ready; the registration budget elapses and the groupless
+    // path resolves to the (empty) flat listing.
+    await vi.advanceTimersByTimeAsync(30_001);
+    await expect(pending).resolves.toEqual([]);
+  });
+
+  it('reuses the cached sync within the TTL instead of re-initializing', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const first = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({ type: 'models', models: providerModels() });
+    await first;
+    const listCalls = () => transport.commands().filter((c) => c.cmd === 'list_models').length;
+    const before = listCalls();
+    // A second silent enumeration inside the TTL must not re-query the actor.
+    await expect(
+      provider.provideLanguageModelChatInformation({ silent: true }, fakeToken()),
+    ).resolves.toEqual([]);
+    expect(listCalls()).toBe(before);
+  });
 });
 
 describe('provideLanguageModelChatResponse', () => {
