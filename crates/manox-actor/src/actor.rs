@@ -468,6 +468,13 @@ fn handle_command(
             if let Some(session) = state.sessions.remove(&id) {
                 if session.turn_active.load(Ordering::SeqCst) {
                     cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
+                    // The session's subscription is already dropped, so the
+                    // backend's eventual `TurnFinished` can no longer clear
+                    // the store's running flag; reset it here.
+                    cx.update(|app| {
+                        let store = agent::thread_store::global();
+                        store.update(app, |s, cx| s.mark_idle(&id, cx));
+                    });
                 }
                 sink.emit(
                     serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
@@ -494,9 +501,10 @@ fn handle_command(
                 .flatten()
                 .map(|(name, args)| (name.to_string(), args.to_string()));
             // Navigation built-ins (`/exit` / `/new` and aliases) are
-            // session-level: archive the thread and dispose the session so
-            // the webview returns to its home composer, mirroring the gpui
-            // host's archive-and-fresh flow. No-op while a turn is running.
+            // session-level: cancel any in-flight turn, archive the thread,
+            // and dispose the session so the webview returns to its home
+            // composer, mirroring the gpui host's archive-and-fresh flow.
+            // Takes effect immediately even while a turn is running.
             if let Some((name, _)) = slash.as_ref()
                 && let Some(builtin) = agent::slash_builtins::canonical_builtin(name)
                 && matches!(builtin.name, "exit" | "new")
@@ -508,8 +516,22 @@ fn handle_command(
                     .sessions
                     .get(&id)
                     .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+                // Cancel the in-flight turn so the engine aborts before the
+                // thread is disposed.
                 if running {
-                    return true;
+                    cx.update(|app| {
+                        if let Some(session) = state.sessions.get(&id) {
+                            session.thread.update(app, |t, cx| t.cancel(cx));
+                        }
+                    });
+                    // The disposal below drops the session's subscription,
+                    // so the backend's eventual `TurnFinished` can no longer
+                    // clear the store's running flag; reset it here or the
+                    // archived row keeps spinning until restart.
+                    cx.update(|app| {
+                        let store = agent::thread_store::global();
+                        store.update(app, |s, cx| s.mark_idle(&id, cx));
+                    });
                 }
                 ensure_store_subscription(cx, state, sink);
                 cx.update(|app| {
@@ -2888,6 +2910,94 @@ mod tests {
             messages.is_empty(),
             "a handled slash turn must not insert the raw invocation"
         );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn exit_while_turn_running_cancels_and_disposes() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        // Seed a session file so the store scan can surface the archived
+        // summary; a fresh thread's jsonl materializes only on the first
+        // assistant message.
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink_out = out.clone();
+        let sink = EventSink::new(move |json| sink_out.lock().unwrap().push(json));
+
+        // Make the store aware of s1, then simulate the in-flight turn the
+        // event subscription would have flagged.
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let known = cx.update(|app| {
+                let store = agent::thread_store::global();
+                let s = store.read(app);
+                s.summaries()
+                    .iter()
+                    .chain(s.archived_summaries())
+                    .any(|sum| sum.id == "s1")
+            });
+            if known {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded session never landed in the store scan"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Simulate the running turn the event subscription would have
+        // flagged: the actor's `turn_active` plus the store's running set.
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.update(app, |s, cx| s.mark_running("s1", cx));
+        });
+
+        // `/exit` while running must cancel the turn and dispose the session
+        // immediately instead of silently dropping the command.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/exit"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+
+        // The thread-store summary lands in the archived partition.
+        let archived = cx.update(|app| {
+            let store = agent::thread_store::global();
+            let s = store.read(app);
+            s.archived_summaries()
+                .iter()
+                .any(|sum| sum.id == "s1" && sum.archived)
+        });
+        assert!(archived, "s1 must be archived in the thread store");
+
+        // The store's running flag is cleared: the disposal drops the
+        // session's subscription, so the backend's eventual `TurnFinished`
+        // can never reach `mark_idle` — the exit path must do it.
+        let running = cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.read(app).is_running("s1")
+        });
+        assert!(!running, "s1 must not stay flagged running after /exit");
 
         drop(state);
         agent::thread_store::drop_global_for_test();
