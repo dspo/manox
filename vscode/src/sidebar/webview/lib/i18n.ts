@@ -56,6 +56,12 @@ const DICT = {
   stop: { en: 'Stop', zh: '停止' },
   remove_attachment: { en: 'Remove attachment', zh: '移除附件' },
   context_compacted: { en: 'context compacted', zh: '上下文已压缩' },
+  queued: { en: 'Queued', zh: '排队中' },
+  steer_now: { en: 'Steer', zh: '引导' },
+  drop_queued: { en: 'Remove', zh: '删除' },
+  steer_pending: { en: 'Steering…', zh: '引导中…' },
+  steer_failed: { en: 'Not injected', zh: '未注入' },
+  steer_retry: { en: 'Retry', zh: '重试' },
   thinking: { en: 'Thinking…', zh: '思考中…' },
   thought_seconds: {
     en: (s: number) => `Thought for ${s} seconds`,

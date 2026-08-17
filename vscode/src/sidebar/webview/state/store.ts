@@ -190,8 +190,14 @@ export class Store {
   }
 
   /** Optimistic echo of a submission; the actor never replays user
-   * messages back as events. */
-  echoUser(sessionId: string, text: string, images?: UserImage[]): void {
+   * messages back as events. `opts.queued` marks a bubble parked while a
+   * turn runs (the composer passes the flag and its echo `clientId`). */
+  echoUser(
+    sessionId: string,
+    text: string,
+    images?: UserImage[],
+    opts?: { queued?: boolean; clientId?: string },
+  ): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
@@ -204,8 +210,23 @@ export class Store {
             modelId: t.currentModelId,
             timestamp: Date.now() / 1000,
             images: images?.length ? images : undefined,
+            queued: opts?.queued,
+            clientId: opts?.clientId,
           },
         ],
+      })),
+    );
+  }
+
+  /** Local removal of a queued bubble; the caller posts `drop_queued` so
+   * the actor stops parking the same message. */
+  removeUser(sessionId: string, clientId: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.filter(
+          (i) => !(i.kind === 'user' && i.clientId === clientId),
+        ),
       })),
     );
   }
@@ -378,16 +399,40 @@ function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
 
 function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string }): ThreadState {
   switch (ev.type) {
-    case 'turn_started':
-      // A fresh turn supersedes any stale error from the previous one.
+    case 'turn_started': {
+      // A fresh turn supersedes any stale error from the previous one;
+      // queued bubbles entered this round (the actor drained them into it).
       return {
         ...t,
         turnActive: true,
         turnModelId: t.currentModelId,
         turnStartedAt: Date.now(),
         error: null,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.queued ? { ...i, queued: false } : i,
+        ),
       };
-    case 'turn_finished':
+    }
+    case 'turn_finished': {
+      // Steers stranded by a failed/cancelled run become failed bubbles;
+      // pending ids the actor never listed are a race — clear them anyway.
+      const stranded = new Set(ev.strandedSteerIds ?? []);
+      return {
+        ...t,
+        turnActive: false,
+        lastTurnDurationSec:
+          t.turnStartedAt === null
+            ? t.lastTurnDurationSec
+            : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
+        turnStartedAt: null,
+        items: t.items.map((i) => {
+          if (i.kind !== 'user' || !i.steerPendingId) return i;
+          return stranded.has(i.steerPendingId)
+            ? { ...i, steerPendingId: null, steerFailed: true }
+            : { ...i, steerPendingId: null };
+        }),
+      };
+    }
     case 'stop':
       return {
         ...t,
@@ -397,6 +442,24 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
             ? t.lastTurnDurationSec
             : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
         turnStartedAt: null,
+      };
+    case 'steer_pending':
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.clientId === ev.clientId
+            ? { ...i, steerPendingId: ev.messageId }
+            : i,
+        ),
+      };
+    case 'steer_injected':
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.steerPendingId === ev.messageId
+            ? { ...i, steerPendingId: null }
+            : i,
+        ),
       };
     case 'agent_text':
       return appendAssistantText(t, ev.text);

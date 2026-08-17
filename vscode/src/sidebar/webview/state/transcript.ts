@@ -60,6 +60,15 @@ export type TranscriptItem =
       /** Unix seconds; echo submissions stamp wall-clock time. */
       timestamp?: number | null;
       images?: UserImage[];
+      /** Echo id of a submission parked while a turn ran. */
+      clientId?: string;
+      /** Parked: the bubble shows the queued chip until the turn drains. */
+      queued?: boolean;
+      /** Kernel message id once the message was steered into the running
+       * turn; the bubble shows the pending chip until `steer_injected`. */
+      steerPendingId?: string | null;
+      /** The steer was stranded by a failed/cancelled run. */
+      steerFailed?: boolean;
     }
   | { kind: 'assistant'; id: string; text: string; modelId?: string | null }
   | { kind: 'thinking'; id: string; text: string }

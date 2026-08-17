@@ -41,8 +41,19 @@ function post(message: WebviewToHost): void {
 export class ThreadApi {
   constructor(readonly sessionId: string) {}
 
-  submit(text: string, images?: ImageAttachment[]): void {
-    post({ type: 'submit', sessionId: this.sessionId, text, images });
+  submit(text: string, images?: ImageAttachment[], clientId?: string): void {
+    post({ type: 'submit', sessionId: this.sessionId, text, images, clientId });
+  }
+
+  /** Turn the queued message identified by `clientId` into a steer of the
+   * running turn; the actor replies with `steer_pending`. */
+  steer(clientId: string, text: string, images?: ImageAttachment[]): void {
+    post({ type: 'steer', sessionId: this.sessionId, clientId, text, images });
+  }
+
+  /** Drop a queued message (its echo bubble is removed locally too). */
+  dropQueued(clientId: string): void {
+    post({ type: 'drop_queued', sessionId: this.sessionId, clientId });
   }
 
   approve(id: string, allow: boolean): void {

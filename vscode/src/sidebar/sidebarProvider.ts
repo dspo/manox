@@ -166,7 +166,29 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     const manager = SessionManager.shared();
     switch (msg.type) {
       case 'submit':
-        manager.send({ cmd: 'submit', sessionId: msg.sessionId, text: msg.text, images: msg.images });
+        manager.send({
+          cmd: 'submit',
+          sessionId: msg.sessionId,
+          text: msg.text,
+          images: msg.images,
+          clientId: msg.clientId,
+        });
+        return;
+      case 'steer':
+        manager.send({
+          cmd: 'steer',
+          sessionId: msg.sessionId,
+          clientId: msg.clientId,
+          text: msg.text,
+          images: msg.images,
+        });
+        return;
+      case 'drop_queued':
+        manager.send({
+          cmd: 'drop_queued',
+          sessionId: msg.sessionId,
+          clientId: msg.clientId,
+        });
         return;
       case 'approve':
         manager.send({ cmd: 'approve', sessionId: msg.sessionId, id: msg.id, allow: msg.allow });

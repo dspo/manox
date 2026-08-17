@@ -9,13 +9,13 @@
 //! when the host grows the matching UI): `ApprovalDecision`, `Retry`,
 //! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
 //! `MainCallMetricsUpdated`, `CompactionStarted`, `PeerMessage`,
-//! `SteerInjected`, `BrowserNotification`, `InboundAuthorization`,
-//! `HistoryRestored`. `HistoryRestored` stays out of this pure projection:
-//! the actor pairs it with a full `thread_history` snapshot that needs `App`
-//! access to read the thread's messages. `GoalChanged` likewise pairs with a
-//! rich `goal_changed` snapshot emitted by the actor's subscription.
-//! `BackgroundTaskUpdated` and `SubagentChild` are projected here (the
-//! mini-panel and task cards consume them).
+//! `BrowserNotification`, `InboundAuthorization`, `HistoryRestored`.
+//! `HistoryRestored` stays out of this pure projection: the actor pairs it
+//! with a full `thread_history` snapshot that needs `App` access to read the
+//! thread's messages. `GoalChanged` likewise pairs with a rich `goal_changed`
+//! snapshot emitted by the actor's subscription. `BackgroundTaskUpdated` and
+//! `SubagentChild` are projected here (the mini-panel and task cards consume
+//! them).
 
 use agent::{ThreadEvent, ToolCallStatus};
 use serde_json::{Value, json};
@@ -70,8 +70,18 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             "input": input,
         }),
         ThreadEvent::TurnFinished {
-            cancelled, failed, ..
-        } => json!({"type": "turn_finished", "cancelled": cancelled, "failed": failed}),
+            cancelled,
+            failed,
+            stranded_steer_ids,
+        } => json!({
+            "type": "turn_finished",
+            "cancelled": cancelled,
+            "failed": failed,
+            "strandedSteerIds": stranded_steer_ids,
+        }),
+        ThreadEvent::SteerInjected { message_id } => {
+            json!({"type": "steer_injected", "messageId": message_id})
+        }
         ThreadEvent::ModelChanged { from, to } => {
             json!({"type": "model_changed", "from": from, "to": to})
         }
@@ -211,12 +221,56 @@ mod tests {
         assert_eq!(v["effort"], "max");
         assert_eq!(v["sessionId"], "s1");
     }
-
     #[test]
     fn drops_unprojected_variants() {
-        // HistoryRestored is handled by the actor (it needs `App` access to
-        // read messages), not by this pure projection.
-        assert!(thread_event_to_json(&ThreadEvent::HistoryRestored, Some("s1")).is_none());
+        // `Retry` is not surfaced on the wire; keep it out of the pure
+        // projection until a host renders provider retries.
+        assert!(
+            thread_event_to_json(
+                &ThreadEvent::Retry {
+                    attempt: 2,
+                    max_attempts: 3,
+                    delay_secs: 5,
+                    reason: "timeout".into(),
+                    detail: None,
+                },
+                Some("s1"),
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn projects_steer_injected() {
+        let json = thread_event_to_json(
+            &ThreadEvent::SteerInjected {
+                message_id: "m1".into(),
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "steer_injected");
+        assert_eq!(v["messageId"], "m1");
+        assert_eq!(v["sessionId"], "s1");
+    }
+
+    #[test]
+    fn projects_turn_finished_stranded_steer_ids() {
+        let json = thread_event_to_json(
+            &ThreadEvent::TurnFinished {
+                cancelled: false,
+                failed: false,
+                stranded_steer_ids: vec!["m1".into(), "m2".into()],
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "turn_finished");
+        assert_eq!(v["cancelled"], false);
+        assert_eq!(v["failed"], false);
+        assert_eq!(v["strandedSteerIds"], json!(["m1", "m2"]));
+        assert_eq!(v["sessionId"], "s1");
     }
 
     #[test]
