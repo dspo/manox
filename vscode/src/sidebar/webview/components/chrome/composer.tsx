@@ -122,6 +122,34 @@ const ApprovalChip = ({
   );
 };
 
+/** Plan-mode toggle chip: a one-click switch next to the approval chip. */
+const PlanChip = ({
+  enabled,
+  disabled,
+  onChange,
+}: {
+  enabled: boolean;
+  disabled: boolean;
+  onChange: (enabled: boolean) => void;
+}) => (
+  <button
+    className={cn(
+      'flex min-w-24 cursor-pointer items-center gap-1.5 rounded-full border border-border px-2 py-1 text-xs transition-colors',
+      enabled ? 'text-info hover:bg-accent' : 'hover:bg-accent text-muted-foreground',
+      disabled && 'pointer-events-none opacity-50',
+    )}
+    disabled={disabled}
+    onClick={() => onChange(!enabled)}
+    title={t('plan_mode')}
+    type="button"
+  >
+    <span>{t('plan')}</span>
+    <span className={cn(enabled ? 'text-info' : 'text-muted-foreground')}>
+      {t(enabled ? 'plan_mode_on' : 'plan_mode_off')}
+    </span>
+  </button>
+);
+
 export type ComposerProps = {
   /** Owning thread; null until a session is established. With an
    * `onCreateSession` callback the composer works as a draft input whose
@@ -132,6 +160,7 @@ export type ComposerProps = {
   models: ModelInfo[];
   currentModelId: string | null;
   approvalMode: ApprovalMode;
+  planMode: boolean;
   commands: CommandEntry[];
   /** Drafted session still waiting for the host's confirmation. */
   creating?: boolean;
@@ -147,6 +176,7 @@ export const Composer = ({
   models,
   currentModelId,
   approvalMode,
+  planMode,
   commands,
   creating = false,
   onCreateSession,
@@ -354,11 +384,18 @@ export const Composer = ({
          * creates one with the host's defaults. Model selection works for
          * drafts too: the choice rides along on creation. */}
         {!draft && (
-          <ApprovalChip
-            disabled={!ready}
-            mode={approvalMode}
-            onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
-          />
+          <div className="flex items-center gap-1.5">
+            <ApprovalChip
+              disabled={!ready}
+              mode={approvalMode}
+              onChange={(m) => sessionId && new ThreadApi(sessionId).setApprovalMode(m)}
+            />
+            <PlanChip
+              disabled={!ready}
+              enabled={planMode}
+              onChange={(enabled) => sessionId && new ThreadApi(sessionId).setPlanMode(enabled)}
+            />
+          </div>
         )}
         <div className="flex items-center gap-2">
           <ModelPicker

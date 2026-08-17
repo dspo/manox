@@ -86,10 +86,10 @@ impl GoalBridge {
         *self.goal.lock().unwrap() = goal;
     }
 
-    fn emit(&self, active: bool) {
+    fn emit(&self, goal: Option<ThreadGoal>) {
         if let Some(tx) = self.notice_tx.lock().unwrap().as_ref() {
             let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::GoalChanged {
-                active,
+                goal,
             })));
         }
     }
@@ -252,11 +252,11 @@ impl GoalBridge {
         match status {
             GoalStatus::Complete => {
                 self.clear(GoalActor::Model)?;
-                self.emit(false);
+                self.emit(self.snapshot());
             }
             GoalStatus::Blocked => {
                 self.set_status(status, reason, GoalActor::Model)?;
-                self.emit(true);
+                self.emit(self.snapshot());
             }
             other => bail!("UpdateGoal cannot report {other:?}"),
         }
@@ -384,7 +384,7 @@ impl AgentTool for CreateGoalTool {
         self.bridge
             .create(input.objective, input.token_budget, GoalActor::Model)
             .map_err(|e| ToolError::ExecutionFailed(format!("{e:#}")))?;
-        self.bridge.emit(true);
+        self.bridge.emit(self.bridge.snapshot());
         Ok(AgentToolResult::text(self.bridge.snapshot_json()))
     }
 }

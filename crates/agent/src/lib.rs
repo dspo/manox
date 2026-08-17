@@ -16,6 +16,7 @@ pub mod file_lock;
 pub mod frontmatter;
 pub mod goal;
 pub mod goal_tools;
+pub mod host;
 pub mod i18n;
 pub mod image;
 pub mod language;
@@ -53,6 +54,7 @@ pub mod thread;
 pub mod thread_engine;
 pub mod thread_store;
 
+pub mod monitor_bridge;
 pub mod pi_approval;
 pub mod pi_engine;
 use gpui::App;

@@ -203,6 +203,21 @@ impl BackgroundManager {
         kill_all_tasks(&self.registry, &self.tasks, &self.event_tx).await;
     }
 
+    /// Kill one task synchronously (user-facing stop). The task's exit path
+    /// emits `Killed` exactly once.
+    pub fn kill(&self, id: &pi::TaskId) {
+        let _ = self.registry.kill_sync(id);
+    }
+
+    /// Poll one task's status, with a bounded tail of its output.
+    pub fn status(
+        &self,
+        id: &pi::TaskId,
+        tail_bytes: usize,
+    ) -> Result<TaskStatusInfo, pi::TaskError> {
+        self.registry.status(id, tail_bytes)
+    }
+
     /// Subscribe to background events; dropping the receiver unsubscribes.
     pub fn subscribe(&self) -> broadcast::Receiver<BackgroundEvent> {
         self.event_tx.subscribe()

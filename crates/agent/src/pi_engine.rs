@@ -1146,10 +1146,23 @@ fn session_builder(
         .with_system_prompt(system_prompt(cwd))
         .with_resources(instruction_resources(cwd))
         .with_tools(tools);
+    // Every session a host creates is tagged with its identity so each
+    // host's session list stays disjoint.
+    builder = builder.with_metadata(serde_json::json!({ "host": crate::host::current().slug() }));
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
     (builder, orchestrators)
+}
+
+/// Adopt the session's own model after a restore: the reopened session
+/// projects its persisted model onto the harness, and the actor's working
+/// model plus the shared slot must follow so `Ready`, the approval
+/// reviewer, and the title scheduler all see the restored choice.
+fn adopt_session_model(session: &AgentSession, pi_model: &mut PiModel, state: &EngineState) {
+    let restored = session.model().clone();
+    *pi_model = restored.clone();
+    *state.model.lock().unwrap() = Some(restored);
 }
 
 /// Register plan-mode extension hooks on a freshly built/restored session:
@@ -1404,10 +1417,15 @@ async fn run_actor(
         None
     } else {
         repo.list().await.ok().and_then(|list| {
+            // Only this host's sessions are eligible for restore; an explicit
+            // path from another host is not restored (fail-closed).
+            let mut list = list
+                .into_iter()
+                .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()));
             if let Some(requested) = &initial_path {
-                return list.into_iter().find(|info| info.path == *requested);
+                return list.find(|info| info.path == *requested);
             }
-            list.into_iter().find(|info| info.message_count > 0)
+            list.find(|info| info.message_count > 0)
         })
     };
     let mut restored = false;
@@ -1431,11 +1449,15 @@ async fn run_actor(
         let meta = load_worktree_state(&sessions_dir, &info.path).await;
         worktree_restored = meta.clone();
         *state.worktree.lock().unwrap() = meta;
+        // The restore path passes no model override: `builder.open()`
+        // projects the session's own model only when the builder carries
+        // none (TS `options.model > restored model`), and the actor adopts
+        // it right after the open below.
         let (builder, orchestrators) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
-            Some(&pi_model),
+            None,
             &state.gate,
             &state.plan,
             &notice_tx,
@@ -1446,9 +1468,16 @@ async fn run_actor(
         match builder.open(info.path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
+                crate::monitor_bridge::spawn(
+                    Arc::clone(&orchestrators.monitor),
+                    Arc::clone(&orchestrators.background),
+                    notice_tx.clone(),
+                    thread_id.clone(),
+                );
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
                 attach_path_policy_hooks(&mut s, &tool_cwd, &state.gate);
                 attach_plugin_hooks(&mut s, &tool_cwd);
+                adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 session = Some(s);
             }
@@ -1482,6 +1511,12 @@ async fn run_actor(
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
+                    crate::monitor_bridge::spawn(
+                        Arc::clone(&orchestrators.monitor),
+                        Arc::clone(&orchestrators.background),
+                        notice_tx.clone(),
+                        thread_id.clone(),
+                    );
                     attach_plan_hooks(&mut s, &state.plan, &cwd);
                     attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                     attach_plugin_hooks(&mut s, &cwd);
@@ -1945,7 +1980,8 @@ async fn run_actor(
                     &path,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -1953,6 +1989,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2038,7 +2075,8 @@ async fn run_actor(
                     &fork_path,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -2046,6 +2084,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2089,7 +2128,8 @@ async fn run_actor(
                     &original,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -2097,6 +2137,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2154,6 +2195,12 @@ async fn run_actor(
                 match builder.with_session_id(thread_id.clone()).build().await {
                     Ok(mut s) => {
                         attach_orchestrators(&mut s, &orchestrators);
+                        crate::monitor_bridge::spawn(
+                            Arc::clone(&orchestrators.monitor),
+                            Arc::clone(&orchestrators.background),
+                            notice_tx.clone(),
+                            thread_id.clone(),
+                        );
                         attach_plan_hooks(&mut s, &state.plan, &cwd);
                         attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                         attach_plugin_hooks(&mut s, &cwd);
@@ -2230,7 +2277,8 @@ async fn rebuild_session(
     path: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: &PiModel,
+    pi_model: &mut PiModel,
+    state: &EngineState,
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     gate: &Arc<ApprovalGate>,
@@ -2238,6 +2286,7 @@ async fn rebuild_session(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    thread_id: &str,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -2259,11 +2308,14 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    // Like the startup restore, a session swap passes no model override so
+    // the opened session's own persisted model wins (TS `options.model >
+    // restored model`); the actor adopts it right after the open.
     let (builder, orchestrators) = session_builder(
         &cwd,
         sessions_dir,
         runtime,
-        Some(model),
+        None,
         gate,
         plan,
         notice_tx,
@@ -2274,12 +2326,19 @@ async fn rebuild_session(
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
+            crate::monitor_bridge::spawn(
+                Arc::clone(&orchestrators.monitor),
+                Arc::clone(&orchestrators.background),
+                notice_tx.clone(),
+                thread_id.to_string(),
+            );
             attach_plan_hooks(&mut s, plan, &cwd);
             // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
             // the same path policy as fresh builds — without it the
             // replaced session loses write confinement entirely.
             attach_path_policy_hooks(&mut s, &cwd, gate);
             attach_plugin_hooks(&mut s, &cwd);
+            adopt_session_model(&s, pi_model, state);
             *session = s;
         }
         Err(err) => {
@@ -3031,7 +3090,10 @@ async fn refresh_session_list(
     let mut out = Vec::new();
     if let Ok(list) = repo.list().await {
         for info in list {
-            out.push(session_info_to_summary(&info));
+            // The mirrored list stays host-scoped like the sidebar's own.
+            if crate::host::belongs_to_current_host(info.metadata.as_ref()) {
+                out.push(session_info_to_summary(&info));
+            }
         }
     }
     *state.sessions.lock().unwrap() = out;
@@ -4227,6 +4289,127 @@ mod tests {
         assert!(
             jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
             "the mid-run switch must persist a model_change entry for the new model"
+        );
+    }
+
+    /// A stream that answers every provider request immediately with a
+    /// terminal assistant message carrying the request's model identity.
+    struct StaticStream;
+
+    #[async_trait::async_trait]
+    impl pi::agent_loop::StreamFn for StaticStream {
+        async fn stream(
+            &self,
+            context: &pi::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<pi::types::AgentEvent>,
+        ) -> Result<pi::types::AgentMessage, anyhow::Error> {
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "ok".into(),
+                    signature: None,
+                }],
+                model: context.model.id.clone(),
+                provider: context.model.provider.clone(),
+                api: context.model.api.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(pi::types::StopReason::Stop),
+                usage: Box::new(pi::types::Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// Restores the two test models from their session references.
+    struct TestModelCatalog;
+
+    impl pi::coding_agent::model_runtime::ModelCatalog for TestModelCatalog {
+        fn resolve(&self, provider: &str, model_id: &str) -> Option<PiModel> {
+            match (provider, model_id) {
+                ("test", "test") => Some(test_model()),
+                ("test", "new") => Some(test_model_switched()),
+                _ => None,
+            }
+        }
+    }
+
+    /// A reopened session must project its own persisted model onto the
+    /// harness: the restore path builds with no model override so
+    /// `builder.open()` restores the session model, and
+    /// `adopt_session_model` mirrors it into the actor's working model and
+    /// the shared slot. Regression for the reopen that showed the default
+    /// model in the composer selector.
+    #[tokio::test]
+    async fn reopened_session_restores_its_own_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let sessions = dir.path().join("sessions");
+        let agent = dir.path().join("agent");
+        tokio::fs::create_dir_all(&sessions).await.unwrap();
+        tokio::fs::create_dir_all(&agent).await.unwrap();
+
+        let resolver: pi::agent_loop::StreamResolver =
+            Arc::new(
+                |_m: &PiModel| Ok(Arc::new(StaticStream) as Arc<dyn pi::agent_loop::StreamFn>),
+            );
+        let runtime = ModelRuntime::new(resolver).with_catalog(Arc::new(TestModelCatalog));
+
+        // Phase 1: a session that ran under `test` and switched to `new`.
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(&sessions)
+            .with_agent_dir(&agent)
+            .with_model_runtime(runtime.clone())
+            .with_model(test_model())
+            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+        let path = session.path().clone();
+        // A prompt materializes the JSONL (the deferred-first contract
+        // writes disk only once an assistant message exists).
+        let _ = session.prompt("first turn").await.unwrap();
+        session.set_model(test_model_switched()).await.unwrap();
+        let jsonl = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
+            "the switch must persist a model_change entry for the new model"
+        );
+        session.close().await.unwrap();
+
+        // Phase 2: the fixed restore path — no model override on the
+        // builder, so `open()` restores the session's own model.
+        let reopened = create_agent_session()
+            .with_agent_dir(&agent)
+            .with_model_runtime(runtime)
+            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_system_prompt("You are a test assistant.")
+            .open(path)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.model().id,
+            "new",
+            "the reopened session must restore its own model, not the default"
+        );
+
+        let state = test_engine_state();
+        let mut pi_model = test_model();
+        adopt_session_model(&reopened, &mut pi_model, &state);
+        assert_eq!(
+            pi_model.id, "new",
+            "the actor's working model follows the restored session"
+        );
+        assert_eq!(
+            state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()),
+            Some("new"),
+            "the shared model slot follows the restored session"
         );
     }
 

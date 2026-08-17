@@ -3,7 +3,12 @@
 // address any live thread; view switching stays inside the webview and never
 // crosses this boundary.
 
-import type { ApprovalMode, ImageAttachment } from '../../../protocol';
+import type {
+  ApprovalMode,
+  GoalAction,
+  ImageAttachment,
+  PlanVerdictChoice,
+} from '../../../protocol';
 import type { HostToWebview, WebviewToHost } from '../../messages';
 
 interface HostApi {
@@ -43,6 +48,12 @@ export class ThreadApi {
     post({ type: 'approve', sessionId: this.sessionId, id, allow });
   }
 
+  /** Resolve an `AskUserQuestion` card: per-question selections (labels
+   * joined by ", ") plus an optional free-form note that overrides them. */
+  answerQuestion(id: string, answers: [string, string][], response: string | null): void {
+    post({ type: 'answer_question', sessionId: this.sessionId, id, answers, response });
+  }
+
   cancel(): void {
     post({ type: 'cancel', sessionId: this.sessionId });
   }
@@ -53,6 +64,28 @@ export class ThreadApi {
 
   setApprovalMode(mode: ApprovalMode): void {
     post({ type: 'set_approval_mode', sessionId: this.sessionId, mode });
+  }
+
+  setPlanMode(enabled: boolean): void {
+    post({ type: 'set_plan_mode', sessionId: this.sessionId, enabled });
+  }
+
+  planVerdict(choice: PlanVerdictChoice): void {
+    post({ type: 'plan_verdict', sessionId: this.sessionId, choice });
+  }
+
+  /** Execute-fresh: the host archives this session and seeds a new one with
+   * the plan (host-side orchestration via `plan_execute_fresh`). */
+  planExecuteFresh(planFile: string, cwd: string): void {
+    post({ type: 'plan_execute_fresh', sessionId: this.sessionId, planFile, cwd });
+  }
+
+  goal(action: GoalAction, objective?: string, budget?: number): void {
+    post({ type: 'goal', sessionId: this.sessionId, action, objective, budget });
+  }
+
+  stopBackgroundTask(taskId: string): void {
+    post({ type: 'stop_background_task', sessionId: this.sessionId, taskId });
   }
 
   requestUsage(): void {

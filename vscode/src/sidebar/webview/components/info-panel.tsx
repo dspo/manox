@@ -15,9 +15,16 @@ import {
   TriangleAlert,
   XCircle,
 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 
-import type { GoalSnapshotWire, ModelInfo, SubagentSnapshot, TokenUsageSnapshot } from '../../../protocol';
+import type {
+  GoalSnapshotWire,
+  ModelInfo,
+  SubagentChildWire,
+  SubagentSnapshot,
+  TokenUsageSnapshot,
+} from '../../../protocol';
+import { ThreadApi } from '../api/client';
 import { apiTint } from '../lib/api-tint';
 import { t } from '../lib/i18n';
 import { formatCost, formatTokens, formatTokensPi } from '../lib/usage-format';
@@ -81,17 +88,84 @@ const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => 
   return <Circle className="text-muted-foreground size-3.5 shrink-0" />;
 };
 
-/** Localized label for the Goal's status enum (serde PascalCase wire form). */
+/** Localized label for the Goal's status enum (serde snake_case wire form). */
 const goalStatusLabel = (status: GoalSnapshotWire['status']): string =>
   t(
     ({
-      Active: 'goal_active',
-      Paused: 'goal_paused',
-      Blocked: 'goal_blocked',
-      BudgetLimited: 'goal_budget_limited',
-      Complete: 'goal_complete',
+      active: 'goal_active',
+      paused: 'goal_paused',
+      blocked: 'goal_blocked',
+      budget_limited: 'goal_budget_limited',
+      complete: 'goal_complete',
     } as const)[status],
   );
+
+/** Small inline actions for the Goal card: pause/resume, clear, edit. */
+const GoalActions = ({ goal, sessionId }: { goal: GoalSnapshotWire; sessionId: string }) => {
+  const api = new ThreadApi(sessionId);
+  const running = goal.status === 'active';
+  const edit = () => {
+    const objective = window.prompt('Objective', goal.objective);
+    if (objective) api.goal('edit', objective, goal.token_budget ?? undefined);
+  };
+  const btn =
+    'text-muted-foreground hover:text-foreground shrink-0 cursor-pointer rounded px-1.5 text-xs';
+  return (
+    <div className="flex gap-1">
+      {running ? (
+        <button className={btn} onClick={() => api.goal('pause')} type="button">
+          {t('goal_pause')}
+        </button>
+      ) : (
+        <button className={btn} onClick={() => api.goal('resume')} type="button">
+          {t('goal_resume')}
+        </button>
+      )}
+      <button className={btn} onClick={edit} type="button">
+        {t('goal_edit')}
+      </button>
+      <button className={btn} onClick={() => api.goal('clear')} type="button">
+        {t('goal_clear')}
+      </button>
+    </div>
+  );
+};
+
+/** One sub-agent's streamed child events (text/thinking deltas, tool
+ * lifecycle) rendered as a collapsible drill-down under the agents list. */
+const SubagentMiniPanel = ({ id, events }: { id: string; events: SubagentChildWire[] }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-0.5">
+      <button
+        className="text-muted-foreground hover:text-foreground cursor-pointer rounded px-1 text-[11px]"
+        onClick={() => setOpen((o) => !o)}
+        type="button"
+      >
+        {open ? t('subagent_hide_activity') : t('subagent_activity')}
+      </button>
+      {open && (
+        <ul className="mt-1 space-y-1 border-l border-border pl-2">
+          {events.length === 0 && (
+            <li className="text-muted-foreground text-[11px]">…</li>
+          )}
+          {events.map((ev, i) => (
+            <li className="text-muted-foreground text-[11px]" key={i}>
+              {ev.kind === 'text' && ev.text}
+              {ev.kind === 'thinking' && <span className="italic">{ev.text}</span>}
+              {(ev.kind === 'tool_start' || ev.kind === 'tool_end') && (
+                <span className="font-code">
+                  {ev.kind === 'tool_start' ? '▶' : '■'} {ev.name}
+                  {ev.kind === 'tool_end' && ev.is_error ? ' ✗' : ''}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+};
 
 /** The main agent's own status, mirroring the host's captain indicator:
  * ship-wheel on success (sub-agents get the plain check) and a red X on a
@@ -209,7 +283,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
           {(info?.agents ?? []).map((agent) => (
             <li className="flex items-start gap-1.5" key={agent.id}>
               <AgentStatusIcon status={agent.status} />
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <p className="truncate font-medium">
                   {agent.agent_type}
                   {agent.description ? ` · ${agent.description}` : ''}
@@ -217,6 +291,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
                 {agent.latest_activity && (
                   <p className="text-muted-foreground truncate">{agent.latest_activity}</p>
                 )}
+                <SubagentMiniPanel id={agent.id} events={thread.subagentChildren[agent.id] ?? []} />
               </div>
             </li>
           ))}
@@ -277,6 +352,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
               {formatTokensPi(info.goal.token_budget)}
             </p>
           )}
+          <GoalActions goal={info.goal} sessionId={thread.sessionId} />
         </Section>
       )}
 

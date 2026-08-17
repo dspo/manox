@@ -600,19 +600,26 @@ impl Sidebar {
                 .children(rows.into_iter().map(|row| {
                     let is_selected = selected == Some(row.id());
                     match row {
-                        SidebarRow::Thread(s) => render_thread_item(
-                            &SidebarThreadItem::from_thread(
-                                &s,
-                                is_selected,
-                                store.read(cx).is_running(&s.id),
-                                store.read(cx).pending_auth_contains(&s.id),
-                                px(16.),
+                        SidebarRow::Thread(s) => {
+                            let store = store.read(cx);
+                            render_thread_item(
+                                &SidebarThreadItem::from_thread(
+                                    &s,
+                                    is_selected,
+                                    ThreadLiveState {
+                                        running: store.is_running(&s.id),
+                                        pending_auth: store.pending_auth_contains(&s.id),
+                                        pending_plan: store.pending_plan_contains(&s.id),
+                                        background_work: store.background_work_contains(&s.id),
+                                    },
+                                    px(16.),
+                                    &theme,
+                                ),
+                                slide,
                                 &theme,
-                            ),
-                            slide,
-                            &theme,
-                            cx,
-                        ),
+                                cx,
+                            )
+                        }
                         SidebarRow::External(s) => render_thread_item(
                             &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
                             slide,
@@ -822,19 +829,29 @@ impl Render for Sidebar {
                                     .children(rows.into_iter().map(|row| {
                                         let is_selected = selected.as_deref() == Some(row.id());
                                         match row {
-                                            SidebarRow::Thread(s) => render_thread_item(
-                                                &SidebarThreadItem::from_thread(
-                                                    &s,
-                                                    is_selected,
-                                                    store.read(cx).is_running(&s.id),
-                                                    store.read(cx).pending_auth_contains(&s.id),
-                                                    px(0.),
+                                            SidebarRow::Thread(s) => {
+                                                let store = store.read(cx);
+                                                render_thread_item(
+                                                    &SidebarThreadItem::from_thread(
+                                                        &s,
+                                                        is_selected,
+                                                        ThreadLiveState {
+                                                            running: store.is_running(&s.id),
+                                                            pending_auth: store
+                                                                .pending_auth_contains(&s.id),
+                                                            pending_plan: store
+                                                                .pending_plan_contains(&s.id),
+                                                            background_work: store
+                                                                .background_work_contains(&s.id),
+                                                        },
+                                                        px(0.),
+                                                        &theme,
+                                                    ),
+                                                    &slide,
                                                     &theme,
-                                                ),
-                                                &slide,
-                                                &theme,
-                                                cx,
-                                            ),
+                                                    cx,
+                                                )
+                                            }
                                             SidebarRow::External(s) => render_thread_item(
                                                 &SidebarThreadItem::from_external(
                                                     &s,
@@ -1019,6 +1036,16 @@ enum RowKind {
     External,
 }
 
+/// Live per-thread state the store tracks for the row's icon: the spin /
+/// blue-static / triangle decision is purely a function of these four flags.
+#[derive(Clone, Copy, Default)]
+struct ThreadLiveState {
+    running: bool,
+    pending_auth: bool,
+    pending_plan: bool,
+    background_work: bool,
+}
+
 /// A UI-layer sidebar row projected from either a manox `ThreadSummary` or an
 /// `ExternalSessionSummary`, so the two render through one layout with a shared
 /// selection-slide animation, id tag, and hover archive action. Only display +
@@ -1041,6 +1068,11 @@ struct SidebarThreadItem {
     /// A tool authorization is parked waiting for the user's verdict (the
     /// thread's card is only visible when it is the active thread).
     pending_auth: bool,
+    /// A plan-review verdict is due; the icon stays blue static, not spinning.
+    pending_plan: bool,
+    /// Live monitors / background bash: the loop can still self-advance even
+    /// with no turn in flight, so the icon keeps spinning.
+    background_work: bool,
     /// A sidecar-restored row with no live process; clicking it resumes the
     /// CLI. Rendered dimmed with a resume hover action.
     resumable: bool,
@@ -1059,8 +1091,7 @@ impl SidebarThreadItem {
     fn from_thread(
         summary: &agent::ThreadSummary,
         selected: bool,
-        running: bool,
-        pending_auth: bool,
+        live: ThreadLiveState,
         indent: gpui::Pixels,
         theme: &Theme,
     ) -> Self {
@@ -1079,8 +1110,10 @@ impl SidebarThreadItem {
             pinned: summary.pinned,
             has_unread: summary.has_unread,
             errored: summary.errored,
-            running,
-            pending_auth,
+            running: live.running,
+            pending_auth: live.pending_auth,
+            pending_plan: live.pending_plan,
+            background_work: live.background_work,
             resumable: false,
             resuming: false,
             selected,
@@ -1135,6 +1168,8 @@ impl SidebarThreadItem {
             errored: false,
             running: false,
             pending_auth: false,
+            pending_plan: false,
+            background_work: false,
             resumable: summary.resumable,
             resuming: summary.resuming,
             selected,
@@ -1179,7 +1214,10 @@ fn render_thread_item(
     let icon = item.icon.clone();
     let open_kind = item.kind.clone();
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
-    let tag_variant = if item.selected || item.running {
+    // The loop can still self-advance (turn in flight, monitors / background
+    // bash alive): the row spins and the id tag stays highlighted.
+    let autonomous = item.running || item.background_work;
+    let tag_variant = if item.selected || autonomous {
         TagVariant::Primary
     } else {
         TagVariant::Secondary
@@ -1245,7 +1283,7 @@ fn render_thread_item(
         });
 
     let tag_wrapper = gpui::div().relative().overflow_hidden().child(tag_button);
-    let tag_element: AnyElement = if item.running {
+    let tag_element: AnyElement = if autonomous {
         let accent = theme.accent;
         tag_wrapper
             .with_animation(
@@ -1270,7 +1308,13 @@ fn render_thread_item(
         tag_wrapper.into_any_element()
     };
 
-    let leading_icon = if item.resuming {
+    let leading_icon = if item.errored {
+        // Abnormal stop: the danger triangle replaces the ship-wheel.
+        Icon::new(IconName::TriangleAlert)
+            .xsmall()
+            .text_color(theme.danger)
+            .into_any_element()
+    } else if item.resuming {
         // A resume is in flight: the loading indicator replaces the idle icon.
         crate::views::braille_spinner::BrailleSpinner::new()
             .xsmall()
@@ -1279,10 +1323,14 @@ fn render_thread_item(
     } else {
         match icon {
             RowIcon::Thread => {
-                // ship-wheel tri-state: black at rest, green and spinning
-                // while the agent runs, blue while a finished turn awaits the
-                // user's view (`has_unread`).
-                let (color, spin) = if item.running {
+                // ship-wheel state machine: green and spinning while the loop
+                // can self-advance, blue static while it waits on the user
+                // (approval / plan verdict / unread finished turn), gray for a
+                // read pause or a never-run thread.
+                let waiting_user = item.pending_auth || item.pending_plan;
+                let (color, spin) = if waiting_user {
+                    (theme.info, false)
+                } else if autonomous {
                     (theme.success, true)
                 } else if item.has_unread {
                     (theme.info, false)
@@ -1352,27 +1400,11 @@ fn render_thread_item(
                         .gap_1()
                         .items_center()
                         .min_w_0()
-                        .when(item.has_unread, |this| {
-                            this.child(
-                                gpui::div()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .rounded_full()
-                                    .bg(theme.info),
-                            )
-                        })
                         .when(item.pinned, |this| {
                             this.child(
                                 Icon::new(IconName::Star)
                                     .xsmall()
                                     .text_color(theme.accent_foreground),
-                            )
-                        })
-                        .when(item.errored, |this| {
-                            this.child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .xsmall()
-                                    .text_color(theme.danger),
                             )
                         })
                         .when(item.pending_auth, |this| {
@@ -1570,8 +1602,13 @@ mod tests {
     fn external_selection_mirrors_thread_selection() {
         let theme = real_theme();
 
-        let thread =
-            SidebarThreadItem::from_thread(&sample_thread(), true, false, false, px(0.), &theme);
+        let thread = SidebarThreadItem::from_thread(
+            &sample_thread(),
+            true,
+            ThreadLiveState::default(),
+            px(0.),
+            &theme,
+        );
         assert!(thread.selected);
         assert_eq!(thread.id, "thread-abcdef12");
         assert_eq!(thread.wash, approval_mode_color(0, &theme));
@@ -1612,8 +1649,13 @@ mod tests {
     #[test]
     fn external_and_thread_rows_share_deselected_state() {
         let theme = real_theme();
-        let thread =
-            SidebarThreadItem::from_thread(&sample_thread(), false, false, false, px(0.), &theme);
+        let thread = SidebarThreadItem::from_thread(
+            &sample_thread(),
+            false,
+            ThreadLiveState::default(),
+            px(0.),
+            &theme,
+        );
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
         assert!(!thread.selected);
         assert!(!external.selected);

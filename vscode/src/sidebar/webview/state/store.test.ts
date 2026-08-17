@@ -594,7 +594,7 @@ describe('plan, goal, and compaction events', () => {
           thread_id: 's',
           goal_id: 'g1',
           objective: 'Ship it',
-          status: 'Active',
+          status: 'active',
           token_budget: 1000,
           tokens_used: 10,
           time_used_seconds: 5,
@@ -604,7 +604,7 @@ describe('plan, goal, and compaction events', () => {
         },
       }),
     );
-    expect(thread(store)?.info?.goal).toMatchObject({ objective: 'Ship it', status: 'Active' });
+    expect(thread(store)?.info?.goal).toMatchObject({ objective: 'Ship it', status: 'active' });
   });
 
   it('renders a live compaction as a transcript recap item', () => {
@@ -763,5 +763,172 @@ describe('Store notifications', () => {
     store.subscribe(() => calls++);
     store.dispatch(event({ type: 'token_usage', sessionId: 's', input: 1, output: 2, cache_creation: 0, cache_read: 0 }));
     expect(calls).toBe(0);
+  });
+});
+
+describe('plan / goal / task folding', () => {
+  const task = (id: string) => ({
+    task_id: id,
+    kind: 'MonitorCommand' as const,
+    owner_thread_id: 's',
+    description: 'watch build',
+    status: 'Running' as const,
+    created_at_ms: 1,
+    ended_at_ms: null,
+    event_count: 1,
+    total_bytes: 4,
+    exit_code: null,
+    failure_summary: null,
+    anchor_message_id: null,
+    output_tail: 'hi',
+  });
+
+  it('plan_ready appends a review card and records pendingPlan', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'plan_ready',
+        sessionId: 's',
+        plan_file: '/tmp/plan.md',
+        title: 'Do things',
+        content: '# Plan',
+      }),
+    );
+    expect(thread(store)?.pendingPlan).toMatchObject({ planFile: '/tmp/plan.md' });
+    expect(thread(store)?.items.some((i) => i.kind === 'plan_review')).toBe(true);
+  });
+
+  it('clearPlanReview removes the card and pending state', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'plan_ready',
+        sessionId: 's',
+        plan_file: '/tmp/plan.md',
+        title: 'Do things',
+      }),
+    );
+    store.clearPlanReview('s');
+    expect(thread(store)?.pendingPlan).toBeNull();
+    expect(thread(store)?.items.some((i) => i.kind === 'plan_review')).toBe(false);
+  });
+
+  it('background_task_updated upserts a task card, then updates it', () => {
+    const store = startSession();
+    store.dispatch(event({ type: 'background_task_updated', sessionId: 's', snapshot: task('t1') }));
+    let card = thread(store)?.items.find((i) => i.kind === 'background_task');
+    expect(card && card.kind === 'background_task' ? card.task.output_tail : null).toBe('hi');
+    expect(thread(store)?.backgroundTasks.t1).toMatchObject({ task_id: 't1' });
+
+    store.dispatch(
+      event({
+        type: 'background_task_updated',
+        sessionId: 's',
+        snapshot: { ...task('t1'), status: 'Completed', output_tail: 'hi\ndone' },
+      }),
+    );
+    const cards = thread(store)?.items.filter((i) => i.kind === 'background_task');
+    expect(cards).toHaveLength(1);
+    // The transcript card is append-once; the live tail rides the map the
+    // render layer reads from.
+    expect(thread(store)?.backgroundTasks.t1.output_tail).toBe('hi\ndone');
+  });
+
+  it('background_task_updated tolerates a missing output_tail (empty-output spawn)', () => {
+    // The first Running snapshot of a fresh monitor has no output yet; the
+    // sender omits the empty tail, so the card must render with an empty
+    // output instead of crashing on a missing field.
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'background_task_updated',
+        sessionId: 's',
+        snapshot: { ...task('t1'), output_tail: undefined },
+      }),
+    );
+    const card = thread(store)?.items.find((i) => i.kind === 'background_task');
+    expect(card && card.kind === 'background_task' ? card.task.output_tail : 'missing').toBeUndefined();
+    expect(thread(store)?.backgroundTasks.t1).toMatchObject({ task_id: 't1' });
+  });
+
+  it('subagent_progress upserts a row on first sighting and updates after', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'subagent_progress',
+        sessionId: 's',
+        id: 'sub1',
+        agent_type: 'Explore',
+        tool_uses: 1,
+        latest_activity: 'reading',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.info?.agents).toHaveLength(1);
+    expect(thread(store)?.info?.agents[0]).toMatchObject({ id: 'sub1', agent_type: 'Explore' });
+
+    store.dispatch(
+      event({
+        type: 'subagent_progress',
+        sessionId: 's',
+        id: 'sub1',
+        agent_type: 'Explore',
+        tool_uses: 2,
+        latest_activity: 'grep',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.info?.agents).toHaveLength(1);
+    expect(thread(store)?.info?.agents[0].tool_uses).toBe(2);
+  });
+
+  it('subagent_child accumulates a bounded stream per agent', () => {
+    const store = startSession();
+    for (let i = 0; i < 5; i++) {
+      store.dispatch(
+        event({ type: 'subagent_child', sessionId: 's', id: 'sub1', event: { kind: 'text', text: `line${i}` } }),
+      );
+    }
+    const stream = thread(store)?.subagentChildren.sub1;
+    expect(stream).toHaveLength(5);
+    expect(stream?.[4]).toMatchObject({ text: 'line4' });
+  });
+
+  it('tool_call_authorization folds AskUserQuestion into an ask_question card', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ask1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Clarify',
+        input: {
+          questions: [
+            { question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] },
+          ],
+        },
+      }),
+    );
+    const item = thread(store)?.items.find((i) => i.kind === 'ask_question');
+    expect(item?.id).toBe('ask1');
+    store.decideApproval('s', 'ask1');
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+  });
+
+  it('tool_call_authorization keeps non-ask tools as approval cards', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ap1',
+        tool_name: 'Bash',
+        summary: 'run it',
+        input: { command: 'ls' },
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'approval' && i.id === 'ap1')).toBe(true);
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
   });
 });

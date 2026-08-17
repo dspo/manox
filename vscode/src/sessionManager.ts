@@ -97,7 +97,7 @@ export class SessionManager {
           'init ready',
           INIT_TIMEOUT_MS,
         );
-        this.send({ cmd: 'init', cwd });
+        this.send({ cmd: 'init', cwd, host: 'vscode' });
         await ready;
       } catch (e) {
         this.initPhase = 'idle';
