@@ -1295,4 +1295,16 @@ describe('tool output tail cap', () => {
     );
     expect(toolCard(store, 't1')?.output).toHaveLength(64_000);
   });
+
+  it('never splits a surrogate pair at the cap boundary', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'emoji', status: 'running' }),
+    );
+    // 64_001 code units: the naive cut lands inside the leading pair.
+    store.dispatch(
+      event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: '😀' + 'a'.repeat(63_999) }),
+    );
+    expect(toolCard(store, 't1')?.output).toBe('a'.repeat(63_999));
+  });
 });

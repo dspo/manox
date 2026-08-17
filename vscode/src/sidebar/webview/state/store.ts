@@ -136,8 +136,15 @@ const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelle
  * long output dominate each transcript diff; the display layer clips well
  * below this cap anyway. */
 const TOOL_OUTPUT_CAP = 64_000;
-const capOutputTail = (text: string): string =>
-  text.length <= TOOL_OUTPUT_CAP ? text : text.slice(-TOOL_OUTPUT_CAP);
+const capOutputTail = (text: string): string => {
+  if (text.length <= TOOL_OUTPUT_CAP) return text;
+  let start = text.length - TOOL_OUTPUT_CAP;
+  // A cut inside a surrogate pair would leave an orphaned half; drop the
+  // pair's trailing half too so the tail stays valid UTF-16.
+  const code = text.charCodeAt(start);
+  if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+  return text.slice(start);
+};
 
 type AskQuestionTranscriptItem = Extract<TranscriptItem, { kind: 'ask_question' }>;
 
@@ -882,7 +889,7 @@ export function wireMessagesToTranscriptItems(messages: WireMessage[]): Transcri
           title:
             existing >= 0 ? (items[existing] as { kind: 'tool'; tool: ToolCallState }).tool.title : name,
           status: result.is_error ? 'failed' : 'completed',
-          output: result.content,
+          output: capOutputTail(result.content),
           isError: result.is_error,
         };
         if (existing >= 0) {

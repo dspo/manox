@@ -109,6 +109,7 @@ describe('sidebar event batching', () => {
   it('posts session_ready before any buffered event of that session', async () => {
     const { provider, posted } = setup();
     await provider.newSession({ sessionId: 's1' });
+    expect(managerMock.sent.at(-1)).toMatchObject({ cmd: 'get_current_model', sessionId: 's1' });
     managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'a' });
     vi.advanceTimersByTime(33);
     expect(posted.map((m) => m.type)).toEqual(['session_ready', 'events']);
