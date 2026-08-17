@@ -41,6 +41,16 @@ pub struct ThreadStore {
     /// only signal until the user switches back). In-memory only: cleared on
     /// attach, on terminal events, and when the run resumes past the call.
     pending_auth: HashSet<String>,
+    /// Threads whose last turn parked on a plan-review verdict awaiting the
+    /// user's choice. Mirrors `pending_auth` (the sidebar shows a static
+    /// icon, not a spinner, while a verdict is due); cleared on verdict,
+    /// terminal events, and error.
+    pending_plan: HashSet<String>,
+    /// Threads with live monitors or background bash: no turn is in flight,
+    /// but the loop can still self-advance on external events. Populated
+    /// from `BackgroundTaskUpdated` via the legacy registry's per-thread
+    /// running-task check.
+    background_work: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, WeakEntity<Thread>>,
     sessions_dir: PathBuf,
@@ -80,6 +90,8 @@ pub fn init(cx: &mut App) {
         known_projects,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
+        pending_plan: HashSet::new(),
+        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
@@ -206,6 +218,47 @@ impl ThreadStore {
         };
         if changed {
             cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
+    }
+
+    /// Whether a thread's turn is parked on a plan-review verdict.
+    pub fn pending_plan_contains(&self, id: &str) -> bool {
+        self.pending_plan.contains(id)
+    }
+
+    /// Mark/unmark a thread as awaiting a plan-review verdict. Same lifecycle
+    /// and event as `mark_pending_auth`: the sidebar's blue static icon (not
+    /// the spinner) signals the wait until the user decides.
+    pub fn mark_pending_plan(&mut self, id: &str, pending: bool, cx: &mut Context<Self>) {
+        let changed = if pending {
+            self.pending_plan.insert(id.to_string())
+        } else {
+            self.pending_plan.remove(id)
+        };
+        if changed {
+            cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
+    }
+
+    /// Whether a thread has live monitors or background bash (the loop can
+    /// still self-advance even with no turn in flight).
+    pub fn background_work_contains(&self, id: &str) -> bool {
+        self.background_work.contains(id)
+    }
+
+    /// Mark/unmark a thread as carrying live background work. Fires
+    /// `RunningChanged` (the spinner-driving event) so the sidebar re-evaluates
+    /// the rotating state without a list rescan.
+    pub fn mark_background_work(&mut self, id: &str, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.background_work.insert(id.to_string())
+        } else {
+            self.background_work.remove(id)
+        };
+        if changed {
+            cx.emit(ThreadStoreEvent::RunningChanged);
             cx.notify();
         }
     }
@@ -475,6 +528,8 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
         db: db.clone(),
         running: HashSet::new(),
         pending_auth: HashSet::new(),
+        pending_plan: HashSet::new(),
+        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
     });
@@ -515,6 +570,8 @@ mod tests {
                 db,
                 running: HashSet::new(),
                 pending_auth: HashSet::new(),
+                pending_plan: HashSet::new(),
+                background_work: HashSet::new(),
                 live_threads: HashMap::new(),
                 sessions_dir: std::env::temp_dir(),
             })
@@ -586,6 +643,97 @@ mod tests {
         });
         assert!(!cx.update(|cx| store.read(cx).pending_auth_contains("t1")));
         assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(sub);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The running-set marker (the sidebar spinner source) toggles per thread
+    /// id, fires `RunningChanged` only on an actual state change, and is
+    /// idempotent under repeated marks — the store contract every host
+    /// subscription (foreground, parked, actor) relies on.
+    #[test]
+    fn mark_running_toggles_marker() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = {
+            let events = std::sync::Arc::clone(&events);
+            cx.update(|cx| {
+                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
+                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t1", cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).is_running("t1")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Idempotent mark: no event, no duplicate work.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t1", cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A second thread marks independently.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t2", cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_idle("t1", cx));
+        });
+        assert!(!cx.update(|cx| store.read(cx).is_running("t1")));
+        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
+        drop(sub);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The plan-review and background-work markers (the blue-static vs
+    /// spinner distinction) toggle per thread id and are idempotent under
+    /// repeated marks.
+    #[test]
+    fn plan_and_background_markers_toggle() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = {
+            let events = std::sync::Arc::clone(&events);
+            cx.update(|cx| {
+                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
+                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
+        assert!(cx.update(|cx| store.read(cx).background_work_contains("t1")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Idempotent marks: no duplicate events.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A second thread marks independently; clearing only removes its own.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t2", true, cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", false, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", false, cx));
+        });
+        assert!(!cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
+        assert!(!cx.update(|cx| store.read(cx).background_work_contains("t1")));
+        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 5);
         drop(sub);
         std::fs::remove_file(path).ok();
     }

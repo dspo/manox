@@ -770,6 +770,11 @@ impl Workspace {
                     // the card (the engine re-emits PlanReady on Ready).
                     this.thread
                         .update(cx, |t, cx| t.set_plan_review_pending(true, cx));
+                    // The sidebar row pauses its spinner (blue static) while
+                    // the verdict is due; `respond_plan_review` releases it.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_plan(&thread_id, true, cx));
                     this.sync_list_count(cx);
                     // The finalized plan surfaces at the tail; reveal it like any
                     // user-initiated jump to the live end.
@@ -786,6 +791,21 @@ impl Workspace {
                     let snapshot = snapshot.clone();
                     this.context_rail
                         .update(cx, |r, cx| r.set_plan(snapshot, cx));
+                }
+                ThreadEvent::BackgroundTaskUpdated { .. } => {
+                    // Live monitors / background bash keep the loop able to
+                    // self-advance; mirror the per-thread running-task check
+                    // into the store so the sidebar keeps the row spinning
+                    // even with no turn in flight.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.mark_background_work(
+                            &thread_id,
+                            agent::background_task::thread_has_running_tasks(&thread_id),
+                            cx,
+                        );
+                    });
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + Danger badge; no conversation item.
@@ -879,7 +899,15 @@ impl Workspace {
                 ThreadEvent::TurnStarted => {
                     // Light up the sidebar running indicator immediately —
                     // before the first streaming delta arrives (model warm-up,
-                    // network latency). Terminal `Stop`/`Error` below clear it.
+                    // network latency). Terminal `TurnFinished`/`Error` below
+                    // clear it. A new turn also supersedes a stale error flag
+                    // from the previous turn.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.mark_running(&thread_id, cx);
+                        s.set_errored(&thread_id, false, cx);
+                    });
                     // Drive the Thinking status row's per-second "for Xs"
                     // counter while this turn is live. The ticker polls
                     // `turn_active` and self-terminates on the terminal stop.
@@ -891,7 +919,6 @@ impl Workspace {
                     failed,
                     stranded_steer_ids,
                 } => {
-                    let _ = failed;
                     // Seal the conversation's streaming state at the
                     // authoritative turn boundary: a turn that ended without
                     // a terminal `Stop` (provider error, stream closed without
@@ -918,6 +945,17 @@ impl Workspace {
                     this.mark_stranded_steers_failed(stranded_steer_ids, cx);
                     let thread_id = this.thread.read(cx).id.0.clone();
                     save_thread(this.thread.clone(), true, cx);
+                    // Sidebar running indicator: the turn released the running
+                    // slot, so the row stops spinning. A successful or
+                    // cancelled turn also supersedes a stale error flag.
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.mark_idle(&thread_id, cx);
+                        s.mark_pending_plan(&thread_id, false, cx);
+                        if !*failed {
+                            s.set_errored(&thread_id, false, cx);
+                        }
+                    });
                     this.turn_active = false;
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -1027,6 +1065,16 @@ impl Workspace {
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(e) = ev {
                         let thread_id = this.thread.read(cx).id.0.clone();
+                        // Sidebar running indicator: the turn aborted, so the
+                        // row stops spinning, flags the error, and surfaces
+                        // the unread state for the failed turn.
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| {
+                            s.mark_idle(&thread_id, cx);
+                            s.mark_pending_plan(&thread_id, false, cx);
+                            s.set_errored(&thread_id, true, cx);
+                            s.set_unread(&thread_id, true, cx);
+                        });
                         this.turn_active = false;
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -1173,6 +1221,13 @@ impl Workspace {
                 ThreadEvent::SteerInjected { message_id } => {
                     this.consume_background_steer(&id, message_id);
                 }
+                ThreadEvent::PlanReady { .. } => {
+                    // A parked thread's engine can re-emit PlanReady on
+                    // restore; the sidebar keeps the blue-static wait visible
+                    // until the verdict lands.
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_pending_plan(&id, true, cx));
+                }
                 ThreadEvent::TurnFinished {
                     cancelled,
                     failed,
@@ -1182,6 +1237,7 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.mark_pending_plan(&id, false, cx);
                         s.mark_pending_auth(&id, false, cx);
                         if !*failed {
                             s.set_errored(&id, false, cx);
@@ -1202,6 +1258,7 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.mark_pending_plan(&id, false, cx);
                         s.mark_pending_auth(&id, false, cx);
                         s.set_errored(&id, true, cx);
                         s.set_unread(&id, true, cx);
@@ -1210,7 +1267,14 @@ impl Workspace {
                 ThreadEvent::BackgroundTaskUpdated { .. } => {
                     save_thread(parked_thread.clone(), false, cx);
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.set_unread(&id, true, cx));
+                    store.update(cx, |s, cx| {
+                        s.mark_background_work(
+                            &id,
+                            agent::background_task::thread_has_running_tasks(&id),
+                            cx,
+                        );
+                        s.set_unread(&id, true, cx);
+                    });
                 }
                 _ => {}
             },
@@ -2539,6 +2603,14 @@ impl Workspace {
             || agent::background_task::thread_has_running_tasks(&old_id))
             && old_id != new_id
         {
+            // Seed the running set for the in-flight turn: the background
+            // subscription below reacts only to future events, so a turn that
+            // started while this thread was foreground would otherwise never
+            // reach the sidebar's running indicator.
+            if old_thread.read(cx).is_running() {
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| s.mark_running(&old_id, cx));
+            }
             let sub = self.subscribe_background_thread(old_thread.clone(), cx);
             self.background_threads.push(BackgroundThread {
                 entity: old_thread,
@@ -4073,9 +4145,13 @@ impl Workspace {
         let Some(review) = self.pending_plan_review.take() else {
             return;
         };
-        // Every verdict consumes the card; clear the persisted pending flag.
+        // Every verdict consumes the card; clear the persisted pending flag
+        // and release the sidebar's plan-wait state. Capture the id before
+        // `ExecuteFresh` swaps in a new thread below.
+        let thread_id = self.thread.read(cx).id.0.clone();
         self.thread
             .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
+        agent::thread_store_global().update(cx, |s, cx| s.mark_pending_plan(&thread_id, false, cx));
         if matches!(choice, PlanReviewChoice::Refine) {
             // Keep plan mode ON: demote the card and prompt for feedback.
             // The feedback turn runs under the plan-mode instructions; the
