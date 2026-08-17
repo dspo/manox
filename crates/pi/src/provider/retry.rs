@@ -34,7 +34,9 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Whether an HTTP status is transient (rate limit, timeout, gateway
 /// errors). Auth (401/403), invalid requests (400/404), and quota/billing
 /// (429 with an error body the API marks terminal) are not — those are
-/// deterministic and must not be retried.
+/// deterministic and must not be retried. The explicit allowlist, rather
+/// than a blanket >=500, keeps deterministic codes (501, 511) from burning
+/// the retry budget.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(
         status,
@@ -323,8 +325,9 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     // reqwest renders request-phase failures as "error sending request for
     // url (...)" and body-phase failures as "error decoding response body";
     // the inner hyper/io cause often renders empty, so the outer text alone
-    // must classify.
-    "error.?sending.?request",
+    // must classify. The "for url" qualifier keeps provider error bodies
+    // that merely mention "error sending request" from classifying.
+    "error.?sending.?request.?for.?url",
     "decoding.?response.?body",
     "ResourceExhausted",
 ];
@@ -676,6 +679,11 @@ mod tests {
                 "{message}"
             );
         }
+        // A provider error body that coincidentally contains reqwest wording
+        // must not classify as retryable.
+        assert!(!is_retryable_assistant_error(&assistant(Some(
+            "http 400: {\"error\":{\"message\":\"error sending request ID is required\"}}"
+        ))));
         // A successful stop or an error without a message is never retried.
         let stop = crate::types::AgentMessage::Assistant {
             content: Vec::new(),
