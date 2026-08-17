@@ -246,6 +246,14 @@ mod tests {
             )]))),
             "bailian:deepseek-v4-flash"
         );
+        // Non-string metadata values fall back to the registration id.
+        assert_eq!(
+            config_id(&model(std::collections::HashMap::from([(
+                "config_id".to_string(),
+                serde_json::json!(42),
+            )]))),
+            "deepseek-v4-flash"
+        );
     }
 
     #[test]

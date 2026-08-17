@@ -4388,6 +4388,9 @@ impl Workspace {
 
     /// Model menu for the pi harness: grouped by provider display name;
     /// each row shows a wire-api Tag and selects through the registry.
+    /// A config model registered through several wire apis appears once
+    /// (first registration wins), matching the sidebar cascade and the
+    /// macOS menu bar.
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
