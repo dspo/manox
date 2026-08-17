@@ -1,24 +1,32 @@
-// Breakpoint layout for the conversation view: columns join as the
-// container widens so each column keeps a non-cramped width.
-export const TWO_COL_BREAKPOINT_PX = 760;
-export const THREE_COL_BREAKPOINT_PX = 1120;
-export const INFO_PANEL_WIDTH_PX = 260;
+// Breakpoint layout for the conversation view: the info card joins the
+// conversation column as the container widens, then the session list.
+// The card breakpoint is the message-content floor plus the card gutter,
+// so the content never drops below the floor in any layout.
+
+// The widths the breakpoints derive from; declared first so the derived
+// constants below can reference them.
+export const INFO_CARD_WIDTH_PX = 260;
+// Right gutter the transcript reserves so messages clear the floating card
+// and its shadow.
+export const INFO_CARD_GUTTER_PX = INFO_CARD_WIDTH_PX + 36;
 export const CONVERSATION_MIN_PX = 480;
-// Chrome beside the conversation column the sash clamp must reserve so the
-// conversation never drops below CONVERSATION_MIN_PX: sash 4px + info column
-// border 1px + info wrapper horizontal padding 16px.
-export const NON_FLEX_OVERHEAD_PX = 21;
+// Sash width the session list leaves beside the conversation column
+// (SidebarSash's w-1).
+export const SASH_PX = 4;
+
+export const INFO_CARD_BREAKPOINT_PX = CONVERSATION_MIN_PX + INFO_CARD_GUTTER_PX;
+export const SESSION_LIST_BREAKPOINT_PX = 1120;
 
 export type ChatLayout = 'conversation' | 'conversation-info' | 'list-conversation-info';
 
 export function chatLayoutForWidth(width: number): ChatLayout {
-  if (width >= THREE_COL_BREAKPOINT_PX) return 'list-conversation-info';
-  if (width >= TWO_COL_BREAKPOINT_PX) return 'conversation-info';
+  if (width >= SESSION_LIST_BREAKPOINT_PX) return 'list-conversation-info';
+  if (width >= INFO_CARD_BREAKPOINT_PX) return 'conversation-info';
   return 'conversation';
 }
 
-/** Widest the session list may grow while the conversation column keeps at
- * least CONVERSATION_MIN_PX in the three-column layout. */
+/** Widest the session list may grow while the message content keeps at
+ * least CONVERSATION_MIN_PX beside the card gutter and the sash. */
 export function maxSessionListWidth(width: number): number {
-  return Math.max(0, width - CONVERSATION_MIN_PX - INFO_PANEL_WIDTH_PX - NON_FLEX_OVERHEAD_PX);
+  return Math.max(0, width - CONVERSATION_MIN_PX - INFO_CARD_GUTTER_PX - SASH_PX);
 }

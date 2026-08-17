@@ -1,7 +1,7 @@
 // Conversation view: header, transcript, error banner, and the composer
 // pinned beneath the transcript. The layout widens in steps with the
-// container: the conversation alone, then the conversation info panel
-// joins as a side column, then the session list joins on the left.
+// container: the conversation alone, then the conversation info card
+// floats over the transcript, then the session list joins on the left.
 
 import { ArrowLeft, Search } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
@@ -9,7 +9,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
-import { chatLayoutForWidth, INFO_PANEL_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
+import { chatLayoutForWidth, INFO_CARD_GUTTER_PX, INFO_CARD_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
 import { collectUserTurns } from '../lib/turn-nav';
 import { useContainerWidth } from '../lib/use-container-width';
 import type { ThreadState } from '../state/bridge';
@@ -115,9 +115,22 @@ export const ConversationView = ({
               items={thread.items}
               lastTurnDurationSec={thread.lastTurnDurationSec}
               models={models}
+              rightInsetPx={layout !== 'conversation' ? INFO_CARD_GUTTER_PX : undefined}
               sessionId={thread.sessionId}
               turnActive={thread.turnActive}
             />
+            {layout !== 'conversation' && (
+              <div
+                className="pointer-events-none absolute inset-y-4 right-4 flex flex-col"
+                style={{ width: INFO_CARD_WIDTH_PX }}
+              >
+                <InfoPanel
+                  className="pointer-events-auto max-h-full overflow-y-auto"
+                  models={models}
+                  thread={thread}
+                />
+              </div>
+            )}
             {navigatorOpen && (
               <div
                 className="absolute inset-0 z-10 flex items-center justify-center bg-background/60"
@@ -144,14 +157,6 @@ export const ConversationView = ({
             turnActive={thread.turnActive}
           />
         </div>
-        {layout !== 'conversation' && (
-          <div
-            className="flex shrink-0 flex-col border-l border-border p-2"
-            style={{ width: INFO_PANEL_WIDTH_PX }}
-          >
-            <InfoPanel className="min-h-0 flex-1 overflow-y-auto" models={models} thread={thread} />
-          </div>
-        )}
       </div>
     </div>
   );
