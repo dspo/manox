@@ -1,10 +1,12 @@
 // User message rendered as a gate frame: a rounded border tinted by the
-// approval mode, opened at bottom center by a background-colored strip.
+// approval mode, opened at bottom center by a background-colored strip. The
+// body renders as markdown, mirroring the gpui host's user-turn rendering.
 
 import type { ApprovalMode } from '../../../../protocol';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import type { TranscriptItem } from '../../state/store';
+import { MarkdownContent } from '../ai/markdown-content';
 import { CopyOnHover } from './copy-on-hover';
 
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -17,6 +19,9 @@ export type UserMessageProps = {
 export const UserMessage = ({ item, approvalMode }: UserMessageProps) => {
   const time = item.timestamp ? timeFormat.format(item.timestamp * 1000) : null;
   const visibleImages = item.images?.filter((img) => img.data) ?? [];
+  // The body is the persisted display form when present (non-empty), else
+  // the full text — the host renders the same priority.
+  const body = item.displayText || item.text;
   return (
     <div
       className={cn(
@@ -41,7 +46,7 @@ export const UserMessage = ({ item, approvalMode }: UserMessageProps) => {
         )}
         <CopyOnHover className="ml-auto" text={item.text} />
       </div>
-      <p className="whitespace-pre-wrap text-sm">{item.displayText ?? item.text}</p>
+      <MarkdownContent content={body} />
       {visibleImages.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-2">
           {visibleImages.map((img, index) => (
