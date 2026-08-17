@@ -1014,7 +1014,9 @@ fn subscribe_thread(
                         s.set_errored(&id, false, cx);
                     });
                 }
-                ThreadEvent::TurnFinished { cancelled, .. } => {
+                ThreadEvent::TurnFinished {
+                    cancelled, failed, ..
+                } => {
                     turn_active.store(false, Ordering::SeqCst);
                     let unread = focused.lock().unwrap().as_deref() != Some(session_id.as_str());
                     let id = session_id.clone();
@@ -1022,6 +1024,14 @@ fn subscribe_thread(
                         s.mark_idle(&id, cx);
                         s.mark_pending_auth(&id, false, cx);
                         s.mark_pending_plan(&id, false, cx);
+                        // A successful finish supersedes a mid-turn error flag:
+                        // the loop can recover (auto-retry, compact-and-retry)
+                        // without a `TurnStarted` in between, so only
+                        // `TurnStarted` and `TurnFinished` may clear it —
+                        // mirroring the gpui host's `TurnFinished` handler.
+                        if !*failed {
+                            s.set_errored(&id, false, cx);
+                        }
                         if unread {
                             s.set_unread(&id, true, cx);
                         }
@@ -2351,6 +2361,183 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A mid-turn stream error (provider hiccup) flags the row errored;
+    /// the loop's auto-retry then completes the same turn without a
+    /// `TurnStarted` in between, so only a successful `TurnFinished` can
+    /// clear the flag — the webview's thread-row state must follow the
+    /// turn's real outcome, mirroring the gpui host's `TurnFinished`
+    /// handler.
+    #[test]
+    fn successful_finish_clears_stale_errored_flag() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/proj");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/proj"));
+        let (out, sink) = collect_sink();
+
+        let snapshot_rows =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+                cx.run_until_parked();
+                out.lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                    .find(|e| e["type"] == "threads_updated")
+                    .and_then(|s| s["threads"].as_array().cloned())
+                    .unwrap_or_default()
+            };
+        let row_errored =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Option<bool> {
+                snapshot_rows(out, cx)
+                    .into_iter()
+                    .find(|t| t["id"] == "s1")
+                    .and_then(|t| t["errored"].as_bool())
+            };
+        let wait_for_errored = |out: &Arc<Mutex<Vec<String>>>,
+                                cx: &mut HeadlessAppContext,
+                                expected: bool,
+                                msg: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let flag = row_errored(out, cx);
+                if flag == Some(expected) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{msg}; last errored flag: {flag:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // The seeded session appears in the list snapshot (the row whose
+        // errored flag the webview renders).
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if snapshot_rows(&out, &mut cx).iter().any(|t| t["id"] == "s1") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "seeded session never appeared in the snapshot"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // A live session drives the wire events that flip the row's flag.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1","cwd":"/proj"}"#,
+        );
+        cx.run_until_parked();
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+
+        // The fresh thread's real engine cannot assemble a session in this
+        // hermetic env (no providers registered) and bails with a Fatal
+        // notice, which also flags the row errored. Drain it before the
+        // assertions so the startup failure cannot race the finish below.
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                if types(&out).contains(&"error".to_string()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the engine's startup error never arrived; types: {:?}",
+                    types(&out)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        wait_for_errored(
+            &out,
+            &mut cx,
+            true,
+            "the startup failure never flagged the row",
+        );
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Event(Box::new(
+                agent::ThreadEvent::Error(anyhow::anyhow!("transient provider failure")),
+            )))
+            .unwrap();
+        wait_for_errored(&out, &mut cx, true, "the error never flagged the row");
+
+        // The auto-retry completes the same turn (no `TurnStarted` in
+        // between): the row must follow the real outcome.
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        wait_for_errored(
+            &out,
+            &mut cx,
+            false,
+            "a successful finish never cleared the errored flag",
+        );
+
+        // A failed finish keeps the flag.
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Event(Box::new(
+                agent::ThreadEvent::Error(anyhow::anyhow!("another failure")),
+            )))
+            .unwrap();
+        wait_for_errored(
+            &out,
+            &mut cx,
+            true,
+            "the second error never flagged the row",
+        );
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: true,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            row_errored(&out, &mut cx),
+            Some(true),
+            "a failed finish must keep the errored flag"
+        );
 
         drop(state);
         agent::thread_store::drop_global_for_test();

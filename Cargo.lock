@@ -5410,6 +5410,7 @@ name = "manox-actor"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "anyhow",
  "async-trait",
  "chrono",
  "gpui",

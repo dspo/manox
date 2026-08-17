@@ -373,6 +373,26 @@ describe('transcript folding', () => {
     store.dispatch(event({ type: 'turn_started', sessionId: 'a' }));
     expect(thread(store, 'a')?.error).toBeNull();
   });
+  it('clears a thread error when its turn finishes successfully after recovery', () => {
+    // A mid-turn provider failure surfaces the error, then the loop's
+    // auto-retry completes the same turn without a new `turn_started` —
+    // the banner and captain icon must follow the successful finish.
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 'a', cancelled: false, failed: false }),
+    );
+    expect(thread(store, 'a')?.error).toBeNull();
+  });
+
+  it('keeps a thread error when its turn finishes failed', () => {
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 'a', cancelled: false, failed: true }),
+    );
+    expect(thread(store, 'a')?.error).toBe('boom');
+  });
 
   it('drops session errors for unknown sessions instead of spawning ghost threads', () => {
     const store = startSession('a');

@@ -17,3 +17,7 @@ async-trait = "0.1"
 chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[dev-dependencies]
+# The thread-subscription tests construct `ThreadEvent::Error` payloads.
+anyhow.workspace = true
