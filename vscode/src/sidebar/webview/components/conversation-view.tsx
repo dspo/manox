@@ -3,13 +3,14 @@
 // container: the conversation alone, then the conversation info panel
 // joins as a side column, then the session list joins on the left.
 
-import { ArrowLeft } from 'lucide-react';
-import { useEffect } from 'react';
+import { ArrowLeft, Search } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
 import { chatLayoutForWidth, INFO_PANEL_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
+import { collectUserTurns } from '../lib/turn-nav';
 import { useContainerWidth } from '../lib/use-container-width';
 import type { ThreadState } from '../state/bridge';
 import { store } from '../state/bridge';
@@ -20,6 +21,7 @@ import { InfoPanel } from './info-panel';
 import { openThread, SessionList } from './session-list';
 import { SidebarSash, SIDEBAR_MIN_PX, useSidebarWidth } from './sidebar-sash';
 import { MessageList } from './transcript/message-list';
+import { TurnNavigator } from './turn-navigator';
 import { Button } from './ui/button';
 
 export type ConversationViewProps = {
@@ -53,6 +55,14 @@ export const ConversationView = ({
     threadApi.requestUsage();
   }, [thread.sessionId]);
 
+  const [navigatorOpen, setNavigatorOpen] = useState(false);
+  const turns = useMemo(() => collectUserTurns(thread.items), [thread.items]);
+
+  const navigateToTurn = (id: string) => {
+    setNavigatorOpen(false);
+    document.getElementById(`turn-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
   const backToList = () => {
     store.backToList();
     api.blurThread();
@@ -66,6 +76,14 @@ export const ConversationView = ({
             <ArrowLeft className="size-4" />
           </Button>
         )}
+        <Button
+          onClick={() => setNavigatorOpen((open) => !open)}
+          size="icon-sm"
+          title={t('turn_navigator_title')}
+          variant="ghost"
+        >
+          <Search className="size-4" />
+        </Button>
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{thread.title}</span>
       </div>
       {thread.planMode && <PlanModeBanner sessionId={thread.sessionId} />}
@@ -95,6 +113,18 @@ export const ConversationView = ({
               sessionId={thread.sessionId}
               turnActive={thread.turnActive}
             />
+            {navigatorOpen && (
+              <div
+                className="absolute inset-0 z-10 flex items-center justify-center bg-background/60"
+                onClick={() => setNavigatorOpen(false)}
+              >
+                <TurnNavigator
+                  onClose={() => setNavigatorOpen(false)}
+                  onNavigate={navigateToTurn}
+                  turns={turns}
+                />
+              </div>
+            )}
           </div>
           <ErrorBanner message={error} />
           <Composer

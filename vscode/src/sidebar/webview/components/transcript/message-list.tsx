@@ -163,7 +163,11 @@ export const MessageList = ({
       }
       nodes.push(renderItem(item));
     }
-    return <div key={group.user?.id ?? `lead-${index}`}>{nodes}</div>;
+    return (
+      <div id={group.user ? `turn-${group.user.id}` : undefined} key={group.user?.id ?? `lead-${index}`}>
+        {nodes}
+      </div>
+    );
   };
 
   return (
