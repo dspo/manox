@@ -87,6 +87,9 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // This binary is the native-app host; the identity must be pinned
+        // before `agent::init` computes host-scoped state.
+        agent::host::set_host(agent::host::Host::ManoxApp);
         agent::init(cx);
         agent_ui::slash_command::init(cx);
         terminal::init(cx);

@@ -395,6 +395,11 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
     };
     let mut out = Vec::new();
     for info in list {
+        // The sidebar renders only the current host's sessions; other hosts'
+        // files stay addressable on disk but never surface here.
+        if !crate::host::belongs_to_current_host(info.metadata.as_ref()) {
+            continue;
+        }
         let meta = pi_extensions::session_meta::load(dir, &info.path)
             .await
             .unwrap_or_default();
