@@ -944,6 +944,14 @@ impl Workspace {
                     this.turn_active = false;
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
+                    // A turn that ended while a plan-review card is still up
+                    // (cancel / abnormal stop) demotes it, mirroring `Error` —
+                    // the verdict is moot once the loop released the turn.
+                    if this.pending_plan_review.take().is_some() {
+                        this.conversation
+                            .update(cx, |c, cx| c.consume_plan_review(cx));
+                        this.list_state.remeasure();
+                    }
                     this.spawn_git_status_refresh(cx);
                     // Dispatch last: `run_turn` emits `TurnStarted`
                     // synchronously, so no terminal bookkeeping above may run
@@ -1068,10 +1076,13 @@ impl Workspace {
                         let thread_id = this.thread.read(cx).id.0.clone();
                         // Sidebar running indicator: the turn aborted, so the
                         // row stops spinning, flags the error, and surfaces
-                        // the unread state for the failed turn.
+                        // the unread state for the failed turn. A dead loop
+                        // can no longer self-advance, so any background-work
+                        // flag is stale and the row goes fully static.
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| {
                             s.mark_idle(&thread_id, cx);
+                            s.mark_background_work(&thread_id, false, cx);
                             s.mark_pending_plan(&thread_id, false, cx);
                             s.set_errored(&thread_id, true, cx);
                             s.set_unread(&thread_id, true, cx);
@@ -1259,6 +1270,7 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.mark_background_work(&id, false, cx);
                         s.mark_pending_plan(&id, false, cx);
                         s.mark_pending_auth(&id, false, cx);
                         s.set_errored(&id, true, cx);
@@ -2604,13 +2616,19 @@ impl Workspace {
             || agent::background_task::thread_has_running_tasks(&old_id))
             && old_id != new_id
         {
-            // Seed the running set for the in-flight turn: the background
-            // subscription below reacts only to future events, so a turn that
-            // started while this thread was foreground would otherwise never
-            // reach the sidebar's running indicator.
+            // Seed the live-state sets for whatever is still in flight: the
+            // background subscription below reacts only to future events, so a
+            // turn that started (or a monitor / task that spawned) while this
+            // thread was foreground would otherwise never reach the sidebar's
+            // running indicator. A task-only thread (no turn) gets the
+            // background-work seed, not the running one.
             if old_thread.read(cx).is_running() {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.mark_running(&old_id, cx));
+            }
+            if agent::background_task::thread_has_running_tasks(&old_id) {
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| s.mark_background_work(&old_id, true, cx));
             }
             let sub = self.subscribe_background_thread(old_thread.clone(), cx);
             self.background_threads.push(BackgroundThread {

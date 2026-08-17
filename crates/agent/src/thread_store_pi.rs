@@ -177,6 +177,7 @@ impl ThreadStore {
     pub fn mark_running(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.running.insert(id.to_string()) {
             cx.emit(ThreadStoreEvent::RunningChanged);
+            cx.notify();
         }
     }
 

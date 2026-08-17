@@ -600,23 +600,26 @@ impl Sidebar {
                 .children(rows.into_iter().map(|row| {
                     let is_selected = selected == Some(row.id());
                     match row {
-                        SidebarRow::Thread(s) => render_thread_item(
-                            &SidebarThreadItem::from_thread(
-                                &s,
-                                is_selected,
-                                ThreadLiveState {
-                                    running: store.read(cx).is_running(&s.id),
-                                    pending_auth: store.read(cx).pending_auth_contains(&s.id),
-                                    pending_plan: store.read(cx).pending_plan_contains(&s.id),
-                                    background_work: store.read(cx).background_work_contains(&s.id),
-                                },
-                                px(16.),
+                        SidebarRow::Thread(s) => {
+                            let store = store.read(cx);
+                            render_thread_item(
+                                &SidebarThreadItem::from_thread(
+                                    &s,
+                                    is_selected,
+                                    ThreadLiveState {
+                                        running: store.is_running(&s.id),
+                                        pending_auth: store.pending_auth_contains(&s.id),
+                                        pending_plan: store.pending_plan_contains(&s.id),
+                                        background_work: store.background_work_contains(&s.id),
+                                    },
+                                    px(16.),
+                                    &theme,
+                                ),
+                                slide,
                                 &theme,
-                            ),
-                            slide,
-                            &theme,
-                            cx,
-                        ),
+                                cx,
+                            )
+                        }
                         SidebarRow::External(s) => render_thread_item(
                             &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
                             slide,
@@ -826,29 +829,29 @@ impl Render for Sidebar {
                                     .children(rows.into_iter().map(|row| {
                                         let is_selected = selected.as_deref() == Some(row.id());
                                         match row {
-                                            SidebarRow::Thread(s) => render_thread_item(
-                                                &SidebarThreadItem::from_thread(
-                                                    &s,
-                                                    is_selected,
-                                                    ThreadLiveState {
-                                                        running: store.read(cx).is_running(&s.id),
-                                                        pending_auth: store
-                                                            .read(cx)
-                                                            .pending_auth_contains(&s.id),
-                                                        pending_plan: store
-                                                            .read(cx)
-                                                            .pending_plan_contains(&s.id),
-                                                        background_work: store
-                                                            .read(cx)
-                                                            .background_work_contains(&s.id),
-                                                    },
-                                                    px(0.),
+                                            SidebarRow::Thread(s) => {
+                                                let store = store.read(cx);
+                                                render_thread_item(
+                                                    &SidebarThreadItem::from_thread(
+                                                        &s,
+                                                        is_selected,
+                                                        ThreadLiveState {
+                                                            running: store.is_running(&s.id),
+                                                            pending_auth: store
+                                                                .pending_auth_contains(&s.id),
+                                                            pending_plan: store
+                                                                .pending_plan_contains(&s.id),
+                                                            background_work: store
+                                                                .background_work_contains(&s.id),
+                                                        },
+                                                        px(0.),
+                                                        &theme,
+                                                    ),
+                                                    &slide,
                                                     &theme,
-                                                ),
-                                                &slide,
-                                                &theme,
-                                                cx,
-                                            ),
+                                                    cx,
+                                                )
+                                            }
                                             SidebarRow::External(s) => render_thread_item(
                                                 &SidebarThreadItem::from_external(
                                                     &s,
