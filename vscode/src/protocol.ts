@@ -40,9 +40,9 @@ export type Command =
 			cmd: 'answer_question';
 			sessionId: string;
 			id: string;
-			/** (question text, selected labels joined by ", " or free-form text). */
+			/** (question text, selected labels joined by ", "). */
 			answers: [string, string][];
-			/** Free-form note that dismisses the whole card; overrides answers. */
+			/** Free-form supplemental note; rides alongside the selections. */
 			response: string | null;
 	  };
 

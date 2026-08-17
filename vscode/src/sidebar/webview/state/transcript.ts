@@ -74,4 +74,14 @@ export type TranscriptItem =
       content: string;
     }
   | { kind: 'background_task'; id: string; task: BackgroundTaskSnapshotWire }
-  | { kind: 'ask_question'; id: string; summary: string; input: unknown };
+  | {
+      kind: 'ask_question';
+      id: string;
+      summary: string;
+      input: unknown;
+      /** Set once the user answers or cancels; the drawer hides and the
+       * card morphs into the answered state fed by `tool_result`. */
+      answered?: boolean;
+      output?: string;
+      isError?: boolean;
+    };

@@ -49,7 +49,7 @@ export class ThreadApi {
   }
 
   /** Resolve an `AskUserQuestion` card: per-question selections (labels
-   * joined by ", ") plus an optional free-form note that overrides them. */
+   * joined by ", ") plus an optional free-form supplemental note. */
   answerQuestion(id: string, answers: [string, string][], response: string | null): void {
     post({ type: 'answer_question', sessionId: this.sessionId, id, answers, response });
   }

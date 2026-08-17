@@ -127,6 +127,8 @@ const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
 
 const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelled', 'continued']);
 
+type AskQuestionTranscriptItem = Extract<TranscriptItem, { kind: 'ask_question' }>;
+
 let echoCounter = 0;
 
 export class Store {
@@ -204,14 +206,31 @@ export class Store {
     );
   }
 
-  /** Drop a pending authorization card (approval or AskUserQuestion) from
-   * the transcript; the caller posts the actual verdict to the host. */
+  /** Drop a pending approval card from the transcript; the caller posts the
+   * actual verdict to the host. (AskUserQuestion cards morph via
+   * `respondAsk` instead of being dropped.) */
   decideApproval(sessionId: string, id: string): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
         items: t.items.filter(
           (i) => !((i.kind === 'approval' || i.kind === 'ask_question') && i.id === id),
+        ),
+      })),
+    );
+  }
+
+  /** Mark an `AskUserQuestion` card answered (submit or cancel path); the
+   * caller posts the actual verdict. The card stays and morphs into the
+   * answered state fed by the completion events, mirroring the native
+   * drawer — dropping it would lose the human title and strand the result
+   * in a code-named tool item. */
+  respondAsk(sessionId: string, id: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'ask_question' && i.id === id ? { ...i, answered: true } : i,
         ),
       })),
     );
@@ -380,12 +399,29 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
     case 'agent_thinking':
       return appendThinkingText(t, ev.text);
     case 'tool_call':
+      // AskUserQuestion owns a single surface: the interactive card while
+      // pending (no generic tool item beside it) that morphs into the
+      // answered card once the completion call lands. Non-ask tools keep the
+      // ordinary tool-item lifecycle.
+      if (ev.name === 'AskUserQuestion') {
+        const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+        if (askIdx !== -1) {
+          if (ev.status === 'pending-approval') return t;
+          const items = t.items.slice();
+          items[askIdx] = { ...(items[askIdx] as AskQuestionTranscriptItem), answered: true };
+          return { ...t, items };
+        }
+        if (ev.status === 'pending-approval') return t;
+      }
       return upsertToolItem(t, ev.id, (prev) => {
         const status = foldToolStatus(ev.status);
         return {
           id: ev.id,
           name: ev.name,
-          title: ev.title || prev?.title || ev.name,
+          // The engine replays `title: tool_name` on the completion call;
+          // keep the human title (command line, path, question label) that
+          // the start call carried instead of degrading to the code name.
+          title: prev?.title && ev.title === ev.name ? prev.title : (ev.title || prev?.title || ev.name),
           status,
           output: prev?.output ?? '',
           isError: status === 'failed' ? true : (prev?.isError ?? false),
@@ -401,6 +437,20 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         isError: prev?.isError ?? false,
       }));
     case 'tool_result':
+      // An answered AskUserQuestion card absorbs its own result in place
+      // (the morph keeps the card's human title); everything else feeds the
+      // ordinary tool item.
+      const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+      if (askIdx !== -1) {
+        const items = t.items.slice();
+        items[askIdx] = {
+          ...(items[askIdx] as AskQuestionTranscriptItem),
+          answered: true,
+          output: ev.output,
+          isError: ev.is_error,
+        };
+        return { ...t, items };
+      }
       return upsertToolItem(t, ev.id, (prev) => ({
         id: ev.id,
         name: prev?.name ?? '',
