@@ -234,6 +234,8 @@ describe('listThreads', () => {
           unread: true,
           errored: false,
           pending_auth: false,
+          pending_plan: false,
+          background_work: false,
           pinned: false,
           archived: false,
           model_id: 'm',

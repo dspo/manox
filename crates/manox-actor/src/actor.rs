@@ -877,9 +877,9 @@ fn emit_persisted_approval_mode(mode: ApprovalMode, session_id: &str, sink: &Eve
 
 /// Shared `ThreadEvent` subscription for fresh and restored sessions alike.
 /// Beyond projecting events onto the wire it maintains the thread-store list
-/// bookkeeping (running / unread / pending-auth / errored), aggregates
-/// sub-agent progress for the info panel, and answers `HistoryRestored` with
-/// a full history snapshot.
+/// bookkeeping (running / unread / pending-auth / pending-plan / errored /
+/// background-work), aggregates sub-agent progress for the info panel, and
+/// answers `HistoryRestored` with a full history snapshot.
 #[allow(clippy::too_many_arguments)] // subscription setup: each input is a distinct owner/handle
 fn subscribe_thread(
     app: &mut App,
@@ -910,6 +910,7 @@ fn subscribe_thread(
                     agent::thread_store::global().update(app, |s, cx| {
                         s.mark_idle(&id, cx);
                         s.mark_pending_auth(&id, false, cx);
+                        s.mark_pending_plan(&id, false, cx);
                         if unread {
                             s.set_unread(&id, true, cx);
                         }
@@ -922,7 +923,11 @@ fn subscribe_thread(
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
-                    agent::thread_store::global().update(app, |s, cx| s.set_errored(&id, true, cx));
+                    agent::thread_store::global().update(app, |s, cx| {
+                        s.set_errored(&id, true, cx);
+                        s.mark_pending_plan(&id, false, cx);
+                        s.mark_background_work(&id, false, cx);
+                    });
                 }
                 ThreadEvent::SubagentStarted {
                     id,
@@ -995,6 +1000,11 @@ fn subscribe_thread(
                     *pending_plan.lock().unwrap() = Some(PendingPlan {
                         plan_file: plan_file.clone(),
                     });
+                    // Mirror the gpui host's sidebar bookkeeping: the thread
+                    // row shows the blue-static wait until the verdict lands.
+                    let id = session_id.clone();
+                    agent::thread_store::global()
+                        .update(app, |s, cx| s.mark_pending_plan(&id, true, cx));
                     // Persist the pending verdict (sidecar) so a restarted
                     // session re-surfaces the card — the engine re-emits
                     // `PlanReady` on Ready only when this flag is recorded.
@@ -1015,6 +1025,20 @@ fn subscribe_thread(
                         })
                         .to_string(),
                     );
+                }
+                ThreadEvent::BackgroundTaskUpdated { .. } => {
+                    // Live monitors / background bash keep the loop able to
+                    // self-advance; mirror the gpui host's per-thread
+                    // running-task check so the row keeps spinning even with
+                    // no turn in flight.
+                    let id = session_id.clone();
+                    agent::thread_store::global().update(app, |s, cx| {
+                        s.mark_background_work(
+                            &id,
+                            agent::background_task::thread_has_running_tasks(&id),
+                            cx,
+                        );
+                    });
                 }
                 _ => {}
             }
@@ -1125,6 +1149,8 @@ fn threads_snapshot(
                 "unread": s.has_unread,
                 "errored": s.errored,
                 "pending_auth": store.pending_auth_contains(&s.id),
+                "pending_plan": store.pending_plan_contains(&s.id),
+                "background_work": store.background_work_contains(&s.id),
                 "model_id": s.model_id,
                 "pinned": s.pinned,
                 "archived": s.archived,
@@ -2083,6 +2109,90 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "archive/pin flags never settled in the snapshot; last rows: {rows:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Live-state flags the gpui sidebar mirrors — `pending_plan` (blue-static
+    /// wait for the review verdict) and `background_work` (row spins while
+    /// monitors / background bash are alive) — must ride the same
+    /// `threads_updated` rows so the VS Code surface renders the same state
+    /// machine.
+    #[test]
+    fn threads_snapshot_carries_pending_plan_and_background_work() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "live-flags", "/live/flags/project");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/live/flags/project"));
+        let (out, sink) = collect_sink();
+
+        let latest_rows = |cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids: Vec<String> = latest_rows(&mut cx)
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids.iter().any(|id| id == "live-flags") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Flag the store the way the actor's subscription does on PlanReady /
+        // BackgroundTaskUpdated; each write emits a store event that pushes a
+        // fresh snapshot through the subscription.
+        cx.update(|app| {
+            agent::thread_store::global().update(app, |s, cx| {
+                s.mark_pending_plan("live-flags", true, cx);
+                s.mark_background_work("live-flags", true, cx);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = latest_rows(&mut cx)
+                .into_iter()
+                .find(|t| t["id"] == "live-flags");
+            let flagged = row.is_some_and(|t| {
+                t["pending_plan"].as_bool() == Some(true)
+                    && t["background_work"].as_bool() == Some(true)
+            });
+            if flagged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live-state flags never reached the snapshot"
             );
             thread::sleep(Duration::from_millis(10));
         }

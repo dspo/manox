@@ -79,6 +79,7 @@ plan-verdict-execute-keep = Approve and keep context
 plan-verdict-refine = Refine plan
 plan-refine-notice = Plan mode stays on — type your feedback; the model updates the plan file and proposes again.
 plan-chip-label = Plan mode
+plan-chip-exit-tooltip = Exit plan mode
 plan-mode-on-notice = Plan mode on: the working tree is read-only; the model researches, writes the plan file, and submits it for your approval via ProposePlan.
 plan-mode-off-notice = Plan mode off: full write access restored.
 thinking-tool-result = tool result

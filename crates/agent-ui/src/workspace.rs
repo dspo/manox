@@ -46,7 +46,7 @@ use gpui_component::{
 };
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
-use gpui_component::{WindowExt as _, notification::Notification};
+use gpui_component::{WindowExt as _, notification::Notification, tooltip::Tooltip};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 
@@ -5228,7 +5228,9 @@ impl Workspace {
     }
 
     /// Plan-mode indicator chip: visible while the session plans (read-only
-    /// research + plan-file writes), so the state is never silent.
+    /// research + plan-file writes), so the state is never silent. Clicking
+    /// it leaves plan mode — the escape hatch when a review card is missed
+    /// or the model stalls in research.
     fn render_plan_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.thread.read(cx).plan_mode() {
             return None;
@@ -5242,6 +5244,15 @@ impl Workspace {
                 .py_1()
                 .rounded(theme.radius)
                 .bg(theme.warning.opacity(0.12))
+                .hover(|s| s.bg(theme.warning.opacity(0.22)))
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    Tooltip::new(i18n::t("plan-chip-exit-tooltip")).build(window, cx)
+                })
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.set_thread_plan_mode(false, cx);
+                    this.add_info_message(i18n::t("plan-mode-off-notice").to_string(), cx);
+                }))
                 .child(
                     Icon::new(IconName::LayoutDashboard)
                         .xsmall()

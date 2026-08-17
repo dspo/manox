@@ -14,6 +14,8 @@ const item = (partial: Partial<ThreadListItem>): ThreadListItem => ({
   unread: false,
   errored: false,
   pending_auth: false,
+  pending_plan: false,
+  background_work: false,
   model_id: 'm',
   pinned: false,
   archived: false,
