@@ -623,7 +623,10 @@ fn handle_command(
         }),
         "plan_verdict" => with_session(state, session_id.as_deref(), sink, |session, sink| {
             let choice = cmd["choice"].as_str().unwrap_or_default();
-            let pending = session.pending_plan.lock().unwrap().as_ref().cloned();
+            // Consume the pending review on every verdict (mirrors the gpui
+            // host's `take`): refine keeps plan mode on, but a later verdict
+            // without a fresh ProposePlan must not seed execution again.
+            let pending = session.pending_plan.lock().unwrap().take();
             let Some(pending) = pending else {
                 sink.emit(error_json(session_id.as_deref(), "no pending plan review"));
                 return;
@@ -972,6 +975,14 @@ fn subscribe_thread(
                     *pending_plan.lock().unwrap() = Some(PendingPlan {
                         plan_file: plan_file.clone(),
                     });
+                    // Persist the pending verdict (sidecar) so a restarted
+                    // session re-surfaces the card — the engine re-emits
+                    // `PlanReady` on Ready only when this flag is recorded.
+                    // The gpui host mirrors the same call on its review card;
+                    // without it a session torn down before the verdict
+                    // (webview/window reload, chat-participant handoff) is
+                    // left in plan mode with no review card to resolve.
+                    entity.update(app, |t, cx| t.set_plan_review_pending(true, cx));
                     let content = std::fs::read_to_string(plan_file).unwrap_or_default();
                     let id = session_id.clone();
                     sink.emit(
@@ -2489,6 +2500,81 @@ mod tests {
             &mut cx,
             &mut state,
             &sink_for(&out),
+            r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn plan_ready_emits_review_card_and_records_the_pending_verdict() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        // A proposed plan surfaces as the enriched wire event the sidebar's
+        // review card renders from.
+        let dir = std::env::temp_dir().join(format!("manox-plan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan_file = dir.join("audit-plan.md");
+        std::fs::write(&plan_file, "# Audit\n\nsteps").unwrap();
+        let plan_file = plan_file.to_string_lossy().to_string();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |_t, cx| {
+                cx.emit(agent::ThreadEvent::PlanReady {
+                    plan_file: plan_file.clone(),
+                    title: "Audit".into(),
+                });
+            });
+        });
+        cx.run_until_parked();
+        let ready = out
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .find(|v| v["type"] == "plan_ready")
+            .expect("plan_ready wire event");
+        assert_eq!(ready["sessionId"], "s1");
+        assert_eq!(ready["plan_file"], plan_file.as_str());
+        assert_eq!(ready["title"], "Audit");
+        assert_eq!(ready["content"], "# Audit\n\nsteps");
+
+        // The recorded pending plan makes a verdict succeed (refine keeps
+        // plan mode on and consumes the card).
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"plan_verdict","sessionId":"s1","choice":"refine"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!out.lock().unwrap().iter().any(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
+                == "no pending plan review"
+        }));
+        // A second verdict now has nothing to consume.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"plan_verdict","sessionId":"s1","choice":"refine"}"#,
+        );
+        cx.run_until_parked();
+        assert!(out.lock().unwrap().iter().any(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
+                == "no pending plan review"
+        }));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
             r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
         );
         cx.run_until_parked();

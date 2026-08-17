@@ -14,6 +14,7 @@ import { useContainerWidth } from '../lib/use-container-width';
 import type { ThreadState } from '../state/bridge';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
+import { PlanModeBanner } from './chrome/plan-mode-banner';
 import { ErrorBanner } from './chrome/error-banner';
 import { InfoPanel } from './info-panel';
 import { MessageList } from './transcript/message-list';
@@ -57,6 +58,7 @@ export const ConversationView = ({ thread, models, commands, error }: Conversati
         </Button>
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{thread.title}</span>
       </div>
+      {thread.planMode && <PlanModeBanner sessionId={thread.sessionId} />}
       <div className="relative flex min-h-0 flex-1 flex-col">
         <MessageList
           approvalMode={thread.approvalMode}

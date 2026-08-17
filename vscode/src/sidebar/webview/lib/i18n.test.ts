@@ -34,6 +34,15 @@ describe('i18n', () => {
     expect(t('conversation_info')).toBe('Conversation info');
   });
 
+  it('localizes the plan-mode banner in both locales', () => {
+    setLanguageForTest('zh-cn');
+    expect(t('plan_mode_banner')).toBe('计划模式已开启');
+    expect(t('plan_mode_exit')).toBe('退出计划模式');
+    setLanguageForTest('en');
+    expect(t('plan_mode_banner')).toBe('Plan mode is on');
+    expect(t('plan_mode_exit')).toBe('Exit plan mode');
+  });
+
   it('degrades unknown keys to the raw key instead of throwing', () => {
     // Wire-driven lookups can name keys this build never shipped; the
     // render tree must survive them.
