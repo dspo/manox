@@ -1972,7 +1972,8 @@ async fn run_actor(
                     &path,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -2066,7 +2067,8 @@ async fn run_actor(
                     &fork_path,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -2118,7 +2120,8 @@ async fn run_actor(
                     &original,
                     &sessions_dir,
                     &runtime,
-                    &pi_model,
+                    &mut pi_model,
+                    &state,
                     &cwd,
                     &notice_tx,
                     &state.gate,
@@ -2266,7 +2269,8 @@ async fn rebuild_session(
     path: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: &PiModel,
+    pi_model: &mut PiModel,
+    state: &EngineState,
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     gate: &Arc<ApprovalGate>,
@@ -2296,11 +2300,14 @@ async fn rebuild_session(
             }
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
+    // Like the startup restore, a session swap passes no model override so
+    // the opened session's own persisted model wins (TS `options.model >
+    // restored model`); the actor adopts it right after the open.
     let (builder, orchestrators) = session_builder(
         &cwd,
         sessions_dir,
         runtime,
-        Some(model),
+        None,
         gate,
         plan,
         notice_tx,
@@ -2323,6 +2330,7 @@ async fn rebuild_session(
             // replaced session loses write confinement entirely.
             attach_path_policy_hooks(&mut s, &cwd, gate);
             attach_plugin_hooks(&mut s, &cwd);
+            adopt_session_model(&s, pi_model, state);
             *session = s;
         }
         Err(err) => {
