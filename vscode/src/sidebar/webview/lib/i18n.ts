@@ -141,9 +141,11 @@ const DICT = {
   ask_recommended: { en: 'recommended', zh: '推荐' },
   ask_cancel: { en: 'Cancel', zh: '取消' },
   ask_submit: { en: 'Submit', zh: '提交' },
+  ask_prev_question: { en: 'Previous question', zh: '上一个问题' },
+  ask_next_question: { en: 'Next question', zh: '下一个问题' },
   ask_note_placeholder: {
-    en: 'Optional note (overrides the selections)…',
-    zh: '可选补充说明（将覆盖所选选项）…',
+    en: 'Add optional context…',
+    zh: '添加可选补充说明…',
   },
 } satisfies Record<string, Entry>;
 

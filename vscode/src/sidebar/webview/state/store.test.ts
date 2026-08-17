@@ -916,6 +916,187 @@ describe('plan / goal / task folding', () => {
     expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
   });
 
+  it('AskUserQuestion real event flow keeps a single surface and morphs the card', () => {
+    const store = startSession();
+    // The kernel emits the start call (running, code-name title) before the
+    // tool's own execute() runs; neither the start call nor the
+    // pending-approval marker may spawn a generic tool card — the
+    // authorization card is the single surface for the whole lifecycle.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'AskUserQuestion',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'Clarifying question',
+        status: 'pending-approval',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ask1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Clarifying question',
+        input: {
+          questions: [
+            { question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] },
+          ],
+        },
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question' && i.id === 'ask1')).toBe(true);
+
+    // The user answers; the completion events morph the card in place.
+    store.respondAsk('s', 'ask1');
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'AskUserQuestion',
+        status: 'success',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_result',
+        sessionId: 's',
+        id: 'ask1',
+        output: 'Question: Which one?\nAnswer: A',
+        is_error: false,
+      }),
+    );
+    const items = thread(store)?.items ?? [];
+    const ask = items.find((i) => i.kind === 'ask_question');
+    expect(items.some((i) => i.kind === 'tool')).toBe(false);
+    expect(ask && ask.kind === 'ask_question' ? ask.answered : false).toBe(true);
+    expect(ask && ask.kind === 'ask_question' ? ask.output : undefined).toBe(
+      'Question: Which one?\nAnswer: A',
+    );
+  });
+
+  it('escalation restore hands the id back to the real tool item', () => {
+    const store = startSession();
+    // The real tool starts normally; the gate then re-brands the same id as
+    // an AskUserQuestion escalation card.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: '$ ls',
+        status: 'running',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'AskUserQuestion',
+        title: '$ ls',
+        status: 'pending-approval',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 't1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Approval required',
+        input: {
+          questions: [
+            {
+              question: 'reviewer needs a verdict',
+              options: [{ label: 'Allow once' }, { label: 'Always allow' }, { label: 'Deny' }],
+            },
+          ],
+        },
+      }),
+    );
+    store.respondAsk('s', 't1');
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(true);
+
+    // The gate's restore event hands the id back to the real tool: the
+    // question card is dropped so the Bash item owns completion + result.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: '$ ls',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: 'Bash',
+        status: 'success',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_result',
+        sessionId: 's',
+        id: 't1',
+        output: 'total 0',
+        is_error: false,
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
+    expect(toolCard(store, 't1')?.output).toBe('total 0');
+  });
+
+  it('tool completion keeps the human title over the replayed tool name', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'bash',
+        title: '$ ls -la',
+        status: 'running',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'bash',
+        title: 'bash',
+        status: 'success',
+      }),
+    );
+    expect(toolCard(store, 't1')?.title).toBe('$ ls -la');
+  });
+
   it('tool_call_authorization keeps non-ask tools as approval cards', () => {
     const store = startSession();
     store.dispatch(
