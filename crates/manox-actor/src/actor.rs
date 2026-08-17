@@ -735,6 +735,26 @@ fn handle_command(
                 None => sink.emit(error_json(session_id.as_deref(), "unknown model")),
             }
         }),
+        "set_reasoning_effort" => {
+            with_session(state, session_id.as_deref(), sink, |session, sink| {
+                let effort = match cmd["effort"].as_str() {
+                    Some("high") => agent::language_model::ReasoningEffort::High,
+                    Some("max") => agent::language_model::ReasoningEffort::Max,
+                    _ => {
+                        sink.emit(error_json(
+                            session_id.as_deref(),
+                            "set_reasoning_effort requires effort: high|max",
+                        ));
+                        return;
+                    }
+                };
+                cx.update(|app| {
+                    session
+                        .thread
+                        .update(app, |t, cx| t.set_reasoning_effort(effort, cx));
+                });
+            })
+        }
         "get_current_model" => with_session(state, session_id.as_deref(), sink, |session, sink| {
             let model = cx.update(|app| session.thread.read(app).model().cloned());
             let json = match model {
@@ -1060,6 +1080,7 @@ fn emit_thread_info(
             "type": "thread_info",
             "sessionId": session_id,
             "info": {
+                "reasoning_effort": t.reasoning_effort().wire_value(),
                 "worktree_path": worktree_path,
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
                 "goal": serde_json::to_value(t.goal()).unwrap_or(Value::Null),
@@ -1531,6 +1552,77 @@ mod tests {
         assert!(types(&out).contains(&"session_disposed".to_string()));
         // Release every thread handle before the context drops so the gpui
         // leak detector sees a clean entity map.
+        drop(state);
+    }
+
+    #[test]
+    fn set_reasoning_effort_routes_and_rejects_invalid() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let mut state = state_with(PathBuf::from("/"));
+        let (out, sink) = collect_sink();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"set_reasoning_effort","sessionId":"s1","effort":"max"}"#,
+        );
+        cx.run_until_parked();
+        let events: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "reasoning_effort_changed")
+            .map(|v| v["effort"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(events, vec!["max".to_string()]);
+        let thread_effort = cx.update(|app| {
+            state
+                .sessions
+                .get("s1")
+                .map(|s| s.thread.read(app).reasoning_effort())
+        });
+        assert_eq!(
+            thread_effort,
+            Some(agent::language_model::ReasoningEffort::Max)
+        );
+
+        // An unparseable effort surfaces as an error event and leaves the
+        // thread's effort untouched.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"set_reasoning_effort","sessionId":"s1","effort":"turbo"}"#,
+        );
+        let errors: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "error")
+            .map(|v| v["message"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("set_reasoning_effort requires effort")),
+            "{errors:?}"
+        );
+
         drop(state);
     }
 

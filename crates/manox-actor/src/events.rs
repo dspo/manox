@@ -8,14 +8,14 @@
 //! Variants intentionally not projected (silently dropped; surface them here
 //! when the host grows the matching UI): `ApprovalDecision`, `Retry`,
 //! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
-//! `MainCallMetricsUpdated`, `ReasoningEffortChanged`, `CompactionStarted`,
-//! `PeerMessage`, `SteerInjected`, `BrowserNotification`,
-//! `InboundAuthorization`, `HistoryRestored`. `HistoryRestored` stays out of
-//! this pure projection: the actor pairs it with a full `thread_history`
-//! snapshot that needs `App` access to read the thread's messages.
-//! `GoalChanged` likewise pairs with a rich `goal_changed` snapshot emitted by
-//! the actor's subscription. `BackgroundTaskUpdated` and `SubagentChild` are
-//! projected here (the mini-panel and task cards consume them).
+//! `MainCallMetricsUpdated`, `CompactionStarted`, `PeerMessage`,
+//! `SteerInjected`, `BrowserNotification`, `InboundAuthorization`,
+//! `HistoryRestored`. `HistoryRestored` stays out of this pure projection:
+//! the actor pairs it with a full `thread_history` snapshot that needs `App`
+//! access to read the thread's messages. `GoalChanged` likewise pairs with a
+//! rich `goal_changed` snapshot emitted by the actor's subscription.
+//! `BackgroundTaskUpdated` and `SubagentChild` are projected here (the
+//! mini-panel and task cards consume them).
 
 use agent::{ThreadEvent, ToolCallStatus};
 use serde_json::{Value, json};
@@ -74,6 +74,9 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
         } => json!({"type": "turn_finished", "cancelled": cancelled, "failed": failed}),
         ThreadEvent::ModelChanged { from, to } => {
             json!({"type": "model_changed", "from": from, "to": to})
+        }
+        ThreadEvent::ReasoningEffortChanged { effort } => {
+            json!({"type": "reasoning_effort_changed", "effort": effort.wire_value()})
         }
         ThreadEvent::ApprovalModeChanged { mode } => {
             json!({"type": "approval_mode_changed", "mode": mode})
@@ -192,6 +195,21 @@ mod tests {
         assert_eq!(v["type"], "model_changed");
         assert_eq!(v["from"], "a");
         assert_eq!(v["to"], "b");
+    }
+
+    #[test]
+    fn projects_reasoning_effort_changed() {
+        let json = thread_event_to_json(
+            &ThreadEvent::ReasoningEffortChanged {
+                effort: agent::language_model::ReasoningEffort::Max,
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "reasoning_effort_changed");
+        assert_eq!(v["effort"], "max");
+        assert_eq!(v["sessionId"], "s1");
     }
 
     #[test]
