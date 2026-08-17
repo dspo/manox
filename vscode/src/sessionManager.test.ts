@@ -182,12 +182,14 @@ describe('listModels', () => {
     ]);
   });
 
-  it('rejects after the response timeout', async () => {
+  it('rejects after the registration budget', async () => {
     vi.useFakeTimers();
     const { manager } = create();
     const pending = manager.listModels();
     const assertion = expect(pending).rejects.toThrow(/timed out waiting for actor event: models/);
-    await vi.advanceTimersByTimeAsync(5_001);
+    // listModels budgets the cold-boot registration (INIT_TIMEOUT_MS), not
+    // a plain round trip.
+    await vi.advanceTimersByTimeAsync(30_001);
     await assertion;
   });
 });

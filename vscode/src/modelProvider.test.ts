@@ -246,7 +246,8 @@ describe('provideLanguageModelChatInformation', () => {
     const pending = provider.provideLanguageModelChatInformation({ silent: false }, fakeToken());
     await flush();
     transport.emit({ type: 'ready' });
-    await vi.advanceTimersByTimeAsync(5_001);
+    // listModels budgets the cold-boot registration (INIT_TIMEOUT_MS).
+    await vi.advanceTimersByTimeAsync(30_001);
     await expect(pending).resolves.toEqual([]);
   });
 });

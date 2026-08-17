@@ -198,7 +198,10 @@ export class SessionManager {
   }
 
   listModels(): Promise<ModelInfo[]> {
-    const models = this.awaitGlobal((ev) => ev.type === 'models', 'models');
+    // The actor answers only after its one-shot provider registration
+    // (keychain/shell lookups) completes; budget the cold boot rather than
+    // a plain round trip.
+    const models = this.awaitGlobal((ev) => ev.type === 'models', 'models', INIT_TIMEOUT_MS);
     this.send({ cmd: 'list_models' });
     return models.then((ev) => (ev as Extract<ActorEvent, { type: 'models' }>).models);
   }
