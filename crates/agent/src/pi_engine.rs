@@ -442,7 +442,8 @@ fn system_prompt(cwd: &Path) -> String {
          Working directory: {cwd}\n\
          Date: {date}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
-         Make changes directly, keep replies concise, and verify your work when practical.",
+         Make changes directly, keep replies concise, and verify your work when practical.\n\
+         When several tool calls or subagent spawns are independent, emit them together in one turn so they run in parallel.",
         cwd = cwd.display(),
     );
     // Skill summaries let the model know which skills are installed (users
