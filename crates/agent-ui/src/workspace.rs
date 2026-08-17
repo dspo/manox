@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -4410,6 +4410,9 @@ impl Workspace {
 
     /// Model menu for the pi harness: grouped by provider display name;
     /// each row shows a wire-api Tag and selects through the registry.
+    /// A config model registered through several wire apis appears once
+    /// (first registration wins), matching the sidebar cascade and the
+    /// macOS menu bar.
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
@@ -4420,8 +4423,12 @@ impl Workspace {
         // sorted by registration name, so same-display-name providers with
         // different registrations must still merge into one submenu.
         let mut providers: Vec<(String, Vec<pi::types::Model>)> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in agent::pi_providers::global().models() {
             let prov = agent::pi_providers::display_provider_name(&m);
+            if !seen.insert((prov.clone(), agent::pi_providers::config_id(&m))) {
+                continue; // same model registered on several wire apis
+            }
             match providers.iter_mut().find(|(name, _)| *name == prov) {
                 Some((_, models)) => models.push(m),
                 None => providers.push((prov, vec![m])),

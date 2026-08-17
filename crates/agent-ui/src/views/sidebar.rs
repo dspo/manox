@@ -1039,12 +1039,7 @@ fn build_model_cascade(
             continue;
         }
         let prov = agent::pi_providers::display_provider_name(&m);
-        let config_id = m
-            .metadata
-            .get("config_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(m.id.as_str())
-            .to_string();
+        let config_id = agent::pi_providers::config_id(&m);
         if !seen.insert((prov.clone(), config_id.clone())) {
             continue; // same model registered on several wire apis
         }
