@@ -1146,6 +1146,9 @@ fn session_builder(
         .with_system_prompt(system_prompt(cwd))
         .with_resources(instruction_resources(cwd))
         .with_tools(tools);
+    // Every session a host creates is tagged with its identity so each
+    // host's session list stays disjoint.
+    builder = builder.with_metadata(serde_json::json!({ "host": crate::host::current().slug() }));
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
@@ -1404,10 +1407,15 @@ async fn run_actor(
         None
     } else {
         repo.list().await.ok().and_then(|list| {
+            // Only this host's sessions are eligible for restore; an explicit
+            // path from another host is not restored (fail-closed).
+            let mut list = list
+                .into_iter()
+                .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()));
             if let Some(requested) = &initial_path {
-                return list.into_iter().find(|info| info.path == *requested);
+                return list.find(|info| info.path == *requested);
             }
-            list.into_iter().find(|info| info.message_count > 0)
+            list.find(|info| info.message_count > 0)
         })
     };
     let mut restored = false;
@@ -3059,7 +3067,10 @@ async fn refresh_session_list(
     let mut out = Vec::new();
     if let Ok(list) = repo.list().await {
         for info in list {
-            out.push(session_info_to_summary(&info));
+            // The mirrored list stays host-scoped like the sidebar's own.
+            if crate::host::belongs_to_current_host(info.metadata.as_ref()) {
+                out.push(session_info_to_summary(&info));
+            }
         }
     }
     *state.sessions.lock().unwrap() = out;

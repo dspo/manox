@@ -209,6 +209,16 @@ fn handle_command(
             if let Some(cwd) = cmd["cwd"].as_str() {
                 state.cwd = PathBuf::from(cwd);
             }
+            // The declaring host pins its identity before `agent::init`
+            // computes host-scoped session state.
+            if let Some(host) = cmd["host"].as_str().and_then(agent::host::Host::from_slug) {
+                agent::host::set_host(host);
+            } else if cmd.get("host").is_some() {
+                eprintln!(
+                    "manox actor: unrecognized host slug on init: {:?}",
+                    cmd["host"]
+                );
+            }
             cx.update(agent::init);
             sink.emit(r#"{"type":"ready"}"#.to_string());
             spawn_models_push(sink.clone());
@@ -1714,6 +1724,26 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed a session file with an explicit header `metadata.host` tag.
+    fn seed_session_file_meta(dir: &Path, id: &str, cwd: &str, host: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"{host}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Restore the process host identity on drop so a panicking test cannot
+    /// leak a switched host into later tests.
+    struct HostGuard(agent::host::Host);
+    impl Drop for HostGuard {
+        fn drop(&mut self) {
+            agent::host::set_host(self.0);
+        }
+    }
+
     fn run_git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .current_dir(dir)
@@ -1957,6 +1987,81 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A session file with no `metadata.host` tag belongs to the native-app
+    /// host; one tagged `vscode` belongs to the VS Code host. Switching the
+    /// process host flips which of the two a `list_threads` snapshot shows.
+    /// The host switch goes through `set_host` directly: a full `init`
+    /// command would run `agent::init` (MCP/plugin/provider registration),
+    /// whose background side effects destabilize sibling tests in the suite.
+    #[test]
+    fn init_command_scopes_threads_to_the_declared_host() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "legacy", "/iso/project");
+        seed_session_file_meta(&sessions, "vscode-one", "/iso/project", "vscode");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let mut state = state_with(PathBuf::from("/iso/project"));
+        let (out, sink) = collect_sink();
+        let snapshot_ids =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<String> {
+                cx.run_until_parked();
+                out.lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                    .find(|e| e["type"] == "threads_updated")
+                    .and_then(|s| s["threads"].as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t["id"].as_str().map(str::to_string))
+                    .collect()
+            };
+        let wait_for =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext, expected: &[&str]| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let ids = snapshot_ids(out, cx);
+                    if ids.iter().map(String::as_str).eq(expected.iter().copied()) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "snapshot never matched {expected:?}; last ids: {ids:?}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            };
+
+        // Default host (the native app): the untagged session is the only
+        // one visible.
+        cx.update(agent::thread_store::init);
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &["legacy"]);
+        agent::thread_store::drop_global_for_test();
+
+        // A vscode host: only the tagged session is visible.
+        let host_guard = HostGuard(agent::host::current());
+        agent::host::set_host(agent::host::Host::Vscode);
+        cx.update(agent::thread_store::init);
+        // The store global was rebuilt; re-subscribe so follow-up snapshot
+        // pushes land on the new entity.
+        state.store_subscription = None;
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &["vscode-one"]);
+        drop(host_guard);
 
         drop(state);
         agent::thread_store::drop_global_for_test();

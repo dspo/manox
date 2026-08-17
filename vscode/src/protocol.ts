@@ -11,7 +11,7 @@
 // protocol — the napi binding terminates the thread directly.
 
 export type Command =
-	| { cmd: 'init'; cwd: string }
+	| { cmd: 'init'; cwd: string; host: 'vscode' }
 	| { cmd: 'create_session'; sessionId: string; cwd: string }
 	| { cmd: 'dispose_session'; sessionId: string }
 	| { cmd: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }

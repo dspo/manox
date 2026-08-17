@@ -938,7 +938,7 @@ impl AgentSession {
                     cwd: self.cwd.to_string_lossy().into_owned(),
                     created_at: chrono::Utc::now(),
                     parent_session_path: Some(self.session_path.to_string_lossy().into_owned()),
-                    metadata: None,
+                    metadata: self.harness.session().storage().metadata.metadata.clone(),
                 })
                 .await?
             }
@@ -1135,6 +1135,8 @@ pub struct AgentSessionBuilder {
     /// Session id pinned by the caller for a fresh `build()`; `None` draws a
     /// fresh uuid. `open()` ignores it — the file's own id wins.
     session_id: Option<String>,
+    /// Free-form session header metadata written by `build()`.
+    metadata: Option<serde_json::Value>,
 }
 
 impl AgentSessionBuilder {
@@ -1199,6 +1201,13 @@ impl AgentSessionBuilder {
     /// `open()` ignores this: the file's own header id wins.
     pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
         self.session_id = Some(id.into());
+        self
+    }
+
+    /// Free-form session header metadata written by `build()`; `open()`
+    /// ignores it (the file's own header wins).
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 
@@ -1538,7 +1547,7 @@ impl AgentSessionBuilder {
                 cwd: cwd.to_string_lossy().into_owned(),
                 created_at: chrono::Utc::now(),
                 parent_session_path: None,
-                metadata: None,
+                metadata: self.metadata.clone(),
             })
             .await?;
         self.assemble_common(session, cwd, session_dir, false).await
@@ -1670,11 +1679,17 @@ mod tests {
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
+            .with_metadata(serde_json::json!({ "host": "vscode" }))
             .with_model_runtime(fake_runtime())
             .with_model(test_model())
             .build()
             .await
             .unwrap();
+        // The builder-injected header metadata lands on the session file.
+        assert_eq!(
+            session.harness.session().storage().metadata.metadata,
+            Some(serde_json::json!({ "host": "vscode" }))
+        );
         session.prompt("first question").await.unwrap();
         session.prompt("second question").await.unwrap();
         let entries = session
@@ -1706,6 +1721,12 @@ mod tests {
             .unwrap();
         // The selected user message's text rides on the result.
         assert_eq!(selected_text.as_deref(), Some("second question"));
+        // The fork inherits the parent's header metadata (host identity
+        // survives forking).
+        assert_eq!(
+            fork.harness.session().storage().metadata.metadata,
+            Some(serde_json::json!({ "host": "vscode" }))
+        );
         // The fork holds only the first turn's path.
         assert_eq!(fork.harness_messages().len(), 2);
         assert!(

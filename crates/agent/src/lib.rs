@@ -16,6 +16,7 @@ pub mod file_lock;
 pub mod frontmatter;
 pub mod goal;
 pub mod goal_tools;
+pub mod host;
 pub mod i18n;
 pub mod image;
 pub mod language;

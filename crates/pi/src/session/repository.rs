@@ -30,6 +30,9 @@ pub struct SessionInfo {
     pub first_message: String,
     /// All user and assistant text contents joined by spaces.
     pub all_messages_text: String,
+    /// Free-form header metadata (agent identity, environment snapshot),
+    /// surfaced so host layers can route sessions without reopening files.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// A repository over the JSONL session files in one directory.
@@ -105,7 +108,7 @@ impl SessionRepository {
                 cwd: target_cwd.to_string(),
                 created_at: chrono::Utc::now(),
                 parent_session_path: Some(source.to_string_lossy().into_owned()),
-                metadata: None,
+                metadata: source_storage.metadata.metadata.clone(),
             },
         )
         .await?;
@@ -200,7 +203,7 @@ impl SessionRepository {
                 cwd: source_storage.metadata.cwd.clone(),
                 created_at: chrono::Utc::now(),
                 parent_session_path: Some(source.to_string_lossy().into_owned()),
-                metadata: None,
+                metadata: source_storage.metadata.metadata.clone(),
             },
         )
         .await?;
@@ -282,6 +285,7 @@ async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
             first_message
         },
         all_messages_text: all_texts.join(" "),
+        metadata: storage.metadata.metadata.clone(),
     })
 }
 
@@ -674,5 +678,83 @@ mod tests {
 
         repo.delete(&listed[0].path).await.unwrap();
         assert!(repo.list().await.unwrap().is_empty());
+    }
+
+    fn meta_with(metadata: serde_json::Value) -> JsonlSessionMetadata {
+        JsonlSessionMetadata {
+            metadata: Some(metadata),
+            ..meta()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_repository_list_surfaces_header_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepository::new(dir.path());
+        let session = repo
+            .create(meta_with(serde_json::json!({ "host": "vscode" })))
+            .await
+            .unwrap();
+        session
+            .append_message(AgentMessage::user("first"))
+            .await
+            .unwrap();
+        session.append_message(assistant("hello")).await.unwrap();
+        let listed = repo.list().await.unwrap();
+        assert_eq!(
+            listed[0].metadata,
+            Some(serde_json::json!({ "host": "vscode" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repository_forks_inherit_the_source_header_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SessionRepository::new(dir.path());
+        let session = repo
+            .create(meta_with(serde_json::json!({ "host": "vscode" })))
+            .await
+            .unwrap();
+        session
+            .append_message(AgentMessage::user("u1"))
+            .await
+            .unwrap();
+        session.append_message(assistant("a1")).await.unwrap();
+        let listed = repo.list().await.unwrap();
+        let source_path = listed[0].path.clone();
+
+        // fork_from: eager materialization, the header metadata carries over.
+        let fork = repo.fork_from(&source_path, "/other").await.unwrap();
+        assert_eq!(
+            fork.storage().metadata.metadata,
+            Some(serde_json::json!({ "host": "vscode" }))
+        );
+
+        // create_branched_session: deferred materialization, the in-memory
+        // header metadata carries over (the file writes it on materialize).
+        let entries = session
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
+        let a1_id = entries
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Message {
+                    message: AgentMessage::Assistant { .. },
+                    id,
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("assistant entry");
+        let branch = repo
+            .create_branched_session(&source_path, &a1_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            branch.storage().metadata.metadata,
+            Some(serde_json::json!({ "host": "vscode" }))
+        );
     }
 }

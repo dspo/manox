@@ -61,7 +61,7 @@ describe('init', () => {
     const pending = manager.init('/w');
     // The init command goes out only after `transport.ready` settles.
     await Promise.resolve();
-    expect(transport.lastCommand()).toEqual({ cmd: 'init', cwd: '/w' });
+    expect(transport.lastCommand()).toEqual({ cmd: 'init', cwd: '/w', host: 'vscode' });
     transport.emit({ type: 'ready' });
     await pending;
 
