@@ -233,8 +233,9 @@ export const Composer = ({
     const trimmed = text.trim();
     // Navigation built-ins bypass the turn-active guard: the actor cancels
     // any in-flight turn, so `/exit` etc. return to the thread list
-    // immediately.
-    if (sessionId && !creating && NAV_BUILTIN.test(trimmed)) {
+    // immediately. Attached images fall through — the actor only routes
+    // slashes on text-only submissions.
+    if (sessionId && !creating && images.length === 0 && NAV_BUILTIN.test(trimmed)) {
       store.echoUser(sessionId, trimmed);
       store.backToList();
       new ThreadApi(sessionId).submit(trimmed);

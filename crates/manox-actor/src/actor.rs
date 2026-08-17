@@ -451,6 +451,13 @@ fn handle_command(
             if let Some(session) = state.sessions.remove(&id) {
                 if session.turn_active.load(Ordering::SeqCst) {
                     cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
+                    // The session's subscription is already dropped, so the
+                    // backend's eventual `TurnFinished` can no longer clear
+                    // the store's running flag; reset it here.
+                    cx.update(|app| {
+                        let store = agent::thread_store::global();
+                        store.update(app, |s, cx| s.mark_idle(&id, cx));
+                    });
                 }
                 sink.emit(
                     serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
@@ -499,6 +506,14 @@ fn handle_command(
                         if let Some(session) = state.sessions.get(&id) {
                             session.thread.update(app, |t, cx| t.cancel(cx));
                         }
+                    });
+                    // The disposal below drops the session's subscription,
+                    // so the backend's eventual `TurnFinished` can no longer
+                    // clear the store's running flag; reset it here or the
+                    // archived row keeps spinning until restart.
+                    cx.update(|app| {
+                        let store = agent::thread_store::global();
+                        store.update(app, |s, cx| s.mark_idle(&id, cx));
                     });
                 }
                 ensure_store_subscription(cx, state, sink);
@@ -2601,9 +2616,15 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        // Simulate the running turn the event subscription would have
+        // flagged: the actor's `turn_active` plus the store's running set.
         state.sessions["s1"]
             .turn_active
             .store(true, Ordering::SeqCst);
+        cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.update(app, |s, cx| s.mark_running("s1", cx));
+        });
 
         // `/exit` while running must cancel the turn and dispose the session
         // immediately instead of silently dropping the command.
@@ -2626,6 +2647,15 @@ mod tests {
                 .any(|sum| sum.id == "s1" && sum.archived)
         });
         assert!(archived, "s1 must be archived in the thread store");
+
+        // The store's running flag is cleared: the disposal drops the
+        // session's subscription, so the backend's eventual `TurnFinished`
+        // can never reach `mark_idle` — the exit path must do it.
+        let running = cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.read(app).is_running("s1")
+        });
+        assert!(!running, "s1 must not stay flagged running after /exit");
 
         drop(state);
         agent::thread_store::drop_global_for_test();
