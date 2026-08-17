@@ -135,6 +135,35 @@ fn compute_runs(
     runs
 }
 
+static OVERLAP_DIAG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn overlap_diag_enabled() -> bool {
+    *OVERLAP_DIAG_ENABLED.get_or_init(|| {
+        std::env::var("MANOX_OVERLAP_DIAG")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Append to the shared overlap diagnostic log (`/tmp/manox-overlap-diag.log`).
+/// The agent-ui row/body registry writes to the same file; this leaf-level
+/// record localizes an escape to the RichText that painted it.
+fn append_overlap_log(line: &str) {
+    use std::io::Write as _;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("manox-overlap-diag.log"))
+    else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(file, "[{timestamp}] {line}");
+}
+
 struct ShapedText {
     lines: Rc<Vec<WrappedLine>>,
     size: Size<Pixels>,
@@ -523,6 +552,22 @@ impl Element for RichText {
             shaped.size.height,
             bounds,
         );
+        // Runtime twin of the debug_assert, gated by MANOX_OVERLAP_DIAG=1: the
+        // release build compiles the assert out, so a live overlap otherwise
+        // leaves no trace of which leaf escaped its box.
+        if shaped.size.height > bounds.size.height + px(1.) && overlap_diag_enabled() {
+            append_overlap_log(&format!(
+                "RICHTEXT_OVERFLOW bounds=({:.0},{:.0} {:.0}x{:.0}) shaped={:.0}x{:.0} wrap_width={:?} text={:?}",
+                f32::from(bounds.origin.x),
+                f32::from(bounds.origin.y),
+                f32::from(bounds.size.width),
+                f32::from(bounds.size.height),
+                f32::from(shaped.size.width),
+                f32::from(shaped.size.height),
+                shaped.wrap_width,
+                self.text.chars().take(80).collect::<String>(),
+            ));
+        }
         let layout = BlockLayout::new(
             self.text.to_string(),
             shaped.lines.clone(),
