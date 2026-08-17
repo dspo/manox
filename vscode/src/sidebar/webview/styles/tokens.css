@@ -1,5 +1,13 @@
 @import "tw-animate-css";
 @import "tailwindcss";
+@layer base {
+  /* Bare border utilities resolve to the theme border token; without this
+   * reset, Tailwind v4 preflight leaves border-color at currentColor and
+   * every 1px border renders in the foreground color. */
+  *, ::before, ::after {
+    border-color: var(--color-border);
+  }
+}
 
 /*
  * Design tokens for the manox sidebar. Every color references a VS Code
