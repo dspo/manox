@@ -589,7 +589,10 @@ mod tests {
             )
             .await
         });
-        let event = rx.recv().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("send-phase drop must emit a retry event")
+            .expect("retry channel closed");
         assert!(matches!(event, AgentEvent::Retry { attempt: 1, .. }));
         sig.cancel();
         let err = handle.await.unwrap().unwrap_err();
