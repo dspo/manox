@@ -197,6 +197,46 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
     }
 }
 
+/// Archive a session and dispose it — the single archive path shared by the
+/// `/exit`/`/new` submit branch and the `archive_thread` command. An
+/// in-flight turn is cancelled so the release is unconditional; the pi
+/// transcript and sidecar persist, so reopening re-materializes the thread.
+fn archive_and_dispose_session(
+    state: &mut ActorState,
+    id: &str,
+    cx: &mut HeadlessAppContext,
+    sink: &EventSink,
+) {
+    ensure_store_subscription(cx, state, sink);
+    if let Some(session) = state.sessions.get(id)
+        && session.turn_active.load(Ordering::SeqCst)
+    {
+        cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
+    }
+    cx.update(|app| {
+        let store = agent::thread_store::global();
+        store.update(app, |s, cx| {
+            s.archive_thread(id, true, cx);
+            // The disposal below drops the session's subscription, so the
+            // backend's eventual `TurnFinished` can no longer clear the
+            // store's live flags; reset them here or the archived row keeps
+            // spinning until restart.
+            s.mark_idle(id, cx);
+            s.mark_pending_auth(id, false, cx);
+            s.mark_pending_plan(id, false, cx);
+            s.mark_background_work(id, false, cx);
+        });
+    });
+    {
+        let mut focused = state.focused.lock().unwrap();
+        if focused.as_deref() == Some(id) {
+            *focused = None;
+        }
+    }
+    state.sessions.remove(id);
+    sink.emit(json!({"type": "session_disposed", "sessionId": id}).to_string());
+}
+
 /// Returns `false` when the actor loop must exit (shutdown sentinel).
 fn handle_command(
     cx: &mut HeadlessAppContext,
@@ -365,11 +405,18 @@ fn handle_command(
                 return true;
             };
             let archived = cmd["archived"].as_bool().unwrap_or(true);
-            ensure_store_subscription(cx, state, sink);
-            cx.update(|app| {
-                let store = agent::thread_store::global();
-                store.update(app, |s, cx| s.archive_thread(&id, archived, cx));
-            });
+            if archived {
+                archive_and_dispose_session(state, &id, cx, sink);
+            } else {
+                // Unarchive never touches sessions: an archived thread has no
+                // live session, and content stays unloaded until explicitly
+                // opened.
+                ensure_store_subscription(cx, state, sink);
+                cx.update(|app| {
+                    let store = agent::thread_store::global();
+                    store.update(app, |s, cx| s.archive_thread(&id, false, cx));
+                });
+            }
         }
         "pin_thread" => {
             let Some(id) = session_id.clone() else {
@@ -512,42 +559,7 @@ fn handle_command(
                 let Some(id) = session_id.clone() else {
                     return true;
                 };
-                let running = state
-                    .sessions
-                    .get(&id)
-                    .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-                // Cancel the in-flight turn so the engine aborts before the
-                // thread is disposed.
-                if running {
-                    cx.update(|app| {
-                        if let Some(session) = state.sessions.get(&id) {
-                            session.thread.update(app, |t, cx| t.cancel(cx));
-                        }
-                    });
-                    // The disposal below drops the session's subscription,
-                    // so the backend's eventual `TurnFinished` can no longer
-                    // clear the store's running flag; reset it here or the
-                    // archived row keeps spinning until restart.
-                    cx.update(|app| {
-                        let store = agent::thread_store::global();
-                        store.update(app, |s, cx| s.mark_idle(&id, cx));
-                    });
-                }
-                ensure_store_subscription(cx, state, sink);
-                cx.update(|app| {
-                    let store = agent::thread_store::global();
-                    store.update(app, |s, cx| s.archive_thread(&id, true, cx));
-                });
-                {
-                    let mut focused = state.focused.lock().unwrap();
-                    if focused.as_deref() == Some(id.as_str()) {
-                        *focused = None;
-                    }
-                }
-                state.sessions.remove(&id);
-                sink.emit(
-                    serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
-                );
+                archive_and_dispose_session(state, &id, cx, sink);
                 return true;
             }
             with_session(state, session_id.as_deref(), sink, |session, _| {
@@ -1766,6 +1778,213 @@ mod tests {
         // Release every thread handle before the context drops so the gpui
         // leak detector sees a clean entity map.
         drop(state);
+    }
+
+    /// Archiving a live session releases it: the row moves to the archived
+    /// partition, the session is disposed, and `session_disposed` lands so
+    /// the webview folds the thread state away.
+    #[test]
+    fn archive_thread_disposes_live_session() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/archive/dispose/project");
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/dispose/project"));
+        let (out, sink) = collect_sink();
+
+        let rows = |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+        let wait_for = |out: &Arc<Mutex<Vec<String>>>,
+                        cx: &mut HeadlessAppContext,
+                        check: &dyn Fn(&[Value]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if check(&rows(out, cx)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot never settled"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &|r| r.iter().any(|t| t["id"] == "s1"));
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        assert!(state.sessions.contains_key("s1"));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+        wait_for(&out, &mut cx, &|r| {
+            r.iter()
+                .find(|t| t["id"] == "s1")
+                .is_some_and(|t| t["archived"].as_bool() == Some(true))
+        });
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Archiving a thread with an in-flight turn cancels the turn and still
+    /// releases the session — the archive path is unconditional.
+    #[test]
+    fn archive_thread_cancels_running_turn() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/"));
+        let (out, sink) = collect_sink();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        state
+            .sessions
+            .get_mut("s1")
+            .expect("session live")
+            .turn_active
+            .store(true, Ordering::SeqCst);
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Unarchiving only flips the list flag — it never re-creates a session
+    /// and never emits another `session_disposed`.
+    #[test]
+    fn unarchive_does_not_dispose_or_load() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/archive/dispose/project");
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/dispose/project"));
+        let (out, sink) = collect_sink();
+
+        let rows = |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+        let wait_for = |out: &Arc<Mutex<Vec<String>>>,
+                        cx: &mut HeadlessAppContext,
+                        check: &dyn Fn(&[Value]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if check(&rows(out, cx)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot never settled"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &|r| r.iter().any(|t| t["id"] == "s1"));
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        let disposed_before = types(&out)
+            .iter()
+            .filter(|t| t.as_str() == "session_disposed")
+            .count();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":false}"#,
+        );
+        cx.run_until_parked();
+        let disposed_after = types(&out)
+            .iter()
+            .filter(|t| t.as_str() == "session_disposed")
+            .count();
+        assert_eq!(disposed_after, disposed_before);
+        assert!(!state.sessions.contains_key("s1"));
+        wait_for(&out, &mut cx, &|r| {
+            r.iter()
+                .find(|t| t["id"] == "s1")
+                .is_some_and(|t| t["archived"].as_bool() == Some(false))
+        });
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
     }
 
     #[test]

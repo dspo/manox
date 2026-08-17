@@ -219,8 +219,10 @@ export class SessionManager {
     );
   }
 
-  /** Archive/unarchive a thread; the store mutation pushes an updated
-   * `threads_updated` snapshot through the global stream. */
+  /** Archive/unarchive a thread; archiving also disposes the actor-side
+   * session (cancelling any in-flight turn), so the thread's resources are
+   * released. The store mutation pushes an updated `threads_updated`
+   * snapshot through the global stream. */
   archiveThread(sessionId: string, archived: boolean): void {
     this.send({ cmd: 'archive_thread', sessionId, archived });
   }
