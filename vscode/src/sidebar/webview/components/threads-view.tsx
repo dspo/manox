@@ -10,7 +10,6 @@ import { api } from '../api/client';
 import { useContainerWidth } from '../lib/use-container-width';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
-import { ErrorBanner } from './chrome/error-banner';
 import { openThread, SessionList } from './session-list';
 import { SidebarSash, SIDEBAR_MIN_PX, useSidebarWidth } from './sidebar-sash';
 
@@ -34,7 +33,7 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
     () => localStorage.getItem(DRAFT_MODEL_KEY) ?? null,
   );
   const { width: listWidth, ...sash } = useSidebarWidth(
-    Math.max(SIDEBAR_MIN_PX, (width ?? WIDE_BREAKPOINT_PX) - COMPOSER_COLUMN_MIN_PX),
+    Math.max(SIDEBAR_MIN_PX, width - COMPOSER_COLUMN_MIN_PX),
   );
 
   const pickDraftModel = useCallback((modelId: string) => {
@@ -79,12 +78,7 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
     />
   );
 
-  const list = (
-    <>
-      <ErrorBanner message={error} />
-      <SessionList threads={threads} onOpen={openThread} />
-    </>
-  );
+  const list = <SessionList error={error} threads={threads} onOpen={openThread} />;
 
   return (
     <div ref={ref} className="font-chrome flex h-screen flex-col bg-background text-foreground">

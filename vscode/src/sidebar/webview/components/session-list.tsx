@@ -22,6 +22,7 @@ import { partitionSessions } from '../lib/sessions';
 import { threadRowState } from '../lib/thread-status';
 import { cn } from '../lib/utils';
 import { store } from '../state/bridge';
+import { ErrorBanner } from './chrome/error-banner';
 
 export const openThread = (item: ThreadListItem) => {
   // Threads with live local state switch instantly and only refocus the
@@ -133,10 +134,14 @@ export type SessionListProps = {
   threads: ThreadListItem[];
   /** Row highlighted when its session is the active conversation. */
   activeThreadId?: string | null;
+  /** Global error shown between the header and the rows; the three-column
+   * conversation list leaves it unset because the conversation column
+   * already surfaces it. */
+  error?: string | null;
   onOpen: (item: ThreadListItem) => void;
 };
 
-export const SessionList = ({ threads, activeThreadId, onOpen }: SessionListProps) => {
+export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionListProps) => {
   const [archivedOpen, setArchivedOpen] = useState(false);
 
   // Relative times age on their own; tick once a minute to keep them honest.
@@ -155,6 +160,7 @@ export const SessionList = ({ threads, activeThreadId, onOpen }: SessionListProp
           {t('sessions')}
         </span>
       </div>
+      <ErrorBanner message={error ?? null} />
       {active.length === 0 && archived.length === 0 ? (
         <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 text-sm">
           <MessageSquare className="size-6" />
@@ -191,3 +197,4 @@ export const SessionList = ({ threads, activeThreadId, onOpen }: SessionListProp
     </div>
   );
 };
+

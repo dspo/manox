@@ -9,7 +9,7 @@ import { useEffect } from 'react';
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
-import { chatLayoutForWidth, CONVERSATION_MIN_PX, INFO_PANEL_WIDTH_PX } from '../lib/layout';
+import { chatLayoutForWidth, INFO_PANEL_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
 import { useContainerWidth } from '../lib/use-container-width';
 import type { ThreadState } from '../state/bridge';
 import { store } from '../state/bridge';
@@ -42,7 +42,7 @@ export const ConversationView = ({
   // The left list column only exists in the three-column layout; its drag
   // range keeps the conversation column above its non-cramped minimum.
   const { width: listWidth, ...sash } = useSidebarWidth(
-    Math.max(SIDEBAR_MIN_PX, width - CONVERSATION_MIN_PX - INFO_PANEL_WIDTH_PX - 21),
+    Math.max(SIDEBAR_MIN_PX, maxSessionListWidth(width)),
   );
 
   // Restore the info snapshot whenever a thread comes into view; live
