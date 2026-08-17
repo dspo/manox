@@ -177,6 +177,9 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'set_model':
         manager.send({ cmd: 'set_model', sessionId: msg.sessionId, id: msg.id });
         return;
+      case 'set_reasoning_effort':
+        manager.send({ cmd: 'set_reasoning_effort', sessionId: msg.sessionId, effort: msg.effort });
+        return;
       case 'set_approval_mode':
         manager.send({ cmd: 'set_approval_mode', sessionId: msg.sessionId, mode: msg.mode });
         return;

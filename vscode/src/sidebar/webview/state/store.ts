@@ -11,6 +11,7 @@ import type {
   CommandEntry,
   GoalSnapshotWire,
   ModelInfo,
+  ReasoningEffort,
   SubagentChildWire,
   ThreadInfoSnapshot,
   ThreadListItem,
@@ -38,6 +39,7 @@ export interface ThreadState {
   /** Model the in-flight turn started with; stamps assistant items. */
   turnModelId: string | null;
   approvalMode: ApprovalMode;
+  reasoningEffort: ReasoningEffort;
   usage: TokenUsageSnapshot | null;
   cost: number;
   info: ThreadInfoSnapshot | null;
@@ -87,8 +89,9 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   items: [],
   currentModelId: null,
   turnModelId: null,
-  // Matches the thread-side default; the actor replays the persisted mode
-  // on open, correcting this value for restored threads.
+  // Matches the thread-side default; the actor replays the persisted effort
+  // (and approval mode) on open, correcting these values for restored threads.
+  reasoningEffort: 'high',
   approvalMode: 'autopilot',
   usage: null,
   cost: 0,
@@ -102,8 +105,8 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   turnStartedAt: null,
   lastTurnDurationSec: null,
 });
-
 const emptyInfo = (): ThreadInfoSnapshot => ({
+  reasoning_effort: 'high',
   worktree_path: null,
   plan: null,
   goal: null,
@@ -120,6 +123,7 @@ const emptyInfo = (): ThreadInfoSnapshot => ({
  * corrects the zeroed pre-materialization `get_usage` reply. */
 const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
   ...t,
+  reasoningEffort: info.reasoning_effort,
   usage: info.usage,
   cost: info.cost,
   info: { ...info, git_stats: info.git_stats ?? t.info?.git_stats },
@@ -497,6 +501,8 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       };
     case 'model_changed':
       return { ...t, currentModelId: ev.to };
+    case 'reasoning_effort_changed':
+      return { ...t, reasoningEffort: ev.effort };
     case 'approval_mode_changed':
       return { ...t, approvalMode: ev.mode };
     case 'current_model':

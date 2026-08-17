@@ -6,7 +6,7 @@ import { ArrowUp, Bot, Check, ChevronDown, Pause, TriangleAlert, X } from 'lucid
 import type { ClipboardEvent, KeyboardEvent } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { ApprovalMode, CommandEntry, ModelInfo } from '../../../../protocol';
+import type { ApprovalMode, CommandEntry, ModelInfo, ReasoningEffort } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
 import { hasCommandKey, t, type I18nKey } from '../../lib/i18n';
 import { enterAction } from '../../lib/ime';
@@ -160,6 +160,7 @@ export type ComposerProps = {
   models: ModelInfo[];
   currentModelId: string | null;
   approvalMode: ApprovalMode;
+  reasoningEffort: ReasoningEffort;
   planMode: boolean;
   commands: CommandEntry[];
   /** Drafted session still waiting for the host's confirmation. */
@@ -176,6 +177,7 @@ export const Composer = ({
   models,
   currentModelId,
   approvalMode,
+  reasoningEffort,
   planMode,
   commands,
   creating = false,
@@ -403,6 +405,7 @@ export const Composer = ({
             disabled={!ready || creating}
             models={models}
             onSelect={draft ? onModelChange : undefined}
+            reasoningEffort={reasoningEffort}
             sessionId={sessionId}
           />
           {turnActive && sessionId ? (

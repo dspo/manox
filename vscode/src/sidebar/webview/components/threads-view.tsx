@@ -224,6 +224,7 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
       onCreateSession={createSession}
       onModelChange={pickDraftModel}
       planMode={false}
+      reasoningEffort="high"
       sessionId={null}
       turnActive={false}
     />
