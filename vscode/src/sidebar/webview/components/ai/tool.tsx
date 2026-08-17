@@ -1,10 +1,11 @@
 import { Ban, Check, ChevronRight, Circle, Clock, MinusCircle, X } from 'lucide-react';
 import type { ComponentProps, ReactNode } from 'react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible';
+import { BrailleSpinner } from '../ui/braille-spinner';
 
 /** UI status vocabulary. Terminal wire statuses are folded in the store
  * (success → completed, error → failed); authorization states pass through. */
@@ -26,16 +27,6 @@ export const Tool = ({ className, ...props }: ToolProps) => (
   />
 );
 
-const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-const BrailleSpinner = ({ className }: { className?: string }) => {
-  const [frame, setFrame] = useState(0);
-  useEffect(() => {
-    const timer = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 80);
-    return () => clearInterval(timer);
-  }, []);
-  return <span className={cn('inline-block leading-none', className)}>{SPINNER_FRAMES[frame]}</span>;
-};
 
 const statusIcons: Record<ToolStatus, ReactNode> = {
   'pending-approval': <Clock className="size-3.5 shrink-0 text-warning" />,

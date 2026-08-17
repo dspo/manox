@@ -121,6 +121,11 @@ const DICT = {
     en: 'Plan submitted for review.',
     zh: '已提交计划供审阅。',
   },
+  plan_remaining: {
+    en: (n: number) => `+${n} to do`,
+    zh: (n: number) => `+${n} 项待办`,
+  },
+  plan_all_done: { en: 'All done', zh: '全部完成' },
   task_running: { en: 'Running', zh: '运行中' },
   task_stopping: { en: 'Stopping', zh: '停止中' },
   task_completed: { en: 'Completed', zh: '已完成' },

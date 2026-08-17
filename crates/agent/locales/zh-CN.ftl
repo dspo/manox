@@ -66,6 +66,7 @@ plan-verdict-execute-keep = 批准并保留上下文执行
 plan-verdict-refine = 修订计划
 plan-refine-notice = Plan 模式保持开启——输入你的修改意见，模型将更新 plan 文件并重新提交。
 plan-chip-label = Plan 模式
+plan-chip-exit-tooltip = 退出计划模式
 plan-mode-on-notice = Plan 模式已开启：工作树只读；模型调研、写 plan 文件，并通过 ProposePlan 提交给你批准。
 plan-mode-off-notice = Plan 模式已关闭：完整写权限恢复。
 thinking-tool-result = 工具结果

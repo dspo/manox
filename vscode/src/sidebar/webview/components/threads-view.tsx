@@ -10,9 +10,9 @@ import {
   Archive,
   ArchiveRestore,
   ChevronRight,
-  LoaderCircle,
   MessageSquare,
   Pin,
+  ShipWheel,
   TriangleAlert,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -21,6 +21,7 @@ import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol'
 import { api, ThreadApi } from '../api/client';
 import { formatRelativeTime, t } from '../lib/i18n';
 import { partitionSessions } from '../lib/sessions';
+import { threadRowState } from '../lib/thread-status';
 import { useContainerWidth } from '../lib/use-container-width';
 import { cn } from '../lib/utils';
 import { store } from '../state/bridge';
@@ -46,19 +47,17 @@ const openThread = (item: ThreadListItem) => {
 };
 
 const StatusIcon = ({ item }: { item: ThreadListItem }) => {
-  if (item.running) {
-    return <LoaderCircle className="text-info size-3.5 shrink-0 animate-spin" />;
+  switch (threadRowState(item)) {
+    case 'errored':
+      return <TriangleAlert className="text-danger size-3.5 shrink-0" />;
+    case 'waiting':
+    case 'unread':
+      return <ShipWheel className="text-blue size-4 shrink-0" />;
+    case 'autonomous':
+      return <ShipWheel className="text-success size-4 shrink-0 animate-wheel-spin" />;
+    case 'idle':
+      return <ShipWheel className="text-foreground size-4 shrink-0" />;
   }
-  if (item.pending_auth) {
-    return <TriangleAlert className="text-warning size-3.5 shrink-0" />;
-  }
-  if (item.errored) {
-    return <TriangleAlert className="text-danger size-3.5 shrink-0" />;
-  }
-  if (item.unread) {
-    return <span className="bg-info block size-2 shrink-0 rounded-full" />;
-  }
-  return <span className="bg-muted-foreground/40 block size-1.5 shrink-0 rounded-full" />;
 };
 
 const RowActionButton = ({

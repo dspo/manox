@@ -147,6 +147,11 @@ export interface ThreadListItem {
 	unread: boolean;
 	errored: boolean;
 	pending_auth: boolean;
+	/** A plan review verdict is due; the row shows the static blue wheel. */
+	pending_plan: boolean;
+	/** Live monitors / background bash keep the loop self-advancing; the row
+	 * spins even with no turn in flight. */
+	background_work: boolean;
 	model_id: string;
 	pinned: boolean;
 	archived: boolean;
