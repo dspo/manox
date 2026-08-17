@@ -171,6 +171,11 @@ export interface ThreadListItem {
 	model_id: string;
 	pinned: boolean;
 	archived: boolean;
+	/** Leader session id for a team worker row; null for a top-level row. */
+	parent_id: string | null;
+	/** Nesting level: 0 is top-level, 1 is a team member of a top-level
+	 * leader, and so on. */
+	depth: number;
 }
 
 /** One slash-completion entry: a built-in/prompt-macro command or a skill. */

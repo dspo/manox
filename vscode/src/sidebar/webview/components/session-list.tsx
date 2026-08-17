@@ -13,12 +13,12 @@ import {
   ShipWheel,
   TriangleAlert,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 
 import type { ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
 import { formatRelativeTime, t } from '../lib/i18n';
-import { partitionSessions } from '../lib/sessions';
+import { partitionSessions, type SessionTreeNode } from '../lib/sessions';
 import { threadRowState } from '../lib/thread-status';
 import { cn } from '../lib/utils';
 import { store } from '../state/bridge';
@@ -74,18 +74,27 @@ const RowActionButton = ({
 const SessionRow = ({
   active,
   item,
+  depth,
+  hasChildren,
+  collapsed,
+  onToggle,
   onOpen,
 }: {
   active?: boolean;
   item: ThreadListItem;
+  depth: number;
+  hasChildren: boolean;
+  collapsed: boolean;
+  onToggle: (id: string) => void;
   onOpen: (item: ThreadListItem) => void;
 }) => (
   <li>
     <div
       className={cn(
-        'group hover:bg-muted relative flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left',
+        'group hover:bg-muted relative flex w-full cursor-pointer items-center gap-2 py-2 text-left',
         active && 'bg-muted',
       )}
+      style={{ paddingLeft: 12 + depth * 14 }}
       onClick={() => onOpen(item)}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -96,6 +105,20 @@ const SessionRow = ({
       role="button"
       tabIndex={0}
     >
+      {hasChildren ? (
+        <button
+          className="text-muted-foreground hover:text-foreground -ml-1 cursor-pointer rounded p-0.5 transition-transform"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle(item.id);
+          }}
+          type="button"
+        >
+          <ChevronRight className={cn('size-3.5 transition-transform', !collapsed && 'rotate-90')} />
+        </button>
+      ) : (
+        <span className="size-4 shrink-0" />
+      )}
       <StatusIcon item={item} />
       <span className="min-w-0 flex-1 truncate text-sm">{item.title}</span>
       {item.pinned && !item.archived && (
@@ -143,6 +166,7 @@ export type SessionListProps = {
 
 export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionListProps) => {
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [collapsedTeams, setCollapsedTeams] = useState<Set<string>>(() => new Set());
 
   // Relative times age on their own; tick once a minute to keep them honest.
   const [, setTick] = useState(0);
@@ -152,6 +176,39 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
   }, []);
 
   const { active, archived } = partitionSessions(threads);
+
+  const toggleTeam = (id: string) => {
+    setCollapsedTeams((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const renderNodes = (nodes: SessionTreeNode[], depth: number) =>
+    nodes.map((node) => {
+      const { item } = node;
+      const hasChildren = node.children.length > 0;
+      const collapsed = collapsedTeams.has(item.id);
+      return (
+        <Fragment key={item.id}>
+          <SessionRow
+            active={item.id === activeThreadId}
+            item={item}
+            depth={depth}
+            hasChildren={hasChildren}
+            collapsed={collapsed}
+            onToggle={toggleTeam}
+            onOpen={onOpen}
+          />
+          {hasChildren && !collapsed && renderNodes(node.children, depth + 1)}
+        </Fragment>
+      );
+    });
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -168,9 +225,7 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
         </div>
       ) : (
         <ul className="min-h-0 flex-1 overflow-y-auto py-1">
-          {active.map((item) => (
-            <SessionRow active={item.id === activeThreadId} item={item} key={item.id} onOpen={onOpen} />
-          ))}
+          {renderNodes(active, 0)}
           {archived.length > 0 && (
             <>
               <li>
@@ -186,10 +241,7 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
                   <span className="ml-auto">{archived.length}</span>
                 </button>
               </li>
-              {archivedOpen &&
-                archived.map((item) => (
-                  <SessionRow active={item.id === activeThreadId} item={item} key={item.id} onOpen={onOpen} />
-                ))}
+              {archivedOpen && renderNodes(archived, 0)}
             </>
           )}
         </ul>
