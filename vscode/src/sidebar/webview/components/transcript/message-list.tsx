@@ -174,7 +174,7 @@ export const MessageList = ({
       <ConversationContent
         style={rightInsetPx ? { paddingRight: rightInsetPx } : undefined}
       >
-        <div className="mx-auto w-full max-w-[760px]">{groups.map(renderGroup)}</div>
+        <div className="w-full">{groups.map(renderGroup)}</div>
       </ConversationContent>
       {items.length === 0 && (
         <ConversationEmptyState description={t('no_messages_desc')} title={t('no_messages_title')} />
