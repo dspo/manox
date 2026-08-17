@@ -446,6 +446,11 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
             ? t.lastTurnDurationSec
             : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
         turnStartedAt: null,
+        // A successful finish supersedes a stale mid-turn error: the loop can
+        // recover (auto-retry, compact-and-retry) without a `turn_started` in
+        // between, so the banner and captain icon must follow the turn's real
+        // outcome. A failed finish keeps the error.
+        error: ev.failed ? t.error : null,
         items: t.items.map((i) => {
           if (i.kind !== 'user' || !i.steerPendingId) return i;
           return stranded.has(i.steerPendingId)
