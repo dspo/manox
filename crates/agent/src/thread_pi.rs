@@ -1834,6 +1834,7 @@ pub(crate) mod tests {
     pub(crate) struct FakeEngine {
         history: Vec<Message>,
         shutdown_calls: AtomicUsize,
+        abort_calls: AtomicUsize,
         approval_mode: Mutex<Option<ApprovalMode>>,
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
@@ -1848,6 +1849,7 @@ pub(crate) mod tests {
             Self {
                 history: Vec::new(),
                 shutdown_calls: AtomicUsize::new(0),
+                abort_calls: AtomicUsize::new(0),
                 approval_mode: Mutex::new(None),
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
@@ -1888,7 +1890,9 @@ pub(crate) mod tests {
             false
         }
 
-        fn abort(&self) {}
+        fn abort(&self) {
+            self.abort_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         fn set_model(&self, _model: PiModel) {}
 
@@ -2015,6 +2019,7 @@ pub(crate) mod tests {
                 "partial answer".into(),
             )])],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2056,6 +2061,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2117,6 +2123,7 @@ pub(crate) mod tests {
                 )]),
             ],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2163,6 +2170,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2201,6 +2209,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2228,6 +2237,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2249,6 +2259,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2301,6 +2312,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2326,6 +2338,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2362,6 +2375,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2422,6 +2436,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2463,6 +2478,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2502,6 +2518,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2527,5 +2544,23 @@ pub(crate) mod tests {
             cx.read(|cx| thread.read(cx).reasoning_effort()),
             ReasoningEffort::Max
         );
+    }
+
+    /// `Thread::cancel` aborts the engine; the actor relies on this when
+    /// disposal must not wait for the in-flight turn.
+    #[gpui::test]
+    fn cancel_aborts_engine(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| t.cancel(cx));
+        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -27,6 +27,10 @@ const MAX_IMAGE_EDGE_PX = 1568;
 const COMPOSITION_TRAIL_WINDOW_MS = 300;
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+// Navigation built-ins (`/exit` / `/new` and their aliases) take effect on
+// submit even while a turn is running: the actor cancels the in-flight turn
+// and disposes the session.
+const NAV_BUILTIN = /^\s*\/(?:exit|quit|new|clear|archive)(?:\s|$)/;
 
 /** Chip state while attached; `preview` is a renderable data url, `data`
  * the bare base64 payload that goes on the wire. */
@@ -225,9 +229,19 @@ export const Composer = ({
     entry.i18n_key && hasCommandKey(entry.i18n_key)
       ? t(entry.i18n_key as I18nKey)
       : (entry.description ?? `/${entry.name}`);
-
   const submit = useCallback(() => {
     const trimmed = text.trim();
+    // Navigation built-ins bypass the turn-active guard: the actor cancels
+    // any in-flight turn, so `/exit` etc. return to the thread list
+    // immediately.
+    if (sessionId && !creating && NAV_BUILTIN.test(trimmed)) {
+      store.echoUser(sessionId, trimmed);
+      store.backToList();
+      new ThreadApi(sessionId).submit(trimmed);
+      setText('');
+      setImages([]);
+      return;
+    }
     if ((!trimmed && images.length === 0) || turnActive || creating) {
       return;
     }
