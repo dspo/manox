@@ -605,7 +605,17 @@ fn handle_command(
             });
             sink.emit(json.to_string());
         }),
-        "list_models" => sink.emit(models_snapshot().to_string()),
+        "list_models" => {
+            // Registration runs on a background thread (keychain/shell); a
+            // reply must not race it with an empty snapshot — surface that
+            // lists before the build lands would never retry. Answer only
+            // once the one-shot registration completes.
+            let sink = sink.clone();
+            agent::runtime::handle().spawn(async move {
+                agent::pi_providers::wait_ready().await;
+                sink.emit(models_snapshot().to_string());
+            });
+        }
         "model_chat" => {
             let Some(request_id) = cmd["requestId"].as_str().map(str::to_string) else {
                 return true;
@@ -2059,6 +2069,33 @@ mod tests {
             serde_json::from_str(&out.lock().unwrap()[0]).expect("models event is valid json");
         // The hermetic home registers no providers; the snapshot still lands
         // so waiting surfaces can leave their disabled state.
+        assert!(event["models"].is_array());
+    }
+
+    #[test]
+    fn list_models_replies_after_registration() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let (out, sink) = collect_sink();
+        let mut state = state_with(PathBuf::from("/"));
+
+        // The command must not answer before the one-shot provider
+        // registration finishes (hermetic home: no providers, but the
+        // snapshot still lands so waiting surfaces leave their disabled
+        // state).
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_models"}"#);
+        assert!(pump_until(&out, &mut cx, "models", 1));
+        let event: Value = serde_json::from_str(
+            out.lock()
+                .unwrap()
+                .iter()
+                .find(|raw| raw.contains("\"type\":\"models\""))
+                .expect("models event present"),
+        )
+        .expect("models event is valid json");
         assert!(event["models"].is_array());
     }
 
