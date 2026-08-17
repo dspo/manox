@@ -25,7 +25,7 @@ use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{MessageContent, TokenUsage};
+use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
@@ -877,6 +877,22 @@ where
                     *state.model.lock().unwrap() = Some(new_model.clone());
                     *pi_model = new_model;
                 }
+                Some(SessionCmd::SetThinkingLevel(level)) => {
+                    // Mid-run switch: the queued mutation lands at the next
+                    // turn boundary (same semantics as `set_model`); persist
+                    // the choice so a reopened session restores it.
+                    handle.set_thinking_level(level.clone());
+                    if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
+                        && let Err(err) = write_reasoning_effort_sidecar(
+                            sessions_dir,
+                            session_path,
+                            effort,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "failed to persist reasoning effort");
+                    }
+                }
                 Some(SessionCmd::PersistGeneratedTitle {
                     session_path: target,
                     title,
@@ -1587,6 +1603,17 @@ async fn run_actor(
     // reopened Danger session doesn't silently gate (or vice versa).
     let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
     state.gate.set_mode(approval_mode);
+    // The reasoning effort rides the same sidecar: restore it so a reopened
+    // Max session keeps its effort. The engine clamps against the current
+    // model and persists the change in the transcript (TS `setThinkingLevel`).
+    let reasoning_effort = load_reasoning_effort(&sessions_dir, session.path()).await;
+    if reasoning_effort != ReasoningEffort::default()
+        && let Err(err) = session
+            .set_thinking_level(Some(reasoning_effort.wire_value().to_string()))
+            .await
+    {
+        tracing::warn!(error = %err, "failed to restore reasoning effort");
+    }
     // Plan mode rides the same sidecar: restore the flag so a reopened
     // planning session keeps its read-only gate; the facade re-renders and
     // re-sends the instructions once it sees `Ready`.
@@ -1617,6 +1644,7 @@ async fn run_actor(
         restored,
         model: Some(pi_model.clone()),
         approval_mode,
+        reasoning_effort,
         plan_mode: plan_mode_restored,
         plan_file: plan_file_restored,
         plan_review_pending,
@@ -1970,8 +1998,16 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetThinkingLevel(level) => {
-                if let Err(err) = session.set_thinking_level(level).await {
+                if let Err(err) = session.set_thinking_level(level.clone()).await {
                     tracing::warn!("pi set_thinking_level failed: {err}");
+                }
+                // The facade's knob only sends "high"/"max"; persist the
+                // choice so a reopened session restores the same effort.
+                if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
+                    && let Err(err) =
+                        write_reasoning_effort_sidecar(&sessions_dir, session.path(), effort).await
+                {
+                    tracing::warn!(error = %err, "failed to persist reasoning effort");
                 }
             }
             SessionCmd::Open { path } => {
@@ -2849,6 +2885,43 @@ async fn write_approval_mode_sidecar(
         .unwrap_or_else(|| "autopilot".to_string());
     meta.approval_mode = Some(raw);
     pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// The reasoning effort persisted in a session's sidecar; fresh sessions
+/// (missing sidecar or field) default to High.
+async fn load_reasoning_effort(sessions_dir: &Path, session_path: &Path) -> ReasoningEffort {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => match meta.reasoning_effort.as_deref() {
+            Some("high") => ReasoningEffort::High,
+            Some("max") => ReasoningEffort::Max,
+            _ => ReasoningEffort::default(),
+        },
+        Err(_) => ReasoningEffort::default(),
+    }
+}
+
+/// Persist the reasoning effort in the session sidecar so the session
+/// reopens with the same effort.
+async fn write_reasoning_effort_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    effort: ReasoningEffort,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.reasoning_effort = Some(effort.wire_value().to_string());
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// Parse the facade's effort knob wire value; other levels (e.g. "off")
+/// are not user-facing and yield `None`.
+fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
+    match raw {
+        "high" => Some(ReasoningEffort::High),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
 }
 
 /// Re-read the session's persisted approval mode after a session switch and
@@ -4528,5 +4601,51 @@ mod tests {
             .clone();
         let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, &write, true).unwrap();
         assert!(reason.contains("unverifiable"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_sidecar_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-effort.jsonl");
+
+        // Fresh session: no sidecar -> default High.
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High
+        );
+
+        write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::Max)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::Max
+        );
+
+        write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::High)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_sidecar_tolerates_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-effort-unknown.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High,
+            "unknown persisted efforts fall back to the default"
+        );
     }
 }

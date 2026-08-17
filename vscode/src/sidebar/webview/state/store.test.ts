@@ -206,6 +206,7 @@ describe('info snapshots', () => {
         type: 'thread_info',
         sessionId: 'a',
         info: {
+          reasoning_effort: 'high',
           worktree_path: null,
           plan: null,
           goal: null,
@@ -386,7 +387,7 @@ describe('transcript folding', () => {
     expect(store.get().error).toBeNull();
   });
 
-  it('tracks model, approval-mode, and usage changes per thread', () => {
+  it('tracks model, approval-mode, reasoning-effort, and usage changes per thread', () => {
     const store = startSession();
     store.dispatch(event({ type: 'model_changed', sessionId: 's', from: null, to: 'm1' }));
     expect(thread(store)?.currentModelId).toBe('m1');
@@ -394,11 +395,32 @@ describe('transcript folding', () => {
     expect(thread(store)?.currentModelId).toBe('m2');
     store.dispatch(event({ type: 'approval_mode_changed', sessionId: 's', mode: 'autopilot' }));
     expect(thread(store)?.approvalMode).toBe('autopilot');
+    store.dispatch(event({ type: 'reasoning_effort_changed', sessionId: 's', effort: 'max' }));
+    expect(thread(store)?.reasoningEffort).toBe('max');
     store.dispatch(
       event({ type: 'usage', sessionId: 's', usage: { input_tokens: 1 }, cost: 0.5 }),
     );
     expect(thread(store)?.usage).toEqual({ input_tokens: 1 });
     expect(thread(store)?.cost).toBe(0.5);
+  });
+
+  it('thread_info restores the persisted reasoning effort', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'thread_info',
+      sessionId: 's',
+      info: {
+        reasoning_effort: 'max',
+        worktree_path: null,
+        plan: null,
+        goal: null,
+        usage: {},
+        cost: 0,
+        pending_auth_count: 0,
+        agents: [],
+      },
+    });
+    expect(thread(store)?.reasoningEffort).toBe('max');
   });
 
   it('echoUser stamps the current model and wall-clock time', () => {
@@ -460,6 +482,7 @@ describe('global folds', () => {
       type: 'thread_info',
       sessionId: 's',
       info: {
+        reasoning_effort: 'max',
         worktree_path: '/w',
         plan: null,
         goal: null,
@@ -493,6 +516,7 @@ describe('global folds', () => {
       type: 'thread_info',
       sessionId: 's',
       info: {
+        reasoning_effort: 'high',
         worktree_path: null,
         plan: null,
         goal: null,

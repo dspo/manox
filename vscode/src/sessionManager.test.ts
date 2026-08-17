@@ -286,6 +286,7 @@ describe('requestThreadInfo', () => {
       type: 'thread_info',
       sessionId: 't1',
       info: {
+        reasoning_effort: 'high',
         worktree_path: null,
         plan: null,
         goal: null,

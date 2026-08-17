@@ -4443,6 +4443,48 @@ impl Workspace {
                 submenu
             });
         }
+        // The reasoning-effort knob lives in the model dropdown, next to the
+        // model switch it tunes. The current effort is checked; a click
+        // applies to the next request (same mid-run semantics as a model
+        // switch; the menu dismisses like a model row).
+        let current_effort = workspace
+            .update(cx, |this, cx| this.thread.read(cx).reasoning_effort())
+            .unwrap_or_default();
+        let themed = cx.theme().clone();
+        menu = menu.separator();
+        menu = menu.label(i18n::t("workspace-reasoning-effort"));
+        for effort in agent::language_model::ReasoningEffort::ALL {
+            let ws = workspace.clone();
+            let themed = themed.clone();
+            let label = match effort {
+                agent::language_model::ReasoningEffort::High => i18n::t("workspace-reasoning-high"),
+                agent::language_model::ReasoningEffort::Max => i18n::t("workspace-reasoning-max"),
+            };
+            let selected = effort == current_effort;
+            menu = menu.item(
+                PopupMenuItem::element(move |_window, _cx| {
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(themed.foreground)
+                                .child(label.clone()),
+                        )
+                        .when(selected, |el| {
+                            el.child(Icon::new(IconName::Check).small().text_color(themed.accent))
+                        })
+                })
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    let _ = ws.update(cx, |this, cx| {
+                        this.thread.update(cx, |t, cx| {
+                            t.set_reasoning_effort(effort, cx);
+                        });
+                    });
+                }),
+            );
+        }
         menu
     }
 

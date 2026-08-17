@@ -8,6 +8,7 @@ import type {
   GoalAction,
   ImageAttachment,
   PlanVerdictChoice,
+  ReasoningEffort,
 } from '../../../protocol';
 import type { HostToWebview, WebviewToHost } from '../../messages';
 
@@ -57,9 +58,12 @@ export class ThreadApi {
   cancel(): void {
     post({ type: 'cancel', sessionId: this.sessionId });
   }
-
   setModel(id: string): void {
     post({ type: 'set_model', sessionId: this.sessionId, id });
+  }
+
+  setReasoningEffort(effort: ReasoningEffort): void {
+    post({ type: 'set_reasoning_effort', sessionId: this.sessionId, effort });
   }
 
   setApprovalMode(mode: ApprovalMode): void {

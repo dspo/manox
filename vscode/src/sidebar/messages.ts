@@ -12,6 +12,7 @@ import type {
   ImageAttachment,
   ModelInfo,
   PlanVerdictChoice,
+  ReasoningEffort,
   ThreadInfoSnapshot,
   ThreadListItem,
 } from '../protocol';
@@ -21,6 +22,7 @@ export type WebviewToHost =
   | { type: 'approve'; sessionId: string; id: string; allow: boolean }
   | { type: 'cancel'; sessionId: string }
   | { type: 'set_model'; sessionId: string; id: string }
+  | { type: 'set_reasoning_effort'; sessionId: string; effort: ReasoningEffort }
   | { type: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
   | { type: 'set_plan_mode'; sessionId: string; enabled: boolean }
   | { type: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }

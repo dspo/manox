@@ -19,6 +19,7 @@ export type Command =
 	| { cmd: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
 	| { cmd: 'cancel_turn'; sessionId: string }
 	| { cmd: 'set_model'; sessionId: string; id: string }
+	| { cmd: 'set_reasoning_effort'; sessionId: string; effort: ReasoningEffort }
 	| { cmd: 'get_current_model'; sessionId: string }
 	| { cmd: 'list_models' }
 	| { cmd: 'get_usage'; sessionId: string }
@@ -110,6 +111,9 @@ export type ToolCallStatus =
 /** Tool-authorization policy: autopilot gates on the safety reviewer with
  * user escalation, danger runs every tool call without prompting. */
 export type ApprovalMode = 'autopilot' | 'danger';
+
+/** User-facing reasoning-effort knob for the model dropdown (`high`/`max`). */
+export type ReasoningEffort = 'high' | 'max';
 
 export interface ModelInfo {
 	id: string;
@@ -205,6 +209,7 @@ export interface GitStats {
 
 /** Conversation info panel snapshot (thread_info event payload). */
 export interface ThreadInfoSnapshot {
+	reasoning_effort: ReasoningEffort;
 	worktree_path: string | null;
 	plan: PlanSnapshotWire | null;
 	goal: GoalSnapshotWire | null;
@@ -320,6 +325,7 @@ export type ActorEvent =
 	  }
 	// state
 	| { type: 'model_changed'; sessionId: string; from: string | null; to: string }
+	| { type: 'reasoning_effort_changed'; sessionId: string; effort: ReasoningEffort }
 	| { type: 'approval_mode_changed'; sessionId: string; mode: ApprovalMode }
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
