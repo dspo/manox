@@ -88,9 +88,10 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     options: vscode.PrepareLanguageModelChatModelOptions,
     _token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelChatInformation[]> {
-    // The silent resolution path (default-model lookup) must not boot the
-    // actor; the picker's explicit listing does.
-    if (options.silent) return [];
+    // VS Code enumerates vendor models with silent=true on the picker and the
+    // Manage Models table; manox needs no user interaction to list its
+    // models, so silent must still return them (init is idempotent and the
+    // actor boot is one-time).
     try {
       await this.manager.init(resolveWorkspaceCwd());
       const models = await this.manager.listModels();

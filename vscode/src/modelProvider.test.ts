@@ -230,13 +230,22 @@ describe('provideLanguageModelChatInformation', () => {
     ]);
   });
 
-  it('stays silent for silent resolution', async () => {
+  it('still lists models on the silent enumeration path', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
-    await expect(
-      provider.provideLanguageModelChatInformation({ silent: true }, fakeToken()),
-    ).resolves.toEqual([]);
-    expect(transport.sent).toHaveLength(0);
+    const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [{ id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 200000 }],
+    });
+    // VS Code's picker/Manage Models table enumerate with silent=true; the
+    // models must still be returned.
+    await expect(pending).resolves.toEqual([
+      expect.objectContaining({ id: 'm', isUserSelectable: true }),
+    ]);
   });
 
   it('returns no models when the actor never responds', async () => {
