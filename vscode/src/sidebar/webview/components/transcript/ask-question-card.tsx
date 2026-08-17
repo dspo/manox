@@ -91,13 +91,20 @@ export const AskQuestionCard = ({ item, sessionId }: AskQuestionCardProps) => {
 
   // Answered state: the drawer is gone; the card shows the actor's rendered
   // verdict (per-question Question/Answer blocks plus any supplemental note)
-  // once `tool_result` lands, keeping the human title throughout.
+  // once `tool_result` lands, keeping the human title throughout. A denied
+  // or cancelled question renders its output as an error, mirroring the
+  // tool card's error styling.
   if (item.answered) {
     return (
       <div className="border-border bg-card text-foreground rounded-lg border px-3 py-2 text-sm">
         <div className="mb-1 font-medium">{item.summary}</div>
         {item.output && (
-          <pre className="text-muted-foreground whitespace-pre-wrap font-code text-xs">
+          <pre
+            className={cn(
+              'whitespace-pre-wrap font-code text-xs',
+              item.isError ? 'text-danger' : 'text-muted-foreground',
+            )}
+          >
             {item.output}
           </pre>
         )}

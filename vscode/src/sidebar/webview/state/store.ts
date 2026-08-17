@@ -398,22 +398,35 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       return appendAssistantText(t, ev.text);
     case 'agent_thinking':
       return appendThinkingText(t, ev.text);
-    case 'tool_call':
-      // AskUserQuestion owns a single surface: the interactive card while
-      // pending (no generic tool item beside it) that morphs into the
-      // answered card once the completion call lands. Non-ask tools keep the
-      // ordinary tool-item lifecycle.
+    case 'tool_call': {
       if (ev.name === 'AskUserQuestion') {
         const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
-        if (askIdx !== -1) {
-          if (ev.status === 'pending-approval') return t;
-          const items = t.items.slice();
-          items[askIdx] = { ...(items[askIdx] as AskQuestionTranscriptItem), answered: true };
-          return { ...t, items };
-        }
-        if (ev.status === 'pending-approval') return t;
+        // The kernel emits the start (running) and the tool emits the
+        // pending-approval marker before the authorization card exists; both
+        // would spawn a generic tool item beside the card. The card is the
+        // single surface for the whole lifecycle, so every AskUserQuestion
+        // event without a card to morph is dropped.
+        if (askIdx === -1) return t;
+        // Only terminal statuses morph the card into the answered state;
+        // running/pending markers keep the interactive drawer live.
+        const status = foldToolStatus(ev.status);
+        if (!TERMINAL_TOOL_STATUS.has(status)) return t;
+        const items = t.items.slice();
+        items[askIdx] = { ...(items[askIdx] as AskQuestionTranscriptItem), answered: true };
+        return { ...t, items };
       }
-      return upsertToolItem(t, ev.id, (prev) => {
+      // An AutoPilot escalation re-brands the real tool's card as
+      // AskUserQuestion under the same id; the gate's restore event hands
+      // the id back to the real tool (name != AskUserQuestion). Drop the
+      // question card so the real tool item owns the completion and result.
+      let base = t;
+      const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+      if (askIdx !== -1) {
+        const items = t.items.slice();
+        items.splice(askIdx, 1);
+        base = { ...t, items };
+      }
+      return upsertToolItem(base, ev.id, (prev) => {
         const status = foldToolStatus(ev.status);
         return {
           id: ev.id,
@@ -427,6 +440,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           isError: status === 'failed' ? true : (prev?.isError ?? false),
         };
       });
+    }
     case 'tool_output':
       return upsertToolItem(t, ev.id, (prev) => ({
         id: ev.id,
