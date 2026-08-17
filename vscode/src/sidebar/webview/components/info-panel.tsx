@@ -1,8 +1,8 @@
-// Conversation info panel: the captain and sub-agents with live status,
+// Conversation info card: the captain and sub-agents with live status,
 // branch with pending-change counts, a spend tree broken down per model,
-// and a static sources section. Rendered as the right-hand column of the
-// conversation view on wide containers; sizing and scrolling belong to the
-// caller.
+// and a static sources section. Rendered as a floating card over the
+// transcript's top-right corner on wide containers; positioning belongs to
+// the caller.
 
 import {
   Bot,
@@ -367,6 +367,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
     <aside
       className={cn(
         'font-chrome bg-card flex flex-col gap-3 rounded-lg border border-border p-3 text-xs',
+        'shadow-[-3px_6px_10px_rgba(0,0,0,0.22)]',
         className,
       )}
     >
