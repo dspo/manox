@@ -45,11 +45,10 @@ pub fn current() -> Host {
 /// Untagged files (created before the host tag existed) belong to the
 /// native app; an unrecognized slug belongs to no host.
 pub fn session_host(metadata: Option<&serde_json::Value>) -> Option<Host> {
-    match metadata
-        .and_then(|m| m.get("host"))
-        .and_then(|v| v.as_str())
-    {
-        Some(slug) => Host::from_slug(slug),
+    match metadata.and_then(|m| m.get("host")) {
+        // A present but non-string (or unrecognized) value belongs to no
+        // host; only an absent key marks a pre-tag legacy file.
+        Some(value) => value.as_str().and_then(Host::from_slug),
         None => Some(Host::ManoxApp),
     }
 }
@@ -96,6 +95,8 @@ mod tests {
             session_host(Some(&serde_json::json!({ "host": "bogus" }))),
             None
         );
+        // A present but non-string value belongs to no host (fail-closed).
+        assert_eq!(session_host(Some(&serde_json::json!({ "host": 42 }))), None);
     }
 
     #[test]
