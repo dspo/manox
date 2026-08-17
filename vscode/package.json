@@ -95,6 +95,17 @@
         "command": "manox.newSession",
         "title": "manox: New Session",
         "icon": "$(add)"
+      },
+      {
+        "command": "manox.openTurnNavigator",
+        "title": "manox: Open User Turn Navigator"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "manox.openTurnNavigator",
+        "mac": "cmd+m",
+        "when": "view == manox.chatView"
       }
     ],
     "menus": {

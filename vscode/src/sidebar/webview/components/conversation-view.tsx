@@ -7,7 +7,7 @@ import { ArrowLeft, Search } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
-import { api, ThreadApi } from '../api/client';
+import { api, onOpenTurnNavigator, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
 import { chatLayoutForWidth, INFO_PANEL_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
 import { collectUserTurns } from '../lib/turn-nav';
@@ -57,6 +57,9 @@ export const ConversationView = ({
 
   const [navigatorOpen, setNavigatorOpen] = useState(false);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  // macOS cmd+m arrives from the host (VS Code keybinding command) and
+  // toggles the navigator, mirroring the gpui host's global binding.
+  useEffect(() => onOpenTurnNavigator(() => setNavigatorOpen((open) => !open)), []);
   // The collect pass only matters while the overlay is open; the transcript
   // streams a new item reference on every token during a turn.
   const turns = useMemo(

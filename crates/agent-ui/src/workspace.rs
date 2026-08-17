@@ -2594,6 +2594,10 @@ impl Workspace {
             old_id.clone(),
             self.input_state.read(cx).value().to_string(),
         );
+        // A recall walk belongs to the outgoing thread's input; the derived
+        // state would self-correct anyway, but the draft stash is the
+        // natural place to drop it.
+        self.recall_index = -1;
         // The editor pane is a right-side resource of the outgoing thread:
         // stash its text so a switch-back restores the draft (mirrors the
         // composer `drafts` stash above).
@@ -6934,7 +6938,7 @@ impl Workspace {
                     cx.stop_propagation();
                 }),
             )
-            // Composer history recall: fires only via the `composer = recall
+            // Composer history recall: fires only via the `composer == recall
             // > Input` bindings (the wrapper sets that context exactly when
             // the completion context is absent). The handlers stop
             // propagation only when they act, so a deferred key falls through

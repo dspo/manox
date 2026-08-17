@@ -376,6 +376,10 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
       return { ...state, error: msg.message };
     case 'event':
       return foldEvent(state, msg.event);
+    case 'open_turn_navigator':
+      // Host-requested navigator toggle (macOS cmd+m); the component
+      // subscribes via `onOpenTurnNavigator`, the store is untouched.
+      return state;
   }
 }
 
