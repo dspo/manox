@@ -22,9 +22,6 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{Div, ListState, Pixels, px};
 
-/// Max content width (centered, width-capped).
-pub const CONTENT_MAX_W: f32 = 760.0;
-
 /// Width-keyed invalidation for native message-list row heights.
 ///
 /// The pinned official GPUI revision remeasures visible rows, but retains the
@@ -54,11 +51,13 @@ impl MessageListWidthInvalidator {
     }
 }
 
-/// Wrap content in a full-width, centered, width-capped container.
+/// Wrap content in a full-width, centered container that adapts to the
+/// window width (no cap — the host dropped the fixed content width so wide
+/// windows get the full span).
 ///
-/// Used by message entries and the input area so lines don't run too long on
-/// wide screens. The horizontal inset keeps content off the panel edges when
-/// the window shrinks near its minimum width.
+/// Used by message entries and the input area. The horizontal inset keeps
+/// content off the panel edges when the window shrinks near its minimum
+/// width.
 ///
 /// `min_w_0` on both the outer row and inner column breaks the min-content
 /// chain end to end: without it the row's auto min-size = its widest child's
@@ -71,11 +70,10 @@ impl MessageListWidthInvalidator {
 /// never reaches the window as a horizontal scrollbar.
 pub fn centered(child: impl gpui::IntoElement) -> Div {
     use gpui_component::{h_flex, v_flex};
-    h_flex().w_full().min_w_0().justify_center().px_4().child(
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .max_w(px(CONTENT_MAX_W))
-            .child(child),
-    )
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .justify_center()
+        .px_4()
+        .child(v_flex().w_full().min_w_0().child(child))
 }
