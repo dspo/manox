@@ -36,12 +36,24 @@ function copyText(text: string): boolean {
   return ok;
 }
 
+/** macOS displays the command glyph in key hints; other platforms use Ctrl. */
+const COPY_GLYPH =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform ?? '')
+    ? '⌘C'
+    : 'Ctrl+C';
+
 export const TurnNavigator = ({ turns, onNavigate, onClose }: TurnNavigatorProps) => {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState(0);
   const [copied, setCopied] = useState(false);
   const filtered = useMemo(() => filterTurns(turns, query), [turns, query]);
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // A shrinking turn list (compaction) can leave the selection past the end;
+  // clamp it back so the highlighted row stays visible (gpui parity).
+  useEffect(() => {
+    if (filtered.length > 0 && selected >= filtered.length) setSelected(0);
+  }, [filtered.length, selected]);
 
   // Mirrors the gpui host's `ScrollStrategy::Nearest`: keep the highlighted
   // row visible as selection moves under the keyboard.
@@ -66,6 +78,11 @@ export const TurnNavigator = ({ turns, onNavigate, onClose }: TurnNavigatorProps
       const entryIx = filtered[selected];
       if (entryIx !== undefined) onNavigate(turns[entryIx].id);
     } else if (e.key === 'Escape') {
+      onClose();
+    } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'm') {
+      // Mirror the gpui host's global cmd-m toggle: pressing it again from
+      // inside the navigator closes it.
+      e.preventDefault();
       onClose();
     } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c') {
       const entryIx = filtered[selected];
@@ -128,7 +145,7 @@ export const TurnNavigator = ({ turns, onNavigate, onClose }: TurnNavigatorProps
         )}
       </div>
       <div className="border-t border-border px-2 py-1 text-center text-[10px] text-muted-foreground">
-        {copied ? t('turn_navigator_copied') : '↑↓ · ↵ · ⌘C · Esc'}
+        {copied ? t('turn_navigator_copied') : `↑↓ · ↵ · ${COPY_GLYPH} · Esc`}
       </div>
     </div>
   );
