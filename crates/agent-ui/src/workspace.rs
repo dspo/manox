@@ -7453,6 +7453,8 @@ mod tests {
         ComposerPlacement, RecallDirection, RecallStep, Workspace, composer_placement,
         editor_can_submit,
     };
+    use gpui::InteractiveElement as _;
+    use gpui::prelude::*;
 
     fn step(
         direction: RecallDirection,
@@ -7559,5 +7561,72 @@ mod tests {
         assert!(!editor_can_submit(false, true, false, "draft"));
         assert!(!editor_can_submit(false, false, true, "draft"));
         assert!(!editor_can_submit(false, false, false, "   "));
+    }
+    /// Minimal composer harness for the recall keybinding test: a wrapper
+    /// carrying the `composer = recall` context around a live input.
+    struct RecallTestComposer {
+        input: gpui::Entity<gpui_component::input::InputState>,
+    }
+
+    impl gpui::Render for RecallTestComposer {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::div()
+                .key_context("composer = recall")
+                .child(gpui_component::input::Input::new(&self.input))
+        }
+    }
+
+    #[gpui::test]
+    fn recall_bindings_defer_to_native_caret_with_typed_text(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.bind_keys(crate::composer_recall_key_bindings()));
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot_for_window = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| RecallTestComposer {
+                input: cx
+                    .new(|cx| gpui_component::input::InputState::new(window, cx).multi_line(true)),
+            });
+            let input = view.read(cx).input.clone();
+            *slot_for_window.borrow_mut() = Some(input);
+            gpui_component::Root::new(view, window, cx)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(640.), gpui::px(480.)));
+        let input = slot.borrow().as_ref().expect("input initialized").clone();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
+
+        // A multi-line draft: the recall binding matches every Up, but with
+        // no recall applicable the handler defers (no stop_propagation), so
+        // the Input's native MoveUp still runs — the caret moves up a line.
+        cx.simulate_input("hello\nworld");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.selected_range().end),
+            11
+        );
+        cx.simulate_keystrokes("up");
+        let (row, end) = input.read_with(cx, |state, _| {
+            let end = state.selected_range().end;
+            (
+                gpui_component::input::RopeExt::offset_to_position(state.text(), end).line,
+                end,
+            )
+        });
+        assert_eq!(row, 0, "native MoveUp moved the caret to the first line");
+        assert!(end < 11);
+        // Shift+Up is a selection, not a recall key, so it still extends the
+        // selection without interference from the recall bindings. Move down
+        // a line first so the selection has somewhere to extend from.
+        cx.simulate_keystrokes("down");
+        cx.simulate_keystrokes("shift-up");
+        let (start, end) = input.read_with(cx, |state, _| {
+            let range = state.selected_range();
+            (range.start, range.end)
+        });
+        assert_ne!(start, end);
     }
 }
