@@ -16,8 +16,6 @@ import type { TranscriptItem } from '../../state/store';
 import { cn } from '../../lib/utils';
 import {
   Confirmation,
-  ConfirmationAction,
-  ConfirmationActions,
   ConfirmationRequest,
   ConfirmationTitle,
 } from '../ai/confirmation';
@@ -242,12 +240,6 @@ export const AskQuestionCard = ({ item, sessionId }: AskQuestionCardProps) => {
           />
         </div>
       </ConfirmationRequest>
-      <ConfirmationActions>
-        <ConfirmationAction onClick={cancel} variant="outline">
-          {t('ask_cancel')}
-        </ConfirmationAction>
-        <ConfirmationAction onClick={submit}>{t('ask_submit')}</ConfirmationAction>
-      </ConfirmationActions>
     </Confirmation>
   );
 };
