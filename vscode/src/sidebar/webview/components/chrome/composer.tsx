@@ -4,12 +4,13 @@
 
 import { ArrowUp, Bot, Check, ChevronDown, Pause, TriangleAlert, X } from 'lucide-react';
 import type { ClipboardEvent, KeyboardEvent } from 'react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ApprovalMode, CommandEntry, ModelInfo, ReasoningEffort } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
 import { hasCommandKey, t, type I18nKey } from '../../lib/i18n';
 import { enterAction } from '../../lib/ime';
+import { recallStep } from '../../lib/turn-recall';
 import { cn } from '../../lib/utils';
 import { store } from '../../state/bridge';
 import {
@@ -173,6 +174,12 @@ export type ComposerProps = {
   onCreateSession?: (text: string, images: { data: string; mimeType: string }[]) => void;
   /** Draft-mode model selection; the chosen id rides along on creation. */
   onModelChange?: (modelId: string) => void;
+  /** Newest-first user-turn texts of the owning thread, for ↑ recall. */
+  userTurns?: { id: string; text: string }[];
+  /** Opens the turn navigator (cmd/ctrl+m while the input is focused). */
+  onOpenTurnNavigator?: () => void;
+  /** Parent-owned ref for refocusing the composer when the navigator closes. */
+  composerInputRef?: React.RefObject<HTMLTextAreaElement | null>;
 };
 
 export const Composer = ({
@@ -185,6 +192,9 @@ export const Composer = ({
   planMode,
   commands,
   creating = false,
+  userTurns = [],
+  onOpenTurnNavigator,
+  composerInputRef,
   onCreateSession,
   onModelChange,
 }: ComposerProps) => {
@@ -192,7 +202,12 @@ export const Composer = ({
   const [images, setImages] = useState<PastedImage[]>([]);
   const [activeMatch, setActiveMatch] = useState(0);
   const [typeaheadDismissed, setTypeaheadDismissed] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Recall position into `userTurns` (newest-first); -1 = not recalling.
+  // Derived state: the reducer exits recall as soon as the value diverges
+  // from the recalled text, so typing/sending resets it implicitly.
+  const [recallIndex, setRecallIndex] = useState(-1);
+  const fallbackRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = composerInputRef ?? fallbackRef;
   // IME composition state: while composing, and for the trailing Enter some
   // engines fire right after `compositionend`, the key is deferred to the
   // IME. The timestamp window keeps the deferral tight so a later genuine
@@ -215,6 +230,8 @@ export const Composer = ({
     setActiveMatch(0);
     setTypeaheadDismissed(false);
   }, [text]);
+  // The recall walk is over the owning thread's user turns, newest first.
+  const recallTurns = useMemo(() => userTurns.map((turn) => turn.text), [userTurns]);
 
   const complete = useCallback((entry: CommandEntry) => {
     setText(`/${entry.name} `);
@@ -275,6 +292,15 @@ export const Composer = ({
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Cmd/Ctrl-M opens the turn navigator, mirroring the gpui host's
+    // binding; the composer only owns the trigger, the parent renders it.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'm') {
+      if (!onOpenTurnNavigator) return;
+      if (e.nativeEvent.isComposing) return;
+      e.preventDefault();
+      onOpenTurnNavigator();
+      return;
+    }
     if (e.key === 'Enter') {
       const trailingComposition =
         Date.now() - compositionEndedAtRef.current < COMPOSITION_TRAIL_WINDOW_MS;
@@ -317,6 +343,29 @@ export const Composer = ({
         e.preventDefault();
         setTypeaheadDismissed(true);
         return;
+      }
+    }
+    // History recall: the typeahead above already consumed ArrowUp/Down
+    // while visible, so reaching here means the arrows belong to the input.
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      if (e.nativeEvent.isComposing) return;
+      const { index, step } = recallStep(
+        e.key === 'ArrowUp' ? 'up' : 'down',
+        text,
+        recallIndex,
+        recallTurns,
+      );
+      setRecallIndex(index);
+      if (step.kind === 'none') return;
+      e.preventDefault();
+      if (step.kind === 'clear') {
+        setText('');
+      } else {
+        setText(step.text);
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (el) el.setSelectionRange(el.value.length, el.value.length);
+        });
       }
     }
   };

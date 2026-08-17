@@ -51,6 +51,7 @@ const DICT = {
   turn_navigator_no_results: { en: 'No matching messages', zh: '没有匹配的消息' },
   turn_navigator_attachment_only: { en: 'Attachment-only message', zh: '仅附件消息' },
   turn_navigator_empty_message: { en: 'Empty message', zh: '空消息' },
+  turn_navigator_copied: { en: 'Message copied to clipboard.', zh: '消息已复制到剪贴板。' },
   copy: { en: 'Copy', zh: '复制' },
   send: { en: 'Send', zh: '发送' },
   stop: { en: 'Stop', zh: '停止' },

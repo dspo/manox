@@ -4,7 +4,7 @@
 // joins as a side column, then the session list joins on the left.
 
 import { ArrowLeft, Search } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, ThreadApi } from '../api/client';
@@ -12,7 +12,7 @@ import { t } from '../lib/i18n';
 import { chatLayoutForWidth, INFO_PANEL_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
 import { collectUserTurns } from '../lib/turn-nav';
 import { useContainerWidth } from '../lib/use-container-width';
-import type { ThreadState } from '../state/bridge';
+import type { ThreadState, TranscriptItem } from '../state/bridge';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
 import { PlanModeBanner } from './chrome/plan-mode-banner';
@@ -56,15 +56,35 @@ export const ConversationView = ({
   }, [thread.sessionId]);
 
   const [navigatorOpen, setNavigatorOpen] = useState(false);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   // The collect pass only matters while the overlay is open; the transcript
   // streams a new item reference on every token during a turn.
   const turns = useMemo(
     () => (navigatorOpen ? collectUserTurns(thread.items) : []),
     [navigatorOpen, thread.items],
   );
+  // Recall texts stay available while the composer is live; the overlay's
+  // perf gate above does not apply to them because recall must work without
+  // opening the navigator first.
+  const userTurns = useMemo(
+    () =>
+      thread.items
+        .filter(
+          (item): item is Extract<TranscriptItem, { kind: 'user' }> =>
+            item.kind === 'user' && item.text.trim() !== '',
+        )
+        .map((item) => ({ id: item.id, text: item.text }))
+        .reverse(),
+    [thread.items],
+  );
+
+  const closeNavigator = () => {
+    setNavigatorOpen(false);
+    composerInputRef.current?.focus();
+  };
 
   const navigateToTurn = (id: string) => {
-    setNavigatorOpen(false);
+    closeNavigator();
     document.getElementById(`turn-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
@@ -121,13 +141,9 @@ export const ConversationView = ({
             {navigatorOpen && (
               <div
                 className="absolute inset-0 z-10 flex items-center justify-center bg-background/60"
-                onClick={() => setNavigatorOpen(false)}
+                onClick={closeNavigator}
               >
-                <TurnNavigator
-                  onClose={() => setNavigatorOpen(false)}
-                  onNavigate={navigateToTurn}
-                  turns={turns}
-                />
+                <TurnNavigator onClose={closeNavigator} onNavigate={navigateToTurn} turns={turns} />
               </div>
             )}
           </div>
@@ -135,13 +151,16 @@ export const ConversationView = ({
           <Composer
             approvalMode={thread.approvalMode}
             commands={commands}
+            composerInputRef={composerInputRef}
             creating={store.isCreating(thread.sessionId)}
             currentModelId={thread.currentModelId}
             models={models}
+            onOpenTurnNavigator={() => setNavigatorOpen(true)}
             planMode={thread.planMode}
             reasoningEffort={thread.reasoningEffort}
             sessionId={thread.sessionId}
             turnActive={thread.turnActive}
+            userTurns={userTurns}
           />
         </div>
         {layout !== 'conversation' && (
