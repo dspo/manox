@@ -97,6 +97,15 @@ struct SubagentInfo {
 struct PendingPlan {
     plan_file: String,
 }
+/// A submission parked while a turn is running; drained into one batched
+/// follow-up turn when the turn settles (`run_turn` joins the texts with
+/// blank lines, matching the gpui host's `flush_queued_follow_ups`).
+struct QueuedSubmit {
+    client_id: String,
+    text: String,
+    images: Vec<(String, String)>,
+    ui: agent::MessageUiMetadata,
+}
 
 struct SessionState {
     thread: Entity<Thread>,
@@ -107,6 +116,8 @@ struct SessionState {
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
     /// Latest plan submitted for review (PlanReady), for `plan_verdict`.
     pending_plan: Arc<Mutex<Option<PendingPlan>>>,
+    /// Submissions parked while a turn runs; drained on `TurnFinished`.
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
 }
 
 struct ActorState {
@@ -239,6 +250,7 @@ fn handle_command(
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
             let pending_plan = Arc::new(Mutex::new(None));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let thread = cx.update(|app| Thread::new_fresh(ThreadId(id.clone()), cwd, app));
             let subscription = cx.update(|app| {
                 subscribe_thread(
@@ -248,6 +260,7 @@ fn handle_command(
                     turn_active.clone(),
                     subagents.clone(),
                     pending_plan.clone(),
+                    pending_submits.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -266,6 +279,7 @@ fn handle_command(
                     turn_active,
                     subagents,
                     pending_plan,
+                    pending_submits,
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
@@ -304,6 +318,7 @@ fn handle_command(
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
             let pending_plan = Arc::new(Mutex::new(None));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let subscription = cx.update(|app| {
                 subscribe_thread(
                     app,
@@ -312,6 +327,7 @@ fn handle_command(
                     turn_active.clone(),
                     subagents.clone(),
                     pending_plan.clone(),
+                    pending_submits.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -324,6 +340,7 @@ fn handle_command(
                     _subscription: subscription,
                     turn_active,
                     subagents,
+                    pending_submits,
                     pending_plan,
                 },
             );
@@ -534,6 +551,30 @@ fn handle_command(
                 return true;
             }
             with_session(state, session_id.as_deref(), sink, |session, _| {
+                // A running turn parks plain (non-slash) submissions: the
+                // webview echoes the bubble locally and the actor drains the
+                // queue into one follow-up turn when the turn settles. Slash
+                // turns keep executing immediately (their parameter forms
+                // park the prompt in the thread's own queue via
+                // `insert_slash_turn`, which the same drain carries out).
+                if session.turn_active.load(Ordering::SeqCst) && slash.is_none() {
+                    let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+                    let ui = cx.update(|app| {
+                        let t = session.thread.read(app);
+                        MessageUiMetadata {
+                            model_id: t.model().map(|m| m.id.clone()),
+                            approval_mode: Some(t.approval_mode().as_i64()),
+                            ..Default::default()
+                        }
+                    });
+                    session.pending_submits.lock().unwrap().push(QueuedSubmit {
+                        client_id,
+                        text,
+                        images,
+                        ui,
+                    });
+                    return;
+                }
                 cx.update(|app| {
                     session.thread.update(app, |t, cx| {
                         let ui = MessageUiMetadata {
@@ -580,6 +621,75 @@ fn handle_command(
                 });
             });
         }
+        "steer" => with_session(state, session_id.as_deref(), sink, |session, sink| {
+            let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+            let text = cmd["text"].as_str().unwrap_or_default().to_string();
+            let images: Vec<(String, String)> = cmd["images"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|img| {
+                            Some((
+                                img.get("data")?.as_str()?.to_string(),
+                                img.get("mimeType")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Remove the parked copy so the turn-end drain does not resend
+            // the same message as a plain follow-up.
+            session
+                .pending_submits
+                .lock()
+                .unwrap()
+                .retain(|q| q.client_id != client_id);
+            let session_id = session_id.as_deref().unwrap_or_default();
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    let ui = MessageUiMetadata {
+                        model_id: t.model().map(|m| m.id.clone()),
+                        approval_mode: Some(t.approval_mode().as_i64()),
+                        ..Default::default()
+                    };
+                    let mut content = Vec::new();
+                    if !text.trim().is_empty() {
+                        content.push(MessageContent::Text(text));
+                    }
+                    content.extend(
+                        images
+                            .into_iter()
+                            .map(|(data, mime_type)| MessageContent::Image { data, mime_type }),
+                    );
+                    if t.is_running() {
+                        let message_id = t.enqueue_steer(content, Some(ui), cx);
+                        sink.emit(
+                            serde_json::json!({
+                                "type": "steer_pending",
+                                "sessionId": session_id,
+                                "clientId": client_id,
+                                "messageId": message_id,
+                            })
+                            .to_string(),
+                        );
+                    } else {
+                        // Defensive: the webview only shows the steer action
+                        // while a turn is active; an idle steer degrades to a
+                        // regular message.
+                        t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                        t.run_turn(cx);
+                    }
+                });
+            });
+        }),
+        "drop_queued" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+            session
+                .pending_submits
+                .lock()
+                .unwrap()
+                .retain(|q| q.client_id != client_id);
+        }),
         "cancel_turn" => with_session(state, session_id.as_deref(), sink, |session, _| {
             cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
         }),
@@ -910,6 +1020,7 @@ fn subscribe_thread(
     turn_active: Arc<AtomicBool>,
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
     pending_plan: Arc<Mutex<Option<PendingPlan>>>,
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     focused: Arc<Mutex<Option<String>>>,
     sink: EventSink,
 ) -> Subscription {
@@ -925,7 +1036,7 @@ fn subscribe_thread(
                         s.set_errored(&id, false, cx);
                     });
                 }
-                ThreadEvent::TurnFinished { .. } => {
+                ThreadEvent::TurnFinished { cancelled, .. } => {
                     turn_active.store(false, Ordering::SeqCst);
                     let unread = focused.lock().unwrap().as_deref() != Some(session_id.as_str());
                     let id = session_id.clone();
@@ -937,6 +1048,50 @@ fn subscribe_thread(
                             s.set_unread(&id, true, cx);
                         }
                     });
+                    // A settled (non-cancelled) run drains the parked
+                    // submissions into one follow-up turn. The follow-up
+                    // starts deferred so the current turn's `turn_finished`
+                    // wire event lands before the re-entrant
+                    // `turn_started` — the webview keys turnActive off
+                    // those events, and the gpui host gets the same order
+                    // by flushing last.
+                    if !cancelled {
+                        let drained = pending_submits
+                            .lock()
+                            .unwrap()
+                            .drain(..)
+                            .collect::<Vec<_>>();
+                        let drained_any = !drained.is_empty();
+                        if drained_any {
+                            entity.update(app, |t, cx| {
+                                for q in drained {
+                                    let mut content = Vec::new();
+                                    if !q.text.trim().is_empty() {
+                                        content.push(MessageContent::Text(q.text));
+                                    }
+                                    content.extend(q.images.into_iter().map(
+                                        |(data, mime_type)| MessageContent::Image {
+                                            data,
+                                            mime_type,
+                                        },
+                                    ));
+                                    t.insert_user_message_with_content_and_ui_metadata(
+                                        content,
+                                        Some(q.ui),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                        let follow_up = entity.clone();
+                        app.defer(move |app| {
+                            follow_up.update(app, |t, cx| {
+                                if drained_any || t.has_pending_prompts() {
+                                    t.run_turn(cx);
+                                }
+                            });
+                        });
+                    }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
                     let id = session_id.clone();
@@ -2662,6 +2817,321 @@ mod tests {
     }
 
     #[test]
+    fn running_submit_parks_into_pending_submits() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"queued one","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            !types(&out).contains(&"turn_started".to_string()),
+            "a parked submit must not start a turn"
+        );
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert!(
+            messages.is_empty(),
+            "a parked submit must not insert a message"
+        );
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn settled_turn_drains_parked_submits_into_a_follow_up_run() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"follow up","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            pump_until(&out, &mut cx, "turn_started", 1),
+            "the drained queue starts the follow-up turn"
+        );
+
+        assert_eq!(engine.runs.lock().unwrap().as_slice(), ["follow up"]);
+        assert!(
+            state.sessions["s1"]
+                .pending_submits
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Text(t) if t == "follow up"))
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn follow_up_turn_emits_turn_finished_before_turn_started() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"follow up","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        assert!(pump_until(&out, &mut cx, "turn_started", 1));
+
+        // The drained follow-up must surface as a turn whose start lands
+        // after the previous turn's wire finish, so the webview never
+        // renders the running follow-up as idle.
+        let order: Vec<String> = types(&out)
+            .into_iter()
+            .filter(|t| t == "turn_finished" || t == "turn_started")
+            .collect();
+        assert_eq!(order, ["turn_finished", "turn_started"]);
+        assert!(
+            state.sessions["s1"].turn_active.load(Ordering::SeqCst),
+            "the follow-up turn keeps the session turn-active"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn steer_while_running_emits_steer_pending_and_removes_the_parked_copy() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        // A plain submit starts a real run (the FakeEngine never settles),
+        // which flips both the thread's running flag and the actor's
+        // turn-active gate.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"first"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"turn_started".to_string()));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"queued","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"steer","sessionId":"s1","clientId":"c1","text":"steer me"}"#,
+        );
+        cx.run_until_parked();
+
+        assert_eq!(engine.steer_calls.lock().unwrap().as_slice(), ["steer me"]);
+        assert!(
+            state.sessions["s1"]
+                .pending_submits
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the steered submit must not survive for the turn-end drain"
+        );
+        let pending = out
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|raw| {
+                let v: Value = serde_json::from_str(raw).unwrap();
+                (v["type"] == "steer_pending").then_some(v)
+            })
+            .expect("steer_pending emitted");
+        assert_eq!(pending["clientId"], "c1");
+        assert!(
+            pending["messageId"].as_str().is_some_and(|s| !s.is_empty()),
+            "steer_pending carries the kernel message id"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn drop_queued_removes_only_the_matching_parked_submit() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"keep","clientId":"c1"}"#,
+        );
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"drop","clientId":"c2"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            2
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"drop_queued","sessionId":"s1","clientId":"c2"}"#,
+        );
+        cx.run_until_parked();
+        let remaining = state.sessions["s1"].pending_submits.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].client_id, "c1");
+        drop(remaining);
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn idle_steer_falls_back_to_a_regular_message() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"steer","sessionId":"s1","clientId":"c9","text":"steer idle"}"#,
+        );
+        cx.run_until_parked();
+
+        assert!(types(&out).contains(&"turn_started".to_string()));
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Text(t) if t == "steer idle"))
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
     fn pushes_models_snapshot_after_provider_registration() {
         let _guard = GLOBALS_LOCK.lock().unwrap();
         hermetic_home();
@@ -2898,5 +3368,80 @@ mod tests {
     fn sink_for(out: &Arc<Mutex<Vec<String>>>) -> EventSink {
         let out = Arc::clone(out);
         EventSink::new(move |json| out.lock().unwrap().push(json))
+    }
+
+    /// Scripted backend for the queue/steer tests: records `run`/`steer`
+    /// traffic and lets the test drive settlement through the notice
+    /// channel, so the actor pipeline is exercised without a live provider.
+    struct FakeEngine {
+        runs: Mutex<Vec<String>>,
+        steer_calls: Mutex<Vec<String>>,
+        notices: tokio::sync::mpsc::UnboundedSender<agent::thread_engine::BackendNotice>,
+    }
+
+    impl FakeEngine {
+        fn new() -> (
+            Arc<Self>,
+            tokio::sync::mpsc::UnboundedReceiver<agent::thread_engine::BackendNotice>,
+        ) {
+            let (notices, events) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    runs: Mutex::new(Vec::new()),
+                    steer_calls: Mutex::new(Vec::new()),
+                    notices,
+                }),
+                events,
+            )
+        }
+    }
+
+    impl agent::thread_engine::ThreadEngine for FakeEngine {
+        fn is_running(&self) -> bool {
+            false
+        }
+
+        fn history(&self) -> Vec<agent::Message> {
+            Vec::new()
+        }
+
+        fn request_token_usage(&self) -> HashMap<String, agent::TokenUsage> {
+            HashMap::new()
+        }
+
+        fn model(&self) -> Option<pi::types::Model> {
+            None
+        }
+
+        fn run(&self, prompt: String, _images: Vec<pi::types::ContentBlock>) {
+            self.runs.lock().unwrap().push(prompt);
+        }
+
+        fn steer(&self, text: String, _images: Vec<pi::types::ContentBlock>) -> String {
+            self.steer_calls.lock().unwrap().push(text);
+            String::new()
+        }
+
+        fn cancel_steer(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn abort(&self) {}
+
+        fn set_model(&self, _model: pi::types::Model) {}
+
+        fn set_thinking_level(&self, _level: Option<String>) {}
+
+        fn open_session(&self, _path: PathBuf) {}
+
+        fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
+
+        fn active_session_path(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn session_list(&self) -> Vec<agent::ThreadSummary> {
+            Vec::new()
+        }
     }
 }

@@ -36,8 +36,6 @@ export type MessageListProps = {
   lastTurnDurationSec: number | null;
   cwd: string;
   branch: string | null;
-  /** Right gutter reserved for the floating info card on wide containers. */
-  rightInsetPx?: number;
   /** Live background-task snapshots; cards render the map entry so streaming
    * updates never rewrite the transcript items. */
   backgroundTasks: Record<string, BackgroundTaskSnapshotWire>;
@@ -78,7 +76,6 @@ export const MessageList = ({
   lastTurnDurationSec,
   cwd,
   branch,
-  rightInsetPx,
   backgroundTasks,
 }: MessageListProps) => {
   // Only the trailing item can be mid-stream.
@@ -88,7 +85,14 @@ export const MessageList = ({
   const renderItem = (item: TranscriptItem): ReactNode => {
     switch (item.kind) {
       case 'user':
-        return <UserMessage approvalMode={approvalMode} item={item} key={item.id} />;
+        return (
+          <UserMessage
+            approvalMode={approvalMode}
+            item={item}
+            key={item.id}
+            sessionId={sessionId}
+          />
+        );
       case 'assistant':
         return <AssistantMessage item={item} key={item.id} />;
       case 'thinking':
@@ -166,14 +170,16 @@ export const MessageList = ({
       }
       nodes.push(renderItem(item));
     }
-    return <div key={group.user?.id ?? `lead-${index}`}>{nodes}</div>;
+    return (
+      <div id={group.user ? `turn-${group.user.id}` : undefined} key={group.user?.id ?? `lead-${index}`}>
+        {nodes}
+      </div>
+    );
   };
 
   return (
     <Conversation>
-      <ConversationContent
-        style={rightInsetPx ? { paddingRight: rightInsetPx } : undefined}
-      >
+      <ConversationContent>
         <div className="w-full">{groups.map(renderGroup)}</div>
       </ConversationContent>
       {items.length === 0 && (

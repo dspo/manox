@@ -243,7 +243,7 @@ export const Composer = ({
       setImages([]);
       return;
     }
-    if ((!trimmed && images.length === 0) || turnActive || creating) {
+    if ((!trimmed && images.length === 0) || creating) {
       return;
     }
     const wireImages = images.length
@@ -251,12 +251,16 @@ export const Composer = ({
       : undefined;
     if (sessionId) {
       const api = new ThreadApi(sessionId);
+      // A submit while a turn runs parks the message on the actor; the
+      // bubble renders queued until the drain or a steer/drop action.
+      const clientId = crypto.randomUUID();
       store.echoUser(
         sessionId,
         trimmed,
         images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
+        { queued: turnActive, clientId },
       );
-      api.submit(trimmed, wireImages);
+      api.submit(trimmed, wireImages, clientId);
     } else if (onCreateSession) {
       onCreateSession(trimmed, wireImages ?? []);
     } else {

@@ -14,7 +14,23 @@ export type Command =
 	| { cmd: 'init'; cwd: string; host: 'vscode' }
 	| { cmd: 'create_session'; sessionId: string; cwd: string }
 	| { cmd: 'dispose_session'; sessionId: string }
-	| { cmd: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
+	| {
+			cmd: 'submit';
+			sessionId: string;
+			text: string;
+			images?: ImageAttachment[];
+			/** Echo identifier the host relays back on `steer_pending` /
+			 * `drop_queued`; absent on submits from older surfaces. */
+			clientId?: string;
+	  }
+	| {
+			cmd: 'steer';
+			sessionId: string;
+			clientId: string;
+			text: string;
+			images?: ImageAttachment[];
+	  }
+	| { cmd: 'drop_queued'; sessionId: string; clientId: string }
 	| { cmd: 'approve'; sessionId: string; id: string; allow: boolean }
 	| { cmd: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
 	| { cmd: 'cancel_turn'; sessionId: string }
@@ -303,8 +319,25 @@ export type ActorEvent =
 	| { type: 'session_disposed'; sessionId: string }
 	// turn
 	| { type: 'turn_started'; sessionId: string }
-	| { type: 'turn_finished'; sessionId: string; cancelled: boolean; failed: boolean }
+	| {
+			type: 'turn_finished';
+			sessionId: string;
+			cancelled: boolean;
+			failed: boolean;
+			/** Steer message ids that never made it into the settled run. */
+			strandedSteerIds?: string[];
+	  }
 	| { type: 'stop'; sessionId: string; reason: string | null }
+	// queued-message steering
+	| {
+			type: 'steer_pending';
+			sessionId: string;
+			/** The client echo id of the original submission. */
+			clientId: string;
+			/** Kernel message id of the injected steer. */
+			messageId: string;
+	  }
+	| { type: 'steer_injected'; sessionId: string; messageId: string }
 	// content
 	| { type: 'agent_text'; sessionId: string; text: string }
 	| { type: 'agent_thinking'; sessionId: string; text: string }

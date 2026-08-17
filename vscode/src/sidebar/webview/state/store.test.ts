@@ -1139,3 +1139,53 @@ describe('plan / goal / task folding', () => {
     expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
   });
 });
+
+describe('queued-message lifecycle', () => {
+  it('clears the queued flag when the drain starts the follow-up turn', () => {
+    const store = startSession();
+    store.echoUser('s', 'queued one', undefined, { queued: true, clientId: 'c1' });
+    expect(thread(store)?.items[0]).toMatchObject({ kind: 'user', queued: true });
+    store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
+    expect(thread(store)?.items[0]).toMatchObject({ kind: 'user', queued: false });
+  });
+
+  it('markSteerPending flips the bubble optimistically, replaced by the real id', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.markSteerPending('s', 'c1');
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'pending' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'm1' });
+  });
+
+  it('tracks steer_pending and steer_injected on the matching bubble', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'm1' });
+    store.dispatch(event({ type: 'steer_injected', sessionId: 's', messageId: 'm1' }));
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: null });
+  });
+
+  it('marks a stranded steer as failed on turn_finished', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    store.dispatch(
+      event({
+        type: 'turn_finished',
+        sessionId: 's',
+        cancelled: false,
+        failed: true,
+        strandedSteerIds: ['m1'],
+      }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: null, steerFailed: true });
+  });
+});

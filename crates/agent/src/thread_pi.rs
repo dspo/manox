@@ -882,6 +882,28 @@ impl Thread {
         self.running
     }
 
+    /// Whether the facade holds queued prompts/images that the next
+    /// `run_turn` would drain (the actor uses it to decide whether a
+    /// post-settlement follow-up turn is needed).
+    pub fn has_pending_prompts(&self) -> bool {
+        !self.pending_prompts.is_empty() || !self.pending_images.is_empty()
+    }
+
+    /// Test-support: replace the lazily spawned backend with a scripted
+    /// engine and wire its notice channel, so downstream host tests can
+    /// observe run/steer traffic and drive settlement without a live
+    /// provider.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_engine_for_test(
+        &mut self,
+        engine: Arc<dyn ThreadEngine>,
+        events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+        cx: &mut Context<Self>,
+    ) {
+        self.engine = Some(engine);
+        drain_engine_notices(cx, events);
+    }
+
     /// Test-only: force the running flag so team routing tests can simulate
     /// a busy thread without a live engine turn.
     #[cfg(test)]
