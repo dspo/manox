@@ -34,7 +34,9 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Whether an HTTP status is transient (rate limit, timeout, gateway
 /// errors). Auth (401/403), invalid requests (400/404), and quota/billing
 /// (429 with an error body the API marks terminal) are not — those are
-/// deterministic and must not be retried.
+/// deterministic and must not be retried. The explicit allowlist, rather
+/// than a blanket >=500, keeps deterministic codes (501, 511) from burning
+/// the retry budget.
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(
         status,
@@ -42,32 +44,15 @@ pub fn is_retryable_status(status: u16) -> bool {
     )
 }
 
-/// reqwest errors worth retrying. `is_connect` covers only the connect phase,
-/// so a connection reset / broken pipe / HTTP-2 stream reset mid-request (the
-/// common transient-transport class) is caught via the source-chain io kind.
-/// Request-construction (`is_request`) and body-serialization (`is_body`)
-/// errors reproduce identically and are never retried.
+/// reqwest send errors worth retrying. A failure that never produced an HTTP
+/// status is a transport-class error and the request can be re-sent; this
+/// covers connect/timeout failures and the generic request-phase errors
+/// reqwest renders as `error sending request for url (...)` — e.g. a
+/// connection dropped before the response arrived ("connection closed before
+/// message completed") — whose inner cause carries no io kind. Redirect
+/// loops and client-construction bugs reproduce identically and never retry.
 fn is_retryable_send_error(err: &reqwest::Error) -> bool {
-    if err.is_connect() || err.is_timeout() || err.is_redirect() {
-        return true;
-    }
-    let mut source: Option<&dyn std::error::Error> = Some(err);
-    while let Some(s) = source {
-        if let Some(io) = s.downcast_ref::<std::io::Error>()
-            && matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        {
-            return true;
-        }
-        source = s.source();
-    }
-    false
+    !err.is_status() && !err.is_redirect() && !err.is_builder()
 }
 
 /// Short, user-facing label for a retryable reqwest send error. Mirrors the
@@ -337,6 +322,13 @@ const RETRYABLE_PATTERNS: &[&str] = &[
     "you can retry your request",
     "try your request again",
     "please retry your request",
+    // reqwest renders request-phase failures as "error sending request for
+    // url (...)" and body-phase failures as "error decoding response body";
+    // the inner hyper/io cause often renders empty, so the outer text alone
+    // must classify. The "for url" qualifier keeps provider error bodies
+    // that merely mention "error sending request" from classifying.
+    "error.?sending.?request.?for.?url",
+    "decoding.?response.?body",
     "ResourceExhausted",
 ];
 
@@ -565,6 +557,53 @@ mod tests {
             "no retry event for a terminal status"
         );
     }
+    #[tokio::test]
+    async fn send_error_without_io_kind_is_retried() {
+        // A connection accepted then closed before any response surfaces as a
+        // request-phase reqwest error ("connection closed before message
+        // completed") whose inner cause carries no io kind; the send layer
+        // must classify this class as retryable. The retry event proves the
+        // classification; cancelling then aborts the backoff.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.shutdown().await;
+                drop(socket);
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let signal = CancellationToken::new();
+        let sig = signal.clone();
+        // Loopback must bypass any system proxy from the environment; the
+        // default client honors proxy env vars and would route the fixture
+        // server through it.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            send_with_retry(
+                |_| client.post(&url).body("x".to_string()),
+                None,
+                &test_model(),
+                &serde_json::json!({"x": 1}),
+                &signal,
+                &tx,
+            )
+            .await
+        });
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("send-phase drop must emit a retry event")
+            .expect("retry channel closed");
+        assert!(matches!(event, AgentEvent::Retry { attempt: 1, .. }));
+        sig.cancel();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Aborted)
+        ));
+    }
 
     fn assistant(error_message: Option<&str>) -> crate::types::AgentMessage {
         crate::types::AgentMessage::Assistant {
@@ -606,6 +645,26 @@ mod tests {
     }
 
     #[test]
+    fn retryable_assistant_error_classifies_reqwest_transport_wraps() {
+        // The reqwest-produced strings that actually reach the turn-level
+        // classifier in production, wrapped by `ProviderError::Transport`.
+        // The inner hyper/io cause renders empty, so only the outer text is
+        // available to classify.
+        for message in [
+            "transport error: error sending request for url (https://dashscope.aliyuncs.com/apps/anthropic/v1/messages)",
+            "transport error: error sending request for url (https://api.deepseek.com/anthropic/v1/messages)",
+            "transport error: error sending request for url (http://127.0.0.1:1/)",
+            "transport error: error decoding response body",
+            "transport error: error decoding response body for url (https://api.example.com/v1/messages)",
+        ] {
+            assert!(
+                is_retryable_assistant_error(&assistant(Some(message))),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn retryable_assistant_error_excludes_limits_and_non_errors() {
         for message in [
             "insufficient_quota: you have exceeded your quota",
@@ -620,6 +679,11 @@ mod tests {
                 "{message}"
             );
         }
+        // A provider error body that coincidentally contains reqwest wording
+        // must not classify as retryable.
+        assert!(!is_retryable_assistant_error(&assistant(Some(
+            "http 400: {\"error\":{\"message\":\"error sending request ID is required\"}}"
+        ))));
         // A successful stop or an error without a message is never retried.
         let stop = crate::types::AgentMessage::Assistant {
             content: Vec::new(),
