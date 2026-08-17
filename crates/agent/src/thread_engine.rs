@@ -158,6 +158,10 @@ pub enum BackendNotice {
         /// sessions default to AutoPilot); the facade mirrors it for the
         /// access chip.
         approval_mode: crate::thread::ApprovalMode,
+        /// The reasoning effort restored from the session sidecar (fresh
+        /// sessions default to High); the facade mirrors it so the model
+        /// dropdown shows the restored selection.
+        reasoning_effort: crate::language_model::ReasoningEffort,
         /// Plan mode restored from the session sidecar (fresh sessions
         /// default to off); the facade re-syncs rendered instructions.
         plan_mode: bool,

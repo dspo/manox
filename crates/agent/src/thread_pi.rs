@@ -341,6 +341,10 @@ pub struct Thread {
     /// thread; the mode is then not overwritten by the session sidecar's
     /// default when the engine materializes.
     approval_mode_explicitly_set: bool,
+    /// Whether the user explicitly set the reasoning effort on a landing
+    /// thread; the effort is then not overwritten by the session sidecar's
+    /// default when the engine materializes.
+    reasoning_effort_explicitly_set: bool,
     /// Plan mode active: read-only research + plan-file writes, proposals
     /// ride the `ProposePlan` tool. Mirrored from the engine on
     /// `PlanModeChanged`/`Ready`.
@@ -389,6 +393,7 @@ impl Thread {
             engine: None,
             history_phase: HistoryPhase::Ready,
             approval_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
             plan_mode: false,
             persisted_plan: None,
             label: "lead".into(),
@@ -473,8 +478,9 @@ impl Thread {
                     HistoryPhase::Ready
                 },
                 approval_mode_explicitly_set: false,
-            plan_mode: false,
-            persisted_plan: None,
+                reasoning_effort_explicitly_set: false,
+                plan_mode: false,
+                persisted_plan: None,
                 label: "lead".into(),
                 team: None,
                 goal_bridge,            worktree_path: None,
@@ -633,6 +639,7 @@ impl Thread {
                 restored,
                 model,
                 approval_mode,
+                reasoning_effort,
                 plan_mode,
                 plan_file,
                 plan_review_pending,
@@ -648,6 +655,9 @@ impl Thread {
                 }
                 if !self.approval_mode_explicitly_set {
                     self.approval_mode = approval_mode;
+                }
+                if !self.reasoning_effort_explicitly_set {
+                    self.reasoning_effort = reasoning_effort;
                 }
                 if plan_mode {
                     self.plan_mode = true;
@@ -1218,6 +1228,7 @@ impl Thread {
                 engine: Some(engine),
                 history_phase: HistoryPhase::Ready,
                 approval_mode_explicitly_set: true,
+                reasoning_effort_explicitly_set: true,
                 plan_mode: false,
                 persisted_plan: None,
                 goal_bridge: None,
@@ -1443,6 +1454,9 @@ impl Thread {
             return;
         }
         self.reasoning_effort = effort;
+        // An explicit user choice must survive engine materialization: the
+        // session sidecar's default would otherwise overwrite it at `Ready`.
+        self.reasoning_effort_explicitly_set = true;
         if let Some(engine) = &self.engine {
             engine.set_thinking_level(Some(effort.wire_value().to_string()));
         }
@@ -1933,6 +1947,7 @@ pub(crate) mod tests {
                 engine: Some(engine),
                 history_phase: phase,
                 approval_mode_explicitly_set: false,
+                reasoning_effort_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
@@ -2248,6 +2263,7 @@ pub(crate) mod tests {
                     restored: true,
                     model: None,
                     approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2327,6 +2343,7 @@ pub(crate) mod tests {
                     restored: false,
                     model: None,
                     approval_mode: ApprovalMode::AutoPilot,
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2425,6 +2442,7 @@ pub(crate) mod tests {
                     restored: true,
                     model: None,
                     approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2436,5 +2454,78 @@ pub(crate) mod tests {
         cx.read(|cx| {
             assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
         });
+    }
+
+    /// I4: an explicit user reasoning-effort choice survives the sidecar
+    /// default arriving at `Ready` (`reasoning_effort_explicitly_set`).
+    #[gpui::test]
+    fn explicit_reasoning_effort_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, _cx| {
+            t.set_reasoning_effort(ReasoningEffort::Max, _cx);
+        });
+        // The fresh session's sidecar reports High at Ready; the user's Max
+        // choice must not be overwritten.
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: false,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            ReasoningEffort::Max
+        );
+    }
+
+    /// I5: without an explicit choice, `Ready` restores the persisted
+    /// effort from the sidecar.
+    #[gpui::test]
+    fn ready_restores_reasoning_effort_when_not_explicitly_set(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: true,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::Max,
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            ReasoningEffort::Max
+        );
     }
 }
