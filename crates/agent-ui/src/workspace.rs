@@ -4446,7 +4446,7 @@ impl Workspace {
         // The reasoning-effort knob lives in the model dropdown, next to the
         // model switch it tunes. The current effort is checked; a click
         // applies to the next request (same mid-run semantics as a model
-        // switch), without closing the menu.
+        // switch; the menu dismisses like a model row).
         let current_effort = workspace
             .update(cx, |this, cx| this.thread.read(cx).reasoning_effort())
             .unwrap_or_default();
