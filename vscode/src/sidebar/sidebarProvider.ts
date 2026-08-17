@@ -151,6 +151,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   private registerSession(sessionId: string, kind: 'fresh' | 'restored', cwd: string): void {
     const manager = SessionManager.shared();
     const unsubscribe = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
+      if (ev.type === 'session_disposed') {
+        // The actor-side session is gone; drop the stale subscription entry
+        // so the host map stops growing across /exit and archive cycles.
+        this.sessions.delete(sessionId);
+      }
       if (ev.type === 'thread_info') {
         this.post({ type: 'thread_info', sessionId: ev.sessionId, info: ev.info });
         return;

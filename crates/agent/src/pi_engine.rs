@@ -2303,6 +2303,10 @@ async fn run_actor(
     }
 
     let _ = session.close().await;
+    // Thread-lifetime cleanup: monitors/background tasks are stopped and the
+    // monitor bridge has exited with the orchestrator senders, so the legacy
+    // registry entries and mailbox can be released now.
+    crate::background_task::cleanup_thread(&thread_id);
 }
 
 /// Close the current session and open the given jsonl file in its place. The
