@@ -24,6 +24,8 @@ declare module 'vscode' {
     readonly isUserSelectable?: boolean;
   }
 
+  // Mirrors the chatProvider proposal's options: @types/vscode does not ship
+  // the proposed typings, so this local declaration supplies `configuration`.
   export interface PrepareLanguageModelChatModelOptions {
     /**
      * Per-group configuration resolved from the language models config file
