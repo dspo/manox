@@ -464,8 +464,11 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
     out
 }
 
-/// Maximum team nesting depth. A chain longer than the cap is malformed and
-/// degrades to top-level rather than rendering a wild indent.
+/// Maximum team nesting depth. One cap serves two roles: it bounds a legal
+/// chain at 8 levels, and it terminates any cycle — a cycle is an infinite
+/// chain, so the walk always trips the cap and degrades to top-level. There
+/// is no separate visited set; the cap is both the cycle guard and the
+/// legal-depth ceiling.
 const MAX_TEAM_DEPTH: usize = 8;
 
 /// Compute each summary's `depth` by walking its `parent_id` chain within the

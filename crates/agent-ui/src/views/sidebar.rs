@@ -231,6 +231,12 @@ fn team_forest(
     out
 }
 
+/// Render-side nesting cap, mirroring the store's `MAX_TEAM_DEPTH`. The
+/// store zeroes cycle/orphan depths, so a deep tree here means corrupt wire
+/// data; the cap keeps the recursion from stacking forever as a last line of
+/// defense.
+const MAX_TEAM_RENDER_DEPTH: f32 = 8.0;
+
 /// Append a member row and its subtree (recursively) at the given indent.
 fn push_member(
     team_collapsed: &HashSet<String>,
@@ -246,7 +252,7 @@ fn push_member(
         team_leader: has_kids,
         team_collapsed: team_collapsed.contains(&s.id),
     });
-    if has_kids && !team_collapsed.contains(&s.id) {
+    if has_kids && !team_collapsed.contains(&s.id) && depth < MAX_TEAM_RENDER_DEPTH {
         let mut kids = members.get(s.id.as_str()).cloned().unwrap_or_default();
         kids.sort_by_key(|k| std::cmp::Reverse(k.interacted_at));
         for kid in kids {

@@ -107,11 +107,13 @@ const SessionRow = ({
     >
       {hasChildren ? (
         <button
+          aria-label={collapsed ? t('expand_team') : t('collapse_team')}
           className="text-muted-foreground hover:text-foreground -ml-1 cursor-pointer rounded p-0.5 transition-transform"
           onClick={(e) => {
             e.stopPropagation();
             onToggle(item.id);
           }}
+          title={collapsed ? t('expand_team') : t('collapse_team')}
           type="button"
         >
           <ChevronRight className={cn('size-3.5 transition-transform', !collapsed && 'rotate-90')} />
@@ -189,6 +191,11 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
     });
   };
 
+  // Render-side nesting cap, mirroring the store's MAX_TEAM_DEPTH: the store
+  // zeroes cycle/orphan depths, so a deep tree here means corrupt wire data
+  // and the cap stops the recursion instead of overflowing the stack.
+  const MAX_TEAM_RENDER_DEPTH = 8;
+
   const renderNodes = (nodes: SessionTreeNode[], depth: number) =>
     nodes.map((node) => {
       const { item } = node;
@@ -205,7 +212,9 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
             onToggle={toggleTeam}
             onOpen={onOpen}
           />
-          {hasChildren && !collapsed && renderNodes(node.children, depth + 1)}
+          {hasChildren && !collapsed && depth < MAX_TEAM_RENDER_DEPTH && (
+            renderNodes(node.children, depth + 1)
+          )}
         </Fragment>
       );
     });
