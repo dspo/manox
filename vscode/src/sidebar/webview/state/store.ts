@@ -131,6 +131,14 @@ const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
 
 const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelled', 'continued']);
 
+/** Tail window kept per tool item for streamed output. Unbounded
+ * accumulation turns every chunk append into O(total) work and lets one
+ * long output dominate each transcript diff; the display layer clips well
+ * below this cap anyway. */
+const TOOL_OUTPUT_CAP = 64_000;
+const capOutputTail = (text: string): string =>
+  text.length <= TOOL_OUTPUT_CAP ? text : text.slice(-TOOL_OUTPUT_CAP);
+
 type AskQuestionTranscriptItem = Extract<TranscriptItem, { kind: 'ask_question' }>;
 
 let echoCounter = 0;
@@ -155,10 +163,12 @@ export class Store {
   get = (): ChatState => this.state;
 
   dispatch(msg: HostToWebview): void {
-    if (msg.type === 'session_ready') {
+    if (msg.type === 'events') {
+      for (const ev of msg.events) {
+        if (ev.type === 'session_disposed') this.creating.delete(ev.sessionId);
+      }
+    } else if (msg.type === 'session_ready') {
       this.creating.delete(msg.sessionId);
-    } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
-      this.creating.delete(msg.event.sessionId);
     } else if (msg.type === 'global_error' && this.creating.size > 0) {
       // A failed draft creation surfaces only as a global error. Release
       // every pending draft's send guard and drop the orphans; only fall
@@ -374,12 +384,15 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
       return updateThread(state, msg.sessionId, (t) => mergeInfo(t, msg.info));
     case 'global_error':
       return { ...state, error: msg.message };
-    case 'event':
-      return foldEvent(state, msg.event);
     case 'open_turn_navigator':
       // Host-requested navigator toggle (macOS cmd+m); the component
       // subscribes via `onOpenTurnNavigator`, the store is untouched.
       return state;
+    // One fold pass per coalesced frame: the patch (and therefore the
+    // listener notification) happens once for the whole batch instead of
+    // once per streamed event.
+    case 'events':
+      return msg.events.reduce((s, ev) => foldEvent(s, ev), state);
   }
 }
 
@@ -544,7 +557,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         name: prev?.name ?? '',
         title: prev?.title ?? ev.id,
         status: prev?.status ?? 'running',
-        output: (prev?.output ?? '') + ev.chunk,
+        output: capOutputTail((prev?.output ?? '') + ev.chunk),
         isError: prev?.isError ?? false,
       }));
     case 'tool_result':
@@ -573,7 +586,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           : prev && TERMINAL_TOOL_STATUS.has(prev.status)
             ? prev.status
             : 'completed',
-        output: ev.output,
+        output: capOutputTail(ev.output),
         isError: ev.is_error,
       }));
     case 'tool_call_authorization':

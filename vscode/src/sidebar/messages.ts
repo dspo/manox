@@ -67,7 +67,10 @@ export type WebviewToHost =
 
 export type HostToWebview =
   | { type: 'session_ready'; sessionId: string; cwd: string; kind: 'fresh' | 'restored' }
-  | { type: 'event'; event: ActorEvent }
+  // Coalesced session events: the host drains its per-frame buffer as one
+  // message, so a streaming flood crosses the bridge once per frame instead
+  // of once per event. Order inside the array is arrival order.
+  | { type: 'events'; events: ActorEvent[] }
   | { type: 'models'; models: ModelInfo[] }
   | { type: 'threads'; threads: ThreadListItem[] }
   | { type: 'commands'; commands: CommandEntry[] }

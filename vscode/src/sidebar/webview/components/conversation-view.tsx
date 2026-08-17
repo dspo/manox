@@ -4,7 +4,7 @@
 // floats over the transcript, then the session list joins on the left.
 
 import { ArrowLeft, Search } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, onOpenTurnNavigator, ThreadApi } from '../api/client';
@@ -32,7 +32,10 @@ export type ConversationViewProps = {
   error: string | null;
 };
 
-export const ConversationView = ({
+// Memoized on the active thread's state reference: events folded for other
+// sessions replace the per-thread map but never this ThreadState object, so
+// concurrent streaming elsewhere never reconciles this view.
+export const ConversationView = memo(({
   thread,
   threads,
   models,
@@ -182,4 +185,4 @@ export const ConversationView = ({
       </div>
     </div>
   );
-};
+});
