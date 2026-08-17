@@ -7,6 +7,8 @@
 // text as a plain message.
 
 import { Loader2, RotateCw, Send, Trash2 } from 'lucide-react';
+import { memo } from 'react';
+
 import type { ApprovalMode } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
 import { t } from '../../lib/i18n';
@@ -27,7 +29,9 @@ export type UserMessageProps = {
   sessionId: string;
 };
 
-export const UserMessage = ({ item, approvalMode, sessionId }: UserMessageProps) => {
+// Memoized: streaming frames re-render the whole transcript, but only the
+// live items mutate — the queued/steer lifecycle lives on the item object.
+export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageProps) => {
   const time = item.timestamp ? timeFormat.format(item.timestamp * 1000) : null;
   const visibleImages = item.images?.filter((img) => img.data) ?? [];
   // The body is the persisted display form when present (non-empty), else
@@ -135,4 +139,4 @@ export const UserMessage = ({ item, approvalMode, sessionId }: UserMessageProps)
       )}
     </div>
   );
-};
+});

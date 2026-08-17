@@ -10,6 +10,12 @@ import type { ActorEvent, ImageAttachment } from '../protocol';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
 import type { HostToWebview, WebviewToHost } from './messages';
 
+/** Frame interval for draining the session-event buffer. One postMessage
+ * per interval carries every buffered event, so a streaming turn (one wire
+ * event per token / stdout chunk) crosses the bridge ~30 times a second at
+ * most instead of hundreds of times. */
+const EVENT_BATCH_INTERVAL_MS = 33;
+
 export function registerManoxSidebar(context: vscode.ExtensionContext): void {
   const provider = new ManoxSidebarProvider(context.extensionUri);
   context.subscriptions.push(
@@ -39,6 +45,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
    * completing afterwards disposes its actor-side session instead of
    * attaching to a dead view. */
   private sessionGeneration = 0;
+  /** Session events waiting for the next batched flush. Arrival order is
+   * preserved across sessions; bypass messages (session_ready, thread_info)
+   * drain the buffer first so they never overtake queued events. */
+  private pendingEvents: ActorEvent[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -133,7 +144,10 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     if (this.sessions.has(sessionId)) {
       // Already live: re-announce the session so a reloaded webview can
       // rebuild its state from scratch, then have the actor replay its
-      // history/info snapshots through the existing subscription.
+      // history/info snapshots through the existing subscription. The flush
+      // keeps any buffered events ahead of the re-announcement, where they
+      // still fold into the pre-replay state.
+      this.flushEvents();
       this.post({ type: 'session_ready', sessionId, cwd: resolveWorkspaceCwd(), kind: 'restored' });
       manager.send({ cmd: 'get_current_model', sessionId });
       manager.send({ cmd: 'open_thread', sessionId });
@@ -161,6 +175,9 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
    * model snapshot the composer renders. */
   private registerSession(sessionId: string, kind: 'fresh' | 'restored', cwd: string): void {
     const manager = SessionManager.shared();
+    // The ready marker precedes the subscription so the webview always holds
+    // thread state for the session before its first event folds in.
+    this.post({ type: 'session_ready', sessionId, cwd, kind });
     const unsubscribe = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
       if (ev.type === 'session_disposed') {
         // The actor-side session is gone; drop the stale subscription entry
@@ -168,14 +185,38 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         this.sessions.delete(sessionId);
       }
       if (ev.type === 'thread_info') {
+        // The snapshot bypasses the buffer; drain it first so it never
+        // overtakes earlier events.
+        this.flushEvents();
         this.post({ type: 'thread_info', sessionId: ev.sessionId, info: ev.info });
         return;
       }
-      this.post({ type: 'event', event: ev });
+      this.queueEvent(ev);
     });
     this.sessions.set(sessionId, unsubscribe);
-    this.post({ type: 'session_ready', sessionId, cwd, kind });
     manager.send({ cmd: 'get_current_model', sessionId });
+  }
+
+  /** Buffer one session event for the next batched flush; arms the flush
+   * timer on the first queued event of a frame. */
+  private queueEvent(ev: ActorEvent): void {
+    this.pendingEvents.push(ev);
+    if (this.flushTimer === null) {
+      this.flushTimer = setTimeout(() => this.flushEvents(), EVENT_BATCH_INTERVAL_MS);
+    }
+  }
+
+  /** Drain the buffer as a single `events` message. Idempotent; bypass
+   * messages and teardown call this to keep the wire order intact. */
+  private flushEvents(): void {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.pendingEvents.length === 0) return;
+    const events = this.pendingEvents;
+    this.pendingEvents = [];
+    this.post({ type: 'events', events });
   }
 
   private async onWebviewMessage(msg: WebviewToHost): Promise<void> {
@@ -321,6 +362,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 
   private teardown(): void {
     this.sessionGeneration++;
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.pendingEvents = [];
     const manager = SessionManager.shared();
     for (const [sessionId, unsubscribe] of this.sessions) {
       unsubscribe();

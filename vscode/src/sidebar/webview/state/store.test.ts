@@ -8,7 +8,7 @@ import type { HostToWebview } from '../../messages';
 import { Store, wireMessagesToTranscriptItems } from './store';
 import { foldToolStatus } from './transcript';
 
-const event = (ev: ActorEvent): HostToWebview => ({ type: 'event', event: ev });
+const event = (ev: ActorEvent): HostToWebview => ({ type: 'events', events: [ev] });
 
 const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadListItem => ({
   title: 't',
@@ -1209,5 +1209,102 @@ describe('queued-message lifecycle', () => {
       }),
     );
     expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: null, steerFailed: true });
+  });
+});
+
+describe('coalesced event batches', () => {
+  it('folds an events batch like the equivalent single-event stream', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 's', text: 'hello ' },
+        { type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' },
+        { type: 'tool_output', sessionId: 's', id: 't1', chunk: 'out' },
+        { type: 'agent_text', sessionId: 's', text: 'world' },
+      ],
+    });
+    const items = thread(store)?.items ?? [];
+    expect(items).toHaveLength(3);
+    expect(items[0]).toMatchObject({ kind: 'assistant', text: 'hello ' });
+    expect(items[1]).toMatchObject({ kind: 'tool' });
+    expect(toolCard(store, 't1')?.output).toBe('out');
+    expect(items[2]).toMatchObject({ kind: 'assistant', text: 'world' });
+  });
+
+  it('notifies listeners once per batch, not once per event', () => {
+    const store = startSession();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 's', text: 'a' },
+        { type: 'agent_text', sessionId: 's', text: 'b' },
+        { type: 'agent_text', sessionId: 's', text: 'c' },
+      ],
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(thread(store)?.items[0]).toMatchObject({ text: 'abc' });
+  });
+
+  it('ignores an empty batch', () => {
+    const store = startSession();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.dispatch({ type: 'events', events: [] });
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('applies session_disposed folded inside a batch', () => {
+    const store = startSession('a');
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 'a', text: 'x' },
+        { type: 'session_disposed', sessionId: 'a' },
+      ],
+    });
+    expect(store.get().perThread.a).toBeUndefined();
+    expect(store.get().view).toBe('threads');
+  });
+});
+
+describe('tool output tail cap', () => {
+  it('keeps only the tail once streamed output exceeds the cap', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'yes', status: 'running' }),
+    );
+    const chunk = 'y'.repeat(30_000) + '\n';
+    for (let i = 0; i < 3; i++) {
+      store.dispatch(event({ type: 'tool_output', sessionId: 's', id: 't1', chunk }));
+    }
+    const output = toolCard(store, 't1')?.output ?? '';
+    expect(output.length).toBeLessThanOrEqual(64_000);
+    expect(output.endsWith('y\n')).toBe(true);
+  });
+
+  it('caps an oversized terminal result as well', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'big', status: 'running' }),
+    );
+    store.dispatch(
+      event({ type: 'tool_result', sessionId: 's', id: 't1', output: 'z'.repeat(70_000), is_error: false }),
+    );
+    expect(toolCard(store, 't1')?.output).toHaveLength(64_000);
+  });
+
+  it('never splits a surrogate pair at the cap boundary', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'emoji', status: 'running' }),
+    );
+    // 64_001 code units: the naive cut lands inside the leading pair.
+    store.dispatch(
+      event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: '😀' + 'a'.repeat(63_999) }),
+    );
+    expect(toolCard(store, 't1')?.output).toBe('a'.repeat(63_999));
   });
 });
