@@ -551,7 +551,7 @@ Trigger: typing `/` (slash commands) or `@` (skills + subagents) at the caret in
 
 #### ModelMenu
 
-Trigger: [ModelChip](#modelchip). Model selector dropdown.
+Trigger: [ModelChip](#modelchip). Model selector dropdown: provider submenus for the model list, then a Reasoning effort block (High / Max, current effort checked) under a separator.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -969,7 +969,7 @@ Greyed out, "denied" label.
 
 ## 10. Reasoning Effort Levels
 
-Thread-level reasoning effort. No selector UI in the pi path today — the value is inherited across `/new` (`archive_current_thread_inheriting`) and set via the engine facade; High / Max remain the canonical values.
+Thread-level reasoning effort, chosen in [ModelMenu](#modelmenu) (High / Max, current effort checked), persisted in the session sidecar so a reopened session restores it. The value is inherited across `/new` (`archive_current_thread_inheriting`) and set via the engine facade; High / Max remain the canonical values.
 
 #### High
 #### Max
