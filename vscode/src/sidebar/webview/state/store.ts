@@ -11,6 +11,7 @@ import type {
   CommandEntry,
   GoalSnapshotWire,
   ModelInfo,
+  ReasoningEffort,
   SubagentChildWire,
   ThreadInfoSnapshot,
   ThreadListItem,
@@ -38,6 +39,7 @@ export interface ThreadState {
   /** Model the in-flight turn started with; stamps assistant items. */
   turnModelId: string | null;
   approvalMode: ApprovalMode;
+  reasoningEffort: ReasoningEffort;
   usage: TokenUsageSnapshot | null;
   cost: number;
   info: ThreadInfoSnapshot | null;
@@ -87,8 +89,9 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   items: [],
   currentModelId: null,
   turnModelId: null,
-  // Matches the thread-side default; the actor replays the persisted mode
-  // on open, correcting this value for restored threads.
+  // Matches the thread-side default; the actor replays the persisted effort
+  // (and approval mode) on open, correcting these values for restored threads.
+  reasoningEffort: 'high',
   approvalMode: 'autopilot',
   usage: null,
   cost: 0,
@@ -102,8 +105,8 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   turnStartedAt: null,
   lastTurnDurationSec: null,
 });
-
 const emptyInfo = (): ThreadInfoSnapshot => ({
+  reasoning_effort: 'high',
   worktree_path: null,
   plan: null,
   goal: null,
@@ -120,6 +123,7 @@ const emptyInfo = (): ThreadInfoSnapshot => ({
  * corrects the zeroed pre-materialization `get_usage` reply. */
 const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
   ...t,
+  reasoningEffort: info.reasoning_effort,
   usage: info.usage,
   cost: info.cost,
   info: { ...info, git_stats: info.git_stats ?? t.info?.git_stats },
@@ -127,7 +131,29 @@ const mergeInfo = (t: ThreadState, info: ThreadInfoSnapshot): ThreadState => ({
 
 const TERMINAL_TOOL_STATUS = new Set(['completed', 'failed', 'denied', 'cancelled', 'continued']);
 
+/** Tail window kept per tool item for streamed output. Unbounded
+ * accumulation turns every chunk append into O(total) work and lets one
+ * long output dominate each transcript diff; the display layer clips well
+ * below this cap anyway. */
+const TOOL_OUTPUT_CAP = 64_000;
+const capOutputTail = (text: string): string => {
+  if (text.length <= TOOL_OUTPUT_CAP) return text;
+  let start = text.length - TOOL_OUTPUT_CAP;
+  // A cut inside a surrogate pair would leave an orphaned half; drop the
+  // pair's trailing half too so the tail stays valid UTF-16.
+  const code = text.charCodeAt(start);
+  if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+  return text.slice(start);
+};
+
+type AskQuestionTranscriptItem = Extract<TranscriptItem, { kind: 'ask_question' }>;
+
 let echoCounter = 0;
+
+/** Local stand-in for a steer awaiting the actor's `steer_pending`
+ * confirmation; kernel message ids are UUIDs, so the literal never
+ * collides. */
+const STEER_PENDING_SENTINEL = 'pending';
 
 export class Store {
   private state: ChatState = initialState;
@@ -144,10 +170,12 @@ export class Store {
   get = (): ChatState => this.state;
 
   dispatch(msg: HostToWebview): void {
-    if (msg.type === 'session_ready') {
+    if (msg.type === 'events') {
+      for (const ev of msg.events) {
+        if (ev.type === 'session_disposed') this.creating.delete(ev.sessionId);
+      }
+    } else if (msg.type === 'session_ready') {
       this.creating.delete(msg.sessionId);
-    } else if (msg.type === 'event' && msg.event.type === 'session_disposed') {
-      this.creating.delete(msg.event.sessionId);
     } else if (msg.type === 'global_error' && this.creating.size > 0) {
       // A failed draft creation surfaces only as a global error. Release
       // every pending draft's send guard and drop the orphans; only fall
@@ -184,8 +212,14 @@ export class Store {
   }
 
   /** Optimistic echo of a submission; the actor never replays user
-   * messages back as events. */
-  echoUser(sessionId: string, text: string, images?: UserImage[]): void {
+   * messages back as events. `opts.queued` marks a bubble parked while a
+   * turn runs (the composer passes the flag and its echo `clientId`). */
+  echoUser(
+    sessionId: string,
+    text: string,
+    images?: UserImage[],
+    opts?: { queued?: boolean; clientId?: string },
+  ): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
@@ -198,20 +232,68 @@ export class Store {
             modelId: t.currentModelId,
             timestamp: Date.now() / 1000,
             images: images?.length ? images : undefined,
+            queued: opts?.queued,
+            clientId: opts?.clientId,
           },
         ],
       })),
     );
   }
 
-  /** Drop a pending authorization card (approval or AskUserQuestion) from
-   * the transcript; the caller posts the actual verdict to the host. */
+  /** Local removal of a queued bubble; the caller posts `drop_queued` so
+   * the actor stops parking the same message. */
+  removeUser(sessionId: string, clientId: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.filter(
+          (i) => !(i.kind === 'user' && i.clientId === clientId),
+        ),
+      })),
+    );
+  }
+
+  /** Optimistic flip of a queued bubble into the pending-steer state, so a
+   * double-click cannot enqueue the steer twice; the actor's
+   * `steer_pending` replaces the sentinel with the kernel message id. */
+  markSteerPending(sessionId: string, clientId: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.clientId === clientId
+            ? { ...i, steerPendingId: STEER_PENDING_SENTINEL }
+            : i,
+        ),
+      })),
+    );
+  }
+
+  /** Drop a pending approval card from the transcript; the caller posts the
+   * actual verdict to the host. (AskUserQuestion cards morph via
+   * `respondAsk` instead of being dropped.) */
   decideApproval(sessionId: string, id: string): void {
     this.patch(
       updateThread(this.state, sessionId, (t) => ({
         ...t,
         items: t.items.filter(
           (i) => !((i.kind === 'approval' || i.kind === 'ask_question') && i.id === id),
+        ),
+      })),
+    );
+  }
+
+  /** Mark an `AskUserQuestion` card answered (submit or cancel path); the
+   * caller posts the actual verdict. The card stays and morphs into the
+   * answered state fed by the completion events, mirroring the native
+   * drawer — dropping it would lose the human title and strand the result
+   * in a code-named tool item. */
+  respondAsk(sessionId: string, id: string): void {
+    this.patch(
+      updateThread(this.state, sessionId, (t) => ({
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'ask_question' && i.id === id ? { ...i, answered: true } : i,
         ),
       })),
     );
@@ -309,8 +391,15 @@ function foldMessage(state: ChatState, msg: HostToWebview): ChatState {
       return updateThread(state, msg.sessionId, (t) => mergeInfo(t, msg.info));
     case 'global_error':
       return { ...state, error: msg.message };
-    case 'event':
-      return foldEvent(state, msg.event);
+    case 'open_turn_navigator':
+      // Host-requested navigator toggle (macOS cmd+m); the component
+      // subscribes via `onOpenTurnNavigator`, the store is untouched.
+      return state;
+    // One fold pass per coalesced frame: the patch (and therefore the
+    // listener notification) happens once for the whole batch instead of
+    // once per streamed event.
+    case 'events':
+      return msg.events.reduce((s, ev) => foldEvent(s, ev), state);
   }
 }
 
@@ -355,16 +444,45 @@ function foldEvent(state: ChatState, ev: ActorEvent): ChatState {
 
 function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string }): ThreadState {
   switch (ev.type) {
-    case 'turn_started':
-      // A fresh turn supersedes any stale error from the previous one.
+    case 'turn_started': {
+      // A fresh turn supersedes any stale error from the previous one;
+      // queued bubbles entered this round (the actor drained them into it).
       return {
         ...t,
         turnActive: true,
         turnModelId: t.currentModelId,
         turnStartedAt: Date.now(),
         error: null,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.queued ? { ...i, queued: false } : i,
+        ),
       };
-    case 'turn_finished':
+    }
+    case 'turn_finished': {
+      // Steers stranded by a failed/cancelled run become failed bubbles;
+      // pending ids the actor never listed are a race — clear them anyway.
+      const stranded = new Set(ev.strandedSteerIds ?? []);
+      return {
+        ...t,
+        turnActive: false,
+        lastTurnDurationSec:
+          t.turnStartedAt === null
+            ? t.lastTurnDurationSec
+            : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
+        turnStartedAt: null,
+        // A successful finish supersedes a stale mid-turn error: the loop can
+        // recover (auto-retry, compact-and-retry) without a `turn_started` in
+        // between, so the banner and captain icon must follow the turn's real
+        // outcome. A failed finish keeps the error.
+        error: ev.failed ? t.error : null,
+        items: t.items.map((i) => {
+          if (i.kind !== 'user' || !i.steerPendingId) return i;
+          return stranded.has(i.steerPendingId)
+            ? { ...i, steerPendingId: null, steerFailed: true }
+            : { ...i, steerPendingId: null };
+        }),
+      };
+    }
     case 'stop':
       return {
         ...t,
@@ -375,32 +493,95 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
             : Math.max(0, Math.round((Date.now() - t.turnStartedAt) / 1000)),
         turnStartedAt: null,
       };
+    case 'steer_pending':
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.clientId === ev.clientId
+            ? { ...i, steerPendingId: ev.messageId }
+            : i,
+        ),
+      };
+    case 'steer_injected':
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'user' && i.steerPendingId === ev.messageId
+            ? { ...i, steerPendingId: null }
+            : i,
+        ),
+      };
     case 'agent_text':
       return appendAssistantText(t, ev.text);
     case 'agent_thinking':
       return appendThinkingText(t, ev.text);
-    case 'tool_call':
-      return upsertToolItem(t, ev.id, (prev) => {
+    case 'tool_call': {
+      if (ev.name === 'AskUserQuestion') {
+        const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+        // The kernel emits the start (running) and the tool emits the
+        // pending-approval marker before the authorization card exists; both
+        // would spawn a generic tool item beside the card. The card is the
+        // single surface for the whole lifecycle, so every AskUserQuestion
+        // event without a card to morph is dropped.
+        if (askIdx === -1) return t;
+        // Only terminal statuses morph the card into the answered state;
+        // running/pending markers keep the interactive drawer live.
+        const status = foldToolStatus(ev.status);
+        if (!TERMINAL_TOOL_STATUS.has(status)) return t;
+        const items = t.items.slice();
+        items[askIdx] = { ...(items[askIdx] as AskQuestionTranscriptItem), answered: true };
+        return { ...t, items };
+      }
+      // An AutoPilot escalation re-brands the real tool's card as
+      // AskUserQuestion under the same id; the gate's restore event hands
+      // the id back to the real tool (name != AskUserQuestion). Drop the
+      // question card so the real tool item owns the completion and result.
+      let base = t;
+      const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+      if (askIdx !== -1) {
+        const items = t.items.slice();
+        items.splice(askIdx, 1);
+        base = { ...t, items };
+      }
+      return upsertToolItem(base, ev.id, (prev) => {
         const status = foldToolStatus(ev.status);
         return {
           id: ev.id,
           name: ev.name,
-          title: ev.title || prev?.title || ev.name,
+          // The engine replays `title: tool_name` on the completion call;
+          // keep the human title (command line, path, question label) that
+          // the start call carried instead of degrading to the code name.
+          title: prev?.title && ev.title === ev.name ? prev.title : (ev.title || prev?.title || ev.name),
           status,
           output: prev?.output ?? '',
           isError: status === 'failed' ? true : (prev?.isError ?? false),
         };
       });
+    }
     case 'tool_output':
       return upsertToolItem(t, ev.id, (prev) => ({
         id: ev.id,
         name: prev?.name ?? '',
         title: prev?.title ?? ev.id,
         status: prev?.status ?? 'running',
-        output: (prev?.output ?? '') + ev.chunk,
+        output: capOutputTail((prev?.output ?? '') + ev.chunk),
         isError: prev?.isError ?? false,
       }));
     case 'tool_result':
+      // An answered AskUserQuestion card absorbs its own result in place
+      // (the morph keeps the card's human title); everything else feeds the
+      // ordinary tool item.
+      const askIdx = t.items.findIndex((i) => i.kind === 'ask_question' && i.id === ev.id);
+      if (askIdx !== -1) {
+        const items = t.items.slice();
+        items[askIdx] = {
+          ...(items[askIdx] as AskQuestionTranscriptItem),
+          answered: true,
+          output: ev.output,
+          isError: ev.is_error,
+        };
+        return { ...t, items };
+      }
       return upsertToolItem(t, ev.id, (prev) => ({
         id: ev.id,
         name: prev?.name ?? '',
@@ -412,7 +593,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           : prev && TERMINAL_TOOL_STATUS.has(prev.status)
             ? prev.status
             : 'completed',
-        output: ev.output,
+        output: capOutputTail(ev.output),
         isError: ev.is_error,
       }));
     case 'tool_call_authorization':
@@ -433,6 +614,8 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       };
     case 'model_changed':
       return { ...t, currentModelId: ev.to };
+    case 'reasoning_effort_changed':
+      return { ...t, reasoningEffort: ev.effort };
     case 'approval_mode_changed':
       return { ...t, approvalMode: ev.mode };
     case 'current_model':
@@ -706,7 +889,7 @@ export function wireMessagesToTranscriptItems(messages: WireMessage[]): Transcri
           title:
             existing >= 0 ? (items[existing] as { kind: 'tool'; tool: ToolCallState }).tool.title : name,
           status: result.is_error ? 'failed' : 'completed',
-          output: result.content,
+          output: capOutputTail(result.content),
           isError: result.is_error,
         };
         if (existing >= 0) {

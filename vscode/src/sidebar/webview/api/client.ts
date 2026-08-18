@@ -8,6 +8,7 @@ import type {
   GoalAction,
   ImageAttachment,
   PlanVerdictChoice,
+  ReasoningEffort,
 } from '../../../protocol';
 import type { HostToWebview, WebviewToHost } from '../../messages';
 
@@ -32,6 +33,20 @@ export function onHostMessage(listener: (message: HostToWebview) => void): () =>
   return () => listeners.delete(listener);
 }
 
+const navigatorListeners = new Set<() => void>();
+onHostMessage((message) => {
+  if (message.type === 'open_turn_navigator') {
+    for (const listener of navigatorListeners) listener();
+  }
+});
+
+/** Subscribe to host-requested turn-navigator toggles (macOS cmd+m, where
+ * the OS minimize accelerator would swallow the key before the DOM). */
+export function onOpenTurnNavigator(listener: () => void): () => void {
+  navigatorListeners.add(listener);
+  return () => navigatorListeners.delete(listener);
+}
+
 function post(message: WebviewToHost): void {
   host.postMessage(message);
 }
@@ -40,8 +55,19 @@ function post(message: WebviewToHost): void {
 export class ThreadApi {
   constructor(readonly sessionId: string) {}
 
-  submit(text: string, images?: ImageAttachment[]): void {
-    post({ type: 'submit', sessionId: this.sessionId, text, images });
+  submit(text: string, images?: ImageAttachment[], clientId?: string): void {
+    post({ type: 'submit', sessionId: this.sessionId, text, images, clientId });
+  }
+
+  /** Turn the queued message identified by `clientId` into a steer of the
+   * running turn; the actor replies with `steer_pending`. */
+  steer(clientId: string, text: string, images?: ImageAttachment[]): void {
+    post({ type: 'steer', sessionId: this.sessionId, clientId, text, images });
+  }
+
+  /** Drop a queued message (its echo bubble is removed locally too). */
+  dropQueued(clientId: string): void {
+    post({ type: 'drop_queued', sessionId: this.sessionId, clientId });
   }
 
   approve(id: string, allow: boolean): void {
@@ -49,7 +75,7 @@ export class ThreadApi {
   }
 
   /** Resolve an `AskUserQuestion` card: per-question selections (labels
-   * joined by ", ") plus an optional free-form note that overrides them. */
+   * joined by ", ") plus an optional free-form supplemental note. */
   answerQuestion(id: string, answers: [string, string][], response: string | null): void {
     post({ type: 'answer_question', sessionId: this.sessionId, id, answers, response });
   }
@@ -57,9 +83,12 @@ export class ThreadApi {
   cancel(): void {
     post({ type: 'cancel', sessionId: this.sessionId });
   }
-
   setModel(id: string): void {
     post({ type: 'set_model', sessionId: this.sessionId, id });
+  }
+
+  setReasoningEffort(effort: ReasoningEffort): void {
+    post({ type: 'set_reasoning_effort', sessionId: this.sessionId, effort });
   }
 
   setApprovalMode(mode: ApprovalMode): void {

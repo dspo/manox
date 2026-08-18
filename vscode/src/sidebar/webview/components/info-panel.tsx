@@ -7,19 +7,22 @@
 import {
   Bot,
   CheckCircle,
+  ChevronDown,
+  ChevronRight,
   Circle,
   GitBranch,
-  LoaderCircle,
   Minus,
   ShipWheel,
   TriangleAlert,
   XCircle,
 } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 import type {
   GoalSnapshotWire,
   ModelInfo,
+  PlanSnapshotWire,
+  PlanStepWire,
   SubagentChildWire,
   SubagentSnapshot,
   TokenUsageSnapshot,
@@ -30,6 +33,7 @@ import { t } from '../lib/i18n';
 import { formatCost, formatTokens, formatTokensPi } from '../lib/usage-format';
 import { cn } from '../lib/utils';
 import type { ThreadState } from '../state/bridge';
+import { BrailleSpinner } from './ui/braille-spinner';
 
 /** Spend-section glyph, matching the host's scorpio mark. */
 const ScorpioIcon = ({ className }: { className?: string }) => (
@@ -74,7 +78,7 @@ const Section = ({
 
 const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => {
   if (status === 'running' || status === 'pending-approval') {
-    return <LoaderCircle className="size-3.5 shrink-0 animate-spin text-muted-foreground" />;
+    return <BrailleSpinner className="text-accent-foreground" />;
   }
   if (status === 'success' || status === 'completed' || status === 'continued') {
     return <CheckCircle className="size-3.5 shrink-0 text-success" />;
@@ -168,17 +172,15 @@ const SubagentMiniPanel = ({ id, events }: { id: string; events: SubagentChildWi
 };
 
 /** The main agent's own status, mirroring the host's captain indicator:
- * ship-wheel on success (sub-agents get the plain check) and a red X on a
+ * ship-wheel on success (sub-agents get the plain check), a braille spinner
+ * while the turn runs or an authorization is pending, and a red X on a
  * failed turn. */
 const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
-  if (thread.turnActive) {
-    return <LoaderCircle className="size-3.5 shrink-0 animate-spin text-muted-foreground" />;
-  }
   if (thread.error !== null) {
     return <XCircle className="size-3.5 shrink-0 text-danger" />;
   }
-  if ((thread.info?.pending_auth_count ?? 0) > 0) {
-    return <TriangleAlert className="text-warning size-3.5 shrink-0" />;
+  if (thread.turnActive || (thread.info?.pending_auth_count ?? 0) > 0) {
+    return <BrailleSpinner className="text-accent-foreground" />;
   }
   return <ShipWheel className="size-3.5 shrink-0 text-success" />;
 };
@@ -186,6 +188,92 @@ const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
 /** Occupied context for a usage row: live input plus everything cached. */
 const usedTokens = (u: TokenUsageSnapshot): number =>
   (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+
+/** Sort key for plan steps: in-progress first, then pending, then completed;
+ * the stable sort keeps chronological order within each group. */
+const planSortKey = (status: PlanStepWire['status']): number =>
+  status === 'in_progress' ? 0 : status === 'pending' ? 1 : 2;
+
+/** One plan step row: status glyph + title, mirroring the host rail's plan
+ * rows (the live step is bold foreground, the rest muted). */
+const PlanStepRow = ({ step }: { step: PlanStepWire }) => {
+  const glyph =
+    step.status === 'in_progress' ? (
+      <span className="text-foreground min-w-3.5">▶</span>
+    ) : step.status === 'completed' ? (
+      <span className="text-muted-foreground/70 min-w-3.5">✔</span>
+    ) : (
+      <span className="text-muted-foreground min-w-3.5">◻</span>
+    );
+  const titleClass =
+    step.status === 'in_progress' ? 'text-foreground font-semibold' : 'text-muted-foreground';
+  return (
+    <div className="flex items-center gap-1 pl-3 text-xs">
+      {glyph}
+      <span className={cn('min-w-0 flex-1 truncate', titleClass)}>{step.step}</span>
+    </div>
+  );
+};
+
+/** The model's `UpdatePlan` snapshot as a collapsible task list, mirroring
+ * the host rail's plan section: a toggle header with the `done/total` count
+ * and sorted steps (in-progress → pending → completed). Collapsed shows the
+ * first five steps plus the remaining count, or "All done" when finished. */
+const PlanTaskList = ({
+  plan,
+  collapsed,
+  onToggle,
+}: {
+  plan: PlanSnapshotWire;
+  collapsed: boolean;
+  onToggle: () => void;
+}) => {
+  const steps = plan.steps;
+  const total = steps.length;
+  const done = steps.filter((s) => s.status === 'completed').length;
+  const sorted = [...steps].sort((a, b) => planSortKey(a.status) - planSortKey(b.status));
+  const shown = Math.min(sorted.length, 5);
+  const allDone = done === total;
+  return (
+    <div>
+      <button
+        className="flex w-full cursor-pointer items-center gap-1"
+        onClick={onToggle}
+        type="button"
+      >
+        {collapsed ? (
+          <ChevronRight className="text-muted-foreground size-3.5 shrink-0" />
+        ) : (
+          <ChevronDown className="text-muted-foreground size-3.5 shrink-0" />
+        )}
+        <span className="font-code text-muted-foreground/70 ml-auto">
+          {done}/{total}
+        </span>
+      </button>
+      {plan.explanation && <p className="text-muted-foreground">{plan.explanation}</p>}
+      {collapsed ? (
+        allDone ? (
+          <p className="text-muted-foreground pl-3">{t('plan_all_done')}</p>
+        ) : (
+          <>
+            {sorted.slice(0, 5).map((s) => (
+              <PlanStepRow key={s.step} step={s} />
+            ))}
+            {(total - done > shown || steps.length > 5) && (
+              <p className="text-muted-foreground pl-3">{t('plan_remaining', total - shown)}</p>
+            )}
+          </>
+        )
+      ) : (
+        <div className="max-h-40 overflow-y-auto">
+          {sorted.map((s) => (
+            <PlanStepRow key={s.step} step={s} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
 
 /** Full lifetime total of a usage snapshot: occupied context plus output. */
 const totalTokens = (u: TokenUsageSnapshot): number => usedTokens(u) + (u.output_tokens ?? 0);
@@ -261,6 +349,19 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   const perModel = Object.entries(info?.per_model_usage ?? {}).sort(
     ([, a], [, b]) => totalTokens(b) - totalTokens(a),
   );
+  // Plan task list collapse state. The first plan seen per thread decides
+  // the default by length (mirroring the host rail's auto-collapse above
+  // five steps); later updates preserve the user's choice, so a long plan
+  // never yanks a manually expanded list back closed.
+  const [planCollapsed, setPlanCollapsed] = useState(false);
+  const planSeen = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const plan = info?.plan;
+    if (plan && plan.steps.length > 0 && !planSeen.current.has(thread.sessionId)) {
+      planSeen.current.add(thread.sessionId);
+      setPlanCollapsed(plan.steps.length > 5);
+    }
+  }, [info?.plan, thread.sessionId]);
 
   return (
     <aside
@@ -329,14 +430,12 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
               {t(thread.planMode ? 'plan_mode_on' : 'plan_mode_off')}
             </span>
           </p>
-          {info?.plan && (
-            <p className="text-muted-foreground">
-              {info.plan.explanation}
-              <span className="font-code ml-1">
-                {info.plan.steps.filter((s) => s.status === 'completed').length}/
-                {info.plan.steps.length}
-              </span>
-            </p>
+          {info?.plan && info.plan.steps.length > 0 && (
+            <PlanTaskList
+              collapsed={planCollapsed}
+              onToggle={() => setPlanCollapsed((c) => !c)}
+              plan={info.plan}
+            />
           )}
         </Section>
       )}

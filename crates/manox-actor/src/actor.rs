@@ -10,7 +10,7 @@
 //! active, and the thread waits on the command channel when idle, waking
 //! periodically so parked async work still lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -97,6 +97,15 @@ struct SubagentInfo {
 struct PendingPlan {
     plan_file: String,
 }
+/// A submission parked while a turn is running; drained into one batched
+/// follow-up turn when the turn settles (`run_turn` joins the texts with
+/// blank lines, matching the gpui host's `flush_queued_follow_ups`).
+struct QueuedSubmit {
+    client_id: String,
+    text: String,
+    images: Vec<(String, String)>,
+    ui: agent::MessageUiMetadata,
+}
 
 struct SessionState {
     thread: Entity<Thread>,
@@ -107,6 +116,8 @@ struct SessionState {
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
     /// Latest plan submitted for review (PlanReady), for `plan_verdict`.
     pending_plan: Arc<Mutex<Option<PendingPlan>>>,
+    /// Submissions parked while a turn runs; drained on `TurnFinished`.
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
 }
 
 struct ActorState {
@@ -186,6 +197,46 @@ fn run_command_loop(cx: &mut HeadlessAppContext, rx: mpsc::Receiver<String>, sin
     }
 }
 
+/// Archive a session and dispose it — the single archive path shared by the
+/// `/exit`/`/new` submit branch and the `archive_thread` command. An
+/// in-flight turn is cancelled so the release is unconditional; the pi
+/// transcript and sidecar persist, so reopening re-materializes the thread.
+fn archive_and_dispose_session(
+    state: &mut ActorState,
+    id: &str,
+    cx: &mut HeadlessAppContext,
+    sink: &EventSink,
+) {
+    ensure_store_subscription(cx, state, sink);
+    if let Some(session) = state.sessions.get(id)
+        && session.turn_active.load(Ordering::SeqCst)
+    {
+        cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
+    }
+    cx.update(|app| {
+        let store = agent::thread_store::global();
+        store.update(app, |s, cx| {
+            s.archive_thread(id, true, cx);
+            // The disposal below drops the session's subscription, so the
+            // backend's eventual `TurnFinished` can no longer clear the
+            // store's live flags; reset them here or the archived row keeps
+            // spinning until restart.
+            s.mark_idle(id, cx);
+            s.mark_pending_auth(id, false, cx);
+            s.mark_pending_plan(id, false, cx);
+            s.mark_background_work(id, false, cx);
+        });
+    });
+    {
+        let mut focused = state.focused.lock().unwrap();
+        if focused.as_deref() == Some(id) {
+            *focused = None;
+        }
+    }
+    state.sessions.remove(id);
+    sink.emit(json!({"type": "session_disposed", "sessionId": id}).to_string());
+}
+
 /// Returns `false` when the actor loop must exit (shutdown sentinel).
 fn handle_command(
     cx: &mut HeadlessAppContext,
@@ -209,6 +260,16 @@ fn handle_command(
             if let Some(cwd) = cmd["cwd"].as_str() {
                 state.cwd = PathBuf::from(cwd);
             }
+            // The declaring host pins its identity before `agent::init`
+            // computes host-scoped session state.
+            if let Some(host) = cmd["host"].as_str().and_then(agent::host::Host::from_slug) {
+                agent::host::set_host(host);
+            } else if cmd.get("host").is_some() {
+                eprintln!(
+                    "manox actor: unrecognized host slug on init: {:?}",
+                    cmd["host"]
+                );
+            }
             cx.update(agent::init);
             sink.emit(r#"{"type":"ready"}"#.to_string());
             spawn_models_push(sink.clone());
@@ -229,6 +290,7 @@ fn handle_command(
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
             let pending_plan = Arc::new(Mutex::new(None));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let thread = cx.update(|app| Thread::new_fresh(ThreadId(id.clone()), cwd, app));
             let subscription = cx.update(|app| {
                 subscribe_thread(
@@ -238,6 +300,7 @@ fn handle_command(
                     turn_active.clone(),
                     subagents.clone(),
                     pending_plan.clone(),
+                    pending_submits.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -256,6 +319,7 @@ fn handle_command(
                     turn_active,
                     subagents,
                     pending_plan,
+                    pending_submits,
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
@@ -294,6 +358,7 @@ fn handle_command(
             let turn_active = Arc::new(AtomicBool::new(false));
             let subagents = Arc::new(Mutex::new(Vec::new()));
             let pending_plan = Arc::new(Mutex::new(None));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
             let subscription = cx.update(|app| {
                 subscribe_thread(
                     app,
@@ -302,6 +367,7 @@ fn handle_command(
                     turn_active.clone(),
                     subagents.clone(),
                     pending_plan.clone(),
+                    pending_submits.clone(),
                     state.focused.clone(),
                     sink.clone(),
                 )
@@ -314,6 +380,7 @@ fn handle_command(
                     _subscription: subscription,
                     turn_active,
                     subagents,
+                    pending_submits,
                     pending_plan,
                 },
             );
@@ -338,11 +405,18 @@ fn handle_command(
                 return true;
             };
             let archived = cmd["archived"].as_bool().unwrap_or(true);
-            ensure_store_subscription(cx, state, sink);
-            cx.update(|app| {
-                let store = agent::thread_store::global();
-                store.update(app, |s, cx| s.archive_thread(&id, archived, cx));
-            });
+            if archived {
+                archive_and_dispose_session(state, &id, cx, sink);
+            } else {
+                // Unarchive never touches sessions: an archived thread has no
+                // live session, and content stays unloaded until explicitly
+                // opened.
+                ensure_store_subscription(cx, state, sink);
+                cx.update(|app| {
+                    let store = agent::thread_store::global();
+                    store.update(app, |s, cx| s.archive_thread(&id, false, cx));
+                });
+            }
         }
         "pin_thread" => {
             let Some(id) = session_id.clone() else {
@@ -441,6 +515,13 @@ fn handle_command(
             if let Some(session) = state.sessions.remove(&id) {
                 if session.turn_active.load(Ordering::SeqCst) {
                     cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
+                    // The session's subscription is already dropped, so the
+                    // backend's eventual `TurnFinished` can no longer clear
+                    // the store's running flag; reset it here.
+                    cx.update(|app| {
+                        let store = agent::thread_store::global();
+                        store.update(app, |s, cx| s.mark_idle(&id, cx));
+                    });
                 }
                 sink.emit(
                     serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
@@ -467,9 +548,10 @@ fn handle_command(
                 .flatten()
                 .map(|(name, args)| (name.to_string(), args.to_string()));
             // Navigation built-ins (`/exit` / `/new` and aliases) are
-            // session-level: archive the thread and dispose the session so
-            // the webview returns to its home composer, mirroring the gpui
-            // host's archive-and-fresh flow. No-op while a turn is running.
+            // session-level: cancel any in-flight turn, archive the thread,
+            // and dispose the session so the webview returns to its home
+            // composer, mirroring the gpui host's archive-and-fresh flow.
+            // Takes effect immediately even while a turn is running.
             if let Some((name, _)) = slash.as_ref()
                 && let Some(builtin) = agent::slash_builtins::canonical_builtin(name)
                 && matches!(builtin.name, "exit" | "new")
@@ -477,31 +559,34 @@ fn handle_command(
                 let Some(id) = session_id.clone() else {
                     return true;
                 };
-                let running = state
-                    .sessions
-                    .get(&id)
-                    .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-                if running {
-                    return true;
-                }
-                ensure_store_subscription(cx, state, sink);
-                cx.update(|app| {
-                    let store = agent::thread_store::global();
-                    store.update(app, |s, cx| s.archive_thread(&id, true, cx));
-                });
-                {
-                    let mut focused = state.focused.lock().unwrap();
-                    if focused.as_deref() == Some(id.as_str()) {
-                        *focused = None;
-                    }
-                }
-                state.sessions.remove(&id);
-                sink.emit(
-                    serde_json::json!({"type": "session_disposed", "sessionId": id}).to_string(),
-                );
+                archive_and_dispose_session(state, &id, cx, sink);
                 return true;
             }
             with_session(state, session_id.as_deref(), sink, |session, _| {
+                // A running turn parks plain (non-slash) submissions: the
+                // webview echoes the bubble locally and the actor drains the
+                // queue into one follow-up turn when the turn settles. Slash
+                // turns keep executing immediately (their parameter forms
+                // park the prompt in the thread's own queue via
+                // `insert_slash_turn`, which the same drain carries out).
+                if session.turn_active.load(Ordering::SeqCst) && slash.is_none() {
+                    let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+                    let ui = cx.update(|app| {
+                        let t = session.thread.read(app);
+                        MessageUiMetadata {
+                            model_id: t.model().map(|m| m.id.clone()),
+                            approval_mode: Some(t.approval_mode().as_i64()),
+                            ..Default::default()
+                        }
+                    });
+                    session.pending_submits.lock().unwrap().push(QueuedSubmit {
+                        client_id,
+                        text,
+                        images,
+                        ui,
+                    });
+                    return;
+                }
                 cx.update(|app| {
                     session.thread.update(app, |t, cx| {
                         let ui = MessageUiMetadata {
@@ -548,6 +633,75 @@ fn handle_command(
                 });
             });
         }
+        "steer" => with_session(state, session_id.as_deref(), sink, |session, sink| {
+            let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+            let text = cmd["text"].as_str().unwrap_or_default().to_string();
+            let images: Vec<(String, String)> = cmd["images"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|img| {
+                            Some((
+                                img.get("data")?.as_str()?.to_string(),
+                                img.get("mimeType")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Remove the parked copy so the turn-end drain does not resend
+            // the same message as a plain follow-up.
+            session
+                .pending_submits
+                .lock()
+                .unwrap()
+                .retain(|q| q.client_id != client_id);
+            let session_id = session_id.as_deref().unwrap_or_default();
+            cx.update(|app| {
+                session.thread.update(app, |t, cx| {
+                    let ui = MessageUiMetadata {
+                        model_id: t.model().map(|m| m.id.clone()),
+                        approval_mode: Some(t.approval_mode().as_i64()),
+                        ..Default::default()
+                    };
+                    let mut content = Vec::new();
+                    if !text.trim().is_empty() {
+                        content.push(MessageContent::Text(text));
+                    }
+                    content.extend(
+                        images
+                            .into_iter()
+                            .map(|(data, mime_type)| MessageContent::Image { data, mime_type }),
+                    );
+                    if t.is_running() {
+                        let message_id = t.enqueue_steer(content, Some(ui), cx);
+                        sink.emit(
+                            serde_json::json!({
+                                "type": "steer_pending",
+                                "sessionId": session_id,
+                                "clientId": client_id,
+                                "messageId": message_id,
+                            })
+                            .to_string(),
+                        );
+                    } else {
+                        // Defensive: the webview only shows the steer action
+                        // while a turn is active; an idle steer degrades to a
+                        // regular message.
+                        t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                        t.run_turn(cx);
+                    }
+                });
+            });
+        }),
+        "drop_queued" => with_session(state, session_id.as_deref(), sink, |session, _| {
+            let client_id = cmd["clientId"].as_str().unwrap_or_default().to_string();
+            session
+                .pending_submits
+                .lock()
+                .unwrap()
+                .retain(|q| q.client_id != client_id);
+        }),
         "cancel_turn" => with_session(state, session_id.as_deref(), sink, |session, _| {
             cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
         }),
@@ -613,7 +767,10 @@ fn handle_command(
         }),
         "plan_verdict" => with_session(state, session_id.as_deref(), sink, |session, sink| {
             let choice = cmd["choice"].as_str().unwrap_or_default();
-            let pending = session.pending_plan.lock().unwrap().as_ref().cloned();
+            // Consume the pending review on every verdict (mirrors the gpui
+            // host's `take`): refine keeps plan mode on, but a later verdict
+            // without a fresh ProposePlan must not seed execution again.
+            let pending = session.pending_plan.lock().unwrap().take();
             let Some(pending) = pending else {
                 sink.emit(error_json(session_id.as_deref(), "no pending plan review"));
                 return;
@@ -722,6 +879,26 @@ fn handle_command(
                 None => sink.emit(error_json(session_id.as_deref(), "unknown model")),
             }
         }),
+        "set_reasoning_effort" => {
+            with_session(state, session_id.as_deref(), sink, |session, sink| {
+                let effort = match cmd["effort"].as_str() {
+                    Some("high") => agent::language_model::ReasoningEffort::High,
+                    Some("max") => agent::language_model::ReasoningEffort::Max,
+                    _ => {
+                        sink.emit(error_json(
+                            session_id.as_deref(),
+                            "set_reasoning_effort requires effort: high|max",
+                        ));
+                        return;
+                    }
+                };
+                cx.update(|app| {
+                    session
+                        .thread
+                        .update(app, |t, cx| t.set_reasoning_effort(effort, cx));
+                });
+            })
+        }
         "get_current_model" => with_session(state, session_id.as_deref(), sink, |session, sink| {
             let model = cx.update(|app| session.thread.read(app).model().cloned());
             let json = match model {
@@ -752,7 +929,13 @@ fn handle_command(
             });
             sink.emit(json.to_string());
         }),
-        "list_models" => sink.emit(models_snapshot().to_string()),
+        "list_models" => {
+            // Registration runs on a background thread (keychain/shell); a
+            // reply must not race it with an empty snapshot — surfaces that
+            // list before the build lands would never retry. Reuse the shared
+            // push so the answer lands only once registration completes.
+            spawn_models_push(sink.clone());
+        }
         "model_chat" => {
             let Some(request_id) = cmd["requestId"].as_str().map(str::to_string) else {
                 return true;
@@ -838,9 +1021,9 @@ fn emit_persisted_approval_mode(mode: ApprovalMode, session_id: &str, sink: &Eve
 
 /// Shared `ThreadEvent` subscription for fresh and restored sessions alike.
 /// Beyond projecting events onto the wire it maintains the thread-store list
-/// bookkeeping (running / unread / pending-auth / errored), aggregates
-/// sub-agent progress for the info panel, and answers `HistoryRestored` with
-/// a full history snapshot.
+/// bookkeeping (running / unread / pending-auth / pending-plan / errored /
+/// background-work), aggregates sub-agent progress for the info panel, and
+/// answers `HistoryRestored` with a full history snapshot.
 #[allow(clippy::too_many_arguments)] // subscription setup: each input is a distinct owner/handle
 fn subscribe_thread(
     app: &mut App,
@@ -849,6 +1032,7 @@ fn subscribe_thread(
     turn_active: Arc<AtomicBool>,
     subagents: Arc<Mutex<Vec<SubagentInfo>>>,
     pending_plan: Arc<Mutex<Option<PendingPlan>>>,
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     focused: Arc<Mutex<Option<String>>>,
     sink: EventSink,
 ) -> Subscription {
@@ -864,17 +1048,72 @@ fn subscribe_thread(
                         s.set_errored(&id, false, cx);
                     });
                 }
-                ThreadEvent::TurnFinished { .. } => {
+                ThreadEvent::TurnFinished {
+                    cancelled, failed, ..
+                } => {
                     turn_active.store(false, Ordering::SeqCst);
                     let unread = focused.lock().unwrap().as_deref() != Some(session_id.as_str());
                     let id = session_id.clone();
                     agent::thread_store::global().update(app, |s, cx| {
                         s.mark_idle(&id, cx);
                         s.mark_pending_auth(&id, false, cx);
+                        s.mark_pending_plan(&id, false, cx);
+                        // A successful finish supersedes a mid-turn error flag:
+                        // the loop can recover (auto-retry, compact-and-retry)
+                        // without a `TurnStarted` in between, so only
+                        // `TurnStarted` and `TurnFinished` may clear it —
+                        // mirroring the gpui host's `TurnFinished` handler.
+                        if !*failed {
+                            s.set_errored(&id, false, cx);
+                        }
                         if unread {
                             s.set_unread(&id, true, cx);
                         }
                     });
+                    // A settled (non-cancelled) run drains the parked
+                    // submissions into one follow-up turn. The follow-up
+                    // starts deferred so the current turn's `turn_finished`
+                    // wire event lands before the re-entrant
+                    // `turn_started` — the webview keys turnActive off
+                    // those events, and the gpui host gets the same order
+                    // by flushing last.
+                    if !cancelled {
+                        let drained = pending_submits
+                            .lock()
+                            .unwrap()
+                            .drain(..)
+                            .collect::<Vec<_>>();
+                        let drained_any = !drained.is_empty();
+                        if drained_any {
+                            entity.update(app, |t, cx| {
+                                for q in drained {
+                                    let mut content = Vec::new();
+                                    if !q.text.trim().is_empty() {
+                                        content.push(MessageContent::Text(q.text));
+                                    }
+                                    content.extend(q.images.into_iter().map(
+                                        |(data, mime_type)| MessageContent::Image {
+                                            data,
+                                            mime_type,
+                                        },
+                                    ));
+                                    t.insert_user_message_with_content_and_ui_metadata(
+                                        content,
+                                        Some(q.ui),
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                        let follow_up = entity.clone();
+                        app.defer(move |app| {
+                            follow_up.update(app, |t, cx| {
+                                if drained_any || t.has_pending_prompts() {
+                                    t.run_turn(cx);
+                                }
+                            });
+                        });
+                    }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
                     let id = session_id.clone();
@@ -883,7 +1122,11 @@ fn subscribe_thread(
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
-                    agent::thread_store::global().update(app, |s, cx| s.set_errored(&id, true, cx));
+                    agent::thread_store::global().update(app, |s, cx| {
+                        s.set_errored(&id, true, cx);
+                        s.mark_pending_plan(&id, false, cx);
+                        s.mark_background_work(&id, false, cx);
+                    });
                 }
                 ThreadEvent::SubagentStarted {
                     id,
@@ -956,6 +1199,19 @@ fn subscribe_thread(
                     *pending_plan.lock().unwrap() = Some(PendingPlan {
                         plan_file: plan_file.clone(),
                     });
+                    // Mirror the gpui host's sidebar bookkeeping: the thread
+                    // row shows the blue-static wait until the verdict lands.
+                    let id = session_id.clone();
+                    agent::thread_store::global()
+                        .update(app, |s, cx| s.mark_pending_plan(&id, true, cx));
+                    // Persist the pending verdict (sidecar) so a restarted
+                    // session re-surfaces the card — the engine re-emits
+                    // `PlanReady` on Ready only when this flag is recorded.
+                    // The gpui host mirrors the same call on its review card;
+                    // without it a session torn down before the verdict
+                    // (webview/window reload, chat-participant handoff) is
+                    // left in plan mode with no review card to resolve.
+                    entity.update(app, |t, cx| t.set_plan_review_pending(true, cx));
                     let content = std::fs::read_to_string(plan_file).unwrap_or_default();
                     let id = session_id.clone();
                     sink.emit(
@@ -968,6 +1224,20 @@ fn subscribe_thread(
                         })
                         .to_string(),
                     );
+                }
+                ThreadEvent::BackgroundTaskUpdated { .. } => {
+                    // Live monitors / background bash keep the loop able to
+                    // self-advance; mirror the gpui host's per-thread
+                    // running-task check so the row keeps spinning even with
+                    // no turn in flight.
+                    let id = session_id.clone();
+                    agent::thread_store::global().update(app, |s, cx| {
+                        s.mark_background_work(
+                            &id,
+                            agent::background_task::thread_has_running_tasks(&id),
+                            cx,
+                        );
+                    });
                 }
                 _ => {}
             }
@@ -1033,6 +1303,7 @@ fn emit_thread_info(
             "type": "thread_info",
             "sessionId": session_id,
             "info": {
+                "reasoning_effort": t.reasoning_effort().wire_value(),
                 "worktree_path": worktree_path,
                 "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
                 "goal": serde_json::to_value(t.goal()).unwrap_or(Value::Null),
@@ -1077,9 +1348,13 @@ fn threads_snapshot(
                 "unread": s.has_unread,
                 "errored": s.errored,
                 "pending_auth": store.pending_auth_contains(&s.id),
+                "pending_plan": store.pending_plan_contains(&s.id),
+                "background_work": store.background_work_contains(&s.id),
                 "model_id": s.model_id,
                 "pinned": s.pinned,
                 "archived": s.archived,
+                "parent_id": s.parent_id,
+                "depth": s.depth,
             })
         })
         .collect();
@@ -1320,9 +1595,27 @@ fn model_chat_done_error(request_id: &str, error: &str) -> String {
     .to_string()
 }
 
+/// Collapse models the host would register under an identical identity: the
+/// VS Code model picker buckets by provider display name and registers each
+/// bucket's models by id, so two endpoints exposing the same
+/// (display name, id) pair collide ("already registered"). The first entry
+/// wins; the registry listing is sorted by provider then id, so the survivor
+/// is deterministic.
+fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
+    let mut seen = HashSet::new();
+    models
+        .into_iter()
+        .filter(|model| {
+            seen.insert((
+                agent::pi_providers::display_provider_name(model),
+                model.id.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn models_snapshot() -> Value {
-    let models: Vec<Value> = agent::pi_providers::global()
-        .models()
+    let models: Vec<Value> = deduped_models(agent::pi_providers::global().models())
         .iter()
         .map(model_json)
         .collect();
@@ -1504,6 +1797,284 @@ mod tests {
         assert!(types(&out).contains(&"session_disposed".to_string()));
         // Release every thread handle before the context drops so the gpui
         // leak detector sees a clean entity map.
+        drop(state);
+    }
+
+    /// Archiving a live session releases it: the row moves to the archived
+    /// partition, the session is disposed, and `session_disposed` lands so
+    /// the webview folds the thread state away.
+    #[test]
+    fn archive_thread_disposes_live_session() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/archive/dispose/project");
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/dispose/project"));
+        let (out, sink) = collect_sink();
+
+        let rows = |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+        let wait_for = |out: &Arc<Mutex<Vec<String>>>,
+                        cx: &mut HeadlessAppContext,
+                        check: &dyn Fn(&[Value]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if check(&rows(out, cx)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot never settled"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &|r| r.iter().any(|t| t["id"] == "s1"));
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        assert!(state.sessions.contains_key("s1"));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+        wait_for(&out, &mut cx, &|r| {
+            r.iter()
+                .find(|t| t["id"] == "s1")
+                .is_some_and(|t| t["archived"].as_bool() == Some(true))
+        });
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Archiving a thread with an in-flight turn cancels the turn and still
+    /// releases the session — the archive path is unconditional.
+    #[test]
+    fn archive_thread_cancels_running_turn() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/"));
+        let (out, sink) = collect_sink();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        state
+            .sessions
+            .get_mut("s1")
+            .expect("session live")
+            .turn_active
+            .store(true, Ordering::SeqCst);
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Unarchiving only flips the list flag — it never re-creates a session
+    /// and never emits another `session_disposed`.
+    #[test]
+    fn unarchive_does_not_dispose_or_load() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/archive/dispose/project");
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/archive/dispose/project"));
+        let (out, sink) = collect_sink();
+
+        let rows = |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+        let wait_for = |out: &Arc<Mutex<Vec<String>>>,
+                        cx: &mut HeadlessAppContext,
+                        check: &dyn Fn(&[Value]) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if check(&rows(out, cx)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot never settled"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &|r| r.iter().any(|t| t["id"] == "s1"));
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":true}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        let disposed_before = types(&out)
+            .iter()
+            .filter(|t| t.as_str() == "session_disposed")
+            .count();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"archive_thread","sessionId":"s1","archived":false}"#,
+        );
+        cx.run_until_parked();
+        let disposed_after = types(&out)
+            .iter()
+            .filter(|t| t.as_str() == "session_disposed")
+            .count();
+        assert_eq!(disposed_after, disposed_before);
+        assert!(!state.sessions.contains_key("s1"));
+        wait_for(&out, &mut cx, &|r| {
+            r.iter()
+                .find(|t| t["id"] == "s1")
+                .is_some_and(|t| t["archived"].as_bool() == Some(false))
+        });
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn set_reasoning_effort_routes_and_rejects_invalid() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let mut state = state_with(PathBuf::from("/"));
+        let (out, sink) = collect_sink();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"set_reasoning_effort","sessionId":"s1","effort":"max"}"#,
+        );
+        cx.run_until_parked();
+        let events: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "reasoning_effort_changed")
+            .map(|v| v["effort"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(events, vec!["max".to_string()]);
+        let thread_effort = cx.update(|app| {
+            state
+                .sessions
+                .get("s1")
+                .map(|s| s.thread.read(app).reasoning_effort())
+        });
+        assert_eq!(
+            thread_effort,
+            Some(agent::language_model::ReasoningEffort::Max)
+        );
+
+        // An unparseable effort surfaces as an error event and leaves the
+        // thread's effort untouched.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"set_reasoning_effort","sessionId":"s1","effort":"turbo"}"#,
+        );
+        let errors: Vec<String> = out
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
+            .filter(|v| v["type"] == "error")
+            .map(|v| v["message"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("set_reasoning_effort requires effort")),
+            "{errors:?}"
+        );
+
         drop(state);
     }
 
@@ -1702,6 +2273,37 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    /// Seed a session file with an explicit header `metadata.host` tag.
+    fn seed_session_file_meta(dir: &Path, id: &str, cwd: &str, host: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"{host}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Seed a session file whose header records a team parent link.
+    fn seed_session_file_team(dir: &Path, id: &str, cwd: &str, parent: &str) {
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"team\":{{\"parent\":\"{parent}\"}}}}}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Restore the process host identity on drop so a panicking test cannot
+    /// leak a switched host into later tests.
+    struct HostGuard(agent::host::Host);
+    impl Drop for HostGuard {
+        fn drop(&mut self) {
+            agent::host::set_host(self.0);
+        }
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
@@ -1947,6 +2549,398 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// Live-state flags the gpui sidebar mirrors — `pending_plan` (blue-static
+    /// wait for the review verdict) and `background_work` (row spins while
+    /// monitors / background bash are alive) — must ride the same
+    /// `threads_updated` rows so the VS Code surface renders the same state
+    /// machine.
+    #[test]
+    fn threads_snapshot_carries_pending_plan_and_background_work() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "live-flags", "/live/flags/project");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/live/flags/project"));
+        let (out, sink) = collect_sink();
+
+        let latest_rows = |cx: &mut HeadlessAppContext| -> Vec<Value> {
+            cx.run_until_parked();
+            out.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default()
+        };
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids: Vec<String> = latest_rows(&mut cx)
+                .iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_string))
+                .collect();
+            if ids.iter().any(|id| id == "live-flags") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Flag the store the way the actor's subscription does on PlanReady /
+        // BackgroundTaskUpdated; each write emits a store event that pushes a
+        // fresh snapshot through the subscription.
+        cx.update(|app| {
+            agent::thread_store::global().update(app, |s, cx| {
+                s.mark_pending_plan("live-flags", true, cx);
+                s.mark_background_work("live-flags", true, cx);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = latest_rows(&mut cx)
+                .into_iter()
+                .find(|t| t["id"] == "live-flags");
+            let flagged = row.is_some_and(|t| {
+                t["pending_plan"].as_bool() == Some(true)
+                    && t["background_work"].as_bool() == Some(true)
+            });
+            if flagged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live-state flags never reached the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A mid-turn stream error (provider hiccup) flags the row errored;
+    /// the loop's auto-retry then completes the same turn without a
+    /// `TurnStarted` in between, so only a successful `TurnFinished` can
+    /// clear the flag — the webview's thread-row state must follow the
+    /// turn's real outcome, mirroring the gpui host's `TurnFinished`
+    /// handler.
+    #[test]
+    fn successful_finish_clears_stale_errored_flag() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/proj");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/proj"));
+        let (out, sink) = collect_sink();
+
+        let snapshot_rows =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<Value> {
+                cx.run_until_parked();
+                out.lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                    .find(|e| e["type"] == "threads_updated")
+                    .and_then(|s| s["threads"].as_array().cloned())
+                    .unwrap_or_default()
+            };
+        let row_errored =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Option<bool> {
+                snapshot_rows(out, cx)
+                    .into_iter()
+                    .find(|t| t["id"] == "s1")
+                    .and_then(|t| t["errored"].as_bool())
+            };
+        let wait_for_errored = |out: &Arc<Mutex<Vec<String>>>,
+                                cx: &mut HeadlessAppContext,
+                                expected: bool,
+                                msg: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let flag = row_errored(out, cx);
+                if flag == Some(expected) {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{msg}; last errored flag: {flag:?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // The seeded session appears in the list snapshot (the row whose
+        // errored flag the webview renders).
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if snapshot_rows(&out, &mut cx).iter().any(|t| t["id"] == "s1") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "seeded session never appeared in the snapshot"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // A live session drives the wire events that flip the row's flag.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"create_session","sessionId":"s1","cwd":"/proj"}"#,
+        );
+        cx.run_until_parked();
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+
+        // The fresh thread's real engine cannot assemble a session in this
+        // hermetic env (no providers registered) and bails with a Fatal
+        // notice, which also flags the row errored. Drain it before the
+        // assertions so the startup failure cannot race the finish below.
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                cx.run_until_parked();
+                if types(&out).contains(&"error".to_string()) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the engine's startup error never arrived; types: {:?}",
+                    types(&out)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        wait_for_errored(
+            &out,
+            &mut cx,
+            true,
+            "the startup failure never flagged the row",
+        );
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Event(Box::new(
+                agent::ThreadEvent::Error(anyhow::anyhow!("transient provider failure")),
+            )))
+            .unwrap();
+        wait_for_errored(&out, &mut cx, true, "the error never flagged the row");
+
+        // The auto-retry completes the same turn (no `TurnStarted` in
+        // between): the row must follow the real outcome.
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        wait_for_errored(
+            &out,
+            &mut cx,
+            false,
+            "a successful finish never cleared the errored flag",
+        );
+
+        // A failed finish keeps the flag.
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Event(Box::new(
+                agent::ThreadEvent::Error(anyhow::anyhow!("another failure")),
+            )))
+            .unwrap();
+        wait_for_errored(
+            &out,
+            &mut cx,
+            true,
+            "the second error never flagged the row",
+        );
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: true,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            row_errored(&out, &mut cx),
+            Some(true),
+            "a failed finish must keep the errored flag"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A team worker's session header carries its leader's id; the snapshot
+    /// surfaces it as `parent_id` with a computed `depth` (1 under a
+    /// top-level leader), so the sidebar can nest the member row.
+    #[test]
+    fn threads_snapshot_carries_team_parent_and_depth() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "leader-1", "/team/project");
+        seed_session_file_team(&sessions, "member-1", "/team/project", "leader-1");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        cx.update(agent::thread_store::init);
+        let mut state = state_with(PathBuf::from("/team/project"));
+        let (out, sink) = collect_sink();
+
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let rows = loop {
+            cx.run_until_parked();
+            let rows = out
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                .find(|e| e["type"] == "threads_updated")
+                .and_then(|s| s["threads"].as_array().cloned())
+                .unwrap_or_default();
+            let ids: Vec<&str> = rows.iter().filter_map(|t| t["id"].as_str()).collect();
+            if ids.contains(&"member-1") {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded team session never appeared in the snapshot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let member = rows.iter().find(|t| t["id"] == "member-1").unwrap();
+        assert_eq!(member["parent_id"], "leader-1");
+        assert_eq!(member["depth"], 1);
+        let leader = rows.iter().find(|t| t["id"] == "leader-1").unwrap();
+        assert!(leader["parent_id"].is_null());
+        assert_eq!(leader["depth"], 0);
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// A session file with no `metadata.host` tag belongs to the native-app
+    /// host; one tagged `vscode` belongs to the VS Code host. Switching the
+    /// process host flips which of the two a `list_threads` snapshot shows.
+    /// The host switch goes through `set_host` directly: a full `init`
+    /// command would run `agent::init` (MCP/plugin/provider registration),
+    /// whose background side effects destabilize sibling tests in the suite.
+    #[test]
+    fn init_command_scopes_threads_to_the_declared_host() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "legacy", "/iso/project");
+        seed_session_file_meta(&sessions, "vscode-one", "/iso/project", "vscode");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let mut state = state_with(PathBuf::from("/iso/project"));
+        let (out, sink) = collect_sink();
+        let snapshot_ids =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext| -> Vec<String> {
+                cx.run_until_parked();
+                out.lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+                    .find(|e| e["type"] == "threads_updated")
+                    .and_then(|s| s["threads"].as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|t| t["id"].as_str().map(str::to_string))
+                    .collect()
+            };
+        let wait_for =
+            |out: &Arc<Mutex<Vec<String>>>, cx: &mut HeadlessAppContext, expected: &[&str]| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let ids = snapshot_ids(out, cx);
+                    if ids.iter().map(String::as_str).eq(expected.iter().copied()) {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "snapshot never matched {expected:?}; last ids: {ids:?}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            };
+
+        // Default host (the native app): the untagged session is the only
+        // one visible.
+        cx.update(agent::thread_store::init);
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &["legacy"]);
+        agent::thread_store::drop_global_for_test();
+
+        // A vscode host: only the tagged session is visible.
+        let host_guard = HostGuard(agent::host::current());
+        agent::host::set_host(agent::host::Host::Vscode);
+        cx.update(agent::thread_store::init);
+        // The store global was rebuilt; re-subscribe so follow-up snapshot
+        // pushes land on the new entity.
+        state.store_subscription = None;
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        wait_for(&out, &mut cx, &["vscode-one"]);
+        drop(host_guard);
 
         drop(state);
         agent::thread_store::drop_global_for_test();
@@ -2228,6 +3222,409 @@ mod tests {
     }
 
     #[test]
+    fn exit_while_turn_running_cancels_and_disposes() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        // Seed a session file so the store scan can surface the archived
+        // summary; a fresh thread's jsonl materializes only on the first
+        // assistant message.
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/");
+
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink_out = out.clone();
+        let sink = EventSink::new(move |json| sink_out.lock().unwrap().push(json));
+
+        // Make the store aware of s1, then simulate the in-flight turn the
+        // event subscription would have flagged.
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let known = cx.update(|app| {
+                let store = agent::thread_store::global();
+                let s = store.read(app);
+                s.summaries()
+                    .iter()
+                    .chain(s.archived_summaries())
+                    .any(|sum| sum.id == "s1")
+            });
+            if known {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seeded session never landed in the store scan"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Simulate the running turn the event subscription would have
+        // flagged: the actor's `turn_active` plus the store's running set.
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.update(app, |s, cx| s.mark_running("s1", cx));
+        });
+
+        // `/exit` while running must cancel the turn and dispose the session
+        // immediately instead of silently dropping the command.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/exit"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+
+        // The thread-store summary lands in the archived partition.
+        let archived = cx.update(|app| {
+            let store = agent::thread_store::global();
+            let s = store.read(app);
+            s.archived_summaries()
+                .iter()
+                .any(|sum| sum.id == "s1" && sum.archived)
+        });
+        assert!(archived, "s1 must be archived in the thread store");
+
+        // The store's running flag is cleared: the disposal drops the
+        // session's subscription, so the backend's eventual `TurnFinished`
+        // can never reach `mark_idle` — the exit path must do it.
+        let running = cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.read(app).is_running("s1")
+        });
+        assert!(!running, "s1 must not stay flagged running after /exit");
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn running_submit_parks_into_pending_submits() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"queued one","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            !types(&out).contains(&"turn_started".to_string()),
+            "a parked submit must not start a turn"
+        );
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert!(
+            messages.is_empty(),
+            "a parked submit must not insert a message"
+        );
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn settled_turn_drains_parked_submits_into_a_follow_up_run() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"follow up","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            pump_until(&out, &mut cx, "turn_started", 1),
+            "the drained queue starts the follow-up turn"
+        );
+
+        assert_eq!(engine.runs.lock().unwrap().as_slice(), ["follow up"]);
+        assert!(
+            state.sessions["s1"]
+                .pending_submits
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Text(t) if t == "follow up"))
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn follow_up_turn_emits_turn_finished_before_turn_started() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"follow up","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+
+        engine
+            .notices
+            .send(agent::thread_engine::BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        assert!(pump_until(&out, &mut cx, "turn_started", 1));
+
+        // The drained follow-up must surface as a turn whose start lands
+        // after the previous turn's wire finish, so the webview never
+        // renders the running follow-up as idle.
+        let order: Vec<String> = types(&out)
+            .into_iter()
+            .filter(|t| t == "turn_finished" || t == "turn_started")
+            .collect();
+        assert_eq!(order, ["turn_finished", "turn_started"]);
+        assert!(
+            state.sessions["s1"].turn_active.load(Ordering::SeqCst),
+            "the follow-up turn keeps the session turn-active"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn steer_while_running_emits_steer_pending_and_removes_the_parked_copy() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        let (engine, events) = FakeEngine::new();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        // A plain submit starts a real run (the FakeEngine never settles),
+        // which flips both the thread's running flag and the actor's
+        // turn-active gate.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"first"}"#,
+        );
+        cx.run_until_parked();
+        assert!(types(&out).contains(&"turn_started".to_string()));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"queued","clientId":"c1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            1
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"steer","sessionId":"s1","clientId":"c1","text":"steer me"}"#,
+        );
+        cx.run_until_parked();
+
+        assert_eq!(engine.steer_calls.lock().unwrap().as_slice(), ["steer me"]);
+        assert!(
+            state.sessions["s1"]
+                .pending_submits
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the steered submit must not survive for the turn-end drain"
+        );
+        let pending = out
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|raw| {
+                let v: Value = serde_json::from_str(raw).unwrap();
+                (v["type"] == "steer_pending").then_some(v)
+            })
+            .expect("steer_pending emitted");
+        assert_eq!(pending["clientId"], "c1");
+        assert!(
+            pending["messageId"].as_str().is_some_and(|s| !s.is_empty()),
+            "steer_pending carries the kernel message id"
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn drop_queued_removes_only_the_matching_parked_submit() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"keep","clientId":"c1"}"#,
+        );
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"submit","sessionId":"s1","text":"drop","clientId":"c2"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            state.sessions["s1"].pending_submits.lock().unwrap().len(),
+            2
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"drop_queued","sessionId":"s1","clientId":"c2"}"#,
+        );
+        cx.run_until_parked();
+        let remaining = state.sessions["s1"].pending_submits.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].client_id, "c1");
+        drop(remaining);
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn idle_steer_falls_back_to_a_regular_message() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"steer","sessionId":"s1","clientId":"c9","text":"steer idle"}"#,
+        );
+        cx.run_until_parked();
+
+        assert!(types(&out).contains(&"turn_started".to_string()));
+        let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Text(t) if t == "steer idle"))
+        );
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
     fn pushes_models_snapshot_after_provider_registration() {
         let _guard = GLOBALS_LOCK.lock().unwrap();
         hermetic_home();
@@ -2242,6 +3639,33 @@ mod tests {
             serde_json::from_str(&out.lock().unwrap()[0]).expect("models event is valid json");
         // The hermetic home registers no providers; the snapshot still lands
         // so waiting surfaces can leave their disabled state.
+        assert!(event["models"].is_array());
+    }
+
+    #[test]
+    fn list_models_replies_after_registration() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        init_globals(&mut cx);
+        let (out, sink) = collect_sink();
+        let mut state = state_with(PathBuf::from("/"));
+
+        // The command must not answer before the one-shot provider
+        // registration finishes (hermetic home: no providers, but the
+        // snapshot still lands so waiting surfaces leave their disabled
+        // state).
+        handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_models"}"#);
+        assert!(pump_until(&out, &mut cx, "models", 1));
+        let event: Value = serde_json::from_str(
+            out.lock()
+                .unwrap()
+                .iter()
+                .find(|raw| raw.contains("\"type\":\"models\""))
+                .expect("models event present"),
+        )
+        .expect("models event is valid json");
         assert!(event["models"].is_array());
     }
 
@@ -2263,6 +3687,49 @@ mod tests {
         assert_eq!(value["api"], "anthropic");
         assert_eq!(value["context_window"], 200_000);
         assert!(value["name"].is_string());
+    }
+
+    #[test]
+    fn deduped_models_collapses_same_display_name_and_id() {
+        let model = |provider: &str, display: Option<&str>, id: &str| {
+            let mut metadata = HashMap::new();
+            if let Some(display) = display {
+                metadata.insert("provider_display_name".to_string(), json!(display));
+            }
+            pi::types::Model {
+                provider: provider.into(),
+                api: "anthropic".into(),
+                id: id.into(),
+                context_window: 200_000,
+                max_tokens: 8192,
+                thinking: pi::types::ThinkingKind::None,
+                metadata,
+            }
+        };
+        let deduped = deduped_models(vec![
+            // Same display name + id from two endpoints: collapses to the first.
+            model("bailian-a", Some("百炼"), "deepseek-v4-flash"),
+            model("bailian-b", Some("百炼"), "deepseek-v4-flash"),
+            // Same display name, distinct id: kept.
+            model("bailian-a", Some("百炼"), "qwen3-max"),
+            // Same id under a different display name: kept.
+            model("deepseek", Some("DeepSeek"), "deepseek-v4-flash"),
+            // No display metadata: identity falls back to the provider name.
+            model("openai", None, "gpt-5"),
+        ]);
+        let identities: Vec<(String, String)> = deduped
+            .iter()
+            .map(|m| (agent::pi_providers::display_provider_name(m), m.id.clone()))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("百炼".to_string(), "deepseek-v4-flash".to_string()),
+                ("百炼".to_string(), "qwen3-max".to_string()),
+                ("DeepSeek".to_string(), "deepseek-v4-flash".to_string()),
+                ("openai".to_string(), "gpt-5".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2358,9 +3825,159 @@ mod tests {
         agent::thread_store::drop_global_for_test();
     }
 
+    #[test]
+    fn plan_ready_emits_review_card_and_records_the_pending_verdict() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        // A proposed plan surfaces as the enriched wire event the sidebar's
+        // review card renders from.
+        let dir = std::env::temp_dir().join(format!("manox-plan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan_file = dir.join("audit-plan.md");
+        std::fs::write(&plan_file, "# Audit\n\nsteps").unwrap();
+        let plan_file = plan_file.to_string_lossy().to_string();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |_t, cx| {
+                cx.emit(agent::ThreadEvent::PlanReady {
+                    plan_file: plan_file.clone(),
+                    title: "Audit".into(),
+                });
+            });
+        });
+        cx.run_until_parked();
+        let ready = out
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .find(|v| v["type"] == "plan_ready")
+            .expect("plan_ready wire event");
+        assert_eq!(ready["sessionId"], "s1");
+        assert_eq!(ready["plan_file"], plan_file.as_str());
+        assert_eq!(ready["title"], "Audit");
+        assert_eq!(ready["content"], "# Audit\n\nsteps");
+
+        // The recorded pending plan makes a verdict succeed (refine keeps
+        // plan mode on and consumes the card).
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"plan_verdict","sessionId":"s1","choice":"refine"}"#,
+        );
+        cx.run_until_parked();
+        assert!(!out.lock().unwrap().iter().any(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
+                == "no pending plan review"
+        }));
+        // A second verdict now has nothing to consume.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"plan_verdict","sessionId":"s1","choice":"refine"}"#,
+        );
+        cx.run_until_parked();
+        assert!(out.lock().unwrap().iter().any(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()["message"]
+                == "no pending plan review"
+        }));
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
     /// A sink that feeds an already-collected `out` buffer.
     fn sink_for(out: &Arc<Mutex<Vec<String>>>) -> EventSink {
         let out = Arc::clone(out);
         EventSink::new(move |json| out.lock().unwrap().push(json))
+    }
+
+    /// Scripted backend for the queue/steer tests: records `run`/`steer`
+    /// traffic and lets the test drive settlement through the notice
+    /// channel, so the actor pipeline is exercised without a live provider.
+    struct FakeEngine {
+        runs: Mutex<Vec<String>>,
+        steer_calls: Mutex<Vec<String>>,
+        notices: tokio::sync::mpsc::UnboundedSender<agent::thread_engine::BackendNotice>,
+    }
+
+    impl FakeEngine {
+        fn new() -> (
+            Arc<Self>,
+            tokio::sync::mpsc::UnboundedReceiver<agent::thread_engine::BackendNotice>,
+        ) {
+            let (notices, events) = tokio::sync::mpsc::unbounded_channel();
+            (
+                Arc::new(Self {
+                    runs: Mutex::new(Vec::new()),
+                    steer_calls: Mutex::new(Vec::new()),
+                    notices,
+                }),
+                events,
+            )
+        }
+    }
+
+    impl agent::thread_engine::ThreadEngine for FakeEngine {
+        fn is_running(&self) -> bool {
+            false
+        }
+
+        fn history(&self) -> Vec<agent::Message> {
+            Vec::new()
+        }
+
+        fn request_token_usage(&self) -> HashMap<String, agent::TokenUsage> {
+            HashMap::new()
+        }
+
+        fn model(&self) -> Option<pi::types::Model> {
+            None
+        }
+
+        fn run(&self, prompt: String, _images: Vec<pi::types::ContentBlock>) {
+            self.runs.lock().unwrap().push(prompt);
+        }
+
+        fn steer(&self, text: String, _images: Vec<pi::types::ContentBlock>) -> String {
+            self.steer_calls.lock().unwrap().push(text);
+            String::new()
+        }
+
+        fn cancel_steer(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn abort(&self) {}
+
+        fn set_model(&self, _model: pi::types::Model) {}
+
+        fn set_thinking_level(&self, _level: Option<String>) {}
+
+        fn open_session(&self, _path: PathBuf) {}
+
+        fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
+
+        fn active_session_path(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn session_list(&self) -> Vec<agent::ThreadSummary> {
+            Vec::new()
+        }
     }
 }

@@ -97,7 +97,7 @@ export class SessionManager {
           'init ready',
           INIT_TIMEOUT_MS,
         );
-        this.send({ cmd: 'init', cwd });
+        this.send({ cmd: 'init', cwd, host: 'vscode' });
         await ready;
       } catch (e) {
         this.initPhase = 'idle';
@@ -198,7 +198,10 @@ export class SessionManager {
   }
 
   listModels(): Promise<ModelInfo[]> {
-    const models = this.awaitGlobal((ev) => ev.type === 'models', 'models');
+    // The actor answers only after its one-shot provider registration
+    // (keychain/shell lookups) completes; budget the cold boot rather than
+    // a plain round trip.
+    const models = this.awaitGlobal((ev) => ev.type === 'models', 'models', INIT_TIMEOUT_MS);
     this.send({ cmd: 'list_models' });
     return models.then((ev) => (ev as Extract<ActorEvent, { type: 'models' }>).models);
   }
@@ -216,8 +219,10 @@ export class SessionManager {
     );
   }
 
-  /** Archive/unarchive a thread; the store mutation pushes an updated
-   * `threads_updated` snapshot through the global stream. */
+  /** Archive/unarchive a thread; archiving also disposes the actor-side
+   * session (cancelling any in-flight turn), so the thread's resources are
+   * released. The store mutation pushes an updated `threads_updated`
+   * snapshot through the global stream. */
   archiveThread(sessionId: string, archived: boolean): void {
     this.send({ cmd: 'archive_thread', sessionId, archived });
   }

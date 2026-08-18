@@ -341,6 +341,10 @@ pub struct Thread {
     /// thread; the mode is then not overwritten by the session sidecar's
     /// default when the engine materializes.
     approval_mode_explicitly_set: bool,
+    /// Whether the user explicitly set the reasoning effort on a landing
+    /// thread; the effort is then not overwritten by the session sidecar's
+    /// default when the engine materializes.
+    reasoning_effort_explicitly_set: bool,
     /// Plan mode active: read-only research + plan-file writes, proposals
     /// ride the `ProposePlan` tool. Mirrored from the engine on
     /// `PlanModeChanged`/`Ready`.
@@ -389,6 +393,7 @@ impl Thread {
             engine: None,
             history_phase: HistoryPhase::Ready,
             approval_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
             plan_mode: false,
             persisted_plan: None,
             label: "lead".into(),
@@ -444,6 +449,7 @@ impl Thread {
             project.clone(),
             id.0.clone(),
             goal_bridge.clone(),
+            None,
         );
 
         cx.new(|cx| {
@@ -473,8 +479,9 @@ impl Thread {
                     HistoryPhase::Ready
                 },
                 approval_mode_explicitly_set: false,
-            plan_mode: false,
-            persisted_plan: None,
+                reasoning_effort_explicitly_set: false,
+                plan_mode: false,
+                persisted_plan: None,
                 label: "lead".into(),
                 team: None,
                 goal_bridge,            worktree_path: None,
@@ -510,6 +517,7 @@ impl Thread {
             project,
             self.id.0.clone(),
             self.goal_bridge.clone(),
+            None,
         );
         if self.approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(self.approval_mode);
@@ -633,6 +641,7 @@ impl Thread {
                 restored,
                 model,
                 approval_mode,
+                reasoning_effort,
                 plan_mode,
                 plan_file,
                 plan_review_pending,
@@ -648,6 +657,9 @@ impl Thread {
                 }
                 if !self.approval_mode_explicitly_set {
                     self.approval_mode = approval_mode;
+                }
+                if !self.reasoning_effort_explicitly_set {
+                    self.reasoning_effort = reasoning_effort;
                 }
                 if plan_mode {
                     self.plan_mode = true;
@@ -870,6 +882,28 @@ impl Thread {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Whether the facade holds queued prompts/images that the next
+    /// `run_turn` would drain (the actor uses it to decide whether a
+    /// post-settlement follow-up turn is needed).
+    pub fn has_pending_prompts(&self) -> bool {
+        !self.pending_prompts.is_empty() || !self.pending_images.is_empty()
+    }
+
+    /// Test-support: replace the lazily spawned backend with a scripted
+    /// engine and wire its notice channel, so downstream host tests can
+    /// observe run/steer traffic and drive settlement without a live
+    /// provider.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_engine_for_test(
+        &mut self,
+        engine: Arc<dyn ThreadEngine>,
+        events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+        cx: &mut Context<Self>,
+    ) {
+        self.engine = Some(engine);
+        drain_engine_notices(cx, events);
     }
 
     /// Test-only: force the running flag so team routing tests can simulate
@@ -1169,7 +1203,9 @@ impl Thread {
     /// (leader) thread's cwd / model / approval mode / reasoning effort,
     /// labeled with the member name. Engine spawned eagerly (members always
     /// run). Members carry no goal bridge: the goal contract belongs to the
-    /// leader's user-facing conversation.
+    /// leader's user-facing conversation. The member session header records
+    /// this leader's session id (`team.parent`), persisting the affiliation
+    /// with the jsonl file so it survives restarts and team disband.
     pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
@@ -1188,6 +1224,7 @@ impl Thread {
             None,
             id.0.clone(),
             None,
+            Some(self.id.0.clone()),
         );
         if approval_mode != ApprovalMode::default() {
             engine.set_approval_mode(approval_mode);
@@ -1218,6 +1255,7 @@ impl Thread {
                 engine: Some(engine),
                 history_phase: HistoryPhase::Ready,
                 approval_mode_explicitly_set: true,
+                reasoning_effort_explicitly_set: true,
                 plan_mode: false,
                 persisted_plan: None,
                 goal_bridge: None,
@@ -1443,6 +1481,9 @@ impl Thread {
             return;
         }
         self.reasoning_effort = effort;
+        // An explicit user choice must survive engine materialization: the
+        // session sidecar's default would otherwise overwrite it at `Ready`.
+        self.reasoning_effort_explicitly_set = true;
         if let Some(engine) = &self.engine {
             engine.set_thinking_level(Some(effort.wire_value().to_string()));
         }
@@ -1820,6 +1861,7 @@ pub(crate) mod tests {
     pub(crate) struct FakeEngine {
         history: Vec<Message>,
         shutdown_calls: AtomicUsize,
+        abort_calls: AtomicUsize,
         approval_mode: Mutex<Option<ApprovalMode>>,
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
@@ -1834,6 +1876,7 @@ pub(crate) mod tests {
             Self {
                 history: Vec::new(),
                 shutdown_calls: AtomicUsize::new(0),
+                abort_calls: AtomicUsize::new(0),
                 approval_mode: Mutex::new(None),
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
@@ -1874,7 +1917,9 @@ pub(crate) mod tests {
             false
         }
 
-        fn abort(&self) {}
+        fn abort(&self) {
+            self.abort_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         fn set_model(&self, _model: PiModel) {}
 
@@ -1933,6 +1978,7 @@ pub(crate) mod tests {
                 engine: Some(engine),
                 history_phase: phase,
                 approval_mode_explicitly_set: false,
+                reasoning_effort_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
@@ -2000,6 +2046,7 @@ pub(crate) mod tests {
                 "partial answer".into(),
             )])],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2041,6 +2088,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2102,6 +2150,7 @@ pub(crate) mod tests {
                 )]),
             ],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2148,6 +2197,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2186,6 +2236,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2213,6 +2264,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2234,6 +2286,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2248,6 +2301,7 @@ pub(crate) mod tests {
                     restored: true,
                     model: None,
                     approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2285,6 +2339,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2310,6 +2365,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2327,6 +2383,7 @@ pub(crate) mod tests {
                     restored: false,
                     model: None,
                     approval_mode: ApprovalMode::AutoPilot,
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2345,6 +2402,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2405,6 +2463,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
             approval_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -2425,6 +2484,7 @@ pub(crate) mod tests {
                     restored: true,
                     model: None,
                     approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
@@ -2436,5 +2496,98 @@ pub(crate) mod tests {
         cx.read(|cx| {
             assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
         });
+    }
+
+    /// I4: an explicit user reasoning-effort choice survives the sidecar
+    /// default arriving at `Ready` (`reasoning_effort_explicitly_set`).
+    #[gpui::test]
+    fn explicit_reasoning_effort_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, _cx| {
+            t.set_reasoning_effort(ReasoningEffort::Max, _cx);
+        });
+        // The fresh session's sidecar reports High at Ready; the user's Max
+        // choice must not be overwritten.
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: false,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            ReasoningEffort::Max
+        );
+    }
+
+    /// I5: without an explicit choice, `Ready` restores the persisted
+    /// effort from the sidecar.
+    #[gpui::test]
+    fn ready_restores_reasoning_effort_when_not_explicitly_set(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready {
+                    restored: true,
+                    model: None,
+                    approval_mode: ApprovalMode::default(),
+                    reasoning_effort: ReasoningEffort::Max,
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            ReasoningEffort::Max
+        );
+    }
+
+    /// `Thread::cancel` aborts the engine; the actor relies on this when
+    /// disposal must not wait for the in-flight turn.
+    #[gpui::test]
+    fn cancel_aborts_engine(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            approval_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| t.cancel(cx));
+        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
 }

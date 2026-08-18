@@ -41,6 +41,16 @@ pub struct ThreadStore {
     /// only signal until the user switches back). In-memory only: cleared on
     /// attach, on terminal events, and when the run resumes past the call.
     pending_auth: HashSet<String>,
+    /// Threads whose last turn parked on a plan-review verdict awaiting the
+    /// user's choice. Mirrors `pending_auth` (the sidebar shows a static
+    /// icon, not a spinner, while a verdict is due); cleared on verdict,
+    /// terminal events, and error.
+    pending_plan: HashSet<String>,
+    /// Threads with live monitors or background bash: no turn is in flight,
+    /// but the loop can still self-advance on external events. Populated
+    /// from `BackgroundTaskUpdated` via the legacy registry's per-thread
+    /// running-task check.
+    background_work: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, WeakEntity<Thread>>,
     sessions_dir: PathBuf,
@@ -80,6 +90,8 @@ pub fn init(cx: &mut App) {
         known_projects,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
+        pending_plan: HashSet::new(),
+        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
@@ -165,6 +177,7 @@ impl ThreadStore {
     pub fn mark_running(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.running.insert(id.to_string()) {
             cx.emit(ThreadStoreEvent::RunningChanged);
+            cx.notify();
         }
     }
 
@@ -206,6 +219,47 @@ impl ThreadStore {
         };
         if changed {
             cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
+    }
+
+    /// Whether a thread's turn is parked on a plan-review verdict.
+    pub fn pending_plan_contains(&self, id: &str) -> bool {
+        self.pending_plan.contains(id)
+    }
+
+    /// Mark/unmark a thread as awaiting a plan-review verdict. Same lifecycle
+    /// and event as `mark_pending_auth`: the sidebar's blue static icon (not
+    /// the spinner) signals the wait until the user decides.
+    pub fn mark_pending_plan(&mut self, id: &str, pending: bool, cx: &mut Context<Self>) {
+        let changed = if pending {
+            self.pending_plan.insert(id.to_string())
+        } else {
+            self.pending_plan.remove(id)
+        };
+        if changed {
+            cx.emit(ThreadStoreEvent::SummariesUpdated);
+            cx.notify();
+        }
+    }
+
+    /// Whether a thread has live monitors or background bash (the loop can
+    /// still self-advance even with no turn in flight).
+    pub fn background_work_contains(&self, id: &str) -> bool {
+        self.background_work.contains(id)
+    }
+
+    /// Mark/unmark a thread as carrying live background work. Fires
+    /// `RunningChanged` (the spinner-driving event) so the sidebar re-evaluates
+    /// the rotating state without a list rescan.
+    pub fn mark_background_work(&mut self, id: &str, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.background_work.insert(id.to_string())
+        } else {
+            self.background_work.remove(id)
+        };
+        if changed {
+            cx.emit(ThreadStoreEvent::RunningChanged);
             cx.notify();
         }
     }
@@ -395,13 +449,65 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
     };
     let mut out = Vec::new();
     for info in list {
+        // The sidebar renders only the current host's sessions; other hosts'
+        // files stay addressable on disk but never surface here.
+        if !crate::host::belongs_to_current_host(info.metadata.as_ref()) {
+            continue;
+        }
         let meta = pi_extensions::session_meta::load(dir, &info.path)
             .await
             .unwrap_or_default();
         let path = info.path.clone();
         out.push((session_info_to_summary(&info, &meta), path));
     }
+    resolve_depths(&mut out);
     out
+}
+
+/// Maximum team nesting depth. One cap serves two roles: it bounds a legal
+/// chain at 8 levels, and it terminates any cycle — a cycle is an infinite
+/// chain, so the walk always trips the cap and degrades to top-level. There
+/// is no separate visited set; the cap is both the cycle guard and the
+/// legal-depth ceiling.
+const MAX_TEAM_DEPTH: usize = 8;
+
+/// Compute each summary's `depth` by walking its `parent_id` chain within the
+/// loaded list. A parent missing from the list (deleted leader, foreign
+/// host) leaves the row top-level; a cycle or an over-long chain likewise
+/// degrades to 0 instead of looping or nesting wildly.
+fn resolve_depths(list: &mut [(ThreadSummary, PathBuf)]) {
+    let parents: HashMap<String, Option<String>> = list
+        .iter()
+        .map(|(s, _)| (s.id.clone(), s.parent_id.clone()))
+        .collect();
+    for (sum, _) in list.iter_mut() {
+        let mut depth = 0usize;
+        let mut cur = sum.parent_id.as_deref();
+        while let Some(parent) = cur {
+            if depth >= MAX_TEAM_DEPTH {
+                depth = 0;
+                break;
+            }
+            match parents.get(parent) {
+                // A present parent is one nesting level; keep walking. A
+                // parent with no parent of its own ends the chain.
+                Some(Some(next)) => {
+                    depth += 1;
+                    cur = Some(next);
+                }
+                Some(None) => {
+                    depth += 1;
+                    break;
+                }
+                // Orphan: the parent is not in this host's list.
+                None => {
+                    depth = 0;
+                    break;
+                }
+            }
+        }
+        sum.depth = depth as i32;
+    }
 }
 
 /// Split a loaded session list into the id→path map (every session — an
@@ -432,6 +538,18 @@ fn project_session_lists(
     (paths, active, archived)
 }
 
+
+/// The team leader's session id from a session header's `team.parent`, when
+/// present. Shared by the sidebar store and the actor's mirrored session
+/// list so both resolve the affiliation identically.
+pub(crate) fn team_parent_id(info: &pi::session::repository::SessionInfo) -> Option<String> {
+    info.metadata
+        .as_ref()
+        .and_then(|m| m.get("team"))
+        .and_then(|t| t.get("parent"))
+        .and_then(|p| p.as_str())
+        .map(str::to_string)
+}
 /// Map a pi session info + sidecar onto the sidebar summary shape.
 fn session_info_to_summary(
     info: &pi::session::repository::SessionInfo,
@@ -452,7 +570,12 @@ fn session_info_to_summary(
         approval_mode: 0,
         project: info.cwd.clone(),
         depth: 0,
-        parent_id: info.parent_session_path.clone(),
+        // Team affiliation wins over a fork lineage when both are present:
+        // the fork link is history, the team link is the live hierarchy.
+        // A fork lineage alone also nests under its fork source when both
+        // rows share a list (the tree renderer treats any parent_id as a
+        // hierarchy edge).
+        parent_id: team_parent_id(info).or_else(|| info.parent_session_path.clone()),
         archived: meta.archived,
         pinned: meta.pinned,
         has_unread: meta.unread,
@@ -475,6 +598,8 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
         db: db.clone(),
         running: HashSet::new(),
         pending_auth: HashSet::new(),
+        pending_plan: HashSet::new(),
+        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
     });
@@ -515,6 +640,8 @@ mod tests {
                 db,
                 running: HashSet::new(),
                 pending_auth: HashSet::new(),
+                pending_plan: HashSet::new(),
+                background_work: HashSet::new(),
                 live_threads: HashMap::new(),
                 sessions_dir: std::env::temp_dir(),
             })
@@ -590,6 +717,97 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// The running-set marker (the sidebar spinner source) toggles per thread
+    /// id, fires `RunningChanged` only on an actual state change, and is
+    /// idempotent under repeated marks — the store contract every host
+    /// subscription (foreground, parked, actor) relies on.
+    #[test]
+    fn mark_running_toggles_marker() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = {
+            let events = std::sync::Arc::clone(&events);
+            cx.update(|cx| {
+                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
+                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t1", cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).is_running("t1")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Idempotent mark: no event, no duplicate work.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t1", cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A second thread marks independently.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running("t2", cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_idle("t1", cx));
+        });
+        assert!(!cx.update(|cx| store.read(cx).is_running("t1")));
+        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
+        drop(sub);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The plan-review and background-work markers (the blue-static vs
+    /// spinner distinction) toggle per thread id and are idempotent under
+    /// repeated marks.
+    #[test]
+    fn plan_and_background_markers_toggle() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = {
+            let events = std::sync::Arc::clone(&events);
+            cx.update(|cx| {
+                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
+                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        });
+        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
+        assert!(cx.update(|cx| store.read(cx).background_work_contains("t1")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Idempotent marks: no duplicate events.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A second thread marks independently; clearing only removes its own.
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t2", true, cx));
+        });
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_pending_plan("t1", false, cx));
+            store.update(cx, |s, cx| s.mark_background_work("t1", false, cx));
+        });
+        assert!(!cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
+        assert!(!cx.update(|cx| store.read(cx).background_work_contains("t1")));
+        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t2")));
+        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 5);
+        drop(sub);
+        std::fs::remove_file(path).ok();
+    }
+
     fn sample_summary(id: &str, archived: bool) -> ThreadSummary {
         ThreadSummary {
             id: id.to_string(),
@@ -637,5 +855,114 @@ mod tests {
             paths.get("active").unwrap().file_name().unwrap(),
             "active.jsonl"
         );
+    }
+
+    fn sample_info(
+        id: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> pi::session::repository::SessionInfo {
+        let now = chrono::Utc::now();
+        pi::session::repository::SessionInfo {
+            path: PathBuf::from(format!("{id}.jsonl")),
+            id: id.to_string(),
+            cwd: "/p".to_string(),
+            name: None,
+            parent_session_path: None,
+            created_at: now,
+            modified_at: now,
+            message_count: 1,
+            first_message: "hi".to_string(),
+            all_messages_text: "hi".to_string(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn summary_prefers_team_parent_over_fork_lineage() {
+        let mut info = sample_info(
+            "member",
+            Some(serde_json::json!({ "team": { "parent": "leader" } })),
+        );
+        info.parent_session_path = Some("fork-source".to_string());
+        let summary =
+            session_info_to_summary(&info, &pi_extensions::session_meta::SessionMeta::default());
+        assert_eq!(summary.parent_id.as_deref(), Some("leader"));
+    }
+
+    #[test]
+    fn summary_falls_back_to_fork_parent_without_team_key() {
+        let mut info = sample_info("forked", Some(serde_json::json!({ "host": "manox" })));
+        info.parent_session_path = Some("source".to_string());
+        let summary =
+            session_info_to_summary(&info, &pi_extensions::session_meta::SessionMeta::default());
+        assert_eq!(summary.parent_id.as_deref(), Some("source"));
+    }
+
+    #[test]
+    fn resolve_depths_nests_chains_and_degrades_orphans() {
+        let mut list = vec![
+            (sample_summary("a", false), PathBuf::from("a")),
+            (sample_summary("b", false), PathBuf::from("b")),
+            (sample_summary("c", false), PathBuf::from("c")),
+            (sample_summary("orphan", false), PathBuf::from("orphan")),
+        ];
+        list[1].0.parent_id = Some("a".into());
+        list[2].0.parent_id = Some("b".into());
+        list[3].0.parent_id = Some("gone".into());
+        resolve_depths(&mut list);
+        let depths: Vec<(String, i32)> = list
+            .iter()
+            .map(|(s, _)| (s.id.clone(), s.depth))
+            .collect();
+        assert_eq!(
+            depths,
+            vec![
+                ("a".into(), 0),
+                ("b".into(), 1),
+                ("c".into(), 2),
+                ("orphan".into(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_depths_breaks_cycles_and_overlong_chains() {
+        // a <-> b cycle: neither can resolve a stable depth.
+        let mut cycle = vec![
+            (sample_summary("a", false), PathBuf::from("a")),
+            (sample_summary("b", false), PathBuf::from("b")),
+        ];
+        cycle[0].0.parent_id = Some("b".into());
+        cycle[1].0.parent_id = Some("a".into());
+        resolve_depths(&mut cycle);
+        assert_eq!(cycle[0].0.depth, 0);
+        assert_eq!(cycle[1].0.depth, 0);
+
+        // A chain longer than the cap is malformed: rows whose own depth
+        // would exceed the cap degrade to top-level, while rows at or under
+        // the cap keep their valid nesting.
+        let mut chain: Vec<(ThreadSummary, PathBuf)> = (0..=MAX_TEAM_DEPTH + 1)
+            .map(|i| (sample_summary(&format!("n{i}"), false), PathBuf::new()))
+            .collect();
+        for (i, item) in chain
+            .iter_mut()
+            .enumerate()
+            .skip(1)
+            .take(MAX_TEAM_DEPTH + 1)
+        {
+            item.0.parent_id = Some(format!("n{}", i - 1));
+        }
+        resolve_depths(&mut chain);
+        assert_eq!(
+            chain[MAX_TEAM_DEPTH + 1].0.depth,
+            0,
+            "over-cap row degrades"
+        );
+        assert_eq!(
+            chain[MAX_TEAM_DEPTH].0.depth,
+            MAX_TEAM_DEPTH as i32,
+            "at-cap row keeps depth"
+        );
+        assert_eq!(chain[0].0.depth, 0);
     }
 }

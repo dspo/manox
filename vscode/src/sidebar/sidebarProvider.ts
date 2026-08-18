@@ -10,6 +10,12 @@ import type { ActorEvent, ImageAttachment } from '../protocol';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
 import type { HostToWebview, WebviewToHost } from './messages';
 
+/** Frame interval for draining the session-event buffer. One postMessage
+ * per interval carries every buffered event, so a streaming turn (one wire
+ * event per token / stdout chunk) crosses the bridge ~30 times a second at
+ * most instead of hundreds of times. */
+const EVENT_BATCH_INTERVAL_MS = 33;
+
 export function registerManoxSidebar(context: vscode.ExtensionContext): void {
   const provider = new ManoxSidebarProvider(context.extensionUri);
   context.subscriptions.push(
@@ -20,6 +26,12 @@ export function registerManoxSidebar(context: vscode.ExtensionContext): void {
       vscode.commands.executeCommand('manox.chatView.focus'),
     ),
     vscode.commands.registerCommand('manox.newSession', () => provider.newSession()),
+    // macOS cmd+m is a minimize accelerator; the extension keybinding
+    // contribution routes it here instead, since the webview DOM would
+    // never receive the key.
+    vscode.commands.registerCommand('manox.openTurnNavigator', () =>
+      provider.openTurnNavigator(),
+    ),
   );
 }
 
@@ -33,8 +45,18 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
    * completing afterwards disposes its actor-side session instead of
    * attaching to a dead view. */
   private sessionGeneration = 0;
+  /** Session events waiting for the next batched flush. Arrival order is
+   * preserved across sessions; bypass messages (session_ready, thread_info)
+   * drain the buffer first so they never overtake queued events. */
+  private pendingEvents: ActorEvent[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
+
+  /** Toggle the turn navigator from the host (macOS cmd+m path). */
+  openTurnNavigator(): void {
+    this.post({ type: 'open_turn_navigator' });
+  }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
@@ -122,7 +144,10 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     if (this.sessions.has(sessionId)) {
       // Already live: re-announce the session so a reloaded webview can
       // rebuild its state from scratch, then have the actor replay its
-      // history/info snapshots through the existing subscription.
+      // history/info snapshots through the existing subscription. The flush
+      // keeps any buffered events ahead of the re-announcement, where they
+      // still fold into the pre-replay state.
+      this.flushEvents();
       this.post({ type: 'session_ready', sessionId, cwd: resolveWorkspaceCwd(), kind: 'restored' });
       manager.send({ cmd: 'get_current_model', sessionId });
       manager.send({ cmd: 'open_thread', sessionId });
@@ -150,23 +175,77 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
    * model snapshot the composer renders. */
   private registerSession(sessionId: string, kind: 'fresh' | 'restored', cwd: string): void {
     const manager = SessionManager.shared();
+    // The ready marker precedes the subscription so the webview always holds
+    // thread state for the session before its first event folds in.
+    this.post({ type: 'session_ready', sessionId, cwd, kind });
     const unsubscribe = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
+      if (ev.type === 'session_disposed') {
+        // The actor-side session is gone; drop the stale subscription entry
+        // so the host map stops growing across /exit and archive cycles.
+        this.sessions.delete(sessionId);
+      }
       if (ev.type === 'thread_info') {
+        // The snapshot bypasses the buffer; drain it first so it never
+        // overtakes earlier events.
+        this.flushEvents();
         this.post({ type: 'thread_info', sessionId: ev.sessionId, info: ev.info });
         return;
       }
-      this.post({ type: 'event', event: ev });
+      this.queueEvent(ev);
     });
     this.sessions.set(sessionId, unsubscribe);
-    this.post({ type: 'session_ready', sessionId, cwd, kind });
     manager.send({ cmd: 'get_current_model', sessionId });
+  }
+
+  /** Buffer one session event for the next batched flush; arms the flush
+   * timer on the first queued event of a frame. */
+  private queueEvent(ev: ActorEvent): void {
+    this.pendingEvents.push(ev);
+    if (this.flushTimer === null) {
+      this.flushTimer = setTimeout(() => this.flushEvents(), EVENT_BATCH_INTERVAL_MS);
+    }
+  }
+
+  /** Drain the buffer as a single `events` message. Idempotent; bypass
+   * messages and teardown call this to keep the wire order intact. */
+  private flushEvents(): void {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.pendingEvents.length === 0) return;
+    const events = this.pendingEvents;
+    this.pendingEvents = [];
+    this.post({ type: 'events', events });
   }
 
   private async onWebviewMessage(msg: WebviewToHost): Promise<void> {
     const manager = SessionManager.shared();
     switch (msg.type) {
       case 'submit':
-        manager.send({ cmd: 'submit', sessionId: msg.sessionId, text: msg.text, images: msg.images });
+        manager.send({
+          cmd: 'submit',
+          sessionId: msg.sessionId,
+          text: msg.text,
+          images: msg.images,
+          clientId: msg.clientId,
+        });
+        return;
+      case 'steer':
+        manager.send({
+          cmd: 'steer',
+          sessionId: msg.sessionId,
+          clientId: msg.clientId,
+          text: msg.text,
+          images: msg.images,
+        });
+        return;
+      case 'drop_queued':
+        manager.send({
+          cmd: 'drop_queued',
+          sessionId: msg.sessionId,
+          clientId: msg.clientId,
+        });
         return;
       case 'approve':
         manager.send({ cmd: 'approve', sessionId: msg.sessionId, id: msg.id, allow: msg.allow });
@@ -176,6 +255,9 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         return;
       case 'set_model':
         manager.send({ cmd: 'set_model', sessionId: msg.sessionId, id: msg.id });
+        return;
+      case 'set_reasoning_effort':
+        manager.send({ cmd: 'set_reasoning_effort', sessionId: msg.sessionId, effort: msg.effort });
         return;
       case 'set_approval_mode':
         manager.send({ cmd: 'set_approval_mode', sessionId: msg.sessionId, mode: msg.mode });
@@ -188,14 +270,23 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         return;
       case 'plan_execute_fresh': {
         // Execute-fresh orchestration: archive the reviewing session, spin a
-        // new one in the same cwd, then seed it with the plan so it starts
-        // executing immediately.
+        // new one in the same cwd, register it with the sidebar, then seed it
+        // with the plan so it starts executing immediately.
         void (async () => {
+          const generation = ++this.sessionGeneration;
           try {
             await manager.init(resolveWorkspaceCwd());
+            // Archiving always proceeds: the execute-fresh intent belongs to
+            // the user rather than the sidebar view, so it stays outside the
+            // generation guard.
             manager.archiveThread(msg.sessionId, true);
             const freshId = crypto.randomUUID();
             await manager.createSession(msg.cwd, freshId);
+            if (generation !== this.sessionGeneration) {
+              manager.disposeSession(freshId);
+              return;
+            }
+            this.registerSession(freshId, 'fresh', msg.cwd);
             manager.send({ cmd: 'plan_seed_execution', sessionId: freshId, planFile: msg.planFile });
           } catch (e) {
             this.post({ type: 'global_error', message: String(e) });
@@ -280,6 +371,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 
   private teardown(): void {
     this.sessionGeneration++;
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.pendingEvents = [];
     const manager = SessionManager.shared();
     for (const [sessionId, unsubscribe] of this.sessions) {
       unsubscribe();

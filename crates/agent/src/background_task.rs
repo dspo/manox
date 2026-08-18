@@ -930,6 +930,7 @@ pub fn register_for_goal(
     cancel: CancellationToken,
     owner_goal_id: Option<String>,
 ) -> (TaskId, Arc<BackgroundTask>) {
+    gc();
     let id = next_id(&kind);
     let task = Arc::new(BackgroundTask::new(
         kind,
@@ -956,6 +957,7 @@ pub fn register_with_id(
     description: String,
     cancel: CancellationToken,
 ) -> Arc<BackgroundTask> {
+    gc();
     let mut reg = registry().lock().expect("registry poisoned");
     if let Some(existing) = reg.tasks.get(&id.0) {
         return Arc::clone(existing);
@@ -1201,6 +1203,13 @@ pub fn remove_all_for_thread(thread_id: &str) {
     let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks
         .retain(|_, task| task.owner_thread_id() != thread_id);
+}
+
+/// Release all process-global state owned by a thread: its task registry
+/// entries and its mailbox. Called when the thread's engine actor exits.
+pub fn cleanup_thread(thread_id: &str) {
+    remove_all_for_thread(thread_id);
+    remove_thread_mailbox(thread_id);
 }
 
 #[cfg(test)]
@@ -1593,5 +1602,32 @@ mod tests {
         assert!(tail.ends_with('中'));
         remove(&id);
         remove_thread_mailbox("thread-utf8");
+    }
+    /// Thread-lifetime cleanup releases both the legacy registry entries and
+    /// the per-thread mailbox — the process-global maps must not accumulate
+    /// entries for disposed threads.
+    #[test]
+    fn cleanup_thread_removes_mailbox_and_tasks() {
+        let id = TaskId("cleanup_42".into());
+        register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-cleanup".into(),
+            "cleanup watcher".into(),
+            CancellationToken::new(),
+        );
+        assert!(get(&id).is_some(), "task registered");
+        assert!(
+            thread_notify("t-cleanup").is_some(),
+            "push_state_changed created the mailbox"
+        );
+
+        cleanup_thread("t-cleanup");
+
+        assert!(get(&id).is_none(), "task removed from the registry");
+        assert!(
+            thread_notify("t-cleanup").is_none(),
+            "mailbox removed from the per-thread map"
+        );
     }
 }

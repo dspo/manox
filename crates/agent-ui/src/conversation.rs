@@ -19,7 +19,7 @@ use agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
-use crate::views::message::{MessageItem, build_items};
+use crate::views::message::{AutoCollapseTarget, MessageItem, build_items, schedule_auto_collapse};
 
 /// A decoded image attached to a user message, kept only for UI preview. The
 /// canonical bytes live in the `Thread`'s `MessageContent::Image`; this holds
@@ -240,10 +240,11 @@ pub struct ToolCallItem {
     /// True while live `ToolOutput` chunks are still streaming in; flipped to
     /// false once the final `ToolResult` lands the canonical output.
     pub streaming: bool,
-    /// True ⇒ body hidden. Auto-flipped to true on terminal status (Success /
-    /// Error / Denied) unless `user_toggled` is set, so a completed tool call
-    /// collapses back to a single-line card. While `streaming` is true the
-    /// body is always shown regardless of this flag.
+    /// True ⇒ body hidden. Auto-flipped to true ~1s after the tool call
+    /// reaches a terminal status (Success / Error / Denied) unless
+    /// `user_toggled` is set, so a completed tool call plays out its stream
+    /// and then folds. Live entries are created expanded; restored-history
+    /// entries mount collapsed.
     pub collapsed: bool,
     /// Becomes true the first time the user clicks the card header. Once
     /// set, the auto-collapse logic stops touching `collapsed` so the user's
@@ -265,8 +266,8 @@ pub struct ToolCallItem {
 pub enum ActivityEntry {
     /// One reasoning round: a contiguous run of `AgentThinking` deltas. A new
     /// round starts when thinking resumes after being interrupted by a tool
-    /// call, assistant text, or terminal stop. Auto-collapses when streaming
-    /// ends unless the user manually expanded it.
+    /// call, assistant text, or terminal stop. Auto-collapses ~1s after
+    /// streaming ends unless the user toggled it.
     Reasoning {
         text: String,
         streaming: bool,
@@ -573,7 +574,7 @@ pub enum ApplyOutcome {
     /// cache) AND a new item was appended at the tail. The `AgentText`
     /// `needs_new` arm hits this whenever a live activity segment is closed
     /// for the incoming reply: `close_segment_for_text` finalizes the segment
-    /// (freezing elapsed, possibly collapsing entries → height change) right
+    /// (freezing elapsed, scheduling entries' delayed collapse → height change)
     /// before the new assistant bubble is pushed. Remeasure the segment so its
     /// cached height catches up to the finalized state, and splice the count
     /// for the appended bubble.
@@ -1146,7 +1147,7 @@ impl ConversationState {
                             t.entries.push(ActivityEntry::Reasoning {
                                 text: delta,
                                 streaming: true,
-                                collapsed: true,
+                                collapsed: false,
                                 user_toggled: false,
                                 markdown: None,
                             });
@@ -1271,7 +1272,16 @@ impl ConversationState {
                                 t.title = title;
                                 t.status = status;
                                 t.input = input;
-                                t.collapsed = !t.user_toggled;
+                                if matches!(
+                                    status,
+                                    ToolCallStatus::Success
+                                        | ToolCallStatus::Error
+                                        | ToolCallStatus::Denied
+                                ) && !t.user_toggled
+                                    && !t.collapsed
+                                {
+                                    schedule_auto_collapse(AutoCollapseTarget::Tool(t.id.clone()), cx);
+                                }
                             }
                             cx.notify();
                         });
@@ -1313,8 +1323,10 @@ impl ConversationState {
                                             | ToolCallStatus::Error
                                             | ToolCallStatus::Denied
                                     ) && !entry.streaming
+                                        && !entry.user_toggled
+                                        && !entry.collapsed
                                     {
-                                        entry.collapsed = !entry.user_toggled;
+                                        schedule_auto_collapse(AutoCollapseTarget::Tool(id.clone()), cx);
                                     }
                                 } else {
                                     t.entries.push(ActivityEntry::Tool(ToolCallItem {
@@ -1326,7 +1338,11 @@ impl ConversationState {
                                         is_error: false,
                                         input: entry_input,
                                         streaming: matches!(status, ToolCallStatus::Running),
-                                        collapsed: true,
+                                        collapsed: !matches!(
+                                            status,
+                                            ToolCallStatus::Running
+                                                | ToolCallStatus::PendingApproval
+                                        ),
                                         user_toggled: false,
                                         panel: None,
                                     }));
@@ -1403,7 +1419,12 @@ impl ConversationState {
                                 entry.is_error = entry_is_error;
                                 entry.streaming = false;
                                 entry.status = status;
-                                entry.collapsed = !entry.user_toggled;
+                                // Delayed auto-collapse: the result played out,
+                                // so the entry folds ~1s later unless the user
+                                // toggled it (now or before the timer fires).
+                                if !entry.user_toggled && !entry.collapsed {
+                                    schedule_auto_collapse(AutoCollapseTarget::Tool(id.clone()), cx);
+                                }
                             }
                             // A finalized entry does NOT close the segment —
                             // `accepting_entries` stays true across the
@@ -1423,9 +1444,11 @@ impl ConversationState {
                             t.is_error = *is_error;
                             t.streaming = false;
                             t.status = status;
-                            // Auto-collapse once the tool call reaches a terminal
-                            // status. Preserves the user's manual choice if any.
-                            t.collapsed = !t.user_toggled;
+                            // Delayed auto-collapse: the card folds ~1s after the
+                            // terminal status lands unless the user toggled it.
+                            if !t.user_toggled && !t.collapsed {
+                                schedule_auto_collapse(AutoCollapseTarget::Tool(t.id.clone()), cx);
+                            }
                         }
                         item.sync_tool_call_panel(cwd, cx);
                         cx.notify();
@@ -3237,5 +3260,375 @@ mod tests {
             "prompt": "ignored"
         }));
         assert_eq!(description, "review PR");
+    }
+
+    /// A live reasoning round opens expanded so the stream plays out
+    /// (vscode-extension parity); restored-history segments mount collapsed.
+    #[gpui::test]
+    fn live_reasoning_round_opens_expanded(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let outcome = c.apply(
+                    &ThreadEvent::AgentThinking("thinking...".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Reasoning {
+                    collapsed,
+                    streaming,
+                    ..
+                } = &t.entries[0]
+                else {
+                    panic!("expected reasoning entry");
+                };
+                assert!(!collapsed, "live reasoning round plays open");
+                assert!(streaming);
+            });
+        });
+    }
+
+    /// A live tool entry opens expanded while in flight (Running); the
+    /// restored-history rebuild path still mounts collapsed.
+    #[gpui::test]
+    fn live_tool_entry_opens_expanded(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "cargo build".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Tool(entry) = &t.entries[0] else {
+                    panic!("expected tool entry");
+                };
+                assert!(!entry.collapsed, "live tool entry plays open");
+                assert!(entry.streaming);
+            });
+        });
+    }
+
+    /// The auto-collapse after `ToolResult` is delayed ~1s: the entry stays
+    /// expanded right after the result lands, then folds once the clock
+    /// advances.
+    #[gpui::test]
+    fn tool_result_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "cargo build".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolResult {
+                        id: "tu_1".into(),
+                        output: "built".into(),
+                        is_error: false,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Tool(entry) = &t.entries[0] else {
+                    panic!("expected tool entry");
+                };
+                assert!(
+                    !entry.collapsed,
+                    "still expanded right after the result (delayed collapse)"
+                );
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Tool(entry) = &t.entries[0] else {
+                    panic!("expected tool entry");
+                };
+                assert!(entry.collapsed, "entry folds ~1s after the result");
+            });
+        });
+    }
+
+    /// A user-toggle pins the entry: the delayed collapse is skipped and the
+    /// entry stays in the user's chosen state.
+    #[gpui::test]
+    fn user_toggled_entry_skips_auto_collapse(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "cargo build".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolResult {
+                        id: "tu_1".into(),
+                        output: "built".into(),
+                        is_error: false,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        // Pin the entry open (what the header click handler does).
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.items[0].update(cx, |item, cx| {
+                    if let ConvItem::Thinking(t) = item.kind_mut()
+                        && let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(0)
+                    {
+                        entry.user_toggled = true;
+                    }
+                    cx.notify();
+                });
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Tool(entry) = &t.entries[0] else {
+                    panic!("expected tool entry");
+                };
+                assert!(!entry.collapsed, "user-pinned entry stays open");
+            });
+        });
+    }
+
+    /// A reasoning round stops streaming at a mid-turn `Stop(ToolUse)` and
+    /// auto-collapses ~1s later — the round plays out before folding.
+    #[gpui::test]
+    fn reasoning_round_auto_collapses_after_tool_use_stop(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let _ = c.apply(
+                    &ThreadEvent::AgentThinking("round 1".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::Stop(StopReason::ToolUse),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Reasoning {
+                    collapsed,
+                    streaming,
+                    ..
+                } = &t.entries[0]
+                else {
+                    panic!("expected reasoning entry");
+                };
+                assert!(!streaming);
+                assert!(
+                    !collapsed,
+                    "round still expanded right after the ToolUse stop"
+                );
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                let ActivityEntry::Reasoning { collapsed, .. } = &t.entries[0] else {
+                    panic!("expected reasoning entry");
+                };
+                assert!(collapsed, "round folds ~1s after it stops streaming");
+            });
+        });
+    }
+
+    /// A terminal stop schedules the delayed auto-collapse for every expanded
+    /// entry — both the finished reasoning round and the completed tool call.
+    #[gpui::test]
+    fn terminal_stop_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let _ = c.apply(
+                    &ThreadEvent::AgentThinking("round 1".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "cargo build".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolResult {
+                        id: "tu_1".into(),
+                        output: "built".into(),
+                        is_error: false,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::Stop(StopReason::EndTurn),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                for entry in &t.entries {
+                    let collapsed = match entry {
+                        ActivityEntry::Reasoning { collapsed, .. } => collapsed,
+                        ActivityEntry::Tool(tool) => &tool.collapsed,
+                    };
+                    assert!(
+                        !collapsed,
+                        "entries stay open right after the terminal stop"
+                    );
+                }
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                    panic!("expected thinking item");
+                };
+                for entry in &t.entries {
+                    let collapsed = match entry {
+                        ActivityEntry::Reasoning { collapsed, .. } => collapsed,
+                        ActivityEntry::Tool(tool) => &tool.collapsed,
+                    };
+                    assert!(collapsed, "entries fold ~1s after the terminal stop");
+                }
+            });
+        });
     }
 }

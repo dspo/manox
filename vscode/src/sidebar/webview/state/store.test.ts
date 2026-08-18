@@ -8,7 +8,7 @@ import type { HostToWebview } from '../../messages';
 import { Store, wireMessagesToTranscriptItems } from './store';
 import { foldToolStatus } from './transcript';
 
-const event = (ev: ActorEvent): HostToWebview => ({ type: 'event', event: ev });
+const event = (ev: ActorEvent): HostToWebview => ({ type: 'events', events: [ev] });
 
 const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadListItem => ({
   title: 't',
@@ -17,9 +17,13 @@ const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadList
   unread: false,
   errored: false,
   pending_auth: false,
+  pending_plan: false,
+  background_work: false,
   model_id: 'm',
   pinned: false,
   archived: false,
+  parent_id: null,
+  depth: 0,
   ...partial,
 });
 
@@ -206,6 +210,7 @@ describe('info snapshots', () => {
         type: 'thread_info',
         sessionId: 'a',
         info: {
+          reasoning_effort: 'high',
           worktree_path: null,
           plan: null,
           goal: null,
@@ -370,6 +375,26 @@ describe('transcript folding', () => {
     store.dispatch(event({ type: 'turn_started', sessionId: 'a' }));
     expect(thread(store, 'a')?.error).toBeNull();
   });
+  it('clears a thread error when its turn finishes successfully after recovery', () => {
+    // A mid-turn provider failure surfaces the error, then the loop's
+    // auto-retry completes the same turn without a new `turn_started` —
+    // the banner and captain icon must follow the successful finish.
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 'a', cancelled: false, failed: false }),
+    );
+    expect(thread(store, 'a')?.error).toBeNull();
+  });
+
+  it('keeps a thread error when its turn finishes failed', () => {
+    const store = startSession('a');
+    store.dispatch(event({ type: 'error', sessionId: 'a', message: 'boom' }));
+    store.dispatch(
+      event({ type: 'turn_finished', sessionId: 'a', cancelled: false, failed: true }),
+    );
+    expect(thread(store, 'a')?.error).toBe('boom');
+  });
 
   it('drops session errors for unknown sessions instead of spawning ghost threads', () => {
     const store = startSession('a');
@@ -386,7 +411,7 @@ describe('transcript folding', () => {
     expect(store.get().error).toBeNull();
   });
 
-  it('tracks model, approval-mode, and usage changes per thread', () => {
+  it('tracks model, approval-mode, reasoning-effort, and usage changes per thread', () => {
     const store = startSession();
     store.dispatch(event({ type: 'model_changed', sessionId: 's', from: null, to: 'm1' }));
     expect(thread(store)?.currentModelId).toBe('m1');
@@ -394,11 +419,32 @@ describe('transcript folding', () => {
     expect(thread(store)?.currentModelId).toBe('m2');
     store.dispatch(event({ type: 'approval_mode_changed', sessionId: 's', mode: 'autopilot' }));
     expect(thread(store)?.approvalMode).toBe('autopilot');
+    store.dispatch(event({ type: 'reasoning_effort_changed', sessionId: 's', effort: 'max' }));
+    expect(thread(store)?.reasoningEffort).toBe('max');
     store.dispatch(
       event({ type: 'usage', sessionId: 's', usage: { input_tokens: 1 }, cost: 0.5 }),
     );
     expect(thread(store)?.usage).toEqual({ input_tokens: 1 });
     expect(thread(store)?.cost).toBe(0.5);
+  });
+
+  it('thread_info restores the persisted reasoning effort', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'thread_info',
+      sessionId: 's',
+      info: {
+        reasoning_effort: 'max',
+        worktree_path: null,
+        plan: null,
+        goal: null,
+        usage: {},
+        cost: 0,
+        pending_auth_count: 0,
+        agents: [],
+      },
+    });
+    expect(thread(store)?.reasoningEffort).toBe('max');
   });
 
   it('echoUser stamps the current model and wall-clock time', () => {
@@ -460,6 +506,7 @@ describe('global folds', () => {
       type: 'thread_info',
       sessionId: 's',
       info: {
+        reasoning_effort: 'max',
         worktree_path: '/w',
         plan: null,
         goal: null,
@@ -493,6 +540,7 @@ describe('global folds', () => {
       type: 'thread_info',
       sessionId: 's',
       info: {
+        reasoning_effort: 'high',
         worktree_path: null,
         plan: null,
         goal: null,
@@ -916,6 +964,187 @@ describe('plan / goal / task folding', () => {
     expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
   });
 
+  it('AskUserQuestion real event flow keeps a single surface and morphs the card', () => {
+    const store = startSession();
+    // The kernel emits the start call (running, code-name title) before the
+    // tool's own execute() runs; neither the start call nor the
+    // pending-approval marker may spawn a generic tool card — the
+    // authorization card is the single surface for the whole lifecycle.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'AskUserQuestion',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'Clarifying question',
+        status: 'pending-approval',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ask1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Clarifying question',
+        input: {
+          questions: [
+            { question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] },
+          ],
+        },
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'tool')).toBe(false);
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question' && i.id === 'ask1')).toBe(true);
+
+    // The user answers; the completion events morph the card in place.
+    store.respondAsk('s', 'ask1');
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 'ask1',
+        name: 'AskUserQuestion',
+        title: 'AskUserQuestion',
+        status: 'success',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_result',
+        sessionId: 's',
+        id: 'ask1',
+        output: 'Question: Which one?\nAnswer: A',
+        is_error: false,
+      }),
+    );
+    const items = thread(store)?.items ?? [];
+    const ask = items.find((i) => i.kind === 'ask_question');
+    expect(items.some((i) => i.kind === 'tool')).toBe(false);
+    expect(ask && ask.kind === 'ask_question' ? ask.answered : false).toBe(true);
+    expect(ask && ask.kind === 'ask_question' ? ask.output : undefined).toBe(
+      'Question: Which one?\nAnswer: A',
+    );
+  });
+
+  it('escalation restore hands the id back to the real tool item', () => {
+    const store = startSession();
+    // The real tool starts normally; the gate then re-brands the same id as
+    // an AskUserQuestion escalation card.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: '$ ls',
+        status: 'running',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'AskUserQuestion',
+        title: '$ ls',
+        status: 'pending-approval',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 't1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Approval required',
+        input: {
+          questions: [
+            {
+              question: 'reviewer needs a verdict',
+              options: [{ label: 'Allow once' }, { label: 'Always allow' }, { label: 'Deny' }],
+            },
+          ],
+        },
+      }),
+    );
+    store.respondAsk('s', 't1');
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(true);
+
+    // The gate's restore event hands the id back to the real tool: the
+    // question card is dropped so the Bash item owns completion + result.
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: '$ ls',
+        status: 'running',
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'Bash',
+        title: 'Bash',
+        status: 'success',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_result',
+        sessionId: 's',
+        id: 't1',
+        output: 'total 0',
+        is_error: false,
+      }),
+    );
+    expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
+    expect(toolCard(store, 't1')?.output).toBe('total 0');
+  });
+
+  it('tool completion keeps the human title over the replayed tool name', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'bash',
+        title: '$ ls -la',
+        status: 'running',
+      }),
+    );
+    store.dispatch(
+      event({
+        type: 'tool_call',
+        sessionId: 's',
+        id: 't1',
+        name: 'bash',
+        title: 'bash',
+        status: 'success',
+      }),
+    );
+    expect(toolCard(store, 't1')?.title).toBe('$ ls -la');
+  });
+
   it('tool_call_authorization keeps non-ask tools as approval cards', () => {
     const store = startSession();
     store.dispatch(
@@ -930,5 +1159,152 @@ describe('plan / goal / task folding', () => {
     );
     expect(thread(store)?.items.some((i) => i.kind === 'approval' && i.id === 'ap1')).toBe(true);
     expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
+  });
+});
+
+describe('queued-message lifecycle', () => {
+  it('clears the queued flag when the drain starts the follow-up turn', () => {
+    const store = startSession();
+    store.echoUser('s', 'queued one', undefined, { queued: true, clientId: 'c1' });
+    expect(thread(store)?.items[0]).toMatchObject({ kind: 'user', queued: true });
+    store.dispatch(event({ type: 'turn_started', sessionId: 's' }));
+    expect(thread(store)?.items[0]).toMatchObject({ kind: 'user', queued: false });
+  });
+
+  it('markSteerPending flips the bubble optimistically, replaced by the real id', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.markSteerPending('s', 'c1');
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'pending' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'm1' });
+  });
+
+  it('tracks steer_pending and steer_injected on the matching bubble', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: 'm1' });
+    store.dispatch(event({ type: 'steer_injected', sessionId: 's', messageId: 'm1' }));
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: null });
+  });
+
+  it('marks a stranded steer as failed on turn_finished', () => {
+    const store = startSession();
+    store.echoUser('s', 'steer me', undefined, { queued: true, clientId: 'c1' });
+    store.dispatch(
+      event({ type: 'steer_pending', sessionId: 's', clientId: 'c1', messageId: 'm1' }),
+    );
+    store.dispatch(
+      event({
+        type: 'turn_finished',
+        sessionId: 's',
+        cancelled: false,
+        failed: true,
+        strandedSteerIds: ['m1'],
+      }),
+    );
+    expect(thread(store)?.items[0]).toMatchObject({ steerPendingId: null, steerFailed: true });
+  });
+});
+
+describe('coalesced event batches', () => {
+  it('folds an events batch like the equivalent single-event stream', () => {
+    const store = startSession();
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 's', text: 'hello ' },
+        { type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' },
+        { type: 'tool_output', sessionId: 's', id: 't1', chunk: 'out' },
+        { type: 'agent_text', sessionId: 's', text: 'world' },
+      ],
+    });
+    const items = thread(store)?.items ?? [];
+    expect(items).toHaveLength(3);
+    expect(items[0]).toMatchObject({ kind: 'assistant', text: 'hello ' });
+    expect(items[1]).toMatchObject({ kind: 'tool' });
+    expect(toolCard(store, 't1')?.output).toBe('out');
+    expect(items[2]).toMatchObject({ kind: 'assistant', text: 'world' });
+  });
+
+  it('notifies listeners once per batch, not once per event', () => {
+    const store = startSession();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 's', text: 'a' },
+        { type: 'agent_text', sessionId: 's', text: 'b' },
+        { type: 'agent_text', sessionId: 's', text: 'c' },
+      ],
+    });
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(thread(store)?.items[0]).toMatchObject({ text: 'abc' });
+  });
+
+  it('ignores an empty batch', () => {
+    const store = startSession();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    store.dispatch({ type: 'events', events: [] });
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('applies session_disposed folded inside a batch', () => {
+    const store = startSession('a');
+    store.dispatch({
+      type: 'events',
+      events: [
+        { type: 'agent_text', sessionId: 'a', text: 'x' },
+        { type: 'session_disposed', sessionId: 'a' },
+      ],
+    });
+    expect(store.get().perThread.a).toBeUndefined();
+    expect(store.get().view).toBe('threads');
+  });
+});
+
+describe('tool output tail cap', () => {
+  it('keeps only the tail once streamed output exceeds the cap', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'yes', status: 'running' }),
+    );
+    const chunk = 'y'.repeat(30_000) + '\n';
+    for (let i = 0; i < 3; i++) {
+      store.dispatch(event({ type: 'tool_output', sessionId: 's', id: 't1', chunk }));
+    }
+    const output = toolCard(store, 't1')?.output ?? '';
+    expect(output.length).toBeLessThanOrEqual(64_000);
+    expect(output.endsWith('y\n')).toBe(true);
+  });
+
+  it('caps an oversized terminal result as well', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'big', status: 'running' }),
+    );
+    store.dispatch(
+      event({ type: 'tool_result', sessionId: 's', id: 't1', output: 'z'.repeat(70_000), is_error: false }),
+    );
+    expect(toolCard(store, 't1')?.output).toHaveLength(64_000);
+  });
+
+  it('never splits a surrogate pair at the cap boundary', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'emoji', status: 'running' }),
+    );
+    // 64_001 code units: the naive cut lands inside the leading pair.
+    store.dispatch(
+      event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: '😀' + 'a'.repeat(63_999) }),
+    );
+    expect(toolCard(store, 't1')?.output).toBe('a'.repeat(63_999));
   });
 });

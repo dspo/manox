@@ -87,6 +87,9 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // This binary is the native-app host; the identity must be pinned
+        // before `agent::init` computes host-scoped state.
+        agent::host::set_host(agent::host::Host::ManoxApp);
         agent::init(cx);
         agent_ui::slash_command::init(cx);
         terminal::init(cx);
@@ -245,6 +248,7 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-;", agent_ui::ToggleTurnNavigator, None),
         ]);
         cx.bind_keys(agent_ui::turn_navigator_key_bindings());
+        cx.bind_keys(agent_ui::composer_recall_key_bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
             if let Some(handle) = cx.active_window() {
@@ -563,12 +567,7 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
             continue;
         }
         let provider = agent::pi_providers::display_provider_name(&model);
-        let model_id = model
-            .metadata
-            .get("config_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(model.id.as_str())
-            .to_string();
+        let model_id = agent::pi_providers::config_id(&model);
         if !seen.insert((provider.clone(), model_id.clone())) {
             continue; // same model registered on several wire apis
         }

@@ -9,7 +9,7 @@
 //! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
 //! menu and bottom account footer are static decoration.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -125,6 +125,16 @@ impl SidebarRow {
     }
 }
 
+/// One ordered sidebar row plus its team nesting metadata: `indent` offsets
+/// members under their leader, `team_leader` marks a row that can collapse
+/// its member group, `team_collapsed` the fold state.
+struct ThreadRender {
+    row: SidebarRow,
+    indent: f32,
+    team_leader: bool,
+    team_collapsed: bool,
+}
+
 /// Events the sidebar emits to the Workspace.
 #[derive(Debug, Clone)]
 pub enum SidebarEvent {
@@ -164,6 +174,93 @@ pub enum SidebarEvent {
     ArchiveExternalSession(String),
 }
 
+/// Order threads as a team forest: top-level rows (threads + externals)
+/// merged by recency, each leader followed by its indented member subtree.
+/// Orphans and cycles stay top-level (`depth` is zeroed for them at the
+/// store); a collapsed leader hides its subtree.
+fn team_forest(
+    team_collapsed: &HashSet<String>,
+    threads: &[agent::ThreadSummary],
+    externals: &[crate::external_session::ExternalSessionSummary],
+) -> Vec<ThreadRender> {
+    let mut members: HashMap<&str, Vec<&agent::ThreadSummary>> = HashMap::new();
+    let ids: HashSet<&str> = threads.iter().map(|s| s.id.as_str()).collect();
+    for s in threads {
+        if s.depth > 0
+            && let Some(parent) = s.parent_id.as_deref()
+        {
+            members.entry(parent).or_default().push(s);
+        }
+    }
+    let mut top: Vec<SidebarRow> = threads
+        .iter()
+        .filter(|s| {
+            // A member whose leader lives in another partition (e.g. an
+            // archived leader) cannot nest here: emit it top-level like the
+            // webview forest, so archiving a leader never hides its members.
+            s.depth == 0 || !s.parent_id.as_deref().is_some_and(|p| ids.contains(p))
+        })
+        .cloned()
+        .map(SidebarRow::Thread)
+        .chain(externals.iter().cloned().map(SidebarRow::External))
+        .collect();
+    top.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+
+    let mut out = Vec::new();
+    for row in top {
+        let id = row.id().to_string();
+        // Only threads can lead a team; external CLI sessions never do.
+        let team_leader = match &row {
+            SidebarRow::Thread(s) => members.contains_key(s.id.as_str()),
+            SidebarRow::External(_) => false,
+        };
+        out.push(ThreadRender {
+            row,
+            indent: 0.0,
+            team_leader,
+            team_collapsed: team_collapsed.contains(&id),
+        });
+        if team_leader && !team_collapsed.contains(&id) {
+            let mut kids = members.get(id.as_str()).cloned().unwrap_or_default();
+            kids.sort_by_key(|k| std::cmp::Reverse(k.interacted_at));
+            for kid in kids {
+                push_member(team_collapsed, &mut out, kid, 1.0, &members);
+            }
+        }
+    }
+    out
+}
+
+/// Render-side nesting cap, mirroring the store's `MAX_TEAM_DEPTH`. The
+/// store zeroes cycle/orphan depths, so a deep tree here means corrupt wire
+/// data; the cap keeps the recursion from stacking forever as a last line of
+/// defense.
+const MAX_TEAM_RENDER_DEPTH: f32 = 8.0;
+
+/// Append a member row and its subtree (recursively) at the given indent.
+fn push_member(
+    team_collapsed: &HashSet<String>,
+    out: &mut Vec<ThreadRender>,
+    s: &agent::ThreadSummary,
+    depth: f32,
+    members: &HashMap<&str, Vec<&agent::ThreadSummary>>,
+) {
+    let has_kids = members.contains_key(s.id.as_str());
+    out.push(ThreadRender {
+        row: SidebarRow::Thread(s.clone()),
+        indent: depth * 14.0,
+        team_leader: has_kids,
+        team_collapsed: team_collapsed.contains(&s.id),
+    });
+    if has_kids && !team_collapsed.contains(&s.id) && depth < MAX_TEAM_RENDER_DEPTH {
+        let mut kids = members.get(s.id.as_str()).cloned().unwrap_or_default();
+        kids.sort_by_key(|k| std::cmp::Reverse(k.interacted_at));
+        for kid in kids {
+            push_member(team_collapsed, out, kid, depth + 1.0, members);
+        }
+    }
+}
+
 pub struct Sidebar {
     store: Entity<ThreadStore>,
     selected: Option<String>,
@@ -177,7 +274,9 @@ pub struct Sidebar {
     select_gen: u64,
     /// Project paths whose folder group is collapsed; absent means expanded.
     collapsed: HashSet<String>,
-    /// Live external agent sessions, projected from the Workspace's canonical
+    /// Team leader ids whose member group is collapsed; absent means
+    /// expanded. Mirrors `collapsed` but per leader row instead of folder.
+    team_collapsed: HashSet<String>,
     /// list. Merged into the Conversations list by recency (an `external:` id
     /// in `selected` highlights the active one).
     external_sessions: Vec<crate::external_session::ExternalSessionSummary>,
@@ -218,6 +317,7 @@ impl Sidebar {
             store,
             selected: None,
             collapsed: HashSet::new(),
+            team_collapsed: HashSet::new(),
             prev_selected: None,
             select_gen: 0,
             external_sessions: Vec::new(),
@@ -468,6 +568,18 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Order threads as a team forest: top-level rows (threads + externals)
+    /// merged by recency, each leader followed by its indented member
+    /// subtree. Orphans and cycles stay top-level (`depth` is zeroed for
+    /// them at the store); a collapsed leader hides its subtree.
+    fn order_rows(
+        &self,
+        threads: &[agent::ThreadSummary],
+        externals: &[crate::external_session::ExternalSessionSummary],
+    ) -> Vec<ThreadRender> {
+        team_forest(&self.team_collapsed, threads, externals)
+    }
+
     /// A collapsible project folder: a clickable header (chevron + folder icon +
     /// basename) over its indented conversation rows when expanded. The `+`
     /// button opens the new-session popup menu with the project path so the
@@ -586,33 +698,37 @@ impl Sidebar {
         let rows = expanded.then(|| {
             // Threads + this project's external sessions, merged by recency so
             // an external CLI session launched from the folder's `+` sits
-            // among the folder's manox threads instead of in the loose list.
-            let mut rows: Vec<SidebarRow> = group
-                .iter()
-                .cloned()
-                .map(SidebarRow::Thread)
-                .chain(externals.iter().cloned().map(SidebarRow::External))
-                .collect();
-            rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+            // among the folder's manox threads instead of in the loose list;
+            // team members nest indented under their leader.
+            let team_rows = self.order_rows(group, &externals);
             v_flex()
                 .w_full()
                 .gap_0p5()
-                .children(rows.into_iter().map(|row| {
-                    let is_selected = selected == Some(row.id());
-                    match row {
-                        SidebarRow::Thread(s) => render_thread_item(
-                            &SidebarThreadItem::from_thread(
-                                &s,
-                                is_selected,
-                                store.read(cx).is_running(&s.id),
-                                store.read(cx).pending_auth_contains(&s.id),
-                                px(16.),
+                .children(team_rows.into_iter().map(|tr| {
+                    let is_selected = selected == Some(tr.row.id());
+                    match tr.row {
+                        SidebarRow::Thread(s) => {
+                            let store = store.read(cx);
+                            render_thread_item(
+                                &SidebarThreadItem::from_thread(
+                                    &s,
+                                    is_selected,
+                                    ThreadLiveState {
+                                        running: store.is_running(&s.id),
+                                        pending_auth: store.pending_auth_contains(&s.id),
+                                        pending_plan: store.pending_plan_contains(&s.id),
+                                        background_work: store.background_work_contains(&s.id),
+                                    },
+                                    px(16. + tr.indent),
+                                    tr.team_leader,
+                                    tr.team_collapsed,
+                                    &theme,
+                                ),
+                                slide,
                                 &theme,
-                            ),
-                            slide,
-                            &theme,
-                            cx,
-                        ),
+                                cx,
+                            )
+                        }
                         SidebarRow::External(s) => render_thread_item(
                             &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
                             slide,
@@ -810,31 +926,38 @@ impl Render for Sidebar {
                                 cx,
                             ))
                             .child({
-                                let mut rows: Vec<SidebarRow> = loose
-                                    .into_iter()
-                                    .map(SidebarRow::Thread)
-                                    .chain(loose_externals.into_iter().map(SidebarRow::External))
-                                    .collect();
-                                rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+                                let team_rows = self.order_rows(&loose, &loose_externals);
                                 v_flex()
                                     .w_full()
                                     .gap_0p5()
-                                    .children(rows.into_iter().map(|row| {
-                                        let is_selected = selected.as_deref() == Some(row.id());
-                                        match row {
-                                            SidebarRow::Thread(s) => render_thread_item(
-                                                &SidebarThreadItem::from_thread(
-                                                    &s,
-                                                    is_selected,
-                                                    store.read(cx).is_running(&s.id),
-                                                    store.read(cx).pending_auth_contains(&s.id),
-                                                    px(0.),
+                                    .children(team_rows.into_iter().map(|tr| {
+                                        let is_selected = selected.as_deref() == Some(tr.row.id());
+                                        match tr.row {
+                                            SidebarRow::Thread(s) => {
+                                                let store = store.read(cx);
+                                                render_thread_item(
+                                                    &SidebarThreadItem::from_thread(
+                                                        &s,
+                                                        is_selected,
+                                                        ThreadLiveState {
+                                                            running: store.is_running(&s.id),
+                                                            pending_auth: store
+                                                                .pending_auth_contains(&s.id),
+                                                            pending_plan: store
+                                                                .pending_plan_contains(&s.id),
+                                                            background_work: store
+                                                                .background_work_contains(&s.id),
+                                                        },
+                                                        px(tr.indent),
+                                                        tr.team_leader,
+                                                        tr.team_collapsed,
+                                                        &theme,
+                                                    ),
+                                                    &slide,
                                                     &theme,
-                                                ),
-                                                &slide,
-                                                &theme,
-                                                cx,
-                                            ),
+                                                    cx,
+                                                )
+                                            }
                                             SidebarRow::External(s) => render_thread_item(
                                                 &SidebarThreadItem::from_external(
                                                     &s,
@@ -916,12 +1039,7 @@ fn build_model_cascade(
             continue;
         }
         let prov = agent::pi_providers::display_provider_name(&m);
-        let config_id = m
-            .metadata
-            .get("config_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(m.id.as_str())
-            .to_string();
+        let config_id = agent::pi_providers::config_id(&m);
         if !seen.insert((prov.clone(), config_id.clone())) {
             continue; // same model registered on several wire apis
         }
@@ -1019,6 +1137,16 @@ enum RowKind {
     External,
 }
 
+/// Live per-thread state the store tracks for the row's icon: the spin /
+/// blue-static / triangle decision is purely a function of these four flags.
+#[derive(Clone, Copy, Default)]
+struct ThreadLiveState {
+    running: bool,
+    pending_auth: bool,
+    pending_plan: bool,
+    background_work: bool,
+}
+
 /// A UI-layer sidebar row projected from either a manox `ThreadSummary` or an
 /// `ExternalSessionSummary`, so the two render through one layout with a shared
 /// selection-slide animation, id tag, and hover archive action. Only display +
@@ -1037,18 +1165,28 @@ struct SidebarThreadItem {
     pinned: bool,
     has_unread: bool,
     errored: bool,
-    running: bool,
+    selected: bool,
+    indent: gpui::Pixels,
+    /// A team leader whose member rows nest under this row; renders a
+    /// collapse chevron before the status icon.
+    team_leader: bool,
+    /// The leader's member group is folded; the chevron shows the fold.
+    team_collapsed: bool,
+    icon: RowIcon,
+    /// A plan-review verdict is due; the icon stays blue static, not spinning.
+    pending_plan: bool,
+    /// Live monitors / background bash: the loop can still self-advance even
+    /// with no turn in flight, so the icon keeps spinning.
+    background_work: bool,
     /// A tool authorization is parked waiting for the user's verdict (the
     /// thread's card is only visible when it is the active thread).
     pending_auth: bool,
+    running: bool,
     /// A sidecar-restored row with no live process; clicking it resumes the
     /// CLI. Rendered dimmed with a resume hover action.
     resumable: bool,
     /// A resume is in flight for this row; rendered with a loading indicator.
     resuming: bool,
-    selected: bool,
-    indent: gpui::Pixels,
-    icon: RowIcon,
     /// Selection-wash color: threads tint by approval mode, external rows use
     /// the theme accent.
     wash: gpui::Hsla,
@@ -1059,9 +1197,10 @@ impl SidebarThreadItem {
     fn from_thread(
         summary: &agent::ThreadSummary,
         selected: bool,
-        running: bool,
-        pending_auth: bool,
+        live: ThreadLiveState,
         indent: gpui::Pixels,
+        team_leader: bool,
+        team_collapsed: bool,
         theme: &Theme,
     ) -> Self {
         let display = summary.display_title();
@@ -1079,12 +1218,16 @@ impl SidebarThreadItem {
             pinned: summary.pinned,
             has_unread: summary.has_unread,
             errored: summary.errored,
-            running,
-            pending_auth,
+            running: live.running,
+            pending_auth: live.pending_auth,
+            pending_plan: live.pending_plan,
+            background_work: live.background_work,
             resumable: false,
             resuming: false,
             selected,
             indent,
+            team_leader,
+            team_collapsed,
             icon: RowIcon::Thread,
             wash: approval_mode_color(summary.approval_mode, theme),
             kind: RowKind::Thread {
@@ -1135,10 +1278,15 @@ impl SidebarThreadItem {
             errored: false,
             running: false,
             pending_auth: false,
+            pending_plan: false,
+            background_work: false,
             resumable: summary.resumable,
             resuming: summary.resuming,
             selected,
             indent,
+            // External CLI sessions never lead a team; no collapse affordance.
+            team_leader: false,
+            team_collapsed: false,
             icon: RowIcon::External(summary.kind.icon_asset()),
             // Same wash as AutoPilot threads: `theme.accent` resolves to
             // `neutral-100` (near-white) in the forced Light theme, which made
@@ -1163,6 +1311,7 @@ fn render_thread_item(
     let id = item.id.clone();
     let id_open = id.clone();
     let id_archive = id.clone();
+    let id_team = id.clone();
     let id_copy = item.copy_value.clone();
     let short_id = item.short_id.clone();
     let title = item.title.clone();
@@ -1179,7 +1328,10 @@ fn render_thread_item(
     let icon = item.icon.clone();
     let open_kind = item.kind.clone();
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
-    let tag_variant = if item.selected || item.running {
+    // The loop can still self-advance (turn in flight, monitors / background
+    // bash alive): the row spins and the id tag stays highlighted.
+    let autonomous = item.running || item.background_work;
+    let tag_variant = if item.selected || autonomous {
         TagVariant::Primary
     } else {
         TagVariant::Secondary
@@ -1245,7 +1397,7 @@ fn render_thread_item(
         });
 
     let tag_wrapper = gpui::div().relative().overflow_hidden().child(tag_button);
-    let tag_element: AnyElement = if item.running {
+    let tag_element: AnyElement = if autonomous {
         let accent = theme.accent;
         tag_wrapper
             .with_animation(
@@ -1270,7 +1422,13 @@ fn render_thread_item(
         tag_wrapper.into_any_element()
     };
 
-    let leading_icon = if item.resuming {
+    let leading_icon = if item.errored {
+        // Abnormal stop: the danger triangle replaces the ship-wheel.
+        Icon::new(IconName::TriangleAlert)
+            .xsmall()
+            .text_color(theme.danger)
+            .into_any_element()
+    } else if item.resuming {
         // A resume is in flight: the loading indicator replaces the idle icon.
         crate::views::braille_spinner::BrailleSpinner::new()
             .xsmall()
@@ -1279,10 +1437,14 @@ fn render_thread_item(
     } else {
         match icon {
             RowIcon::Thread => {
-                // ship-wheel tri-state: black at rest, green and spinning
-                // while the agent runs, blue while a finished turn awaits the
-                // user's view (`has_unread`).
-                let (color, spin) = if item.running {
+                // ship-wheel state machine: green and spinning while the loop
+                // can self-advance, blue static while it waits on the user
+                // (approval / plan verdict / unread finished turn), gray for a
+                // read pause or a never-run thread.
+                let waiting_user = item.pending_auth || item.pending_plan;
+                let (color, spin) = if waiting_user {
+                    (theme.info, false)
+                } else if autonomous {
                     (theme.success, true)
                 } else if item.has_unread {
                     (theme.info, false)
@@ -1339,6 +1501,32 @@ fn render_thread_item(
             RowKind::External => cx.emit(SidebarEvent::OpenExternalSession(id_open.clone())),
         }))
         .when_some(wash_overlay, |this, overlay| this.child(overlay))
+        .when(item.team_leader, |this| {
+            // Team collapse toggle: folds/unfolds the member rows nested
+            // under this leader without opening the conversation.
+            let id_team = id_team.clone();
+            this.child(
+                gpui::div()
+                    .id(format!("thread-team-chevron-{id}"))
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(if item.team_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                    )
+                    .on_click(cx.listener(move |this, _ev, _window, cx| {
+                        cx.stop_propagation();
+                        if !this.team_collapsed.remove(&id_team) {
+                            this.team_collapsed.insert(id_team.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+        })
         .child(leading_icon)
         .child(
             v_flex()
@@ -1352,27 +1540,11 @@ fn render_thread_item(
                         .gap_1()
                         .items_center()
                         .min_w_0()
-                        .when(item.has_unread, |this| {
-                            this.child(
-                                gpui::div()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .rounded_full()
-                                    .bg(theme.info),
-                            )
-                        })
                         .when(item.pinned, |this| {
                             this.child(
                                 Icon::new(IconName::Star)
                                     .xsmall()
                                     .text_color(theme.accent_foreground),
-                            )
-                        })
-                        .when(item.errored, |this| {
-                            this.child(
-                                Icon::new(IconName::TriangleAlert)
-                                    .xsmall()
-                                    .text_color(theme.danger),
                             )
                         })
                         .when(item.pending_auth, |this| {
@@ -1562,6 +1734,68 @@ mod tests {
         }
     }
 
+    /// A member whose leader is not in the current partition (e.g. an
+    /// archived leader) must not disappear: the row degrades to top-level,
+    /// matching the webview forest.
+    #[test]
+    fn team_forest_keeps_members_when_leader_is_in_another_partition() {
+        let thread = |id: &str, parent: Option<&str>, depth: i32, at: i64| {
+            let mut s = sample_thread();
+            s.id = id.into();
+            s.parent_id = parent.map(str::to_string);
+            s.depth = depth;
+            s.interacted_at = at;
+            s
+        };
+        // Only the active partition is handed to the forest; the leader sits
+        // in the archived partition, so its depth-1 member must surface as a
+        // top-level row instead of vanishing.
+        let threads = vec![thread("member", Some("leader"), 1, 100)];
+        let rows = team_forest(&HashSet::new(), &threads, &[]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.row.id()).collect();
+        assert_eq!(ids, vec!["member"]);
+        assert_eq!(rows[0].indent, 0.0);
+        assert!(!rows[0].team_leader);
+    }
+
+    /// The team forest orders top-level rows by recency with members nested
+    /// indented right after their leader; a collapsed leader hides its
+    /// subtree and an orphan stays top-level.
+    #[test]
+    fn team_forest_nests_members_and_honors_collapse() {
+        let thread = |id: &str, parent: Option<&str>, depth: i32, at: i64| {
+            let mut s = sample_thread();
+            s.id = id.into();
+            s.parent_id = parent.map(str::to_string);
+            s.depth = depth;
+            s.interacted_at = at;
+            s
+        };
+        let threads = vec![
+            thread("leader", None, 0, 100),
+            thread("member-old", Some("leader"), 1, 50),
+            thread("member-new", Some("leader"), 1, 200),
+            thread("orphan", Some("gone"), 0, 300),
+        ];
+
+        let collapsed = HashSet::new();
+        let rows = team_forest(&collapsed, &threads, &[]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.row.id()).collect();
+        // Orphan sorts newest first; the leader carries its members right
+        // after it, members in activity order.
+        assert_eq!(ids, vec!["orphan", "leader", "member-new", "member-old"]);
+        assert!(rows[1].team_leader);
+        assert_eq!(rows[2].indent, 14.0);
+        assert_eq!(rows[3].indent, 14.0);
+        assert!(!rows[0].team_leader);
+
+        let collapsed = HashSet::from(["leader".to_string()]);
+        let rows = team_forest(&collapsed, &threads, &[]);
+        let ids: Vec<&str> = rows.iter().map(|r| r.row.id()).collect();
+        assert_eq!(ids, vec!["orphan", "leader"]);
+        assert!(rows[1].team_collapsed);
+    }
+
     /// The unified row projection: a selected external session carries the
     /// same `selected` flag, id-namespace, and a non-transparent wash as a
     /// selected manox thread, so `set_selected(external_id)` highlights its
@@ -1570,8 +1804,15 @@ mod tests {
     fn external_selection_mirrors_thread_selection() {
         let theme = real_theme();
 
-        let thread =
-            SidebarThreadItem::from_thread(&sample_thread(), true, false, false, px(0.), &theme);
+        let thread = SidebarThreadItem::from_thread(
+            &sample_thread(),
+            true,
+            ThreadLiveState::default(),
+            px(0.),
+            false,
+            false,
+            &theme,
+        );
         assert!(thread.selected);
         assert_eq!(thread.id, "thread-abcdef12");
         assert_eq!(thread.wash, approval_mode_color(0, &theme));
@@ -1612,8 +1853,15 @@ mod tests {
     #[test]
     fn external_and_thread_rows_share_deselected_state() {
         let theme = real_theme();
-        let thread =
-            SidebarThreadItem::from_thread(&sample_thread(), false, false, false, px(0.), &theme);
+        let thread = SidebarThreadItem::from_thread(
+            &sample_thread(),
+            false,
+            ThreadLiveState::default(),
+            px(0.),
+            false,
+            false,
+            &theme,
+        );
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
         assert!(!thread.selected);
         assert!(!external.selected);

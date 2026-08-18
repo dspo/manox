@@ -61,7 +61,7 @@ describe('init', () => {
     const pending = manager.init('/w');
     // The init command goes out only after `transport.ready` settles.
     await Promise.resolve();
-    expect(transport.lastCommand()).toEqual({ cmd: 'init', cwd: '/w' });
+    expect(transport.lastCommand()).toEqual({ cmd: 'init', cwd: '/w', host: 'vscode' });
     transport.emit({ type: 'ready' });
     await pending;
 
@@ -182,12 +182,14 @@ describe('listModels', () => {
     ]);
   });
 
-  it('rejects after the response timeout', async () => {
+  it('rejects after the registration budget', async () => {
     vi.useFakeTimers();
     const { manager } = create();
     const pending = manager.listModels();
     const assertion = expect(pending).rejects.toThrow(/timed out waiting for actor event: models/);
-    await vi.advanceTimersByTimeAsync(5_001);
+    // listModels budgets the cold-boot registration (INIT_TIMEOUT_MS), not
+    // a plain round trip.
+    await vi.advanceTimersByTimeAsync(30_001);
     await assertion;
   });
 });
@@ -232,8 +234,12 @@ describe('listThreads', () => {
           unread: true,
           errored: false,
           pending_auth: false,
+          pending_plan: false,
+          background_work: false,
           pinned: false,
           archived: false,
+          parent_id: null,
+          depth: 0,
           model_id: 'm',
         },
       ],
@@ -284,6 +290,7 @@ describe('requestThreadInfo', () => {
       type: 'thread_info',
       sessionId: 't1',
       info: {
+        reasoning_effort: 'high',
         worktree_path: null,
         plan: null,
         goal: null,

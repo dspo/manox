@@ -12,15 +12,27 @@ import type {
   ImageAttachment,
   ModelInfo,
   PlanVerdictChoice,
+  ReasoningEffort,
   ThreadInfoSnapshot,
   ThreadListItem,
 } from '../protocol';
 
 export type WebviewToHost =
-  | { type: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
+  | {
+      type: 'submit';
+      sessionId: string;
+      text: string;
+      images?: ImageAttachment[];
+      /** Echo identifier for the queued-bubble lifecycle (`steer` /
+       * `drop_queued` target the same id the host relayed back). */
+      clientId?: string;
+    }
+  | { type: 'steer'; sessionId: string; clientId: string; text: string; images?: ImageAttachment[] }
+  | { type: 'drop_queued'; sessionId: string; clientId: string }
   | { type: 'approve'; sessionId: string; id: string; allow: boolean }
   | { type: 'cancel'; sessionId: string }
   | { type: 'set_model'; sessionId: string; id: string }
+  | { type: 'set_reasoning_effort'; sessionId: string; effort: ReasoningEffort }
   | { type: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
   | { type: 'set_plan_mode'; sessionId: string; enabled: boolean }
   | { type: 'plan_verdict'; sessionId: string; choice: PlanVerdictChoice }
@@ -55,9 +67,16 @@ export type WebviewToHost =
 
 export type HostToWebview =
   | { type: 'session_ready'; sessionId: string; cwd: string; kind: 'fresh' | 'restored' }
-  | { type: 'event'; event: ActorEvent }
+  // Coalesced session events: the host drains its per-frame buffer as one
+  // message, so a streaming flood crosses the bridge once per frame instead
+  // of once per event. Order inside the array is arrival order.
+  | { type: 'events'; events: ActorEvent[] }
   | { type: 'models'; models: ModelInfo[] }
   | { type: 'threads'; threads: ThreadListItem[] }
   | { type: 'commands'; commands: CommandEntry[] }
   | { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
-  | { type: 'global_error'; message: string };
+  | { type: 'global_error'; message: string }
+  /** macOS cmd+m lands here via the manox.openTurnNavigator command (the
+   * OS minimize accelerator would otherwise swallow the key before the
+   * webview DOM sees it); the webview toggles the turn navigator. */
+  | { type: 'open_turn_navigator' };

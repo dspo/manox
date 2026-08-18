@@ -13,6 +13,7 @@ import {
   ConfirmationRequest,
   ConfirmationTitle,
 } from '../ai/confirmation';
+import { MarkdownContent } from '../ai/markdown-content';
 
 export type PlanReviewItem = Extract<TranscriptItem, { kind: 'plan_review' }>;
 
@@ -41,7 +42,11 @@ export const PlanReviewCard = ({ item, sessionId, cwd }: PlanReviewCardProps) =>
     >
       <ConfirmationTitle>{item.title}</ConfirmationTitle>
       <ConfirmationRequest>
-        <div className="text-sm">{item.content || t('plan_review_empty')}</div>
+        {item.content ? (
+          <MarkdownContent content={item.content} />
+        ) : (
+          <div className="text-sm">{t('plan_review_empty')}</div>
+        )}
       </ConfirmationRequest>
       <ConfirmationActions>
         <ConfirmationAction onClick={() => verdict('refine')} variant="outline">

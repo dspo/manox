@@ -28,7 +28,16 @@
     "languageModelChatProviders": [
       {
         "vendor": "manox",
-        "displayName": "manox"
+        "displayName": "manox",
+        "configuration": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "cx provider name whose models this group exposes (matches the provider name in ~/.config/cx/cx.providers.config.yaml)."
+            }
+          }
+        }
       }
     ],
     "chatParticipants": [
@@ -86,6 +95,23 @@
         "command": "manox.newSession",
         "title": "manox: New Session",
         "icon": "$(add)"
+      },
+      {
+        "command": "manox.openTurnNavigator",
+        "title": "manox: Open User Turn Navigator"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "manox.openTurnNavigator",
+        "mac": "cmd+m",
+        "when": "view == manox.chatView"
+      },
+      {
+        "command": "manox.openTurnNavigator",
+        "win": "ctrl+m",
+        "linux": "ctrl+m",
+        "when": "view == manox.chatView"
       }
     ],
     "menus": {

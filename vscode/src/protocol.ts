@@ -11,14 +11,31 @@
 // protocol — the napi binding terminates the thread directly.
 
 export type Command =
-	| { cmd: 'init'; cwd: string }
+	| { cmd: 'init'; cwd: string; host: 'vscode' }
 	| { cmd: 'create_session'; sessionId: string; cwd: string }
 	| { cmd: 'dispose_session'; sessionId: string }
-	| { cmd: 'submit'; sessionId: string; text: string; images?: ImageAttachment[] }
+	| {
+			cmd: 'submit';
+			sessionId: string;
+			text: string;
+			images?: ImageAttachment[];
+			/** Echo identifier the host relays back on `steer_pending` /
+			 * `drop_queued`; absent on submits from older surfaces. */
+			clientId?: string;
+	  }
+	| {
+			cmd: 'steer';
+			sessionId: string;
+			clientId: string;
+			text: string;
+			images?: ImageAttachment[];
+	  }
+	| { cmd: 'drop_queued'; sessionId: string; clientId: string }
 	| { cmd: 'approve'; sessionId: string; id: string; allow: boolean }
 	| { cmd: 'set_approval_mode'; sessionId: string; mode: ApprovalMode }
 	| { cmd: 'cancel_turn'; sessionId: string }
 	| { cmd: 'set_model'; sessionId: string; id: string }
+	| { cmd: 'set_reasoning_effort'; sessionId: string; effort: ReasoningEffort }
 	| { cmd: 'get_current_model'; sessionId: string }
 	| { cmd: 'list_models' }
 	| { cmd: 'get_usage'; sessionId: string }
@@ -40,9 +57,9 @@ export type Command =
 			cmd: 'answer_question';
 			sessionId: string;
 			id: string;
-			/** (question text, selected labels joined by ", " or free-form text). */
+			/** (question text, selected labels joined by ", "). */
 			answers: [string, string][];
-			/** Free-form note that dismisses the whole card; overrides answers. */
+			/** Free-form supplemental note; rides alongside the selections. */
 			response: string | null;
 	  };
 
@@ -111,6 +128,9 @@ export type ToolCallStatus =
  * user escalation, danger runs every tool call without prompting. */
 export type ApprovalMode = 'autopilot' | 'danger';
 
+/** User-facing reasoning-effort knob for the model dropdown (`high`/`max`). */
+export type ReasoningEffort = 'high' | 'max';
+
 export interface ModelInfo {
 	id: string;
 	name: string;
@@ -143,9 +163,19 @@ export interface ThreadListItem {
 	unread: boolean;
 	errored: boolean;
 	pending_auth: boolean;
+	/** A plan review verdict is due; the row shows the static blue wheel. */
+	pending_plan: boolean;
+	/** Live monitors / background bash keep the loop self-advancing; the row
+	 * spins even with no turn in flight. */
+	background_work: boolean;
 	model_id: string;
 	pinned: boolean;
 	archived: boolean;
+	/** Leader session id for a team worker row; null for a top-level row. */
+	parent_id: string | null;
+	/** Nesting level: 0 is top-level, 1 is a team member of a top-level
+	 * leader, and so on. */
+	depth: number;
 }
 
 /** One slash-completion entry: a built-in/prompt-macro command or a skill. */
@@ -205,6 +235,7 @@ export interface GitStats {
 
 /** Conversation info panel snapshot (thread_info event payload). */
 export interface ThreadInfoSnapshot {
+	reasoning_effort: ReasoningEffort;
 	worktree_path: string | null;
 	plan: PlanSnapshotWire | null;
 	goal: GoalSnapshotWire | null;
@@ -293,8 +324,25 @@ export type ActorEvent =
 	| { type: 'session_disposed'; sessionId: string }
 	// turn
 	| { type: 'turn_started'; sessionId: string }
-	| { type: 'turn_finished'; sessionId: string; cancelled: boolean; failed: boolean }
+	| {
+			type: 'turn_finished';
+			sessionId: string;
+			cancelled: boolean;
+			failed: boolean;
+			/** Steer message ids that never made it into the settled run. */
+			strandedSteerIds?: string[];
+	  }
 	| { type: 'stop'; sessionId: string; reason: string | null }
+	// queued-message steering
+	| {
+			type: 'steer_pending';
+			sessionId: string;
+			/** The client echo id of the original submission. */
+			clientId: string;
+			/** Kernel message id of the injected steer. */
+			messageId: string;
+	  }
+	| { type: 'steer_injected'; sessionId: string; messageId: string }
 	// content
 	| { type: 'agent_text'; sessionId: string; text: string }
 	| { type: 'agent_thinking'; sessionId: string; text: string }
@@ -320,6 +368,7 @@ export type ActorEvent =
 	  }
 	// state
 	| { type: 'model_changed'; sessionId: string; from: string | null; to: string }
+	| { type: 'reasoning_effort_changed'; sessionId: string; effort: ReasoningEffort }
 	| { type: 'approval_mode_changed'; sessionId: string; mode: ApprovalMode }
 	| { type: 'current_model'; sessionId: string; id: string | null; name?: string }
 	| { type: 'models'; models: ModelInfo[] }
