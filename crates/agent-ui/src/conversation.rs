@@ -2722,6 +2722,65 @@ mod tests {
         );
     }
 
+    /// A tool-anchored note also lands after a top-level `ToolCall` card
+    /// (the `AskUserQuestion` path — not folded into an activity segment),
+    /// matching the live `notice_anchor_for_tool` resolution.
+    #[test]
+    fn merge_ui_notes_places_tool_anchored_note_after_top_level_card() {
+        let messages = vec![
+            msg_with_id("u1", Role::User, "clarify"),
+            msg_with_id("a1", Role::Assistant, "answered"),
+        ];
+        let items = vec![
+            ConvItem::User {
+                text: "clarify".into(),
+                images: Vec::new(),
+                meta: None,
+                display_state: UserMessageDisplayState::Normal,
+            },
+            ConvItem::ToolCall(ToolCallItem {
+                id: "ask_1".into(),
+                name: agent::tools::ASK_USER_QUESTION.into(),
+                title: "which?".into(),
+                status: ToolCallStatus::Success,
+                output: String::new(),
+                is_error: false,
+                input: serde_json::Value::Null,
+                streaming: false,
+                collapsed: false,
+                user_toggled: false,
+                panel: None,
+            }),
+            ConvItem::Assistant {
+                text: "answered".into(),
+                streaming: false,
+                token_usage: None,
+                activity_summary: None,
+            },
+        ];
+        let mut data = serde_json::json!({ "text": "allowed" });
+        data["tool_call_id"] = serde_json::Value::String("ask_1".into());
+        let note_rec = UiNoteRecord {
+            id: 0,
+            thread_id: "t".to_string(),
+            seq: 0,
+            anchor_user_id: Some("u1".to_string()),
+            kind: UiNoteKind::Notice,
+            data,
+            ts: 0,
+        };
+        let merged = merge_ui_notes(&messages, items, &[note_rec]);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:clarify",
+                "?",         // top-level ToolCall card
+                "N:allowed", // tool-anchored → right after the card
+                "A:answered",
+            ]
+        );
+    }
+
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
     /// preceding assistant message, so a reloaded historical thread shows tool output.
     #[test]

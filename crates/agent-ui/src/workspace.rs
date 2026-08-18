@@ -4001,16 +4001,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Persist a UI annotation (`Error` / `Notice`) to `thread_ui_notes`.
-    /// The anchor is the current turn's user message — `None` before the first
-    /// user message — so the rebuild can place the note at the end of its turn.
-    /// Best-effort: the live item already rendered this turn; only the reload
-    /// copy is at stake.
+    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview`) to the
+    /// session sidecar. The anchor is the current turn's user message —
+    /// `None` before the first user message — so the rebuild can place the
+    /// note at the end of its turn (or next to its tool call when
+    /// `tool_call_id` is set). Best-effort: the live item already rendered
+    /// this turn; only the reload copy is at stake.
     ///
-    /// Also appends to the in-memory `Thread::ui_notes` cache so a background
-    /// thread reclaimed via `attach_thread` (which rebuilds from the entity,
-    /// not a db reload) still reproduces the note. The placeholder row is
-    /// discarded on the next db reload, which replaces the cache wholesale.
+    /// The in-memory `Thread::ui_notes` Vec is the render source of truth
+    /// (a background thread reclaimed via `attach_thread` rebuilds from the
+    /// entity, not the sidecar); `save_thread` snapshots the whole Vec into
+    /// the sidecar so a process restart reproduces the notes too.
     fn record_ui_note(
         &self,
         kind: agent::db::UiNoteKind,
@@ -4044,10 +4045,11 @@ impl Workspace {
             ts: 0,
         };
         self.thread.update(cx, |t, _| t.push_ui_note(cached));
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| {
-            s.record_ui_note(&thread_id, kind, anchor.as_deref(), &data, cx)
-        });
+        // Flush the in-memory cache to the session sidecar (the pi backend's
+        // authority for restore): the next `save_thread` — or a full snapshot
+        // at turn end / thread switch — overwrites the whole Vec, so this
+        // write is best-effort and last-write-wins.
+        save_thread(self.thread.clone(), false, cx);
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {

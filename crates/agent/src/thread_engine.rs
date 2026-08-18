@@ -174,6 +174,11 @@ pub enum BackendNotice {
         /// mirrors it as the rebuild fallback after compaction summarized
         /// the transcript's plan tool calls away.
         plan_snapshot: Option<serde_json::Value>,
+        /// Persisted UI annotation cards (sidecar); the facade seeds
+        /// `thread.ui_notes` BEFORE emitting `HistoryRestored`, so the
+        /// rebuild splices them back at the anchored position
+        /// (tool-call-adjacent for approval records).
+        ui_notes: Vec<crate::db::UiNoteRecord>,
     },
     /// The turn loop unwound and released the running slot.
     Settled {

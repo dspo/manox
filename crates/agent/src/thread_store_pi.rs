@@ -383,17 +383,6 @@ impl ThreadStore {
     ) {
     }
 
-    /// Persist a UI annotation card. Not produced by the pi backend.
-    pub fn record_ui_note(
-        &self,
-        _thread_id: &str,
-        _kind: crate::db::UiNoteKind,
-        _anchor_user_id: Option<&str>,
-        _data: &serde_json::Value,
-        _cx: &mut Context<Self>,
-    ) {
-    }
-
     /// Persist a sidecar change for a session. The caller's in-memory update
     /// is the render source of truth, so `SummariesUpdated` fires up front;
     /// the sidecar write is best-effort. The list is rescanned only after
@@ -433,12 +422,24 @@ impl ThreadStore {
 }
 
 /// Persist a `Thread` snapshot. The pi transcript persists itself — this
-/// refreshes the sidebar list on real user activity.
-pub fn save_thread(_thread: Entity<Thread>, touch: bool, cx: &mut App) {
-    if touch {
-        let store = global();
-        store.update(cx, |s, cx| s.refresh(cx));
-    }
+/// mirrors the current `ui_notes` (host-only annotation cards) into the
+/// session sidecar on real user activity, and refreshes the sidebar list.
+///
+/// The sidecar write is a detached load→modify→save with no per-session
+/// serialization (`write_meta`): a stale in-flight write landing after a
+/// newer one can drop the newest note (lost-update window). The next
+/// `save_thread` self-heals; a process crash inside the window loses at
+/// most the final notice — the same crash window the jsonl transcript has.
+pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
+    let store = global();
+    let id = thread.read(cx).id.0.clone();
+    let snapshot = serde_json::to_value(thread.read(cx).ui_notes()).ok();
+    store.update(cx, |s, cx| {
+        if touch {
+            s.refresh(cx);
+        }
+        s.write_meta(&id, move |meta| meta.ui_notes = snapshot.clone(), cx);
+    });
 }
 
 /// Read every session plus its sidecar into the sidebar summary shape.
@@ -646,6 +647,65 @@ mod tests {
                 sessions_dir: std::env::temp_dir(),
             })
         })
+    }
+
+    /// The ui_notes sidecar write path: `write_meta` snapshots the caller's
+    /// update through the detached load→modify→save pipeline, and a
+    /// subsequent sidecar load sees it — the mechanism `save_thread` uses to
+    /// persist `Thread::ui_notes` (Error / Notice / PlanReview cards,
+    /// including `data.tool_call_id` on approval records).
+    #[test]
+    fn write_meta_persists_ui_notes_to_sidecar() {
+        let (db, db_path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("t1.jsonl");
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.session_paths.insert("t1".to_string(), session.clone());
+                s.sessions_dir = dir.path().to_path_buf();
+            });
+        });
+        let notes = serde_json::json!([
+            {
+                "id": 0,
+                "thread_id": "t1",
+                "seq": 0,
+                "anchor_user_id": "u1",
+                "kind": "notice",
+                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" },
+                "ts": 0
+            }
+        ]);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.write_meta("t1", move |meta| meta.ui_notes = Some(notes.clone()), cx);
+            });
+        });
+        // Start the gpui-side write task (it parks awaiting the tokio inner
+        // task), then poll the tokio runtime until the sidecar write lands.
+        cx.executor().run_until_parked();
+        let mut records: Option<Vec<crate::db::UiNoteRecord>> = None;
+        for _ in 0..200 {
+            if let Ok(meta) = crate::runtime::handle().block_on(
+                pi_extensions::session_meta::load(dir.path(), &session),
+            ) && let Some(notes) = meta.ui_notes
+            {
+                records = serde_json::from_value(notes).ok();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let records = records.expect("sidecar write landed within the poll window");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].data.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tu_1"),
+            "the tool anchor survives the sidecar write"
+        );
+        std::fs::remove_file(db_path).ok();
     }
 
     #[test]
