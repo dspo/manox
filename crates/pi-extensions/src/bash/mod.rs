@@ -16,7 +16,7 @@ use std::time::Duration;
 use pi::BackgroundTaskRegistry;
 use pi::env::CommandResult;
 
-use orchestration::BackgroundManager;
+use orchestration::{BackgroundManager, OutputShape};
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use pi::tools::bash::{BashExecRequest, BashOperations};
 use pi::tools::truncate::{self, TruncateConfig};
@@ -125,10 +125,12 @@ impl AgentTool for BashTool {
     fn description(&self) -> &str {
         "Execute a shell command. State (cwd, exported vars, functions) persists across calls. \
          Optionally run in the background with `run_in_background: true` — the command starts in a \
-         fresh shell (no persistent state) at the session cwd — and collect output via `bash_output`; \
-         stop it with `task_stop`. Use `head_lines`/`tail_lines` to keep a selection of the output \
-         instead of piping through `head`/`tail`. Set `unsandboxed: true` to run without the sandbox \
-         (no write/network confinement; requires user approval in non-Danger modes). In Danger mode \
+         fresh shell (no persistent state) at the session cwd — a completion summary with the \
+         output tail arrives automatically; `bash_output` fetches the full output; `task_stop` \
+         stops the task. Use `head_lines`/`tail_lines` to keep a selection of the output instead \
+         of piping through `head`/`tail` — they shape the foreground result and the background \
+         completion summary. Set `unsandboxed: true` to run without the sandbox (no \
+         write/network confinement; requires user approval in non-Danger modes). In Danger mode \
          the host escalates every call regardless of this flag."
     }
 
@@ -173,7 +175,7 @@ impl AgentTool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Start the command in the background and return a task id immediately; poll with bash_output, stop with task_stop"
+                    "description": "Start the command in the background and return a task id immediately; a completion summary with the output tail arrives automatically — use bash_output for the full output, task_stop to stop"
                 },
                 "unsandboxed": {
                     "type": "boolean",
@@ -181,11 +183,11 @@ impl AgentTool for BashTool {
                 },
                 "head_lines": {
                     "type": "integer",
-                    "description": "Keep only the first N lines of output"
+                    "description": "Keep only the first N lines of output (applies to the result and the background completion summary)"
                 },
                 "tail_lines": {
                     "type": "integer",
-                    "description": "Keep only the last N lines of output"
+                    "description": "Keep only the last N lines of output (applies to the result and the background completion summary)"
                 }
             },
             "required": ["command"]
@@ -254,18 +256,20 @@ impl BashTool {
             // Background tasks route through the same confinement decision
             // as foreground calls: escalated → bare spawn, else sandboxed.
             // Without a seatbelt there is no wrapper either way.
-            let escalate = params["unsandboxed"].as_bool().unwrap_or(false)
-                || self.force_unsandboxed.as_ref().is_some_and(|f| f());
             let sandboxed = self.sandbox_available && !escalate;
+            let shape = OutputShape {
+                head_lines,
+                tail_lines,
+            };
             let id = match &self.manager {
                 Some(manager) if sandboxed => manager
-                    .spawn_sandboxed(&command, run_cwd)
+                    .spawn_sandboxed(&command, run_cwd, shape)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
                 // Without a manager there is no sandbox wrapper to route
                 // through — the bare trait path (approval still gates
                 // escalated calls).
                 Some(manager) => manager
-                    .spawn(&command, run_cwd)
+                    .spawn(&command, run_cwd, shape)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
                 None => self
                     .registry
@@ -273,7 +277,7 @@ impl BashTool {
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
             };
             return Ok(AgentToolResult::text(format!(
-                "Started in background as `{id}`. Poll with `bash_output` (shell_id), stop with `task_stop`."
+                "Started in background as `{id}`. A completion summary with the output tail will arrive automatically. Use `bash_output` (shell_id) for the full output; `task_stop` stops the task."
             )));
         }
 
@@ -369,6 +373,8 @@ mod tests {
     use super::*;
     use pi::tools::bash::BashOperations;
     use std::sync::Mutex;
+
+    use super::background::BackgroundRegistry;
 
     struct EchoOps;
     #[async_trait::async_trait]
@@ -759,5 +765,70 @@ mod tests {
             tool.requires_approval(&serde_json::json!({"command": "ls"})),
             "no OS confinement → the gate is the only barrier"
         );
+    }
+
+    #[tokio::test]
+    async fn background_summary_honors_tail_lines() {
+        let registry = Arc::new(BackgroundRegistry::new());
+        let manager = Arc::new(BackgroundManager::new(Arc::clone(&registry)));
+        let seen: Arc<Mutex<Vec<pi::types::AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
+        let tool =
+            BashTool::new(Arc::new(EchoOps), registry.clone()).with_manager(Arc::clone(&manager));
+
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "command": "printf 'a\nb\nc\nd\ne\n'",
+                    "run_in_background": true,
+                    "tail_lines": 2,
+                }),
+                CancellationToken::new(),
+                &ctx("/tmp"),
+            )
+            .await
+            .unwrap();
+        let start = output_text(&result);
+        let id = start
+            .strip_prefix("Started in background as `")
+            .and_then(|t| t.split('`').next())
+            .unwrap_or_else(|| panic!("background id in start text: {start}"));
+
+        let summary = wait_for_steered(&seen).await;
+        let section = summary
+            .split("Recent output:\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("shaped tail in summary: {summary}"));
+        let lines: Vec<&str> = section
+            .lines()
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(lines, vec!["d", "e"], "tail lines: {lines:?}");
+        assert!(summary.contains(id), "summary names the task: {summary}");
+        let status = registry.status(&pi::TaskId(id.to_string()), 0).unwrap();
+        assert!(!status.is_running, "task finished");
+    }
+
+    /// Wait until the recording steerer received the completion summary and
+    /// return its text.
+    async fn wait_for_steered(seen: &Arc<Mutex<Vec<pi::types::AgentMessage>>>) -> String {
+        for _ in 0..100 {
+            let summary = seen.lock().unwrap().iter().find_map(|m| match m {
+                pi::types::AgentMessage::User { content, .. } => {
+                    content.iter().find_map(|b| match b {
+                        pi::types::ContentBlock::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            });
+            if let Some(s) = summary {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("completion summary not steered in time");
     }
 }

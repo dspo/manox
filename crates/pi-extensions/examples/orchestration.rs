@@ -21,7 +21,7 @@ use pi::tool::AgentTool;
 use pi::types::{AgentEvent, AgentMessage, ContentBlock, Model, StopReason};
 use pi_extensions::agents::{SubagentTool, register_defaults};
 use pi_extensions::bash::BashTool;
-use pi_extensions::bash::orchestration::{BackgroundEvent, BackgroundManager};
+use pi_extensions::bash::orchestration::{BackgroundEvent, BackgroundManager, OutputShape};
 use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 
 /// A stream returning a scripted sequence of assistant messages, one per call.
@@ -182,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Background orchestration: spawn a task; the completion event and the
     //    steered summary (into the session's steering queue) follow.
-    let id = manager.spawn("sleep 0.2; echo done", dir.path())?;
+    let id = manager.spawn("sleep 0.2; echo done", dir.path(), OutputShape::default())?;
     println!("[2/2] spawned background task {id}");
 
     let mut saw_spawned = false;
