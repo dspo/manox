@@ -111,10 +111,10 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     // Isolate config + sessions under a temp HOME.
     let home = std::env::temp_dir().join(format!("manox-execute-fresh-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(home.join(".config/cx/manox")).unwrap();
-    std::fs::create_dir_all(home.join(".config/cx/manox/pi-sessions")).unwrap();
+    std::fs::create_dir_all(home.join(".manox")).unwrap();
+    std::fs::create_dir_all(home.join(".manox/pi-sessions")).unwrap();
     std::fs::write(
-        home.join(".config/cx/cx.providers.config.yaml"),
+        home.join(".manox/cx.providers.config.yaml"),
         format!(
             "providers:\n- name: Fake\n  apikey_source: literal:test-key\n  endpoints:\n    anthropic: http://127.0.0.1:{port}\n  models:\n    fake-model:\n      wire_apis: [anthropic]\n      context: 200000\n"
         ),

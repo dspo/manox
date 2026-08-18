@@ -1,6 +1,6 @@
 //! MCP (Model Context Protocol) client integration — shared core.
 //!
-//! Reads `~/.config/cx/manox/mcp.toml` (layered with each installed plugin's
+//! Reads `~/.manox/mcp.toml` (layered with each installed plugin's
 //! `.mcp.json`), connects every configured server (stdio or streamable HTTP)
 //! via the `rmcp` SDK, and lists their tools. The harness bridges differ:
 //! the pi path wraps each tool as a pi `AgentTool` ([`pi_tool::PiMcpTool`]);

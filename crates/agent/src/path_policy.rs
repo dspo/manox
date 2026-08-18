@@ -138,6 +138,9 @@ impl Default for ReadPolicy {
 }
 
 /// The canonicalized sensitive subtrees under the user's home directory.
+/// The `.manox` state root is denied per-item (provider config holds API
+/// keys, `sessions/` the IPC sockets) rather than wholesale, so the shared
+/// `~/.manox/plans/` stays readable to the model during plan mode.
 /// Empty when `$HOME` is unset.
 fn home_denied_roots() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME") else {
@@ -149,6 +152,11 @@ fn home_denied_roots() -> Vec<PathBuf> {
         ".aws",
         ".gnupg",
         ".config",
+        ".manox/cx.providers.config.yaml",
+        ".manox/cx.db",
+        ".manox/sessions",
+        ".manox/.codex",
+        ".manox/.patch_source",
         "Library",
         "Music",
         "Pictures",
@@ -271,7 +279,17 @@ mod tests {
         let policy = ReadPolicy::new();
         assert!(policy.is_denied(&home().join(".ssh/id_rsa")));
         assert!(policy.is_denied(&home().join(".aws/credentials")));
-        assert!(policy.is_denied(&home().join(".config/cx/cx.providers.config.yaml")));
+        assert!(policy.is_denied(&home().join(".manox/cx.providers.config.yaml")));
+        assert!(policy.is_denied(&home().join(".manox/cx.db")));
+        assert!(policy.is_denied(&home().join(".manox/sessions/abc.sock")));
+    }
+
+    #[test]
+    fn read_policy_denies_manox_secrets_but_allows_plans() {
+        let policy = ReadPolicy::new();
+        // The plan-file directory stays readable so plan mode can re-read and
+        // incrementally Edit an existing plan.
+        assert!(!policy.is_denied(&home().join(".manox/plans/example-plan.md")));
     }
 
     #[test]

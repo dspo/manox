@@ -1155,7 +1155,7 @@ struct ThreadLiveState {
 struct SidebarThreadItem {
     id: String,
     /// 8-char tag label. Threads use the thread UUID prefix; external sessions
-    /// use the cx session id prefix (traceable to `~/.config/cx/sessions/<id>.sock`).
+    /// use the cx session id prefix (traceable to `~/.manox/sessions/<id>.sock`).
     short_id: String,
     /// Clipboard payload for the id-tag click. Threads copy the thread id;
     /// external sessions copy the full cx session id (or socket path).

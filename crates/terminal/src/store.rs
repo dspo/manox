@@ -32,7 +32,7 @@ static GLOBAL: OnceLock<Entity<TerminalStore>> = OnceLock::new();
 
 /// Test-only override of the process-global `TerminalStore`. `init_for_test`
 /// stores an in-memory-db-backed entity here so persistence-bearing tests
-/// don't touch the real `~/.config/cx/manox/threads.db`; `drop_for_test`
+/// don't touch the real `~/.manox/threads.db`; `drop_for_test`
 /// clears it so gpui's leaked-handle check at teardown doesn't trip on an
 /// entity held alive by a process-global `OnceLock`. Mirrors `thread_store`.
 #[cfg(any(test, feature = "test-support"))]
@@ -72,7 +72,7 @@ pub fn global() -> Entity<TerminalStore> {
 
 /// Test-only initializer that primes the process-global `TerminalStore` with a
 /// caller-provided db (typically `:memory:`) so persistence-bearing tests
-/// don't touch the real `~/.config/cx/manox/threads.db`. The override lives in
+/// don't touch the real `~/.manox/threads.db`. The override lives in
 /// `TEST_OVERRIDE` (not `GLOBAL`) precisely so `drop_for_test` can release the
 /// entity before teardown — a `OnceLock` can't be cleared, which would trip
 /// gpui's leaked-handle check. Pair every call with `drop_for_test`.

@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repo.
 
 ## 项目概述
 
-manox 是进程内 native agent 工作台，三层架构（核心逻辑 `crates/agent` / UI 层 `crates/agent-ui` / 薄 bin `crates/manox`，另有 `terminal` + `terminal-ui`）。基于 GPUI（GPU 加速 UI 框架）+ gpui-component（longbridge 组件库），LLM 通过 `~/.config/cx/cx.providers.config.yaml` 直连 provider。**单二进制、单进程**。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
+manox 是进程内 native agent 工作台，三层架构（核心逻辑 `crates/agent` / UI 层 `crates/agent-ui` / 薄 bin `crates/manox`，另有 `terminal` + `terminal-ui`）。基于 GPUI（GPU 加速 UI 框架）+ gpui-component（longbridge 组件库），LLM 通过 `~/.manox/cx.providers.config.yaml` 直连 provider。**单二进制、单进程**。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
 
 ## 构建与开发命令
 
@@ -33,16 +33,25 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 1. **模型面向一律英文，绝不本地化**：`prompt/templates/{en,zh-CN}/**/*.tera.md` 模板散文、所有工具 `description()`、工具 `run` 返回的 Err 字符串、`thread_pi.rs` 里 LLM 能读到的消息。永远不经 i18n。
 2. **仅 UI chrome 本地化**：按钮、标签、状态徽章、overlay 标题、输入占位符、侧栏、设置面板、系统菜单。经 `agent::i18n::t("key")`。
-3. **Fluent 资源**在 `crates/agent/locales/{en,zh-CN}.ftl`，`include_str!` 编译期嵌入。**新增 UI 字符串 = 在两个 `.ftl` 各加一个键 + 调用处换 `t("key")`**，缺一不可。语言来自 `~/.config/cx/manox/settings.toml`：UI 语言（`ui_language`）`agent::init` 时读一次，可运行时热切换（`i18n::set_ui_language`，仅 chrome 重新本地化，已产生的内容不回改）；agent 语言（`agent_language`）按 thread 快照、终身不变。
+3. **Fluent 资源**在 `crates/agent/locales/{en,zh-CN}.ftl`，`include_str!` 编译期嵌入。**新增 UI 字符串 = 在两个 `.ftl` 各加一个键 + 调用处换 `t("key")`**，缺一不可。语言来自 `~/.manox/settings.toml`：UI 语言（`ui_language`）`agent::init` 时读一次，可运行时热切换（`i18n::set_ui_language`，仅 chrome 重新本地化，已产生的内容不回改）；agent 语言（`agent_language`）按 thread 快照、终身不变。
 
 ## 提示词系统
 
 非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/pi-extensions/agents/*.md`（`include_str!`）、审批 reviewer 在 `crates/agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
-## 运行时配置（`~/.config/cx/`）
+## 运行时配置（`~/.manox/`）
 
-- LLM：`cx.providers.config.yaml`（格式见 `provider/config.rs`）；SQLite：`cx/manox/threads.db`；设置：`cx/manox/settings.toml`
-- 子 agent：`cx/manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`cx/manox/mcp.toml`（stdio 或 HTTP）；插件：`cx/manox/plugins/`
+**所有持久化内容统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）。路径清单：
+
+- 单一状态根：`~/.manox/`（`agent::paths::manox_config_dir()` 与 `cx_providers::cx_state_dir()` 均指向它）
+- LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/cx-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
+- SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
+- pi 会话（.jsonl）：`~/.manox/pi-sessions/`
+- 外部会话：`~/.manox/external-sessions/`
+- 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
+- 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
+- Plan 文件：`~/.manox/plans/`
+- cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
 - **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
 

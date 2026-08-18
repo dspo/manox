@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cx_state_dir;
 
-/// Sessions 子目录：`~/.config/cx/sessions/`，存放每个活跃会话的 `<id>.sock` 与 `<id>.json`。
+/// Sessions 子目录：`~/.manox/sessions/`，存放每个活跃会话的 `<id>.sock` 与 `<id>.json`。
 pub(crate) fn sessions_dir() -> Result<PathBuf> {
     Ok(cx_state_dir()?.join("sessions"))
 }

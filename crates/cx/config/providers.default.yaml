@@ -1,5 +1,5 @@
 # Default provider configuration baseline for cx.
-# Patch or copy this into ~/.config/cx/cx.providers.config.yaml and adjust
+# Patch or copy this into ~/.manox/cx.providers.config.yaml and adjust
 # apikey_source to match your local secret backend if needed.
 
 providers:

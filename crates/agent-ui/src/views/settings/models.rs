@@ -1,7 +1,7 @@
 //! Settings → General → Models panel.
 //!
 //! Two-column form view over the cx providers config
-//! (`~/.config/cx/cx.providers.config.yaml`, schema: `cx_providers::CxConfig`).
+//! (`~/.manox/cx.providers.config.yaml`, schema: `cx_providers::CxConfig`).
 //! The left column lists provider cards (accordion, double-click header to
 //! rename); the expanded card renders whichever module the right-hand module
 //! nav has selected — 基本信息 / 环境变量 / 端点信息 / 模型列表. Every edit

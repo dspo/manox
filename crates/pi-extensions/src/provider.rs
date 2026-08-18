@@ -1,5 +1,5 @@
 //! Native provider registration: reads the cx-style provider config
-//! (`~/.config/cx/cx.providers.config.yaml` — this project's native
+//! (`~/.manox/cx.providers.config.yaml` — this project's native
 //! provider format) and registers every provider × wire_api endpoint into
 //! the pi kernel's [`pi::ProviderRegistry`].
 //!
@@ -18,11 +18,11 @@ use serde::Deserialize;
 
 const CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
 
-/// The default provider config path: `$HOME/.config/cx/cx.providers.config.yaml`.
+/// The default provider config path: `$HOME/.manox/cx.providers.config.yaml`.
 pub fn default_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/cx")
+        .join(".manox")
         .join(CONFIG_FILE_NAME)
 }
 

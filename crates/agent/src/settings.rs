@@ -1,4 +1,4 @@
-//! User settings — `~/.config/cx/manox/settings.toml`.
+//! User settings — `~/.manox/settings.toml`.
 //!
 //! Plain-file preferences. The two language fields are read at startup and on
 //! every save: `ui_language` drives the Fluent UI locale (and is swapped live

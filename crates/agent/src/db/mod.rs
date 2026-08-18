@@ -87,7 +87,7 @@ impl ThreadsDatabase {
     }
 }
 
-/// Default db path: `$HOME/.config/cx/manox/threads.db`.
+/// Default db path: `$HOME/.manox/threads.db`.
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     Ok(paths::manox_config_dir()?.join("threads.db"))
 }
