@@ -34,7 +34,7 @@
           "properties": {
             "provider": {
               "type": "string",
-              "description": "cx provider name whose models this group exposes (matches the provider name in ~/.config/cx/cx.providers.config.yaml)."
+              "description": "cx provider name whose models this group exposes (matches the provider name in ~/.manox/cx.providers.config.yaml)."
             }
           }
         }

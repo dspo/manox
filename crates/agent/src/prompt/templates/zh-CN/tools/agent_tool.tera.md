@@ -7,4 +7,4 @@
 
 括号中的 capability 标签显示每个子 agent 的能力：`read-only` 子 agent 无法写文件或运行 bash——不要将写入/执行工作委派给它们（它们会拒绝并浪费一轮）。每个子 agent 从空白上下文开始，没有父级历史，因此请将子 agent 必须遵守的任何接口契约（确切的函数名、签名、类型）直接写在提示词中。{% else %}
 
-未加载子 agent 定义。在 ~/.config/cx/manox/agents/ 下添加 Markdown 文件（frontmatter name/description/tools/model + 正文作为系统提示词）并重启。{% endif %}
+未加载子 agent 定义。在 ~/.manox/agents/ 下添加 Markdown 文件（frontmatter name/description/tools/model + 正文作为系统提示词）并重启。{% endif %}

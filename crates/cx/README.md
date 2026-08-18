@@ -44,8 +44,8 @@ builds the release binary and installs it to the same location.
 
 ## Runtime provider config
 
-`cx` reads provider/model config from `~/.config/cx/cx.providers.config.yaml`
-at runtime. If an older `~/.config/cx/config.yaml` exists, it is migrated to the
+`cx` reads provider/model config from `~/.manox/cx.providers.config.yaml`
+at runtime. If an older `~/.manox/config.yaml` exists, it is migrated to the
 new path automatically on first use.
 
 The repo keeps `config/providers.default.yaml` as the published baseline
@@ -58,7 +58,7 @@ cx patch --url <url>
 cx patch --refresh
 ```
 
-If `~/.config/cx/cx.providers.config.yaml` is missing, `cx` creates it from the
+If `~/.manox/cx.providers.config.yaml` is missing, `cx` creates it from the
 published baseline automatically on first use. You can also edit it directly.
 
 `cx add` launches a TUI wizard rooted at the Providers list. From there you can:

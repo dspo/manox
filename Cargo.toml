@@ -5,7 +5,7 @@
 #   - agent-ui:  UI 层（Workspace + ConversationState + views，gpui + gpui-component）
 #   - manox:     薄 bin（窗口 + 主题 + 接线）
 #
-# LLM 直连 ~/.config/cx/cx.providers.config.yaml 定义的 providers。
+# LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
 # cx / cx-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
 # github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/cx-providers）。
