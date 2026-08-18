@@ -472,7 +472,7 @@ impl ContextRail {
                 // (the tooltip convention) when there is no input to measure.
                 // With a priced model the cost row follows as the last child.
                 let cache_hit = crate::cockpit::cache_read_ratio(**usage)
-                    .map(|r| format!("{:.1}", r * 100.0))
+                    .map(|r| format!("{:.1}%", r * 100.0))
                     .unwrap_or_else(|| "--".into());
                 let cost = per_model_cost.get(*model_name).copied().unwrap_or(0.0);
                 let token_branch = if cost > 0.0 { "├─" } else { "└─" };

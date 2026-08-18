@@ -112,8 +112,8 @@ export const ModelPicker = ({
                   return (
                     <DropdownMenuItem
                       className="gap-2"
-                      key={m.id}
-                      onSelect={() => select(m.id)}
+                      key={`${m.provider}/${m.id}`}
+                      onSelect={() => select(`${m.provider}/${m.id}`)}
                     >
                       <Badge
                         className={cn('px-1 text-[10px] font-normal', tag.className)}

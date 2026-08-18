@@ -2,12 +2,16 @@
 // card's usage rows; labels and variants mirror the host's Tag rendering.
 
 const API_META: Record<string, { label: string; text: string; border: string }> = {
-  anthropic: { label: 'Anthropic', text: 'text-primary', border: 'border-primary/50' },
-  openai_responses: { label: 'Responses', text: 'text-info', border: 'border-info/50' },
+  anthropic: { label: 'Anthropic', text: 'text-wire-anthropic', border: 'border-wire-anthropic/50' },
+  openai_responses: {
+    label: 'Responses',
+    text: 'text-wire-responses',
+    border: 'border-wire-responses/50',
+  },
   openai_completions: {
     label: 'Completions',
-    text: 'text-warning',
-    border: 'border-warning/50',
+    text: 'text-wire-completions',
+    border: 'border-wire-completions/50',
   },
 };
 

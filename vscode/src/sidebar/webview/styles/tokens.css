@@ -7,6 +7,18 @@
   *, ::before, ::after {
     border-color: var(--color-border);
   }
+  /* Wire-api tint colors, pinned to the gpui host's palette (blue/cyan/amber
+   * at 600 in light, 300 in dark) so both sides render identical hues. */
+  :root {
+    --wire-anthropic: #2563eb;
+    --wire-responses: #0891b2;
+    --wire-completions: #d97706;
+  }
+  .vscode-dark {
+    --wire-anthropic: #93c5fd;
+    --wire-responses: #67e8f9;
+    --wire-completions: #fcd34d;
+  }
 }
 
 /*
@@ -36,6 +48,9 @@
   --color-danger: var(--vscode-charts-red, var(--vscode-errorForeground, #f85149));
   --color-warning: var(--vscode-charts-yellow, #e3b341);
   --color-success: var(--vscode-charts-green, #34d058);
+  --color-wire-anthropic: var(--wire-anthropic);
+  --color-wire-responses: var(--wire-responses);
+  --color-wire-completions: var(--wire-completions);
   --color-blue: var(--vscode-charts-blue, #3794ff);
 
   --font-chrome: var(--vscode-font-family);

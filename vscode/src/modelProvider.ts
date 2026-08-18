@@ -179,6 +179,20 @@ function toModelInfo(m: ModelInfo): vscode.LanguageModelChatInformation {
   };
 }
 
+/** VS Code registers each group bucket's models by id; one provider's wire
+ * variants (anthropic/responses/completions endpoints of the same model)
+ * share an id, so a bucket may hold several. Keep the first (the actor lists
+ * the anthropic variant first) so the native chat never sees an "already
+ * registered" collision. */
+function dedupById(models: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>();
+  return models.filter((m) => {
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+}
+
 /** Keep the config file's manox groups in sync with the current cx providers:
  * append one `Manox-<provider>` group for every provider not yet covered,
  * preserving existing entries. Idempotent — providers already covered are
@@ -262,9 +276,9 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
       try {
         await this.manager.init(resolveWorkspaceCwd());
         const models = await this.manager.listModels();
-        return models
-          .filter((m) => (m.provider_name ?? m.provider) === providerName)
-          .map(toModelInfo);
+        return dedupById(
+          models.filter((m) => (m.provider_name ?? m.provider) === providerName),
+        ).map(toModelInfo);
       } catch {
         return [];
       }
@@ -276,7 +290,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     // cx provider exists at all do we fall back to the flat listing.
     const { models, grouped } = await this.resolveGroupless();
     if (grouped) return [];
-    return models.map(toModelInfo);
+    return dedupById(models).map(toModelInfo);
   }
 
   async provideLanguageModelChatResponse(
