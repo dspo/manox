@@ -4383,12 +4383,15 @@ impl Workspace {
     }
 
     /// Wire api string → text color for the pi composer model label and the
-    /// context rail's per-model usage rows.
+    /// context rail's per-model usage rows. Blue/cyan/amber at 600 in light,
+    /// 300 in dark, mirroring the VS Code webview's `--wire-*` tokens so both
+    /// sides render identical hues.
     pub(crate) fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
+        let step = if theme.is_dark() { 300 } else { 600 };
         match api {
-            "anthropic" => ColorName::Blue.scale(600),
-            "openai_responses" => ColorName::Cyan.scale(600),
-            "openai_completions" => ColorName::Amber.scale(600),
+            "anthropic" => ColorName::Blue.scale(step),
+            "openai_responses" => ColorName::Cyan.scale(step),
+            "openai_completions" => ColorName::Amber.scale(step),
             _ => theme.muted_foreground,
         }
     }
