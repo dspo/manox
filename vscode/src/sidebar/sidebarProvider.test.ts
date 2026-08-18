@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
 
 import type { ThreadInfoSnapshot } from '../protocol';
-import type { HostToWebview } from './messages';
+import type { HostToWebview, WebviewToHost } from './messages';
 import { registerManoxSidebar } from './sidebarProvider';
 
 const { managerMock } = vi.hoisted(() => {
@@ -21,6 +21,7 @@ const { managerMock } = vi.hoisted(() => {
       return () => handlers.delete(sessionId);
     },
     onGlobalEvent: vi.fn(() => () => {}),
+    archiveThread: vi.fn(),
     send(command: Record<string, unknown>): void {
       this.sent.push(command);
     },
@@ -48,6 +49,7 @@ interface Harness {
   provider: { newSession(opts?: { sessionId?: string }): Promise<void> };
   posted: HostToWebview[];
   disposeView: () => void;
+  onMessage: (msg: WebviewToHost) => void;
 }
 
 const setup = (): Harness => {
@@ -63,6 +65,7 @@ const setup = (): Harness => {
 
   const posted: HostToWebview[] = [];
   let disposeView = () => {};
+  let onMessage: (msg: WebviewToHost) => void = () => {};
   provider.resolveWebviewView({
     webview: {
       options: {},
@@ -73,14 +76,17 @@ const setup = (): Harness => {
         posted.push(message);
         return Promise.resolve(true);
       },
-      onDidReceiveMessage: () => ({ dispose() {} }),
+      onDidReceiveMessage: (cb: (msg: WebviewToHost) => void) => {
+        onMessage = cb;
+        return { dispose() {} };
+      },
     },
     onDidDispose: (cb: () => void) => {
       disposeView = cb;
       return { dispose() {} };
     },
   });
-  return { provider, posted, disposeView };
+  return { provider, posted, disposeView, onMessage };
 };
 
 const threadInfo: ThreadInfoSnapshot = {
@@ -99,6 +105,8 @@ beforeEach(() => {
   managerMock.handlers.clear();
   managerMock.sent.length = 0;
   managerMock.disposeSession.mockClear();
+  managerMock.createSession.mockClear();
+  managerMock.archiveThread.mockClear();
 });
 
 afterEach(() => {
@@ -157,5 +165,74 @@ describe('sidebar event batching', () => {
     vi.advanceTimersByTime(100);
     expect(posted.map((m) => m.type)).toEqual(['session_ready']);
     expect(managerMock.disposeSession).toHaveBeenCalledWith('s1');
+  });
+});
+
+describe('plan_execute_fresh', () => {
+  const message: WebviewToHost = {
+    type: 'plan_execute_fresh',
+    sessionId: 's1',
+    planFile: '/p/plan.md',
+    cwd: '/w',
+  };
+
+  // Both awaited steps of the orchestration IIFE resolve immediately; a few
+  // microtask hops drain it deterministically under fake timers.
+  const settle = async (): Promise<void> => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it('registers the fresh session before seeding execution', async () => {
+    const { posted, onMessage } = setup();
+    onMessage(message);
+    await settle();
+
+    const seed = managerMock.sent.find((c) => c.cmd === 'plan_seed_execution') as
+      | { cmd: string; sessionId: string; planFile: string }
+      | undefined;
+    expect(seed).toBeDefined();
+    const freshId = seed!.sessionId;
+    expect(managerMock.sent.map((c) => c.cmd)).toEqual([
+      'get_current_model',
+      'plan_seed_execution',
+    ]);
+    expect(managerMock.archiveThread).toHaveBeenCalledWith('s1', true);
+    expect(managerMock.createSession).toHaveBeenCalledWith('/w', freshId);
+    expect(posted).toEqual([
+      { type: 'session_ready', sessionId: freshId, cwd: '/w', kind: 'fresh' },
+    ]);
+    expect(managerMock.handlers.has(freshId)).toBe(true);
+
+    // The core symptom regression: the fresh session's events reach the
+    // webview without the user manually opening the thread.
+    managerMock.emit(freshId, { type: 'agent_text', sessionId: freshId, text: 'seed' });
+    vi.advanceTimersByTime(33);
+    expect(posted.at(-1)).toEqual({
+      type: 'events',
+      events: [{ type: 'agent_text', sessionId: freshId, text: 'seed' }],
+    });
+  });
+
+  it('disposes the orphaned session when teardown wins the create race', async () => {
+    const { posted, onMessage, disposeView } = setup();
+    let releaseInit!: () => void;
+    managerMock.init.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseInit = resolve;
+      }),
+    );
+    onMessage(message);
+    disposeView();
+    releaseInit();
+    await settle();
+
+    expect(managerMock.createSession).toHaveBeenCalledTimes(1);
+    const freshId = managerMock.createSession.mock.calls[0][1];
+    expect(freshId).toBeDefined();
+    expect(managerMock.disposeSession).toHaveBeenCalledWith(freshId);
+    expect(managerMock.sent.some((c) => c.cmd === 'plan_seed_execution')).toBe(false);
+    expect(posted).toEqual([]);
   });
 });
