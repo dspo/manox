@@ -854,7 +854,7 @@ fn legacy_provider_config_path() -> Result<PathBuf> {
 fn legacy_cx_state_dir() -> PathBuf {
     dirs::home_dir()
         .map(|home| home.join(".config/cx"))
-        .unwrap_or_else(PathBuf::new)
+        .unwrap_or_default()
 }
 
 /// Rename a legacy `config.yaml` to the current name if the current file is absent.
