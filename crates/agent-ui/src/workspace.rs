@@ -936,7 +936,7 @@ impl Workspace {
                         .conversation
                         .read(cx)
                         .notice_anchor_for_tool(tool_call_id, cx);
-                    this.add_info_message(msg, anchor, cx);
+                    this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -1163,7 +1163,7 @@ impl Workspace {
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
-                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
+                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), None, cx);
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
@@ -2529,15 +2529,15 @@ impl Workspace {
             ApplyOutcome::Unchanged | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
         }
     }
+
     /// Splice a single newly inserted conversation item at `ix` into
     /// `list_state`. Mid-list insertions (anchored notices) can't ride the
     /// tail-diff in `sync_list_count`, so this splices at the exact position
     /// and bumps `list_count` to keep the two reconciliations consistent (a
     /// later `sync_list_count` sees an equal count and is a no-op).
-    fn apply_list_insert(&mut self, ix: usize, cx: &App) {
+    fn apply_list_insert(&mut self, ix: usize) {
         self.list_state.splice(ix..ix, 1);
         self.list_count += 1;
-        let _ = cx;
     }
 
     /// Re-engage tail-follow. `FollowMode::Tail` pins to the end natively and
@@ -3145,6 +3145,7 @@ impl Workspace {
                     this.add_info_message(
                         i18n::t("composer-image-process-failed").to_string(),
                         NoticeAnchor::TurnEnd,
+                        None,
                         cx,
                     );
                 }
@@ -3280,6 +3281,7 @@ impl Workspace {
             self.record_ui_note(
                 agent::db::UiNoteKind::PlanReview,
                 review.content.clone(),
+                None,
                 cx,
             );
         }
@@ -3972,19 +3974,26 @@ impl Workspace {
     /// `ConvItem::Error`).
     ///
     /// The notice is inserted at `anchor` — `TurnEnd` (the end of the current
-    /// turn, i.e. the list tail when idle, matching where the persisted copy
-    /// is spliced on reload) or `After(ix)` for a tool-call-adjacent record.
-    /// Also persists the notice so a reloaded thread reproduces it; the live
-    /// `push_notice` only touches `ConversationState`, the persisted copy is
-    /// spliced back by `rebuild_from_messages` on next load anchored to the
-    /// current turn.
-    pub fn add_info_message(&mut self, text: String, anchor: NoticeAnchor, cx: &mut Context<Self>) {
+    /// turn, i.e. the list tail when idle) or `After(ix)` for a tool-call-
+    /// adjacent record. Also persists the notice so a reloaded thread
+    /// reproduces it; the live `push_notice` only touches
+    /// `ConversationState`, while `record_ui_note` persists it (carrying
+    /// `tool_call_id` when given) and `merge_ui_notes` splices it back at the
+    /// same position on next load — the turn end, or right after the tool
+    /// item for an approval record.
+    pub fn add_info_message(
+        &mut self,
+        text: String,
+        anchor: NoticeAnchor,
+        tool_call_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         let weak = cx.weak_entity();
         let ix = self
             .conversation
             .update(cx, |c, cx| c.push_notice(text.clone(), anchor, weak, cx));
-        self.apply_list_insert(ix, cx);
-        self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
+        self.apply_list_insert(ix);
+        self.record_ui_note(agent::db::UiNoteKind::Notice, text, tool_call_id, cx);
         // Tail-follow keeps the viewport pinned to the live end, so a
         // `TurnEnd`-anchored notice is revealed by the follow; an `After`
         // anchored one sits above the viewport by design (a record near its
@@ -4002,14 +4011,27 @@ impl Workspace {
     /// thread reclaimed via `attach_thread` (which rebuilds from the entity,
     /// not a db reload) still reproduces the note. The placeholder row is
     /// discarded on the next db reload, which replaces the cache wholesale.
-    fn record_ui_note(&self, kind: agent::db::UiNoteKind, text: String, cx: &mut Context<Self>) {
+    fn record_ui_note(
+        &self,
+        kind: agent::db::UiNoteKind,
+        text: String,
+        tool_call_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         let thread_id = self.thread.read(cx).id.0.clone();
         let anchor = self
             .thread
             .read(cx)
             .last_user_message_id()
             .map(str::to_owned);
-        let data = serde_json::json!({ "text": text });
+        let mut data = serde_json::json!({ "text": text });
+        // A tool-anchored notice (an approval decision record) carries the
+        // tool call id so `merge_ui_notes` can splice it next to the tool
+        // item on reload, matching the live placement. `data` is raw JSON —
+        // no schema change.
+        if let Some(id) = tool_call_id {
+            data["tool_call_id"] = serde_json::Value::String(id.to_owned());
+        }
         // Keep the in-memory cache consistent with the persisted record so the
         // background-reclaim rebuild path (no db reload) reproduces the note.
         let cached = agent::db::UiNoteRecord {
@@ -4276,6 +4298,7 @@ impl Workspace {
             self.add_info_message(
                 i18n::t("plan-refine-notice").to_string(),
                 NoticeAnchor::TurnEnd,
+                None,
                 cx,
             );
             cx.notify();
@@ -5471,6 +5494,7 @@ impl Workspace {
                     this.add_info_message(
                         i18n::t("plan-mode-off-notice").to_string(),
                         NoticeAnchor::TurnEnd,
+                        None,
                         cx,
                     );
                 }))
@@ -7538,6 +7562,7 @@ impl Workspace {
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
             NoticeAnchor::TurnEnd,
+            None,
             cx,
         );
         self.close_access_menu();

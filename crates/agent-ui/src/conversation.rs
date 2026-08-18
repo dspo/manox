@@ -114,7 +114,9 @@ pub enum ConvItem {
     /// A runtime error from the agent (red danger styling).
     Error(String),
     /// An ephemeral system notice — status changes, slash-command acks, etc.
-    /// Rendered with neutral tones, not danger colors.
+    /// Plain text only (i18n chrome strings / reviewer reasons); the body
+    /// renders as a paginated `TerminalPanel`, so markdown syntax is not
+    /// interpreted. Rendered with neutral tones, not danger colors.
     Notice(String),
     /// A context-compaction summary: older history was folded into this handoff
     /// note. The summary is model-generated text (rendered as markdown, not
@@ -537,8 +539,11 @@ pub(crate) fn agent_task_labels(input: &serde_json::Value) -> (String, String) {
 
 /// A single renderable conversation item list plus the turn-timing state that
 /// seeds activity segments. Items only ever grow (append or mid-list insert);
-/// `next_item_id` keeps `MessageItem::id` unique and stable across inserts so
-/// element ids (the markdown entity key) never collide or shift.
+/// `next_item_id` keeps `MessageItem::id` unique and stable across inserts.
+/// The id anchors all entity-held state on a row (markdown document
+/// selection, terminal-panel pagination cursor, element ids), which must not
+/// shift for the lifetime of the item; the list index only keys transient
+/// per-frame chrome, so its displacement on a mid-list insert is harmless.
 #[derive(Debug)]
 pub struct ConversationState {
     items: Vec<Entity<MessageItem>>,
@@ -2019,10 +2024,15 @@ fn new_history_item(
 /// bearing user message (in message order), so those bubbles align 1:1 with
 /// the "segment anchors" derived from `messages`. Each note lands at the end
 /// of its segment — i.e. right before the next turn's user bubble — mirroring
-/// where it appeared live. Notes whose anchor was a pure-tool-result user
-/// message (no bubble) fold into the nearest preceding segment; notes whose
-/// anchor was dropped by compaction land at the tail; notes emitted before
-/// any user message (anchor `None`) land at the top.
+/// where it appeared live. A note carrying a `data.tool_call_id` (an approval
+/// decision record) lands directly after the item containing that tool call —
+/// a top-level `ToolCall` card or the activity segment holding the entry —
+/// matching the live anchored placement, and falls back to the segment end
+/// when the tool item is absent (compaction dropped it). Notes whose anchor
+/// was a pure-tool-result user message (no bubble) fold into the nearest
+/// preceding segment; notes whose anchor was dropped by compaction land at
+/// the tail; notes emitted before any user message (anchor `None`) land at
+/// the top.
 ///
 /// Notes arrive already sorted by `seq` from `list_ui_notes`, so per-segment
 /// order preserves emit order with no extra sort.
@@ -2155,19 +2165,49 @@ fn merge_ui_notes(
     }
     for (k, &start) in bubble_ix.iter().enumerate() {
         let end = bubble_ix.get(k + 1).copied().unwrap_or(items.len());
-        for it in items.iter().take(end).skip(start) {
-            out.push(it.clone());
-        }
-        if let Some(bucket) = buckets.get(k) {
-            for n in bucket {
-                out.push(note_to_item(n));
+        let bucket = buckets.get(k).map(Vec::as_slice).unwrap_or(&[]);
+        // Split the segment's notes: tool-anchored ones (carrying
+        // `data.tool_call_id`) splice in right after the item holding their
+        // tool call; everything else lands at the segment end as before.
+        let mut by_item: HashMap<usize, Vec<&UiNoteRecord>> = HashMap::new();
+        let mut turn_end: Vec<&UiNoteRecord> = Vec::new();
+        for n in bucket {
+            let placed = n
+                .data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| (start..end).find(|&j| item_contains_tool(&items[j], id)));
+            match placed {
+                Some(j) => by_item.entry(j).or_default().push(n),
+                None => turn_end.push(n),
             }
+        }
+        for (j, it) in items.iter().enumerate().take(end).skip(start) {
+            out.push(it.clone());
+            if let Some(notes) = by_item.get(&j) {
+                for n in notes {
+                    out.push(note_to_item(n));
+                }
+            }
+        }
+        for n in turn_end {
+            out.push(note_to_item(n));
         }
     }
     for n in &orphan {
         out.push(note_to_item(n));
     }
     out
+}
+
+/// Whether `it` is the item carrying the given tool call: a top-level
+/// `ToolCall` card or an activity segment holding the tool entry.
+fn item_contains_tool(it: &ConvItem, tool_call_id: &str) -> bool {
+    match it {
+        ConvItem::ToolCall(t) => t.id == tool_call_id,
+        ConvItem::Thinking(t) => t.find_tool_entry_index(tool_call_id).is_some(),
+        _ => false,
+    }
 }
 
 /// Render a persisted note as its live `ConvItem` counterpart, reading the
@@ -2614,6 +2654,72 @@ mod tests {
             merged[2],
             ConvItem::PlanReview { active: false, .. }
         ));
+    }
+
+    /// A note carrying `data.tool_call_id` (an approval decision record) is
+    /// spliced directly after the item containing that tool call — a top-level
+    /// `ToolCall` card or the activity segment holding the entry — matching
+    /// the live anchored placement instead of the turn end. A note whose tool
+    /// item is absent (compaction dropped it) falls back to the segment end.
+    #[test]
+    fn merge_ui_notes_places_tool_anchored_note_after_its_tool_item() {
+        // Turn 0: a user prompt + an assistant tool batch (rebuilds into one
+        // Thinking container) + reply; turn 1: a plain user turn.
+        let messages = vec![
+            msg_with_id("u1", Role::User, "read it"),
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tu_1".to_string(),
+                name: Arc::from("Read"),
+                raw_input: String::new(),
+                input: serde_json::Value::Null,
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_1".to_string(),
+                tool_name: Arc::from("Read"),
+                is_error: false,
+                content: "ok".to_string(),
+            })]),
+            msg_with_id("a1", Role::Assistant, "done"),
+            msg_with_id("u2", Role::User, "again"),
+            msg_with_id("a2", Role::Assistant, "yo"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        assert!(
+            items.iter().any(|i| matches!(i, ConvItem::Thinking(_))),
+            "the tool batch rebuilds into one Thinking container"
+        );
+        let tool_note = |text: &str, tool_id: &str| {
+            let mut data = serde_json::json!({ "text": text });
+            data["tool_call_id"] = serde_json::Value::String(tool_id.to_string());
+            UiNoteRecord {
+                id: 0,
+                thread_id: "t".to_string(),
+                seq: 0,
+                anchor_user_id: Some("u1".to_string()),
+                kind: UiNoteKind::Notice,
+                data,
+                ts: 0,
+            }
+        };
+        let notes = vec![
+            tool_note("Bash allowed", "tu_1"),
+            tool_note("dropped tool", "ghost"),
+        ];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:read it",
+                "?",              // Thinking container carrying tu_1
+                "N:Bash allowed", // tool-anchored → right after its item
+                "A:done",
+                "N:dropped tool", // unresolvable tool → segment end fallback
+                "U:again",
+                "A:yo",
+            ]
+        );
     }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the

@@ -378,6 +378,7 @@ impl SlashCommand for PlanCommand {
             workspace.add_info_message(
                 i18n::t("plan-mode-off-notice").to_string(),
                 NoticeAnchor::TurnEnd,
+                None,
                 cx,
             );
             return SlashResult::Handled;
@@ -387,6 +388,7 @@ impl SlashCommand for PlanCommand {
             workspace.add_info_message(
                 i18n::t("plan-mode-on-notice").to_string(),
                 NoticeAnchor::TurnEnd,
+                None,
                 cx,
             );
             SlashResult::Handled
