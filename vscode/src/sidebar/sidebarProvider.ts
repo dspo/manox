@@ -276,6 +276,9 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
           const generation = ++this.sessionGeneration;
           try {
             await manager.init(resolveWorkspaceCwd());
+            // Archiving always proceeds: the execute-fresh intent belongs to
+            // the user rather than the sidebar view, so it stays outside the
+            // generation guard.
             manager.archiveThread(msg.sessionId, true);
             const freshId = crypto.randomUUID();
             await manager.createSession(msg.cwd, freshId);

@@ -62,6 +62,7 @@ const setup = (): Harness => {
     resolveWebviewView(view: unknown): void;
     newSession(opts?: { sessionId?: string }): Promise<void>;
   };
+
   const posted: HostToWebview[] = [];
   let disposeView = () => {};
   let onMessage: (msg: WebviewToHost) => void = () => {};
@@ -227,7 +228,8 @@ describe('plan_execute_fresh', () => {
     releaseInit();
     await settle();
 
-    const freshId = managerMock.createSession.mock.calls.at(-1)?.[1];
+    expect(managerMock.createSession).toHaveBeenCalledTimes(1);
+    const freshId = managerMock.createSession.mock.calls[0][1];
     expect(freshId).toBeDefined();
     expect(managerMock.disposeSession).toHaveBeenCalledWith(freshId);
     expect(managerMock.sent.some((c) => c.cmd === 'plan_seed_execution')).toBe(false);
