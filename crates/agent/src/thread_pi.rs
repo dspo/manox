@@ -206,8 +206,10 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
-    /// An autopilot approval decision.
+    /// An autopilot approval decision. `tool_call_id` lets the host anchor
+    /// the decision record next to the tool call that triggered it.
     ApprovalDecision {
+        tool_call_id: String,
         tool_name: String,
         tool_title: String,
         verdict: crate::approval::ReviewVerdict,
@@ -646,7 +648,13 @@ impl Thread {
                 plan_file,
                 plan_review_pending,
                 plan_snapshot,
+                ui_notes,
             } => {
+                // Seed the UI-note cache from the sidecar before
+                // `HistoryRestored` so the rebuild splices the cards back at
+                // their anchored position. The sidecar is the authority on a
+                // restore; the in-memory Vec is replaced wholesale.
+                self.ui_notes = ui_notes;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot
@@ -1553,6 +1561,10 @@ impl Thread {
         }
     }
 
+    /// Append a UI annotation card to the in-memory cache. `Workspace`
+    /// snapshots the whole Vec into the session sidecar via `save_thread`
+    /// (best-effort, last-write-wins); a restore replaces the cache from the
+    /// sidecar wholesale.
     pub fn push_ui_note(&mut self, note: UiNoteRecord) {
         self.ui_notes.push(note);
     }
@@ -2306,6 +2318,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2388,6 +2401,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2489,6 +2503,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: Some(value),
+                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2528,6 +2543,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2563,6 +2579,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    ui_notes: Vec::new(),
                 },
                 cx,
             );

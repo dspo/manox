@@ -966,4 +966,20 @@ mod tests {
         assert!(matches!(classify_diff(" context"), DiffLine::Context));
         assert!(matches!(classify_diff(""), DiffLine::Context));
     }
+    /// A notice-style panel (no command / cwd, plain kind) renders only the
+    /// paginated body: an empty prompt block and the first `visible` lines,
+    /// so a long notice folds like a tool's output by default.
+    #[test]
+    fn notice_style_panel_renders_paginated_body_without_prompt() {
+        let theme = test_theme();
+        let mut p = TerminalPanel::new(PanelKind::Plain, None, None, &theme);
+        p.output = "line one\nline two\nline three".to_string();
+        p.visible = 2;
+        let (prompt, _runs) = p.prompt_block();
+        assert!(prompt.is_empty(), "no command/cwd → no prompt block");
+        let (text, _runs, total, v) = p.body();
+        assert_eq!(total, 3);
+        assert_eq!(v, 2);
+        assert_eq!(text, "line one\nline two");
+    }
 }

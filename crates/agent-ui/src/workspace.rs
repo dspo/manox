@@ -52,7 +52,7 @@ use manox_components::markdown::Markdown;
 
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
-use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
+use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
 use crate::external_session::{
     ExternalSession, ResumeSidecar, SessionKind, list_sidecars, merge_external_summaries,
     remove_sidecar, resume_args, write_sidecar,
@@ -910,12 +910,16 @@ impl Workspace {
                     }
                 }
                 ThreadEvent::ApprovalDecision {
+                    tool_call_id,
                     tool_title,
                     verdict,
                     ..
                 } => {
                     // Show a brief autopilot decision record in the
-                    // MessageList, mirroring Codex's approval cell.
+                    // MessageList, mirroring Codex's approval cell. Anchored
+                    // next to the tool call that triggered it, so approval
+                    // records cluster at their occurrence position instead of
+                    // piling at the conversation tail.
                     let msg = match &verdict {
                         agent::approval::ReviewVerdict::Allow => i18n::t_str(
                             "workspace-approval-autopilot-allowed",
@@ -928,7 +932,11 @@ impl Workspace {
                         )
                         .to_string(),
                     };
-                    this.add_info_message(msg, cx);
+                    let anchor = this
+                        .conversation
+                        .read(cx)
+                        .notice_anchor_for_tool(tool_call_id, cx);
+                    this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -1155,7 +1163,7 @@ impl Workspace {
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
-                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
+                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), None, cx);
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
@@ -2522,6 +2530,16 @@ impl Workspace {
         }
     }
 
+    /// Splice a single newly inserted conversation item at `ix` into
+    /// `list_state`. Mid-list insertions (anchored notices) can't ride the
+    /// tail-diff in `sync_list_count`, so this splices at the exact position
+    /// and bumps `list_count` to keep the two reconciliations consistent (a
+    /// later `sync_list_count` sees an equal count and is a no-op).
+    fn apply_list_insert(&mut self, ix: usize) {
+        self.list_state.splice(ix..ix, 1);
+        self.list_count += 1;
+    }
+
     /// Re-engage tail-follow. `FollowMode::Tail` pins to the end natively and
     /// keeps following; an upward user scroll disengages it and landing back
     /// at the bottom re-arms it. This is the user-initiated "jump to live
@@ -3124,7 +3142,12 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 this.send_user_turn(text, extra, cx);
                 if failed > 0 {
-                    this.add_info_message(i18n::t("composer-image-process-failed").to_string(), cx);
+                    this.add_info_message(
+                        i18n::t("composer-image-process-failed").to_string(),
+                        NoticeAnchor::TurnEnd,
+                        None,
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -3258,6 +3281,7 @@ impl Workspace {
             self.record_ui_note(
                 agent::db::UiNoteKind::PlanReview,
                 review.content.clone(),
+                None,
                 cx,
             );
         }
@@ -3944,61 +3968,83 @@ impl Workspace {
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
-    /// no model turn). Used by slash commands to report outcomes — e.g. the
-    /// mode-change acknowledging the mode change. Renders as a neutral-toned
-    /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
+    /// no model turn). Used by slash commands and mode toggles to report
+    /// outcomes — e.g. the mode-change acknowledgement. Renders as a
+    /// neutral-toned `ConvItem::Notice` card (distinct from the red
+    /// `ConvItem::Error`).
     ///
-    /// Also persists the notice so a reloaded thread reproduces it. The live
-    /// `push_notice` only touches `ConversationState`; the persisted copy is
-    /// spliced back by `rebuild_from_messages` on next load, anchored to the
-    /// current turn.
-    pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
+    /// The notice is inserted at `anchor` — `TurnEnd` (the end of the current
+    /// turn, i.e. the list tail when idle) or `After(ix)` for a tool-call-
+    /// adjacent record. Also persists the notice so a reloaded thread
+    /// reproduces it; the live `push_notice` only touches
+    /// `ConversationState`, while `record_ui_note` persists it (carrying
+    /// `tool_call_id` when given) and `merge_ui_notes` splices it back at the
+    /// same position on next load — the turn end, or right after the tool
+    /// item for an approval record.
+    pub fn add_info_message(
+        &mut self,
+        text: String,
+        anchor: NoticeAnchor,
+        tool_call_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         let weak = cx.weak_entity();
-        self.conversation.update(cx, |c, cx| {
-            c.push_notice(text.clone(), weak, cx);
-        });
-        self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
-        self.sync_list_count(cx);
-        // If tail-follow is engaged the list reveals the notice; if the user
-        // scrolled up, `FollowMode::Tail` has already disengaged so the
-        // viewport stays put.
+        let ix = self
+            .conversation
+            .update(cx, |c, cx| c.push_notice(text.clone(), anchor, weak, cx));
+        self.apply_list_insert(ix);
+        self.record_ui_note(agent::db::UiNoteKind::Notice, text, tool_call_id, cx);
+        // Tail-follow keeps the viewport pinned to the live end, so a
+        // `TurnEnd`-anchored notice is revealed by the follow; an `After`
+        // anchored one sits above the viewport by design (a record near its
+        // tool call, not an alert).
         cx.notify();
     }
 
-    /// Persist a UI annotation (`Error` / `Notice`) to `thread_ui_notes`.
-    /// The anchor is the current turn's user message — `None` before the first
-    /// user message — so the rebuild can place the note at the end of its turn.
-    /// Best-effort: the live item already rendered this turn; only the reload
-    /// copy is at stake.
+    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview`) to the
+    /// session sidecar. The anchor is the current turn's user message —
+    /// `None` before the first user message — so the rebuild can place the
+    /// note at the end of its turn (or next to its tool call when
+    /// `tool_call_id` is set). Best-effort: the live item already rendered
+    /// this turn; only the reload copy is at stake.
     ///
-    /// Also appends to the in-memory `Thread::ui_notes` cache so a background
-    /// thread reclaimed via `attach_thread` (which rebuilds from the entity,
-    /// not a db reload) still reproduces the note. The placeholder row is
-    /// discarded on the next db reload, which replaces the cache wholesale.
-    fn record_ui_note(&self, kind: agent::db::UiNoteKind, text: String, cx: &mut Context<Self>) {
-        let thread_id = self.thread.read(cx).id.0.clone();
+    /// The in-memory `Thread::ui_notes` Vec is the render source of truth
+    /// (a background thread reclaimed via `attach_thread` rebuilds from the
+    /// entity, not the sidecar); `save_thread` snapshots the whole Vec into
+    /// the sidecar so a process restart reproduces the notes too.
+    fn record_ui_note(
+        &self,
+        kind: agent::db::UiNoteKind,
+        text: String,
+        tool_call_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         let anchor = self
             .thread
             .read(cx)
             .last_user_message_id()
             .map(str::to_owned);
-        let data = serde_json::json!({ "text": text });
+        let mut data = serde_json::json!({ "text": text });
+        // A tool-anchored notice (an approval decision record) carries the
+        // tool call id so `merge_ui_notes` can splice it next to the tool
+        // item on reload, matching the live placement. `data` is raw JSON —
+        // no schema change.
+        if let Some(id) = tool_call_id {
+            data["tool_call_id"] = serde_json::Value::String(id.to_owned());
+        }
         // Keep the in-memory cache consistent with the persisted record so the
         // background-reclaim rebuild path (no db reload) reproduces the note.
         let cached = agent::db::UiNoteRecord {
-            id: 0,
-            thread_id: thread_id.clone(),
-            seq: 0,
             anchor_user_id: anchor.clone(),
             kind,
             data: data.clone(),
-            ts: 0,
         };
         self.thread.update(cx, |t, _| t.push_ui_note(cached));
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| {
-            s.record_ui_note(&thread_id, kind, anchor.as_deref(), &data, cx)
-        });
+        // Flush the in-memory cache to the session sidecar (the pi backend's
+        // authority for restore): the next `save_thread` — or a full snapshot
+        // at turn end / thread switch — overwrites the whole Vec, so this
+        // write is best-effort and last-write-wins.
+        save_thread(self.thread.clone(), false, cx);
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
@@ -4246,7 +4292,12 @@ impl Workspace {
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
             self.list_state.remeasure();
-            self.add_info_message(i18n::t("plan-refine-notice").to_string(), cx);
+            self.add_info_message(
+                i18n::t("plan-refine-notice").to_string(),
+                NoticeAnchor::TurnEnd,
+                None,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -5437,7 +5488,12 @@ impl Workspace {
                 })
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.set_thread_plan_mode(false, cx);
-                    this.add_info_message(i18n::t("plan-mode-off-notice").to_string(), cx);
+                    this.add_info_message(
+                        i18n::t("plan-mode-off-notice").to_string(),
+                        NoticeAnchor::TurnEnd,
+                        None,
+                        cx,
+                    );
                 }))
                 .child(
                     Icon::new(IconName::LayoutDashboard)
@@ -7502,6 +7558,8 @@ impl Workspace {
             .update(cx, |t, cx| t.set_approval_mode(mode, cx));
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
+            NoticeAnchor::TurnEnd,
+            None,
             cx,
         );
         self.close_access_menu();

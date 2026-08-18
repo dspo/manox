@@ -1649,6 +1649,7 @@ async fn run_actor(
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
+    let ui_notes = load_ui_notes(&sessions_dir, session.path()).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
     // facade's Ready handler reads `history()` immediately, and a drainer
@@ -1669,6 +1670,7 @@ async fn run_actor(
         plan_file: plan_file_restored,
         plan_review_pending,
         plan_snapshot,
+        ui_notes,
     });
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -2812,6 +2814,18 @@ async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<
     }
 }
 
+/// The UI annotation cards (Error / Notice / PlanReview) persisted in the
+/// sidecar, in emit order. The host serializes its `Vec<UiNoteRecord>`;
+/// `None`/absent on a fresh session restores as empty.
+async fn load_ui_notes(sessions_dir: &Path, session_path: &Path) -> Vec<crate::db::UiNoteRecord> {
+    pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .ok()
+        .and_then(|m| m.ui_notes)
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
 /// The active worktree binding persisted in a session's sidecar (forked
 /// worktree sessions carry it; originals and plain sessions don't).
 async fn load_worktree_state(
@@ -3293,6 +3307,43 @@ mod tests {
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
             ApprovalMode::AutoPilot
+        );
+    }
+
+    #[tokio::test]
+    async fn load_ui_notes_restores_sidecar_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-notes.jsonl");
+
+        // Fresh session: no ui_notes key -> empty.
+        assert!(load_ui_notes(dir.path(), &session).await.is_empty());
+
+        // Persist the agent's `Vec<UiNoteRecord>` shape, including an approval
+        // record carrying `data.tool_call_id`.
+        let record = crate::db::UiNoteRecord {
+            anchor_user_id: Some("u1".into()),
+            kind: crate::db::UiNoteKind::Notice,
+            data: serde_json::json!({ "text": "Bash allowed", "tool_call_id": "tu_1" }),
+        };
+        let mut meta = pi_extensions::session_meta::load(dir.path(), &session)
+            .await
+            .unwrap();
+        meta.ui_notes = Some(serde_json::to_value(vec![record.clone()]).unwrap());
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+
+        let restored = load_ui_notes(dir.path(), &session).await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].kind, crate::db::UiNoteKind::Notice);
+        assert_eq!(restored[0].anchor_user_id.as_deref(), Some("u1"));
+        assert_eq!(
+            restored[0]
+                .data
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("tu_1"),
+            "the tool anchor survives the sidecar restore"
         );
     }
 

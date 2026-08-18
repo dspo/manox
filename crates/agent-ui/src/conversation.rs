@@ -114,7 +114,9 @@ pub enum ConvItem {
     /// A runtime error from the agent (red danger styling).
     Error(String),
     /// An ephemeral system notice — status changes, slash-command acks, etc.
-    /// Rendered with neutral tones, not danger colors.
+    /// Plain text only (i18n chrome strings / reviewer reasons); the body
+    /// renders as a paginated `TerminalPanel`, so markdown syntax is not
+    /// interpreted. Rendered with neutral tones, not danger colors.
     Notice(String),
     /// A context-compaction summary: older history was folded into this handoff
     /// note. The summary is model-generated text (rendered as markdown, not
@@ -535,9 +537,20 @@ pub(crate) fn agent_task_labels(input: &serde_json::Value) -> (String, String) {
     (subagent_type, description)
 }
 
+/// A single renderable conversation item list plus the turn-timing state that
+/// seeds activity segments. Items only ever grow (append or mid-list insert);
+/// `next_item_id` keeps `MessageItem::id` unique and stable across inserts.
+/// The id anchors all entity-held state on a row (markdown document
+/// selection, terminal-panel pagination cursor, element ids), which must not
+/// shift for the lifetime of the item; the list index only keys transient
+/// per-frame chrome, so its displacement on a mid-list insert is harmless.
 #[derive(Debug)]
 pub struct ConversationState {
     items: Vec<Entity<MessageItem>>,
+    /// Monotonic item-id counter. `MessageItem::id` is an opaque element-key,
+    /// decoupled from the list index so an anchored (mid-list) insertion does
+    /// not renumber existing items (which would reset gpui element state).
+    next_item_id: usize,
     /// The start instant of the current (or most recent) user turn, captured on
     /// `ThreadEvent::TurnStarted`. Seeded into each new activity segment's
     /// `started_at` so the elapsed covers the whole turn — reasoning warmup,
@@ -551,6 +564,21 @@ pub struct ConversationState {
     /// Dropped when the authoritative `rebuild_from_messages` replaces this
     /// conversation (`HistoryRestored`).
     history_builder: Option<crate::views::message::ItemBuilder>,
+}
+
+/// Where a notice lands in the item list.
+///
+/// `TurnEnd` mirrors the persisted placement (`merge_ui_notes` splices a note
+/// at the end of its anchor turn — the list tail when that turn is the last
+/// one). `After` anchors a notice to a specific item (e.g. the tool call that
+/// triggered an approval decision) so it reads at its occurrence position
+/// instead of the global tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeAnchor {
+    /// The end of the current (last) turn — the list tail when idle.
+    TurnEnd,
+    /// Immediately after the item at this index (clamped to the list length).
+    After(usize),
 }
 
 /// What `apply` did to the item list, so the caller can keep the message
@@ -585,6 +613,7 @@ impl Default for ConversationState {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            next_item_id: 0,
             turn_started_at: Instant::now(),
             history_builder: None,
         }
@@ -610,6 +639,13 @@ impl ConversationState {
 
     pub fn items(&self) -> &[Entity<MessageItem>] {
         &self.items
+    }
+    /// Allocate the next unique item id. Decoupled from the list index (see
+    /// `next_item_id`) so anchored mid-list inserts never renumber siblings.
+    fn alloc_id(&mut self) -> usize {
+        let id = self.next_item_id;
+        self.next_item_id += 1;
+        id
     }
 
     /// True when the conversation has no substantive items (user, assistant,
@@ -641,7 +677,7 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
-        let id = self.items.len();
+        let id = self.alloc_id();
         let role = meta.model_id.clone();
         self.items.push(cx.new(|_| {
             MessageItem::new(
@@ -671,7 +707,7 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
-        let id = self.items.len();
+        let id = self.alloc_id();
         let role = meta.model_id.clone();
         self.items.push(cx.new(|_| {
             MessageItem::new(
@@ -755,13 +791,41 @@ impl ConversationState {
         false
     }
 
-    /// Append a system-styled notice. Does not touch the canonical `Thread`
-    /// messages — UI-only, for slash-command acknowledgements and similar
-    /// ephemeral notices.
-    pub fn push_notice(&mut self, text: String, weak: WeakEntity<Workspace>, cx: &mut App) {
-        let id = self.items.len();
-        self.items
-            .push(cx.new(|_| MessageItem::new(ConvItem::Notice(text), String::new(), id, weak)));
+    /// The `NoticeAnchor` for a notice tied to a tool call: directly after the
+    /// item that carries the tool call — a top-level `ToolCall` card or the
+    /// activity segment containing it — falling back to the turn end when the
+    /// item has not reached the list yet (event-ordering race).
+    pub fn notice_anchor_for_tool(&self, tool_call_id: &str, cx: &App) -> NoticeAnchor {
+        if let Some(ix) = self.find_tool(tool_call_id, cx) {
+            return NoticeAnchor::After(ix);
+        }
+        if let Some((cix, _)) = self.find_thinking_entry(tool_call_id, cx) {
+            return NoticeAnchor::After(cix);
+        }
+        NoticeAnchor::TurnEnd
+    }
+
+    /// Insert a system-styled notice at the given anchor. Does not touch the
+    /// canonical `Thread` messages — UI-only, for slash-command
+    /// acknowledgements, approval decision records, and similar ephemeral
+    /// notices. Returns the list index the notice was inserted at.
+    pub fn push_notice(
+        &mut self,
+        text: String,
+        anchor: NoticeAnchor,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> usize {
+        let ix = match anchor {
+            NoticeAnchor::TurnEnd => self.items.len(),
+            NoticeAnchor::After(i) => (i + 1).min(self.items.len()),
+        };
+        let id = self.alloc_id();
+        self.items.insert(
+            ix,
+            cx.new(|_| MessageItem::new(ConvItem::Notice(text), String::new(), id, weak)),
+        );
+        ix
     }
 
     /// Push a plan-review card at the tail of the conversation. The card
@@ -778,7 +842,7 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
-        let id = self.items.len();
+        let id = self.alloc_id();
         self.items.push(cx.new(|_| {
             MessageItem::new(
                 ConvItem::PlanReview {
@@ -920,7 +984,7 @@ impl ConversationState {
             // The card is appended (never updated in place): a compaction is a
             // one-time boundary marker, and the summary text is final.
             ThreadEvent::Compaction { summary, .. } => {
-                let id = self.items.len();
+                let id = self.alloc_id();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(
                         ConvItem::Recap {
@@ -942,7 +1006,7 @@ impl ConversationState {
             ThreadEvent::CacheInvalidation {
                 reprocessed_tokens,
             } => {
-                let id = self.items.len();
+                let id = self.alloc_id();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(
                         ConvItem::CacheMiss {
@@ -1065,7 +1129,7 @@ impl ConversationState {
                         } else {
                             (None, None)
                         };
-                    let id = self.items.len();
+                    let id = self.alloc_id();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
                             ConvItem::Assistant {
@@ -1117,13 +1181,14 @@ impl ConversationState {
                     Some(i) => (i, false),
                     None => {
                         let i = self.items.len();
+                        let id = self.alloc_id();
                         self.items.push(cx.new(|_| {
                             let mut container = ThinkingContainer::new();
                             container.started_at = turn_started_at;
                             MessageItem::new(
                                 ConvItem::Thinking(container),
                                 role.to_string(),
-                                i,
+                                id,
                                 weak.clone(),
                             )
                         }));
@@ -1199,7 +1264,7 @@ impl ConversationState {
                         });
                         ApplyOutcome::Remeasure(ix)
                     } else {
-                        let ix = self.items.len();
+                        let item_id = self.alloc_id();
                         self.items.push(cx.new(|_| {
                             MessageItem::new(
                                 ConvItem::AgentTask(AgentTaskItem {
@@ -1210,7 +1275,7 @@ impl ConversationState {
                                     is_error: false,
                                 }),
                                 role.to_string(),
-                                ix,
+                                item_id,
                                 weak,
                             )
                         }));
@@ -1232,7 +1297,7 @@ impl ConversationState {
                         });
                         ApplyOutcome::Remeasure(ix)
                     } else {
-                        let ix = self.items.len();
+                        let item_id = self.alloc_id();
                         self.items.push(cx.new(|_| {
                             MessageItem::new(
                                 ConvItem::ToolCall(ToolCallItem {
@@ -1249,7 +1314,7 @@ impl ConversationState {
                                     panel: None,
                                 }),
                                 role.to_string(),
-                                ix,
+                                item_id,
                                 weak,
                             )
                         }));
@@ -1292,13 +1357,14 @@ impl ConversationState {
                             Some(i) => (i, false),
                             None => {
                                 let i = self.items.len();
+                                let id = self.alloc_id();
                                 self.items.push(cx.new(|_| {
                                     let mut container = ThinkingContainer::new();
                                     container.started_at = turn_started_at;
                                     MessageItem::new(
                                         ConvItem::Thinking(container),
                                         role.to_string(),
-                                        i,
+                                        id,
                                         weak,
                                     )
                                 }));
@@ -1459,6 +1525,7 @@ impl ConversationState {
                     // activity segment so the orphan result still renders as a
                     // `⎿` line rather than a bare ToolCall card.
                     let ix = self.items.len();
+                    let item_id = self.alloc_id();
                     let entry = ToolCallItem {
                         id: id.clone(),
                         name: String::new(),
@@ -1481,7 +1548,7 @@ impl ConversationState {
                     container.collapsed = false;
                     container.entries.push(ActivityEntry::Tool(entry));
                     self.items.push(cx.new(|_| {
-                        MessageItem::new(ConvItem::Thinking(container), role.to_string(), ix, weak.clone())
+                        MessageItem::new(ConvItem::Thinking(container), role.to_string(), item_id, weak.clone())
                     }));
                     // Mount the orphan entry's persistent panel after push — the
                     // panel needs an `&mut Context<MessageItem>` to create the
@@ -1540,14 +1607,14 @@ impl ConversationState {
                 }
             }
             ThreadEvent::Error(e) => {
-                let ix = self.items.len();
+                let id = self.alloc_id();
                 self.items.push(cx.new(|_| {
-                    MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
+                    MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), id, weak)
                 }));
                 ApplyOutcome::Appended
             }
             ThreadEvent::PeerMessage { from, content } => {
-                let ix = self.items.len();
+                let id = self.alloc_id();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(
                         ConvItem::TeamMessage {
@@ -1555,7 +1622,7 @@ impl ConversationState {
                             content: content.clone(),
                         },
                         role.to_string(),
-                        ix,
+                        id,
                         weak,
                     )
                 }));
@@ -1611,7 +1678,7 @@ impl ConversationState {
                         return ApplyOutcome::Remeasure(ix);
                     }
                 }
-                let id = self.items.len();
+                let id = self.alloc_id();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(
                         ConvItem::Retry {
@@ -1696,7 +1763,7 @@ impl ConversationState {
                 } else {
                     // New task card.
                     let recent_events = recent_background_task_output(&task_id);
-                    let ix = self.items.len();
+                    let id = self.alloc_id();
                     let entity = cx.new(|_| {
                         MessageItem::new(
                             ConvItem::BackgroundTask(BackgroundTaskItem {
@@ -1712,7 +1779,7 @@ impl ConversationState {
                                 recent_events,
                             }),
                             role.to_string(),
-                            ix,
+                            id,
                             weak,
                         )
                     });
@@ -1822,9 +1889,14 @@ impl ConversationState {
             .into_iter()
             .enumerate()
             .map(|(id, kind)| new_history_item(kind, id, role, weak.clone(), cwd.clone(), cx))
-            .collect();
+            .collect::<Vec<_>>();
+        // A fresh conversation: ids start at 0 and the enumerate above already
+        // assigned them in item order, so the counter continues from the item
+        // count.
+        let next_item_id = items.len();
         Self {
             items,
+            next_item_id,
             turn_started_at: Instant::now(),
             history_builder: None,
         }
@@ -1853,9 +1925,8 @@ impl ConversationState {
             .get_or_insert_with(crate::views::message::ItemBuilder::new);
         let mut kinds = Vec::new();
         builder.extend(messages, usage, &mut kinds);
-        let start = self.items.len();
-        for (offset, kind) in kinds.into_iter().enumerate() {
-            let id = start + offset;
+        for kind in kinds {
+            let id = self.alloc_id();
             self.items.push(new_history_item(
                 kind,
                 id,
@@ -1879,7 +1950,7 @@ impl ConversationState {
         cx: &mut App,
     ) {
         for snapshot in snapshots {
-            let id = self.items.len();
+            let id = self.alloc_id();
             self.items.push(cx.new(|_| {
                 MessageItem::new(
                     ConvItem::BackgroundTask(BackgroundTaskItem {
@@ -1937,6 +2008,11 @@ fn new_history_item(
         // renders the terminal-styled body with working selection, not a
         // per-frame fallback.
         item.rebuild_tool_panels(cwd, cx);
+        // Mount the persistent paginated `TerminalPanel` for every historical
+        // `Notice` so a reloaded notice folds like its live counterpart
+        // (default `PAGE_SIZE` lines, `+N` load-more) instead of a per-frame
+        // fallback.
+        item.ensure_notice_panel(cx);
         item
     })
 }
@@ -1948,10 +2024,15 @@ fn new_history_item(
 /// bearing user message (in message order), so those bubbles align 1:1 with
 /// the "segment anchors" derived from `messages`. Each note lands at the end
 /// of its segment — i.e. right before the next turn's user bubble — mirroring
-/// where it appeared live. Notes whose anchor was a pure-tool-result user
-/// message (no bubble) fold into the nearest preceding segment; notes whose
-/// anchor was dropped by compaction land at the tail; notes emitted before
-/// any user message (anchor `None`) land at the top.
+/// where it appeared live. A note carrying a `data.tool_call_id` (an approval
+/// decision record) lands directly after the item containing that tool call —
+/// a top-level `ToolCall` card or the activity segment holding the entry —
+/// matching the live anchored placement, and falls back to the segment end
+/// when the tool item is absent (compaction dropped it). Notes whose anchor
+/// was a pure-tool-result user message (no bubble) fold into the nearest
+/// preceding segment; notes whose anchor was dropped by compaction land at
+/// the tail; notes emitted before any user message (anchor `None`) land at
+/// the top.
 ///
 /// Notes arrive already sorted by `seq` from `list_ui_notes`, so per-segment
 /// order preserves emit order with no extra sort.
@@ -2084,19 +2165,49 @@ fn merge_ui_notes(
     }
     for (k, &start) in bubble_ix.iter().enumerate() {
         let end = bubble_ix.get(k + 1).copied().unwrap_or(items.len());
-        for it in items.iter().take(end).skip(start) {
-            out.push(it.clone());
-        }
-        if let Some(bucket) = buckets.get(k) {
-            for n in bucket {
-                out.push(note_to_item(n));
+        let bucket = buckets.get(k).map(Vec::as_slice).unwrap_or(&[]);
+        // Split the segment's notes: tool-anchored ones (carrying
+        // `data.tool_call_id`) splice in right after the item holding their
+        // tool call; everything else lands at the segment end as before.
+        let mut by_item: HashMap<usize, Vec<&UiNoteRecord>> = HashMap::new();
+        let mut turn_end: Vec<&UiNoteRecord> = Vec::new();
+        for n in bucket {
+            let placed = n
+                .data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| (start..end).find(|&j| item_contains_tool(&items[j], id)));
+            match placed {
+                Some(j) => by_item.entry(j).or_default().push(n),
+                None => turn_end.push(n),
             }
+        }
+        for (j, it) in items.iter().enumerate().take(end).skip(start) {
+            out.push(it.clone());
+            if let Some(notes) = by_item.get(&j) {
+                for n in notes {
+                    out.push(note_to_item(n));
+                }
+            }
+        }
+        for n in turn_end {
+            out.push(note_to_item(n));
         }
     }
     for n in &orphan {
         out.push(note_to_item(n));
     }
     out
+}
+
+/// Whether `it` is the item carrying the given tool call: a top-level
+/// `ToolCall` card or an activity segment holding the tool entry.
+fn item_contains_tool(it: &ConvItem, tool_call_id: &str) -> bool {
+    match it {
+        ConvItem::ToolCall(t) => t.id == tool_call_id,
+        ConvItem::Thinking(t) => t.find_tool_entry_index(tool_call_id).is_some(),
+        _ => false,
+    }
 }
 
 /// Render a persisted note as its live `ConvItem` counterpart, reading the
@@ -2385,15 +2496,11 @@ mod tests {
         }
     }
 
-    fn note(seq: i64, kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
+    fn note(kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
         UiNoteRecord {
-            id: seq,
-            thread_id: "t".to_string(),
-            seq,
             anchor_user_id: anchor.map(str::to_owned),
             kind,
             data: serde_json::json!({ "text": text }),
-            ts: 0,
         }
     }
 
@@ -2426,10 +2533,10 @@ mod tests {
         let items = build_items(&messages, &HashMap::new(), false);
         // Notes arrive seq-sorted from list_ui_notes.
         let notes = vec![
-            note(1, UiNoteKind::Notice, None, "top"),
-            note(2, UiNoteKind::Notice, Some("u1"), "t0end"),
-            note(3, UiNoteKind::Error, Some("u2"), "t1end"),
-            note(4, UiNoteKind::Notice, Some("ghost"), "orphan"),
+            note(UiNoteKind::Notice, None, "top"),
+            note(UiNoteKind::Notice, Some("u1"), "t0end"),
+            note(UiNoteKind::Error, Some("u2"), "t1end"),
+            note(UiNoteKind::Notice, Some("ghost"), "orphan"),
         ];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
@@ -2474,7 +2581,7 @@ mod tests {
                 .count(),
             1
         );
-        let notes = vec![note(1, UiNoteKind::Notice, Some("u2"), "mid")];
+        let notes = vec![note(UiNoteKind::Notice, Some("u2"), "mid")];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
             signature(&merged).last(),
@@ -2498,7 +2605,7 @@ mod tests {
         });
         let messages = vec![msg_with_id("u1", Role::User, "plain turn"), tool_result];
         let items = build_items(&messages, &HashMap::new(), false);
-        let notes = vec![note(1, UiNoteKind::Error, Some("u2"), "failed")];
+        let notes = vec![note(UiNoteKind::Error, Some("u2"), "failed")];
 
         let merged = merge_ui_notes(&messages, items, &notes);
 
@@ -2526,7 +2633,7 @@ mod tests {
         let items = build_items(&messages, &HashMap::new(), false);
         // Anchored to u1 — the plan turn's triggering message — so the card
         // lands at the end of turn 0, before the u2 bubble that dismissed it.
-        let notes = vec![note(1, UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
+        let notes = vec![note(UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
             signature(&merged),
@@ -2543,6 +2650,123 @@ mod tests {
             merged[2],
             ConvItem::PlanReview { active: false, .. }
         ));
+    }
+
+    /// A note carrying `data.tool_call_id` (an approval decision record) is
+    /// spliced directly after the item containing that tool call — a top-level
+    /// `ToolCall` card or the activity segment holding the entry — matching
+    /// the live anchored placement instead of the turn end. A note whose tool
+    /// item is absent (compaction dropped it) falls back to the segment end.
+    #[test]
+    fn merge_ui_notes_places_tool_anchored_note_after_its_tool_item() {
+        // Turn 0: a user prompt + an assistant tool batch (rebuilds into one
+        // Thinking container) + reply; turn 1: a plain user turn.
+        let messages = vec![
+            msg_with_id("u1", Role::User, "read it"),
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tu_1".to_string(),
+                name: Arc::from("Read"),
+                raw_input: String::new(),
+                input: serde_json::Value::Null,
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_1".to_string(),
+                tool_name: Arc::from("Read"),
+                is_error: false,
+                content: "ok".to_string(),
+            })]),
+            msg_with_id("a1", Role::Assistant, "done"),
+            msg_with_id("u2", Role::User, "again"),
+            msg_with_id("a2", Role::Assistant, "yo"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        assert!(
+            items.iter().any(|i| matches!(i, ConvItem::Thinking(_))),
+            "the tool batch rebuilds into one Thinking container"
+        );
+        let tool_note = |text: &str, tool_id: &str| {
+            let mut data = serde_json::json!({ "text": text });
+            data["tool_call_id"] = serde_json::Value::String(tool_id.to_string());
+            UiNoteRecord {
+                anchor_user_id: Some("u1".to_string()),
+                kind: UiNoteKind::Notice,
+                data,
+            }
+        };
+        let notes = vec![
+            tool_note("Bash allowed", "tu_1"),
+            tool_note("dropped tool", "ghost"),
+        ];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:read it",
+                "?",              // Thinking container carrying tu_1
+                "N:Bash allowed", // tool-anchored → right after its item
+                "A:done",
+                "N:dropped tool", // unresolvable tool → segment end fallback
+                "U:again",
+                "A:yo",
+            ]
+        );
+    }
+
+    /// A tool-anchored note also lands after a top-level `ToolCall` card
+    /// (the `AskUserQuestion` path — not folded into an activity segment),
+    /// matching the live `notice_anchor_for_tool` resolution.
+    #[test]
+    fn merge_ui_notes_places_tool_anchored_note_after_top_level_card() {
+        let messages = vec![
+            msg_with_id("u1", Role::User, "clarify"),
+            msg_with_id("a1", Role::Assistant, "answered"),
+        ];
+        let items = vec![
+            ConvItem::User {
+                text: "clarify".into(),
+                images: Vec::new(),
+                meta: None,
+                display_state: UserMessageDisplayState::Normal,
+            },
+            ConvItem::ToolCall(ToolCallItem {
+                id: "ask_1".into(),
+                name: agent::tools::ASK_USER_QUESTION.into(),
+                title: "which?".into(),
+                status: ToolCallStatus::Success,
+                output: String::new(),
+                is_error: false,
+                input: serde_json::Value::Null,
+                streaming: false,
+                collapsed: false,
+                user_toggled: false,
+                panel: None,
+            }),
+            ConvItem::Assistant {
+                text: "answered".into(),
+                streaming: false,
+                token_usage: None,
+                activity_summary: None,
+            },
+        ];
+        let mut data = serde_json::json!({ "text": "allowed" });
+        data["tool_call_id"] = serde_json::Value::String("ask_1".into());
+        let note_rec = UiNoteRecord {
+            anchor_user_id: Some("u1".to_string()),
+            kind: UiNoteKind::Notice,
+            data,
+        };
+        let merged = merge_ui_notes(&messages, items, &[note_rec]);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:clarify",
+                "?",         // top-level ToolCall card
+                "N:allowed", // tool-anchored → right after the card
+                "A:answered",
+            ]
+        );
     }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
@@ -3628,6 +3852,231 @@ mod tests {
                     };
                     assert!(collapsed, "entries fold ~1s after the terminal stop");
                 }
+            });
+        });
+    }
+    /// A `TurnEnd`-anchored notice appends at the list tail (the end of the
+    /// current turn), and item ids stay unique across subsequent appends.
+    #[test]
+    fn push_notice_turn_end_appends_with_unique_ids() {
+        let cx = gpui::TestAppContext::single();
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "hello".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(1, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                let ix = c.push_notice("ack".into(), NoticeAnchor::TurnEnd, weak.clone(), cx);
+                assert_eq!(ix, 1, "TurnEnd appends after the user bubble");
+                assert_eq!(c.items().len(), 2);
+                assert!(
+                    matches!(c.items().last().unwrap().read(cx).kind(), ConvItem::Notice(t) if t == "ack"),
+                    "notice is the tail item"
+                );
+                // A later append must not collide with the notice's id.
+                c.push_user(
+                    "again".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(2, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                assert_eq!(c.items().len(), 3);
+            });
+        });
+    }
+
+    /// An `After(ix)`-anchored notice is inserted mid-list, right after the
+    /// anchor item, with the list kept dense (indices shift, ids do not).
+    #[test]
+    fn push_notice_after_anchor_inserts_mid_list() {
+        let cx = gpui::TestAppContext::single();
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "u1".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(1, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                c.push_user(
+                    "u2".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(2, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                // Anchor after the first user bubble: the notice lands between
+                // u1 and u2.
+                let ix = c.push_notice("mid".into(), NoticeAnchor::After(0), weak.clone(), cx);
+                assert_eq!(ix, 1);
+                let kinds: Vec<&str> = c
+                    .items()
+                    .iter()
+                    .map(|e| match e.read(cx).kind() {
+                        ConvItem::User { text, .. } if text == "u1" => "u1",
+                        ConvItem::User { text, .. } if text == "u2" => "u2",
+                        ConvItem::Notice(t) => {
+                            assert_eq!(t, "mid");
+                            "notice"
+                        }
+                        _ => "?",
+                    })
+                    .collect();
+                assert_eq!(kinds, vec!["u1", "notice", "u2"]);
+                // A post-insert append still works and ids stay unique.
+                let tail = c.push_notice("tail".into(), NoticeAnchor::TurnEnd, weak.clone(), cx);
+                assert_eq!(tail, 3);
+                assert_eq!(c.items().len(), 4);
+            });
+        });
+    }
+
+    /// An out-of-range `After` anchor clamps to the list length (the notice
+    /// lands at the tail rather than panicking).
+    #[test]
+    fn push_notice_after_anchor_clamps_out_of_range() {
+        let cx = gpui::TestAppContext::single();
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let ix = c.push_notice("solo".into(), NoticeAnchor::After(99), weak, cx);
+                assert_eq!(ix, 0, "empty list clamps to the tail");
+                assert_eq!(c.items().len(), 1);
+            });
+        });
+    }
+
+    /// `notice_anchor_for_tool` resolves a top-level `ToolCall` card (the
+    /// `AskUserQuestion` path) and a tool folded into an activity segment, and
+    /// falls back to `TurnEnd` for an unknown id.
+    #[test]
+    fn notice_anchor_for_tool_resolves_containing_item() {
+        let cx = gpui::TestAppContext::single();
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx {
+            weak: weak.clone(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "do it".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(1, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                // Ordinary tool folds into an activity segment.
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "run tests".into(),
+                        status: agent::ToolCallStatus::Running,
+                        input: Some(serde_json::json!({"command": "cargo test"})),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert_eq!(
+                    c.notice_anchor_for_tool("tu_1", cx),
+                    NoticeAnchor::After(1),
+                    "a segment-folded tool anchors after its container"
+                );
+                // AskUserQuestion is a top-level card.
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "ask_1".into(),
+                        name: agent::tools::ASK_USER_QUESTION.into(),
+                        title: "clarify".into(),
+                        status: agent::ToolCallStatus::PendingApproval,
+                        input: Some(serde_json::json!({"question": "which?"})),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let anchor = c.notice_anchor_for_tool("ask_1", cx);
+                assert!(
+                    matches!(anchor, NoticeAnchor::After(ix) if ix == 2),
+                    "top-level tool anchors after its card, got {anchor:?}"
+                );
+                assert_eq!(
+                    c.notice_anchor_for_tool("ghost", cx),
+                    NoticeAnchor::TurnEnd,
+                    "unknown id falls back to the turn end"
+                );
+            });
+        });
+    }
+
+    /// An `ApprovalDecision` notice for a tool call lands right after the item
+    /// carrying the tool call; without a resolvable item it lands at the turn
+    /// end. Mirrors the workspace handler's `notice_anchor_for_tool` + anchored
+    /// `push_notice` wiring.
+    #[test]
+    fn approval_notice_anchors_near_its_tool_call() {
+        let cx = gpui::TestAppContext::single();
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx {
+            weak: weak.clone(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "ship it".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(1, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Bash".into(),
+                        title: "deploy".into(),
+                        status: agent::ToolCallStatus::Running,
+                        input: Some(serde_json::json!({"command": "deploy"})),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                // The notice is anchored next to the tool's container (item 1)
+                // and inserted right after it.
+                let anchor = c.notice_anchor_for_tool("tu_1", cx);
+                let ix = c.push_notice("allowed".into(), anchor, weak, cx);
+                assert_eq!(ix, 2);
+                let kinds: Vec<&str> = c
+                    .items()
+                    .iter()
+                    .map(|e| match e.read(cx).kind() {
+                        ConvItem::User { .. } => "user",
+                        ConvItem::Thinking(_) => "segment",
+                        ConvItem::Notice(_) => "notice",
+                        _ => "?",
+                    })
+                    .collect();
+                assert_eq!(kinds, vec!["user", "segment", "notice"]);
             });
         });
     }

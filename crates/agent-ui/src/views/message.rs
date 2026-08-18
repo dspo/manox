@@ -137,7 +137,8 @@ fn text_body_of(kind: &ConvItem) -> Option<(bool, String)> {
         } => Some((*streaming, text.clone())),
         ConvItem::User { text, .. } => Some((false, text.clone())),
         ConvItem::Error(msg) => Some((false, msg.clone())),
-        ConvItem::Notice(msg) => Some((false, msg.clone())),
+        // `Notice` owns a paginated `TerminalPanel` body (`notice_panel`),
+        // not a markdown document.
         ConvItem::TeamMessage { content, .. } => Some((false, content.clone())),
         ConvItem::Recap { summary, .. } => Some((false, summary.clone())),
         ConvItem::Retry {
@@ -157,14 +158,16 @@ fn text_body_of(kind: &ConvItem) -> Option<(bool, String)> {
 /// switches models.
 ///
 /// `markdown` holds the owned `Entity<Markdown>` for items with a text body
-/// (Assistant, User, Error, Notice, TeamMessage, Recap, Retry): a
+/// (Assistant, User, Error, TeamMessage, Recap, Retry): a
 /// stateful document carrying parse-once incremental parsing + document-level
 /// selection, so a streaming delta re-parses only the tail and a cross-block
 /// drag selects one continuous range with Cmd/Ctrl+C copy. `None` for other
-/// items (Thinking, ToolCall, AgentTask, …): reasoning and tool-call bodies
-/// own their own persistent entities, and the remaining static chrome mounts a
-/// fresh `Entity<Markdown>` per frame via `markdown_tv` (no persistent
-/// selection; code blocks carry their own hover copy button).
+/// items (Thinking, ToolCall, AgentTask, Notice, …): reasoning and tool-call
+/// bodies own their own persistent entities, a `Notice` body is a persistent
+/// `TerminalPanel` (`notice_panel`, paginating long notices like tool
+/// output), and the remaining static chrome mounts a fresh `Entity<Markdown>`
+/// per frame via `markdown_tv` (no persistent selection; code blocks carry
+/// their own hover copy button).
 pub struct MessageItem {
     kind: ConvItem,
     role: String,
@@ -173,6 +176,13 @@ pub struct MessageItem {
     /// rows such as `AgentTask` to open their peer right-pane view.
     weak_workspace: WeakEntity<Workspace>,
     markdown: Option<Entity<Markdown>>,
+    /// Persistent `Entity<TerminalPanel>` for a `ConvItem::Notice` body: the
+    /// same paginated surface as tool output (default `PAGE_SIZE` lines, `+N`
+    /// to reveal more) so a long notice — e.g. an escalated approval reason —
+    /// folds by default instead of pushing the transcript off-screen. The
+    /// pagination cursor and selection survive across frames. `None` for
+    /// non-notice items.
+    notice_panel: Option<Entity<TerminalPanel>>,
     /// Ask-card snapshot budgeted by `Workspace` before the native list starts
     /// measuring rows, so `render` never reads the owning `Workspace` and the
     /// list callback remains read-only.
@@ -187,6 +197,7 @@ impl MessageItem {
             id,
             weak_workspace: weak,
             markdown: None,
+            notice_panel: None,
             ask_snapshot: None,
         }
     }
@@ -262,6 +273,26 @@ impl MessageItem {
         if let Some(md) = &self.markdown {
             md.update(cx, |m, cx| m.finalize(cx));
         }
+    }
+    /// Mount (lazily) the persistent `TerminalPanel` body for a `Notice` item,
+    /// fed with the notice text. Renders the body with the same paginated
+    /// surface as tool output (default `PAGE_SIZE` lines, `+N` to reveal
+    /// more), keeping the pagination cursor and selection across frames.
+    /// `None` for non-notice items.
+    pub fn ensure_notice_panel(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<Entity<TerminalPanel>> {
+        let ConvItem::Notice(text) = &self.kind else {
+            return None;
+        };
+        if self.notice_panel.is_none() {
+            let panel = cx.new(|cx| TerminalPanel::new(PanelKind::Plain, None, None, cx.theme()));
+            let text = text.clone();
+            panel.update(cx, |p, cx| p.set_output(text, cx));
+            self.notice_panel = Some(panel);
+        }
+        self.notice_panel.clone()
     }
 
     /// Ensure the `eix`-th activity entry's persistent `Entity<Markdown>` exists
@@ -688,6 +719,9 @@ impl Render for MessageItem {
         let body = self.ensure_markdown(cx);
         let diag_id = self.id;
         let diag_enabled = crate::overlap_diag::enabled();
+        // The owned paginated `TerminalPanel` for a `Notice` body (`None` for
+        // every other kind).
+        let notice_panel = self.ensure_notice_panel(cx);
         centered(render_item(
             &self.kind,
             self.id,
@@ -696,6 +730,7 @@ impl Render for MessageItem {
             agent_ctx.as_ref(),
             tool_ctx.as_ref(),
             body,
+            notice_panel,
             cx,
         ))
         .debug_selector(|| format!("message-item-body-{}", self.id))
@@ -714,8 +749,10 @@ impl Render for MessageItem {
 /// in a static state with no-op clicks (used when the owning Workspace is gone).
 ///
 /// `body` is the owned `Entity<Markdown>` for a top-level text body
-/// (Assistant / Reasoning); the recursive `render_item` calls for embedded
-/// sub-messages pass `None`, falling back to a per-frame `Entity<Markdown>`.
+/// (Assistant / Reasoning); `notice_panel` is the owned paginated
+/// `TerminalPanel` for a `Notice` body. The recursive `render_item` calls for
+/// embedded sub-messages pass `None` for both, falling back to a per-frame
+/// `Entity<Markdown>`.
 //
 // Each arg is a distinct render input; the function is a leaf dispatch, not a
 // public API. Bundling would only forward the same values through an
@@ -729,6 +766,7 @@ pub fn render_item(
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
     body: Option<Entity<Markdown>>,
+    notice_panel: Option<Entity<TerminalPanel>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     match item {
@@ -778,7 +816,7 @@ pub fn render_item(
         }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
         ConvItem::Error(msg) => render_error(msg, ix, theme, body, cx),
-        ConvItem::Notice(msg) => render_notice(msg, ix, theme, body, cx),
+        ConvItem::Notice(msg) => render_notice(msg, ix, theme, notice_panel, cx),
         ConvItem::TeamMessage { from, content } => {
             render_team_message(from, content, ix, theme, body, cx)
         }
@@ -1169,16 +1207,20 @@ pub fn render_error(
         None,
     )
 }
-
 /// Render an ephemeral system notice — status toggles, slash-command acks.
 /// Neutral tones so positive state changes (e.g. "Danger mode is on") do not
-/// read as a runtime error.
+/// read as a runtime error. The body is the persistent paginated
+/// `TerminalPanel` (`notice_panel`) — the same folded surface as tool output,
+/// defaulting to `PAGE_SIZE` lines with a `+N` load-more row. The defensive
+/// fallback (the panel is mounted synchronously for every `Notice` item)
+/// renders plain text so the notice body never falls back to markdown
+/// interpretation.
 pub fn render_notice(
     msg: &str,
     ix: usize,
     theme: &Theme,
-    body: Option<Entity<Markdown>>,
-    cx: &mut App,
+    notice_panel: Option<Entity<TerminalPanel>>,
+    _cx: &mut App,
 ) -> gpui::AnyElement {
     render_banner(
         theme.muted_foreground,
@@ -1188,7 +1230,9 @@ pub fn render_notice(
         ix,
         "copy-notice",
         msg.to_string(),
-        body_or_static(body, ("notice", ix), msg.to_string(), theme, cx),
+        notice_panel
+            .map(|p| p.into_any_element())
+            .unwrap_or_else(|| gpui::div().child(msg.to_string()).into_any_element()),
         theme,
         None,
     )
@@ -3656,6 +3700,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            None,
                             cx,
                         ))
                         .child(render_item(
@@ -3666,6 +3711,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            None,
                             cx,
                         ))
                         .child(render_item(
@@ -3673,6 +3719,7 @@ mod tests {
                             2,
                             "test-model",
                             &theme,
+                            None,
                             None,
                             None,
                             None,
@@ -4581,8 +4628,10 @@ mod tests {
         let error = ConvItem::Error("boom".into());
         assert_eq!(text_body_of(&error), Some((false, "boom".into())));
 
+        // `Notice` owns a paginated `TerminalPanel` body, not a markdown
+        // document — `text_body_of` reports `None` for it.
         let notice = ConvItem::Notice("n".into());
-        assert_eq!(text_body_of(&notice), Some((false, "n".into())));
+        assert_eq!(text_body_of(&notice), None);
 
         let team = ConvItem::TeamMessage {
             from: "alice".into(),
