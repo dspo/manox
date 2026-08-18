@@ -109,6 +109,9 @@ jobs:
             if [ -f "$candidate" ]; then cp "$candidate" manox_napi.node; break; fi
           done
           test -f manox_napi.node
+          # Strip DWARF debug info: the unstripped debug cdylib (~0.5GB) makes
+          # vsce's secret scanner error out and bloats the packaged vsix.
+          strip manox_napi.node
 
       - name: Package vsix
         working-directory: vscode
