@@ -210,13 +210,13 @@ fn log_sources() -> Vec<LogSource> {
             kind: SourceKind::PiSession(AGENT_PI),
         },
         LogSource {
-            root: home.join(".config/cx/manox"),
+            root: home.join(".manox"),
             extra_file: None,
             kind: SourceKind::ManoxSession,
         },
         // manox pi 化后的 session jsonl（新数据源，与上方 SQLite 历史源并存）。
         LogSource {
-            root: home.join(".config/cx/manox/pi-sessions"),
+            root: home.join(".manox/pi-sessions"),
             extra_file: None,
             kind: SourceKind::PiSession(AGENT_MANOX),
         },

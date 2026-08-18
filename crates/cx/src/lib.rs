@@ -818,7 +818,7 @@ fn prepare_codex_launch_home(
 }
 
 /// 为 Codex Desktop App 准备注入配置。
-/// 使用固定目录 ~/.config/cx/.codex/，Symlink 真实 ~/.codex/ 内容（config.toml 除外），
+/// 使用固定目录 ~/.manox/.codex/，Symlink 真实 ~/.codex/ 内容（config.toml 除外），
 /// 写入我们注入的 config.toml（动态 provider key / env_key）。Codex Desktop 读 CODEX_HOME 指向此目录。
 ///
 /// 返回 `ChatGptAppPrepared`：codex_home 供调用方在启动子进程时设 `CODEX_HOME` 环境变量，
@@ -1632,7 +1632,7 @@ struct Cli {
     /// 经 PTY 中继启动（cx 持 master，终端 IO 透传，并暴露外部 IPC 注入入口）；默认直连。
     #[arg(long)]
     pty: bool,
-    /// 自定义 IPC socket 路径（仅与 --pty 同时生效；默认 ~/.config/cx/sessions/<id>.sock）。
+    /// 自定义 IPC socket 路径（仅与 --pty 同时生效；默认 ~/.manox/sessions/<id>.sock）。
     #[arg(long, short = 'S', value_name = "SOCK PATH", requires = "pty")]
     socket: Option<String>,
     /// Agent 进程的工作目录；默认继承 cx 自身 cwd。绑定外部 CLI session 到项目目录时用。
@@ -2024,8 +2024,7 @@ fn print_help() {
 // ══════════════════════════════════════════════════
 
 fn patch_source_path() -> Result<PathBuf> {
-    let home = home_dir().context("无法解析用户主目录")?;
-    Ok(home.join(".config/cx/.patch_source"))
+    Ok(cx_state_dir()?.join(".patch_source"))
 }
 
 fn save_patch_source(url: &str) -> Result<()> {
@@ -2724,7 +2723,7 @@ struct LaunchSpec {
     /// 是否经 PTY 中继启动（cx 持 master，终端 IO 透传），而非 `Command::status()` 直连。
     /// 由 `--pty` CLI flag 决定；默认 false（直连）。
     pty: bool,
-    /// 自定义 IPC socket 路径（仅 pty 时生效；None 则用 ~/.config/cx/sessions/<id>.sock）。
+    /// 自定义 IPC socket 路径（仅 pty 时生效；None 则用 ~/.manox/sessions/<id>.sock）。
     socket: Option<String>,
     /// Agent 进程的工作目录。`None` 时继承 cx 自身的 cwd（`std::env::current_dir`），
     /// 保留直连/库调用的默认行为；`Some` 时 PTY 与直连两条 spawn 路径都以此为子进程 cwd。
@@ -6726,7 +6725,7 @@ trust_level = "trusted"
 
     #[test]
     fn materialize_passthrough_dir_is_idempotent_on_rerun() {
-        // 持久目录（如 ~/.config/cx/.codex/）二次启动时，上次创建的符号链接已存在，
+        // 持久目录（如 ~/.manox/.codex/）二次启动时，上次创建的符号链接已存在，
         // materialize 必须能幂等地重建而非报 EEXIST。
         let root = temp_test_dir("passthrough-idempotent");
         let real = root.join("real");

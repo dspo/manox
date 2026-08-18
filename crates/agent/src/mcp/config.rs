@@ -1,4 +1,4 @@
-//! MCP server configuration types — parsed from `~/.config/cx/manox/mcp.toml`.
+//! MCP server configuration types — parsed from `~/.manox/mcp.toml`.
 //!
 //! The file is a `[mcp_servers.<name>]` map. Each entry is either a stdio
 //! command (`command` + `args`) or a streamable-HTTP endpoint (`url`). A

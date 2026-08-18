@@ -727,7 +727,7 @@ fn build_tools(
     if let Some(model) = model {
         let mut registry = AgentRegistry::new();
         register_defaults(&mut registry);
-        // User-authored (~/.config/cx/manox/agents) + plugin-provided
+        // User-authored (~/.manox/agents) + plugin-provided
         // (`<plugin>/agents/`, namespaced) definitions layer over the
         // built-ins; same-name user files override built-ins.
         crate::agent_defs::register_user_and_plugin(&mut registry);

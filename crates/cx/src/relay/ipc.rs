@@ -1,7 +1,7 @@
 // IPC server: a Unix socket per session that external processes connect to
 // in order to inject messages into the running agent.
 //
-// The socket lives at `~/.config/cx/sessions/<id>.sock` and a sibling `<id>.json`
+// The socket lives at `~/.manox/sessions/<id>.sock` and a sibling `<id>.json`
 // registry file advertises it to `cx send`. Stale sockets from crashed sessions
 // are reclaimed by a connect-probe before bind.
 
@@ -26,7 +26,7 @@ impl IpcServer {
     /// Bind the session socket at `sock`, reclaiming it if it belongs to a dead session.
     ///
     /// `sock` is fully resolved by the caller (either the default
-    /// `~/.config/cx/sessions/<id>.sock` or a `--socket` override), so this fn is
+    /// `~/.manox/sessions/<id>.sock` or a `--socket` override), so this fn is
     /// agnostic to the path's origin.
     pub(crate) fn bind(sock: &Path) -> Result<Self> {
         if let Some(parent) = sock.parent() {

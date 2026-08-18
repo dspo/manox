@@ -96,7 +96,7 @@ pub struct InstalledPluginRecord {
 }
 
 /// Filesystem-backed plugin manager. State is stored under
-/// `~/.config/cx/manox/` (cloned marketplaces, installed plugin trees, the
+/// `~/.manox/` (cloned marketplaces, installed plugin trees, the
 /// enabled-plugins list), so it survives across sessions without an in-process
 /// registry slot.
 pub struct PluginManager;

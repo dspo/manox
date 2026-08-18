@@ -1,42 +1,42 @@
-//! Filesystem paths for manox configuration.
+//! Filesystem paths for manox persistent state.
 //!
-//! All manox-specific config lives under `~/.config/cx/manox/` (the `cx` config
-//! root is shared with `cx.providers.config.yaml`): the SQLite database, agent
+//! All manox state lives under `~/.manox/` — the single root shared with the
+//! cx provider config (`~/.manox/cx.providers.config.yaml`) and the cx CLI
+//! state (`~/.manox/cx.db`, `~/.manox/sessions/`): the SQLite database, agent
 //! definitions, and any future state.
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 
-/// `$HOME/.config/cx` — shared root for cx-family config.
-pub fn cx_config_dir() -> Result<PathBuf> {
-    let home = dirs();
-    Ok(home.join(".config").join("cx"))
+/// `$HOME/.manox` — the single root for all manox (and cx-family) persistent state.
+pub fn manox_home() -> Result<PathBuf> {
+    Ok(dirs().join(".manox"))
 }
 
-/// `$HOME/.config/cx/manox` — manox-specific config root.
+/// `$HOME/.manox` — manox-specific config and state root.
 pub fn manox_config_dir() -> Result<PathBuf> {
-    Ok(cx_config_dir()?.join("manox"))
+    manox_home()
 }
 
-/// `$HOME/.config/cx/manox/agents` — subagent definition markdown files.
+/// `$HOME/.manox/agents` — subagent definition markdown files.
 pub fn agents_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("agents"))
 }
 
-/// `$HOME/.config/cx/manox/skills` — user-authored skills (`<name>/SKILL.md`).
+/// `$HOME/.manox/skills` — user-authored skills (`<name>/SKILL.md`).
 /// Plugin skills live under each plugin's `skills/` subdir instead.
 pub fn skills_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("skills"))
 }
 
-/// `$HOME/.config/cx/manox/commands` — user-authored slash commands (`<name>.md`).
+/// `$HOME/.manox/commands` — user-authored slash commands (`<name>.md`).
 /// Plugin commands live under each plugin's `commands/` subdir.
 pub fn commands_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("commands"))
 }
 
-/// `$HOME/.config/cx/manox/plugins` — installed plugin roots, one
+/// `$HOME/.manox/plugins` — installed plugin roots, one
 /// subdirectory per plugin (`plugins/<name>/`). Populated by the plugin
 /// manager on `install`; scanned by the skill/command/agent/hook loaders.
 pub fn plugins_dir() -> Result<PathBuf> {
@@ -48,7 +48,7 @@ pub fn plugin_root(name: &str) -> Result<PathBuf> {
     Ok(plugins_dir()?.join(name))
 }
 
-/// `$HOME/.config/cx/manox/marketplaces` — cloned marketplace git repos,
+/// `$HOME/.manox/marketplaces` — cloned marketplace git repos,
 /// one per remote URL. Each clone contains a `.claude-plugin/marketplace.json`
 /// index plus the `plugins/<name>/` sources the index points at.
 pub fn marketplace_cache_dir() -> Result<PathBuf> {
@@ -84,14 +84,14 @@ pub fn disabled_plugins_file() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("disabled_plugins.txt"))
 }
 
-/// `$HOME/.config/cx/manox/settings.toml` — plain-file user preferences (UI
+/// `$HOME/.manox/settings.toml` — plain-file user preferences (UI
 /// language, …). Read once at startup by [`crate::settings`]; absence is normal
 /// on a fresh machine and yields defaults.
 pub fn settings_file() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("settings.toml"))
 }
 
-/// `$HOME/.config/cx/manox/themes` — terminal color themes (`.ottytheme`
+/// `$HOME/.manox/themes` — terminal color themes (`.ottytheme`
 /// TOML files), referenced by name from `[terminal].theme` in settings.
 pub fn themes_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("themes"))
@@ -119,7 +119,7 @@ fn dirs() -> PathBuf {
     // No HOME env var: fall back to the process CWD so a missing HOME surfaces
     // as a benign relative path rather than a hard crash. Warn once so the
     // user notices (db/agents would otherwise silently land under CWD).
-    tracing::warn!("HOME env var unset; manox config will live under the process CWD");
+    tracing::warn!("HOME env var unset; manox state will live under the process CWD");
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 

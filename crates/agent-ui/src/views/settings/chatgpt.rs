@@ -98,7 +98,7 @@ impl ChatGptPanelState {
     pub fn load(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let codex_home = cx::chatgpt_codex_home()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.config/cx/.codex".to_string());
+            .unwrap_or_else(|_| "~/.manox/.codex".to_string());
         let mut state = Self {
             load_error: None,
             codex_home,

@@ -2,7 +2,7 @@
 //!
 //! `Thread` state machine + `LanguageModel` trait + tools + SQLite persistence,
 //! gpui-native. The LLM connects directly to providers declared in
-//! `~/.config/cx/cx.providers.config.yaml`.
+//! `~/.manox/cx.providers.config.yaml`.
 
 pub mod agent_defs;
 pub mod approval;

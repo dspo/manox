@@ -1,4 +1,4 @@
-//! SQLite 持久化用量缓存（~/.config/cx/cx.db）。
+//! SQLite 持久化用量缓存（~/.manox/cx.db）。
 //!
 //! v3 schema：per-message 明细表替代 v1 的 per-day 聚合表，
 //! 单一真相来源，聚合用 SQL GROUP BY 实时计算。
@@ -7,7 +7,7 @@
 //! 跨文件去重（codex/copilot）在 insert 时处理。
 
 use anyhow::{Context, Result};
-use dirs::home_dir;
+use cx_providers::cx_state_dir;
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
@@ -25,8 +25,7 @@ pub(super) struct ScanState {
 }
 
 pub(super) fn db_path() -> Result<PathBuf> {
-    let home = home_dir().context("无法解析用户主目录")?;
-    Ok(home.join(".config/cx/cx.db"))
+    Ok(cx_state_dir()?.join("cx.db"))
 }
 
 pub(super) fn open_db(path: &Path) -> Result<Connection> {

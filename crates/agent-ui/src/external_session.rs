@@ -107,7 +107,7 @@ impl SessionKind {
 /// The `id` is namespaced `external:<kind>:<uuid>` so it never collides with a
 /// manox thread UUID in the sidebar's selection namespace. The cx-internal
 /// `cx_session_id` (and the socket path backing it) are the traceable identity
-/// for `~/.config/cx/sessions/<id>.sock`, surfaced in the sidebar tag and the
+/// for `~/.manox/sessions/<id>.sock`, surfaced in the sidebar tag and the
 /// copy-to-clipboard action; they are derived from `handle.socket_path()` until
 /// cx exposes `session_id()` publicly.
 ///
@@ -138,12 +138,12 @@ pub struct ExternalSession {
     /// freshly spawned session reads "Claude Code" / "Codex" / "GitHub
     /// Copilot" before the TUI sets its own title.
     pub title: Option<String>,
-    /// The cx-internal session id naming `~/.config/cx/sessions/<id>.sock`.
+    /// The cx-internal session id naming `~/.manox/sessions/<id>.sock`.
     /// Recovered from `handle.socket_path()`'s `<id>.sock` filename until cx
     /// exposes `SessionHandle::session_id()`. Empty when the IPC bind failed
     /// (no socket to derive from).
     pub cx_session_id: String,
-    /// The absolute socket path (`~/.config/cx/sessions/<id>.sock`), `None`
+    /// The absolute socket path (`~/.manox/sessions/<id>.sock`), `None`
     /// when the IPC bind failed. Copied to the clipboard as a fallback identity
     /// alongside `cx_session_id`.
     pub socket_path: Option<PathBuf>,
@@ -207,7 +207,7 @@ pub struct ExternalSessionSummary {
     pub project: Option<PathBuf>,
     /// Mirrored OSC title — `display_title()` falls back to the kind label.
     pub title: Option<String>,
-    /// cx session id backing `~/.config/cx/sessions/<id>.sock`. Surfaced in the
+    /// cx session id backing `~/.manox/sessions/<id>.sock`. Surfaced in the
     /// sidebar tag (short) + clipboard copy (full). Empty for a resumable row
     /// (its cx id died with the previous process).
     pub cx_session_id: String,
@@ -231,7 +231,7 @@ impl ExternalSessionSummary {
     }
 
     /// The value copied to the clipboard from the row's id tag — the cx session
-    /// id traces back to `~/.config/cx/sessions/<id>.sock`; the socket path is a
+    /// id traces back to `~/.manox/sessions/<id>.sock`; the socket path is a
     /// fallback when the id could not be recovered (IPC bind failed).
     pub fn copy_identity(&self) -> String {
         if !self.cx_session_id.is_empty() {
@@ -300,7 +300,7 @@ impl ResumeSidecar {
     }
 }
 
-/// `~/.config/cx/manox/external-sessions` — one `<id>.json` per unclosed
+/// `~/.manox/external-sessions` — one `<id>.json` per unclosed
 /// external agent session.
 pub(crate) fn resume_dir() -> PathBuf {
     agent::paths::manox_config_dir()
@@ -407,7 +407,7 @@ mod tests {
             project: None,
             title: None,
             cx_session_id: "deadbeef".into(),
-            socket_path: Some(PathBuf::from("/h/u/.config/cx/sessions/deadbeef.sock")),
+            socket_path: Some(PathBuf::from("/h/u/.manox/sessions/deadbeef.sock")),
             resumable: false,
             resuming: false,
         }
@@ -447,12 +447,12 @@ mod tests {
     fn copy_identity_falls_back_to_socket_path() {
         let mut s = sample_summary();
         s.cx_session_id = String::new();
-        assert_eq!(s.copy_identity(), "/h/u/.config/cx/sessions/deadbeef.sock");
+        assert_eq!(s.copy_identity(), "/h/u/.manox/sessions/deadbeef.sock");
     }
 
     #[test]
     fn cx_session_id_extracted_from_socket_path() {
-        let p = std::path::Path::new("/home/u/.config/cx/sessions/abcdef0123.sock");
+        let p = std::path::Path::new("/home/u/.manox/sessions/abcdef0123.sock");
         assert_eq!(cx_session_id_from_socket(p).as_deref(), Some("abcdef0123"));
         assert_eq!(
             cx_session_id_from_socket(std::path::Path::new("/tmp/notasock.json")),

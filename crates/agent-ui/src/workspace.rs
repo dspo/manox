@@ -1706,7 +1706,7 @@ impl Workspace {
         // title into the sidebar row + titlebar as it changes.
         let exit_sub = self.subscribe_session_terminal(&terminal, &id, cx);
         // The cx session id (and its socket path) are the traceable identity for
-        // `~/.config/cx/sessions/<id>.sock`, surfaced in the sidebar tag +
+        // `~/.manox/sessions/<id>.sock`, surfaced in the sidebar tag +
         // clipboard copy. cx does not yet expose `SessionHandle::session_id()`,
         // so the id is recovered from the `<id>.sock` filename.
         let socket_path = handle.socket_path().map(std::path::Path::to_path_buf);

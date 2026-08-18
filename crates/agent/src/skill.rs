@@ -9,7 +9,7 @@
 //!
 //! Discovery mirrors the marketplace layout: each installed plugin's
 //! `skills/<skill-name>/SKILL.md` is registered under `plugin:skill-name`, and
-//! user-authored `~/.config/cx/manox/skills/<name>/SKILL.md` files use the bare
+//! user-authored `~/.manox/skills/<name>/SKILL.md` files use the bare
 //! name. A plugin may also carry a root-level `SKILL.md` (the plugin's own
 //! overview) — registered under the bare plugin name.
 
@@ -229,7 +229,7 @@ pub fn list_skill_records() -> Vec<SkillRecord> {
         .collect()
 }
 
-/// Write a user-authored skill to `~/.config/cx/manox/skills/<name>/SKILL.md`.
+/// Write a user-authored skill to `~/.manox/skills/<name>/SKILL.md`.
 /// When `previous_name` differs from `draft.name`, the old directory is removed
 /// after the new one is written so renames do not leave stale copies behind.
 pub fn save_user_skill(draft: &UserSkillDraft, previous_name: Option<&str>) -> Result<()> {

@@ -149,6 +149,7 @@ fn home_denied_roots() -> Vec<PathBuf> {
         ".aws",
         ".gnupg",
         ".config",
+        ".manox",
         "Library",
         "Music",
         "Pictures",
@@ -271,7 +272,7 @@ mod tests {
         let policy = ReadPolicy::new();
         assert!(policy.is_denied(&home().join(".ssh/id_rsa")));
         assert!(policy.is_denied(&home().join(".aws/credentials")));
-        assert!(policy.is_denied(&home().join(".config/cx/cx.providers.config.yaml")));
+        assert!(policy.is_denied(&home().join(".manox/cx.providers.config.yaml")));
     }
 
     #[test]

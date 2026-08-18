@@ -1,5 +1,5 @@
 # cx 配置文件结构（推荐版）
-# 用户运行时路径：~/.config/cx/cx.providers.config.yaml
+# 用户运行时路径：~/.manox/cx.providers.config.yaml
 # 仓库基线示例：config/providers.default.yaml
 #
 # 设计目标：
