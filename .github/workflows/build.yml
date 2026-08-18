@@ -56,17 +56,69 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Restore target cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        with:
+          path: target/
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-target-
+
       - name: Fmt check
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace
-
       - name: Test
         run: cargo test --workspace --all-targets
 
       - name: Offline example gate
         run: ./crates/pi/scripts/check_examples.sh
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: vscode/package-lock.json
+
+      - name: Build napi binding
+        run: cargo build -p manox-napi
+
+      - name: Install extension dependencies
+        working-directory: vscode
+        run: npm ci
+
+      - name: Type-check and compile extension host
+        working-directory: vscode
+        run: npm run compile
+
+      - name: Unit tests
+        working-directory: vscode
+        run: npm test
+
+      - name: Bundle webview
+        working-directory: vscode
+        run: npm run build:webview
+
+      - name: Stage napi binding
+        working-directory: vscode
+        run: |
+          for candidate in ../target/debug/libmanox_napi.dylib ../target/debug/libmanox_napi.so ../target/debug/manox_napi.dll; do
+            if [ -f "$candidate" ]; then cp "$candidate" manox_napi.node; break; fi
+          done
+          test -f manox_napi.node
+
+      - name: Package vsix
+        working-directory: vscode
+        run: npx vsce package --no-dependencies --out manox-vscode.vsix
+
+      - name: Save target cache
+        if: github.event_name == 'push' && success()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: target/
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+
