@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::language_model::{
     LanguageModelToolResult, LanguageModelToolUse, StopReason as ManoxStopReason,
