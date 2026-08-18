@@ -1211,14 +1211,16 @@ pub fn render_error(
 /// Neutral tones so positive state changes (e.g. "Danger mode is on") do not
 /// read as a runtime error. The body is the persistent paginated
 /// `TerminalPanel` (`notice_panel`) — the same folded surface as tool output,
-/// defaulting to `PAGE_SIZE` lines with a `+N` load-more row — falling back to
-/// a static markdown frame if the panel is not mounted yet.
+/// defaulting to `PAGE_SIZE` lines with a `+N` load-more row. The defensive
+/// fallback (the panel is mounted synchronously for every `Notice` item)
+/// renders plain text so the notice body never falls back to markdown
+/// interpretation.
 pub fn render_notice(
     msg: &str,
     ix: usize,
     theme: &Theme,
     notice_panel: Option<Entity<TerminalPanel>>,
-    cx: &mut App,
+    _cx: &mut App,
 ) -> gpui::AnyElement {
     render_banner(
         theme.muted_foreground,
@@ -1230,7 +1232,7 @@ pub fn render_notice(
         msg.to_string(),
         notice_panel
             .map(|p| p.into_any_element())
-            .unwrap_or_else(|| body_or_static(None, ("notice", ix), msg.to_string(), theme, cx)),
+            .unwrap_or_else(|| gpui::div().child(msg.to_string()).into_any_element()),
         theme,
         None,
     )

@@ -250,16 +250,12 @@ mod tests {
         // order; approval records carry `data.tool_call_id`).
         let notes = serde_json::json!([
             {
-                "id": 0,
-                "thread_id": "t",
-                "seq": 0,
                 "anchor_user_id": "u1",
                 "kind": "notice",
-                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" },
-                "ts": 0
+                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" }
             },
-            { "id": 0, "thread_id": "t", "seq": 0, "anchor_user_id": null,
-              "kind": "error", "data": { "text": "boom" }, "ts": 0 }
+            { "anchor_user_id": null,
+              "kind": "error", "data": { "text": "boom" } }
         ]);
         let mut meta = load(dir.path(), &session).await.unwrap();
         meta.ui_notes = Some(notes.clone());

@@ -29,15 +29,16 @@ pub enum UiNoteKind {
 /// `{ "text": String }`, plus `tool_call_id` for approval decision records —
 /// and is left as raw JSON so future note shapes extend without a schema
 /// change. Array order (in memory / in the sidecar) equals emit order.
+///
+/// The struct doubles as the sidecar wire shape (`SessionMeta::ui_notes`),
+/// so it carries no SQLite-row artifacts (id / seq / ts / thread_id): the
+/// per-thread in-memory Vec and the per-session sidecar both provide order
+/// and ownership.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNoteRecord {
-    pub id: i64,
-    pub thread_id: String,
-    pub seq: i64,
     /// User message id whose turn this note belongs to; `None` for notes
     /// emitted before any user message (placed at the top on rebuild).
     pub anchor_user_id: Option<String>,
     pub kind: UiNoteKind,
     pub data: serde_json::Value,
-    pub ts: i64,
 }

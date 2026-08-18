@@ -433,7 +433,9 @@ impl ThreadStore {
 pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
     let store = global();
     let id = thread.read(cx).id.0.clone();
-    let snapshot = serde_json::to_value(thread.read(cx).ui_notes()).ok();
+    let snapshot = serde_json::to_value(thread.read(cx).ui_notes())
+        .ok()
+        .filter(|v| !matches!(v, serde_json::Value::Array(a) if a.is_empty()));
     store.update(cx, |s, cx| {
         if touch {
             s.refresh(cx);
@@ -670,13 +672,9 @@ mod tests {
         });
         let notes = serde_json::json!([
             {
-                "id": 0,
-                "thread_id": "t1",
-                "seq": 0,
                 "anchor_user_id": "u1",
                 "kind": "notice",
-                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" },
-                "ts": 0
+                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" }
             }
         ]);
         cx.update(|cx| {

@@ -4019,7 +4019,6 @@ impl Workspace {
         tool_call_id: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let thread_id = self.thread.read(cx).id.0.clone();
         let anchor = self
             .thread
             .read(cx)
@@ -4036,13 +4035,9 @@ impl Workspace {
         // Keep the in-memory cache consistent with the persisted record so the
         // background-reclaim rebuild path (no db reload) reproduces the note.
         let cached = agent::db::UiNoteRecord {
-            id: 0,
-            thread_id: thread_id.clone(),
-            seq: 0,
             anchor_user_id: anchor.clone(),
             kind,
             data: data.clone(),
-            ts: 0,
         };
         self.thread.update(cx, |t, _| t.push_ui_note(cached));
         // Flush the in-memory cache to the session sidecar (the pi backend's

@@ -3321,13 +3321,9 @@ mod tests {
         // Persist the agent's `Vec<UiNoteRecord>` shape, including an approval
         // record carrying `data.tool_call_id`.
         let record = crate::db::UiNoteRecord {
-            id: 0,
-            thread_id: "sess-notes".into(),
-            seq: 0,
             anchor_user_id: Some("u1".into()),
             kind: crate::db::UiNoteKind::Notice,
             data: serde_json::json!({ "text": "Bash allowed", "tool_call_id": "tu_1" }),
-            ts: 0,
         };
         let mut meta = pi_extensions::session_meta::load(dir.path(), &session)
             .await

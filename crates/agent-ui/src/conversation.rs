@@ -2496,15 +2496,11 @@ mod tests {
         }
     }
 
-    fn note(seq: i64, kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
+    fn note(kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
         UiNoteRecord {
-            id: seq,
-            thread_id: "t".to_string(),
-            seq,
             anchor_user_id: anchor.map(str::to_owned),
             kind,
             data: serde_json::json!({ "text": text }),
-            ts: 0,
         }
     }
 
@@ -2537,10 +2533,10 @@ mod tests {
         let items = build_items(&messages, &HashMap::new(), false);
         // Notes arrive seq-sorted from list_ui_notes.
         let notes = vec![
-            note(1, UiNoteKind::Notice, None, "top"),
-            note(2, UiNoteKind::Notice, Some("u1"), "t0end"),
-            note(3, UiNoteKind::Error, Some("u2"), "t1end"),
-            note(4, UiNoteKind::Notice, Some("ghost"), "orphan"),
+            note(UiNoteKind::Notice, None, "top"),
+            note(UiNoteKind::Notice, Some("u1"), "t0end"),
+            note(UiNoteKind::Error, Some("u2"), "t1end"),
+            note(UiNoteKind::Notice, Some("ghost"), "orphan"),
         ];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
@@ -2585,7 +2581,7 @@ mod tests {
                 .count(),
             1
         );
-        let notes = vec![note(1, UiNoteKind::Notice, Some("u2"), "mid")];
+        let notes = vec![note(UiNoteKind::Notice, Some("u2"), "mid")];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
             signature(&merged).last(),
@@ -2609,7 +2605,7 @@ mod tests {
         });
         let messages = vec![msg_with_id("u1", Role::User, "plain turn"), tool_result];
         let items = build_items(&messages, &HashMap::new(), false);
-        let notes = vec![note(1, UiNoteKind::Error, Some("u2"), "failed")];
+        let notes = vec![note(UiNoteKind::Error, Some("u2"), "failed")];
 
         let merged = merge_ui_notes(&messages, items, &notes);
 
@@ -2637,7 +2633,7 @@ mod tests {
         let items = build_items(&messages, &HashMap::new(), false);
         // Anchored to u1 — the plan turn's triggering message — so the card
         // lands at the end of turn 0, before the u2 bubble that dismissed it.
-        let notes = vec![note(1, UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
+        let notes = vec![note(UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
         let merged = merge_ui_notes(&messages, items, &notes);
         assert_eq!(
             signature(&merged),
@@ -2694,13 +2690,9 @@ mod tests {
             let mut data = serde_json::json!({ "text": text });
             data["tool_call_id"] = serde_json::Value::String(tool_id.to_string());
             UiNoteRecord {
-                id: 0,
-                thread_id: "t".to_string(),
-                seq: 0,
                 anchor_user_id: Some("u1".to_string()),
                 kind: UiNoteKind::Notice,
                 data,
-                ts: 0,
             }
         };
         let notes = vec![
@@ -2761,13 +2753,9 @@ mod tests {
         let mut data = serde_json::json!({ "text": "allowed" });
         data["tool_call_id"] = serde_json::Value::String("ask_1".into());
         let note_rec = UiNoteRecord {
-            id: 0,
-            thread_id: "t".to_string(),
-            seq: 0,
             anchor_user_id: Some("u1".to_string()),
             kind: UiNoteKind::Notice,
             data,
-            ts: 0,
         };
         let merged = merge_ui_notes(&messages, items, &[note_rec]);
         assert_eq!(
