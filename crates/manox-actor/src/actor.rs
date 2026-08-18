@@ -1309,6 +1309,7 @@ fn emit_thread_info(
                 "goal": serde_json::to_value(t.goal()).unwrap_or(Value::Null),
                 "usage": t.cumulative_token_usage(),
                 "per_model_usage": t.per_model_token_usage(),
+                "per_model_last_usage": t.per_model_last_request_usage(),
                 "per_model_cost": t.per_model_cost(),
                 "cost": t.cumulative_cost(),
                 "pending_auth_count": t.pending_auth_entries().len(),

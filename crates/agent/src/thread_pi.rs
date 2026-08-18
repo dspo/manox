@@ -993,8 +993,27 @@ impl Thread {
         &self.request_usage
     }
 
+    /// The current turn's total, keyed off the triggering user message; the
+    /// conversation footer stamps it onto the just-finished reply at `Stop`.
     pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
-        None
+        let id = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                matches!(m.role, crate::language_model::Role::User)
+                    && m.provenance == crate::message::MessageProvenance::User
+            })?
+            .id
+            .clone();
+        self.request_usage.get(&id).copied()
+    }
+
+    pub fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
+        self.engine
+            .as_ref()
+            .map(|e| e.per_model_last_request_usage())
+            .unwrap_or_default()
     }
 
     pub fn cumulative_token_usage(&self) -> TokenUsage {

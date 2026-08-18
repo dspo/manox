@@ -122,6 +122,9 @@ struct EngineState {
     running: AtomicBool,
     history: Mutex<Vec<Message>>,
     request_usage: Mutex<HashMap<String, TokenUsage>>,
+    /// Usage of each model's most recent request; the context-budget
+    /// numerator behind the env card's `used / window` rows.
+    per_model_last_usage: Mutex<HashMap<String, TokenUsage>>,
     cumulative: Mutex<TokenUsage>,
     per_model: Mutex<HashMap<String, TokenUsage>>,
     /// USD cost aggregated from the kernel's rate-card pricing (#418 wire
@@ -197,6 +200,7 @@ pub fn spawn_engine(
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
         request_usage: Mutex::new(HashMap::new()),
+        per_model_last_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
         per_model: Mutex::new(HashMap::new()),
         cumulative_cost: Mutex::new(0.0),
@@ -304,6 +308,10 @@ impl ThreadEngine for PiEngine {
 
     fn request_token_usage(&self) -> HashMap<String, TokenUsage> {
         self.state.request_usage.lock().unwrap().clone()
+    }
+
+    fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
+        self.state.per_model_last_usage.lock().unwrap().clone()
     }
 
     fn cumulative_token_usage(&self) -> TokenUsage {
@@ -3085,29 +3093,72 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
     *state.per_model.lock().unwrap() = per_model;
     *state.cumulative_cost.lock().unwrap() = stats.tokens.cost;
     *state.per_model_cost.lock().unwrap() = per_model_cost;
-    *state.request_usage.lock().unwrap() = request_attribution(session);
+    store_attribution(state, session);
 }
 
-/// Per-request attribution for the env card: the assistant usage of the
-/// transcript, attributed to the triggering (most recent) user message.
-/// Presentation-layer accounting, hence host-side.
-fn request_attribution(session: &AgentSession) -> HashMap<String, TokenUsage> {
-    let mut request: HashMap<String, TokenUsage> = HashMap::new();
-    let key = last_user_id(session);
-    for m in session.harness_messages() {
-        let AgentMessage::Assistant { usage, .. } = m else {
-            continue;
+/// Rebuild both attribution maps from the authoritative mapped history and
+/// the kernel transcript, then mirror them into engine state.
+fn store_attribution(state: &Arc<EngineState>, session: &AgentSession) {
+    let (per_turn, per_model_last) =
+        request_attribution(&state.history.lock().unwrap(), session.harness_messages());
+    *state.request_usage.lock().unwrap() = per_turn;
+    *state.per_model_last_usage.lock().unwrap() = per_model_last;
+}
+
+/// Presentation-layer attribution for the env card, walked in lockstep over
+/// the kernel transcript and the authoritative mapped history so per-turn
+/// keys are the facade's own message ids. Returns the per-turn totals (each
+/// assistant request accumulates under the user message that triggered its
+/// turn) and each model's latest single request (the context-budget
+/// numerator; summing requests would count the repeated prompt prefix once
+/// per tool-loop iteration).
+fn request_attribution(
+    history: &[Message],
+    messages: &[AgentMessage],
+) -> (HashMap<String, TokenUsage>, HashMap<String, TokenUsage>) {
+    let mut per_turn: HashMap<String, TokenUsage> = HashMap::new();
+    let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
+    let mut ids = history.iter();
+    let mut turn_key: Option<String> = None;
+    for m in messages {
+        // Id-stream cardinality must mirror
+        // `adapt::harness_messages_to_messages`: hidden Custom messages
+        // produce no mapped row.
+        let id = match m {
+            AgentMessage::Custom {
+                display, content, ..
+            } if !*display || content.is_empty() => None,
+            _ => ids.next(),
         };
-        let u = to_token_usage(usage);
-        if u.total_tokens() == 0 {
-            continue;
+        match m {
+            AgentMessage::User { .. } => turn_key = id.map(|m| m.id.clone()),
+            AgentMessage::Assistant {
+                usage,
+                model,
+                provider,
+                response_model,
+                ..
+            } => {
+                let u = to_token_usage(usage);
+                if u.total_tokens() == 0 {
+                    continue;
+                }
+                if let Some(key) = &turn_key {
+                    per_turn
+                        .entry(key.clone())
+                        .and_modify(|acc| *acc = *acc + u)
+                        .or_insert(u);
+                }
+                let key = format!(
+                    "{provider}/{}",
+                    response_model.as_deref().unwrap_or(model.as_str())
+                );
+                per_model_last.insert(key, u);
+            }
+            _ => {}
         }
-        request
-            .entry(key.clone())
-            .and_modify(|acc| *acc = *acc + u)
-            .or_insert(u);
     }
-    request
+    (per_turn, per_model_last)
 }
 
 /// Fallback aggregation when `session_stats()` is unavailable: assistant
@@ -3145,7 +3196,7 @@ fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
     *state.per_model.lock().unwrap() = per_model;
     *state.cumulative_cost.lock().unwrap() = 0.0;
     *state.per_model_cost.lock().unwrap() = HashMap::new();
-    *state.request_usage.lock().unwrap() = request_attribution(session);
+    store_attribution(state, session);
 }
 
 /// Kernel usage totals → the facade's token usage shape.
@@ -3156,18 +3207,6 @@ fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsa
         cache_creation_input_tokens: t.cache_write,
         cache_read_input_tokens: t.cache_read,
     }
-}
-
-/// The message id of the most recent user message, as the facade's history
-/// assigns it. Usage is attributed to the turn's triggering user message.
-fn last_user_id(session: &AgentSession) -> String {
-    let mapped = adapt::harness_messages_to_messages(session.harness_messages());
-    mapped
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, crate::language_model::Role::User))
-        .map(|m| m.id.clone())
-        .unwrap_or_default()
 }
 
 /// Map a pi usage report onto the manox token shape.
@@ -3654,6 +3693,7 @@ mod tests {
             session_start_fired: AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
+            per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
             per_model: Mutex::new(HashMap::new()),
             cumulative_cost: Mutex::new(0.0),
@@ -4253,5 +4293,68 @@ mod tests {
             ReasoningEffort::High,
             "unknown persisted efforts fall back to the default"
         );
+    }
+
+    fn assistant_usage(cache_read: u64) -> pi::types::Usage {
+        pi::types::Usage {
+            input_tokens: 10,
+            cache_read_input_tokens: cache_read,
+            ..Default::default()
+        }
+    }
+
+    fn assistant_request(usage: pi::types::Usage) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: Vec::new(),
+            model: "deepseek-v4-flash".into(),
+            provider: "DeepSeek".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(pi::types::StopReason::Stop),
+            raw_stop_reason: None,
+            usage: Box::new(usage),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn request_attribution_keys_turns_and_keeps_only_latest_request_per_model() {
+        let (u1, u2, u3) = (
+            assistant_usage(100),
+            assistant_usage(200),
+            assistant_usage(300),
+        );
+        let messages = vec![
+            AgentMessage::User {
+                content: Vec::new(),
+                timestamp: chrono::Utc::now(),
+            },
+            assistant_request(u1.clone()),
+            assistant_request(u2.clone()),
+            AgentMessage::User {
+                content: Vec::new(),
+                timestamp: chrono::Utc::now(),
+            },
+            assistant_request(u3.clone()),
+        ];
+        let history = adapt::harness_messages_to_messages(&messages);
+        let (per_turn, per_model_last) = request_attribution(&history, &messages);
+
+        // Each turn accumulates under its own triggering user message.
+        assert_eq!(per_turn.len(), 2);
+        assert_eq!(
+            per_turn[&history[0].id],
+            to_token_usage(&u1) + to_token_usage(&u2)
+        );
+        assert_eq!(per_turn[&history[3].id], to_token_usage(&u3));
+
+        // The budget numerator is the single latest request, never a sum.
+        let last = per_model_last
+            .get("DeepSeek/deepseek-v4-flash")
+            .expect("latest request keyed by provider/model");
+        assert_eq!(last.cache_read_input_tokens, 300);
     }
 }

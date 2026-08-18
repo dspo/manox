@@ -32,6 +32,13 @@ pub trait ThreadEngine: Send + Sync {
     /// Token usage keyed by user-message id, as the env card renders it.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
 
+    /// Usage of each model's most recent request — the context-budget
+    /// numerator per model row (a single request's prompt size, never a
+    /// session sum).
+    fn per_model_last_request_usage(&self) -> HashMap<String, TokenUsage> {
+        HashMap::new()
+    }
+
     /// The thread-wide cumulative usage across all settled turns.
     fn cumulative_token_usage(&self) -> TokenUsage {
         TokenUsage::default()

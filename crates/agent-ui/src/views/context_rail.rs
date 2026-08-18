@@ -379,19 +379,7 @@ impl ContextRail {
         let thread = self.thread.read(cx);
         let per_model = thread.per_model_token_usage();
         let per_model_cost = thread.per_model_cost();
-        let effective_tokens = thread
-            .messages()
-            .iter()
-            .rev()
-            .find_map(|message| thread.request_token_usage().get(&message.id))
-            .map(|usage| {
-                usage
-                    .input_tokens
-                    .saturating_add(usage.cache_creation_input_tokens)
-                    .saturating_add(usage.cache_read_input_tokens)
-                    .saturating_add(usage.output_tokens)
-            })
-            .unwrap_or(0);
+        let per_model_last = thread.per_model_last_request_usage();
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
@@ -454,8 +442,15 @@ impl ContextRail {
                 // Context budget row — first tree child, only when the model is
                 // registered (so its window size is resolvable).
                 let window_tokens = model_window_tokens(model_name);
-                let budget =
-                    window_tokens.and_then(|cap| context_budget_pct(cap, effective_tokens));
+                let budget = window_tokens.and_then(|cap| {
+                    per_model_last.get(*model_name).and_then(|u| {
+                        let active = u
+                            .input_tokens
+                            .saturating_add(u.cache_creation_input_tokens)
+                            .saturating_add(u.cache_read_input_tokens);
+                        context_budget_pct(cap, active)
+                    })
+                });
                 if let Some(budget) = budget {
                     let used = crate::cockpit::format_tokens_pi(budget.active_tokens);
                     let cap = crate::cockpit::format_tokens_pi(budget.cap_tokens);
