@@ -3,6 +3,7 @@ import { useState } from 'react';
 
 import type { ModelInfo, ReasoningEffort } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
+import { findCurrentModel } from '../../lib/current-model';
 import { apiTag, apiTint } from '../../lib/api-tint';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
@@ -41,7 +42,7 @@ export const ModelPicker = ({
   onSelect,
 }: ModelPickerProps) => {
   const [open, setOpen] = useState(false);
-  const current = models.find((m) => m.id === currentModelId);
+  const current = findCurrentModel(models, currentModelId);
   // Group by provider DISPLAY name with same-name registrations merged into
   // one submenu, mirroring the host's popup grouping.
   const groups: { name: string; models: ModelInfo[] }[] = [];
@@ -112,8 +113,8 @@ export const ModelPicker = ({
                   return (
                     <DropdownMenuItem
                       className="gap-2"
-                      key={m.id}
-                      onSelect={() => select(m.id)}
+                      key={`${m.provider}/${m.id}`}
+                      onSelect={() => select(`${m.provider}/${m.id}`)}
                     >
                       <Badge
                         className={cn('px-1 text-[10px] font-normal', tag.className)}

@@ -31,8 +31,8 @@ use gpui::{ClickEvent, CursorStyle, DragMoveEvent, MouseUpEvent};
 /// `Option<Entity<PopupMenu>>` regardless of feature.
 use gpui_component::menu::PopupMenu;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _, Size,
-    TITLE_BAR_HEIGHT, Theme, TitleBar,
+    ActiveTheme as _, ColorName, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
+    Size, TITLE_BAR_HEIGHT, Theme, TitleBar,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
@@ -4375,20 +4375,23 @@ impl Workspace {
     /// Wire api string → Tag variant + label for the pi model menu.
     fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
         match api {
-            "anthropic" => (TagVariant::Primary, "Anthropic"),
-            "openai_responses" => (TagVariant::Info, "Responses"),
-            "openai_completions" => (TagVariant::Warning, "Completions"),
+            "anthropic" => (TagVariant::Color(ColorName::Blue), "Anthropic"),
+            "openai_responses" => (TagVariant::Color(ColorName::Cyan), "Responses"),
+            "openai_completions" => (TagVariant::Color(ColorName::Amber), "Completions"),
             _ => (TagVariant::Secondary, "N/A"),
         }
     }
 
     /// Wire api string → text color for the pi composer model label and the
-    /// context rail's per-model usage rows.
+    /// context rail's per-model usage rows. Blue/cyan/amber at 600 in light,
+    /// 300 in dark, mirroring the VS Code webview's `--wire-*` tokens so both
+    /// sides render identical hues.
     pub(crate) fn pi_wire_text_color(api: &str, theme: &Theme) -> gpui::Hsla {
+        let step = if theme.is_dark() { 300 } else { 600 };
         match api {
-            "anthropic" => theme.primary,
-            "openai_responses" => theme.info,
-            "openai_completions" => theme.warning,
+            "anthropic" => ColorName::Blue.scale(step),
+            "openai_responses" => ColorName::Cyan.scale(step),
+            "openai_completions" => ColorName::Amber.scale(step),
             _ => theme.muted_foreground,
         }
     }
@@ -4508,9 +4511,9 @@ impl Workspace {
 
     /// Model menu for the pi harness: grouped by provider display name;
     /// each row shows a wire-api Tag and selects through the registry.
-    /// A config model registered through several wire apis appears once
-    /// (first registration wins), matching the sidebar cascade and the
-    /// macOS menu bar.
+    /// A config model registered through several wire apis appears once per
+    /// wire endpoint (exact duplicates collapse), so the responses and
+    /// completions variants stay selectable alongside the anthropic one.
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
@@ -4525,8 +4528,11 @@ impl Workspace {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in agent::pi_providers::global().models() {
             let prov = agent::pi_providers::display_provider_name(&m);
-            if !seen.insert((prov.clone(), agent::pi_providers::config_id(&m))) {
-                continue; // same model registered on several wire apis
+            // Identity is the registration name (unique per wire endpoint), so
+            // wire variants of one provider stay separate; only exact
+            // duplicates collapse.
+            if !seen.insert((m.provider.clone(), agent::pi_providers::config_id(&m))) {
+                continue;
             }
             match providers.iter_mut().find(|(name, _)| *name == prov) {
                 Some((_, models)) => models.push(m),

@@ -433,7 +433,7 @@ export const Composer = ({
           </div>
         )}
         <Textarea
-          className="font-code min-h-[52px] resize-none border-0 bg-transparent px-3 py-2 text-[13px] font-light shadow-none focus-visible:ring-0"
+          className="font-code min-h-[85px] resize-none border-0 bg-transparent px-3 py-2 text-[13px] font-light shadow-none focus-visible:ring-0"
           onChange={(e) => setText(e.target.value)}
           onCompositionEnd={handleCompositionEnd}
           onKeyDown={handleKeyDown}

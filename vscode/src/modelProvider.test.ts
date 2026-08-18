@@ -337,6 +337,47 @@ describe('provideLanguageModelChatInformation', () => {
     await expect(pending).resolves.toEqual([expect.objectContaining({ id: 'a' })]);
   });
 
+  it('dedups wire variants of one model inside a group bucket', async () => {
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation(
+      { silent: false, configuration: { provider: 'DeepSeek' } } as unknown as vscode.PrepareLanguageModelChatModelOptions,
+      fakeToken(),
+    );
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-anthropic', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
+        { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-responses', api: 'openai_responses', context_window: 100000, provider_name: 'DeepSeek' },
+      ],
+    });
+    // The bucket holds wire variants sharing an id; VS Code registers by id,
+    // so only the first survives.
+    await expect(pending).resolves.toEqual([expect.objectContaining({ id: 'deepseek-v4-pro' })]);
+  });
+
+  it('dedups wire variants of one model in the flat remote listing', async () => {
+    (vscode as unknown as { setRemoteName(t: string | undefined): void }).setRemoteName('ssh');
+    const { transport, manager } = create();
+    const provider = new ManoxModelProvider(manager);
+    const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
+    await flush();
+    transport.emit({ type: 'ready' });
+    await flush();
+    transport.emit({
+      type: 'models',
+      models: [
+        { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-anthropic', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
+        { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-responses', api: 'openai_responses', context_window: 100000, provider_name: 'DeepSeek' },
+      ],
+    });
+    await expect(pending).resolves.toHaveLength(1);
+    expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
+  });
+
   it('returns no models for a group call without a provider filter', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);

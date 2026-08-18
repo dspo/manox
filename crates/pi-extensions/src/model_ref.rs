@@ -63,6 +63,15 @@ pub fn resolve_model_ref(
     // Exact match is case-insensitive like the alias/probe paths, so
     // `DeepSeek-V4-Flash` and `deepseek-v4-flash` resolve identically.
     let wanted = model_ref.to_lowercase();
+    // A registration-qualified reference (`provider/id`) pins one wire
+    // endpoint: wire variants of one model share the bare id, so the
+    // bare-id match below would always resolve the first registration.
+    if let Some(exact) = models
+        .iter()
+        .find(|m| format!("{}/{}", m.provider, m.id).to_lowercase() == wanted)
+    {
+        return Some(exact.clone());
+    }
     if let Some(exact) = models.iter().find(|m| m.id.to_lowercase() == wanted) {
         return Some(exact.clone());
     }
@@ -148,6 +157,67 @@ mod tests {
         let registry2 = pi::ProviderRegistry::new();
         register(&registry2, "claude-sonnet-4-6", None);
         assert!(resolve_model_ref(&registry2, "sonnet").is_none());
+    }
+
+    #[test]
+    fn registration_qualified_ref_pins_wire_variant() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "provider_display_name".to_string(),
+            serde_json::json!("DeepSeek"),
+        );
+        let model = ProviderModelConfig {
+            id: "deepseek-v4-pro".into(),
+            name: "deepseek-v4-pro".into(),
+            reasoning: false,
+            input: vec![pi::provider_registry::InputModality::Text],
+            context_window: 1000,
+            max_tokens: 100,
+            cost: Cost::default(),
+            api: None,
+            base_url: None,
+            metadata: metadata.clone(),
+        };
+        let registry = pi::ProviderRegistry::new();
+        registry
+            .register_provider(
+                "DeepSeek-anthropic",
+                ProviderConfig {
+                    name: Some("DeepSeek".into()),
+                    base_url: Some("https://api.example/anthropic".into()),
+                    api_key: Some("k".into()),
+                    api: Some(pi::provider_registry::Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![model.clone()],
+                },
+            )
+            .unwrap();
+        registry
+            .register_provider(
+                "DeepSeek-responses",
+                ProviderConfig {
+                    name: Some("DeepSeek".into()),
+                    base_url: Some("https://api.example".into()),
+                    api_key: Some("k".into()),
+                    api: Some(pi::provider_registry::Api::OpenAiResponses),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![model],
+                },
+            )
+            .unwrap();
+        // A bare id resolves the first registration (anthropic).
+        let bare = resolve_model_ref(&registry, "deepseek-v4-pro").unwrap();
+        assert_eq!(bare.provider, "DeepSeek-anthropic");
+        assert_eq!(bare.api, "anthropic");
+        // A registration-qualified ref pins the responses endpoint.
+        let pinned = resolve_model_ref(&registry, "DeepSeek-responses/deepseek-v4-pro").unwrap();
+        assert_eq!(pinned.provider, "DeepSeek-responses");
+        assert_eq!(pinned.api, "openai_responses");
+        // An unknown registration in a qualified ref resolves to nothing
+        // (fails closed) instead of silently picking the first variant.
+        assert!(resolve_model_ref(&registry, "no-such-provider/deepseek-v4-pro").is_none());
     }
 
     #[test]

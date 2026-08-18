@@ -301,7 +301,7 @@ const ModelUsageRow = ({
   const cacheRead = usage.cache_read_input_tokens ?? 0;
   // Cache-hit share of uncached input plus cache-read; `--` with no input.
   const hitRate =
-    input + cacheRead > 0 ? ((cacheRead / (input + cacheRead)) * 100).toFixed(1) : '--';
+    input + cacheRead > 0 ? `${((cacheRead / (input + cacheRead)) * 100).toFixed(1)}%` : '--';
   const branch = last ? '└─' : '├─';
   const indent = last ? '    ' : '│   ';
   return (

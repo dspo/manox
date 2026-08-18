@@ -1596,22 +1596,16 @@ fn model_chat_done_error(request_id: &str, error: &str) -> String {
     .to_string()
 }
 
-/// Collapse models the host would register under an identical identity: the
-/// VS Code model picker buckets by provider display name and registers each
-/// bucket's models by id, so two endpoints exposing the same
-/// (display name, id) pair collide ("already registered"). The first entry
-/// wins; the registry listing is sorted by provider then id, so the survivor
-/// is deterministic.
+/// Collapse models sharing one registration identity: same provider
+/// registration name (which is unique per wire endpoint, `{name}-{wire}`) and
+/// model id. Distinct wire-api variants of one provider stay separate — the
+/// VS Code native-chat registration constraint that used to live here moved
+/// to the extension side (per-bucket id dedup in `ManoxModelProvider`).
 fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
     let mut seen = HashSet::new();
     models
         .into_iter()
-        .filter(|model| {
-            seen.insert((
-                agent::pi_providers::display_provider_name(model),
-                model.id.clone(),
-            ))
-        })
+        .filter(|model| seen.insert((model.provider.clone(), model.id.clone())))
         .collect()
 }
 
@@ -3691,15 +3685,15 @@ mod tests {
     }
 
     #[test]
-    fn deduped_models_collapses_same_display_name_and_id() {
-        let model = |provider: &str, display: Option<&str>, id: &str| {
+    fn deduped_models_keeps_wire_variants() {
+        let model = |provider: &str, display: Option<&str>, api: &str, id: &str| {
             let mut metadata = HashMap::new();
             if let Some(display) = display {
                 metadata.insert("provider_display_name".to_string(), json!(display));
             }
             pi::types::Model {
                 provider: provider.into(),
-                api: "anthropic".into(),
+                api: api.into(),
                 id: id.into(),
                 context_window: 200_000,
                 max_tokens: 8192,
@@ -3708,27 +3702,82 @@ mod tests {
             }
         };
         let deduped = deduped_models(vec![
-            // Same display name + id from two endpoints: collapses to the first.
-            model("bailian-a", Some("百炼"), "deepseek-v4-flash"),
-            model("bailian-b", Some("百炼"), "deepseek-v4-flash"),
-            // Same display name, distinct id: kept.
-            model("bailian-a", Some("百炼"), "qwen3-max"),
-            // Same id under a different display name: kept.
-            model("deepseek", Some("DeepSeek"), "deepseek-v4-flash"),
-            // No display metadata: identity falls back to the provider name.
-            model("openai", None, "gpt-5"),
+            // Wire variants of one provider: same display name + id, distinct
+            // registration names ({name}-{wire}) — all kept so the picker can
+            // offer the responses/completions endpoints.
+            model(
+                "DeepSeek-anthropic",
+                Some("DeepSeek"),
+                "anthropic",
+                "deepseek-v4-pro",
+            ),
+            model(
+                "DeepSeek-responses",
+                Some("DeepSeek"),
+                "openai_responses",
+                "deepseek-v4-pro",
+            ),
+            // An exact registration duplicate collapses to the first.
+            model(
+                "DeepSeek-anthropic",
+                Some("DeepSeek"),
+                "anthropic",
+                "deepseek-v4-pro",
+            ),
+            model(
+                "DeepSeek-completions",
+                Some("DeepSeek"),
+                "openai_completions",
+                "deepseek-v4-pro",
+            ),
+            // Same registration name, distinct id: kept.
+            model(
+                "DeepSeek-anthropic",
+                Some("DeepSeek"),
+                "anthropic",
+                "deepseek-v4-flash",
+            ),
+            // No display metadata: identity is the registration name.
+            model("openai", None, "anthropic", "gpt-5"),
         ]);
-        let identities: Vec<(String, String)> = deduped
+        let identities: Vec<(String, String, String)> = deduped
             .iter()
-            .map(|m| (agent::pi_providers::display_provider_name(m), m.id.clone()))
+            .map(|m| {
+                (
+                    agent::pi_providers::display_provider_name(m),
+                    m.api.clone(),
+                    m.id.clone(),
+                )
+            })
             .collect();
         assert_eq!(
             identities,
             vec![
-                ("百炼".to_string(), "deepseek-v4-flash".to_string()),
-                ("百炼".to_string(), "qwen3-max".to_string()),
-                ("DeepSeek".to_string(), "deepseek-v4-flash".to_string()),
-                ("openai".to_string(), "gpt-5".to_string()),
+                (
+                    "DeepSeek".to_string(),
+                    "anthropic".to_string(),
+                    "deepseek-v4-pro".to_string()
+                ),
+                (
+                    "DeepSeek".to_string(),
+                    "openai_responses".to_string(),
+                    "deepseek-v4-pro".to_string()
+                ),
+                (
+                    "DeepSeek".to_string(),
+                    "openai_completions".to_string(),
+                    "deepseek-v4-pro".to_string()
+                ),
+                (
+                    "DeepSeek".to_string(),
+                    "anthropic".to_string(),
+                    "deepseek-v4-flash".to_string()
+                ),
+                (
+                    "openai".to_string(),
+                    "anthropic".to_string(),
+                    "gpt-5".to_string()
+                ),
             ]
         );
     }
