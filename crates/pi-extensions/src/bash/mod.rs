@@ -126,8 +126,8 @@ impl AgentTool for BashTool {
         "Execute a shell command. State (cwd, exported vars, functions) persists across calls. \
          Optionally run in the background with `run_in_background: true` — the command starts in a \
          fresh shell (no persistent state) at the session cwd — a completion summary with the \
-         output tail arrives automatically; fetch the full output via BashOutput; stop with \
-         TaskStop. Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
+         output tail arrives automatically; fetch the full output via `BashOutput`; stop with \
+         `TaskStop`. Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
          piping through `head`/`tail` — they shape the foreground result and the background \
          completion summary. Set `unsandboxed: true` to run without the sandbox (no write/network \
          confinement; requires user approval in non-Danger modes). In Danger mode the host \
@@ -175,7 +175,7 @@ impl AgentTool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Start the command in the background and return a task id immediately; a completion summary with the output tail arrives automatically — use BashOutput for the full output, TaskStop to stop"
+                    "description": "Start the command in the background and return a task id immediately; a completion summary with the output tail arrives automatically — use `BashOutput` for the full output, `TaskStop` to stop"
                 },
                 "unsandboxed": {
                     "type": "boolean",
