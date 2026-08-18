@@ -16,6 +16,10 @@ for candidate in target/debug/libmanox_napi.dylib target/debug/libmanox_napi.so 
 done
 [ -n "$LIB" ] || { echo "napi cdylib not found"; exit 1; }
 cp "$LIB" vscode/manox_napi.node
+# Strip debug info: the unstripped debug cdylib (~0.5GB on Linux) makes vsce's
+# secret scanner error out and bloats the packaged vsix. `-S` strips debug
+# sections on both GNU and Apple strip; plain strip rejects macOS dylibs.
+strip -S vscode/manox_napi.node 2>/dev/null || true
 
 # 2. Compile the host TypeScript and bundle the webview frontend.
 cd vscode
