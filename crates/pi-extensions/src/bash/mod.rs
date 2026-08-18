@@ -108,7 +108,7 @@ impl BashTool {
 
     /// Bind an orchestrator so background tasks participate in the agent
     /// session's lifecycle. The manager's registry replaces the wrapper's
-    /// own, so tasks it spawns stay visible to `bash_output` / `task_stop`.
+    /// own, so tasks it spawns stay visible to `BashOutput` / `TaskStop`.
     pub fn with_manager(mut self, manager: Arc<BackgroundManager>) -> Self {
         self.registry = manager.registry.clone();
         self.manager = Some(manager);
@@ -126,12 +126,12 @@ impl AgentTool for BashTool {
         "Execute a shell command. State (cwd, exported vars, functions) persists across calls. \
          Optionally run in the background with `run_in_background: true` — the command starts in a \
          fresh shell (no persistent state) at the session cwd — a completion summary with the \
-         output tail arrives automatically; `bash_output` fetches the full output; `task_stop` \
-         stops the task. Use `head_lines`/`tail_lines` to keep a selection of the output instead \
-         of piping through `head`/`tail` — they shape the foreground result and the background \
-         completion summary. Set `unsandboxed: true` to run without the sandbox (no \
-         write/network confinement; requires user approval in non-Danger modes). In Danger mode \
-         the host escalates every call regardless of this flag."
+         output tail arrives automatically; fetch the full output via BashOutput; stop with \
+         TaskStop. Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
+         piping through `head`/`tail` — they shape the foreground result and the background \
+         completion summary. Set `unsandboxed: true` to run without the sandbox (no write/network \
+         confinement; requires user approval in non-Danger modes). In Danger mode the host \
+         escalates every call regardless of this flag."
     }
 
     fn is_read_only(&self) -> bool {
@@ -175,7 +175,7 @@ impl AgentTool for BashTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Start the command in the background and return a task id immediately; a completion summary with the output tail arrives automatically — use bash_output for the full output, task_stop to stop"
+                    "description": "Start the command in the background and return a task id immediately; a completion summary with the output tail arrives automatically — use BashOutput for the full output, TaskStop to stop"
                 },
                 "unsandboxed": {
                     "type": "boolean",
@@ -277,7 +277,7 @@ impl BashTool {
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
             };
             return Ok(AgentToolResult::text(format!(
-                "Started in background as `{id}`. A completion summary with the output tail will arrive automatically. Use `bash_output` (shell_id) for the full output; `task_stop` stops the task."
+                "Started in background as `{id}`. A completion summary with the output tail will arrive automatically. Use `BashOutput` (shell_id) for the full output; `TaskStop` stops the task."
             )));
         }
 
@@ -796,7 +796,7 @@ mod tests {
             .and_then(|t| t.split('`').next())
             .unwrap_or_else(|| panic!("background id in start text: {start}"));
 
-        let summary = wait_for_steered(&seen).await;
+        let summary = test_helpers::wait_for_steered(&seen, 1).await;
         let section = summary
             .split("Recent output:\n")
             .nth(1)
@@ -810,25 +810,39 @@ mod tests {
         let status = registry.status(&pi::TaskId(id.to_string()), 0).unwrap();
         assert!(!status.is_running, "task finished");
     }
+}
 
-    /// Wait until the recording steerer received the completion summary and
-    /// return its text.
-    async fn wait_for_steered(seen: &Arc<Mutex<Vec<pi::types::AgentMessage>>>) -> String {
+/// Shared test helpers for the bash module's test suites.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use pi::types::AgentMessage;
+    use std::sync::Mutex;
+
+    /// Wait until `count` completion summaries reached the recording steerer
+    /// and return the most recent one.
+    pub async fn wait_for_steered(seen: &Mutex<Vec<AgentMessage>>, count: usize) -> String {
         for _ in 0..100 {
-            let summary = seen.lock().unwrap().iter().find_map(|m| match m {
-                pi::types::AgentMessage::User { content, .. } => {
-                    content.iter().find_map(|b| match b {
-                        pi::types::ContentBlock::Text { text, .. } => Some(text.clone()),
+            {
+                let msgs = seen.lock().unwrap();
+                if msgs.len() >= count
+                    && let Some(summary) = msgs.iter().rev().find_map(|m| match m {
+                        AgentMessage::User { content, .. } => {
+                            content.iter().find_map(|b| match b {
+                                pi::types::ContentBlock::Text { text, .. } => Some(text.clone()),
+                                _ => None,
+                            })
+                        }
                         _ => None,
                     })
+                {
+                    return summary;
                 }
-                _ => None,
-            });
-            if let Some(s) = summary {
-                return s;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("completion summary not steered in time");
+        panic!(
+            "completion summary not steered in time; {} messages seen",
+            seen.lock().unwrap().len()
+        );
     }
 }

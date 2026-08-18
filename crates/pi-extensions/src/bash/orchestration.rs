@@ -7,7 +7,7 @@
 //   1. task → model: a completed task steers a summary into the agent's
 //      context at the next tool-call boundary, shaped by the task's head/tail
 //      line preference (the model can still fetch the full output via
-//      `bash_output`, whose read cursor is untouched).
+//      `BashOutput`, whose read cursor is untouched).
 //   2. run → task: an aborted run kills its background tasks; a settled run
 //      keeps them so a long task survives across turns. The caller kills
 //      everything on session teardown via [`BackgroundManager::kill_all`].
@@ -41,7 +41,7 @@ pub struct OutputShape {
 impl OutputShape {
     /// Apply the line preference to a text window; no preference returns the
     /// window unchanged.
-    pub fn apply(self, text: &str) -> String {
+    fn apply(self, text: &str) -> String {
         super::select_lines(text, self.head_lines, self.tail_lines)
     }
 }
@@ -320,6 +320,7 @@ async fn kill_all_tasks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bash::test_helpers::wait_for_steered;
     use pi::types::ContentBlock;
     use std::path::Path;
     use std::time::Duration;
@@ -553,6 +554,19 @@ mod tests {
             },
         );
         assert!(!summary.contains("Recent output"), "empty shape: {summary}");
+        // tail_lines: Some(0) also drops every line and omits the section.
+        let summary = format_summary(
+            &pi::TaskId("bg_1".into()),
+            &status,
+            OutputShape {
+                head_lines: None,
+                tail_lines: Some(0),
+            },
+        );
+        assert!(
+            !summary.contains("Recent output"),
+            "empty tail shape: {summary}"
+        );
     }
 
     #[tokio::test]
@@ -616,33 +630,5 @@ mod tests {
             .lines()
             .take_while(|l| !l.trim().is_empty())
             .collect()
-    }
-
-    /// Wait until `count` completion summaries reached the recording steerer
-    /// and return the most recent one.
-    async fn wait_for_steered(seen: &Arc<Mutex<Vec<AgentMessage>>>, count: usize) -> String {
-        for _ in 0..100 {
-            {
-                let msgs = seen.lock().unwrap();
-                if msgs.len() >= count
-                    && let Some(summary) = msgs.iter().rev().find_map(|m| match m {
-                        AgentMessage::User { content, .. } => {
-                            content.iter().find_map(|b| match b {
-                                ContentBlock::Text { text, .. } => Some(text.clone()),
-                                _ => None,
-                            })
-                        }
-                        _ => None,
-                    })
-                {
-                    return summary;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "completion summary not steered in time; {} messages seen",
-            seen.lock().unwrap().len()
-        );
     }
 }
