@@ -181,8 +181,8 @@ function toModelInfo(m: ModelInfo): vscode.LanguageModelChatInformation {
 
 /** VS Code registers each group bucket's models by id; one provider's wire
  * variants (anthropic/responses/completions endpoints of the same model)
- * share an id, so a bucket may hold several. Keep the first (the actor lists
- * the anthropic variant first) so the native chat never sees an "already
+ * share an id, so a bucket may hold several. Keep the first registration
+ * (sorted by registration name) so the native chat never sees an "already
  * registered" collision. */
 function dedupById(models: ModelInfo[]): ModelInfo[] {
   const seen = new Set<string>();
