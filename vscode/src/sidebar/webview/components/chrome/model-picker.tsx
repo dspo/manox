@@ -1,7 +1,7 @@
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { useState } from 'react';
 
-import type { ModelInfo } from '../../../../protocol';
+import type { ModelInfo, ReasoningEffort } from '../../../../protocol';
 import { ThreadApi } from '../../api/client';
 import { apiTag, apiTint } from '../../lib/api-tint';
 import { t } from '../../lib/i18n';
@@ -12,17 +12,21 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
 
+const REASONING_EFFORTS: ReasoningEffort[] = ['high', 'max'];
+
 export type ModelPickerProps = {
   models: ModelInfo[];
   currentModelId: string | null;
   disabled: boolean;
   sessionId: string | null;
+  reasoningEffort: ReasoningEffort;
   /** Selection without a live session (a draft thread's first send applies
    * the model at creation time). Takes precedence over the sessionId path. */
   onSelect?: (modelId: string) => void;
@@ -33,6 +37,7 @@ export const ModelPicker = ({
   currentModelId,
   disabled,
   sessionId,
+  reasoningEffort,
   onSelect,
 }: ModelPickerProps) => {
   const [open, setOpen] = useState(false);
@@ -124,6 +129,23 @@ export const ModelPicker = ({
             </DropdownMenuSub>
           ))
         )}
+        {/* The effort knob tunes the same model the submenus above pick; the
+         * current effort is checked and a click applies to the next request.
+         * Draft threads have no session yet, so the knob stays disabled. */}
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel className="text-muted-foreground font-normal">
+          {t('reasoning_effort')}
+        </DropdownMenuLabel>
+        {REASONING_EFFORTS.map((effort) => (
+          <DropdownMenuItem
+            disabled={!sessionId || disabled}
+            key={effort}
+            onSelect={() => sessionId && new ThreadApi(sessionId).setReasoningEffort(effort)}
+          >
+            <span className="flex-1">{t(effort === 'high' ? 'reasoning_high' : 'reasoning_max')}</span>
+            {reasoningEffort === effort && <Check className="size-3.5" />}
+          </DropdownMenuItem>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

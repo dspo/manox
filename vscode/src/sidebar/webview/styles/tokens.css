@@ -1,5 +1,13 @@
 @import "tw-animate-css";
 @import "tailwindcss";
+@layer base {
+  /* Bare border utilities resolve to the theme border token; without this
+   * reset, Tailwind v4 preflight leaves border-color at currentColor and
+   * every 1px border renders in the foreground color. */
+  *, ::before, ::after {
+    border-color: var(--color-border);
+  }
+}
 
 /*
  * Design tokens for the manox sidebar. Every color references a VS Code
@@ -28,6 +36,7 @@
   --color-danger: var(--vscode-charts-red, var(--vscode-errorForeground, #f85149));
   --color-warning: var(--vscode-charts-yellow, #e3b341);
   --color-success: var(--vscode-charts-green, #34d058);
+  --color-blue: var(--vscode-charts-blue, #3794ff);
 
   --font-chrome: var(--vscode-font-family);
   --font-transcript: var(--vscode-font-family);
@@ -35,6 +44,7 @@
   --font-thinking: var(--vscode-font-family);
 
   --animate-shimmer: shimmer 2s linear infinite;
+  --animate-wheel-spin: wheel-spin 1.6s linear infinite;
 
   @keyframes shimmer {
     from {
@@ -42,6 +52,12 @@
     }
     to {
       background-position: -200% center;
+    }
+  }
+
+  @keyframes wheel-spin {
+    to {
+      transform: rotate(360deg);
     }
   }
 }

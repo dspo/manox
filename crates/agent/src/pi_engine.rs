@@ -25,7 +25,7 @@ use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::db::ThreadSummary;
-use crate::language_model::{MessageContent, TokenUsage};
+use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
@@ -184,6 +184,7 @@ pub fn spawn_engine(
     project: Option<PathBuf>,
     thread_id: String,
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
+    parent_session: Option<String>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
@@ -221,6 +222,7 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&state),
         thread_id,
+        parent_session,
     ));
     // Display-only streaming preview: while the actor's eager restore reads
     // the whole session file, stream its transcript into the mirrored history
@@ -442,7 +444,8 @@ fn system_prompt(cwd: &Path) -> String {
          Working directory: {cwd}\n\
          Date: {date}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
-         Make changes directly, keep replies concise, and verify your work when practical.",
+         Make changes directly, keep replies concise, and verify your work when practical.\n\
+         When several tool calls or subagent spawns are independent, emit them together in one turn so they run in parallel.",
         cwd = cwd.display(),
     );
     // Skill summaries let the model know which skills are installed (users
@@ -877,6 +880,22 @@ where
                     *state.model.lock().unwrap() = Some(new_model.clone());
                     *pi_model = new_model;
                 }
+                Some(SessionCmd::SetThinkingLevel(level)) => {
+                    // Mid-run switch: the queued mutation lands at the next
+                    // turn boundary (same semantics as `set_model`); persist
+                    // the choice so a reopened session restores it.
+                    handle.set_thinking_level(level.clone());
+                    if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
+                        && let Err(err) = write_reasoning_effort_sidecar(
+                            sessions_dir,
+                            session_path,
+                            effort,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %err, "failed to persist reasoning effort");
+                    }
+                }
                 Some(SessionCmd::PersistGeneratedTitle {
                     session_path: target,
                     title,
@@ -1113,6 +1132,17 @@ fn subscribe_harness_events(
     }))
 }
 
+/// Session header metadata: the creating host's identity, plus (for a team
+/// worker) the leader's session id. The team link persists with the jsonl
+/// file, so the affiliation survives restarts and outlives the team.
+fn session_metadata(parent_session: Option<&str>) -> serde_json::Value {
+    let mut metadata = serde_json::json!({ "host": crate::host::current().slug() });
+    if let Some(parent) = parent_session {
+        metadata["team"] = serde_json::json!({ "parent": parent });
+    }
+    metadata
+}
+
 /// Build the session builder against the given project dir, using the shared
 /// runtime and model.
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
@@ -1127,6 +1157,7 @@ fn session_builder(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    parent_session: Option<&str>,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
     let (tools, orchestrators) = build_tools(
         cwd,
@@ -1147,14 +1178,16 @@ fn session_builder(
         .with_resources(instruction_resources(cwd))
         .with_tools(tools);
     // Every session a host creates is tagged with its identity so each
-    // host's session list stays disjoint.
-    builder = builder.with_metadata(serde_json::json!({ "host": crate::host::current().slug() }));
+    // host's session list stays disjoint. A team worker additionally carries
+    // its leader's session id: the link persists with the jsonl file, so the
+    // affiliation survives restarts and outlives the in-memory team.
+    builder = builder.with_metadata(session_metadata(parent_session));
+
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
     (builder, orchestrators)
 }
-
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
 /// model plus the shared slot must follow so `Ready`, the approval
@@ -1375,6 +1408,7 @@ async fn run_actor(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     state: Arc<EngineState>,
     thread_id: String,
+    parent_session: Option<String>,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -1464,6 +1498,7 @@ async fn run_actor(
             state.goal_bridge.as_ref(),
             &cmd_tx,
             &state.worktree,
+            None,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -1504,6 +1539,7 @@ async fn run_actor(
                 state.goal_bridge.as_ref(),
                 &cmd_tx,
                 &state.worktree,
+                parent_session.as_deref(),
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -1587,6 +1623,17 @@ async fn run_actor(
     // reopened Danger session doesn't silently gate (or vice versa).
     let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
     state.gate.set_mode(approval_mode);
+    // The reasoning effort rides the same sidecar: restore it so a reopened
+    // Max session keeps its effort. The engine clamps against the current
+    // model and persists the change in the transcript (TS `setThinkingLevel`).
+    let reasoning_effort = load_reasoning_effort(&sessions_dir, session.path()).await;
+    if reasoning_effort != ReasoningEffort::default()
+        && let Err(err) = session
+            .set_thinking_level(Some(reasoning_effort.wire_value().to_string()))
+            .await
+    {
+        tracing::warn!(error = %err, "failed to restore reasoning effort");
+    }
     // Plan mode rides the same sidecar: restore the flag so a reopened
     // planning session keeps its read-only gate; the facade re-renders and
     // re-sends the instructions once it sees `Ready`.
@@ -1617,6 +1664,7 @@ async fn run_actor(
         restored,
         model: Some(pi_model.clone()),
         approval_mode,
+        reasoning_effort,
         plan_mode: plan_mode_restored,
         plan_file: plan_file_restored,
         plan_review_pending,
@@ -1970,8 +2018,16 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetThinkingLevel(level) => {
-                if let Err(err) = session.set_thinking_level(level).await {
+                if let Err(err) = session.set_thinking_level(level.clone()).await {
                     tracing::warn!("pi set_thinking_level failed: {err}");
+                }
+                // The facade's knob only sends "high"/"max"; persist the
+                // choice so a reopened session restores the same effort.
+                if let Some(effort) = level.as_deref().and_then(parse_reasoning_effort)
+                    && let Err(err) =
+                        write_reasoning_effort_sidecar(&sessions_dir, session.path(), effort).await
+                {
+                    tracing::warn!(error = %err, "failed to persist reasoning effort");
                 }
             }
             SessionCmd::Open { path } => {
@@ -2187,6 +2243,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    parent_session.as_deref(),
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -2266,6 +2323,10 @@ async fn run_actor(
     }
 
     let _ = session.close().await;
+    // Thread-lifetime cleanup: monitors/background tasks are stopped and the
+    // monitor bridge has exited with the orchestrator senders, so the legacy
+    // registry entries and mailbox can be released now.
+    crate::background_task::cleanup_thread(&thread_id);
 }
 
 /// Close the current session and open the given jsonl file in its place. The
@@ -2322,6 +2383,7 @@ async fn rebuild_session(
         goal_bridge,
         cmd_tx,
         worktree,
+        None,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
@@ -2851,6 +2913,43 @@ async fn write_approval_mode_sidecar(
     pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
 }
 
+/// The reasoning effort persisted in a session's sidecar; fresh sessions
+/// (missing sidecar or field) default to High.
+async fn load_reasoning_effort(sessions_dir: &Path, session_path: &Path) -> ReasoningEffort {
+    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+        Ok(meta) => match meta.reasoning_effort.as_deref() {
+            Some("high") => ReasoningEffort::High,
+            Some("max") => ReasoningEffort::Max,
+            _ => ReasoningEffort::default(),
+        },
+        Err(_) => ReasoningEffort::default(),
+    }
+}
+
+/// Persist the reasoning effort in the session sidecar so the session
+/// reopens with the same effort.
+async fn write_reasoning_effort_sidecar(
+    sessions_dir: &Path,
+    session_path: &Path,
+    effort: ReasoningEffort,
+) -> Result<(), anyhow::Error> {
+    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .unwrap_or_default();
+    meta.reasoning_effort = Some(effort.wire_value().to_string());
+    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+}
+
+/// Parse the facade's effort knob wire value; other levels (e.g. "off")
+/// are not user-facing and yield `None`.
+fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
+    match raw {
+        "high" => Some(ReasoningEffort::High),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
+}
+
 /// Re-read the session's persisted approval mode after a session switch and
 /// align the gate + the facade's chip with it.
 async fn resync_approval_mode(
@@ -3099,7 +3198,13 @@ async fn refresh_session_list(
     *state.sessions.lock().unwrap() = out;
 }
 
-/// Map a pi session info onto the sidebar summary shape.
+/// Map a pi session info onto the actor's mirrored session list.
+///
+/// A flat mirror of the sidebar store (the sidebar itself renders
+/// `ThreadStore::summaries()` with team depth resolution); rows here stay
+/// depth 0 because the mirror is never rendered as a tree. `parent_id`
+/// still resolves the team affiliation via the shared helper so any reader
+/// sees the same edge the sidebar does.
 fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> ThreadSummary {
     ThreadSummary {
         id: info.id.clone(),
@@ -3115,7 +3220,8 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
             info.cwd.clone()
         },
         depth: 0,
-        parent_id: info.parent_session_path.clone(),
+        parent_id: crate::thread_store::team_parent_id(info)
+            .or_else(|| info.parent_session_path.clone()),
         archived: false,
         pinned: false,
         has_unread: false,
@@ -3588,6 +3694,17 @@ pub(crate) mod adapt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_metadata_tags_host_and_optional_team_parent() {
+        let tagged = session_metadata(Some("leader-1"));
+        assert_eq!(tagged["host"], crate::host::current().slug());
+        assert_eq!(tagged["team"]["parent"], "leader-1");
+
+        let plain = session_metadata(None);
+        assert_eq!(plain["host"], crate::host::current().slug());
+        assert!(plain.get("team").is_none(), "no team key without a parent");
+    }
 
     #[tokio::test]
     async fn approval_mode_sidecar_round_trips() {
@@ -4528,5 +4645,51 @@ mod tests {
             .clone();
         let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, &write, true).unwrap();
         assert!(reason.contains("unverifiable"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_sidecar_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-effort.jsonl");
+
+        // Fresh session: no sidecar -> default High.
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High
+        );
+
+        write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::Max)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::Max
+        );
+
+        write_reasoning_effort_sidecar(dir.path(), &session, ReasoningEffort::High)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_sidecar_tolerates_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-effort-unknown.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_reasoning_effort(dir.path(), &session).await,
+            ReasoningEffort::High,
+            "unknown persisted efforts fall back to the default"
+        );
     }
 }

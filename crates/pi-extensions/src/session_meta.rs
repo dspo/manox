@@ -30,6 +30,10 @@ pub struct SessionMeta {
     /// load so a resumed session keeps its read-only planning semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bool>,
+    /// The reasoning effort the session runs at (`"high"` or `"max"`), as
+    /// chosen in the model dropdown. Absent = the harness default (High).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Last plan file this session proposed (`<slug>-plan.md` under the
     /// global plans dir), kept for restore + execution handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,5 +210,23 @@ mod tests {
             Some("/gitwork:deliver fast")
         );
         assert!(!loaded.registry_displays.contains_key(&0));
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_round_trips_and_defaults_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+
+        // Fresh sidecar: no persisted effort.
+        let fresh = load(dir.path(), &session).await.unwrap();
+        assert!(fresh.reasoning_effort.is_none());
+
+        let meta = SessionMeta {
+            reasoning_effort: Some("max".into()),
+            ..Default::default()
+        };
+        save(dir.path(), &session, &meta).await.unwrap();
+        let loaded = load(dir.path(), &session).await.unwrap();
+        assert_eq!(loaded.reasoning_effort.as_deref(), Some("max"));
     }
 }

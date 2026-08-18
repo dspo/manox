@@ -88,7 +88,14 @@ export const MessageList = ({
   const renderItem = (item: TranscriptItem): ReactNode => {
     switch (item.kind) {
       case 'user':
-        return <UserMessage approvalMode={approvalMode} item={item} key={item.id} />;
+        return (
+          <UserMessage
+            approvalMode={approvalMode}
+            item={item}
+            key={item.id}
+            sessionId={sessionId}
+          />
+        );
       case 'assistant':
         return <AssistantMessage item={item} key={item.id} />;
       case 'thinking':
@@ -166,20 +173,22 @@ export const MessageList = ({
       }
       nodes.push(renderItem(item));
     }
-    return <div key={group.user?.id ?? `lead-${index}`}>{nodes}</div>;
+    return (
+      <div id={group.user ? `turn-${group.user.id}` : undefined} key={group.user?.id ?? `lead-${index}`}>
+        {nodes}
+      </div>
+    );
   };
 
   return (
     <Conversation>
-      <ConversationContent
-        style={rightInsetPx ? { paddingRight: rightInsetPx } : undefined}
-      >
-        <div className="mx-auto w-full max-w-[760px]">{groups.map(renderGroup)}</div>
+      <ConversationContent style={rightInsetPx ? { paddingRight: rightInsetPx } : undefined}>
+        <div className="w-full">{groups.map(renderGroup)}</div>
       </ConversationContent>
       {items.length === 0 && (
         <ConversationEmptyState description={t('no_messages_desc')} title={t('no_messages_title')} />
       )}
-      <ConversationScrollButton />
+      <ConversationScrollButton rightInsetPx={rightInsetPx} />
     </Conversation>
   );
 };

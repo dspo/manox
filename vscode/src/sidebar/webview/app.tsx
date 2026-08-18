@@ -42,6 +42,7 @@ export const App = () => {
         error={thread.error ?? state.error}
         models={state.models}
         thread={thread}
+        threads={state.threads}
       />
     );
   }

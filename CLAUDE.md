@@ -31,20 +31,20 @@ Rust **1.95.0**（`rust-toolchain.toml`），edition **2024**，需 `clippy`/`ru
 
 manox 区分**模型面向**与**用户面向**两条字符串边界：
 
-1. **模型面向一律英文，绝不本地化**：`system_prompt.md` 散文、所有工具 `description()`、工具 `run` 返回的 Err 字符串、`thread.rs` 里 LLM 能读到的消息。永远不经 i18n。
+1. **模型面向一律英文，绝不本地化**：`prompt/templates/{en,zh-CN}/**/*.tera.md` 模板散文、所有工具 `description()`、工具 `run` 返回的 Err 字符串、`thread_pi.rs` 里 LLM 能读到的消息。永远不经 i18n。
 2. **仅 UI chrome 本地化**：按钮、标签、状态徽章、overlay 标题、输入占位符、侧栏、设置面板、系统菜单。经 `agent::i18n::t("key")`。
 3. **Fluent 资源**在 `crates/agent/locales/{en,zh-CN}.ftl`，`include_str!` 编译期嵌入。**新增 UI 字符串 = 在两个 `.ftl` 各加一个键 + 调用处换 `t("key")`**，缺一不可。语言来自 `~/.config/cx/manox/settings.toml`：UI 语言（`ui_language`）`agent::init` 时读一次，可运行时热切换（`i18n::set_ui_language`，仅 chrome 重新本地化，已产生的内容不回改）；agent 语言（`agent_language`）按 thread 快照、终身不变。
 
 ## 提示词系统
 
-非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护，`include_str!` 编译期嵌入：`system_prompt.md`（主 agent）、`agents/*.md`（子 agent 定义）、`approval/prompt.md`（审批 reviewer）、`skills/<name>/SKILL.md`（技能）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
+非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/pi-extensions/agents/*.md`（`include_str!`）、审批 reviewer 在 `crates/agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
 ## 运行时配置（`~/.config/cx/`）
 
 - LLM：`cx.providers.config.yaml`（格式见 `provider/config.rs`）；SQLite：`cx/manox/threads.db`；设置：`cx/manox/settings.toml`
 - 子 agent：`cx/manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`cx/manox/mcp.toml`（stdio 或 HTTP）；插件：`cx/manox/plugins/`
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
-- **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效，由 `provider/anthropic.rs` 的 `MANOX_RUN_LIVE` 门控探针确证。
+- **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
 
 ## GPUI 依赖版本锁定
 
@@ -90,7 +90,7 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 ### 工作流约定
 
 - 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
-- 每 PR 门禁：两 harness 变体 `cargo clippy -D warnings --all-targets` + 全量 `cargo test` + `cargo fmt`。
+- 每 PR 门禁：`cargo clippy -D warnings --all-targets` + 全量 `cargo test` + `cargo fmt`。
 - 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
 

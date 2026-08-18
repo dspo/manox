@@ -47,6 +47,8 @@ gpui::actions!(
         CompletionDown,
         CompletionConfirm,
         CompletionDismiss,
+        ComposerRecallUp,
+        ComposerRecallDown,
         UndoLastQueued,
         ToggleCockpitTasks,
         BackgroundCurrentThread,
@@ -55,6 +57,21 @@ gpui::actions!(
         ArchiveCurrentThread
     ]
 );
+
+/// Keybindings shadowing the composer Input's own up/down while it is
+/// focused; the handlers defer to native caret movement unless a history
+/// recall is eligible. Registered after `gpui_component::init`, so the
+/// same-depth `composer == recall > Input` predicate wins the tie.
+pub fn composer_recall_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        gpui::KeyBinding::new("up", ComposerRecallUp, Some("composer == recall > Input")),
+        gpui::KeyBinding::new(
+            "down",
+            ComposerRecallDown,
+            Some("composer == recall > Input"),
+        ),
+    ]
+}
 
 /// Keybindings owned by the user-turn navigator.
 ///
@@ -77,4 +94,17 @@ pub fn turn_navigator_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("enter", CompletionConfirm, Some("TurnNavigator > Input")),
         gpui::KeyBinding::new("escape", CompletionDismiss, Some("TurnNavigator > Input")),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{composer_recall_key_bindings, turn_navigator_key_bindings};
+
+    /// `KeyBinding::new` panics on an unparseable context predicate, so
+    /// constructing every binding set is a startup crash regression test.
+    #[test]
+    fn key_bindings_parse() {
+        assert_eq!(composer_recall_key_bindings().len(), 2);
+        assert_eq!(turn_navigator_key_bindings().len(), 6);
+    }
 }

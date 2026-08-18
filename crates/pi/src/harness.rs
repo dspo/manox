@@ -959,7 +959,7 @@ pub struct AgentHarness<S: SessionStorage> {
 /// (off by default, like TS); `custom_instructions` / `replace_instructions`
 /// shape the summarization prompt; `label` is written to the summary entry
 /// when one is generated, otherwise to the target entry, and is also
-/// surfaced on the `session_before_tree` hook (see docs/ts-pi-parity.md §9).
+/// surfaced on the `session_before_tree` hook.
 #[derive(Debug, Clone, Default)]
 pub struct NavigateTreeOptions {
     /// Generate a summary of the abandoned branch (requires a provider).

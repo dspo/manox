@@ -1,3 +1,5 @@
+import { memo } from 'react';
+
 import { t } from '../../lib/i18n';
 import { Reasoning, ReasoningContent, ReasoningTrigger } from '../ai/reasoning';
 import { Shimmer } from '../ai/shimmer';
@@ -8,7 +10,9 @@ export type ThinkingBlockProps = {
   isStreaming: boolean;
 };
 
-export const ThinkingBlock = ({ text, isStreaming }: ThinkingBlockProps) => (
+// Memoized: finished thinking blocks keep their text across streaming
+// frames; only the trailing live block re-renders.
+export const ThinkingBlock = memo(({ text, isStreaming }: ThinkingBlockProps) => (
   <div className="group relative">
     <CopyOnHover className="absolute top-0 right-0" text={text} />
     <Reasoning isStreaming={isStreaming}>
@@ -26,4 +30,4 @@ export const ThinkingBlock = ({ text, isStreaming }: ThinkingBlockProps) => (
       <ReasoningContent>{text}</ReasoningContent>
     </Reasoning>
   </div>
-);
+));

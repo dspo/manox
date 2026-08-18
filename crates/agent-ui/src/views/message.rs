@@ -447,20 +447,22 @@ impl MessageItem {
     /// O(items) walk is harmless. `terminal` distinguishes a turn-ending stop
     /// (`EndTurn`/`MaxTokens`/`Refusal`/cancel/error) from a mid-turn
     /// `StopReason::ToolUse`: a terminal stop freezes the activity segment
-    /// (pins elapsed, auto-collapses) and the tool-call cards; a ToolUse stop
-    /// only finalizes the assistant/reasoning text streaming so the next model
-    /// response's tool calls fold into the same segment. The markdown document
+    /// (pins elapsed, schedules the entries' delayed auto-collapse) and the
+    /// tool-call cards; a ToolUse stop only finalizes the assistant/reasoning
+    /// text streaming so the next model response's tool calls fold into the
+    /// same segment. The markdown document
     /// always gets a final pass so the frozen prefix + tail match a one-shot
     /// full parse exactly.
     pub fn finalize_streaming(&mut self, terminal: bool, cx: &mut gpui::Context<Self>) {
         match &mut self.kind {
             ConvItem::Assistant { streaming, .. } => *streaming = false,
             ConvItem::Thinking(t) if terminal => {
-                // Turn ended: freeze the segment, pin elapsed, auto-collapse
-                // entries the user didn't pin. `finalize_segment` is
-                // idempotent with `recompute_streaming`'s pinning.
+                // Turn ended: freeze the segment, pin elapsed, and schedule
+                // the entries' delayed auto-collapse (the stream plays out,
+                // then folds ~1s later). `finalize_segment` is idempotent
+                // with `recompute_streaming`'s pinning.
                 t.finalize_segment();
-                for entry in &mut t.entries {
+                for (eix, entry) in t.entries.iter_mut().enumerate() {
                     match entry {
                         ActivityEntry::Reasoning {
                             streaming,
@@ -470,7 +472,9 @@ impl MessageItem {
                             ..
                         } => {
                             *streaming = false;
-                            *collapsed = !*user_toggled;
+                            if !*user_toggled && !*collapsed {
+                                schedule_auto_collapse(AutoCollapseTarget::ReasoningEntry(eix), cx);
+                            }
                             if let Some(md) = markdown.as_ref() {
                                 md.update(cx, |m, cx| m.finalize_streaming(cx));
                             }
@@ -482,8 +486,13 @@ impl MessageItem {
                                 ToolCallStatus::Success
                                     | ToolCallStatus::Error
                                     | ToolCallStatus::Denied
-                            ) {
-                                tool.collapsed = !tool.user_toggled;
+                            ) && !tool.user_toggled
+                                && !tool.collapsed
+                            {
+                                schedule_auto_collapse(
+                                    AutoCollapseTarget::Tool(tool.id.clone()),
+                                    cx,
+                                );
                             }
                         }
                     }
@@ -497,11 +506,21 @@ impl MessageItem {
             // fresh round instead of appending to the previous one.
             ConvItem::Thinking(t) => {
                 t.finalize_reasoning_rounds();
-                for entry in &mut t.entries {
-                    if let ActivityEntry::Reasoning { markdown, .. } = entry
-                        && let Some(md) = markdown.as_ref()
+                for (eix, entry) in t.entries.iter_mut().enumerate() {
+                    if let ActivityEntry::Reasoning {
+                        streaming: false,
+                        collapsed,
+                        user_toggled,
+                        markdown,
+                        ..
+                    } = entry
                     {
-                        md.update(cx, |m, cx| m.finalize_streaming(cx));
+                        if !*user_toggled && !*collapsed {
+                            schedule_auto_collapse(AutoCollapseTarget::ReasoningEntry(eix), cx);
+                        }
+                        if let Some(md) = markdown.as_ref() {
+                            md.update(cx, |m, cx| m.finalize_streaming(cx));
+                        }
                     }
                 }
             }
@@ -515,8 +534,10 @@ impl MessageItem {
                             | ToolCallStatus::Error
                             | ToolCallStatus::Denied
                     )
+                    && !t.user_toggled
+                    && !t.collapsed
                 {
-                    t.collapsed = !t.user_toggled;
+                    schedule_auto_collapse(AutoCollapseTarget::Tool(t.id.clone()), cx);
                 }
             }
             ConvItem::AgentTask(_) => {}
@@ -537,15 +558,108 @@ impl MessageItem {
         };
         t.close_for_text();
         // Finalize reasoning markdown so the streaming cursor stops and the
-        // final parse matches a one-shot parse.
-        for entry in &mut t.entries {
-            if let ActivityEntry::Reasoning { markdown, .. } = entry
-                && let Some(md) = markdown.as_ref()
+        // final parse matches a one-shot parse; schedule the rounds' delayed
+        // auto-collapse so a finished round folds ~1s after it stops
+        // streaming.
+        for (eix, entry) in t.entries.iter_mut().enumerate() {
+            if let ActivityEntry::Reasoning {
+                streaming: false,
+                collapsed,
+                user_toggled,
+                markdown,
+                ..
+            } = entry
             {
-                md.update(cx, |m, cx| m.finalize_streaming(cx));
+                if !*user_toggled && !*collapsed {
+                    schedule_auto_collapse(AutoCollapseTarget::ReasoningEntry(eix), cx);
+                }
+                if let Some(md) = markdown.as_ref() {
+                    md.update(cx, |m, cx| m.finalize_streaming(cx));
+                }
             }
         }
     }
+}
+
+/// One-shot auto-collapse delay after an entry stops streaming / reaches a
+/// terminal status — mirrors the vscode extension's `AUTO_CLOSE_DELAY`.
+const ENTRY_AUTO_COLLAPSE_DELAY: Duration = Duration::from_millis(1000);
+
+/// Target of a delayed auto-collapse.
+pub(crate) enum AutoCollapseTarget {
+    /// A reasoning round inside an activity segment, by entry index (entries
+    /// are append-only, so the index stays valid).
+    ReasoningEntry(usize),
+    /// A tool node inside an activity segment or a top-level `ToolCall` card,
+    /// by tool id (ids are unique across cards and segment entries).
+    Tool(String),
+}
+
+/// Schedule a one-shot auto-collapse for an activity entry or top-level tool
+/// card: `ENTRY_AUTO_COLLAPSE_DELAY` after the entry stopped streaming /
+/// reached a terminal status it folds to its header, so the live stream plays
+/// out before the block closes (vscode-extension parity). The fire is skipped
+/// when the user toggled the entry (either before scheduling or within the
+/// delay window) — afterwards the entry is fully user-driven. A missing entry
+/// (thread switch, cleared conversation) makes the fire a no-op.
+pub(crate) fn schedule_auto_collapse(
+    target: AutoCollapseTarget,
+    cx: &mut gpui::Context<MessageItem>,
+) {
+    cx.spawn(async move |weak, cx| {
+        cx.background_executor()
+            .timer(ENTRY_AUTO_COLLAPSE_DELAY)
+            .await;
+        let Some(item) = weak.upgrade() else {
+            return;
+        };
+        item.update(cx, |item, cx| {
+            let collapsed = match &target {
+                AutoCollapseTarget::ReasoningEntry(eix) => {
+                    let ConvItem::Thinking(t) = item.kind_mut() else {
+                        return;
+                    };
+                    let Some(ActivityEntry::Reasoning {
+                        collapsed,
+                        user_toggled,
+                        ..
+                    }) = t.entries.get_mut(*eix)
+                    else {
+                        return;
+                    };
+                    if *user_toggled || *collapsed {
+                        return;
+                    }
+                    *collapsed = true;
+                    true
+                }
+                AutoCollapseTarget::Tool(id) => match item.kind_mut() {
+                    ConvItem::Thinking(t) => {
+                        let Some(entry) = t.get_tool_entry_mut(id) else {
+                            return;
+                        };
+                        if entry.user_toggled || entry.collapsed {
+                            return;
+                        }
+                        entry.collapsed = true;
+                        true
+                    }
+                    ConvItem::ToolCall(t) if t.id == *id => {
+                        if t.user_toggled || t.collapsed {
+                            return;
+                        }
+                        t.collapsed = true;
+                        true
+                    }
+                    _ => return,
+                },
+            };
+            if collapsed {
+                cx.notify();
+            }
+        });
+    })
+    .detach();
 }
 
 impl Render for MessageItem {
@@ -1269,9 +1383,10 @@ fn disclosure_icon(collapsed: bool, theme: &Theme) -> gpui::AnyElement {
 /// Render an activity segment as a flat stack of its entries — each a
 /// self-collapsible reasoning round or tool node, sitting at the same level
 /// as the surrounding assistant text (no segment-level header, no left rail,
-/// no branch connectors). Entries default to collapsed so the live stream
-/// does not auto-play their content; a manual expand reveals the body. The
-/// segment's aggregated totals ("思考了 N 轮次 · 调用了 M 次工具 · Ss") are
+/// no branch connectors). Live entries play open so the stream is visible;
+/// each folds ~1s after it stops streaming / reaches a terminal status
+/// (unless the user toggled it). Restored-history segments mount collapsed.
+/// The segment's aggregated totals ("思考了 N 轮次 · 调用了 M 次工具 · Ss") are
 /// rendered on the following reply's model row via `activity_summary`.
 pub fn render_thinking(
     t: &ThinkingContainer,
@@ -1287,7 +1402,7 @@ pub fn render_thinking(
     }
     // No segment-level header or rail-and-branch tree: each entry is a self-
     // collapsible row at the same level as the surrounding assistant text,
-    // defaulting to collapsed so the live stream does not auto-play. The
+    // live entries open while streaming and fold ~1s after they finish. The
     // segment's totals are summarized on the following reply's model row.
     v_flex()
         .w_full()
@@ -1371,10 +1486,9 @@ fn render_reasoning_entry(
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let label = i18n::t("message-reasoning").to_string();
-    // Default-collapsed: the live stream does not auto-play the reasoning
-    // text — only a manual expand (user_toggled → collapsed=false) reveals
-    // the body. The streaming spinner on the header still shows work in
-    // progress while collapsed.
+    // Live rounds play open; the delayed auto-collapse folds the body once
+    // the stream is done. The header spinner still shows work in progress
+    // while collapsed.
     let show_body = !collapsed;
 
     let mut row = v_flex().w_full().min_w_0().flex_1().italic().child(
@@ -1500,8 +1614,8 @@ fn render_tool_entry(
         };
         icon.xsmall().text_color(status_color).into_any_element()
     };
-    // Default-collapsed: a streaming tool does not auto-reveal its output —
-    // only a manual expand does. The status icon still spins while running.
+    // Live tools play open; the delayed auto-collapse folds the output once
+    // the result lands. The status icon still spins while running.
     let show_output = !e.collapsed;
     let title = if !e.title.is_empty() {
         e.title.clone()

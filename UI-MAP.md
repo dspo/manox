@@ -229,13 +229,13 @@ Middle section: project-grouped threads (if any projects exist). Its section hea
 
 #### SidebarProjectGroup
 
-Collapsible folder: chevron + folder icon + project name, indented thread list.
+Collapsible folder: chevron + folder icon + project name, indented thread list. Threads inside a folder order as a team forest (`team_forest`): top-level rows merged by recency, each team leader followed by its member rows indented one level (`14px` per `depth`); a leader with members renders a collapse chevron and hides its subtree when folded.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
 #### SidebarConversationsSection
 
-Loose (non-project) threads + external sessions (scroll-body child 1). Its section header sits in-flow directly above these rows and carries the `+` button opening the `SidebarNewSessionMenu` popup; the sticky overlay (`SidebarPinnedSectionHeader`) pins a copy when scrolled.
+Loose (non-project) threads + external sessions (scroll-body child 1). Its section header sits in-flow directly above these rows and carries the `+` button opening the `SidebarNewSessionMenu` popup; the sticky overlay (`SidebarPinnedSectionHeader`) pins a copy when scrolled. Like the project folders, loose rows order as a team forest with member rows nested under their leader.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -247,7 +247,9 @@ Loose (non-project) threads + external sessions (scroll-body child 1). Its secti
 
 #### SidebarThreadItem
 
-Unified row projection (`SidebarThreadItem` struct: `id`/`short_id`/`title`/`updated`/`pinned`/`has_unread`/`errored`/`running`/`pending_auth`/`pending_plan`/`background_work`/`resumable`/`resuming`/`selected`/`indent`/`icon`/`wash`/`kind`, live flags packed in `ThreadLiveState`) rendered by one `render_thread_item` for both native threads and external-agent sessions. The two kinds are merged into one recency-ordered list (loose rows under "Conversations", project-bound rows inside their folder group) and share the selection-slide wash animation, the hover/active wash, and the hover archive action. Native thread row: leading `ship-wheel` icon with a five-state machine — danger `TriangleAlert` on `errored`; `theme.info` static while waiting on the user (`pending_auth` tool authorization / AskUserQuestion, or `pending_plan` plan-review verdict); `theme.success` + clockwise spin while the loop can self-advance (`running` turn in flight, or `background_work` live monitors / background bash — `ThreadLiveState.background_work` refreshed from `BackgroundTaskUpdated` via `thread_has_running_tasks`); `theme.info` static while a finished turn awaits the user's view (`has_unread`); `theme.foreground` static otherwise (read pause or never-run thread) — pinned star, pending-auth spinner (accent, tooltip "Waiting for approval", shown while a tool authorization awaits the user's verdict — the thread's approval card is only visible when it is the active thread), title, short-id tag (shimmer while the loop can self-advance), relative time, hover archive button. The hover/active/selected wash uses the thread's last saved approval-mode color (`theme.info` AutoPilot / `theme.danger` Danger). External rows reuse the same layout but swap the leading icon for the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`), carry the same visible wash as AutoPilot threads (`theme.info` — `theme.accent` resolves to the near-white `neutral-100` in the forced Light theme, invisible on the sidebar), show the cx session id prefix in the short-id tag (click-to-copy of the full id / socket path, traceable to `~/.config/cx/sessions/<id>.sock`), and drop the unread/pin/error/running-shimmer affordances. A resumable row (restored from a [`ResumeSidecar`](#resumesidecar), no live process) renders dimmed with a Play hover action (`render_hover_action` emits `OpenExternalSession`, same as the row click) instead of the Inbox archive button, and swaps its leading icon for a `BrailleSpinner` while a resume is in flight. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the open click and the hover archive button to the right `SidebarEvent` (`OpenThread` / `ArchiveThread` vs `OpenExternalSession` / `ArchiveExternalSession` — the latter kills + drops the `SessionHandle`, the unified archive semantics).
+Unified row projection (`SidebarThreadItem` struct: `id`/`short_id`/`title`/`updated`/`pinned`/`has_unread`/`errored`/`running`/`pending_auth`/`pending_plan`/`background_work`/`resumable`/`resuming`/`selected`/`indent`/`team_leader`/`team_collapsed`/`icon`/`wash`/`kind`, live flags packed in `ThreadLiveState`) rendered by one `render_thread_item` for both native threads and external-agent sessions. The two kinds are merged into one recency-ordered list (loose rows under "Conversations", project-bound rows inside their folder group) and share the selection-slide wash animation, the hover/active wash, and the hover archive action. A leader row (`team_leader`, from the store's `parent_id`/`depth` team hierarchy) renders a collapse chevron before the status icon (`ChevronDown` expanded / `ChevronRight` folded) that folds its indented member rows without opening the conversation; member rows render indented (`indent` = `depth * 14px`) under their leader. Native thread row: leading `ship-wheel` icon with a five-state machine — danger `TriangleAlert` on `errored`; `theme.info` static while waiting on the user (`pending_auth` tool authorization / AskUserQuestion, or `pending_plan` plan-review verdict); `theme.success` + clockwise spin while the loop can self-advance (`running` turn in flight, or `background_work` live monitors / background bash — `ThreadLiveState.background_work` refreshed from `BackgroundTaskUpdated` via `thread_has_running_tasks`); `theme.info` static while a finished turn awaits the user's view (`has_unread`); `theme.foreground` static otherwise (read pause or never-run thread) — pinned star, pending-auth spinner (accent, tooltip "Waiting for approval", shown while a tool authorization awaits the user's verdict — the thread's approval card is only visible when it is the active thread), title, short-id tag (shimmer while the loop can self-advance), relative time, hover archive button. The hover/active/selected wash uses the thread's last saved approval-mode color (`theme.info` AutoPilot / `theme.danger` Danger). External rows reuse the same layout but swap the leading icon for the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`), carry the same visible wash as AutoPilot threads (`theme.info` — `theme.accent` resolves to the near-white `neutral-100` in the forced Light theme, invisible on the sidebar), show the cx session id prefix in the short-id tag (click-to-copy of the full id / socket path, traceable to `~/.config/cx/sessions/<id>.sock`), and drop the unread/pin/error/running-shimmer affordances. A resumable row (restored from a [`ResumeSidecar`](#resumesidecar), no live process) renders dimmed with a Play hover action (`render_hover_action` emits `OpenExternalSession`, same as the row click) instead of the Inbox archive button, and swaps its leading icon for a `BrailleSpinner` while a resume is in flight. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the open click and the hover archive button to the right `SidebarEvent` (`OpenThread` / `ArchiveThread` vs `OpenExternalSession` / `ArchiveExternalSession` — the latter kills + drops the `SessionHandle`, the unified archive semantics).
+
+> Source: `agent-ui/src/views/sidebar.rs`
 
 #### ResumeSidecar
 
@@ -331,7 +333,7 @@ Virtual list backed by native `gpui::list` (`gpui::list(list_state, render_item)
 
 #### MessageItem
 
-Single rendered conversation item, centered, max-width 760px. Each `MessageItem` renders one of the variant cards below based on `ConvItem` kind. Every kind that carries a text body — user, assistant, error, notice, team message, recap, retry detail, plan review — mounts a persistent `Entity<Markdown>` (`MessageItem::markdown`, created lazily by `ensure_markdown`) instead of rebuilding one per frame: a per-frame `Entity` resets the document's `DocSelection`/`FocusHandle` on every render and breaks drag-select + Cmd/Ctrl+C (the old `markdown_tv` fallback), while a persistent body keeps its selection state alive across frames and leaves inline links clickable.
+Single rendered conversation item, centered, full width (no fixed content cap — the transcript adapts to the window width). Each `MessageItem` renders one of the variant cards below based on `ConvItem` kind. Every kind that carries a text body — user, assistant, error, notice, team message, recap, retry detail, plan review — mounts a persistent `Entity<Markdown>` (`MessageItem::markdown`, created lazily by `ensure_markdown`) instead of rebuilding one per frame: a per-frame `Entity` resets the document's `DocSelection`/`FocusHandle` on every render and breaks drag-select + Cmd/Ctrl+C (the old `markdown_tv` fallback), while a persistent body keeps its selection state alive across frames and leaves inline links clickable.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -551,7 +553,7 @@ Trigger: typing `/` (slash commands) or `@` (skills + subagents) at the caret in
 
 #### ModelMenu
 
-Trigger: [ModelChip](#modelchip). Model selector dropdown.
+Trigger: [ModelChip](#modelchip). Model selector dropdown: provider submenus for the model list, then a Reasoning effort block (High / Max, current effort checked) under a separator.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -969,7 +971,7 @@ Greyed out, "denied" label.
 
 ## 10. Reasoning Effort Levels
 
-Thread-level reasoning effort. No selector UI in the pi path today — the value is inherited across `/new` (`archive_current_thread_inheriting`) and set via the engine facade; High / Max remain the canonical values.
+Thread-level reasoning effort, chosen in [ModelMenu](#modelmenu) (High / Max, current effort checked), persisted in the session sidecar so a reopened session restores it. The value is inherited across `/new` (`archive_current_thread_inheriting`) and set via the engine facade; High / Max remain the canonical values.
 
 #### High
 #### Max
