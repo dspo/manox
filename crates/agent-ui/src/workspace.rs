@@ -378,6 +378,12 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
+    /// Height-invalidation subscription: any `ConversationState` mutation may
+    /// change a row's height (including off-screen rows whose height is cached
+    /// in the list sum tree). Remeasure all rows on every conversation notify —
+    /// the same cure a window resize applies — so a stale cached height can
+    /// never survive to paint an overlapping row.
+    conversation_sub: Option<Subscription>,
     /// Scroll/virtualization state for the message column, held natively by
     /// `gpui::ListState`. `ListAlignment::Bottom` gives chat-log semantics:
     /// short histories sit at the bottom, long ones scroll. `FollowMode::Tail`
@@ -675,6 +681,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
+            conversation_sub: None,
             list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
             message_list_width: crate::views::MessageListWidthInvalidator::default(),
             list_count: 0,
@@ -699,12 +706,26 @@ impl Workspace {
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
+        ws.observe_conversation(cx);
         // The sidebar lists the restored resumable rows from the first frame;
         // nothing is resumed until the user clicks one.
         ws.sync_sidebar_external(cx);
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
         ws
+    }
+
+    /// Remeasure every list row whenever the conversation mutates. A height
+    /// change on an off-screen row would otherwise leave the list's cached
+    /// height stale until the next width change; this applies that cure
+    /// automatically on every conversation notify. Callers must invoke this
+    /// after any `self.conversation = ...` reassignment so the subscription
+    /// tracks the live entity.
+    fn observe_conversation(&mut self, cx: &mut Context<Self>) {
+        let list_state = self.list_state.clone();
+        self.conversation_sub = Some(cx.observe(&self.conversation, move |_this, _conv, _cx| {
+            list_state.remeasure_items(0..list_state.item_count());
+        }));
     }
 
     /// Rebuild the conversation view from the current thread's message
@@ -734,6 +755,7 @@ impl Workspace {
             )
         });
         self.conversation = new_conv;
+        self.observe_conversation(cx);
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
@@ -2696,6 +2718,7 @@ impl Workspace {
             conversation
         });
         self.conversation = new_conv;
+        self.observe_conversation(cx);
         // Restore the incoming thread's saved draft, or clear the input if it
         // has none — without this the previous thread's text would bleed into
         // the new one (Bug 1). `set_value` is silent (no Change event), so
