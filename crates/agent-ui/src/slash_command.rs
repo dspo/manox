@@ -30,6 +30,7 @@ use agent::command::CommandDefinition;
 use agent::i18n;
 use agent::skill::SkillDefinition;
 
+use crate::conversation::NoticeAnchor;
 use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
 
@@ -374,12 +375,20 @@ impl SlashCommand for PlanCommand {
         // alongside becomes the first planning turn. Leaving: the gate lifts.
         if workspace.thread_plan_mode(cx) {
             workspace.set_thread_plan_mode(false, cx);
-            workspace.add_info_message(i18n::t("plan-mode-off-notice").to_string(), cx);
+            workspace.add_info_message(
+                i18n::t("plan-mode-off-notice").to_string(),
+                NoticeAnchor::TurnEnd,
+                cx,
+            );
             return SlashResult::Handled;
         }
         workspace.set_thread_plan_mode(true, cx);
         if args.trim().is_empty() {
-            workspace.add_info_message(i18n::t("plan-mode-on-notice").to_string(), cx);
+            workspace.add_info_message(
+                i18n::t("plan-mode-on-notice").to_string(),
+                NoticeAnchor::TurnEnd,
+                cx,
+            );
             SlashResult::Handled
         } else {
             SlashResult::InjectUserTurn(args.to_string())

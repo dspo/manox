@@ -391,9 +391,9 @@ Rounded card, `bg:danger/0.06`, red text, "Error" label + copy btn. Body is a pe
 
 #### NoticeMessage
 
-Rounded card, `bg:secondary/0.15`, muted text, "Notice" label + copy btn. Body is a persistent selectable `Entity<Markdown>`.
+Rounded card, `bg:secondary/0.15`, muted text, "Notice" label + copy btn. Body is a persistent paginated `TerminalPanel` (`PanelKind::Plain`, no command/cwd) — the same folded surface as tool output: default `PAGE_SIZE` (20) lines with a `+N` load-more row; selection + pagination cursor survive across frames. Mounted by `MessageItem::ensure_notice_panel` (live) and `new_history_item` (reload).
 
-> Source: `agent-ui/src/views/message.rs`
+> Source: `agent-ui/src/views/message.rs` · panel: `components/src/markdown/terminal_panel.rs`
 
 #### RecapCard
 

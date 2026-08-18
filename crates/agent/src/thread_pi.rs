@@ -206,8 +206,10 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
-    /// An autopilot approval decision.
+    /// An autopilot approval decision. `tool_call_id` lets the host anchor
+    /// the decision record next to the tool call that triggered it.
     ApprovalDecision {
+        tool_call_id: String,
         tool_name: String,
         tool_title: String,
         verdict: crate::approval::ReviewVerdict,

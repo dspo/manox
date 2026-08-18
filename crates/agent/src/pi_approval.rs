@@ -273,7 +273,10 @@ impl ApprovalGatedTool {
         if self.gate.mode() == ApprovalMode::AutoPilot
             && crate::settings::side_calls().approval_policy().enabled
         {
-            match self.review(&name, &title, &params, ctx, &signal).await {
+            match self
+                .review(tool_call_id, &name, &title, &params, ctx, &signal)
+                .await
+            {
                 ReviewDisposition::Allowed => {
                     return self
                         .delegate(tool_call_id, params, signal, ctx, progress)
@@ -331,6 +334,7 @@ impl ApprovalGatedTool {
     /// Run a fresh host-private Approval agent over this single call.
     async fn review(
         &self,
+        tool_call_id: &str,
         name: &str,
         title: &str,
         params: &serde_json::Value,
@@ -368,6 +372,7 @@ impl ApprovalGatedTool {
                 reason: "approval reviewer unavailable or returned an invalid decision".into(),
             });
         self.gate.emit(ThreadEvent::ApprovalDecision {
+            tool_call_id: tool_call_id.to_string(),
             tool_name: name.to_string(),
             tool_title: title.to_string(),
             verdict: verdict.clone(),

@@ -52,7 +52,7 @@ use manox_components::markdown::Markdown;
 
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
-use crate::conversation::{ApplyOutcome, ConversationState, UserImage, UserTurnMeta};
+use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
 use crate::external_session::{
     ExternalSession, ResumeSidecar, SessionKind, list_sidecars, merge_external_summaries,
     remove_sidecar, resume_args, write_sidecar,
@@ -910,12 +910,16 @@ impl Workspace {
                     }
                 }
                 ThreadEvent::ApprovalDecision {
+                    tool_call_id,
                     tool_title,
                     verdict,
                     ..
                 } => {
                     // Show a brief autopilot decision record in the
-                    // MessageList, mirroring Codex's approval cell.
+                    // MessageList, mirroring Codex's approval cell. Anchored
+                    // next to the tool call that triggered it, so approval
+                    // records cluster at their occurrence position instead of
+                    // piling at the conversation tail.
                     let msg = match &verdict {
                         agent::approval::ReviewVerdict::Allow => i18n::t_str(
                             "workspace-approval-autopilot-allowed",
@@ -928,7 +932,11 @@ impl Workspace {
                         )
                         .to_string(),
                     };
-                    this.add_info_message(msg, cx);
+                    let anchor = this
+                        .conversation
+                        .read(cx)
+                        .notice_anchor_for_tool(tool_call_id, cx);
+                    this.add_info_message(msg, anchor, cx);
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -2521,6 +2529,16 @@ impl Workspace {
             ApplyOutcome::Unchanged | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
         }
     }
+    /// Splice a single newly inserted conversation item at `ix` into
+    /// `list_state`. Mid-list insertions (anchored notices) can't ride the
+    /// tail-diff in `sync_list_count`, so this splices at the exact position
+    /// and bumps `list_count` to keep the two reconciliations consistent (a
+    /// later `sync_list_count` sees an equal count and is a no-op).
+    fn apply_list_insert(&mut self, ix: usize, cx: &App) {
+        self.list_state.splice(ix..ix, 1);
+        self.list_count += 1;
+        let _ = cx;
+    }
 
     /// Re-engage tail-follow. `FollowMode::Tail` pins to the end natively and
     /// keeps following; an upward user scroll disengages it and landing back
@@ -3124,7 +3142,11 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 this.send_user_turn(text, extra, cx);
                 if failed > 0 {
-                    this.add_info_message(i18n::t("composer-image-process-failed").to_string(), cx);
+                    this.add_info_message(
+                        i18n::t("composer-image-process-failed").to_string(),
+                        NoticeAnchor::TurnEnd,
+                        cx,
+                    );
                 }
             })
             .ok();
@@ -3944,24 +3966,29 @@ impl Workspace {
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
-    /// no model turn). Used by slash commands to report outcomes — e.g. the
-    /// mode-change acknowledging the mode change. Renders as a neutral-toned
-    /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
+    /// no model turn). Used by slash commands and mode toggles to report
+    /// outcomes — e.g. the mode-change acknowledgement. Renders as a
+    /// neutral-toned `ConvItem::Notice` card (distinct from the red
+    /// `ConvItem::Error`).
     ///
-    /// Also persists the notice so a reloaded thread reproduces it. The live
-    /// `push_notice` only touches `ConversationState`; the persisted copy is
-    /// spliced back by `rebuild_from_messages` on next load, anchored to the
+    /// The notice is inserted at `anchor` — `TurnEnd` (the end of the current
+    /// turn, i.e. the list tail when idle, matching where the persisted copy
+    /// is spliced on reload) or `After(ix)` for a tool-call-adjacent record.
+    /// Also persists the notice so a reloaded thread reproduces it; the live
+    /// `push_notice` only touches `ConversationState`, the persisted copy is
+    /// spliced back by `rebuild_from_messages` on next load anchored to the
     /// current turn.
-    pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn add_info_message(&mut self, text: String, anchor: NoticeAnchor, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
-        self.conversation.update(cx, |c, cx| {
-            c.push_notice(text.clone(), weak, cx);
-        });
+        let ix = self
+            .conversation
+            .update(cx, |c, cx| c.push_notice(text.clone(), anchor, weak, cx));
+        self.apply_list_insert(ix, cx);
         self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
-        self.sync_list_count(cx);
-        // If tail-follow is engaged the list reveals the notice; if the user
-        // scrolled up, `FollowMode::Tail` has already disengaged so the
-        // viewport stays put.
+        // Tail-follow keeps the viewport pinned to the live end, so a
+        // `TurnEnd`-anchored notice is revealed by the follow; an `After`
+        // anchored one sits above the viewport by design (a record near its
+        // tool call, not an alert).
         cx.notify();
     }
 
@@ -4246,7 +4273,11 @@ impl Workspace {
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
             self.list_state.remeasure();
-            self.add_info_message(i18n::t("plan-refine-notice").to_string(), cx);
+            self.add_info_message(
+                i18n::t("plan-refine-notice").to_string(),
+                NoticeAnchor::TurnEnd,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -5437,7 +5468,11 @@ impl Workspace {
                 })
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.set_thread_plan_mode(false, cx);
-                    this.add_info_message(i18n::t("plan-mode-off-notice").to_string(), cx);
+                    this.add_info_message(
+                        i18n::t("plan-mode-off-notice").to_string(),
+                        NoticeAnchor::TurnEnd,
+                        cx,
+                    );
                 }))
                 .child(
                     Icon::new(IconName::LayoutDashboard)
@@ -7502,6 +7537,7 @@ impl Workspace {
             .update(cx, |t, cx| t.set_approval_mode(mode, cx));
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
+            NoticeAnchor::TurnEnd,
             cx,
         );
         self.close_access_menu();
