@@ -256,8 +256,6 @@ impl BashTool {
             // Background tasks route through the same confinement decision
             // as foreground calls: escalated → bare spawn, else sandboxed.
             // Without a seatbelt there is no wrapper either way.
-            let escalate = params["unsandboxed"].as_bool().unwrap_or(false)
-                || self.force_unsandboxed.as_ref().is_some_and(|f| f());
             let sandboxed = self.sandbox_available && !escalate;
             let shape = OutputShape {
                 head_lines,
