@@ -236,7 +236,7 @@ impl Default for BackgroundRegistry {
 /// Non-consuming snapshot of a task: unlike `poll`, `status` does not
 /// advance the read cursor, so an orchestrator can watch for completion and
 /// build a summary without stealing output the model still expects to fetch
-/// via `bash_output`.
+/// via `BashOutput`.
 #[derive(Debug, Clone)]
 pub struct TaskStatusInfo {
     pub is_running: bool,
@@ -536,7 +536,7 @@ fn render_poll(poll: &pi::PollResult) -> String {
     out
 }
 
-/// `bash_output` tool — poll a background task for output since the last poll.
+/// `BashOutput` tool — poll a background task for output since the last poll.
 pub struct BashOutputTool {
     registry: Arc<dyn BackgroundTaskRegistry>,
 }
@@ -594,7 +594,7 @@ impl AgentTool for BashOutputTool {
     }
 }
 
-/// `task_stop` tool — terminate a background task's process group.
+/// `TaskStop` tool — terminate a background task's process group.
 ///
 /// With a WebSocket monitor registry attached, ids unknown to the background
 /// registry fall back to cancelling the WS monitor (`ws_N` ids), so a single
