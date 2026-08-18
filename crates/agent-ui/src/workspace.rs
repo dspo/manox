@@ -4359,9 +4359,10 @@ impl Workspace {
                     this.model_menu_sub = None;
                 } else {
                     this.model_open = true;
+                    let current_effort = this.thread.read(cx).reasoning_effort();
                     let workspace = cx.entity().downgrade();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                        Self::build_model_popup_menu_pi(menu, workspace, window, cx)
+                        Self::build_model_popup_menu_pi(menu, workspace, current_effort, window, cx)
                     });
                     let sub = cx.subscribe(
                         &menu,
@@ -4416,6 +4417,7 @@ impl Workspace {
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
+        current_effort: agent::language_model::ReasoningEffort,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
@@ -4476,9 +4478,6 @@ impl Workspace {
         // model switch it tunes. The current effort is checked; a click
         // applies to the next request (same mid-run semantics as a model
         // switch; the menu dismisses like a model row).
-        let current_effort = workspace
-            .update(cx, |this, cx| this.thread.read(cx).reasoning_effort())
-            .unwrap_or_default();
         let themed = cx.theme().clone();
         menu = menu.separator();
         menu = menu.label(i18n::t("workspace-reasoning-effort"));
