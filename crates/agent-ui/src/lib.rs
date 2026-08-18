@@ -12,7 +12,7 @@ pub mod conversation;
 pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
-pub mod overlap_diag;
+pub(crate) mod overlap_diag;
 pub mod slash_command;
 pub mod views;
 pub mod vscode_app;
