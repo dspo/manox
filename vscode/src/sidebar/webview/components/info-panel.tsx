@@ -284,16 +284,19 @@ const ModelUsageRow = ({
   cost,
   models,
   last,
+  lastUsage,
 }: {
   modelKey: string;
   usage: TokenUsageSnapshot;
   cost: number;
   models: ModelInfo[];
   last: boolean;
+  /** Latest single request for this model; the budget numerator. */
+  lastUsage?: TokenUsageSnapshot;
 }) => {
   const model = models.find((m) => `${m.provider}/${m.id}` === modelKey);
   const cap = model?.context_window;
-  const used = usedTokens(usage);
+  const used = lastUsage ? usedTokens(lastUsage) : 0;
   const input = usage.input_tokens ?? 0;
   const cacheRead = usage.cache_read_input_tokens ?? 0;
   // Cache-hit share of uncached input plus cache-read; `--` with no input.
@@ -314,14 +317,14 @@ const ModelUsageRow = ({
           `${branch} ${modelKey}`
         )}
       </p>
-      {cap !== undefined && (
+      {cap !== undefined && lastUsage !== undefined && (
         <p
           className={cn(
             'whitespace-pre overflow-hidden text-ellipsis',
             used / cap >= 0.9 ? 'text-warning' : 'text-muted-foreground',
           )}
         >
-          {`${indent}├─ ${((used / cap) * 100).toFixed(1)}% ${formatTokensPi(used)}/${formatTokensPi(cap)}`}
+          {`${indent}├─ ${Math.min(100, (used / cap) * 100).toFixed(1)}% ${formatTokensPi(used)}/${formatTokensPi(cap)}`}
         </p>
       )}
       <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">
@@ -472,6 +475,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
                 cost={info?.per_model_cost?.[modelKey] ?? 0}
                 key={modelKey}
                 last={index === perModel.length - 1}
+                lastUsage={info?.per_model_last_usage?.[modelKey]}
                 models={models}
                 modelKey={modelKey}
                 usage={modelUsage}

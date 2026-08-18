@@ -244,6 +244,8 @@ export interface ThreadInfoSnapshot {
 	per_model_usage?: Record<string, TokenUsageSnapshot>;
 	/** Per-model spend keyed like `per_model_usage`. */
 	per_model_cost?: Record<string, number>;
+	/** Latest single request per model; the context-budget numerator. */
+	per_model_last_usage?: Record<string, TokenUsageSnapshot>;
 	cost: number;
 	pending_auth_count: number;
 	agents: SubagentSnapshot[];
