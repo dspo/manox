@@ -3120,6 +3120,7 @@ fn request_attribution(
     let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
     let mut ids = history.iter();
     let mut turn_key: Option<String> = None;
+    let mut over_consumed = false;
     for m in messages {
         // Id-stream cardinality must mirror
         // `adapt::harness_messages_to_messages`: hidden Custom messages
@@ -3128,7 +3129,13 @@ fn request_attribution(
             AgentMessage::Custom {
                 display, content, ..
             } if !*display || content.is_empty() => None,
-            _ => ids.next(),
+            _ => match ids.next() {
+                Some(id) => Some(id),
+                None => {
+                    over_consumed = true;
+                    None
+                }
+            },
         };
         match m {
             AgentMessage::User { .. } => turn_key = id.map(|m| m.id.clone()),
@@ -3158,6 +3165,13 @@ fn request_attribution(
             _ => {}
         }
     }
+    // Cardinality backstop: the skip rules above manually mirror
+    // `adapt::harness_messages_to_messages`; a divergence shifts every later
+    // attribution, so trip loudly in debug builds.
+    debug_assert!(
+        !over_consumed && ids.next().is_none(),
+        "request_attribution id stream out of lockstep with the mapped history"
+    );
     (per_turn, per_model_last)
 }
 
@@ -4356,5 +4370,37 @@ mod tests {
             .get("DeepSeek/deepseek-v4-flash")
             .expect("latest request keyed by provider/model");
         assert_eq!(last.cache_read_input_tokens, 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of lockstep")]
+    fn request_attribution_backstop_trips_on_leftover_mapped_rows() {
+        let messages = vec![
+            AgentMessage::User {
+                content: Vec::new(),
+                timestamp: chrono::Utc::now(),
+            },
+            assistant_request(assistant_usage(100)),
+        ];
+        let mut history = adapt::harness_messages_to_messages(&messages);
+        // Simulate adapt drift: one mapped row the walk never consumes.
+        history.push(history[0].clone());
+        let _ = request_attribution(&history, &messages);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of lockstep")]
+    fn request_attribution_backstop_trips_on_over_consumption() {
+        let messages = vec![
+            AgentMessage::User {
+                content: Vec::new(),
+                timestamp: chrono::Utc::now(),
+            },
+            assistant_request(assistant_usage(100)),
+        ];
+        // Simulate adapt drift in the other direction: the walk consumes an
+        // id for a message the mapping would not emit.
+        let history = adapt::harness_messages_to_messages(&messages[..1]);
+        let _ = request_attribution(&history, &messages);
     }
 }
