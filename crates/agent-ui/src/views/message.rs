@@ -35,7 +35,7 @@ use gpui::prelude::*;
 use gpui::{Animation, AnimationExt as _, CursorStyle, ease_out_quint};
 use gpui::{App, ClipboardItem, Entity, Render, SharedString, WeakEntity, px};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
     tooltip::Tooltip,
@@ -197,6 +197,12 @@ impl MessageItem {
 
     pub fn kind_mut(&mut self) -> &mut ConvItem {
         &mut self.kind
+    }
+
+    /// Diagnostic handle for the overlap registry; the row factory maps its
+    /// list index to this id so row/body bounds can be paired.
+    pub fn diagnostic_id(&self) -> usize {
+        self.id
     }
 
     /// Lazily create (or re-sync) the owned `Entity<Markdown>` for an item with
@@ -680,6 +686,8 @@ impl Render for MessageItem {
         // frames → selection + streaming state survive). `None` for non-text
         // items; their chrome mounts a fresh `Entity<Markdown>` per frame.
         let body = self.ensure_markdown(cx);
+        let diag_id = self.id;
+        let diag_enabled = crate::overlap_diag::enabled();
         centered(render_item(
             &self.kind,
             self.id,
@@ -690,6 +698,12 @@ impl Render for MessageItem {
             body,
             cx,
         ))
+        .debug_selector(|| format!("message-item-body-{}", self.id))
+        .when(diag_enabled, |this| {
+            this.on_prepaint(move |bounds, _window, _cx| {
+                crate::overlap_diag::record_body(diag_id, bounds);
+            })
+        })
     }
 }
 

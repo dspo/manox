@@ -715,6 +715,29 @@ impl Workspace {
         ws
     }
 
+    /// Swap the conversation + list for a prebuilt state and re-arm tail
+    /// follow. Diagnostic-only entry point used by the full-workspace overlap
+    /// walk test to open a real session without the async attach pipeline.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_replace_conversation(
+        &mut self,
+        conversation: Entity<ConversationState>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversation = conversation;
+        self.observe_conversation(cx);
+        let count = self.conversation.read(cx).items().len();
+        self.list_state.reset(count);
+        self.list_count = count;
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        cx.notify();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_list_state(&self) -> ListState {
+        self.list_state.clone()
+    }
+
     /// Remeasure every list row whenever the conversation mutates. A height
     /// change on an off-screen row would otherwise leave the list's cached
     /// height stale until the next width change; this applies that cure
@@ -6769,20 +6792,37 @@ impl Workspace {
                             // mutating a MessageItem here invalidates the same
                             // entity tree whose height is being cached.
                             let conversation = self.conversation.clone();
+                            let diag_enabled = crate::overlap_diag::enabled();
                             let processor = move |ix: usize, _window: &mut Window, cx: &mut App| {
                                 let item = conversation.read(cx).items().get(ix).cloned();
                                 match item {
                                     // `flex_shrink_0` guards against any
                                     // available height leaking down the
                                     // flex chain and compressing a row.
-                                    Some(item) => v_flex()
-                                        .w_full()
-                                        .pt_1()
-                                        .pb_4()
-                                        .flex_shrink_0()
-                                        .min_w_0()
-                                        .child(item)
-                                        .into_any_element(),
+                                    Some(item) => {
+                                        if diag_enabled {
+                                            crate::overlap_diag::record_mapping(
+                                                ix,
+                                                item.read(cx).diagnostic_id(),
+                                            );
+                                        }
+                                        v_flex()
+                                            .w_full()
+                                            .pt_1()
+                                            .pb_4()
+                                            .flex_shrink_0()
+                                            .min_w_0()
+                                            .debug_selector(move || {
+                                                format!("workspace-message-row-{ix}")
+                                            })
+                                            .when(diag_enabled, |this| {
+                                                this.on_prepaint(move |bounds, _window, _cx| {
+                                                    crate::overlap_diag::record_row(ix, bounds);
+                                                })
+                                            })
+                                            .child(item)
+                                            .into_any_element()
+                                    }
                                     // Index out of range mid-splice (count
                                     // changed between a layout pass and the
                                     // render closure): render an empty row.
@@ -6792,6 +6832,7 @@ impl Workspace {
                             let list_state = self.list_state.clone();
                             let width_state = self.list_state.clone();
                             let message_list_width = self.message_list_width.clone();
+                            let diag_state = self.list_state.clone();
                             let mono_family = theme.mono_font_family.clone();
                             (!first_screen).then(move || {
                                 // Native `gpui::list`: it owns virtualization,
@@ -6832,6 +6873,12 @@ impl Workspace {
                                             .update(bounds.size.width, &width_state)
                                         {
                                             window.refresh();
+                                        }
+                                        if crate::overlap_diag::enabled() {
+                                            crate::overlap_diag::check_completed_frame(
+                                                bounds,
+                                                diag_state.item_count(),
+                                            );
                                         }
                                     });
                                 h_flex()

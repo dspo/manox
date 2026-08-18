@@ -8,6 +8,14 @@ publish.workspace = true
 name = "agent_ui"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Exposes the `Workspace::diagnostic_*` hooks and the full-workspace overlap
+# walk test (`tests/workspace_overlap.rs`). The walk additionally requires the
+# local session fixture and is a no-op without it. Run locally via:
+#   cargo test -p agent-ui --features test-support --test workspace_overlap
+test-support = []
+
 
 [dependencies]
 anyhow.workspace = true
