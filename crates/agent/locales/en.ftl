@@ -625,6 +625,7 @@ plugins-notice-plugin-disabled = Plugin disabled. Restart manox to unload runtim
 member-running = running
 member-idle = idle
 member-disbanded = gone
+member-dismiss = dismiss
 member-tasks = Tasks
 member-tasks-mine = Mine
 member-tasks-unassigned = Unassigned

@@ -568,6 +568,7 @@ plugins-notice-plugin-disabled = 插件已禁用。重启 manox 后会卸载启�
 member-running = 运行中
 member-idle = 空闲
 member-disbanded = 已离线
+member-dismiss = 回收
 member-tasks = 任务
 member-tasks-mine = 我的
 member-tasks-unassigned = 未分配

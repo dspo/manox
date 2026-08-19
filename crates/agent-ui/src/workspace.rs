@@ -3464,6 +3464,19 @@ impl Workspace {
         true
     }
 
+    /// UI entry for the member panel's dismiss button: the `TeamDismiss`
+    /// op on the leader thread (cancel, archive session, release tasks,
+    /// drop from roster).
+    pub(crate) fn dismiss_member(&mut self, name: String, cx: &mut Context<Self>) {
+        self.thread.update(cx, |t, cx| {
+            let _ = agent::team::tools::execute_team_op(
+                t,
+                agent::thread_engine::TeamOp::Dismiss { name },
+                cx,
+            );
+        });
+    }
+
     /// Archive the active thread and open a fresh one that inherits the
     /// outgoing thread's project, model, approval mode, and reasoning effort —
     /// `/new` starts a clean conversation without dropping the working

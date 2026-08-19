@@ -23,7 +23,11 @@ use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Pixels, Render, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, px,
 };
-use gpui_component::{ActiveTheme as _, ElementExt as _, Theme, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, ElementExt as _, Sizable as _, Theme,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 
 use crate::Workspace;
 use crate::conversation::ConversationState;
@@ -147,6 +151,16 @@ impl MemberPanel {
         self.member.upgrade().is_some()
     }
 
+    /// The member's last terminal stop reason from the roster, for the
+    /// header chip; `None` while it has never stopped.
+    fn last_stop_label(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let team = self.team.upgrade()?;
+        let member = team.read(cx).members().get(&self.member_name)?;
+        member
+            .last_stop()
+            .map(|reason| SharedString::from(format!("stopped: {reason:?}")))
+    }
+
     fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let alive = self.alive();
         let running = self
@@ -197,6 +211,23 @@ impl MemberPanel {
                     .text_color(theme.muted_foreground)
                     .child(format!("· {}", self.role)),
             )
+            .when_some(self.last_stop_label(cx), |el, label| {
+                el.child(gpui::div().text_xs().text_color(theme.warning).child(label))
+            })
+            .when(alive, |el| {
+                let weak_ws = self.weak_workspace.clone();
+                let name = self.member_name.clone();
+                el.child(
+                    Button::new(format!("dismiss-{}", self.member_name))
+                        .ghost()
+                        .small()
+                        .label(i18n::t("member-dismiss"))
+                        .on_click(move |_, _, cx| {
+                            let _ =
+                                weak_ws.update(cx, |ws, cx| ws.dismiss_member(name.clone(), cx));
+                        }),
+                )
+            })
     }
 
     fn render_task_board(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
