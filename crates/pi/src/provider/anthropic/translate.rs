@@ -108,29 +108,23 @@ fn tools_param(
     )
 }
 
-/// The thinking field mirrors the model's thinking protocol: `"off"` forces
-/// `disabled`, a set level picks `adaptive` or `enabled` per the model's
-/// [`ThinkingKind`], and no level at all omits the field (server default).
-/// Enabled (non-adaptive) models carry a `budget_tokens` cap derived from the
-/// level and clamped below `max_tokens`; adaptive models defer depth to
-/// `output_config.effort`. Thinking text comes back summarized; its signature
-/// is always preserved for multi-turn continuity.
+/// A configured thinking level always reaches the wire: `"off"` forces
+/// `disabled`; adaptive models use `adaptive`; all other models use `enabled`
+/// with a level-derived `budget_tokens` clamped below `max_tokens`. An absent
+/// level omits the field and leaves the server default in place. Model metadata
+/// selects the wire shape but never suppresses an explicit user choice.
 fn thinking_config(context: &AgentContext, max_tokens: usize) -> Option<ThinkingConfig> {
     let display = Some(ThinkingDisplay::Summarized);
-    match context.model.thinking {
-        ThinkingKind::None => None,
-        kind => match context.thinking_level.as_deref() {
-            None => None,
-            Some("off") => Some(ThinkingConfig::Disabled),
-            Some(level) => Some(match kind {
-                ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
-                ThinkingKind::Enabled => ThinkingConfig::Enabled {
-                    display,
-                    budget_tokens: Some(map_budget(level, max_tokens)),
-                },
-                ThinkingKind::None => unreachable!(),
-            }),
-        },
+    match context.thinking_level.as_deref() {
+        None => None,
+        Some("off") => Some(ThinkingConfig::Disabled),
+        Some(level) => Some(match context.model.thinking {
+            ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
+            _ => ThinkingConfig::Enabled {
+                display,
+                budget_tokens: Some(map_budget(level, max_tokens)),
+            },
+        }),
     }
 }
 
@@ -528,10 +522,11 @@ mod tests {
             })
         ));
 
-        // A non-thinking model emits neither, even with a level set.
-        let no_think = ctx(vec![user("hi")], ThinkingKind::None, Some("high"));
-        let req = to_request(&no_think, &StreamOptions::default());
-        assert!(req.thinking.is_none());
+        // Unregistered metadata uses the enabled wire shape rather than
+        // silently dropping an explicit effort selection.
+        let unregistered = ctx(vec![user("hi")], ThinkingKind::None, Some("high"));
+        let req = to_request(&unregistered, &StreamOptions::default());
+        assert!(matches!(req.thinking, Some(ThinkingConfig::Enabled { .. })));
         assert!(req.output_config.is_none());
     }
 

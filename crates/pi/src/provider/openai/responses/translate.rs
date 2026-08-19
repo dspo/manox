@@ -25,9 +25,7 @@ use serde_json::Value as JsonValue;
 
 use super::wire::*;
 use crate::provider::openai::{clamp_cache_key, ensure_object_properties};
-use crate::types::{
-    AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions, ThinkingKind,
-};
+use crate::types::{AgentContext, AgentMessage, CacheRetention, ContentBlock, StreamOptions};
 
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesParams {
@@ -55,17 +53,11 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesP
     }
 }
 
-/// The reasoning object mirrors the model's declared mechanism. Both
-/// thinking kinds encode as the same effort dial on this shape; a
-/// thinking-capable model always carries the object, with an absent or
-/// `"off"` level meaning the explicit off state. Turning reasoning on also
-/// requests the encrypted reasoning payload, without which reasoning items
-/// could not be replayed under `store: false`. Levels pass through
-/// unclamped.
+/// A configured thinking level always emits the reasoning object and requests
+/// the encrypted payload needed to replay reasoning items under `store: false`.
+/// Model metadata does not gate this request. An absent or `"off"` level
+/// carries the explicit off state. Levels pass through unclamped.
 fn reasoning_params(context: &AgentContext) -> (Option<ReasoningParam>, Option<Vec<&'static str>>) {
-    if matches!(context.model.thinking, ThinkingKind::None) {
-        return (None, None);
-    }
     match context.thinking_level.as_deref() {
         Some(level) if level != "off" => (
             Some(ReasoningParam {
@@ -508,7 +500,7 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AgentMessage, ContentBlock, Model, Usage};
+    use crate::types::{AgentMessage, ContentBlock, Model, ThinkingKind, Usage};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -596,8 +588,12 @@ mod tests {
     // ── reasoning params ────────────────────────────────────────────────────
 
     #[test]
-    fn level_turns_reasoning_on_for_both_kinds() {
-        for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
+    fn level_turns_reasoning_on_regardless_of_model_metadata() {
+        for kind in [
+            ThinkingKind::Enabled,
+            ThinkingKind::Adaptive,
+            ThinkingKind::None,
+        ] {
             let v = request(&ctx(vec![user("hi")], kind, Some("high")));
             assert_eq!(
                 v["reasoning"],
@@ -621,15 +617,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plain_model_omits_reasoning() {
-        let v = request(&ctx(vec![user("hi")], ThinkingKind::None, Some("high")));
-        assert!(v.get("reasoning").is_none());
-        assert!(v.get("include").is_none());
-    }
-
     // ── request shell ───────────────────────────────────────────────────────
-
     #[test]
     fn request_shell_fields() {
         let opts = StreamOptions {

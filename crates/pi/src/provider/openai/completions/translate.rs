@@ -68,25 +68,23 @@ fn prompt_cache_key(context: &AgentContext, base_url: &str) -> Option<String> {
     }
 }
 
-/// The thinking fields mirror the model's declared mechanism. An `Enabled`
-/// model takes the on/off switch, with the level passed alongside as
-/// `reasoning_effort` — endpoints that speak the switch also accept the
-/// dial. An `Adaptive` model takes the dial alone. `"off"` forces the
-/// explicit off state; no level omits both fields (server default); levels
-/// pass through unclamped.
+/// A configured thinking level always reaches the wire. Model metadata only
+/// selects the encoding: adaptive models use the effort dial, while enabled
+/// and unregistered models use the on/off switch plus `reasoning_effort`.
+/// `"off"` forces the explicit off state; no level omits both fields and
+/// leaves the server default in place.
 fn thinking_params(context: &AgentContext) -> (Option<ThinkingParam>, Option<String>) {
     let level = context.thinking_level.as_deref();
     match context.model.thinking {
-        ThinkingKind::None => (None, None),
-        ThinkingKind::Enabled => match level {
-            None => (None, None),
-            Some("off") => (Some(ThinkingParam::Disabled), None),
-            Some(level) => (Some(ThinkingParam::Enabled), Some(level.to_string())),
-        },
         ThinkingKind::Adaptive => match level {
             None => (None, None),
             Some("off") => (None, Some("none".to_string())),
             Some(level) => (None, Some(level.to_string())),
+        },
+        _ => match level {
+            None => (None, None),
+            Some("off") => (Some(ThinkingParam::Disabled), None),
+            Some(level) => (Some(ThinkingParam::Enabled), Some(level.to_string())),
         },
     }
 }
@@ -441,10 +439,11 @@ mod tests {
             assert!(v.get("thinking").is_none(), "{kind:?}");
             assert!(v.get("reasoning_effort").is_none(), "{kind:?}");
         }
-        // A non-thinking model never emits the fields, level or not.
+        // Unregistered metadata uses the enabled wire shape rather than
+        // silently dropping an explicit effort selection.
         let v = request(&ctx(vec![user("hi")], ThinkingKind::None, Some("high")));
-        assert!(v.get("thinking").is_none());
-        assert!(v.get("reasoning_effort").is_none());
+        assert_eq!(v["thinking"], json!({"type": "enabled"}));
+        assert_eq!(v["reasoning_effort"], "high");
     }
 
     // ── message conversion ──────────────────────────────────────────────────
