@@ -1277,11 +1277,27 @@ fn emit_history_and_info(
     sink: &EventSink,
 ) {
     let messages = strip_messages_for_wire(thread.read(app).messages());
+    // Auto-approval badges ride the ui_notes sidecar, which the webview's
+    // `wireMessagesToTranscriptItems` rebuild never sees; project just the
+    // marked tool ids so the restored transcript stamps the same badges.
+    let auto_approved_tools: Vec<String> = thread
+        .read(app)
+        .ui_notes()
+        .iter()
+        .filter(|n| n.kind == agent::db::UiNoteKind::AutoApproval)
+        .filter_map(|n| {
+            n.data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
     sink.emit(
         json!({
             "type": "thread_history",
             "sessionId": session_id,
             "messages": messages,
+            "auto_approved_tools": auto_approved_tools,
         })
         .to_string(),
     );

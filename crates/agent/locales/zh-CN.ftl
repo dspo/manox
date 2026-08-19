@@ -375,7 +375,6 @@ workspace-mode-notice = { $mode ->
     [autopilot] 自动驾驶模式：安全工具调用免提示，风险操作将被拒绝。
    *[danger] 危险驾驶：工具调用免审批，bash 在沙箱外运行。
 }
-workspace-approval-autopilot-allowed = ✔ 自动批准：{$tool}
 workspace-approval-autopilot-escalated = ✗ 已升级待裁决：{$tool} — {$reason}
 workspace-project-choose = 选择项目
 workspace-project-new = 新建项目

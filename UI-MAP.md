@@ -359,7 +359,7 @@ Collapsible: chevron + "Reasoning" label + left-bordered muted body. Each reason
 
 #### ThinkingStatusRow
 
-Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: braille spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards.
+Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: braille spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards. An autopilot auto-approved call renders a muted `check-check` badge immediately before its own status icon (the `ToolCallItem.auto_approved` flag, stamped live on an `ApprovalDecision::Allow` and restored from a persisted `AutoApproval` note); the former "Auto-approved" notice card no longer exists, though escalated calls still post an anchored notice.
 
 > Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `thinking_summary`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
 
@@ -475,7 +475,7 @@ Circular button, `primary` color (idle) / `danger` color (running, acts as stop)
 
 #### ModelChip
 
-Dropdown chip showing current model name → [ModelMenu](#modelmenu) popup.
+Dropdown chip showing `provider · model · effort` (the reasoning-effort wire value, `high`/`max`) → [ModelMenu](#modelmenu) popup.
 
 > Source: `agent-ui/src/workspace.rs`
 

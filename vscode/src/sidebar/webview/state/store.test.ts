@@ -312,6 +312,62 @@ describe('transcript folding', () => {
     expect(toolCard(store, 't1')?.isError).toBe(true);
   });
 
+  it('approval_decision allow stamps the tool card badge; ask and unknown ids pass', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' }),
+    );
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+
+    // The badge rides the card through the streamed output and the final
+    // result, which rebuild the tool object in place.
+    store.dispatch(event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: 'ok\n' }));
+    store.dispatch(
+      event({ type: 'tool_result', sessionId: 's', id: 't1', output: 'done', is_error: false }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
+
+    // An `ask` verdict leaves the card untouched (the authorization card
+    // surfaces the escalation); an unknown id spawns no stub.
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 'ghost',
+        tool_name: 'bash',
+        tool_title: 'rm',
+        verdict: 'allow',
+      }),
+    );
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't2', name: 'bash', title: 'pwd', status: 'running' }),
+    );
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't2',
+        tool_name: 'bash',
+        tool_title: 'pwd',
+        verdict: 'ask',
+        reason: 'risky',
+      }),
+    );
+    expect(toolCard(store, 't2')?.autoApproved).toBeUndefined();
+    expect(thread(store)?.items.find((i) => i.kind === 'tool' && i.id === 'ghost')).toBeUndefined();
+  });
+
   it('adds authorization cards and removes them on decision', () => {
     const store = startSession();
     store.dispatch(
@@ -789,6 +845,47 @@ describe('wireMessagesToTranscriptItems', () => {
         tool: expect.objectContaining({ id: 'nope', name: 'read', status: 'completed' }),
       }),
     ]);
+  });
+
+  it('stamps auto-approved badges from the thread_history id set', () => {
+    const messages = [
+      wire({
+        id: 'a1',
+        content: [
+          {
+            ToolUse: {
+              id: 'tu1',
+              name: 'bash',
+              raw_input: '{}',
+              input: {},
+              is_input_complete: true,
+              thought_signature: null,
+            },
+          },
+        ],
+      }),
+      wire({
+        id: 't1',
+        role: 'system',
+        provenance: 'tool',
+        content: [
+          { ToolResult: { tool_use_id: 'tu1', tool_name: 'bash', is_error: false, content: 'ok' } },
+        ],
+      }),
+    ];
+    const items = wireMessagesToTranscriptItems(messages, new Set(['tu1']));
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'tool',
+      tool: expect.objectContaining({ id: 'tu1', autoApproved: true }),
+    });
+    // Without the set (older actors) the badge stays absent.
+    const bare = wireMessagesToTranscriptItems(messages);
+    expect(bare[0]).toMatchObject({
+      kind: 'tool',
+      tool: expect.objectContaining({ id: 'tu1' }),
+    });
+    expect((bare[0] as { tool: { autoApproved?: boolean } }).tool.autoApproved).toBeUndefined();
   });
 });
 

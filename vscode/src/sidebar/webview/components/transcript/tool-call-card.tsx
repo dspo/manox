@@ -57,7 +57,7 @@ export const ToolCallCard = memo(({ call, cwd, branch }: ToolCallCardProps) => {
     <div className="group relative">
       <CopyOnHover className="absolute top-0.5 right-7 z-10" text={output || call.title} />
       <Tool onOpenChange={handleOpenChange} open={open}>
-        <ToolHeader status={call.status} title={call.title || call.name} />
+        <ToolHeader autoApproved={call.autoApproved} status={call.status} title={call.title || call.name} />
         <ToolContent>
           {call.name === 'bash' && (
             <div className="font-code mb-1 text-xs italic">

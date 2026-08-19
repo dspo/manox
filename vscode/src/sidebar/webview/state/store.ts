@@ -555,6 +555,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           status,
           output: prev?.output ?? '',
           isError: status === 'failed' ? true : (prev?.isError ?? false),
+          autoApproved: prev?.autoApproved,
         };
       });
     }
@@ -566,6 +567,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         status: prev?.status ?? 'running',
         output: capOutputTail((prev?.output ?? '') + ev.chunk),
         isError: prev?.isError ?? false,
+        autoApproved: prev?.autoApproved,
       }));
     case 'tool_result':
       // An answered AskUserQuestion card absorbs its own result in place
@@ -595,6 +597,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
             : 'completed',
         output: capOutputTail(ev.output),
         isError: ev.is_error,
+        autoApproved: prev?.autoApproved,
       }));
     case 'tool_call_authorization': {
       // Upsert: an id already owned by a generic tool item (the
@@ -621,6 +624,20 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         ],
       };
     }
+    case 'approval_decision': {
+      // An `allow` verdict stamps the tool card's auto-approval badge; the
+      // card exists by construction (the live `tool_call` precedes the
+      // review). `ask` escalations ride the authorization card instead.
+      if (ev.verdict !== 'allow') return t;
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'tool' && i.id === ev.tool_call_id
+            ? { ...i, tool: { ...i.tool, autoApproved: true } }
+            : i,
+        ),
+      };
+    }
     case 'model_changed':
       return { ...t, currentModelId: ev.to };
     case 'reasoning_effort_changed':
@@ -632,7 +649,14 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
     case 'usage':
       return { ...t, usage: ev.usage, cost: ev.cost };
     case 'thread_history':
-      return { ...t, items: wireMessagesToTranscriptItems(ev.messages), loading: false };
+      return {
+        ...t,
+        items: wireMessagesToTranscriptItems(
+          ev.messages,
+          new Set(ev.auto_approved_tools ?? []),
+        ),
+        loading: false,
+      };
     case 'thread_info':
       return mergeInfo(t, ev.info);
     case 'branch':
@@ -811,8 +835,13 @@ function upsertToolItem(
 
 /** Pure mapping from restored wire messages to transcript items. ToolUse
  * blocks open a tool item; a later ToolResult with a matching id replaces
- * it. Images arrive as deflated placeholders (data stripped on the wire). */
-export function wireMessagesToTranscriptItems(messages: WireMessage[]): TranscriptItem[] {
+ * it. Images arrive as deflated placeholders (data stripped on the wire).
+ * `autoApproved` (the actor's `thread_history.auto_approved_tools`) stamps
+ * the matching tool cards with the check-check badge. */
+export function wireMessagesToTranscriptItems(
+  messages: WireMessage[],
+  autoApproved?: ReadonlySet<string>,
+): TranscriptItem[] {
   const items: TranscriptItem[] = [];
   const toolNames = new Map<string, string>();
   for (const msg of messages) {
@@ -876,6 +905,7 @@ export function wireMessagesToTranscriptItems(messages: WireMessage[]): Transcri
               status: 'completed',
               output: '',
               isError: false,
+              autoApproved: autoApproved?.has(block.ToolUse.id) || undefined,
             },
           });
         } else if ('Compaction' in block) {
@@ -904,6 +934,7 @@ export function wireMessagesToTranscriptItems(messages: WireMessage[]): Transcri
           status: result.is_error ? 'failed' : 'completed',
           output: capOutputTail(result.content),
           isError: result.is_error,
+          autoApproved: autoApproved?.has(result.tool_use_id) || undefined,
         };
         if (existing >= 0) {
           items[existing] = { kind: 'tool', id: result.tool_use_id, tool };

@@ -1032,28 +1032,41 @@ impl Workspace {
                     verdict,
                     ..
                 } => {
-                    // Show a brief autopilot decision record in the
-                    // MessageList, mirroring Codex's approval cell. Anchored
-                    // next to the tool call that triggered it, so approval
-                    // records cluster at their occurrence position instead of
-                    // piling at the conversation tail.
-                    let msg = match &verdict {
-                        agent::approval::ReviewVerdict::Allow => i18n::t_str(
-                            "workspace-approval-autopilot-allowed",
-                            &[("tool", tool_title.as_str())],
-                        )
-                        .to_string(),
-                        agent::approval::ReviewVerdict::Ask { reason } => i18n::t_str(
-                            "workspace-approval-autopilot-escalated",
-                            &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
-                        )
-                        .to_string(),
-                    };
-                    let anchor = this
-                        .conversation
-                        .read(cx)
-                        .notice_anchor_for_tool(tool_call_id, cx);
-                    this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
+                    match &verdict {
+                        // Auto-approved: no notice card. The badge rides the
+                        // tool-call row itself (check-check ahead of the
+                        // status icon); persist a marker note so a rebuild
+                        // reproduces it.
+                        agent::approval::ReviewVerdict::Allow => {
+                            let marked = this
+                                .conversation
+                                .update(cx, |c, cx| c.mark_auto_approved(tool_call_id, cx));
+                            if marked {
+                                this.record_ui_note(
+                                    agent::db::UiNoteKind::AutoApproval,
+                                    String::new(),
+                                    Some(tool_call_id.as_str()),
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                        }
+                        // Escalated for review: keep the anchored decision
+                        // record so the reason clusters at the tool call that
+                        // triggered it instead of piling at the tail.
+                        agent::approval::ReviewVerdict::Ask { reason } => {
+                            let msg = i18n::t_str(
+                                "workspace-approval-autopilot-escalated",
+                                &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
+                            )
+                            .to_string();
+                            let anchor = this
+                                .conversation
+                                .read(cx)
+                                .notice_anchor_for_tool(tool_call_id, cx);
+                            this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
+                        }
+                    }
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -3406,6 +3419,7 @@ impl Workspace {
                     streaming: false,
                     collapsed: false,
                     user_toggled: false,
+                    auto_approved: false,
                     panel: None,
                 },
                 role,
@@ -4461,12 +4475,13 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview`) to the
-    /// session sidecar. The anchor is the current turn's user message —
-    /// `None` before the first user message — so the rebuild can place the
-    /// note at the end of its turn (or next to its tool call when
-    /// `tool_call_id` is set). Best-effort: the live item already rendered
-    /// this turn; only the reload copy is at stake.
+    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview` /
+    /// `AutoApproval`) to the session sidecar. The anchor is the current
+    /// turn's user message — `None` before the first user message — so the
+    /// rebuild can place the note at the end of its turn (or next to its tool
+    /// call when `tool_call_id` is set; for `AutoApproval` the id names the
+    /// tool item the badge lands on). Best-effort: the live item already
+    /// rendered this turn; only the reload copy is at stake.
     ///
     /// The in-memory `Thread::ui_notes` Vec is the render source of truth
     /// (a background thread reclaimed via `attach_thread` rebuilds from the
@@ -4485,10 +4500,11 @@ impl Workspace {
             .last_user_message_id()
             .map(str::to_owned);
         let mut data = serde_json::json!({ "text": text });
-        // A tool-anchored notice (an approval decision record) carries the
-        // tool call id so `merge_ui_notes` can splice it next to the tool
-        // item on reload, matching the live placement. `data` is raw JSON —
-        // no schema change.
+        // A tool-anchored note (an escalated approval record or an
+        // auto-approval badge marker) carries the tool call id so
+        // `merge_ui_notes` can splice it next to — or stamp it onto — the
+        // tool item on reload, matching the live placement. `data` is raw
+        // JSON — no schema change.
         if let Some(id) = tool_call_id {
             data["tool_call_id"] = serde_json::Value::String(id.to_owned());
         }
@@ -4858,11 +4874,12 @@ impl Workspace {
 
     /// The pi-harness model selector. Reads the shared pi provider registry
     /// (the streaming source of truth): closed, a ghost button showing
-    /// `provider · model` with the model name tinted by wire api; open, a
-    /// PopupMenu of provider submenus.
+    /// `provider · model · effort` with the model name tinted by wire api;
+    /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
         let model = self.thread.read(cx).model().cloned();
+        let effort = self.thread.read(cx).reasoning_effort();
 
         let trigger = h_flex()
             .id("model-trigger")
@@ -4892,6 +4909,12 @@ impl Workspace {
                         .text_xs()
                         .text_color(model_color)
                         .child(agent::pi_providers::display_name(m))
+                        .into_any_element(),
+                    dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(effort.wire_value().to_string())
                         .into_any_element(),
                 ]
             } else {
