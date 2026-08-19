@@ -417,6 +417,10 @@ fn main() {
     // supervisor's per-process timeouts. The main thread is not a tokio worker
     // (gpui's `run` returned here), so `Handle::block_on` is safe. Only manox's
     // own children are signaled — a server the user ran elsewhere is untouched.
+    // ChromeUse: close the shared Chrome session so a launched (owned) Chrome
+    // process does not outlive manox; an attached browser is detached and
+    // left running.
+    agent::chrome_use::shutdown();
     match agent::runtime::try_handle() {
         Some(handle) => {
             handle.block_on(async {
