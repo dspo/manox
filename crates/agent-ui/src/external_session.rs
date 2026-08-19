@@ -10,12 +10,15 @@
 //! is written at spawn, deleted only when the session is explicitly closed, and
 //! re-scanned at startup. A sidecar left on disk is therefore exactly an
 //! *unclosed* session — the user re-opens it from the sidebar and manox
-//! re-spawns the CLI with its resume flag (`claude --continue` / `codex resume
-//! --last` / `copilot --continue`), so the CLI's own on-disk conversation
-//! storage picks the conversation back up. Plain PTY shells are never
+//! re-spawns the CLI targeting the sidecar's captured CLI session id
+//! (`claude --resume <id>` / `codex resume <id>`; the CLI's own picker when no
+//! id was captured, `copilot --continue`), so the CLI's on-disk conversation
+//! storage picks the exact conversation back up. Plain PTY shells are never
 //! persisted (nothing to resume).
 
+use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -281,6 +284,10 @@ pub struct ResumeSidecar {
     pub model: String,
     /// The agent's last mirrored OSC title, if it ever set one.
     pub title: Option<String>,
+    /// The CLI's own session id (claude conversation UUID / codex session
+    /// UUID) captured from the CLI's on-disk conversation storage while the
+    /// session runs; resume targets it exactly. `None` until captured.
+    pub cli_session_id: Option<String>,
 }
 
 impl ResumeSidecar {
@@ -363,15 +370,21 @@ pub(crate) fn list_sidecars_in(dir: &Path) -> Vec<ResumeSidecar> {
     out
 }
 
-/// CLI resume flags per agent, appended after the agent's configured args via
-/// `cx::AgentBuilder::passthrough`. All three resume the most recent
-/// conversation the CLI recorded for the launch cwd (claude / copilot) or the
-/// most recent recorded session (codex), which after an app exit is exactly the
-/// unclosed one.
-pub(crate) fn resume_args(agent_id: &str) -> Vec<String> {
+/// CLI resume args per agent. With a captured CLI session id the resume
+/// targets exactly that conversation; without one the CLI shows its
+/// interactive picker — resume never silently guesses. copilot has no
+/// verifiable targeted-resume flag and keeps `--continue`.
+pub(crate) fn resume_args(agent_id: &str, cli_session_id: Option<&str>) -> Vec<String> {
     match agent_id {
-        "claude" | "copilot" => vec!["--continue".into()],
-        "codex" => vec!["resume".into(), "--last".into()],
+        "claude" => match cli_session_id {
+            Some(id) => vec!["--resume".into(), id.into()],
+            None => vec!["--resume".into()],
+        },
+        "codex" => match cli_session_id {
+            Some(id) => vec!["resume".into(), id.into()],
+            None => vec!["resume".into()],
+        },
+        "copilot" => vec!["--continue".into()],
         _ => Vec::new(),
     }
 }
@@ -392,6 +405,132 @@ pub(crate) fn merge_external_summaries(
             .filter(|r| !live_ids.contains(&r.id))
             .map(|r| r.summary()),
     );
+    out
+}
+
+/// Slug Claude Code names a project directory with under `~/.claude/projects/`:
+/// the absolute path with every non-alphanumeric ASCII char replaced by `-`
+/// (observed on disk: `/`, `.` and non-ASCII chars all map to `-`).
+pub(crate) fn claude_project_slug(abs_path: &str) -> String {
+    abs_path
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// `~/.claude/projects/<slug>` for a launch cwd, canonicalized first — Claude
+/// records the kernel-resolved cwd. `None`: no HOME or canonicalize failed
+/// (cwd gone).
+pub(crate) fn claude_project_dir_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    claude_project_dir_for_cwd_in(cwd, &agent::paths::home_dir()?)
+}
+
+/// [`claude_project_dir_for_cwd`] against an explicit home — the test seam.
+pub(crate) fn claude_project_dir_for_cwd_in(cwd: &Path, home: &Path) -> Option<PathBuf> {
+    let abs = fs::canonicalize(cwd).ok()?;
+    let slug = claude_project_slug(abs.to_str()?);
+    Some(home.join(".claude").join("projects").join(slug))
+}
+
+/// `~/.codex/sessions` — the codex rollout root. cx symlinks the real
+/// `~/.codex/sessions` into each launch's CODEX_HOME, so rollouts from
+/// cx-launched codex land here. `None`: no HOME.
+pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
+    Some(agent::paths::home_dir()?.join(".codex").join("sessions"))
+}
+
+/// Names of `*.jsonl` regular files directly in `dir` — subdirectories are
+/// excluded (claude nests subagent transcripts under `<uuid>/subagents/`).
+/// Missing dir → empty.
+pub(crate) fn list_top_level_jsonl(dir: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+    for e in entries.flatten() {
+        let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if is_file && e.path().extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            out.insert(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
+/// Names of `*.jsonl` files anywhere under `root` (recursive — codex nests
+/// rollouts in `YYYY/MM/DD/`). Symlinked entries are skipped. Missing dir →
+/// empty.
+pub(crate) fn list_nested_jsonl(root: &Path) -> HashSet<String> {
+    fn walk(dir: &Path, out: &mut HashSet<String>) {
+        let entries = match fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for e in entries.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() {
+                walk(&e.path(), out);
+            } else if t.is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
+            {
+                out.insert(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    walk(root, &mut out);
+    out
+}
+
+/// `<uuid>.jsonl` → `<uuid>` (a claude conversation file name); `None` for
+/// any other extension or an empty stem.
+pub(crate) fn claude_session_id_from_file_name(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".jsonl")?;
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+/// The session id recorded in a codex rollout's first `session_meta` line
+/// (`payload.id`, then `payload.session_id`). Stable across resume forks — a
+/// resumed session writes a new rollout file with the same id. `None`:
+/// unreadable or the first line is not a `session_meta`.
+pub(crate) fn codex_session_id_from_rollout(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    let v: serde_json::Value = serde_json::from_str(first.trim_end()).ok()?;
+    if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = v.get("payload")?;
+    payload
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+/// The first `"cwd":"…"` value in the leading `cap` bytes of a claude jsonl —
+/// the cwd rides on the early message lines; the mode/permission-mode head
+/// lines carry none. Scans naively to the next `"` after the key; paths with a
+/// literal `"` are out of scope. `None` when absent.
+pub(crate) fn claude_cwd_from_file_head(path: &Path, cap: usize) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; cap];
+    let n = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let key = "\"cwd\":\"";
+    let start = text.find(key)? + key.len();
+    let end = text[start..].find('"')? + start;
+    Some(text[start..end].to_string())
+}
+
+/// Names in `current` absent from `known`, sorted for determinism.
+pub(crate) fn new_file_names(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = current.difference(known).cloned().collect();
+    out.sort();
     out
 }
 
@@ -471,13 +610,15 @@ mod tests {
             provider: "DeepSeek".into(),
             model: "deepseek-v4-flash[1m]".into(),
             title: None,
+            cli_session_id: None,
         }
     }
 
     #[test]
     fn sidecar_roundtrips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar = sample_sidecar();
+        let mut sidecar = sample_sidecar();
+        sidecar.cli_session_id = Some("conv-uuid-1".into());
         write_sidecar_in(dir.path(), &sidecar).expect("write");
         let listed = list_sidecars_in(dir.path());
         assert_eq!(listed.len(), 1);
@@ -486,11 +627,31 @@ mod tests {
         assert_eq!(listed[0].cwd, "/repo");
         assert_eq!(listed[0].provider, "DeepSeek");
         assert_eq!(listed[0].model, "deepseek-v4-flash[1m]");
+        assert_eq!(listed[0].cli_session_id.as_deref(), Some("conv-uuid-1"));
         remove_sidecar_in(dir.path(), &sidecar.id);
         assert!(
             list_sidecars_in(dir.path()).is_empty(),
             "removed sidecar is gone"
         );
+    }
+
+    /// A sidecar written before capture existed lacks the `cli_session_id`
+    /// key entirely; serde's missing-`Option`-field semantics yield `None` —
+    /// such a row resumes through the CLI's picker, not an error.
+    #[test]
+    fn sidecar_without_cli_session_id_key_parses_as_none() {
+        let json = r#"{
+            "id": "external:claude:abc",
+            "agent_id": "claude",
+            "cwd": "/repo",
+            "project": null,
+            "created_at": 7,
+            "provider": "p",
+            "model": "m",
+            "title": null
+        }"#;
+        let sidecar: ResumeSidecar = serde_json::from_str(json).expect("parse");
+        assert_eq!(sidecar.cli_session_id, None);
     }
 
     #[test]
@@ -575,11 +736,15 @@ mod tests {
     }
 
     #[test]
-    fn resume_args_map_per_agent() {
-        assert_eq!(resume_args("claude"), vec!["--continue"]);
-        assert_eq!(resume_args("copilot"), vec!["--continue"]);
-        assert_eq!(resume_args("codex"), vec!["resume", "--last"]);
-        assert!(resume_args("unknown").is_empty());
+    fn resume_args_target_by_captured_id_with_picker_fallback() {
+        assert_eq!(resume_args("claude", Some("abc")), vec!["--resume", "abc"]);
+        assert_eq!(resume_args("claude", None), vec!["--resume"]);
+        assert_eq!(resume_args("codex", Some("abc")), vec!["resume", "abc"]);
+        assert_eq!(resume_args("codex", None), vec!["resume"]);
+        assert_eq!(resume_args("copilot", Some("abc")), vec!["--continue"]);
+        assert_eq!(resume_args("copilot", None), vec!["--continue"]);
+        assert!(resume_args("unknown", Some("abc")).is_empty());
+        assert!(resume_args("unknown", None).is_empty());
     }
 
     #[test]
@@ -604,5 +769,136 @@ mod tests {
         assert_eq!(resumable_rows.len(), 1);
         assert_eq!(resumable_rows[0].id, "external:copilot:dead");
         assert_eq!(resumable_rows[0].kind, SessionKind::GithubCopilot);
+    }
+
+    #[test]
+    fn claude_project_slug_replaces_every_non_alphanumeric() {
+        assert_eq!(claude_project_slug("/repo"), "-repo");
+        assert_eq!(
+            claude_project_slug("/Users/x/.config/cx"),
+            "-Users-x--config-cx"
+        );
+        // `/` and each of the four non-ASCII chars slug to one `-` each.
+        assert_eq!(claude_project_slug("/repo/花束标注"), "-repo-----");
+    }
+
+    #[test]
+    fn claude_project_dir_for_cwd_slugs_the_canonical_path() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd_root = tempfile::tempdir().unwrap();
+        let cwd = cwd_root.path().join("a.b");
+        fs::create_dir_all(&cwd).unwrap();
+        let dir = claude_project_dir_for_cwd_in(&cwd, home.path()).expect("resolve");
+        let canonical = fs::canonicalize(&cwd).unwrap();
+        let expected_name = claude_project_slug(canonical.to_str().unwrap());
+        assert_eq!(dir.file_name().unwrap().to_str().unwrap(), expected_name);
+        assert!(dir.starts_with(home.path().join(".claude").join("projects")));
+        assert!(
+            dir.to_str().unwrap().ends_with("-a-b"),
+            "a dot in the cwd name slugs to a dash: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn claude_session_id_from_file_name_strips_jsonl() {
+        assert_eq!(
+            claude_session_id_from_file_name("abc.jsonl").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(claude_session_id_from_file_name("abc.txt"), None);
+        assert_eq!(claude_session_id_from_file_name(".jsonl"), None);
+    }
+
+    #[test]
+    fn jsonl_listings_top_level_vs_nested() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.jsonl"), "x").unwrap();
+        fs::write(root.path().join("skip.txt"), "x").unwrap();
+        let sub = root.path().join("sub");
+        fs::create_dir_all(sub.join("deeper")).unwrap();
+        fs::write(sub.join("b.jsonl"), "x").unwrap();
+        fs::write(sub.join("deeper").join("c.jsonl"), "x").unwrap();
+        assert_eq!(
+            list_top_level_jsonl(root.path()),
+            HashSet::from(["a.jsonl".to_string()])
+        );
+        assert_eq!(
+            list_nested_jsonl(root.path()),
+            HashSet::from([
+                "a.jsonl".to_string(),
+                "b.jsonl".to_string(),
+                "c.jsonl".to_string()
+            ])
+        );
+        assert!(list_top_level_jsonl(&root.path().join("missing")).is_empty());
+        assert!(list_nested_jsonl(&root.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn new_file_names_diffs_and_sorts() {
+        let known = HashSet::from(["a.jsonl".to_string(), "b.jsonl".to_string()]);
+        let current = HashSet::from([
+            "b.jsonl".to_string(),
+            "d.jsonl".to_string(),
+            "c.jsonl".to_string(),
+        ]);
+        assert_eq!(new_file_names(&known, &current), vec!["c.jsonl", "d.jsonl"]);
+        assert!(new_file_names(&current, &current).is_empty());
+    }
+
+    #[test]
+    fn codex_session_id_from_rollout_reads_session_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let by_id = dir.path().join("r1.jsonl");
+        fs::write(
+            &by_id,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"sess-A\"}}\nrest\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_session_id_from_rollout(&by_id).as_deref(),
+            Some("sess-A")
+        );
+        let by_session_id = dir.path().join("r2.jsonl");
+        fs::write(
+            &by_session_id,
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"zed-1\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_session_id_from_rollout(&by_session_id).as_deref(),
+            Some("zed-1")
+        );
+        let not_meta = dir.path().join("r3.jsonl");
+        fs::write(&not_meta, "{\"type\":\"turn_context\",\"payload\":{}}\n").unwrap();
+        assert_eq!(codex_session_id_from_rollout(&not_meta), None);
+        assert_eq!(
+            codex_session_id_from_rollout(&dir.path().join("missing.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_cwd_from_file_head_finds_first_cwd_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"mode\",\"sessionId\":\"s\"}\n{\"type\":\"user\",\"cwd\":\"/x/y\",\"sessionId\":\"s\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_cwd_from_file_head(&path, 4096).as_deref(),
+            Some("/x/y")
+        );
+        assert_eq!(
+            claude_cwd_from_file_head(&path, 30),
+            None,
+            "a cap before the cwd key finds nothing"
+        );
+        assert_eq!(
+            claude_cwd_from_file_head(&dir.path().join("missing"), 4096),
+            None
+        );
     }
 }
