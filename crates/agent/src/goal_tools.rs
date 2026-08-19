@@ -54,9 +54,18 @@ pub struct GoalBridge {
     fold: Mutex<GoalFoldCache>,
     /// Process-local continuation authority (DSH activation): whether the
     /// round driver may queue another round. Never inherited on restore.
+    ///
+    /// Relaxed ordering is sufficient because every reader and writer runs
+    /// on the actor's single thread (facade writes go through the same
+    /// bridge methods, serialized by the fold mutex) — the "arm then gate
+    /// immediately" cross-callsite visibility depends on that single-threaded
+    /// drive model. Do not upgrade to SeqCst: it buys nothing and hides the
+    /// invariant.
     armed: AtomicBool,
     /// Set while a goal round run is in flight; tools read it to decide the
-    /// closing wrapup for `complete`/`blocked` reports.
+    /// closing wrapup for `complete`/`blocked` reports. Same Relaxed
+    /// rationale as `armed`: the engine sets it and settles it on the actor
+    /// thread, and tool reads happen inside a run that only the actor drives.
     goal_round_active: AtomicBool,
 }
 

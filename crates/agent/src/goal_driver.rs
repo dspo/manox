@@ -157,7 +157,11 @@ pub async fn maybe_queue_goal_round(
     };
     // After compaction the transcript may end on a summary user message;
     // `continue_` only drains queued messages when the tail is an assistant
-    // message, so route through the steering queue in that case.
+    // message, so route through the steering queue in that case. The steer
+    // queue is shared with user steers — admission at settle is still
+    // unambiguous because the round's `{round, goal_id, revision}` triple
+    // in `details` is matched against the reserved identity, never against
+    // queue position or ordering.
     let tail_is_assistant = matches!(
         session.harness_messages().last(),
         Some(AgentMessage::Assistant { .. })

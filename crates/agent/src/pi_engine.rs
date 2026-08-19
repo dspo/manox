@@ -147,7 +147,10 @@ struct EngineState {
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
     /// Fencing bit: at most one goal round queued at a time. Set by the gate
-    /// before `follow_up`, cleared at that round's settle.
+    /// before `follow_up`, cleared at that round's settle. Relaxed ordering
+    /// is safe: set and clear both happen on the actor's single thread, and
+    /// the goal gate never runs concurrently with itself (see the `armed`
+    /// rationale in `GoalBridge`).
     goal_continuation_reserved: AtomicBool,
     /// Identity of the reserved round, for the settle-time admission check.
     goal_continuation_round: Mutex<Option<crate::goal_driver::GoalRoundIdentity>>,
