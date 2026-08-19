@@ -38,6 +38,7 @@ pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
 pub mod runtime;
+pub mod sailor_manager;
 pub mod sandbox;
 pub mod settings;
 pub mod skill;

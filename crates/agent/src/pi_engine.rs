@@ -462,12 +462,31 @@ impl ThreadEngine for PiEngine {
 
 // ── The pi actor ───────────────────────────────────────────────────────────
 
+/// Infer a capability tag for an agent definition from its declared tool
+/// allowlist. The host snapshot carries Read/Grep/Glob/Ls (read),
+/// Write/Edit (write), and Bash (exec); `tools: []` means the full
+/// snapshot. The tag rides the `AgentToolDescription` template so the model
+/// knows what each subagent can do before dispatching.
+fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
+    if def.tools.is_empty() {
+        return "write+bash";
+    }
+    let has_write = def.tools.iter().any(|t| t == "Write" || t == "Edit");
+    let has_bash = def.tools.iter().any(|t| t == "Bash");
+    match (has_write, has_bash) {
+        (true, true) => "write+bash",
+        (true, false) => "write",
+        (false, true) => "bash",
+        (false, false) => "read-only",
+    }
+}
+
 /// Minimal builtin coding-agent prompt. Deliberately not the manox
 /// `system_prompt` assembly — that belongs to the manox harness.
 fn system_prompt(cwd: &Path) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d");
     let mut prompt = format!(
-        "You are Manox Pi, a coding agent running inside the manox app on the pi harness.\n\
+        "You are the Captain, the main agent running inside the manox app on the pi harness.\n\
          Working directory: {cwd}\n\
          Date: {date}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
@@ -480,6 +499,30 @@ fn system_prompt(cwd: &Path) -> String {
     // system prompt, which rendered `skill::summaries_or_empty()` into its
     // template; the pi path has no skill tool, so the wording only promises
     // what exists.
+    prompt.push_str("\n\n## Subagents & parallel work\n");
+    prompt.push_str(
+        "You are the Captain. You can dispatch subagents via the `Agent` tool — each runs \
+         in its own fresh context (no parent history) and returns a final summary. The \
+         `Agent` tool description lists the live set of subagent types and their capability \
+         tags. Two are built in:\n\
+         - `Explore` (read-only): locates code by file, symbol, or keyword and returns \
+         conclusions. It cannot write files or run commands — do not delegate write/exec \
+         work to it.\n\
+         - `Sailor` (write+bash): a general-purpose coding worker that reads, writes, and \
+         edits files and runs shell commands (including cargo/clippy/test), autonomously \
+         completing a focused task and returning a concise summary.\n\n\
+         Prefer parallel subagents over serial self-work. For splittable tasks — reviewing \
+         multiple PRs, modifying independent files, exploring alternatives — emit multiple \
+         `Agent` calls in one turn so they run concurrently. Pass \
+         `isolation: \"worktree\"` when a subagent needs its own working tree (builds won't \
+         collide, edits won't clash).\n\n\
+         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use `TeamCreate` \
+         only for long-lived work that needs a shared task list and peer messaging between \
+         members; for independent parallel subtasks, Sailors are lighter and return \
+         directly.\n\n\
+         Each subagent starts from a blank context, so pin any contract it must honor \
+         (exact paths, signatures, gate requirements) directly in the prompt.",
+    );
     let summaries = crate::skill::summaries_or_empty();
     if !summaries.is_empty() {
         prompt.push_str("\n\n## Available skills\n");
@@ -489,6 +532,89 @@ fn system_prompt(cwd: &Path) -> String {
         }
     }
     prompt
+}
+
+/// Host wrapper around [`SubagentTool`] that routes general-purpose
+/// (write+bash) subagents through [`SailorManager`] for async dispatch +
+/// completion notification, while read-only subagents (Explore) stay on the
+/// kernel's synchronous path. Routing is by capability, not name, so a
+/// user/plugin definition declaring a write/bash toolset is also async.
+struct SailorRoutingTool {
+    inner: Arc<SubagentTool>,
+    registry: Arc<pi::ext_point_agent::AgentRegistry>,
+    sailor: Arc<crate::sailor_manager::SailorManager>,
+}
+
+impl SailorRoutingTool {
+    /// Whether `params` selects a subagent that should run asynchronously.
+    /// Any definition whose capability is not `read-only` (i.e. it can write
+    /// or run bash) goes through `SailorManager`; read-only ones stay sync.
+    fn is_async_dispatch(&self, params: &serde_json::Value) -> bool {
+        params["subagent_type"]
+            .as_str()
+            .and_then(|t| self.registry.get(t))
+            .map(subagent_capability)
+            .is_some_and(|c| c != "read-only")
+    }
+
+    fn split_params(&self, params: serde_json::Value) -> (String, String, Option<String>) {
+        let st = params["subagent_type"].as_str().unwrap_or("").to_string();
+        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+        let isolation = params["isolation"].as_str().map(String::from);
+        (st, prompt, isolation)
+    }
+}
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for SailorRoutingTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        false
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if self.is_async_dispatch(&params) {
+            let (st, prompt, isolation) = self.split_params(params);
+            self.sailor.dispatch(st, prompt, isolation, signal).await
+        } else {
+            self.inner.execute(tool_call_id, params, signal, ctx).await
+        }
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if self.is_async_dispatch(&params) {
+            let (st, prompt, isolation) = self.split_params(params);
+            self.sailor.dispatch(st, prompt, isolation, signal).await
+        } else {
+            self.inner
+                .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+                .await
+        }
+    }
 }
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
@@ -758,13 +884,35 @@ fn build_tools(
         // (`<plugin>/agents/`, namespaced) definitions layer over the
         // built-ins; same-name user files override built-ins.
         crate::agent_defs::register_user_and_plugin(&mut registry);
+        // Render the Agent tool description against the live registry so the
+        // model sees the available `subagent_type` values (Explore, Sailor,
+        // user/plugin defs) with capability tags — no filesystem probing.
+        // Tool descriptions are model-facing English, so always `Language::En`.
+        let subagent_descriptions: Vec<crate::prompt::SubagentTypeData> = registry
+            .all()
+            .iter()
+            .map(|def| crate::prompt::SubagentTypeData {
+                name: def.name.clone(),
+                capability: subagent_capability(def),
+                description: def.description.clone(),
+            })
+            .collect();
+        let registry = Arc::new(registry);
         let subagent = SubagentTool::new(
-            Arc::new(registry),
+            registry.clone(),
             vec![
                 Arc::new(pi_extensions::read::SelectorReadTool::new()),
                 Arc::new(pi::tools::grep::GrepTool),
                 Arc::new(pi::tools::glob::GlobTool),
                 Arc::new(pi::tools::ls::LsTool),
+                // Write/exec axis: definitions that opt into the full
+                // snapshot (e.g. Sailor, `tools: []`) get these; read-only
+                // definitions (Explore) name an explicit allowlist that
+                // `select_tools` filters against, so they never reach a
+                // read-only subagent.
+                Arc::new(pi::tools::bash::BashTool::new(None)),
+                Arc::new(pi::tools::write::WriteTool),
+                Arc::new(pi::tools::edit::EditTool),
             ],
         )
         .with_model_runtime(runtime.clone())
@@ -772,7 +920,45 @@ fn build_tools(
         // Resolve agent-definition `model` overrides against the live
         // registry (registration has landed before session assembly).
         .with_provider_registry(crate::pi_providers::global());
-        tools.push(Arc::new(subagent));
+        let subagent = match crate::prompt::render(
+            crate::prompt::PromptTemplate::AgentToolDescription,
+            crate::language::Language::En,
+            &crate::prompt::AgentToolDescriptionData {
+                subagents: subagent_descriptions,
+            },
+        ) {
+            Ok(desc) => subagent.with_description(desc),
+            Err(e) => {
+                tracing::warn!("Agent tool description render failed: {e}");
+                subagent
+            }
+        };
+        // Wrap the SubagentTool so write/bash subagents (Sailor + any
+        // user/plugin def with that capability) dispatch asynchronously
+        // through SailorManager; read-only subagents (Explore) stay on the
+        // kernel's synchronous path. The manager owns an env-backed
+        // ToolContext (cwd = the session's project root) so the spawned
+        // child run needs no borrow of the caller's context.
+        let subagent = Arc::new(subagent);
+        let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
+            cwd.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        ));
+        let sailor = Arc::new(crate::sailor_manager::SailorManager::new(
+            subagent.clone(),
+            sailor_ctx,
+            notice_tx.clone(),
+            // owner_thread_id is assigned at `.with_session_id` (after
+            // build_tools); the async Sailor is attributed for lifecycle
+            // snapshots but per-thread listing is best-effort here.
+            String::new(),
+        ));
+        tools.push(Arc::new(SailorRoutingTool {
+            inner: subagent,
+            registry,
+            sailor,
+        }));
     }
     (
         tools,
@@ -4661,5 +4847,46 @@ mod tests {
         // id for a message the mapping would not emit.
         let history = adapt::harness_messages_to_messages(&messages[..1]);
         let _ = request_attribution(&history, &messages);
+    }
+
+    #[test]
+    fn agent_tool_description_lists_built_in_subagents_with_capability() {
+        let mut registry = pi::ext_point_agent::AgentRegistry::new();
+        pi_extensions::agents::register_defaults(&mut registry);
+        let subagents: Vec<crate::prompt::SubagentTypeData> = registry
+            .all()
+            .iter()
+            .map(|def| crate::prompt::SubagentTypeData {
+                name: def.name.clone(),
+                capability: subagent_capability(def),
+                description: def.description.clone(),
+            })
+            .collect();
+        let rendered = crate::prompt::render(
+            crate::prompt::PromptTemplate::AgentToolDescription,
+            crate::language::Language::En,
+            &crate::prompt::AgentToolDescriptionData { subagents },
+        )
+        .expect("AgentToolDescription renders");
+        assert!(
+            rendered.contains("Explore (read-only)"),
+            "Explore read-only tag present: {rendered}"
+        );
+        assert!(
+            rendered.contains("Sailor (write+bash)"),
+            "Sailor write+bash tag present: {rendered}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_mentions_captain_and_sailors() {
+        let prompt = system_prompt(std::path::Path::new("/tmp"));
+        assert!(prompt.contains("Captain"), "names the Captain: {prompt}");
+        assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
+        assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
+        assert!(
+            prompt.contains("multiple `Agent(Sailor)` calls over forming a `Team`"),
+            "prefers Sailors over Team: {prompt}"
+        );
     }
 }

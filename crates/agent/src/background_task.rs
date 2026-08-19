@@ -54,6 +54,12 @@ pub enum TaskKind {
     MonitorCommand,
     MonitorWebSocket,
     BackgroundBash,
+    /// An asynchronously-dispatched Sailor subagent (general-purpose coding
+    /// worker) running in a background pi session. Completion is delivered to
+    /// the Captain via `BackendNotice::SailorCompleted`; the model polls
+    /// progress via `BashOutput` / cancels via `TaskStop`, like other
+    /// background tasks.
+    Sailor,
 }
 
 /// The terminal status of a background task.
@@ -140,6 +146,7 @@ pub fn format_event_for_model(event: &TaskEvent) -> String {
         TaskKind::MonitorCommand => "Monitor (command)",
         TaskKind::MonitorWebSocket => "Monitor (WebSocket)",
         TaskKind::BackgroundBash => "Background Bash",
+        TaskKind::Sailor => "Sailor",
     };
     let body = match &event.event {
         TaskEventKind::StateChanged => return String::new(),
@@ -908,6 +915,7 @@ fn next_id(kind: &TaskKind) -> TaskId {
         TaskKind::MonitorCommand => "monitor",
         TaskKind::MonitorWebSocket => "ws",
         TaskKind::BackgroundBash => "bash",
+        TaskKind::Sailor => "sailor",
     };
     TaskId::new(prefix, n)
 }
@@ -1067,6 +1075,7 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
                 TaskKind::MonitorCommand => "monitor (command)",
                 TaskKind::MonitorWebSocket => "monitor (WebSocket)",
                 TaskKind::BackgroundBash => "background bash",
+                TaskKind::Sailor => "sailor (subagent)",
             };
             lines.push(format!(
                 "  {id} — {kind_str} — \"{desc}\" (events: {n})",
