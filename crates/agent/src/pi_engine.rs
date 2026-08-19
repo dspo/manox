@@ -2943,14 +2943,19 @@ async fn persist_title(
     session_path: &Path,
     title: String,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+    // Probe first (unlocked read): persisting an unchanged title would only
+    // churn the sidecar; the locked re-read inside `update` makes any race
+    // benign (title is last-write-wins either way).
+    let current = pi_extensions::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
-    if meta.title.as_deref() == Some(title.as_str()) {
+    if current.title.as_deref() == Some(title.as_str()) {
         return Ok(());
     }
-    meta.title = Some(title);
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.title = Some(title.clone());
+    })
+    .await
 }
 
 /// The approval mode persisted in a session's sidecar; fresh sessions
@@ -3000,12 +3005,11 @@ async fn write_plan_sidecar(
     session_path: &Path,
     plan: &crate::plan_mode::PlanSessionState,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.plan_mode = plan.enabled().then_some(true);
-    meta.plan_file = plan.plan_file();
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.plan_mode = plan.enabled().then_some(true);
+        meta.plan_file = plan.plan_file();
+    })
+    .await
 }
 
 async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> bool {
@@ -3055,11 +3059,10 @@ async fn write_worktree_sidecar(
     session_path: &Path,
     worktree: Option<pi_extensions::session_meta::WorktreeMeta>,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.worktree = worktree;
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.worktree = worktree;
+    })
+    .await
 }
 
 /// Re-sync the active-worktree state after a session switch: the binding
@@ -3085,11 +3088,10 @@ async fn write_plan_review_pending_sidecar(
     session_path: &Path,
     pending: bool,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.plan_review_pending = pending.then_some(true);
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.plan_review_pending = pending.then_some(true);
+    })
+    .await
 }
 
 async fn write_plan_snapshot_sidecar(
@@ -3097,11 +3099,10 @@ async fn write_plan_snapshot_sidecar(
     session_path: &Path,
     snapshot: Option<serde_json::Value>,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.plan_snapshot = snapshot;
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.plan_snapshot = snapshot;
+    })
+    .await
 }
 
 /// Re-sync plan mode after a session switch: the flag follows the opened
@@ -3127,15 +3128,14 @@ async fn write_approval_mode_sidecar(
     session_path: &Path,
     mode: ApprovalMode,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
     let raw = serde_json::to_value(mode)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "autopilot".to_string());
-    meta.approval_mode = Some(raw);
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.approval_mode = Some(raw);
+    })
+    .await
 }
 
 /// The reasoning effort persisted in a session's sidecar; fresh sessions
@@ -3158,11 +3158,10 @@ async fn write_reasoning_effort_sidecar(
     session_path: &Path,
     effort: ReasoningEffort,
 ) -> Result<(), anyhow::Error> {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.reasoning_effort = Some(effort.wire_value().to_string());
-    pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await
+    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.reasoning_effort = Some(effort.wire_value().to_string());
+    })
+    .await
 }
 
 /// Parse the facade's effort knob wire value; other levels (e.g. "off")
@@ -3222,14 +3221,18 @@ async fn load_registry_displays(
 /// the wrong user prompt on the next `sync_history`. New registry turns after
 /// the compaction persist fresh ordinals over the rebuilt sequence.
 async fn clear_registry_displays(sessions_dir: &Path, session_path: &Path) {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+    // Probe first: clearing an empty map would only churn the sidecar.
+    let meta = pi_extensions::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
     if meta.registry_displays.is_empty() {
         return;
     }
-    meta.registry_displays.clear();
-    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+    if let Err(err) = pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.registry_displays.clear();
+    })
+    .await
+    {
         tracing::warn!(error = %err, "failed to clear registry display text");
     }
 }
@@ -3270,11 +3273,11 @@ fn attach_registry_displays(
 /// Persist the bound project in the session sidecar so the sidebar groups
 /// the session under its project folder across restarts.
 async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
-    let mut meta = pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .unwrap_or_default();
-    meta.project = Some(project.to_string_lossy().to_string());
-    if let Err(err) = pi_extensions::session_meta::save(sessions_dir, session_path, &meta).await {
+    if let Err(err) = pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+        meta.project = Some(project.to_string_lossy().to_string());
+    })
+    .await
+    {
         tracing::warn!(error = %err, "failed to persist session project");
     }
 }

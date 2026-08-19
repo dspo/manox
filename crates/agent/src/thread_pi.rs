@@ -1895,12 +1895,11 @@ fn persist_registry_display_spawn(
     display: String,
 ) -> tokio::task::JoinHandle<()> {
     crate::runtime::handle().spawn(async move {
-        let mut meta = pi_extensions::session_meta::load(&sessions_dir, &session_path)
-            .await
-            .unwrap_or_default();
-        meta.registry_displays.insert(ordinal, display);
         if let Err(err) =
-            pi_extensions::session_meta::save(&sessions_dir, &session_path, &meta).await
+            pi_extensions::session_meta::update(&sessions_dir, &session_path, |meta| {
+                meta.registry_displays.insert(ordinal, display);
+            })
+            .await
         {
             tracing::warn!(error = %err, "failed to persist registry display text");
         }

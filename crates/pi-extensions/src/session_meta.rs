@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -118,12 +119,65 @@ pub async fn save(
 ) -> Result<(), anyhow::Error> {
     let path = meta_path(session_dir, session_path);
     let bytes = serde_json::to_vec_pretty(meta)?;
-    let tmp = path.with_extension("meta.json.tmp");
+    // `<id>.meta.json.tmp`: `with_extension` would only replace the last
+    // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default()
+    ));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(())
 }
 
+/// Per-sidecar write lock keyed by sidecar path: every load→modify→save
+/// cycle takes it before touching the file, so concurrent writers (archive /
+/// pin / unread, engine title / approval-mode persists, ui_notes snapshots)
+/// can never interleave and clobber each other's fields. The map is unbounded
+/// by design — one entry per session ever written.
+static WRITE_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn write_lock_for(session_dir: &Path, session_path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let key = meta_path(session_dir, session_path)
+        .to_string_lossy()
+        .into_owned();
+    let map = WRITE_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Read-modify-write a sidecar under the per-session lock. A corrupt file
+/// (load error) is treated as fresh and overwritten: the sidecar is
+/// best-effort UI state and the transcript is authoritative, so the write
+/// repairs the file while persisting the mutation. A missing file loads as
+/// the fresh-session default and materializes on first write.
+pub async fn update<F>(
+    session_dir: &Path,
+    session_path: &Path,
+    mutate: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnOnce(&mut SessionMeta) + Send,
+{
+    let lock = write_lock_for(session_dir, session_path);
+    let _guard = lock.lock().await;
+    // Self-heal: a corrupt sidecar loads as fresh and is overwritten by the
+    // save below (the sidecar is best-effort UI state, the transcript is
+    // authoritative). Logged so a self-heal is observable in production.
+    let mut meta = load(session_dir, session_path)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(session = %session_path.display(), error = %error, "session sidecar unreadable; self-healing from defaults");
+            SessionMeta::default()
+        });
+    mutate(&mut meta);
+    save(session_dir, session_path, &meta).await
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +329,49 @@ mod tests {
         save(dir.path(), &session, &meta).await.unwrap();
         let cleared = load(dir.path(), &session).await.unwrap();
         assert!(cleared.ui_notes.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_round_trips_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+        update(dir.path(), &session, |meta| meta.archived = true)
+            .await
+            .unwrap();
+        let meta = load(dir.path(), &session).await.unwrap();
+        assert!(meta.archived);
+    }
+
+    /// Two read-modify-write cycles racing the same sidecar must both
+    /// survive: without the per-session lock one writer's stale load
+    /// clobbers the other's field (the archive//exit lost-update bug).
+    #[tokio::test]
+    async fn update_serializes_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+        let (a, b) = tokio::join!(
+            update(dir.path(), &session, |meta| meta.archived = true),
+            update(dir.path(), &session, |meta| meta.pinned = true),
+        );
+        a.unwrap();
+        b.unwrap();
+        let meta = load(dir.path(), &session).await.unwrap();
+        assert!(meta.archived && meta.pinned, "lost update: {meta:?}");
+    }
+
+    /// A corrupt sidecar must not brick the session: `update` overwrites it
+    /// from the fresh-session default while persisting the mutation.
+    #[tokio::test]
+    async fn update_self_heals_corrupt_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+        tokio::fs::write(meta_path(dir.path(), &session), "{\"broken\":")
+            .await
+            .unwrap();
+        update(dir.path(), &session, |meta| meta.archived = true)
+            .await
+            .unwrap();
+        let meta = load(dir.path(), &session).await.unwrap();
+        assert!(meta.archived);
     }
 }
