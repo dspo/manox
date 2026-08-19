@@ -375,6 +375,15 @@ fn known_model_meta(id: &str) -> KnownModelMeta {
             cost: None,
             input: Some(vec![InputModality::Text, InputModality::Image]),
         },
+        // glm-5.3 always reasons; its endpoint rejects requests without an
+        // enabled thinking config (HTTP 400 code 1210).
+        "glm-5.3" => KnownModelMeta {
+            context_window: 1_000_000,
+            max_tokens: 131_072,
+            reasoning: true,
+            cost: None,
+            input: None,
+        },
         "qwen3.7-plus"
         | "deepseek-v4.1"
         | "deepseek-v4-pro"
@@ -664,6 +673,9 @@ providers:
     glm-5.2[1m]:
       context: 1000000
       wire_apis: [anthropic]
+    glm-5.3[1m]:
+      context: 1000000
+      wire_apis: [anthropic]
     qwen-empty[1m]: {}
 agents:
 - id: claude
@@ -740,6 +752,17 @@ agents:
         assert_eq!(glm.context_window, 1_000_000);
         // KNOWN_MODELS default for glm-5.2 max_tokens applies.
         assert_eq!(glm.max_tokens, 8_192);
+    }
+
+    /// glm-5.3 always reasons; registering it as a non-reasoning model makes
+    /// the host omit the thinking field, which BigModel rejects with 400.
+    #[test]
+    fn glm_5_3_registers_as_reasoning_model() {
+        let registry = register_fixture();
+        let model = registry
+            .resolve_model("Token Plan-anthropic", "glm-5.3")
+            .unwrap();
+        assert!(matches!(model.thinking, pi::types::ThinkingKind::Enabled));
     }
 
     #[test]
