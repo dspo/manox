@@ -14,11 +14,12 @@
 //!
 //! Cancel today: a parent-turn abort (the dispatch's `parent_signal`)
 //! cancels the child token via a watcher that exits when the run settles (no
-//! leak). `TaskStop`/`BashOutput` do NOT yet find Sailor tasks — those tools
-//! query the pi-extensions bash registry, while a Sailor registers in the
-//! legacy `background_task` registry. A legacy-registry-aware stop tool is a
-//! follow-up; until it lands the only abort paths are parent-turn cancel and
-//! natural completion.
+//! leak); and the Running card's Stop button calls `background_task::stop`,
+//! which cancels the same token (the UI path — `TaskStop`/`BashOutput`, the
+//! model-facing tools, do NOT yet find Sailor tasks: they query the
+//! pi-extensions bash registry while a Sailor registers in the legacy
+//! `background_task` registry; a legacy-registry-aware stop tool is a
+//! follow-up). The third path is natural completion.
 
 use std::sync::Arc;
 

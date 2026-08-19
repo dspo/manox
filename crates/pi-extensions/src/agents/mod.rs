@@ -313,18 +313,27 @@ impl SubagentTool {
         while let Ok(event) = ev_rx.try_recv() {
             forward_child(&event);
         }
-        // Tear down the worktree (if any) now that the session is done.
-        // Best-effort: a cleanup failure never masks the run's outcome.
         // Tear down the worktree (if any) now that the session is done. A
         // pristine worktree is removed; one with work is kept and its
-        // branch + path are appended to the result so the caller can find
-        // (and later clean up) the kept branch.
+        // branch + path ride the result (or, on a real failure, the error)
+        // so the caller can find and later clean up the kept branch.
         let kept_worktree = if let Some(worktree) = worktree {
             worktree.clean_up(ctx).await
         } else {
             None
         };
-        let messages = run_outcome?;
+        let messages = match run_outcome {
+            Ok(m) => m,
+            // A user/TaskStop abort settles silently; the kept worktree (if
+            // any) persists on disk for `git worktree list` to find.
+            Err(ToolError::Aborted) => return Err(ToolError::Aborted),
+            Err(e) => {
+                return Err(match kept_worktree {
+                    Some(kept) => ToolError::ExecutionFailed(format!("{e}\n\n{kept}")),
+                    None => e,
+                });
+            }
+        };
 
         let text = collect_text(&messages);
 
@@ -428,7 +437,7 @@ impl Worktree {
                 .exec(&rm, Duration::from_secs(30), CancellationToken::new())
                 .await;
             let del = format!(
-                "git -C {repo_q} branch -d {branch}",
+                "git -C {repo_q} branch -D {branch}",
                 repo_q = shell_quote(&self.repo),
                 branch = self.branch,
             );

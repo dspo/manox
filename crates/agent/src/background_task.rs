@@ -57,9 +57,11 @@ pub enum TaskKind {
     /// An asynchronously-dispatched Sailor subagent (general-purpose coding
     /// worker) running in a background pi session. Completion is delivered to
     /// the Captain via `BackendNotice::SailorCompleted`; a Running snapshot
-    /// is emitted at dispatch + at settlement so UI cards surface during the
-    /// run. `TaskStop`/`BashOutput` do NOT yet find Sailor tasks (registry
-    /// mismatch — follow-up); a parent-turn abort cancels the child token.
+    /// is emitted at dispatch + at settlement so the UI card surfaces during
+    /// the run and its Stop button (`background_task::stop`) cancels the
+    /// child token. `TaskStop`/`BashOutput` (model-facing) do NOT yet find
+    /// Sailor tasks (registry mismatch — follow-up); a parent-turn abort
+    /// also cancels the child token.
     Sailor,
 }
 

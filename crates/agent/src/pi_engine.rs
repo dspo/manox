@@ -541,6 +541,82 @@ fn system_prompt(cwd: &Path) -> String {
     prompt
 }
 
+/// Host wrapper around `pi_extensions::bash::BashTool` for the subagent
+/// snapshot. A Sailor is already an async primitive, so a background bash
+/// inside a subagent session is pointless AND dangerous — the subagent's
+/// registry has no manager/seatbelt-wrap, so `run_in_background` would
+/// spawn a bare process that bypasses the seatbelt, eludes
+/// `TaskStop`/`BashOutput`/UI, and outlives the session (no `Drop` reap).
+/// Reject `run_in_background` outright; the description is also corrected
+/// for the subagent context (one-shot, no state persistence, no gating
+/// claim) since the kernel BashTool's static text assumes the host session.
+struct SubagentBashTool {
+    inner: Arc<pi_extensions::bash::BashTool>,
+}
+
+const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
+    one-shot shell at the current cwd (no persistent cwd/vars across calls), under the same \
+    backend as the Captain (seatbelt-confined where the host has one). `run_in_background` is \
+    not available inside a subagent — the subagent itself is the async primitive, so run long \
+    commands in the foreground. Use `head_lines`/`tail_lines` to keep a selection of output \
+    instead of piping through `head`/`tail`.";
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for SubagentBashTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+    fn description(&self) -> &str {
+        SUBAGENT_BASH_DESCRIPTION
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if params["run_in_background"].as_bool().unwrap_or(false) {
+            return Err(pi::tool::ToolError::ExecutionFailed(
+                "`run_in_background` is not available inside a subagent session — the subagent \
+                 itself is the async primitive. Run the command in the foreground instead."
+                    .into(),
+            ));
+        }
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if params["run_in_background"].as_bool().unwrap_or(false) {
+            return Err(pi::tool::ToolError::ExecutionFailed(
+                "`run_in_background` is not available inside a subagent session — the subagent \
+                 itself is the async primitive. Run the command in the foreground instead."
+                    .into(),
+            ));
+        }
+        self.inner
+            .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+            .await
+    }
+}
+
 /// Host wrapper around [`SubagentTool`] that routes general-purpose
 /// (write+bash) subagents through [`SailorManager`] for async dispatch +
 /// completion notification, while read-only subagents (Explore) stay on the
@@ -644,6 +720,7 @@ fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    owner_thread_id: &str,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (writes + network confined; shell state does
@@ -924,10 +1001,15 @@ fn build_tools(
                 // backend (no ungated bypass); Write/Edit carry the process
                 // write lock so parallel Sailors clobbering the same path
                 // surface a named-holder conflict instead of silently racing.
-                Arc::new(pi_extensions::bash::BashTool::new(
-                    Arc::clone(&subagent_bash_ops),
-                    subagent_background.clone(),
-                )),
+                Arc::new(SubagentBashTool {
+                    inner: Arc::new(
+                        pi_extensions::bash::BashTool::new(
+                            Arc::clone(&subagent_bash_ops),
+                            subagent_background.clone(),
+                        )
+                        .with_sandbox_available(sandbox_available),
+                    ),
+                }),
                 Arc::new(crate::file_lock::FileLockedTool::new(
                     Arc::new(pi::tools::write::WriteTool),
                     "sailor",
@@ -972,10 +1054,10 @@ fn build_tools(
             subagent.clone(),
             sailor_ctx,
             notice_tx.clone(),
-            // owner_thread_id is assigned at `.with_session_id` (after
-            // build_tools); the async Sailor is attributed for lifecycle
-            // snapshots but per-thread listing is best-effort here.
-            String::new(),
+            // Attributing the Sailor to this thread lets
+            // `thread_has_running_tasks` / `cleanup_thread` find + cancel
+            // it (sidebar indicator + no token burn after thread delete).
+            owner_thread_id.to_string(),
         ));
         tools.push(Arc::new(SailorRoutingTool {
             inner: subagent,
@@ -1494,6 +1576,7 @@ fn session_builder(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
     parent_session: Option<&str>,
+    owner_thread_id: &str,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
     let (tools, orchestrators) = build_tools(
         cwd,
@@ -1505,6 +1588,7 @@ fn session_builder(
         goal_bridge,
         cmd_tx,
         worktree,
+        owner_thread_id,
     );
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
@@ -1835,6 +1919,7 @@ async fn run_actor(
             &cmd_tx,
             &state.worktree,
             None,
+            &thread_id,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -1876,6 +1961,7 @@ async fn run_actor(
                 &cmd_tx,
                 &state.worktree,
                 parent_session.as_deref(),
+                &thread_id,
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -2666,6 +2752,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     parent_session.as_deref(),
+                    &thread_id,
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -2806,6 +2893,7 @@ async fn rebuild_session(
         cmd_tx,
         worktree,
         None,
+        thread_id,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
@@ -4942,6 +5030,25 @@ mod tests {
         assert!(
             prompt.contains("multiple `Agent(Sailor)` calls over forming a `Team`"),
             "prefers Sailors over Team: {prompt}"
+        );
+    }
+
+    #[test]
+    fn subagent_bash_description_forbids_background_and_drops_host_claims() {
+        // The subagent Bash wrapper rejects `run_in_background` (N1: no
+        // bare-spawn escape hatch) and its description must not carry the
+        // host-session BashTool's false claims (state persists / approval).
+        assert!(
+            SUBAGENT_BASH_DESCRIPTION.contains("run_in_background"),
+            "description flags background refusal"
+        );
+        assert!(
+            !SUBAGENT_BASH_DESCRIPTION.contains("State persists"),
+            "no state-persistence claim"
+        );
+        assert!(
+            !SUBAGENT_BASH_DESCRIPTION.contains("requires user approval"),
+            "no approval-gating claim for the ungated subagent session"
         );
     }
 }
