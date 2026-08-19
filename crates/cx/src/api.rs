@@ -22,8 +22,8 @@ use crate::relay::transfer::{WriteReq, writer_loop};
 use crate::session::{self, SessionRegistry};
 use crate::warp::WarpSession;
 use crate::{
-    LaunchSpec, ResolvedModel, Selection, WireApi, apply_probe_cache, build_all_models,
-    build_launch_spec, find_agent, load_config, providers_for_agent, resolved_model_supports_agent,
+    LaunchSpec, Selection, WireApi, apply_probe_cache, build_all_models, build_launch_spec,
+    find_agent, load_config, providers_for_agent, resolve_launch_model,
 };
 
 /// The agent binary to launch. ChatGPT.app is intentionally absent: it is a GUI
@@ -59,6 +59,8 @@ pub struct AgentBuilder {
     agent: Option<Agent>,
     provider: Option<String>,
     model: Option<String>,
+    /// Cx wire key pinning the endpoint variant of the model (optional).
+    wire_api: Option<String>,
     passthrough: Vec<String>,
     cwd: Option<PathBuf>,
 }
@@ -77,6 +79,7 @@ impl AgentBuilder {
             agent: None,
             provider: None,
             model: None,
+            wire_api: None,
             passthrough: Vec::new(),
             cwd: None,
         }
@@ -109,6 +112,15 @@ impl AgentBuilder {
 
     pub fn model(mut self, id: impl Into<String>) -> Self {
         self.model = Some(id.into());
+        self
+    }
+
+    /// Pin the endpoint variant of the selected model by cx wire key
+    /// (`"anthropic"` / `"responses"` / `"completions"`). Unset = the first
+    /// agent-visible registration wins (historical default); an unknown key
+    /// degrades to unset with a warning.
+    pub fn wire_api(mut self, key: impl Into<String>) -> Self {
+        self.wire_api = Some(key.into());
         self
     }
 
@@ -159,48 +171,39 @@ impl AgentBuilder {
                 format!("agent `{}` 下未找到 provider `{}`", agent.id, provider_name)
             })?;
 
-        let model = if provider.has_endpoints {
+        let requested_wire = self.wire_api.as_deref().and_then(|raw| {
+            let wire = WireApi::from_str(raw);
+            if wire == WireApi::Unavailable {
+                eprintln!("[cx] 未知 wire `{raw}`，忽略显式 wire 指定");
+                None
+            } else {
+                Some(wire)
+            }
+        });
+
+        let (model, selected_wire_api) = if provider.has_endpoints {
             let model_id = self
                 .model
                 .as_deref()
                 .ok_or_else(|| anyhow!("provider `{}` 需要 model，但未指定", provider.name))?;
-            let model: ResolvedModel = all_models
-                .iter()
-                .find(|m| {
-                    m.provider_name == provider.name
-                        && resolved_model_supports_agent(m, &agent.id)
-                        && m.id == model_id
-                })
-                .with_context(|| {
-                    format!(
-                        "provider `{}` 下未找到支持 `{}` 的 model `{}`",
-                        provider.name, agent.id, model_id
-                    )
-                })?
-                .clone();
-            Some(model)
+            let (model, wire) = resolve_launch_model(
+                &all_models,
+                &provider.name,
+                &agent,
+                model_id,
+                requested_wire,
+            )?;
+            (Some(model), wire)
         } else {
-            None
-        };
-
-        // Pick a wire api the model offers that the agent supports; fall back to
-        // the model's primary wire api, then the agent's first supported one.
-        let selected_wire_api = model
-            .as_ref()
-            .and_then(|m| {
-                m.model_wire_apis
-                    .iter()
-                    .find(|w| agent.supported_wire_apis.contains(w))
-                    .copied()
-            })
-            .or_else(|| model.as_ref().map(|m| m.wire_api))
-            .unwrap_or_else(|| {
+            (
+                None,
                 agent
                     .supported_wire_apis
                     .first()
                     .copied()
-                    .unwrap_or(WireApi::Anthropic)
-            });
+                    .unwrap_or(WireApi::Anthropic),
+            )
+        };
 
         let selection = Selection {
             agent_id: agent.id.clone(),

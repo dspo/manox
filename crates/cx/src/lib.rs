@@ -2730,6 +2730,57 @@ struct LaunchSpec {
     cwd: Option<PathBuf>,
 }
 
+/// Resolve an explicit (provider, model) launch selection to the concrete
+/// endpoint variant plus the wire api to launch with. An explicit wire pins
+/// the endpoint variant and must be agent-supported; without one the first
+/// agent-visible registration wins and the wire falls back to the first
+/// agent-supported wire the model offers, then the endpoint's own wire.
+pub(crate) fn resolve_launch_model(
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+    agent: &ResolvedAgent,
+    model_id: &str,
+    wire: Option<WireApi>,
+) -> Result<(ResolvedModel, WireApi)> {
+    if let Some(w) = wire {
+        anyhow::ensure!(
+            agent.supports_wire_api(w),
+            "agent `{}` 不支持 wire `{}`",
+            agent.id,
+            w.display()
+        );
+    }
+    let model = all_models
+        .iter()
+        .find(|m| {
+            m.provider_name == provider_name
+                && resolved_model_supports_agent(m, &agent.id)
+                && m.id == model_id
+                && wire.map(|w| m.wire_api == w).unwrap_or(true)
+        })
+        .with_context(|| {
+            format!(
+                "provider `{}` 下未找到支持 `{}` 的 model `{}`{}",
+                provider_name,
+                agent.id,
+                model_id,
+                wire.map(|w| format!("（wire `{}`）", w.display()))
+                    .unwrap_or_default()
+            )
+        })?
+        .clone();
+    let selected = wire
+        .or_else(|| {
+            model
+                .model_wire_apis
+                .iter()
+                .find(|w| agent.supported_wire_apis.contains(w))
+                .copied()
+        })
+        .unwrap_or(model.wire_api);
+    Ok((model, selected))
+}
+
 fn build_launch_spec(
     selection: &Selection,
     passthrough_args: &[String],
@@ -7182,5 +7233,66 @@ agents:
         );
         assert_eq!(resolved.env.get("PROVIDER_ONLY"), Some(&"yes".to_string()));
         assert_eq!(resolved.env.get("MODEL_ONLY"), Some(&"yes".to_string()));
+    }
+
+    fn wire_test_agent(id: &str, wires: &[WireApi]) -> ResolvedAgent {
+        ResolvedAgent {
+            id: id.into(),
+            binary: id.into(),
+            args: Vec::new(),
+            supported_wire_apis: wires.to_vec(),
+            env: BTreeMap::new(),
+            hidden: false,
+        }
+    }
+
+    /// One config model registered through every wire endpoint; `visible_agents`
+    /// narrowed to copilot (the only built-in seeing all three wires).
+    fn wire_variant_model(wire: WireApi) -> ResolvedModel {
+        let mut m = test_resolved_model("m", "https://p.example", wire);
+        m.provider_name = "P".into();
+        m.visible_agents = vec!["copilot".into()];
+        m.model_wire_apis = vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions];
+        m
+    }
+
+    #[test]
+    fn resolve_launch_model_explicit_wire_pins_variant() {
+        let models = vec![
+            wire_variant_model(WireApi::Anthropic),
+            wire_variant_model(WireApi::Completions),
+        ];
+        let agent = wire_test_agent(
+            "copilot",
+            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        );
+        let (model, selected) =
+            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).unwrap();
+        assert_eq!(model.wire_api, WireApi::Completions);
+        assert_eq!(selected, WireApi::Completions);
+    }
+
+    #[test]
+    fn resolve_launch_model_without_wire_keeps_first_match() {
+        let models = vec![
+            wire_variant_model(WireApi::Anthropic),
+            wire_variant_model(WireApi::Completions),
+        ];
+        let agent = wire_test_agent(
+            "copilot",
+            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        );
+        let (model, selected) = resolve_launch_model(&models, "P", &agent, "m", None).unwrap();
+        assert_eq!(model.wire_api, WireApi::Anthropic);
+        assert_eq!(selected, WireApi::Anthropic);
+    }
+
+    #[test]
+    fn resolve_launch_model_rejects_agent_unsupported_wire() {
+        let models = vec![wire_variant_model(WireApi::Anthropic)];
+        let agent = wire_test_agent("claude", &[WireApi::Anthropic]);
+        assert!(
+            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).is_err()
+        );
     }
 }

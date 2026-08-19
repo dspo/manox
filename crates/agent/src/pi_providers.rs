@@ -218,6 +218,12 @@ pub fn config_id(model: &pi::types::Model) -> String {
         .unwrap_or_else(|| model.id.clone())
 }
 
+/// Cx wire key of a registered model's endpoint (`"anthropic"` /
+/// `"responses"` / `"completions"`); `None` for non-cx registrations.
+pub fn wire_key(model: &pi::types::Model) -> Option<&'static str> {
+    pi_extensions::provider::model_api_to_wire_key(&model.api)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
