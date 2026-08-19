@@ -144,15 +144,18 @@ pub enum SidebarEvent {
     NewThreadWithProject(PathBuf),
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
-    /// Launch an external agent CLI session with a user-picked provider + model
-    /// (the cascade wizard's terminal action). The kind identifies the agent
-    /// (`claude` / `codex` / `copilot`); the two strings are provider name +
-    /// model id; the optional PathBuf is the project path to use as the CLI's
-    /// cwd (when launched from a project folder's `+` button).
+    /// Launch an external agent CLI session with a user-picked provider +
+    /// model (the cascade wizard's terminal action). The kind identifies the
+    /// agent (`claude` / `codex` / `copilot`); the strings are provider name +
+    /// model id; the optional wire key pins the endpoint variant of the model
+    /// (`anthropic` / `responses` / `completions`); the optional PathBuf is
+    /// the project path to use as the CLI's cwd (when launched from a project
+    /// folder's `+` button).
     SpawnExternalSession(
         crate::external_session::SessionKind,
         String,
         String,
+        Option<String>,
         Option<PathBuf>,
     ),
     /// Launch a plain PTY session with no cx provider injection — the user's
@@ -1000,25 +1003,31 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
 /// new-session menu. Models are drawn from the shared pi provider registry,
 /// filtered by the agent id (registration metadata `agents`, empty = visible
 /// to all); they are grouped by provider display name, each provider a nested
-/// submenu. Picking a model invokes `emit` with (provider, model id, project)
-/// — the project path (if any) is read from the sidebar's
-/// `new_session_project` field so the handler can set the CWD / open
-/// directory. The emitted model id is the raw cx config key
-/// (`metadata["config_id"]`), which cx matches verbatim.
+/// submenu. A config model registered through several wire apis appears once
+/// per wire endpoint (exact duplicates collapse), each row tagged with its
+/// wire api like the composer model menu. Picking a model invokes `emit` with
+/// (provider, model id, wire, project) — the project path (if any) is read
+/// from the sidebar's `new_session_project` field so the handler can set the
+/// CWD / open directory. The emitted model id is the raw cx config key
+/// (`metadata["config_id"]`), which cx matches verbatim; the wire key pins
+/// the endpoint variant at launch resolution.
 fn build_model_cascade(
     menu: PopupMenu,
     agent_id: &'static str,
     sidebar: &WeakEntity<Sidebar>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
-    emit: impl Fn(&mut Sidebar, &mut Context<Sidebar>, String, String, Option<PathBuf>)
+    emit: impl Fn(&mut Sidebar, &mut Context<Sidebar>, String, String, Option<String>, Option<PathBuf>)
     + Clone
     + 'static,
 ) -> PopupMenu {
-    /// One cascade entry: the raw cx config key plus its display name.
+    /// One cascade entry: the raw cx config key, its display name, and the
+    /// wire endpoint variant (row tag + cx wire key for the launch pin).
     struct Entry {
         config_id: String,
         display: String,
+        tag: (TagVariant, &'static str),
+        wire: Option<String>,
     }
     let mut providers: Vec<(String, Vec<Entry>)> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -1040,12 +1049,17 @@ fn build_model_cascade(
         }
         let prov = agent::pi_providers::display_provider_name(&m);
         let config_id = agent::pi_providers::config_id(&m);
-        if !seen.insert((prov.clone(), config_id.clone())) {
-            continue; // same model registered on several wire apis
+        // Identity is the registration name (unique per wire endpoint), so
+        // wire variants of one provider stay separate; only exact
+        // duplicates collapse (parity with the composer model menu).
+        if !seen.insert((m.provider.clone(), config_id.clone())) {
+            continue;
         }
         let entry = Entry {
             config_id,
             display: agent::pi_providers::display_name(&m),
+            tag: crate::Workspace::pi_wire_tag_variant(&m.api),
+            wire: agent::pi_providers::wire_key(&m).map(str::to_string),
         };
         // Lookup-based grouping (not adjacency): the registry is sorted by
         // registration name, so equal display names must still merge.
@@ -1069,20 +1083,37 @@ fn build_model_cascade(
             for m in &models {
                 let model_id = m.config_id.clone();
                 let model_name = m.display.clone();
+                let (variant, label) = m.tag;
+                let wire = m.wire.clone();
                 let prov = prov_for_items.clone();
                 let sidebar = sidebar.clone();
                 let emit = emit.clone();
                 submenu = submenu.item(
                     PopupMenuItem::element(move |_window, _cx| {
-                        gpui::div()
-                            .text_sm()
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Tag::new()
+                                    .with_variant(variant)
+                                    .outline()
+                                    .small()
+                                    .child(label),
+                            )
                             .child(model_name.clone())
                             .into_any_element()
                     })
                     .on_click(move |_, _, cx: &mut App| {
                         let _ = sidebar.update(cx, |this, cx| {
                             let project = this.new_session_project.clone();
-                            emit(this, cx, prov.clone(), model_id.clone(), project);
+                            emit(
+                                this,
+                                cx,
+                                prov.clone(),
+                                model_id.clone(),
+                                wire.clone(),
+                                project,
+                            );
                             cx.notify();
                         });
                     }),
@@ -1096,8 +1127,8 @@ fn build_model_cascade(
 
 /// Cascade for the external-agent CLI submenus (Claude Code / Codex / GitHub
 /// Copilot): picking a model emits `SpawnExternalSession(kind, provider,
-/// model, project)` — the workspace spawns the agent CLI in the project's
-/// directory and mounts its TUI in the main area.
+/// model, wire, project)` — the workspace spawns the agent CLI in the
+/// project's directory and mounts its TUI in the main area.
 fn build_agent_model_cascade(
     menu: PopupMenu,
     kind: crate::external_session::SessionKind,
@@ -1112,9 +1143,9 @@ fn build_agent_model_cascade(
         sidebar,
         window,
         cx,
-        move |_this, cx, provider, model, project| {
+        move |_this, cx, provider, model, wire, project| {
             cx.emit(SidebarEvent::SpawnExternalSession(
-                kind, provider, model, project,
+                kind, provider, model, wire, project,
             ));
         },
     )
