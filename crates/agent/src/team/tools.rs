@@ -628,10 +628,15 @@ fn op_create(
     }
     // Leader playbook rides the notice channel: the leader is mid-turn
     // here, so it queues and lands as a message at this turn's end.
-    if let Ok(playbook) = crate::team::render_leader_playbook(this.agent_language()) {
-        team.update(cx, |t, cx| {
-            let _ = t.deliver(super::TEAM_NOTICE_FROM, LEADER_NAME, playbook, cx);
-        });
+    match crate::team::render_leader_playbook(this.agent_language()) {
+        Ok(playbook) => {
+            team.update(cx, |t, cx| {
+                let _ = t.deliver(super::TEAM_NOTICE_FROM, LEADER_NAME, playbook, cx);
+            });
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to render team leader playbook");
+        }
     }
     Ok(format!(
         "team '{}' created with {} member(s){}",
