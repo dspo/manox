@@ -22,7 +22,7 @@ use pi::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use pi::tool::AgentTool;
 use pi::tools::bash::BashTool;
 use pi::tools::edit::EditTool;
-use pi::tools::find::FindTool;
+use pi::tools::glob::GlobTool;
 use pi::tools::grep::GrepTool;
 use pi::tools::ls::LsTool;
 use pi::tools::read::ReadTool;
@@ -73,7 +73,7 @@ fn default_tools() -> Arc<[Arc<dyn AgentTool>]> {
         Arc::new(EditTool),
         Arc::new(BashTool::new(None)),
         Arc::new(GrepTool),
-        Arc::new(FindTool),
+        Arc::new(GlobTool),
         Arc::new(LsTool),
     ])
 }

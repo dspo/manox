@@ -426,9 +426,9 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             (Some(pattern), None) => format!("Grep {pattern}"),
             _ => "Grep".to_string(),
         },
-        "Find" => match arg("pattern") {
-            Some(pattern) => format!("Find {pattern}"),
-            None => "Find".to_string(),
+        "Glob" => match arg("pattern") {
+            Some(pattern) => format!("Glob {pattern}"),
+            None => "Glob".to_string(),
         },
         "Bash" => match arg("command") {
             Some(command) => format!("$ {command}"),

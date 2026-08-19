@@ -1,4 +1,4 @@
-// Built-in tools — read, write, edit, bash, grep, find, ls.
+// Built-in tools — read, write, edit, bash, grep, glob, ls.
 //
 // Each tool implements the AgentTool trait and operates through the
 // ExecutionEnv abstraction, making them runtime-agnostic.
@@ -7,7 +7,7 @@ pub mod bash;
 pub mod edit;
 pub mod edit_diff;
 pub mod file_mutation_queue;
-pub mod find;
+pub mod glob;
 pub mod grep;
 pub mod ls;
 pub mod path_utils;
@@ -62,7 +62,7 @@ impl ToolRegistry {
         self.register(Arc::new(edit::EditTool));
         self.register(Arc::new(bash::BashTool::new(None)));
         self.register(Arc::new(grep::GrepTool));
-        self.register(Arc::new(find::FindTool));
+        self.register(Arc::new(glob::GlobTool));
         self.register(Arc::new(ls::LsTool));
     }
 }
@@ -90,7 +90,8 @@ mod tests {
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Bash"));
         assert!(names.contains(&"Grep"));
-        assert!(names.contains(&"Find"));
+        assert!(names.contains(&"Glob"));
+        assert!(!names.contains(&"Find"));
         assert!(names.contains(&"Ls"));
         assert_eq!(names.len(), 7);
     }

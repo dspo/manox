@@ -27,7 +27,7 @@ const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ("Edit", "Edit a file with a patch"),
     ("Write", "Write a file"),
     ("Grep", "Search file contents"),
-    ("Find", "Locate files"),
+    ("Glob", "Find files matching a glob pattern"),
     ("Ls", "List directory contents"),
 ];
 
@@ -62,7 +62,7 @@ pub fn build_harness_prompt(
         }
         // TS dynamic guideline: with bash but no grep/find/ls.
         if active_tools.contains(&"Bash".to_string())
-            && !["Grep", "Find", "Ls"]
+            && !["Grep", "Glob", "Ls"]
                 .iter()
                 .any(|t| active_tools.contains(&t.to_string()))
         {

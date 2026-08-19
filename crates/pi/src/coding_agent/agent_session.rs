@@ -22,7 +22,7 @@ use crate::session::{SessionStorage, SessionTreeEntry};
 use crate::tool::AgentTool;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
-use crate::tools::find::FindTool;
+use crate::tools::glob::GlobTool;
 use crate::tools::grep::GrepTool;
 use crate::tools::ls::LsTool;
 use crate::tools::read::ReadTool;
@@ -1281,7 +1281,7 @@ impl AgentSessionBuilder {
         let session_path = session.storage().path().to_path_buf();
         // TS default tool set: read/bash/edit/write only.
         // The registry mounts ALL seven built-in tools (TS); the initial
-        // ACTIVE subset is the TS default four, so grep/find/ls remain
+        // ACTIVE subset is the TS default four, so grep/glob/ls remain
         // enableable later via set_active_tools.
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
             vec![
@@ -1291,7 +1291,7 @@ impl AgentSessionBuilder {
                 Arc::new(EditTool) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
-                Arc::new(FindTool) as Arc<dyn AgentTool>,
+                Arc::new(GlobTool) as Arc<dyn AgentTool>,
                 Arc::new(LsTool) as Arc<dyn AgentTool>,
             ]
         } else {

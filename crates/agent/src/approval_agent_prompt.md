@@ -8,7 +8,7 @@ Evaluate in this order:
 2. Its exact targets, destinations, and blast radius.
 3. Reversibility and plausible loss if it fails.
 4. Whether the user explicitly or implicitly authorized those concrete side effects.
-5. When a local fact matters, use Read, Grep, Find, or Ls before deciding.
+5. When a local fact matters, use Read, Grep, Glob, or Ls before deciding.
 
 Risk taxonomy:
 

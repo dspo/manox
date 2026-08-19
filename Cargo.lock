@@ -6999,6 +6999,8 @@ dependencies = [
  "chrono",
  "futures",
  "globset",
+ "grep-regex",
+ "grep-searcher",
  "ignore",
  "jsonschema",
  "libc",
