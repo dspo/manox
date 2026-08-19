@@ -249,10 +249,6 @@ fn search_files(
             continue;
         }
 
-        if !matched_paths.iter().any(|p| p == path) {
-            matched_paths.push(path.to_path_buf());
-        }
-
         // Paths read relative to the search root: an absolute path repeats
         // the root on every match, spending context on nothing. Searching a
         // single file strips to nothing, so that case falls back to the
@@ -283,6 +279,12 @@ fn search_files(
             for (line_no, line) in &sink.matches {
                 results.push(format!("{display_path}:{line_no}:{line}"));
             }
+        }
+
+        // Record only files that produced output: a context search that can no
+        // longer re-read the file yields no lines and no snapshot entry.
+        if !matched_paths.iter().any(|p| p == path) {
+            matched_paths.push(path.to_path_buf());
         }
     }
 
