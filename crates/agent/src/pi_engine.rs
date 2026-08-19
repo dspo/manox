@@ -3029,9 +3029,9 @@ async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<
     }
 }
 
-/// The UI annotation cards (Error / Notice / PlanReview) persisted in the
-/// sidecar, in emit order. The host serializes its `Vec<UiNoteRecord>`;
-/// `None`/absent on a fresh session restores as empty.
+/// The UI annotation cards (Error / Notice / PlanReview / AutoApproval)
+/// persisted in the sidecar, in emit order. The host serializes its
+/// `Vec<UiNoteRecord>`; `None`/absent on a fresh session restores as empty.
 async fn load_ui_notes(sessions_dir: &Path, session_path: &Path) -> Vec<crate::db::UiNoteRecord> {
     pi_extensions::session_meta::load(sessions_dir, session_path)
         .await
@@ -3578,22 +3578,27 @@ mod tests {
         assert!(load_ui_notes(dir.path(), &session).await.is_empty());
 
         // Persist the agent's `Vec<UiNoteRecord>` shape, including an approval
-        // record carrying `data.tool_call_id`.
+        // record carrying `data.tool_call_id` and an auto-approval marker.
         let record = crate::db::UiNoteRecord {
             anchor_user_id: Some("u1".into()),
             kind: crate::db::UiNoteKind::Notice,
             data: serde_json::json!({ "text": "Bash allowed", "tool_call_id": "tu_1" }),
         };
+        let marker = crate::db::UiNoteRecord {
+            anchor_user_id: Some("u1".into()),
+            kind: crate::db::UiNoteKind::AutoApproval,
+            data: serde_json::json!({ "text": "", "tool_call_id": "tu_2" }),
+        };
         let mut meta = pi_extensions::session_meta::load(dir.path(), &session)
             .await
             .unwrap();
-        meta.ui_notes = Some(serde_json::to_value(vec![record.clone()]).unwrap());
+        meta.ui_notes = Some(serde_json::to_value(vec![record.clone(), marker]).unwrap());
         pi_extensions::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
         let restored = load_ui_notes(dir.path(), &session).await;
-        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].kind, crate::db::UiNoteKind::Notice);
         assert_eq!(restored[0].anchor_user_id.as_deref(), Some("u1"));
         assert_eq!(
@@ -3603,6 +3608,15 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("tu_1"),
             "the tool anchor survives the sidecar restore"
+        );
+        assert_eq!(restored[1].kind, crate::db::UiNoteKind::AutoApproval);
+        assert_eq!(
+            restored[1]
+                .data
+                .get("tool_call_id")
+                .and_then(|v| v.as_str()),
+            Some("tu_2"),
+            "the auto-approval marker survives the sidecar restore"
         );
     }
 
