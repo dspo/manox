@@ -315,9 +315,15 @@ impl SubagentTool {
         }
         // Tear down the worktree (if any) now that the session is done.
         // Best-effort: a cleanup failure never masks the run's outcome.
-        if let Some(worktree) = worktree {
-            worktree.clean_up(ctx).await;
-        }
+        // Tear down the worktree (if any) now that the session is done. A
+        // pristine worktree is removed; one with work is kept and its
+        // branch + path are appended to the result so the caller can find
+        // (and later clean up) the kept branch.
+        let kept_worktree = if let Some(worktree) = worktree {
+            worktree.clean_up(ctx).await
+        } else {
+            None
+        };
         let messages = run_outcome?;
 
         let text = collect_text(&messages);
@@ -335,6 +341,9 @@ impl SubagentTool {
                 truncated.original_lines, truncated.original_bytes
             ));
         }
+        if let Some(kept) = kept_worktree {
+            out.push_str(&format!("\n\n{kept}"));
+        }
         Ok(AgentToolResult::text(out))
     }
 }
@@ -343,21 +352,43 @@ impl SubagentTool {
 /// `isolation: "worktree"`. Created at dispatch time on a throwaway branch
 /// under the system temp dir; the subagent session's cwd is the worktree
 /// path, so every tool operates inside it without manual `cd`. `clean_up`
-/// removes the worktree and its branch on session exit, best-effort.
-pub struct Worktree {
-    pub path: PathBuf,
-    pub branch: String,
-    pub repo: PathBuf,
+/// auto-removes a pristine worktree (no commits, no uncommitted changes)
+/// and its branch; a worktree with work is kept and its branch + path are
+/// reported back so the caller never silently loses edits.
+struct Worktree {
+    path: PathBuf,
+    branch: String,
+    repo: PathBuf,
+    /// The repo HEAD SHA captured at `prepare` time; `clean_up` compares the
+    /// branch tip against it to detect committed work.
+    base: String,
 }
 
 impl Worktree {
-    pub async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
+    async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
         let repo = ctx.cwd().to_path_buf();
         let suffix = unique_suffix();
         let branch = format!("sailor-{suffix}");
         let path = std::env::temp_dir().join(format!("manox-sailor-{suffix}"));
         let cmd = format!(
-            "git -C {repo_q} worktree add {path_q} -b {branch}",
+            "git -C {repo_q} rev-parse --verify HEAD",
+            repo_q = shell_quote(&repo),
+        );
+        let base = ctx
+            .env()
+            .exec(&cmd, Duration::from_secs(10), CancellationToken::new())
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("git rev-parse HEAD: {e}")))?;
+        if base.exit_code != 0 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "cannot resolve repo HEAD (exit {}): {}",
+                base.exit_code,
+                base.stderr.trim()
+            )));
+        }
+        let base = base.stdout.trim().to_string();
+        let cmd = format!(
+            "git -C {repo_q} worktree add {path_q} -b {branch} {base}",
             repo_q = shell_quote(&repo),
             path_q = shell_quote(&path),
         );
@@ -373,48 +404,106 @@ impl Worktree {
                 res.stderr.trim()
             )));
         }
-        Ok(Worktree { path, branch, repo })
+        Ok(Worktree {
+            path,
+            branch,
+            repo,
+            base,
+        })
     }
 
-    pub async fn clean_up(self, ctx: &dyn ToolContext) {
-        let rm = format!(
-            "git -C {repo_q} worktree remove --force {path_q}",
+    /// Remove a pristine worktree + branch; keep a worktree with work and
+    /// return a message naming the kept branch + path. Best-effort: a git
+    /// failure during the pristine check falls back to keeping the worktree
+    /// (never destroy work silently).
+    async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
+        if self.is_pristine(ctx).await {
+            let rm = format!(
+                "git -C {repo_q} worktree remove {path_q}",
+                repo_q = shell_quote(&self.repo),
+                path_q = shell_quote(&self.path),
+            );
+            let _ = ctx
+                .env()
+                .exec(&rm, Duration::from_secs(30), CancellationToken::new())
+                .await;
+            let del = format!(
+                "git -C {repo_q} branch -d {branch}",
+                repo_q = shell_quote(&self.repo),
+                branch = self.branch,
+            );
+            let _ = ctx
+                .env()
+                .exec(&del, Duration::from_secs(10), CancellationToken::new())
+                .await;
+            let _ = std::fs::remove_dir(&self.path);
+            None
+        } else {
+            Some(format!(
+                "[worktree kept: branch={}, path={}]",
+                self.branch,
+                self.path.display()
+            ))
+        }
+    }
+
+    /// Pristine = no commits beyond the dispatch base AND no uncommitted
+    /// changes in the worktree. Either check failing (git error) is treated
+    /// as not-pristine so the worktree is kept rather than destroyed.
+    async fn is_pristine(&self, ctx: &dyn ToolContext) -> bool {
+        let commits = format!(
+            "git -C {repo_q} rev-list --count {base}..{branch}",
             repo_q = shell_quote(&self.repo),
-            path_q = shell_quote(&self.path),
+            base = self.base.as_str(),
+            branch = self.branch.as_str(),
         );
-        let _ = ctx
+        let res = ctx
             .env()
-            .exec(&rm, Duration::from_secs(30), CancellationToken::new())
+            .exec(&commits, Duration::from_secs(10), CancellationToken::new())
             .await;
-        let del = format!(
-            "git -C {repo_q} branch -D {branch}",
-            repo_q = shell_quote(&self.repo),
-            branch = self.branch,
+        let committed = res
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().parse::<u64>().unwrap_or(1))
+            .unwrap_or(1);
+        if committed > 0 {
+            return false;
+        }
+        let dirty = format!(
+            "git -C {path_q} status --porcelain",
+            path_q = shell_quote(&self.path)
         );
-        let _ = ctx
+        let res = ctx
             .env()
-            .exec(&del, Duration::from_secs(30), CancellationToken::new())
+            .exec(&dirty, Duration::from_secs(10), CancellationToken::new())
             .await;
-        let _ = std::fs::remove_dir(&self.path);
+        res.ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().is_empty())
+            .unwrap_or(false)
     }
 }
 
 /// A dependency-free uniqueness suffix for parallel-Sailor branch names:
-/// pid + low bits of a nanosecond timestamp. Two Sailors created in the same
-/// nanosecond on the same process would collide, which is not realistic.
+/// pid + the full nanosecond timestamp. An atomic counter guarantees no two
+/// dispatches in the same process collide even if the clock stalls.
 fn unique_suffix() -> String {
-    let pid = std::process::id();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() % 1_000_000_000)
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{pid}{nanos}")
+    format!("{}-{}-{}", std::process::id(), nanos, n)
 }
 
-/// Double-quote a path for a shell command string. Handles spaces (the
-/// common case for project roots and temp dirs).
+/// Single-quote a path for a shell command string with the standard `'\''`
+/// escape, so a cwd containing `$`, backticks, `"`, or `'` cannot break or
+/// inject into the command.
 fn shell_quote(path: &Path) -> String {
-    format!("\"{}\"", path.display())
+    let s = path.display().to_string();
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Map a child-session event to the host-facing progress payload
@@ -483,7 +572,7 @@ fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
 /// Resolve a definition's tool names against the caller's tool snapshot.
 /// An empty `tools` list means the full snapshot, minus the `agent` tool
 /// itself: a subagent must not inherit the ability to spawn subagents.
-pub fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
+fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
     let selected: Vec<_> = tools
         .iter()
         .filter(|t| t.name() != "Agent")
@@ -507,7 +596,7 @@ pub fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn
 /// Concatenate the subagent's final answer: the text blocks of the last
 /// assistant message that carried no tool calls, skipping intermediate
 /// narration and tool-result turns.
-pub fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
+fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
     use pi::types::{AgentMessage, ContentBlock};
     for message in messages.iter().rev() {
         let AgentMessage::Assistant { content, .. } = message else {
@@ -699,7 +788,8 @@ mod tests {
         );
         let path = wt.path.clone();
         let branch = wt.branch.clone();
-        wt.clean_up(&ctx).await;
+        let kept = wt.clean_up(&ctx).await;
+        assert!(kept.is_none(), "pristine worktree is removed, not kept");
 
         assert!(!path.exists(), "worktree removed after clean_up");
         let branches = String::from_utf8_lossy(
@@ -716,6 +806,77 @@ mod tests {
             !branches.contains(&branch),
             "branch {branch} deleted: {branches}"
         );
+    }
+
+    /// A worktree with committed work is kept (not destroyed) and its branch +
+    /// path are reported back — the B2 invariant: edits never vanish.
+    #[tokio::test]
+    async fn worktree_with_commits_is_kept_not_destroyed() {
+        let dir = tempfile::tempdir().expect("temp repo dir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t"][..],
+            &["config", "user.name", "t"][..],
+            &["commit", "-q", "-m", "init", "--allow-empty"][..],
+        ] {
+            assert!(git(args).status.success(), "git {:?} failed", args);
+        }
+
+        let env: Arc<dyn pi::env::ExecutionEnv> =
+            Arc::new(pi::env::TokioExecutionEnv::new(repo.to_path_buf()));
+        let ctx = pi::tool::LocalToolContext::new(
+            env,
+            repo.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+
+        let wt = Worktree::prepare(&ctx).await.expect("worktree prepares");
+        // Commit on the worktree's branch so it carries work past the base.
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt.path)
+            .args(["commit", "-q", "-m", "sailor work", "--allow-empty"])
+            .output()
+            .expect("commit in worktree");
+        assert!(commit.status.success(), "commit in worktree");
+
+        let path = wt.path.clone();
+        let branch = wt.branch.clone();
+        let kept = wt.clean_up(&ctx).await;
+        assert!(
+            kept.is_some(),
+            "a worktree with commits is kept, not removed"
+        );
+        assert!(
+            kept.as_deref().unwrap().contains(&branch),
+            "the kept message names the branch: {:?}",
+            kept
+        );
+        assert!(
+            path.exists(),
+            "the working tree still exists after clean_up"
+        );
+        // Clean up the kept worktree so the test leaves nothing behind.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "-D", &branch])
+            .output();
     }
 
     #[test]

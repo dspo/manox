@@ -501,27 +501,34 @@ fn system_prompt(cwd: &Path) -> String {
     // what exists.
     prompt.push_str("\n\n## Subagents & parallel work\n");
     prompt.push_str(
-        "You are the Captain. You can dispatch subagents via the `Agent` tool — each runs \
-         in its own fresh context (no parent history) and returns a final summary. The \
-         `Agent` tool description lists the live set of subagent types and their capability \
-         tags. Two are built in:\n\
-         - `Explore` (read-only): locates code by file, symbol, or keyword and returns \
-         conclusions. It cannot write files or run commands — do not delegate write/exec \
-         work to it.\n\
-         - `Sailor` (write+bash): a general-purpose coding worker that reads, writes, and \
-         edits files and runs shell commands (including cargo/clippy/test), autonomously \
-         completing a focused task and returning a concise summary.\n\n\
-         Prefer parallel subagents over serial self-work. For splittable tasks — reviewing \
-         multiple PRs, modifying independent files, exploring alternatives — emit multiple \
-         `Agent` calls in one turn so they run concurrently. Pass \
-         `isolation: \"worktree\"` when a subagent needs its own working tree (builds won't \
-         collide, edits won't clash).\n\n\
-         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use `TeamCreate` \
-         only for long-lived work that needs a shared task list and peer messaging between \
-         members; for independent parallel subtasks, Sailors are lighter and return \
-         directly.\n\n\
-         Each subagent starts from a blank context, so pin any contract it must honor \
-         (exact paths, signatures, gate requirements) directly in the prompt.",
+        "You can dispatch subagents via the `Agent` tool — each runs in its \
+         own fresh context (no parent history). The `Agent` tool description \
+         lists the live subagent types and their capability tags; the tag \
+         also says whether the subagent runs synchronously or asynchronously. \
+         Two are built in:\n\
+         - `Explore` (read-only, synchronous): locates code by file, symbol, \
+         or keyword and returns conclusions; it cannot write files or run \
+         commands. The tool call blocks and returns Explore's answer.\n\
+         - `Sailor` (write+bash, asynchronous): a general-purpose coding \
+         worker that reads, writes, and edits files and runs shell commands \
+         (including cargo/clippy/test). The tool returns immediately with a \
+         `{\"sailor_id\": ...}` dispatch handle — NOT the output. Sailor \
+         runs in the background; when it settles its final summary arrives \
+         as a peer message and triggers your next turn. Continue with other \
+         work while Sailors run; do not poll.\n\n\
+         Prefer parallel subagents over serial self-work. For splittable \
+         tasks — reviewing multiple PRs, modifying independent files, \
+         exploring alternatives — emit multiple `Agent` calls in one turn so \
+         they run concurrently. Pass `isolation: \"worktree\"` when a \
+         subagent needs its own working tree (builds won't collide, edits \
+         won't clash; a worktree with work is kept + reported back).\n\n\
+         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use \
+         `TeamCreate` only for long-lived work that needs a shared task list \
+         and peer messaging between members; for independent parallel \
+         subtasks, Sailors are lighter and report back directly.\n\n\
+         Each subagent starts from a blank context, so pin any contract it \
+         must honor (exact paths, signatures, gate requirements) directly in \
+         the prompt.",
     );
     let summaries = crate::skill::summaries_or_empty();
     if !summaries.is_empty() {
@@ -663,6 +670,10 @@ fn build_tools(
     } else {
         Arc::new(PersistentShellOperations::new(cwd))
     };
+    // Subagent snapshot inherits the same seatbelt backend so a Sailor's
+    // Bash is confined exactly like the Captain's (B4: no ungated bypass).
+    let subagent_bash_ops: Arc<dyn pi::tools::bash::BashOperations> = Arc::clone(&bash_ops);
+    let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Escalation backend: no confinement at all. Selected per call when the
@@ -909,10 +920,22 @@ fn build_tools(
                 // snapshot (e.g. Sailor, `tools: []`) get these; read-only
                 // definitions (Explore) name an explicit allowlist that
                 // `select_tools` filters against, so they never reach a
-                // read-only subagent.
-                Arc::new(pi::tools::bash::BashTool::new(None)),
-                Arc::new(pi::tools::write::WriteTool),
-                Arc::new(pi::tools::edit::EditTool),
+                // read-only subagent. Bash inherits the Captain's seatbelt
+                // backend (no ungated bypass); Write/Edit carry the process
+                // write lock so parallel Sailors clobbering the same path
+                // surface a named-holder conflict instead of silently racing.
+                Arc::new(pi_extensions::bash::BashTool::new(
+                    Arc::clone(&subagent_bash_ops),
+                    subagent_background.clone(),
+                )),
+                Arc::new(crate::file_lock::FileLockedTool::new(
+                    Arc::new(pi::tools::write::WriteTool),
+                    "sailor",
+                )),
+                Arc::new(crate::file_lock::FileLockedTool::new(
+                    Arc::new(pi::tools::edit::EditTool),
+                    "sailor",
+                )),
             ],
         )
         .with_model_runtime(runtime.clone())
@@ -4875,6 +4898,38 @@ mod tests {
         assert!(
             rendered.contains("Sailor (write+bash)"),
             "Sailor write+bash tag present: {rendered}"
+        );
+        assert!(
+            rendered.contains("synchronously"),
+            "template declares synchronous read-only subagents: {rendered}"
+        );
+        assert!(
+            rendered.contains("asynchronously"),
+            "template declares asynchronous write+bash subagents: {rendered}"
+        );
+    }
+
+    /// The async/sync split is a model-facing contract: a `write+bash`
+    /// def routes through SailorManager (async dispatch handle), a
+    /// read-only def stays synchronous. `subagent_capability` is the routing
+    /// key, so this doubles as the `SailorRoutingTool::is_async_dispatch`
+    /// predicate test.
+    #[test]
+    fn subagent_capability_routes_sailor_async_explore_sync() {
+        let mut registry = pi::ext_point_agent::AgentRegistry::new();
+        pi_extensions::agents::register_defaults(&mut registry);
+        let sailor = registry.get("Sailor").expect("Sailor registered");
+        let explore = registry.get("Explore").expect("Explore registered");
+        assert_eq!(subagent_capability(sailor), "write+bash");
+        assert_ne!(
+            subagent_capability(sailor),
+            "read-only",
+            "Sailor routes async (not read-only)"
+        );
+        assert_eq!(
+            subagent_capability(explore),
+            "read-only",
+            "Explore stays synchronous"
         );
     }
 
