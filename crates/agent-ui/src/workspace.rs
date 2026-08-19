@@ -1281,7 +1281,10 @@ impl Workspace {
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // Persist the error card so a reloaded thread reproduces
-                        // what went wrong, anchored to the failed turn.
+                        // what went wrong at the failed turn's position. The
+                        // append rides the actor queue behind the settling run;
+                        // a crash before the actor drains it loses the card
+                        // (accepted window for an annotation).
                         this.append_ui_note(agent::db::UiNoteKind::Error, e.to_string(), None, cx);
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review

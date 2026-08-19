@@ -2592,9 +2592,23 @@ async fn run_actor(
                 // Persist at the leaf through the append queue; refresh the
                 // mirror so an idle switch-away sees the note before the next
                 // authoritative sync.
-                let data = serde_json::to_value(&record).ok();
+                let data = match serde_json::to_value(&record) {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        // A None payload renders as a ghost entry on reload;
+                        // name the impossible case loudly instead of silently
+                        // dropping the card.
+                        tracing::warn!(error = %err, "UI note serialization failed");
+                        None
+                    }
+                };
                 match session.append_custom(UI_NOTE_CUSTOM_TYPE, data).await {
                     Ok(_) => {
+                        // Live-transcript count, not the post-compaction
+                        // projection the reload path counts over: a mid-run
+                        // compaction can make this overshoot, and
+                        // `merge_positioned_notes` clamps the excess to the
+                        // tail (notes always append at the leaf anyway).
                         let after_message = live_mirror.lock().unwrap().messages.len();
                         state
                             .history
