@@ -3165,9 +3165,6 @@ impl ItemBuilder {
         items: &mut Vec<ConvItem>,
     ) {
         for m in messages {
-            if m.is_hidden_from_ui() {
-                continue;
-            }
             match m.role {
                 Role::User => {
                     let external_event =
@@ -4586,21 +4583,6 @@ mod tests {
             1,
             "machine-generated events must not be attributed to the user"
         );
-    }
-
-    #[test]
-    fn build_items_hides_internal_goal_messages() {
-        let messages = vec![
-            Message::user("start".into()),
-            Message::goal_continuation("internal directive".into()),
-            Message::assistant(vec![MessageContent::Text("done".into())]),
-        ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        assert_eq!(items.len(), 2);
-        assert!(!items.iter().any(|item| matches!(
-            item,
-            ConvItem::User { text, .. } if text.contains("internal directive")
-        )));
     }
 
     /// Regression: user messages (and every other text-bearing kind) must feed

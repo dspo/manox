@@ -85,6 +85,9 @@ pub(crate) enum SessionCmd {
     StartPlanExecution(String),
     /// A user-created/replaced Goal starts executing immediately.
     GoalStarted,
+    /// Wake the goal gate now (user resumed an active goal while the agent
+    /// was idle): queue the next continuation round if owed.
+    GoalGate,
     /// Execute an approved plan: exit plan mode, optionally compact the
     /// planning context toward the plan file, then run the seed turn.
     ApprovePlan {
@@ -146,6 +149,14 @@ struct EngineState {
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
+    /// Fencing bit: at most one goal round queued at a time. Set by the gate
+    /// before `follow_up`, cleared at that round's settle. Relaxed ordering
+    /// is safe: set and clear both happen on the actor's single thread, and
+    /// the goal gate never runs concurrently with itself (see the `armed`
+    /// rationale in `GoalBridge`).
+    goal_continuation_reserved: AtomicBool,
+    /// Identity of the reserved round, for the settle-time admission check.
+    goal_continuation_round: Mutex<Option<crate::goal_driver::GoalRoundIdentity>>,
     /// Plugin `SessionStart` hook fires once per session lifetime, before
     /// the first user turn. Restored sessions arm it at Ready (they already
     /// "started"); Open/NewSession re-arm per session switch.
@@ -211,6 +222,8 @@ pub fn spawn_engine(
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
+        goal_continuation_reserved: AtomicBool::new(false),
+        goal_continuation_round: Mutex::new(None),
         session_start_fired: AtomicBool::new(false),
         worktree: crate::worktree::new_state(),
     });
@@ -392,6 +405,12 @@ impl ThreadEngine for PiEngine {
 
     fn goal_started(&self) {
         let _ = self.cmd_tx.send(SessionCmd::GoalStarted);
+    }
+
+    /// Wake the goal gate (resume path): the actor queues the next
+    /// continuation round when the agent is idle and the goal is armed.
+    fn goal_gate(&self) {
+        let _ = self.cmd_tx.send(SessionCmd::GoalGate);
     }
 
     fn approve_plan(&self, compact: bool, compact_instructions: Option<String>, seed_text: String) {
@@ -978,6 +997,106 @@ async fn settle_run(
             "failed": failed,
         }),
     );
+}
+
+/// Post-settle goal housekeeping shared by every run: disarm automatic
+/// continuation on any cancellation or run error (DSH parity — the goal keeps
+/// its durable phase until a human resume re-arms it), and admit the goal
+/// round that just ran when one was in flight.
+async fn goal_housekeeping(
+    result: &anyhow::Result<Vec<AgentMessage>>,
+    abort_requested: bool,
+    session: &AgentSession,
+    state: &Arc<EngineState>,
+) {
+    if (abort_requested || result.is_err())
+        && let Some(bridge) = &state.goal_bridge
+    {
+        bridge.disarm();
+    }
+    if let Some(bridge) = &state.goal_bridge
+        && bridge.goal_round_active()
+    {
+        let _ = crate::goal_driver::settle_goal_round(
+            session,
+            bridge,
+            &state.goal_continuation_reserved,
+            &state.goal_continuation_round,
+            result,
+            abort_requested,
+        )
+        .await;
+    }
+}
+
+/// Chain automatic goal rounds from an idle position: gate first, run one
+/// round, settle + housekeeping, repeat until no round is owed or the user
+/// interrupts. The gate is consulted before every run, so a round is never
+/// started on empty queues.
+#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
+async fn chain_goal_rounds(
+    session: &mut AgentSession,
+    handle: &pi::harness::HarnessHandle,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+    run_steers: &mut Vec<String>,
+    shutdown_after_run: &mut bool,
+    live: Arc<Mutex<LiveTranscript>>,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    pi_model: &mut PiModel,
+    repo: &pi::session::repository::SessionRepository,
+    sessions_dir: &Path,
+    cwd: &Path,
+    session_path: &Path,
+) {
+    loop {
+        let queued = match &state.goal_bridge {
+            Some(bridge) => {
+                crate::goal_driver::maybe_queue_goal_round(
+                    session,
+                    bridge,
+                    &state.goal_continuation_reserved,
+                    &state.goal_continuation_round,
+                    handle,
+                )
+                .await
+            }
+            None => return,
+        };
+        if !queued {
+            return;
+        }
+        let (result, abort_requested) = drive_run(
+            session.continue_(),
+            handle,
+            cmd_rx,
+            run_steers,
+            shutdown_after_run,
+            Arc::clone(&live),
+            state,
+            notice_tx,
+            pi_model,
+            sessions_dir,
+            session_path,
+        )
+        .await;
+        settle_run(
+            &result,
+            abort_requested,
+            session,
+            state,
+            repo,
+            sessions_dir,
+            cwd,
+            notice_tx,
+            run_steers,
+        )
+        .await;
+        if *shutdown_after_run {
+            return;
+        }
+        goal_housekeeping(&result, abort_requested, session, state).await;
+    }
 }
 
 /// Forward every pi run event through the adapt mapping onto the notice
@@ -1725,6 +1844,9 @@ async fn run_actor(
                     )));
                     let handle = session.handle();
                     let active_session_path = session.path().clone();
+                    // One resume run for the steered events, then chain
+                    // automatic goal rounds until the goal stops or the user
+                    // interrupts (the gate re-checks after every settle).
                     let (result, abort_requested) = drive_run(
                         session.continue_(),
                         &handle,
@@ -1754,6 +1876,29 @@ async fn run_actor(
                     if shutdown_after_run {
                         break;
                     }
+                    goal_housekeeping(&result, abort_requested, &session, &state).await;
+                    if shutdown_after_run {
+                        break;
+                    }
+                    chain_goal_rounds(
+                        &mut session,
+                        &handle,
+                        &mut cmd_rx,
+                        &mut run_steers,
+                        &mut shutdown_after_run,
+                        Arc::clone(&live_mirror),
+                        &state,
+                        &notice_tx,
+                        &mut pi_model,
+                        &repo,
+                        &sessions_dir,
+                        &cwd,
+                        &active_session_path,
+                    )
+                    .await;
+                    if shutdown_after_run {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -1774,7 +1919,9 @@ async fn run_actor(
                 let handle = session.handle();
                 let active_session_path = session.path().clone();
                 // Drive the run while still servicing mid-run commands
-                // (abort/steer) through the session handle.
+                // (abort/steer) through the session handle, then chain
+                // automatic goal rounds until the goal stops or the user
+                // interrupts.
                 let (result, abort_requested) = drive_run(
                     session.prompt_with_images(&text, images),
                     &handle,
@@ -1799,6 +1946,29 @@ async fn run_actor(
                     &cwd,
                     &notice_tx,
                     &mut run_steers,
+                )
+                .await;
+                if shutdown_after_run {
+                    break;
+                }
+                goal_housekeeping(&result, abort_requested, &session, &state).await;
+                if shutdown_after_run {
+                    break;
+                }
+                chain_goal_rounds(
+                    &mut session,
+                    &handle,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
+                    &mut pi_model,
+                    &repo,
+                    &sessions_dir,
+                    &cwd,
+                    &active_session_path,
                 )
                 .await;
                 if shutdown_after_run {
@@ -1927,6 +2097,39 @@ async fn run_actor(
             }
             SessionCmd::GoalStarted => {
                 title_scheduler.start_execution(crate::title::TitleWakeReason::GoalStarted);
+            }
+            SessionCmd::GoalGate => {
+                // Resume path: a goal was re-armed while the agent was idle.
+                // Chain continuation rounds only when the gate actually owes
+                // one — no round, no run (continue_ with empty queues errors).
+                if !state.running.load(Ordering::Relaxed) {
+                    state.running.store(true, Ordering::Relaxed);
+                    let _ =
+                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+                    let handle = session.handle();
+                    let active_session_path = session.path().clone();
+                    chain_goal_rounds(
+                        &mut session,
+                        &handle,
+                        &mut cmd_rx,
+                        &mut run_steers,
+                        &mut shutdown_after_run,
+                        Arc::clone(&live_mirror),
+                        &state,
+                        &notice_tx,
+                        &mut pi_model,
+                        &repo,
+                        &sessions_dir,
+                        &cwd,
+                        &active_session_path,
+                    )
+                    .await;
+                    if shutdown_after_run {
+                        break;
+                    }
+                }
+                // Running: the in-flight run's settle path already chains
+                // rounds; the gate fence prevents a double queue.
             }
             SessionCmd::ApprovePlan {
                 compact,
@@ -3769,6 +3972,8 @@ mod tests {
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
+            goal_continuation_reserved: AtomicBool::new(false),
+            goal_continuation_round: Mutex::new(None),
             worktree: crate::worktree::new_state(),
         })
     }

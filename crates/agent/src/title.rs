@@ -574,7 +574,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# Plan").unwrap();
-        let goal = ThreadGoal::new("thread".into(), "Ship Title Agent".into(), None).unwrap();
+        let goal = ThreadGoal::new("thread".into(), "Ship Title Agent".into(), None, None).unwrap();
         assert!(matches!(
             select_source(Some(&goal), plan.to_str(), &[user("chat")]),
             TitleSource::Goal(_)

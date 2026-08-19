@@ -17,7 +17,7 @@ pub enum ThreadEventType {
     BranchSummary,
     GoalCreated,
     GoalUpdated,
-    GoalAccounted,
+    GoalRound,
     GoalCleared,
     Custom,
 }
@@ -30,7 +30,7 @@ impl ThreadEventType {
             ThreadEventType::BranchSummary => "branch_summary",
             ThreadEventType::GoalCreated => "goal_created",
             ThreadEventType::GoalUpdated => "goal_updated",
-            ThreadEventType::GoalAccounted => "goal_accounted",
+            ThreadEventType::GoalRound => "goal_round",
             ThreadEventType::GoalCleared => "goal_cleared",
             ThreadEventType::Custom => "custom",
         }

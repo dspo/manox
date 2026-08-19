@@ -1063,19 +1063,17 @@ impl Thread {
         self.goal_bridge.as_ref().and_then(|bridge| bridge.snapshot())
     }
 
-    /// Elapsed seconds shown on the goal chip: accumulated accounting plus
-    /// wall clock since creation while the goal is live. Per-turn token/time
-    /// accounting is a follow-up, so `time_used_seconds` stays 0 and the
-    /// display is creation-anchored wall time for non-terminal goals.
+    /// Elapsed seconds shown on the goal chip. There is no persisted time
+    /// budget: the display is creation-anchored wall time while live, and the
+    /// created→updated span once the goal reaches a terminal status.
     pub fn goal_elapsed_seconds(&self) -> Option<u64> {
         let goal = self.goal()?;
-        let live = if goal.status.is_terminal() {
-            0
+        if goal.status.is_terminal() {
+            Some((goal.updated_at - goal.created_at).max(0) as u64)
         } else {
             let now = chrono::Utc::now().timestamp();
-            (now - goal.created_at).max(0) as u64
-        };
-        Some(goal.time_used_seconds.saturating_add(live))
+            Some((now - goal.created_at).max(0) as u64)
+        }
     }
 
     fn goal_bridge_or_bail(&self) -> anyhow::Result<Arc<GoalBridge>> {
@@ -1090,11 +1088,12 @@ impl Thread {
         &mut self,
         objective: String,
         token_budget: Option<u64>,
-        actor: crate::db::GoalActor,
+        max_rounds: Option<u64>,
+        actor: crate::goal::GoalActor,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
-        bridge.create_goal(objective, token_budget, actor)?;
+        bridge.create_goal(objective, token_budget, max_rounds, actor)?;
         self.ensure_engine(self.project.clone(), cx);
         if let Some(engine) = &self.engine {
             engine.goal_started();
@@ -1105,22 +1104,23 @@ impl Thread {
         Ok(())
     }
 
-    /// Convenience for `/goal <objective>`: create with no budget as the
-    /// user.
+    /// Convenience for `/goal <objective>`: create with no budget and no
+    /// round cap as the user.
     pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        self.create_goal(objective, None, crate::db::GoalActor::User, cx)
+        self.create_goal(objective, None, None, crate::goal::GoalActor::User, cx)
     }
 
-    /// Edit objective/budget in place (keeps id and status).
+    /// Edit objective/budget/rounds in place (keeps id and status).
     pub fn edit_goal(
         &mut self,
         objective: String,
         token_budget: Option<u64>,
-        actor: crate::db::GoalActor,
+        max_rounds: Option<u64>,
+        actor: crate::goal::GoalActor,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
-        let goal = bridge.edit_goal(objective, token_budget, actor)?;
+        let goal = bridge.edit_goal(objective, token_budget, max_rounds, actor)?;
         cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
@@ -1131,11 +1131,12 @@ impl Thread {
         &mut self,
         objective: String,
         token_budget: Option<u64>,
-        actor: crate::db::GoalActor,
+        max_rounds: Option<u64>,
+        actor: crate::goal::GoalActor,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
-        bridge.replace_goal(objective, token_budget, actor)?;
+        bridge.replace_goal(objective, token_budget, max_rounds, actor)?;
         self.ensure_engine(self.project.clone(), cx);
         if let Some(engine) = &self.engine {
             engine.goal_started();
@@ -1146,24 +1147,31 @@ impl Thread {
         Ok(())
     }
 
-    /// Pause/resume/blocked transitions with the domain guards.
+    /// Pause/resume/blocked transitions with the domain guards. A transition
+    /// to Active (resume) wakes the goal gate so automatic rounds resume.
     pub fn set_goal_status(
         &mut self,
         status: crate::goal::GoalStatus,
-        reason: Option<String>,
-        actor: crate::db::GoalActor,
+        reason: Option<crate::goal::GoalBlockReason>,
+        actor: crate::goal::GoalActor,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
+        let was_active = self.goal().is_some_and(|goal| goal.status == crate::goal::GoalStatus::Active);
         let goal = bridge.set_goal_status(status, reason, actor)?;
+        if status == crate::goal::GoalStatus::Active && !was_active
+            && let Some(engine) = &self.engine
+        {
+            engine.goal_gate();
+        }
         cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
-    /// Clear the current Goal (row deleted, audit trail kept).
+    /// Clear the current Goal (tombstone event; history stays in the stream).
     pub fn clear_goal(
         &mut self,
-        actor: crate::db::GoalActor,
+        actor: crate::goal::GoalActor,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
@@ -1171,6 +1179,7 @@ impl Thread {
         cx.emit(ThreadEvent::GoalChanged { goal: None });
         Ok(())
     }
+
 
     pub fn depth(&self) -> u32 {
         0
@@ -1696,15 +1705,17 @@ impl Thread {
     fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>, cx: &mut Context<Self>) {
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
-            if let Err(error) = self.replace_goal(objective.to_string(), None, crate::db::GoalActor::User, cx)
+            if let Err(error) = self.replace_goal(objective.to_string(), None, None, crate::goal::GoalActor::User, cx)
             {
                 cx.emit(ThreadEvent::Error(error));
             }
             return;
         }
         if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
-            let budget = self.goal().and_then(|goal| goal.token_budget);
-            if let Err(error) = self.edit_goal(objective.to_string(), budget, crate::db::GoalActor::User, cx)
+            let current = self.goal();
+            let budget = current.as_ref().and_then(|goal| goal.token_budget);
+            let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
+            if let Err(error) = self.edit_goal(objective.to_string(), budget, max_rounds, crate::goal::GoalActor::User, cx)
             {
                 cx.emit(ThreadEvent::Error(error));
             }
@@ -1726,24 +1737,49 @@ impl Thread {
                     }
                 }
             };
-            if let Err(error) = self.edit_goal(goal.objective, budget, crate::db::GoalActor::User, cx)
+            if let Err(error) = self.edit_goal(goal.objective, budget, goal.max_rounds, crate::goal::GoalActor::User, cx)
+            {
+                cx.emit(ThreadEvent::Error(error));
+            }
+            return;
+        }
+        if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
+            let Some(goal) = self.goal() else {
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                return;
+            };
+            let max_rounds = if matches!(value, "none" | "unlimited") {
+                None
+            } else {
+                match value.parse::<u64>() {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        cx.emit(ThreadEvent::Error(error.into()));
+                        return;
+                    }
+                }
+            };
+            if let Err(error) = self.edit_goal(goal.objective, goal.token_budget, max_rounds, crate::goal::GoalActor::User, cx)
             {
                 cx.emit(ThreadEvent::Error(error));
             }
             return;
         }
         match trimmed.to_lowercase().as_str() {
-            "" | "edit" | "replace" => {}
+            "" | "edit" | "replace" | "rounds" => {}
             "clear" => {
-                if let Err(error) = self.clear_goal(crate::db::GoalActor::User, cx) {
+                if let Err(error) = self.clear_goal(crate::goal::GoalActor::User, cx) {
                     cx.emit(ThreadEvent::Error(error));
                 }
             }
             "pause" | "stop" => {
                 if let Err(error) = self.set_goal_status(
                     crate::goal::GoalStatus::Paused,
-                    Some("paused by user".into()),
-                    crate::db::GoalActor::User,
+                    Some(crate::goal::GoalBlockReason {
+                        code: "user-paused".into(),
+                        message: "paused by user".into(),
+                    }),
+                    crate::goal::GoalActor::User,
                     cx,
                 ) {
                     cx.emit(ThreadEvent::Error(error));
@@ -1753,7 +1789,7 @@ impl Thread {
                 if let Err(error) = self.set_goal_status(
                     crate::goal::GoalStatus::Active,
                     None,
-                    crate::db::GoalActor::User,
+                    crate::goal::GoalActor::User,
                     cx,
                 ) {
                     cx.emit(ThreadEvent::Error(error));
