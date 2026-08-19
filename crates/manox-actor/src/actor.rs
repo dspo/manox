@@ -1287,16 +1287,21 @@ fn emit_history_and_info(
     );
     emit_thread_info(app, thread, session_id, subagents, sink);
     // Re-emit in-flight interaction cards a reloaded webview lost: pending
-    // authorizations re-fold as ask/approval cards and a submitted plan
-    // re-folds as the review card. The webview store folds these as upserts,
-    // so a session that never lost state stays single-card.
+    // authorizations re-fold as the ask card and a submitted plan re-folds as
+    // the review card. The webview store folds these as upserts, so a session
+    // that never lost state stays single-card. Every authorization surfaces as
+    // `AskUserQuestion` live (the gate emits the escalation payload as the ask
+    // input, even for an escalated tool whose `PendingAuthMeta.tool_name` is the
+    // original tool) — replay the same so an escalated approval re-renders the
+    // three-option ask card, not the two-button approval card that would drop
+    // the always-allow verdict.
     for (id, meta) in thread.read(app).pending_auth_entries() {
         sink.emit(
             json!({
                 "type": "tool_call_authorization",
                 "sessionId": session_id,
                 "id": id,
-                "tool_name": meta.tool_name,
+                "tool_name": agent::tools::ASK_USER_QUESTION,
                 "summary": meta.summary,
                 "input": meta.input,
             })
@@ -4069,6 +4074,89 @@ mod tests {
         agent::thread_store::drop_global_for_test();
     }
 
+    /// A webview reload re-emits a pending authorization as the ask surface:
+    /// an escalated approval's `PendingAuthMeta.tool_name` is the original
+    /// tool (e.g. `Bash`), but the live gate always emits
+    /// `AskUserQuestion`; the replay must match the live shape so the
+    /// three-option ask card renders instead of the two-button approval card.
+    #[test]
+    fn open_thread_replay_reemits_pending_auth_as_ask_surface() {
+        let _guard = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+
+        // Swap in a fake engine carrying an escalated Bash authorization
+        // (tool_name `Bash`, escalation three-option payload). The live gate
+        // would have emitted `AskUserQuestion` for this same id.
+        let (engine, events) = FakeEngine::new();
+        engine.set_pending_auth(
+            "bash-1",
+            "Bash",
+            "rm -rf /tmp/scratch",
+            json!({
+                "questions": [{
+                    "question": "Allow this command?",
+                    "header": "Approval",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Allow once"},
+                        {"label": "Always allow"},
+                        {"label": "Deny"}
+                    ]
+                }]
+            }),
+        );
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |t, cx| {
+                t.set_engine_for_test(engine.clone(), events, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let auth_events = |tool_name: &str| {
+            out.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+                .filter(|v| v["type"] == "tool_call_authorization" && v["id"] == "bash-1")
+                .filter(|v| v["tool_name"].as_str() == Some(tool_name))
+                .count()
+        };
+        assert_eq!(
+            auth_events("Bash"),
+            0,
+            "the replay must not surface the original tool name"
+        );
+
+        // Reopen the live session: the replayed authorization must arrive as
+        // the ask surface (`AskUserQuestion`), matching the live gate.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            auth_events("AskUserQuestion"),
+            1,
+            "open_thread replay must re-emit the pending auth as the ask surface"
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
     /// A sink that feeds an already-collected `out` buffer.
     fn sink_for(out: &Arc<Mutex<Vec<String>>>) -> EventSink {
         let out = Arc::clone(out);
@@ -4082,6 +4170,7 @@ mod tests {
         runs: Mutex<Vec<String>>,
         steer_calls: Mutex<Vec<String>>,
         notices: tokio::sync::mpsc::UnboundedSender<agent::thread_engine::BackendNotice>,
+        pending_auth: Mutex<Vec<(String, agent::permission::PendingAuthMeta)>>,
     }
 
     impl FakeEngine {
@@ -4095,9 +4184,25 @@ mod tests {
                     runs: Mutex::new(Vec::new()),
                     steer_calls: Mutex::new(Vec::new()),
                     notices,
+                    pending_auth: Mutex::new(Vec::new()),
                 }),
                 events,
             )
+        }
+
+        /// Seed a pending authorization the workspace re-surfaces on
+        /// switch-back / replay. `tool_name` is the *original* tool name an
+        /// escalated approval stores, so the replay can prove it re-emits as
+        /// the ask surface regardless.
+        fn set_pending_auth(&self, id: &str, tool_name: &str, summary: &str, input: Value) {
+            *self.pending_auth.lock().unwrap() = vec![(
+                id.to_string(),
+                agent::permission::PendingAuthMeta {
+                    tool_name: tool_name.to_string(),
+                    summary: summary.to_string(),
+                    input,
+                },
+            )];
         }
     }
 
@@ -4147,6 +4252,10 @@ mod tests {
 
         fn session_list(&self) -> Vec<agent::ThreadSummary> {
             Vec::new()
+        }
+
+        fn pending_auth_entries(&self) -> Vec<(String, agent::permission::PendingAuthMeta)> {
+            self.pending_auth.lock().unwrap().clone()
         }
     }
 }
