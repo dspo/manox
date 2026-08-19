@@ -164,7 +164,7 @@ impl MemberPanel {
                 agent::language_model::StopReason::Refusal => "member-stop-refusal",
                 agent::language_model::StopReason::ToolUse => "member-stop-tool-use",
             };
-            SharedString::from(i18n::t(key))
+            i18n::t(key)
         })
     }
 
@@ -224,13 +224,14 @@ impl MemberPanel {
             .when(alive, |el| {
                 let weak_ws = self.weak_workspace.clone();
                 let name = self.member_name.clone();
+                let team = self.team.clone();
                 el.child(
                     Button::new(format!("dismiss-{}", self.member_name))
                         .ghost()
                         .small()
                         .label(i18n::t("member-dismiss"))
                         .on_click(move |_, _, cx| {
-                            let team = self.team.clone();
+                            let team = team.clone();
                             let _ = weak_ws
                                 .update(cx, |ws, cx| ws.dismiss_member(team, name.clone(), cx));
                         }),
