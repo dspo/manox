@@ -404,12 +404,9 @@ impl ThreadStore {
         cx.spawn(async move |_, cx| {
             let saved = crate::runtime::handle()
                 .spawn(async move {
-                    let mut meta = match pi_extensions::session_meta::load(&dir, &path).await {
-                        Ok(meta) => meta,
-                        Err(_) => return false,
-                    };
-                    update(&mut meta);
-                    pi_extensions::session_meta::save(&dir, &path, &meta).await.is_ok()
+                    pi_extensions::session_meta::update(&dir, &path, update)
+                        .await
+                        .is_ok()
                 })
                 .await
                 .unwrap_or(false);
@@ -425,11 +422,10 @@ impl ThreadStore {
 /// mirrors the current `ui_notes` (host-only annotation cards) into the
 /// session sidecar on real user activity, and refreshes the sidebar list.
 ///
-/// The sidecar write is a detached load→modify→save with no per-session
-/// serialization (`write_meta`): a stale in-flight write landing after a
-/// newer one can drop the newest note (lost-update window). The next
-/// `save_thread` self-heals; a process crash inside the window loses at
-/// most the final notice — the same crash window the jsonl transcript has.
+/// The sidecar write runs through the per-session serialized `update` path,
+/// so it cannot interleave with a concurrent archive/pin/unread write (the
+/// `/exit` flow spawns both back-to-back); a crash mid-write loses at most
+/// that write — the same window the jsonl transcript has.
 pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
     let store = global();
     let id = thread.read(cx).id.0.clone();
@@ -457,9 +453,13 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
         if !crate::host::belongs_to_current_host(info.metadata.as_ref()) {
             continue;
         }
-        let meta = pi_extensions::session_meta::load(dir, &info.path)
-            .await
-            .unwrap_or_default();
+        let meta = match pi_extensions::session_meta::load(dir, &info.path).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                tracing::warn!(session = %info.id, error = %error, "session sidecar unreadable; rendering default flags");
+                pi_extensions::session_meta::SessionMeta::default()
+            }
+        };
         let path = info.path.clone();
         out.push((session_info_to_summary(&info, &meta), path));
     }
@@ -1022,5 +1022,54 @@ mod tests {
             "at-cap row keeps depth"
         );
         assert_eq!(chain[0].0.depth, 0);
+    }
+
+    /// The `/exit` flow archives a session and, in the same instant,
+    /// `attach_thread` snapshots the outgoing thread's ui_notes — two
+    /// back-to-back sidecar writes on the same session. Serialized writes
+    /// must keep `archived` on disk while the notes land (the lost-update
+    /// that resurrected archived conversations).
+    #[test]
+    fn archive_survives_concurrent_ui_notes_write() {
+        let (db, db_path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("t1.jsonl");
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.session_paths.insert("t1".to_string(), session.clone());
+                s.sessions_dir = dir.path().to_path_buf();
+            });
+        });
+        let notes = serde_json::json!([
+            {
+                "anchor_user_id": "u1",
+                "kind": "notice",
+                "data": { "text": "Bash allowed" }
+            }
+        ]);
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.archive_thread("t1", true, cx);
+                s.write_meta("t1", move |meta| meta.ui_notes = Some(notes.clone()), cx);
+            });
+        });
+        cx.executor().run_until_parked();
+        let mut settled = false;
+        for _ in 0..200 {
+            if let Ok(meta) = crate::runtime::handle().block_on(
+                pi_extensions::session_meta::load(dir.path(), &session),
+            ) && meta.archived
+                && meta.ui_notes.is_some()
+            {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(settled, "archived flag lost to a concurrent ui_notes write");
+        std::fs::remove_file(db_path).ok();
     }
 }
