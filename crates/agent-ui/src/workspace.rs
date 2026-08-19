@@ -738,6 +738,104 @@ impl Workspace {
         self.list_state.clone()
     }
 
+    /// Attach a thread through the production switch path. Diagnostic-only
+    /// entry point so integration tests can exercise parking + re-surface
+    /// without simulating the sidebar click.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_attach_thread(
+        &mut self,
+        thread: Entity<ThreadEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_thread(thread, window, cx);
+    }
+
+    /// Seed a parsed `AskUserQuestion` as the pending ask. Diagnostic-only:
+    /// bypasses the approval gate so the synthesis path can be tested with a
+    /// fake engine (whose `pending_auth_entries` is empty).
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_seed_ask(
+        &mut self,
+        id: &str,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_ask = parse_pending_ask(id.to_string(), input);
+        self.ask_step = 0;
+        self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// Run the missing-card synthesis. Diagnostic-only wrapper around the
+    /// private `ensure_ask_tool_item`.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_ensure_ask_tool_item(
+        &mut self,
+        id: &str,
+        summary: &str,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_ask_tool_item(id, summary, input, cx);
+    }
+
+    /// Sync the ask snapshots (render-time path). Diagnostic-only.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_sync_ask_card_snapshots(&mut self, cx: &mut Context<Self>) {
+        self.sync_ask_card_snapshots(cx);
+    }
+
+    /// Whether the pending ask's card would render interactively: a matching
+    /// top-level `ToolCall` item carrying the Workspace-derived snapshot.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_ask_card_interactive(&self, id: &str, cx: &App) -> bool {
+        let Some(ix) = self.conversation.read(cx).find_tool(id, cx) else {
+            return false;
+        };
+        self.conversation.read(cx).items()[ix]
+            .read(cx)
+            .ask_snapshot
+            .is_some()
+    }
+
+    /// Whether a plan review is currently awaiting a verdict. Diagnostic-only.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_pending_plan_review(&self) -> bool {
+        self.pending_plan_review.is_some()
+    }
+
+    /// Whether a stashed plan review exists for the given thread.
+    /// Diagnostic-only.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_has_stashed_plan(&self, id: &str) -> bool {
+        self.pending_plans.contains_key(id)
+    }
+
+    /// Whether the conversation's tail item is an *active* plan review card
+    /// (verdict buttons rendered). Diagnostic-only.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_tail_plan_active(&self, cx: &App) -> bool {
+        let Some(last) = self.conversation.read(cx).items().last() else {
+            return false;
+        };
+        matches!(
+            last.read(cx).kind(),
+            ConvItem::PlanReview { active: true, .. }
+        )
+    }
+
+    /// Count of top-level `ToolCall` items with the given id. Diagnostic-only.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_tool_call_count(&self, id: &str, cx: &App) -> usize {
+        self.conversation
+            .read(cx)
+            .items()
+            .iter()
+            .filter(|item| matches!(item.read(cx).kind(), ConvItem::ToolCall(t) if t.id == id))
+            .count()
+    }
+
     /// Remeasure every list row whenever the conversation mutates. A height
     /// change on an off-screen row would otherwise leave the list's cached
     /// height stale until the next width change; this applies that cure
@@ -1003,11 +1101,18 @@ impl Workspace {
                     save_thread(this.thread.clone(), true, cx);
                     // Sidebar running indicator: the turn released the running
                     // slot, so the row stops spinning. A successful or
-                    // cancelled turn also supersedes a stale error flag.
+                    // cancelled turn also supersedes a stale error flag. The
+                    // pending-plan badge survives a normal settle while a
+                    // review is still up (the card stays active below) — it
+                    // clears only when the verdict is moot or absent.
+                    let keep_plan_badge =
+                        !(*cancelled || *failed) && this.pending_plan_review.is_some();
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&thread_id, cx);
-                        s.mark_pending_plan(&thread_id, false, cx);
+                        if !keep_plan_badge {
+                            s.mark_pending_plan(&thread_id, false, cx);
+                        }
                         if !*failed {
                             s.set_errored(&thread_id, false, cx);
                         }
@@ -1015,10 +1120,13 @@ impl Workspace {
                     this.turn_active = false;
                     this.background_threads
                         .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                    // A turn that ended while a plan-review card is still up
-                    // (cancel / abnormal stop) demotes it, mirroring `Error` —
-                    // the verdict is moot once the loop released the turn.
-                    if this.pending_plan_review.take().is_some() {
+                    // Only a cancelled/failed turn demotes an outstanding plan
+                    // review — the verdict is moot once the loop released the
+                    // turn abnormally. A normal settle right after
+                    // `ProposePlan` keeps the card active so the user can
+                    // still choose a verdict; demoting it here made the card
+                    // flash its buttons and collapse to a plain record.
+                    if (*cancelled || *failed) && this.pending_plan_review.take().is_some() {
                         this.conversation
                             .update(cx, |c, cx| c.consume_plan_review(cx));
                         this.list_state.remeasure();
@@ -1304,10 +1412,23 @@ impl Workspace {
                 ThreadEvent::SteerInjected { message_id } => {
                     this.consume_background_steer(&id, message_id);
                 }
-                ThreadEvent::PlanReady { .. } => {
-                    // A parked thread's engine can re-emit PlanReady on
-                    // restore; the sidebar keeps the blue-static wait visible
-                    // until the verdict lands.
+                ThreadEvent::PlanReady { plan_file, title } => {
+                    // A plan proposed while the thread was parked never reaches
+                    // the foreground handler: stash the review so the
+                    // switch-back restore (`attach_thread` drains `pending_plans`)
+                    // re-surfaces the verdict card, and persist the sidecar flag
+                    // so a restart re-emits PlanReady on Ready. The sidebar
+                    // keeps the blue-static wait until the verdict lands.
+                    let content = std::fs::read_to_string(plan_file).unwrap_or_default();
+                    this.pending_plans.insert(
+                        id.clone(),
+                        PendingPlanReview {
+                            plan_file: plan_file.clone(),
+                            title: title.clone(),
+                            content,
+                        },
+                    );
+                    _thread.update(cx, |t, cx| t.set_plan_review_pending(true, cx));
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.mark_pending_plan(&id, true, cx));
                 }
@@ -1317,10 +1438,21 @@ impl Workspace {
                     stranded_steer_ids,
                     ..
                 } => {
+                    // A cancelled/failed turn voids a stashed plan review
+                    // (mirroring the foreground demote); a normal settle keeps
+                    // it so the switch-back restore re-surfaces the card. The
+                    // pending-plan badge stays up while a review is stashed —
+                    // the card is not visible until the user switches back.
+                    if *cancelled || *failed {
+                        this.pending_plans.remove(&id);
+                    }
+                    let has_stashed_plan = this.pending_plans.contains_key(&id);
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
-                        s.mark_pending_plan(&id, false, cx);
+                        if !has_stashed_plan {
+                            s.mark_pending_plan(&id, false, cx);
+                        }
                         s.mark_pending_auth(&id, false, cx);
                         if !*failed {
                             s.set_errored(&id, false, cx);
@@ -1338,6 +1470,9 @@ impl Workspace {
                     }
                 }
                 ThreadEvent::Error(_) => {
+                    // An errored run voids a stashed plan review (the verdict
+                    // is moot once the loop bailed out).
+                    this.pending_plans.remove(&id);
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
@@ -2945,16 +3080,73 @@ impl Workspace {
             .read(cx)
             .pending_auth_entries()
             .into_iter()
-            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.input.clone()))
+            .map(|(id, meta)| (id, meta.summary, meta.input))
             .collect();
-        for (id, _tool_name, input) in entries {
-            self.pending_ask = parse_pending_ask(id.clone(), input);
+        for (id, summary, input) in entries {
+            self.pending_ask = parse_pending_ask(id.clone(), input.clone());
             self.ask_step = 0;
             self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+            // The card renders on a top-level `ToolCall` item. The rebuilt
+            // conversation carries one only for direct asks whose ToolUse the
+            // mirror synced; escalated tools fold into their activity segment
+            // and a stale mirror misses the ask entirely. Synthesize the card
+            // the gate would have created live so the interactive drawer
+            // renders.
+            if self.pending_ask.is_some() {
+                self.ensure_ask_tool_item(&id, &summary, input, cx);
+            }
         }
         if self.pending_ask.is_some() {
             cx.notify();
         }
+    }
+
+    /// Synthesize the top-level AskUserQuestion card when the rebuilt
+    /// conversation lacks the matching `ToolCall` item. The live card is
+    /// created by the gate's `ToolCall` event, which a parked thread never
+    /// sees; the rebuild only carries the underlying ToolUse (an escalated
+    /// tool folds into its activity segment, and a direct ask can miss the
+    /// mirror's sync window). Without the item the ask snapshot cannot
+    /// attach, so the interaction UI never renders.
+    fn ensure_ask_tool_item(
+        &mut self,
+        id: &str,
+        summary: &str,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.conversation.read(cx).find_tool(id, cx).is_some() {
+            return;
+        }
+        let title = if summary.trim().is_empty() {
+            i18n::t("workspace-clarify-title").to_string()
+        } else {
+            summary.to_string()
+        };
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.push_tool_call(
+                crate::conversation::ToolCallItem {
+                    id: id.to_string(),
+                    name: agent::tools::ASK_USER_QUESTION.to_string(),
+                    title,
+                    status: agent::thread::ToolCallStatus::PendingApproval,
+                    output: String::new(),
+                    is_error: false,
+                    input,
+                    streaming: false,
+                    collapsed: false,
+                    user_toggled: false,
+                    panel: None,
+                },
+                role,
+                weak,
+                cx,
+            );
+        });
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
     /// Archive the active thread and navigate to a fresh empty one. Shared

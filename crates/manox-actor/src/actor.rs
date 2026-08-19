@@ -339,7 +339,14 @@ fn handle_command(
                 let persisted_mode = cx.update(|app| thread.read(app).approval_mode());
                 emit_persisted_approval_mode(persisted_mode, &id, sink);
                 cx.update(|app| {
-                    emit_history_and_info(app, &thread, &id, &subagents, sink);
+                    emit_history_and_info(
+                        app,
+                        &thread,
+                        &id,
+                        &subagents,
+                        &session.pending_plan,
+                        sink,
+                    );
                 });
                 return true;
             }
@@ -1173,7 +1180,14 @@ fn subscribe_thread(
                     }
                 }
                 ThreadEvent::HistoryRestored => {
-                    emit_history_and_info(app, &entity, &session_id, &subagents, &sink);
+                    emit_history_and_info(
+                        app,
+                        &entity,
+                        &session_id,
+                        &subagents,
+                        &pending_plan,
+                        &sink,
+                    );
                 }
                 ThreadEvent::GoalChanged { .. } => {
                     // The wire event carries the full snapshot (the pure
@@ -1255,6 +1269,7 @@ fn emit_history_and_info(
     thread: &Entity<Thread>,
     session_id: &str,
     subagents: &Arc<Mutex<Vec<SubagentInfo>>>,
+    pending_plan: &Mutex<Option<PendingPlan>>,
     sink: &EventSink,
 ) {
     let messages = strip_messages_for_wire(thread.read(app).messages());
@@ -1267,6 +1282,43 @@ fn emit_history_and_info(
         .to_string(),
     );
     emit_thread_info(app, thread, session_id, subagents, sink);
+    // Re-emit in-flight interaction cards a reloaded webview lost: pending
+    // authorizations re-fold as ask/approval cards and a submitted plan
+    // re-folds as the review card. The webview store folds these as upserts,
+    // so a session that never lost state stays single-card.
+    for (id, meta) in thread.read(app).pending_auth_entries() {
+        sink.emit(
+            json!({
+                "type": "tool_call_authorization",
+                "sessionId": session_id,
+                "id": id,
+                "tool_name": meta.tool_name,
+                "summary": meta.summary,
+                "input": meta.input,
+            })
+            .to_string(),
+        );
+    }
+    if let Some(pending) = pending_plan.lock().unwrap().as_ref() {
+        let content = std::fs::read_to_string(&pending.plan_file).unwrap_or_default();
+        let slug = std::path::Path::new(&pending.plan_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .trim_end_matches("-plan")
+            .to_string();
+        let title = agent::plan_mode::resolve_plan_title(None, &content, &slug);
+        sink.emit(
+            json!({
+                "type": "plan_ready",
+                "sessionId": session_id,
+                "plan_file": pending.plan_file,
+                "title": title,
+                "content": content,
+            })
+            .to_string(),
+        );
+    }
 }
 
 /// Info-panel snapshot: worktree, plan, cumulative usage/cost, pending-auth
@@ -3943,6 +3995,69 @@ mod tests {
             &mut cx,
             &mut state,
             &sink,
+            r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn open_thread_replay_reemits_pending_plan_review() {
+        // Recover from a poisoned lock: an earlier flaky test's panic can
+        // leave the serialization mutex poisoned; this test must still run.
+        let _guard = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+
+        // A proposed plan records the pending verdict; the enriched wire
+        // event lands once.
+        let dir = std::env::temp_dir().join(format!("manox-plan-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan_file = dir.join("audit-plan.md");
+        std::fs::write(&plan_file, "# Audit\n\nsteps").unwrap();
+        let plan_file = plan_file.to_string_lossy().to_string();
+        cx.update(|app| {
+            state.sessions["s1"].thread.update(app, |_t, cx| {
+                cx.emit(agent::ThreadEvent::PlanReady {
+                    plan_file: plan_file.clone(),
+                    title: "Audit".into(),
+                });
+            });
+        });
+        cx.run_until_parked();
+        let ready_count = || {
+            out.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .filter(|v| v["type"] == "plan_ready" && v["plan_file"] == plan_file)
+                .count()
+        };
+        assert_eq!(ready_count(), 1);
+
+        // Reopening the live session replays its snapshots; a reloaded
+        // webview gets the review card re-emitted instead of losing it.
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
+            r#"{"cmd":"open_thread","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            ready_count(),
+            2,
+            "open_thread replay must re-emit the pending plan review"
+        );
+
+        handle_command(
+            &mut cx,
+            &mut state,
+            &sink_for(&out),
             r#"{"cmd":"dispose_session","sessionId":"s1"}"#,
         );
         cx.run_until_parked();
