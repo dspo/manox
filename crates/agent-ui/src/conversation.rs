@@ -857,6 +857,26 @@ impl ConversationState {
         }));
     }
 
+    /// Push a synthetic top-level `ToolCall` card at the tail, mirroring the
+    /// gate-created AskUserQuestion card. The workspace synthesizes it when
+    /// re-surfacing a pending authorization whose live `ToolCall` event was
+    /// emitted while the thread was parked: the rebuilt conversation only
+    /// carries the underlying ToolUse (an escalated tool folds into its
+    /// activity segment; a direct ask can miss the mirror's sync window), so
+    /// without this card the ask snapshot cannot attach and the interaction
+    /// UI never renders.
+    pub fn push_tool_call(
+        &mut self,
+        item: ToolCallItem,
+        role: String,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        let item_id = self.alloc_id();
+        self.items
+            .push(cx.new(|_| MessageItem::new(ConvItem::ToolCall(item), role, item_id, weak)));
+    }
+
     /// Mark the most recent plan-review card as no longer actionable: a verdict
     /// was clicked or a free-form message superseded it. Only the tail plan can
     /// be active (every prior one was already consumed when its turn ended), so

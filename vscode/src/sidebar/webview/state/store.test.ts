@@ -1160,6 +1160,97 @@ describe('plan / goal / task folding', () => {
     expect(thread(store)?.items.some((i) => i.kind === 'approval' && i.id === 'ap1')).toBe(true);
     expect(thread(store)?.items.some((i) => i.kind === 'ask_question')).toBe(false);
   });
+
+  it('tool_call_authorization replay upserts instead of stacking cards', () => {
+    const store = startSession();
+    const auth = event({
+      type: 'tool_call_authorization',
+      sessionId: 's',
+      id: 'ask1',
+      tool_name: 'AskUserQuestion',
+      summary: 'Clarify',
+      input: {
+        questions: [{ question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] }],
+      },
+    });
+    store.dispatch(auth);
+    store.dispatch(auth);
+    const cards = (thread(store)?.items ?? []).filter((i) => i.kind === 'ask_question');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.id).toBe('ask1');
+  });
+
+  it('thread_history stub tool item cleared by the replay authorization', () => {
+    const store = startSession();
+    // The actor replay emits thread_history first; the pending AskUserQuestion
+    // ToolUse maps to a generic completed tool stub.
+    store.dispatch(
+      event({
+        type: 'thread_history',
+        sessionId: 's',
+        messages: [
+          {
+            id: 'm1',
+            timestamp: 1,
+            parent_id: null,
+            provenance: 'assistant',
+            role: 'assistant',
+            content: [
+              {
+                ToolUse: {
+                  id: 'ask1',
+                  name: 'AskUserQuestion',
+                  raw_input: '{"questions":[]}',
+                  input: { questions: [] },
+                  is_input_complete: true,
+                  thought_signature: null,
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(toolCard(store, 'ask1')).toBeDefined();
+    // The re-emitted authorization replaces the stub with the interactive card.
+    store.dispatch(
+      event({
+        type: 'tool_call_authorization',
+        sessionId: 's',
+        id: 'ask1',
+        tool_name: 'AskUserQuestion',
+        summary: 'Clarify',
+        input: {
+          questions: [{ question: 'Which one?', options: [{ label: 'A' }, { label: 'B' }] }],
+        },
+      }),
+    );
+    expect(toolCard(store, 'ask1')).toBeUndefined();
+    const askCards = (thread(store)?.items ?? []).filter((i) => i.kind === 'ask_question');
+    expect(askCards).toHaveLength(1);
+    expect(askCards[0]?.id).toBe('ask1');
+  });
+
+  it('plan_ready replay replaces the previous card', () => {
+    const store = startSession();
+    const ready = (title: string, planFile: string) =>
+      event({
+        type: 'plan_ready',
+        sessionId: 's',
+        plan_file: planFile,
+        title,
+        content: `# ${title}`,
+      });
+    store.dispatch(ready('First', '/tmp/first-plan.md'));
+    store.dispatch(ready('Second', '/tmp/second-plan.md'));
+    const cards = (thread(store)?.items ?? []).filter((i) => i.kind === 'plan_review');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ title: 'Second', planFile: '/tmp/second-plan.md' });
+    expect(thread(store)?.pendingPlan).toMatchObject({
+      title: 'Second',
+      planFile: '/tmp/second-plan.md',
+    });
+  });
 });
 
 describe('queued-message lifecycle', () => {

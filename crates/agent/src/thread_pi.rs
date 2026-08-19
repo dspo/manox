@@ -915,9 +915,10 @@ impl Thread {
     }
 
     /// Test-only: force the running flag so team routing tests can simulate
-    /// a busy thread without a live engine turn.
-    #[cfg(test)]
-    pub(crate) fn set_running_for_test(&mut self, running: bool) {
+    /// a busy thread without a live engine turn. test-support exposure lets
+    /// host integration tests park a thread by attaching another one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_running_for_test(&mut self, running: bool) {
         self.running = running;
     }
 

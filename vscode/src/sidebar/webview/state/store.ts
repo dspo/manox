@@ -596,11 +596,19 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         output: capOutputTail(ev.output),
         isError: ev.is_error,
       }));
-    case 'tool_call_authorization':
+    case 'tool_call_authorization': {
+      // Upsert: an id already owned by a generic tool item (the
+      // thread_history rebuild stub for a ToolUse whose verdict is pending)
+      // or a prior card is replaced — an actor replay after a webview reload
+      // must not stack cards, and the authorization card is the single
+      // surface for the whole lifecycle.
+      const items = t.items.filter(
+        (i) => !(i.id === ev.id && (i.kind === 'tool' || i.kind === 'ask_question' || i.kind === 'approval')),
+      );
       return {
         ...t,
         items: [
-          ...t.items,
+          ...items,
           ev.tool_name === 'AskUserQuestion'
             ? { kind: 'ask_question', id: ev.id, summary: ev.summary, input: ev.input }
             : {
@@ -612,6 +620,7 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
               },
         ],
       };
+    }
     case 'model_changed':
       return { ...t, currentModelId: ev.to };
     case 'reasoning_effort_changed':
@@ -701,7 +710,10 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           ];
       return { ...t, info: { ...info, agents: updated } };
     }
-    case 'plan_ready':
+    case 'plan_ready': {
+      // Upsert: an actor replay (webview reload re-announce) or the engine's
+      // restart re-emission must replace the previous card, never stack.
+      const items = t.items.filter((i) => i.kind !== 'plan_review');
       return {
         ...t,
         pendingPlan: {
@@ -710,16 +722,17 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           content: ev.content ?? '',
         },
         items: [
-          ...t.items,
+          ...items,
           {
             kind: 'plan_review',
-            id: `plan-review-${t.items.length}`,
+            id: `plan-review-${items.length}`,
             planFile: ev.plan_file,
             title: ev.title,
             content: ev.content ?? '',
           },
         ],
       };
+    }
     case 'background_task_updated': {
       const task = ev.snapshot;
       // The card is appended once; later snapshots only touch the map and the
