@@ -21,7 +21,7 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
 use serde::{Deserialize, Serialize};
 
 use crate::background_task::TaskSnapshot;
-use crate::db::UiNoteRecord;
+use crate::db::{HistoryEntry, UiNoteRecord};
 use crate::goal::ThreadGoal;
 use crate::goal_tools::GoalBridge;
 use crate::language::Language;
@@ -321,7 +321,7 @@ pub struct Thread {
     archived: bool,
     running: bool,
     restored: bool,
-    ui_notes: Vec<UiNoteRecord>,
+    display: Vec<HistoryEntry>,
     request_usage: HashMap<String, TokenUsage>,
     /// Text of user messages inserted since the last run, drained by
     /// `run_turn` into one prompt.
@@ -386,7 +386,7 @@ impl Thread {
             archived: false,
             running: false,
             restored: false,
-            ui_notes: Vec::new(),
+            display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
             pending_images: Vec::new(),
@@ -468,7 +468,7 @@ impl Thread {
                 archived: false,
                 running: false,
                 restored: false,
-                ui_notes: Vec::new(),
+            display: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
                 pending_images: Vec::new(),
@@ -648,13 +648,7 @@ impl Thread {
                 plan_file,
                 plan_review_pending,
                 plan_snapshot,
-                ui_notes,
             } => {
-                // Seed the UI-note cache from the sidecar before
-                // `HistoryRestored` so the rebuild splices the cards back at
-                // their anchored position. The sidecar is the authority on a
-                // restore; the in-memory Vec is replaced wholesale.
-                self.ui_notes = ui_notes;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot
@@ -759,7 +753,15 @@ impl Thread {
         let Some(engine) = &self.engine else {
             return;
         };
-        let mut mapped = engine.history();
+        let seq = engine.history();
+        self.display = seq.clone();
+        let mut mapped: Vec<Message> = seq
+            .into_iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::Message(message) => Some(message),
+                HistoryEntry::Note(_) => None,
+            })
+            .collect();
         if let Some(ui) = self.last_user_ui.clone()
             && let Some(last_user) = mapped
                 .iter_mut()
@@ -1050,8 +1052,20 @@ impl Thread {
             .unwrap_or_default()
     }
 
-    pub fn ui_notes(&self) -> &[UiNoteRecord] {
-        &self.ui_notes
+    /// The engine's display sequence: messages interleaved with the UI
+    /// annotation cards at their persisted position. Empty until the first
+    /// mirror refresh (landing threads have no engine).
+    pub fn display_history(&self) -> &[HistoryEntry] {
+        &self.display
+    }
+
+    /// Persist a UI annotation card as a session `custom` entry (fire and
+    /// forget; the actor queue orders it against prompts). No-op without an
+    /// engine (landing thread).
+    pub fn append_ui_note(&self, record: UiNoteRecord) {
+        if let Some(engine) = &self.engine {
+            engine.append_ui_note(record);
+        }
     }
 
     pub fn worktree(&self) -> Option<&WorktreeState> {
@@ -1283,7 +1297,7 @@ impl Thread {
                 archived: false,
                 running: false,
                 restored: false,
-                ui_notes: Vec::new(),
+                display: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
                 pending_images: Vec::new(),
@@ -1588,14 +1602,6 @@ impl Thread {
         } else {
             false
         }
-    }
-
-    /// Append a UI annotation card to the in-memory cache. `Workspace`
-    /// snapshots the whole Vec into the session sidecar via `save_thread`
-    /// (best-effort, last-write-wins); a restore replaces the cache from the
-    /// sidecar wholesale.
-    pub fn push_ui_note(&mut self, note: UiNoteRecord) {
-        self.ui_notes.push(note);
     }
 
     /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
@@ -1960,8 +1966,8 @@ pub(crate) mod tests {
             false
         }
 
-        fn history(&self) -> Vec<Message> {
-            self.history.clone()
+        fn history(&self) -> Vec<HistoryEntry> {
+            self.history.clone().into_iter().map(HistoryEntry::Message).collect()
         }
 
         fn request_token_usage(&self) -> HashMap<String, TokenUsage> {
@@ -2036,7 +2042,7 @@ pub(crate) mod tests {
                 archived: false,
                 running: false,
                 restored: false,
-                ui_notes: Vec::new(),
+                display: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
                 pending_images: Vec::new(),
@@ -2373,7 +2379,6 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2456,7 +2461,6 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2558,7 +2562,6 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: Some(value),
-                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2598,7 +2601,6 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                    ui_notes: Vec::new(),
                 },
                 cx,
             );
@@ -2634,7 +2636,6 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                    ui_notes: Vec::new(),
                 },
                 cx,
             );

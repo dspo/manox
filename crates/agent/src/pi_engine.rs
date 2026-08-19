@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pi::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
@@ -24,7 +24,7 @@ use pi_extensions::monitor::{MonitorManager, MonitorTool};
 use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
-use crate::db::ThreadSummary;
+use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE, UiNoteRecord};
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
@@ -113,6 +113,10 @@ pub(crate) enum SessionCmd {
         cwd: PathBuf,
         project: Option<PathBuf>,
     },
+    /// Append a host UI annotation as a `custom` entry at the session leaf.
+    /// The single actor queue makes send order the persist order, so a note
+    /// dispatched before a prompt lands before the prompt's user entry.
+    AppendUiNote(UiNoteRecord),
     /// Close the session and stop the actor.
     Shutdown,
 }
@@ -123,7 +127,14 @@ pub(crate) enum SessionCmd {
 /// Authoritative state the actor writes and the facade mirrors.
 struct EngineState {
     running: AtomicBool,
-    history: Mutex<Vec<Message>>,
+    history: Mutex<Vec<HistoryEntry>>,
+    /// UI annotation cards with their position in the entry sequence; the
+    /// live mirror re-merges them on every tick (the live transcript carries
+    /// no custom entries). `append_custom` is the only other writer.
+    notes: Mutex<Vec<PositionedNote>>,
+    /// Bumped on every note append / authoritative sync so live ticks can
+    /// skip re-merge churn when nothing moved.
+    notes_gen: AtomicU64,
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
@@ -210,6 +221,8 @@ pub fn spawn_engine(
     let state = Arc::new(EngineState {
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
+        notes: Mutex::new(Vec::new()),
+        notes_gen: AtomicU64::new(0),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
@@ -284,10 +297,11 @@ fn spawn_history_preview(
             if entries.is_empty() {
                 continue;
             }
-            let msgs: Vec<Message> = entries
+            let msgs: Vec<HistoryEntry> = entries
                 .iter()
                 .flat_map(pi::session::session_entry_to_context_messages)
                 .flat_map(|m| adapt::harness_messages_to_messages(std::slice::from_ref(&m)))
+                .map(HistoryEntry::Message)
                 .collect();
             if msgs.is_empty() {
                 continue;
@@ -315,8 +329,12 @@ impl ThreadEngine for PiEngine {
         self.state.running.load(Ordering::Relaxed)
     }
 
-    fn history(&self) -> Vec<Message> {
+    fn history(&self) -> Vec<HistoryEntry> {
         self.state.history.lock().unwrap().clone()
+    }
+
+    fn append_ui_note(&self, record: UiNoteRecord) {
+        let _ = self.cmd_tx.send(SessionCmd::AppendUiNote(record));
     }
 
     fn request_token_usage(&self) -> HashMap<String, TokenUsage> {
@@ -1168,10 +1186,16 @@ fn subscribe_session(
 
 /// Cheap change fingerprint for the live-history guard: message count plus
 /// the trailing message's content size. Collisions only defer a facade
-/// refresh by one tick, so exactness is unnecessary.
-fn live_fingerprint(mapped: &[Message]) -> (usize, usize) {
+/// refresh by one tick, so exactness is unnecessary. Notes ride alongside
+/// but never contribute: the `notes_gen` guard covers them.
+fn live_fingerprint(mapped: &[HistoryEntry]) -> (usize, usize) {
     let trailing = mapped
-        .last()
+        .iter()
+        .filter_map(|e| match e {
+            HistoryEntry::Message(m) => Some(m),
+            _ => None,
+        })
+        .next_back()
         .map(|m| {
             m.content
                 .iter()
@@ -1186,7 +1210,11 @@ fn live_fingerprint(mapped: &[Message]) -> (usize, usize) {
                 .sum()
         })
         .unwrap_or(0);
-    (mapped.len(), trailing)
+    let count = mapped
+        .iter()
+        .filter(|e| matches!(e, HistoryEntry::Message(_)))
+        .count();
+    (count, trailing)
 }
 
 /// Refresh the engine's history mirror from the live transcript snapshot
@@ -1202,13 +1230,44 @@ fn sync_live_history(live: &Arc<Mutex<LiveTranscript>>, state: &Arc<EngineState>
             msgs.push(streaming.clone());
         }
     }
-    let mapped = adapt::harness_messages_to_messages(&msgs);
+    let mut display: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&msgs)
+        .into_iter()
+        .map(HistoryEntry::Message)
+        .collect();
+    let notes_gen = state.notes_gen.load(Ordering::SeqCst);
     let mut history = state.history.lock().unwrap();
-    if live_fingerprint(&history) == live_fingerprint(&mapped) {
+    if live_fingerprint(&history) == live_fingerprint(&display)
+        && notes_gen == state.notes_gen.load(Ordering::SeqCst)
+    {
         return false;
     }
-    *history = mapped;
+    // The live transcript carries no custom entries: re-merge the positioned
+    // notes so a mid-run switch-back keeps the cards at their position.
+    let notes = state.notes.lock().unwrap().clone();
+    merge_positioned_notes(&mut display, &notes);
+    *history = display;
     true
+}
+
+/// Interleave notes right after their `after_message`-th message; a count of
+/// zero lands at the top, an over-long count clamps to the tail. Notes are
+/// stored in append order (non-decreasing positions), so sequential inserts
+/// preserve their relative order.
+fn merge_positioned_notes(display: &mut Vec<HistoryEntry>, notes: &[PositionedNote]) {
+    for positioned in notes {
+        let target = positioned.after_message;
+        let mut insert_at = if target == 0 { 0 } else { display.len() };
+        let mut count = 0usize;
+        for (i, entry) in display.iter().enumerate() {
+            if matches!(entry, HistoryEntry::Message(_)) {
+                count += 1;
+                if count == target {
+                    insert_at = i + 1;
+                }
+            }
+        }
+        display.insert(insert_at, HistoryEntry::Note(positioned.note.clone()));
+    }
 }
 
 /// Adapt harness lifecycle events onto the notice channel. Carries the
@@ -1776,7 +1835,6 @@ async fn run_actor(
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
-    let ui_notes = load_ui_notes(&sessions_dir, session.path()).await;
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
     // facade's Ready handler reads `history()` immediately, and a drainer
@@ -1797,7 +1855,6 @@ async fn run_actor(
         plan_file: plan_file_restored,
         plan_review_pending,
         plan_snapshot,
-        ui_notes,
     });
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -2531,6 +2588,28 @@ async fn run_actor(
                     }
                 }
             }
+            SessionCmd::AppendUiNote(record) => {
+                // Persist at the leaf through the append queue; refresh the
+                // mirror so an idle switch-away sees the note before the next
+                // authoritative sync.
+                let data = serde_json::to_value(&record).ok();
+                match session.append_custom(UI_NOTE_CUSTOM_TYPE, data).await {
+                    Ok(_) => {
+                        let after_message = live_mirror.lock().unwrap().messages.len();
+                        state
+                            .history
+                            .lock()
+                            .unwrap()
+                            .push(HistoryEntry::Note(record.clone()));
+                        state.notes.lock().unwrap().push(PositionedNote {
+                            note: record,
+                            after_message,
+                        });
+                        state.notes_gen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(err) => tracing::warn!(error = %err, "failed to persist UI note"),
+                }
+            }
             SessionCmd::Shutdown => break,
         }
     }
@@ -3029,18 +3108,6 @@ async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<
     }
 }
 
-/// The UI annotation cards (Error / Notice / PlanReview) persisted in the
-/// sidecar, in emit order. The host serializes its `Vec<UiNoteRecord>`;
-/// `None`/absent on a fresh session restores as empty.
-async fn load_ui_notes(sessions_dir: &Path, session_path: &Path) -> Vec<crate::db::UiNoteRecord> {
-    pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .ok()
-        .and_then(|m| m.ui_notes)
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default()
-}
-
 /// The active worktree binding persisted in a session's sidecar (forked
 /// worktree sessions carry it; originals and plain sessions don't).
 async fn load_worktree_state(
@@ -3189,17 +3256,28 @@ async fn resync_approval_mode(
     )));
 }
 
-/// Mirror the session's authoritative transcript into engine state, then
-/// re-attach the registry slash turns' compact display forms from the
-/// sidecar (the transcript stores only the expanded macro/skill body, so
-/// the attach is what keeps a reloaded thread's bubbles compact).
+/// Mirror the session's authoritative entry list (compaction-aware, every
+/// entry type) into engine state: the display sequence interleaves UI note
+/// entries at their persisted position, then re-attaches the registry slash
+/// turns' compact display forms from the sidecar (the transcript stores only
+/// the expanded macro/skill body, so the attach is what keeps a reloaded
+/// thread's bubbles compact).
 async fn sync_history(session: &AgentSession, sessions_dir: &Path, state: &Arc<EngineState>) {
-    let mut mapped = adapt::harness_messages_to_messages(session.harness_messages());
+    let entries = match session.context_entries().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(error = %err, "context entries unavailable; mirror left as-is");
+            return;
+        }
+    };
+    let (mut display, notes) = adapt::entries_to_display(&entries);
     attach_registry_displays(
-        &mut mapped,
+        &mut display,
         &load_registry_displays(sessions_dir, session.path()).await,
     );
-    *state.history.lock().unwrap() = mapped;
+    *state.history.lock().unwrap() = display;
+    *state.notes.lock().unwrap() = notes;
+    state.notes_gen.fetch_add(1, Ordering::SeqCst);
 }
 
 /// The compact display forms persisted per user-message ordinal by
@@ -3251,14 +3329,17 @@ fn clear_registry_displays_spawn(sessions_dir: PathBuf, session_path: PathBuf) {
 /// provenance — the same set `Thread` counts when persisting — so steers
 /// (user prompts too) and tool results (excluded) align between the two.
 fn attach_registry_displays(
-    history: &mut [Message],
+    history: &mut [HistoryEntry],
     displays: &std::collections::HashMap<usize, String>,
 ) {
     if displays.is_empty() {
         return;
     }
     let mut ordinal = 0usize;
-    for message in history {
+    for entry in history {
+        let HistoryEntry::Message(message) = entry else {
+            continue;
+        };
         if message.role == crate::language_model::Role::User
             && message.provenance == crate::message::MessageProvenance::User
         {
@@ -3333,12 +3414,15 @@ fn store_attribution(state: &Arc<EngineState>, session: &AgentSession) {
 /// numerator; summing requests would count the repeated prompt prefix once
 /// per tool-loop iteration).
 fn request_attribution(
-    history: &[Message],
+    history: &[HistoryEntry],
     messages: &[AgentMessage],
 ) -> (HashMap<String, TokenUsage>, HashMap<String, TokenUsage>) {
     let mut per_turn: HashMap<String, TokenUsage> = HashMap::new();
     let mut per_model_last: HashMap<String, TokenUsage> = HashMap::new();
-    let mut ids = history.iter();
+    let mut ids = history.iter().filter_map(|entry| match entry {
+        HistoryEntry::Message(message) => Some(message),
+        HistoryEntry::Note(_) => None,
+    });
     let mut turn_key: Option<String> = None;
     let mut over_consumed = false;
     for m in messages {
@@ -3570,43 +3654,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_ui_notes_restores_sidecar_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("sess-notes.jsonl");
-
-        // Fresh session: no ui_notes key -> empty.
-        assert!(load_ui_notes(dir.path(), &session).await.is_empty());
-
-        // Persist the agent's `Vec<UiNoteRecord>` shape, including an approval
-        // record carrying `data.tool_call_id`.
-        let record = crate::db::UiNoteRecord {
-            anchor_user_id: Some("u1".into()),
-            kind: crate::db::UiNoteKind::Notice,
-            data: serde_json::json!({ "text": "Bash allowed", "tool_call_id": "tu_1" }),
-        };
-        let mut meta = pi_extensions::session_meta::load(dir.path(), &session)
-            .await
-            .unwrap();
-        meta.ui_notes = Some(serde_json::to_value(vec![record.clone()]).unwrap());
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
-            .await
-            .unwrap();
-
-        let restored = load_ui_notes(dir.path(), &session).await;
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].kind, crate::db::UiNoteKind::Notice);
-        assert_eq!(restored[0].anchor_user_id.as_deref(), Some("u1"));
-        assert_eq!(
-            restored[0]
-                .data
-                .get("tool_call_id")
-                .and_then(|v| v.as_str()),
-            Some("tu_1"),
-            "the tool anchor survives the sidecar restore"
-        );
-    }
-
-    #[tokio::test]
     async fn attach_registry_displays_restores_sidecar_compact_forms() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-display.jsonl");
@@ -3626,7 +3673,7 @@ mod tests {
         let displays = load_registry_displays(dir.path(), &session).await;
         // Ordinals count user prompts only: a tool result (user role, tool
         // provenance) and assistant turns must not consume one.
-        let mut history = vec![
+        let mut history: Vec<HistoryEntry> = vec![
             Message::user("expanded macro body".to_string()), // ordinal 0
             Message::user("plain turn".to_string()),          // ordinal 1
             Message::user_with_content(vec![MessageContent::ToolResult(
@@ -3639,32 +3686,25 @@ mod tests {
             )]),
             Message::assistant(vec![MessageContent::Text("reply".into())]),
             Message::user("expanded skill body".to_string()), // ordinal 2
-        ];
+        ]
+        .into_iter()
+        .map(HistoryEntry::Message)
+        .collect();
         attach_registry_displays(&mut history, &displays);
 
-        assert_eq!(
-            history[0]
-                .ui
-                .as_ref()
-                .and_then(|ui| ui.display_text.as_deref()),
-            Some("/gitwork:deliver fast")
-        );
-        assert!(history[1].ui.is_none(), "plain turn keeps no display text");
-        assert!(
-            history[2].ui.is_none(),
-            "tool result never consumes a display ordinal"
-        );
-        assert!(
-            history[3].ui.is_none(),
-            "assistant turns never get display text"
-        );
-        assert_eq!(
-            history[4]
-                .ui
-                .as_ref()
-                .and_then(|ui| ui.display_text.as_deref()),
-            Some("/healthz")
-        );
+        let ui = |ix: usize| match &history[ix] {
+            HistoryEntry::Message(m) => m.ui.as_ref().and_then(|ui| ui.display_text.clone()),
+            _ => None,
+        };
+        let no_ui = |ix: usize| match &history[ix] {
+            HistoryEntry::Message(m) => m.ui.is_none(),
+            _ => false,
+        };
+        assert_eq!(ui(0).as_deref(), Some("/gitwork:deliver fast"));
+        assert!(no_ui(1), "plain turn keeps no display text");
+        assert!(no_ui(2), "tool result never consumes a display ordinal");
+        assert!(no_ui(3), "assistant turns never get display text");
+        assert_eq!(ui(4).as_deref(), Some("/healthz"));
     }
 
     #[tokio::test]
@@ -3963,6 +4003,8 @@ mod tests {
             running: AtomicBool::new(false),
             session_start_fired: AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
+            notes: Mutex::new(Vec::new()),
+            notes_gen: AtomicU64::new(0),
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
@@ -4016,12 +4058,14 @@ mod tests {
             let history = state.history.lock().unwrap();
             assert_eq!(history.len(), 2);
             assert!(matches!(
-                &history[0].content[0],
-                crate::language_model::MessageContent::Text(t) if t == "hi"
+                &history[0],
+                HistoryEntry::Message(m)
+                    if matches!(&m.content[0], crate::language_model::MessageContent::Text(t) if t == "hi")
             ));
             assert!(matches!(
-                &history[1].content[0],
-                crate::language_model::MessageContent::Text(t) if t == "part"
+                &history[1],
+                HistoryEntry::Message(m)
+                    if matches!(&m.content[0], crate::language_model::MessageContent::Text(t) if t == "part")
             ));
         }
 
@@ -4034,8 +4078,9 @@ mod tests {
         assert!(sync_live_history(&live, &state));
         let history = state.history.lock().unwrap();
         assert!(matches!(
-            &history[1].content[0],
-            crate::language_model::MessageContent::Text(t) if t == "partial-answer"
+            &history[1],
+            HistoryEntry::Message(m)
+                if matches!(&m.content[0], crate::language_model::MessageContent::Text(t) if t == "partial-answer")
         ));
     }
 
@@ -4613,16 +4658,20 @@ mod tests {
             },
             assistant_request(u3.clone()),
         ];
-        let history = adapt::harness_messages_to_messages(&messages);
+        let history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages)
+            .into_iter()
+            .map(HistoryEntry::Message)
+            .collect();
         let (per_turn, per_model_last) = request_attribution(&history, &messages);
+        let id = |ix: usize| match &history[ix] {
+            HistoryEntry::Message(m) => m.id.clone(),
+            _ => String::new(),
+        };
 
         // Each turn accumulates under its own triggering user message.
         assert_eq!(per_turn.len(), 2);
-        assert_eq!(
-            per_turn[&history[0].id],
-            to_token_usage(&u1) + to_token_usage(&u2)
-        );
-        assert_eq!(per_turn[&history[3].id], to_token_usage(&u3));
+        assert_eq!(per_turn[&id(0)], to_token_usage(&u1) + to_token_usage(&u2));
+        assert_eq!(per_turn[&id(3)], to_token_usage(&u3));
 
         // The budget numerator is the single latest request, never a sum.
         let last = per_model_last
@@ -4641,7 +4690,10 @@ mod tests {
             },
             assistant_request(assistant_usage(100)),
         ];
-        let mut history = adapt::harness_messages_to_messages(&messages);
+        let mut history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages)
+            .into_iter()
+            .map(HistoryEntry::Message)
+            .collect();
         // Simulate adapt drift: one mapped row the walk never consumes.
         history.push(history[0].clone());
         let _ = request_attribution(&history, &messages);
@@ -4659,7 +4711,10 @@ mod tests {
         ];
         // Simulate adapt drift in the other direction: the walk consumes an
         // id for a message the mapping would not emit.
-        let history = adapt::harness_messages_to_messages(&messages[..1]);
+        let history: Vec<HistoryEntry> = adapt::harness_messages_to_messages(&messages[..1])
+            .into_iter()
+            .map(HistoryEntry::Message)
+            .collect();
         let _ = request_attribution(&history, &messages);
     }
 }

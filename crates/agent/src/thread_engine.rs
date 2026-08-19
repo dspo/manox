@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
-use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::thread::ApprovalMode;
 use pi::types::Model as PiModel;
@@ -25,9 +24,15 @@ pub trait ThreadEngine: Send + Sync {
     /// Whether a turn is currently in flight.
     fn is_running(&self) -> bool;
 
-    /// The authoritative transcript after the latest settled run. The facade
-    /// replaces its cached history with this on every settle.
-    fn history(&self) -> Vec<Message>;
+    /// The authoritative display sequence after the latest settled run:
+    /// messages interleaved with the persisted UI annotation cards. The
+    /// facade replaces its cached copy with this on every settle.
+    fn history(&self) -> Vec<crate::db::HistoryEntry>;
+
+    /// Persist a UI annotation card into the session transcript (a `custom`
+    /// entry at the current leaf). Fire-and-forget; the backend's command
+    /// queue orders it against prompts.
+    fn append_ui_note(&self, _record: crate::db::UiNoteRecord) {}
 
     /// Token usage keyed by user-message id, as the env card renders it.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
@@ -185,11 +190,6 @@ pub enum BackendNotice {
         /// mirrors it as the rebuild fallback after compaction summarized
         /// the transcript's plan tool calls away.
         plan_snapshot: Option<serde_json::Value>,
-        /// Persisted UI annotation cards (sidecar); the facade seeds
-        /// `thread.ui_notes` BEFORE emitting `HistoryRestored`, so the
-        /// rebuild splices them back at the anchored position
-        /// (tool-call-adjacent for approval records).
-        ui_notes: Vec<crate::db::UiNoteRecord>,
     },
     /// The turn loop unwound and released the running slot.
     Settled {

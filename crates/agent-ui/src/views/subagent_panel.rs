@@ -97,15 +97,16 @@ impl SubagentPanel {
                 // Replay the final answer as a one-message conversation so
                 // the fallback renders through the same pipeline.
                 Some(final_text) => {
-                    let messages = vec![Message::assistant(vec![MessageContent::Text(final_text)])];
+                    let display = vec![agent::db::HistoryEntry::Message(Message::assistant(vec![
+                        MessageContent::Text(final_text),
+                    ]))];
                     let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
                     cx.new(|cx| {
-                        ConversationState::rebuild_from_messages(
-                            &messages,
+                        ConversationState::rebuild_from_display(
+                            &display,
                             &empty_usage,
                             &role_for_conv,
                             false,
-                            &[],
                             ctx,
                             cx,
                         )

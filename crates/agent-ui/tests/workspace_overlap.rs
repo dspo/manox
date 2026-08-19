@@ -105,14 +105,18 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
         agent::thread_store::init(cx);
     });
     let messages = load_real_session_messages();
+    let display: Vec<agent::db::HistoryEntry> = messages
+        .iter()
+        .cloned()
+        .map(agent::db::HistoryEntry::Message)
+        .collect();
     let weak = gpui::WeakEntity::<Workspace>::new_invalid();
     let conversation = cx.new(|cx| {
-        agent_ui::conversation::ConversationState::rebuild_from_messages(
-            &messages,
+        agent_ui::conversation::ConversationState::rebuild_from_display(
+            &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
             true,
-            &[],
             agent_ui::conversation::ApplyCtx { weak, cwd: None },
             cx,
         )
@@ -179,12 +183,11 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
     });
     draw(&mut visual);
     let rebuilt = cx.new(|cx| {
-        agent_ui::conversation::ConversationState::rebuild_from_messages(
-            &messages,
+        agent_ui::conversation::ConversationState::rebuild_from_display(
+            &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
             true,
-            &[],
             agent_ui::conversation::ApplyCtx {
                 weak: gpui::WeakEntity::<Workspace>::new_invalid(),
                 cwd: None,

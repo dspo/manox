@@ -336,6 +336,52 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
     out
 }
 
+/// Project the session entry list onto the display sequence the UI mirror
+/// and the conversation rebuild share: every projected context message
+/// becomes a `HistoryEntry::Message`, and `manox_ui_note` custom entries
+/// become `HistoryEntry::Note` at their persisted position. Returns the
+/// positioned notes alongside so live mirror refreshes can re-merge them
+/// (the live transcript carries no custom entries).
+pub fn entries_to_display(
+    entries: &[pi::session::SessionTreeEntry],
+) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
+    let mut display: Vec<HistoryEntry> = Vec::new();
+    let mut notes: Vec<PositionedNote> = Vec::new();
+    let mut message_count = 0usize;
+    for entry in entries {
+        if let pi::session::SessionTreeEntry::Custom {
+            custom_type, data, ..
+        } = entry
+        {
+            if custom_type == UI_NOTE_CUSTOM_TYPE {
+                match data
+                    .as_ref()
+                    .map(|d| serde_json::from_value::<UiNoteRecord>(d.clone()))
+                {
+                    Some(Ok(note)) => {
+                        notes.push(PositionedNote {
+                            note: note.clone(),
+                            after_message: message_count,
+                        });
+                        display.push(HistoryEntry::Note(note));
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(error = %err, "unparseable UI note entry skipped")
+                    }
+                    None => {}
+                }
+            }
+            continue;
+        }
+        for message in pi::session::session_entry_to_context_messages(entry) {
+            let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+            message_count += mapped.len();
+            display.extend(mapped.into_iter().map(HistoryEntry::Message));
+        }
+    }
+    (display, notes)
+}
+
 /// One pi content block onto one manox content block.
 fn content_block_to_message_content(block: &ContentBlock) -> MessageContent {
     match block {
@@ -441,5 +487,99 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             None => "Agent".to_string(),
         },
         _ => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi::session::SessionTreeEntry;
+
+    fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user(text),
+        }
+    }
+
+    fn note_entry(text: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Custom {
+            id: format!("note-{text}"),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            custom_type: UI_NOTE_CUSTOM_TYPE.to_string(),
+            data: Some(serde_json::json!({
+                "kind": "error",
+                "data": { "text": text },
+            })),
+        }
+    }
+
+    #[test]
+    fn entries_to_display_interleaves_notes_and_skips_unknown_customs() {
+        let entries = vec![
+            message_entry("m1", "one"),
+            note_entry("boom"),
+            SessionTreeEntry::Custom {
+                id: "other".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                custom_type: "some_extension".into(),
+                data: None,
+            },
+            message_entry("m2", "two"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].after_message, 1);
+        let kinds: Vec<&str> = display
+            .iter()
+            .map(|e| match e {
+                HistoryEntry::Message(_) => "m",
+                HistoryEntry::Note(_) => "n",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["m", "n", "m"]);
+    }
+
+    #[test]
+    fn entries_to_display_counts_positions_over_projected_compaction_list() {
+        // `sync_history` feeds the projected (post-compaction) entry list:
+        // pre-boundary notes never reach this function (build_context_entries
+        // drops them — covered by the pi crate's projection tests). The
+        // projection of `m1 [dropped] m2 [kept] c1(keeps m2) m3` is
+        // [c1, m2, note-kept, m3]; positions count the summary + m2.
+        let entries = vec![
+            SessionTreeEntry::Compaction {
+                id: "c1".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                summary: "recap".into(),
+                first_kept_entry_id: Some("m2".into()),
+                tokens_before: 0,
+                retained_tail: None,
+                usage: None,
+                details: None,
+                from_hook: None,
+            },
+            message_entry("m2", "two"),
+            note_entry("kept"),
+            message_entry("m3", "three"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].note.data["text"].as_str(), Some("kept"));
+        // summary + m2 precede the kept note.
+        assert_eq!(notes[0].after_message, 2);
+        let kinds: Vec<&str> = display
+            .iter()
+            .map(|e| match e {
+                HistoryEntry::Message(_) => "m",
+                HistoryEntry::Note(_) => "n",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["m", "m", "n", "m"]);
     }
 }

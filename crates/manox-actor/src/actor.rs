@@ -4211,7 +4211,7 @@ mod tests {
             false
         }
 
-        fn history(&self) -> Vec<agent::Message> {
+        fn history(&self) -> Vec<agent::db::HistoryEntry> {
             Vec::new()
         }
 

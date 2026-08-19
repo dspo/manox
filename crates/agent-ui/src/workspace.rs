@@ -867,19 +867,18 @@ impl Workspace {
     /// restored history lands.
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
-        let notes = self.thread.read(cx).ui_notes().to_vec();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let cwd = thread_cwd(&self.thread, cx);
         let new_conv = cx.new(|cx| {
-            ConversationState::rebuild_from_messages(
-                &messages,
+            ConversationState::rebuild_from_display(
+                &display,
                 &usage,
                 &role,
                 running,
-                &notes,
                 crate::conversation::ApplyCtx {
                     weak: weak.clone(),
                     cwd,
@@ -1283,7 +1282,7 @@ impl Workspace {
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
-                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), None, cx);
+                        this.append_ui_note(agent::db::UiNoteKind::Error, e.to_string(), None, cx);
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
@@ -2896,20 +2895,19 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
-        let notes = self.thread.read(cx).ui_notes().to_vec();
         let background_tasks = self.thread.read(cx).background_task_snapshots();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let cwd = thread_cwd(&self.thread, cx);
         let new_conv = cx.new(|cx| {
-            let mut conversation = ConversationState::rebuild_from_messages(
-                &messages,
+            let mut conversation = ConversationState::rebuild_from_display(
+                &display,
                 &usage,
                 &role,
                 running,
-                &notes,
                 crate::conversation::ApplyCtx {
                     weak: weak.clone(),
                     cwd,
@@ -3491,12 +3489,11 @@ impl Workspace {
             self.list_state.remeasure();
             // Persist the dismissed plan as a UI note so the collapsed record
             // survives a thread switch / reload — the live card is UI-only and
-            // never enters `Thread::messages`. `record_ui_note` anchors to the
-            // last user message, which at this point (before the dismissing
-            // message is appended below) is the one that triggered the plan's
-            // turn, so the rebuild splices the card back at that turn's end,
-            // ahead of this dismissing message — matching the live order.
-            self.record_ui_note(
+            // never enters `Thread::messages`. The append lands before the
+            // dismissing message's prompt dispatch below (single actor
+            // queue), so the rebuilt conversation shows the card ahead of
+            // this dismissing message — matching the live order.
+            self.append_ui_note(
                 agent::db::UiNoteKind::PlanReview,
                 review.content.clone(),
                 None,
@@ -4193,12 +4190,10 @@ impl Workspace {
     ///
     /// The notice is inserted at `anchor` — `TurnEnd` (the end of the current
     /// turn, i.e. the list tail when idle) or `After(ix)` for a tool-call-
-    /// adjacent record. Also persists the notice so a reloaded thread
-    /// reproduces it; the live `push_notice` only touches
-    /// `ConversationState`, while `record_ui_note` persists it (carrying
-    /// `tool_call_id` when given) and `merge_ui_notes` splices it back at the
-    /// same position on next load — the turn end, or right after the tool
-    /// item for an approval record.
+    /// adjacent record. Also persists the notice as a session `custom` entry
+    /// so a reloaded thread reproduces it at the same position (entries
+    /// carrying `tool_call_id` are re-spliced right after their tool item by
+    /// the rebuild).
     pub fn add_info_message(
         &mut self,
         text: String,
@@ -4211,7 +4206,7 @@ impl Workspace {
             .conversation
             .update(cx, |c, cx| c.push_notice(text.clone(), anchor, weak, cx));
         self.apply_list_insert(ix);
-        self.record_ui_note(agent::db::UiNoteKind::Notice, text, tool_call_id, cx);
+        self.append_ui_note(agent::db::UiNoteKind::Notice, text, tool_call_id, cx);
         // Tail-follow keeps the viewport pinned to the live end, so a
         // `TurnEnd`-anchored notice is revealed by the follow; an `After`
         // anchored one sits above the viewport by design (a record near its
@@ -4219,50 +4214,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview`) to the
-    /// session sidecar. The anchor is the current turn's user message —
-    /// `None` before the first user message — so the rebuild can place the
-    /// note at the end of its turn (or next to its tool call when
-    /// `tool_call_id` is set). Best-effort: the live item already rendered
-    /// this turn; only the reload copy is at stake.
-    ///
-    /// The in-memory `Thread::ui_notes` Vec is the render source of truth
-    /// (a background thread reclaimed via `attach_thread` rebuilds from the
-    /// entity, not the sidecar); `save_thread` snapshots the whole Vec into
-    /// the sidecar so a process restart reproduces the notes too.
-    fn record_ui_note(
+    /// Persist a UI annotation (`Error` / `Notice` / `PlanReview`) as a
+    /// `custom` entry in the session jsonl at the current leaf. The append
+    /// order IS the reload order, so rebuilt conversations place the card
+    /// where it appeared live; entries carrying `tool_call_id` are re-spliced
+    /// next to their tool item by the rebuild instead. Fire-and-forget via
+    /// the engine's command queue, which orders it against prompts.
+    fn append_ui_note(
         &self,
         kind: agent::db::UiNoteKind,
         text: String,
         tool_call_id: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let anchor = self
-            .thread
-            .read(cx)
-            .last_user_message_id()
-            .map(str::to_owned);
         let mut data = serde_json::json!({ "text": text });
         // A tool-anchored notice (an approval decision record) carries the
-        // tool call id so `merge_ui_notes` can splice it next to the tool
-        // item on reload, matching the live placement. `data` is raw JSON —
-        // no schema change.
+        // tool call id so the rebuild can splice it next to the tool item,
+        // matching the live placement. `data` is raw JSON — no schema change.
         if let Some(id) = tool_call_id {
             data["tool_call_id"] = serde_json::Value::String(id.to_owned());
         }
-        // Keep the in-memory cache consistent with the persisted record so the
-        // background-reclaim rebuild path (no db reload) reproduces the note.
-        let cached = agent::db::UiNoteRecord {
-            anchor_user_id: anchor.clone(),
-            kind,
-            data: data.clone(),
-        };
-        self.thread.update(cx, |t, _| t.push_ui_note(cached));
-        // Flush the in-memory cache to the session sidecar (the pi backend's
-        // authority for restore): the next `save_thread` — or a full snapshot
-        // at turn end / thread switch — overwrites the whole Vec, so this
-        // write is best-effort and last-write-wins.
-        save_thread(self.thread.clone(), false, cx);
+        self.thread.update(cx, |t, _| {
+            t.append_ui_note(agent::db::UiNoteRecord { kind, data })
+        });
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {

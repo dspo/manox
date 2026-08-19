@@ -49,13 +49,6 @@ pub struct SessionMeta {
     /// after the model clears its plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_snapshot: Option<serde_json::Value>,
-    /// Persisted UI annotation cards (Error / Notice / PlanReview) — host-
-    /// only, never enter the model transcript. Stored as the agent's
-    /// `Vec<UiNoteRecord>` serialized to JSON (array order = emit order);
-    /// restored on session reopen so the rebuilt conversation reproduces
-    /// them at their anchored position.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_notes: Option<serde_json::Value>,
     /// Active git-worktree binding (`EnterWorktree`/`ExitWorktree`): the
     /// session is a fork whose cwd is the worktree; the original session
     /// file + cwd are kept so `ExitWorktree` can return. Absent = not in a
@@ -134,9 +127,9 @@ pub async fn save(
 
 /// Per-sidecar write lock keyed by sidecar path: every load→modify→save
 /// cycle takes it before touching the file, so concurrent writers (archive /
-/// pin / unread, engine title / approval-mode persists, ui_notes snapshots)
-/// can never interleave and clobber each other's fields. The map is unbounded
-/// by design — one entry per session ever written.
+/// pin / unread, engine title / approval-mode persists) can never interleave
+/// and clobber each other's fields. The map is unbounded by design — one
+/// entry per session ever written.
 static WRITE_LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
@@ -289,46 +282,6 @@ mod tests {
         save(dir.path(), &session, &meta).await.unwrap();
         let loaded = load(dir.path(), &session).await.unwrap();
         assert_eq!(loaded.reasoning_effort.as_deref(), Some("max"));
-    }
-
-    #[tokio::test]
-    async fn ui_notes_round_trips_and_defaults_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("abc.jsonl");
-
-        // Fresh sidecar: no persisted ui notes.
-        let fresh = load(dir.path(), &session).await.unwrap();
-        assert!(fresh.ui_notes.is_none());
-
-        // Persist the agent's `Vec<UiNoteRecord>` shape (array order = emit
-        // order; approval records carry `data.tool_call_id`).
-        let notes = serde_json::json!([
-            {
-                "anchor_user_id": "u1",
-                "kind": "notice",
-                "data": { "text": "Bash allowed", "tool_call_id": "tu_1" }
-            },
-            { "anchor_user_id": null,
-              "kind": "error", "data": { "text": "boom" } }
-        ]);
-        let mut meta = load(dir.path(), &session).await.unwrap();
-        meta.ui_notes = Some(notes.clone());
-        save(dir.path(), &session, &meta).await.unwrap();
-        let loaded = load(dir.path(), &session).await.unwrap();
-        assert_eq!(loaded.ui_notes, Some(notes));
-        let first = loaded.ui_notes.as_ref().unwrap()[0].as_object().unwrap();
-        assert_eq!(
-            first["data"]["tool_call_id"].as_str(),
-            Some("tu_1"),
-            "the tool anchor survives the sidecar round-trip"
-        );
-
-        // Clearing removes the field entirely.
-        let mut meta = loaded;
-        meta.ui_notes = None;
-        save(dir.path(), &session, &meta).await.unwrap();
-        let cleared = load(dir.path(), &session).await.unwrap();
-        assert!(cleared.ui_notes.is_none());
     }
 
     #[tokio::test]

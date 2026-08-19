@@ -34,12 +34,13 @@ async fn ask_card_synthesized_when_rebuild_misses_the_tool_item(cx: &mut TestApp
     // Thinking segment, no top-level AskUserQuestion card.
     let weak = gpui::WeakEntity::<Workspace>::new_invalid();
     let conversation = cx.new(|cx| {
-        ConversationState::rebuild_from_messages(
-            &[bash_tool_use_message("t1")],
+        ConversationState::rebuild_from_display(
+            &[agent::db::HistoryEntry::Message(bash_tool_use_message(
+                "t1",
+            ))],
             &std::collections::HashMap::new(),
             "test-model",
             true,
-            &[],
             ApplyCtx { weak, cwd: None },
             cx,
         )
