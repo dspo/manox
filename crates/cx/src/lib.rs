@@ -2787,9 +2787,10 @@ fn build_launch_spec(
 
         // Inject a unified model identifier so agents and their tooling can
         // detect which model cx configured, regardless of the agent type.
-        // 用剥除上下文后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
-        // ctx_hint（[1m] → 1_000_000）由各 agent 分支按需消费：copilot 写入
-        // COPILOT_PROVIDER_MAX_PROMPT_TOKENS，codex 写入 model_context_window。
+        // The wire-facing id is the base id (context suffix stripped; providers
+        // do not recognize cx's suffix). ctx_hint ([1m] → 1_000_000) is consumed
+        // per agent branch: claude writes CLAUDE_CODE_MAX_CONTEXT_TOKENS, copilot
+        // COPILOT_PROVIDER_MAX_PROMPT_TOKENS, codex model_context_window.
         let (api_model_id, ctx_hint) = parse_model_context_suffix(&model.id);
         env.insert("CX_MODEL".into(), api_model_id.to_string());
 
@@ -2845,6 +2846,12 @@ fn build_launch_spec(
                 env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
                 env.insert("ANTHROPIC_API_KEY".into(), apikey);
                 env.insert("ANTHROPIC_MODEL".into(), api_model_id.to_string());
+                // [1m] context declaration travels with the injection: LaunchSpec
+                // env overrides the inherited env at spawn, and suffix-less models
+                // leave any shell-exported value untouched (apply_byok_env parity).
+                if let Some(tokens) = ctx_hint {
+                    env.insert("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), tokens.to_string());
+                }
                 args.push("--model".into());
                 args.push(api_model_id.to_string());
                 args.extend(passthrough_args.iter().cloned());
@@ -5207,6 +5214,8 @@ agents:
             spec.env.get("ANTHROPIC_MODEL"),
             Some(&"qwen3.6-plus".into())
         );
+        // Suffix-less model: no context declaration injected.
+        assert!(!spec.env.contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
         assert_eq!(
             spec.args,
             vec![
@@ -5262,6 +5271,10 @@ agents:
         );
         assert!(spec.args.iter().any(|a| a == "glm-5.2"));
         assert!(!spec.args.iter().any(|a| a.contains("[1m]")));
+        assert_eq!(
+            spec.env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(&"1000000".to_string())
+        );
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
