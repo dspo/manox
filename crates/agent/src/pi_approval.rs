@@ -881,7 +881,7 @@ fn approval_tools(
     Arc::from(vec![
         wrap(Arc::new(pi_extensions::read::SelectorReadTool::new())),
         wrap(Arc::new(pi::tools::grep::GrepTool)),
-        wrap(Arc::new(pi::tools::find::FindTool)),
+        wrap(Arc::new(pi::tools::glob::GlobTool)),
         wrap(Arc::new(pi::tools::ls::LsTool)),
         Arc::new(ApprovalTool { decision, calls }),
     ])
@@ -1000,7 +1000,7 @@ mod tests {
     fn reviewer_exposes_only_four_read_tools_and_approval() {
         let tools = approval_tools(Arc::new(Mutex::new(None)), Arc::new(Mutex::new(0)));
         let names = tools.iter().map(|tool| tool.name()).collect::<Vec<_>>();
-        assert_eq!(names, vec!["Read", "Grep", "Find", "Ls", "Approval"]);
+        assert_eq!(names, vec!["Read", "Grep", "Glob", "Ls", "Approval"]);
         assert!(tools[..4].iter().all(|tool| tool.is_read_only()));
     }
 
@@ -1019,7 +1019,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name())
                 .collect::<Vec<_>>();
-            assert_eq!(names, vec!["Read", "Grep", "Find", "Ls", "Approval"]);
+            assert_eq!(names, vec!["Read", "Grep", "Glob", "Ls", "Approval"]);
             assert_eq!(context.thinking_level.as_deref(), Some("medium"));
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::ToolUse {

@@ -402,7 +402,7 @@ mod tests {
     fn explore_manifest_parses() {
         let def = explore_agent_def();
         assert_eq!(def.name, "Explore");
-        assert_eq!(def.tools, vec!["Read", "Grep", "Find", "Ls"]);
+        assert_eq!(def.tools, vec!["Read", "Grep", "Glob", "Ls"]);
         assert!(def.system_prompt.contains("read-only codebase"));
         assert!(def.description.to_lowercase().contains("read-only"));
     }

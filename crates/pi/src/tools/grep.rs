@@ -1,14 +1,15 @@
 // Grep tool — in-process content search with regex.
 //
-// Uses `ignore` for filesystem traversal (respects .gitignore) and `regex`
-// for pattern matching. No shell execution — the LLM's input is treated as
-// data, not as a command string.
+// Uses the `grep-searcher` engine for matching and `ignore` for filesystem
+// traversal (respects .gitignore). No shell execution — the LLM's input is
+// treated as data, not as a command string.
 
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSetBuilder};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use regex::RegexBuilder;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -98,19 +99,18 @@ impl AgentTool for GrepTool {
             .map(|v| v as usize)
             .unwrap_or(Self::DEFAULT_LIMIT);
 
-        // Build the regex.
-        let regex = if is_literal {
-            let escaped = regex::escape(pattern);
-            RegexBuilder::new(&escaped)
+        // Build the matcher on the ripgrep engine. Literal mode escapes the
+        // pattern first; the engine otherwise interprets it as a regex.
+        let matcher = {
+            let pattern = if is_literal {
+                regex::escape(pattern)
+            } else {
+                pattern.to_string()
+            };
+            RegexMatcherBuilder::new()
                 .case_insensitive(ignore_case)
                 .multi_line(true)
-                .build()
-                .map_err(|e| ToolError::InvalidArguments(format!("invalid pattern: {e}")))?
-        } else {
-            RegexBuilder::new(pattern)
-                .case_insensitive(ignore_case)
-                .multi_line(true)
-                .build()
+                .build(&pattern)
                 .map_err(|e| ToolError::InvalidArguments(format!("invalid regex: {e}")))?
         };
 
@@ -122,8 +122,7 @@ impl AgentTool for GrepTool {
 
         // Walk the directory tree and collect matches.
         let (matches, matched_paths) =
-            search_files(&search_path, &regex, &glob_set, context_lines, limit);
-
+            search_files(&search_path, &matcher, &glob_set, context_lines, limit);
         if matches.is_empty() {
             return Ok(AgentToolResult::text("No matches found"));
         }
@@ -192,18 +191,24 @@ fn build_glob_filter(pattern: Option<&str>) -> Result<Option<globset::GlobSet>, 
     Ok(Some(set))
 }
 
-/// Search files for a regex pattern. Returns the formatted matches plus the
-/// paths of files that produced at least one match, in first-match order
-/// (deduplicated), so the caller can record hashline snapshots for them.
+/// Search files for a pattern with the ripgrep engine. Returns the formatted
+/// matches plus the paths of files that produced at least one match, in
+/// first-match order (deduplicated), so the caller can record hashline
+/// snapshots for them.
 fn search_files(
     search_path: &Path,
-    regex: &regex::Regex,
+    matcher: &RegexMatcher,
     glob_set: &Option<globset::GlobSet>,
     context_lines: usize,
     limit: usize,
 ) -> (Vec<String>, Vec<PathBuf>) {
     let mut results: Vec<String> = Vec::new();
     let mut matched_paths: Vec<PathBuf> = Vec::new();
+    let mut searcher = SearcherBuilder::new()
+        // Ripgrep semantics: a NUL byte marks the file binary, and the search
+        // stops there instead of reporting garbage matches.
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
 
     let walker = WalkBuilder::new(search_path)
         .hidden(false)
@@ -215,6 +220,9 @@ fn search_files(
         .build();
 
     for entry in walker {
+        if results.len() >= limit {
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -232,52 +240,85 @@ fn search_files(
             continue;
         }
 
-        if results.len() >= limit {
-            break;
+        let mut sink = CollectSink {
+            remaining: limit - results.len(),
+            matches: Vec::new(),
+        };
+        let _ = searcher.search_path(matcher, path, &mut sink);
+        if sink.matches.is_empty() {
+            continue;
         }
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        if !matched_paths.iter().any(|p| p == path) {
+            matched_paths.push(path.to_path_buf());
+        }
+
+        // Paths read relative to the search root: an absolute path repeats
+        // the root on every match, spending context on nothing. Searching a
+        // single file strips to nothing, so that case falls back to the
+        // file name rather than emitting an empty path.
+        let display_path = match path.strip_prefix(search_path) {
+            Ok(rel) if rel.as_os_str().is_empty() => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => path.display().to_string(),
         };
 
-        let lines: Vec<&str> = content.lines().collect();
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if results.len() >= limit {
-                break;
-            }
-
-            if !regex.is_match(line) {
+        if context_lines > 0 {
+            let Ok(content) = std::fs::read_to_string(path) else {
                 continue;
-            }
-
-            // Paths read relative to the search root: an absolute path repeats
-            // the root on every match, spending context on nothing. Searching a
-            // single file strips to nothing, so that case falls back to the
-            // file name rather than emitting an empty path.
-            let display_path = match path.strip_prefix(search_path) {
-                Ok(rel) if rel.as_os_str().is_empty() => path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string()),
-                Ok(rel) => rel.display().to_string(),
-                Err(_) => path.display().to_string(),
             };
-            let formatted = if context_lines > 0 {
-                format_with_context(&lines, line_idx, context_lines, &display_path)
-            } else {
-                format!("{display_path}:{}:{}", line_idx + 1, line)
-            };
-
-            if !matched_paths.iter().any(|p| p == path) {
-                matched_paths.push(path.to_path_buf());
+            let lines: Vec<&str> = content.lines().collect();
+            for (line_no, _) in &sink.matches {
+                results.push(format_with_context(
+                    &lines,
+                    line_no.saturating_sub(1) as usize,
+                    context_lines,
+                    &display_path,
+                ));
             }
-            results.push(formatted);
+        } else {
+            for (line_no, line) in &sink.matches {
+                results.push(format!("{display_path}:{line_no}:{line}"));
+            }
         }
     }
 
     (results, matched_paths)
+}
+
+/// Collects matched lines for one file while the searcher runs. The searcher
+/// feeds each line separately; `remaining` bounds the total emitted results
+/// across files, stopping the search of a file once the limit is reached.
+struct CollectSink {
+    remaining: usize,
+    matches: Vec<(u64, String)>,
+}
+
+impl Sink for CollectSink {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
+        if self.matches.len() >= self.remaining {
+            return Ok(false);
+        }
+        // `bytes()` includes the line terminator; strip it and the `\r` of a
+        // CRLF ending so CRLF files report the same line content as
+        // `str::lines()` does — the output stays byte-identical to the
+        // previous line-by-line scan. A lone trailing `\r` at EOF (no `\n`)
+        // is content and survives, matching `str::lines()`.
+        let mut line = String::from_utf8_lossy(mat.bytes()).into_owned();
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        self.matches.push((mat.line_number().unwrap_or(0), line));
+        Ok(true)
+    }
 }
 
 /// Format a match with surrounding context lines.
@@ -325,8 +366,8 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("hit.rs"), "fn needle() {}\n").unwrap();
 
-        let regex = RegexBuilder::new("needle").build().unwrap();
-        let (matches, _) = search_files(dir.path(), &regex, &None, 0, 10);
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let (matches, _) = search_files(dir.path(), &matcher, &None, 0, 10);
         let output = matches.join("\n");
         assert!(
             output.contains("src/deep/hit.rs:1:"),
@@ -346,12 +387,31 @@ mod tests {
         let file = dir.path().join("target.rs");
         std::fs::write(&file, "fn needle() {}\n").unwrap();
 
-        let regex = RegexBuilder::new("needle").build().unwrap();
-        let (matches, _) = search_files(&file, &regex, &None, 0, 10);
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let (matches, _) = search_files(&file, &matcher, &None, 0, 10);
         let output = matches.join("\n");
         assert!(
             output.starts_with("target.rs:1:"),
             "a single-file search must still name the file: {output}"
+        );
+    }
+
+    #[test]
+    fn crlf_lines_report_content_without_trailing_cr() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("win.rs");
+        std::fs::write(&file, "fn a() {\r\nneedle()\r\n}\r\n").unwrap();
+
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let (matches, _) = search_files(dir.path(), &matcher, &None, 0, 10);
+        let output = matches.join("\n");
+        assert!(
+            output.contains("win.rs:2:needle()"),
+            "CRLF content must be reported without a trailing \\r: {output:?}"
+        );
+        assert!(
+            !output.contains('\r'),
+            "no carriage return may leak into the output: {output:?}"
         );
     }
 

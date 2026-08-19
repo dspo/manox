@@ -27,7 +27,7 @@ pub const PROPOSE_PLAN: &str = "ProposePlan";
 const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "Read",
     "Grep",
-    "Find",
+    "Glob",
     "Ls",
     "BashOutput",
     crate::tools::ASK_USER_QUESTION,
@@ -239,7 +239,7 @@ pub fn gate_handler(
             ctx.block_reason = Some(format!(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} may be written (Write/Edit); research with \
-                 Read/Grep/Find/Ls, ask with AskUserQuestion, and submit the plan with \
+                 Read/Grep/Glob/Ls, ask with AskUserQuestion, and submit the plan with \
                  {PROPOSE_PLAN}.",
                 plans_dir.display()
             ));

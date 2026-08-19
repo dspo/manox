@@ -559,7 +559,7 @@ fn build_tools(
             "main",
         )),
         Arc::new(pi::tools::grep::GrepTool),
-        Arc::new(pi::tools::find::FindTool),
+        Arc::new(pi::tools::glob::GlobTool),
         Arc::new(pi::tools::ls::LsTool),
         Arc::new(bash),
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
@@ -744,7 +744,7 @@ fn build_tools(
             vec![
                 Arc::new(pi_extensions::read::SelectorReadTool::new()),
                 Arc::new(pi::tools::grep::GrepTool),
-                Arc::new(pi::tools::find::FindTool),
+                Arc::new(pi::tools::glob::GlobTool),
                 Arc::new(pi::tools::ls::LsTool),
             ],
         )
@@ -1254,7 +1254,7 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
     }
 }
 
-/// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Find`/`Ls`)
+/// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Glob`/`Ls`)
 /// are checked against the sensitive-path deny-list and write tools
 /// (`Write`/`Edit`) against write confinement (project root + temp + plans
 /// dir, `.git` protected). Block reasons surface to the model as tool
@@ -1306,7 +1306,7 @@ fn path_policy_verdict(
     danger: bool,
 ) -> Option<String> {
     match tool_name {
-        "Read" | "Ls" | "Grep" | "Find" => args
+        "Read" | "Ls" | "Grep" | "Glob" => args
             .get("path")
             .and_then(|v| v.as_str())
             .and_then(|raw| read_policy.check(&resolve_tool_path(raw, cwd)).err()),

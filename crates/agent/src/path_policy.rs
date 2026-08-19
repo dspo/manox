@@ -84,7 +84,7 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// Read deny-list for the FS read tools (`Read`/`Grep`/`Find`/`Ls`). The
+/// Read deny-list for the FS read tools (`Read`/`Grep`/`Glob`/`Ls`). The
 /// denied set is the standard sensitive home subtrees plus secret-bearing
 /// filenames. Immutable after construction.
 #[derive(Clone, Debug)]

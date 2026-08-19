@@ -1,4 +1,4 @@
-// Find tool — in-process file search by glob pattern.
+// Glob tool — in-process file search by glob pattern.
 //
 // Uses `ignore` for filesystem traversal and `globset` for pattern matching.
 // No shell execution — the LLM's input is treated as data, not as a command string.
@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::truncate::{self, TruncateConfig};
 
-pub struct FindTool;
+pub struct GlobTool;
 
-impl FindTool {
+impl GlobTool {
     /// Default max output bytes.
     const DEFAULT_MAX_BYTES: usize = 128 * 1024;
     /// Default max output lines.
@@ -25,9 +25,9 @@ impl FindTool {
 }
 
 #[async_trait::async_trait]
-impl AgentTool for FindTool {
+impl AgentTool for GlobTool {
     fn name(&self) -> &str {
-        "Find"
+        "Glob"
     }
 
     fn description(&self) -> &str {
@@ -148,7 +148,7 @@ impl AgentTool for FindTool {
         let mut output = result.content;
         if result.was_truncated {
             output.push_str(&format!(
-                "\n\n[find: {} files, {} lines, {} bytes — output truncated]",
+                "\n\n[glob: {} files, {} lines, {} bytes — output truncated]",
                 results.len(),
                 result.original_lines,
                 result.original_bytes
@@ -202,7 +202,7 @@ mod tests {
             state: crate::tool::ToolState::new(),
         };
 
-        let result = FindTool
+        let result = GlobTool
             .execute(
                 "t1",
                 serde_json::json!({ "pattern": "*.rs", "path": "target.rs" }),
@@ -222,8 +222,8 @@ mod tests {
     }
 
     #[test]
-    fn test_find_tool_schema() {
-        let tool = FindTool;
+    fn test_glob_tool_schema() {
+        let tool = GlobTool;
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("pattern")));

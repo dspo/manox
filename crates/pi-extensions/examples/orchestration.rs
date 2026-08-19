@@ -75,7 +75,7 @@ fn read_only_tools() -> Vec<Arc<dyn AgentTool>> {
     vec![
         Arc::new(pi::tools::read::ReadTool),
         Arc::new(pi::tools::grep::GrepTool),
-        Arc::new(pi::tools::find::FindTool),
+        Arc::new(pi::tools::glob::GlobTool),
         Arc::new(pi::tools::ls::LsTool),
     ]
 }
