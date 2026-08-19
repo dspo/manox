@@ -365,7 +365,7 @@ Folded batch of tool calls from one model response, rendered as one Claude Code�
 
 #### ToolCallCard
 
-A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel).
+A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). An autopilot auto-approved call (`ToolCallItem.auto_approved`) renders a muted `check-check` badge ahead of its status label.
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 

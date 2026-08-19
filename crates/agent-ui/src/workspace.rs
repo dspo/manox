@@ -1036,19 +1036,23 @@ impl Workspace {
                         // Auto-approved: no notice card. The badge rides the
                         // tool-call row itself (check-check ahead of the
                         // status icon); persist a marker note so a rebuild
-                        // reproduces it.
+                        // reproduces it. The verdict may land before the
+                        // creating `ToolCall` event (documented ordering
+                        // race) — park it so the `ToolCall` arm stamps the
+                        // item once it exists, and persist the note either
+                        // way so live and rebuild agree.
                         agent::approval::ReviewVerdict::Allow => {
-                            let marked = this
-                                .conversation
-                                .update(cx, |c, cx| c.mark_auto_approved(tool_call_id, cx));
-                            if marked {
-                                this.record_ui_note(
-                                    agent::db::UiNoteKind::AutoApproval,
-                                    String::new(),
-                                    Some(tool_call_id.as_str()),
-                                    cx,
-                                );
-                            }
+                            this.conversation.update(cx, |c, cx| {
+                                if !c.mark_auto_approved(tool_call_id, cx) {
+                                    c.buffer_auto_approval(tool_call_id);
+                                }
+                            });
+                            this.record_ui_note(
+                                agent::db::UiNoteKind::AutoApproval,
+                                String::new(),
+                                Some(tool_call_id.as_str()),
+                                cx,
+                            );
                             cx.notify();
                         }
                         // Escalated for review: keep the anchored decision
