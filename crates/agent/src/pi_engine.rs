@@ -648,6 +648,12 @@ fn build_tools(
     tools.push(Arc::new(crate::team::tools::TeamDisbandTool::new(
         notice_tx.clone(),
     )));
+    tools.push(Arc::new(crate::team::tools::TeamDismissTool::new(
+        notice_tx.clone(),
+    )));
+    tools.push(Arc::new(crate::team::tools::TeamStatusTool::new(
+        notice_tx.clone(),
+    )));
     tools.push(Arc::new(crate::team::tools::SendMessageTool::new(
         notice_tx.clone(),
     )));

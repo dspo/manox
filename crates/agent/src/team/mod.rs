@@ -23,10 +23,15 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, WeakEntity};
 
 pub use task_list::{Task, TaskList, TaskListEvent, TaskStatus};
 
+use crate::language_model::StopReason;
 use crate::thread::Thread;
 
 /// The leader's member name (matches the main thread's `agent_label`).
 pub const LEADER_NAME: &str = "lead";
+
+/// Sender label of system-synthesized team notices (member stop lifecycle
+/// notifications) delivered to the leader like peer mail.
+pub const TEAM_NOTICE_FROM: &str = "team";
 
 /// Maximum worker members (excluding the leader). The whole team — leader +
 /// workers — is bounded at 6.
@@ -54,6 +59,13 @@ pub struct Member {
     pub role: String,
     thread: Entity<Thread>,
     inbox: VecDeque<PeerMessage>,
+    /// The member sent the leader at least one message during its current
+    /// turn — the completion-report signal the stop notification carries.
+    reported: bool,
+    /// Last terminal stop reason observed for this member.
+    last_stop: Option<StopReason>,
+    /// Unix seconds of `last_stop` (last activity for the roster view).
+    last_stop_at: Option<i64>,
 }
 
 impl Member {
@@ -63,6 +75,9 @@ impl Member {
             role,
             thread,
             inbox: VecDeque::new(),
+            reported: false,
+            last_stop: None,
+            last_stop_at: None,
         }
     }
 
@@ -72,6 +87,21 @@ impl Member {
 
     pub fn role(&self) -> &str {
         &self.role
+    }
+
+    /// Whether the member reported to the leader during its current turn.
+    pub fn reported(&self) -> bool {
+        self.reported
+    }
+
+    /// The member's last terminal stop reason, if any.
+    pub fn last_stop(&self) -> Option<StopReason> {
+        self.last_stop
+    }
+
+    /// Unix seconds of the last terminal stop (roster last-activity).
+    pub fn last_stop_at(&self) -> Option<i64> {
+        self.last_stop_at
     }
 }
 
@@ -260,6 +290,15 @@ impl Team {
         content: String,
         cx: &mut App,
     ) -> Result<(), String> {
+        // A member→leader delivery is the completion-report signal the
+        // stop notification carries; broadcast counts too (it routes here
+        // per target).
+        if to == LEADER_NAME
+            && from != LEADER_NAME
+            && let Some(m) = self.members.get_mut(from)
+        {
+            m.reported = true;
+        }
         let msg = PeerMessage {
             from: from.to_string(),
             content,
@@ -317,15 +356,60 @@ impl Team {
         thread.update(cx, |th, cx| th.deliver_peer_messages(msgs, cx));
     }
 
-    /// Tear down the team: clear each member's `team` back-reference
-    /// (breaking the team↔member strong cycle so the member
+    /// A member began a turn: `reported` now describes the new turn, so the
+    /// previous turn's flag no longer applies.
+    pub fn member_turn_started(&mut self, name: &str) {
+        if let Some(m) = self.members.get_mut(name) {
+            m.reported = false;
+        }
+    }
+
+    /// Record a member's terminal stop and deliver the lifecycle
+    /// notification to the leader like peer mail: an idle leader wakes
+    /// immediately, a busy one drains it at turn end. The leader's playbook
+    /// decides the reaction (dismiss / nudge / replace).
+    pub fn member_stopped(&mut self, name: &str, reason: StopReason, cx: &mut App) {
+        let Some(m) = self.members.get_mut(name) else {
+            return;
+        };
+        m.last_stop = Some(reason);
+        m.last_stop_at = Some(chrono::Utc::now().timestamp());
+        let reported = m.reported;
+        let _ = self.deliver_to_leader(
+            PeerMessage {
+                from: TEAM_NOTICE_FROM.to_string(),
+                content: format!("{name} stopped: reason={reason:?}, reported={reported}"),
+            },
+            cx,
+        );
+    }
+
+    /// Tear down the team: stop running members, archive every member
+    /// session (cleanup invariant — the sidebar row leaves the active list;
+    /// the jsonl stays on disk for audit), then clear each member's `team`
+    /// back-reference (breaking the team↔member strong cycle so the member
     /// `Entity<Thread>`s actually drop), release the leader/member
     /// subscriptions, and drain inboxes. The leader's own `team` field is
     /// cleared separately by the `TeamDisband` op — the team entity holds
     /// the leader only weakly and cannot reach it.
     pub fn disband(&mut self, cx: &mut App) {
         for m in self.members.values() {
-            m.thread.update(cx, |t, cx| t.clear_team(cx));
+            m.thread.update(cx, |t, cx| {
+                if t.is_running() {
+                    t.cancel(cx);
+                }
+                t.clear_team(cx);
+            });
+        }
+        if let Some(store) = crate::thread_store::try_global() {
+            let ids: Vec<String> = self
+                .members
+                .values()
+                .map(|m| m.thread.read(cx).id.0.clone())
+                .collect();
+            for id in ids {
+                store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+            }
         }
         self.members.clear();
         self.member_subs.clear();
@@ -333,6 +417,27 @@ impl Team {
         self.leader_inbox.clear();
         self.child_auth.clear();
     }
+}
+
+/// Rendered leader lifecycle playbook (stop-notice reactions, dismiss /
+/// nudge / replace, cleanup etiquette) for the thread's agent language;
+/// delivered to the leader once at `TeamCreate`.
+pub fn render_leader_playbook(lang: crate::language::Language) -> anyhow::Result<String> {
+    crate::prompt::render(
+        crate::prompt::PromptTemplate::SystemTeam,
+        lang,
+        &crate::prompt::TeamPromptData { is_leader: true },
+    )
+}
+
+/// Rendered member obligations (final report before stopping); appended to
+/// the member's opening prompt at spawn.
+pub fn render_member_obligations(lang: crate::language::Language) -> anyhow::Result<String> {
+    crate::prompt::render(
+        crate::prompt::PromptTemplate::SystemTeam,
+        lang,
+        &crate::prompt::TeamPromptData { is_leader: false },
+    )
 }
 
 #[cfg(test)]
@@ -570,6 +675,136 @@ mod tests {
             );
             team.update(cx, |t, _| t.clear_child_auth("plan::auth-1"));
             assert!(team.read(cx).resolve_child_auth("plan::auth-1").is_none());
+        });
+    }
+
+    /// Cleanup invariant: disband archives every member session so the rows
+    /// leave the sidebar active list (store present ⇒ archival runs).
+    #[test]
+    fn disband_archives_member_sessions() {
+        let _store_lock = crate::thread_store::store_test_lock().lock().unwrap();
+        let mut cx = TestAppContext::single();
+        let db_path =
+            std::env::temp_dir().join(format!("team-disband-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let leader = bare_thread("lead", &mut cx);
+        let member_thread = bare_thread("plan", &mut cx);
+        let (leader_id, member_id) = cx.update(|cx| {
+            (
+                leader.read(cx).id.0.clone(),
+                member_thread.read(cx).id.0.clone(),
+            )
+        });
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            store.update(cx, |s, _| {
+                s.insert_summary_for_test(&leader_id, None);
+                s.insert_summary_for_test(&member_id, Some(&leader_id));
+            });
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+        });
+
+        cx.update(|cx| team.update(cx, |t, cx| t.disband(cx)));
+
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            let archived = store.read(cx).archived_summaries().to_vec();
+            assert!(
+                archived.iter().any(|s| s.id == member_id && s.archived),
+                "member session archived on disband: {archived:?}"
+            );
+        });
+        crate::thread_store::drop_for_test();
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A member that reported then stopped produces a lifecycle notice on
+    /// the leader carrying reason + reported=true.
+    #[test]
+    fn member_stop_notifies_leader_with_reason_and_reported() {
+        let mut cx = TestAppContext::single();
+        let leader = bare_thread("lead", &mut cx);
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        let member_thread = bare_thread("plan", &mut cx);
+        cx.update(|cx| {
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap()
+        });
+        let events = cx.update(|cx| capture_peer_events(&leader, cx));
+
+        // Member reports to the leader, then its turn ends.
+        cx.update(|cx| {
+            team.update(cx, |t, cx| {
+                t.deliver("plan", LEADER_NAME, "done".into(), cx)
+            })
+        })
+        .unwrap();
+        // The scripted engine never emits a terminal Stop, so the facade
+        // stays "running" after the report; settle it like a real turn end.
+        cx.update(|cx| leader.update(cx, |t, _cx| t.set_running_for_test(false)));
+        cx.update(|cx| {
+            team.update(cx, |t, cx| {
+                t.member_stopped("plan", crate::language_model::StopReason::EndTurn, cx)
+            })
+        });
+        cx.run_until_parked();
+
+        let evs = events.lock().unwrap();
+        assert_eq!(evs.len(), 2, "report + lifecycle notice: {evs:?}");
+        assert_eq!(evs[0].0, "plan");
+        assert_eq!(evs[1].0, TEAM_NOTICE_FROM);
+        assert!(
+            evs[1].1.contains("plan stopped") && evs[1].1.contains("reported=true"),
+            "notice content: {:?}",
+            evs[1].1
+        );
+    }
+
+    /// `reported` is set by a member→leader delivery and cleared when the
+    /// member starts its next turn.
+    #[test]
+    fn reported_set_by_report_and_cleared_on_turn_start() {
+        let mut cx = TestAppContext::single();
+        let leader = bare_thread("lead", &mut cx);
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        let member_thread = bare_thread("plan", &mut cx);
+        cx.update(|cx| {
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread),
+                    cx,
+                )
+            })
+            .unwrap()
+        });
+
+        cx.update(|cx| {
+            assert!(!team.read(cx).members()["plan"].reported());
+        });
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("plan", LEADER_NAME, "r".into(), cx)))
+            .unwrap();
+        cx.update(|cx| {
+            assert!(team.read(cx).members()["plan"].reported());
+        });
+        cx.update(|cx| team.update(cx, |t, _| t.member_turn_started("plan")));
+        cx.update(|cx| {
+            assert!(!team.read(cx).members()["plan"].reported());
         });
     }
 }

@@ -135,6 +135,13 @@ struct TaskGetInput {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct TeamDismissInput {
+    /// Name of the worker member to dismiss.
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EmptyInput {}
 
 // ─── tools ──────────────────────────────────────────────────────────────────
@@ -155,6 +162,8 @@ macro_rules! team_tool_ctor {
 team_tool_ctor!(TeamCreateTool);
 team_tool_ctor!(TeamSpawnTool);
 team_tool_ctor!(TeamDisbandTool);
+team_tool_ctor!(TeamDismissTool);
+team_tool_ctor!(TeamStatusTool);
 team_tool_ctor!(SendMessageTool);
 team_tool_ctor!(TaskCreateTool);
 team_tool_ctor!(TaskListTool);
@@ -206,8 +215,10 @@ impl AgentTool for TeamSpawnTool {
     }
     fn description(&self) -> &str {
         "Add a worker member to the active team. The team must already exist \
-         (TeamCreate). The new member runs autonomously and reports back via \
-         `SendMessage`. Refused if the roster is full (5 workers max)."
+         (TeamCreate). The new member runs autonomously and must send its \
+         final report via `SendMessage` before stopping; write that \
+         obligation into the opening prompt. Refused if the roster is full \
+         (5 workers max)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<MemberSpecInput>()
@@ -237,9 +248,11 @@ impl AgentTool for TeamDisbandTool {
         "TeamDisband"
     }
     fn description(&self) -> &str {
-        "Disband the active team: drop all worker member threads, release the \
-         shared task list, and clear the leader's team. No-op message if no team \
-         is active. Member conversations are session-scoped and not persisted."
+        "Disband the active team: stop running members, archive every member \
+         session (rows leave the sidebar active list; transcripts stay on \
+         disk), release the shared task list, and clear the leader's team. \
+         No-op message if no team is active. Disbanded members can no longer \
+         receive `SendMessage`."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<EmptyInput>()
@@ -254,6 +267,62 @@ impl AgentTool for TeamDisbandTool {
         let _input: EmptyInput = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         team_round_trip(&self.notice_tx, TeamOp::Disband).await
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for TeamDismissTool {
+    fn name(&self) -> &str {
+        "TeamDismiss"
+    }
+    fn description(&self) -> &str {
+        "Dismiss one worker member from the active team: stop its turn if \
+         running, archive its session (row leaves the sidebar active list; \
+         transcript stays on disk), and return its in-progress tasks to the \
+         unassigned pool so a replacement can claim them. Use when a member \
+         finished (after reading its report), died, or stalled beyond \
+         nudging. Errors if the member is unknown."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        schema::<TeamDismissInput>()
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: serde_json::Value,
+        _signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let input: TeamDismissInput = serde_json::from_value(params)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        team_round_trip(&self.notice_tx, TeamOp::Dismiss { name: input.name }).await
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for TeamStatusTool {
+    fn name(&self) -> &str {
+        "TeamStatus"
+    }
+    fn description(&self) -> &str {
+        "Read-only roster inspection: per worker member, running/idle state, \
+         last terminal stop reason and time, and whether the member reported \
+         to the leader during its last turn. Use to check why a member \
+         stopped before deciding dismiss / nudge / replace."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        schema::<EmptyInput>()
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: serde_json::Value,
+        _signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let _input: EmptyInput = serde_json::from_value(params)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        team_round_trip(&self.notice_tx, TeamOp::Status).await
     }
 }
 
@@ -424,6 +493,8 @@ pub fn execute_team_op(
         TeamOp::Spawn { spec } => op_spawn(this, spec, cx),
         TeamOp::Send { to, content } => op_send(this, to, content, cx),
         TeamOp::Disband => op_disband(this, cx),
+        TeamOp::Dismiss { name } => op_dismiss(this, name, cx),
+        TeamOp::Status => op_status(this, cx),
         TeamOp::TaskCreate {
             subject,
             description,
@@ -555,6 +626,13 @@ fn op_create(
             }
         }
     }
+    // Leader playbook rides the notice channel: the leader is mid-turn
+    // here, so it queues and lands as a message at this turn's end.
+    if let Ok(playbook) = crate::team::render_leader_playbook(this.agent_language()) {
+        team.update(cx, |t, cx| {
+            let _ = t.deliver(super::TEAM_NOTICE_FROM, LEADER_NAME, playbook, cx);
+        });
+    }
     Ok(format!(
         "team '{}' created with {} member(s){}",
         name,
@@ -610,6 +688,68 @@ fn op_disband(this: &mut Thread, cx: &mut Context<Thread>) -> Result<String, Str
     Ok("team disbanded".to_string())
 }
 
+/// Single-member teardown: cancel a running turn, archive the session,
+/// release its in-progress tasks, and drop it from the roster. The cleanup
+/// invariant for one worker instead of the whole team.
+fn op_dismiss(this: &mut Thread, name: String, cx: &mut Context<Thread>) -> Result<String, String> {
+    let Some(team) = team_of(this).cloned() else {
+        return Err("no active team".to_string());
+    };
+    let Some(thread) = team.read_with(cx, |t, _| t.thread_for(&name).cloned()) else {
+        return Err(format!("member '{name}' not found"));
+    };
+    thread.update(cx, |t, cx| {
+        if t.is_running() {
+            t.cancel(cx);
+        }
+    });
+    let id = thread.read(cx).id.0.clone();
+    if let Some(store) = crate::thread_store::try_global() {
+        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+    }
+    let tasks = team.read_with(cx, |t, _| t.tasks().clone());
+    tasks.update(cx, |t, cx| t.release_owner(&name, cx));
+    team.update(cx, |t, cx| t.remove_member(&name, cx))?;
+    Ok(format!("dismissed member '{name}'"))
+}
+
+/// Roster status report: per member, running/idle, last terminal stop
+/// reason + time, and whether the member reported during its last turn.
+fn op_status(this: &mut Thread, cx: &mut Context<Thread>) -> Result<String, String> {
+    let Some(team) = team_of(this).cloned() else {
+        return Err("no active team".to_string());
+    };
+    let rendered = team.read_with(cx, |t, cx| {
+        if t.members().is_empty() {
+            return "team has no worker members".to_string();
+        }
+        t.members()
+            .values()
+            .map(|m| {
+                let state = if m.thread().read(cx).is_running() {
+                    "running"
+                } else {
+                    "idle"
+                };
+                let stop = match (m.last_stop(), m.last_stop_at()) {
+                    (Some(reason), Some(at)) => format!("{reason:?} at {at}"),
+                    _ => "never stopped".to_string(),
+                };
+                format!(
+                    "{} ({}) — {}; last stop: {}; reported={}",
+                    m.name,
+                    m.role,
+                    state,
+                    stop,
+                    m.reported()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    Ok(rendered)
+}
+
 /// Spawn a long-lived team worker: an independent pi `Entity<Thread>`
 /// inheriting the leader's cwd / model / approval mode / reasoning effort,
 /// labeled with the member name. The member's `team` back-reference is set
@@ -662,15 +802,27 @@ fn spawn_member(
                         input,
                     });
                 }
+                crate::thread::ThreadEvent::TurnStarted => {
+                    if let Some(team) = this.team().cloned() {
+                        team.update(cx, |t, _| t.member_turn_started(&name));
+                    }
+                }
                 crate::thread::ThreadEvent::Stop(reason)
                     if !matches!(reason, StopReason::ToolUse) =>
                 {
                     let tw = team_w.clone();
                     let name = name.clone();
+                    let reason = *reason;
                     cx.spawn(
                         async move |_this: gpui::WeakEntity<Thread>, cx: &mut gpui::AsyncApp| {
                             if let Some(t) = tw.upgrade() {
-                                t.update(cx, |t, cx| t.flush_inbox(&name, cx));
+                                t.update(cx, |t, cx| {
+                                    // Lifecycle notification first (wakes an
+                                    // idle leader), then the member's own
+                                    // queued peer mail.
+                                    t.member_stopped(&name, reason, cx);
+                                    t.flush_inbox(&name, cx);
+                                });
                             }
                         },
                     )
@@ -689,11 +841,144 @@ fn spawn_member(
         Ok::<(), String>(())
     })?;
 
-    // Opening task: the member runs it immediately (fire-and-forget worker).
+    // Opening task + member obligations (final report before stopping);
+    // the member runs both in its first turn (fire-and-forget worker).
     let prompt = spec.prompt.clone();
+    let obligations =
+        crate::team::render_member_obligations(leader.agent_language()).unwrap_or_default();
     member.update(cx, |t, cx| {
         t.insert_user_message_with_ui_metadata(prompt, None, cx);
+        if !obligations.is_empty() {
+            t.insert_user_message_with_ui_metadata(obligations, None, cx);
+        }
         t.run_turn(cx);
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn bare_thread(label: &str, cx: &mut TestAppContext) -> Entity<Thread> {
+        let thread = crate::thread::tests::thread_with_engine(
+            crate::thread::HistoryPhase::Ready,
+            std::sync::Arc::new(crate::thread::tests::FakeEngine::new()),
+            cx,
+        );
+        cx.update(|cx| thread.update(cx, |t, _cx| t.set_label_for_test(label.to_string())));
+        thread
+    }
+
+    /// `TeamDismiss` cancels + archives the member, releases its in-progress
+    /// tasks, and drops it from the roster in one op.
+    #[test]
+    fn dismiss_archives_member_and_releases_its_tasks() {
+        let _store_lock = crate::thread_store::store_test_lock().lock().unwrap();
+        let mut cx = TestAppContext::single();
+        let db_path =
+            std::env::temp_dir().join(format!("team-dismiss-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let leader = bare_thread("lead", &mut cx);
+        let member_thread = bare_thread("plan", &mut cx);
+        let member_id = cx.update(|cx| member_thread.read(cx).id.0.clone());
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            store.update(cx, |s, _| s.insert_summary_for_test(&member_id, None));
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+            let tasks = team.read(cx).tasks().clone();
+            tasks.update(cx, |l, cx| {
+                l.create("mid-work".into(), None, cx);
+                l.update(
+                    "T1",
+                    Some(crate::team::TaskStatus::InProgress),
+                    Some(Some("plan".into())),
+                    None,
+                    cx,
+                )
+                .unwrap();
+            });
+        });
+
+        cx.update(|cx| {
+            leader.update(cx, |this, cx| {
+                execute_team_op(
+                    this,
+                    TeamOp::Dismiss {
+                        name: "plan".into(),
+                    },
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            assert!(team.read(cx).members().is_empty(), "roster emptied");
+            let tasks = team.read(cx).tasks().clone();
+            tasks.read_with(cx, |l, _| {
+                assert_eq!(
+                    l.get("T1").unwrap().status,
+                    crate::team::TaskStatus::Pending
+                );
+                assert_eq!(l.get("T1").unwrap().owner, None);
+            });
+            let store = crate::thread_store::global();
+            assert!(
+                store
+                    .read(cx)
+                    .archived_summaries()
+                    .iter()
+                    .any(|s| s.id == member_id && s.archived),
+                "member session archived on dismiss"
+            );
+        });
+        crate::thread_store::drop_for_test();
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// `TeamStatus` reports running/idle, last stop reason, and reported.
+    #[test]
+    fn status_reports_lifecycle_fields() {
+        let mut cx = TestAppContext::single();
+        let leader = bare_thread("lead", &mut cx);
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        let member_thread = bare_thread("plan", &mut cx);
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+            team.update(cx, |t, cx| {
+                t.deliver("plan", LEADER_NAME, "done".into(), cx)
+            })
+            .unwrap();
+            team.update(cx, |t, cx| {
+                t.member_stopped("plan", crate::language_model::StopReason::EndTurn, cx)
+            });
+        });
+        let report =
+            cx.update(|cx| leader.update(cx, |this, cx| execute_team_op(this, TeamOp::Status, cx)));
+        let report = report.unwrap();
+        assert!(report.contains("plan (explorer)"), "{report}");
+        assert!(report.contains("EndTurn"), "{report}");
+        assert!(report.contains("reported=true"), "{report}");
+    }
 }
