@@ -2054,7 +2054,7 @@ fn merge_ui_notes(
     let segment_ids: Vec<&str> = messages
         .iter()
         .filter(|m| {
-            if m.role != Role::User || m.is_hidden_from_ui() {
+            if m.role != Role::User {
                 return false;
             }
             if m.ui
@@ -2089,7 +2089,7 @@ fn merge_ui_notes(
     let user_msg_index: HashMap<&str, usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User && !m.is_hidden_from_ui())
+        .filter(|(_, m)| m.role == Role::User)
         .map(|(i, m)| (m.id.as_str(), i))
         .collect();
     let segment_msg_ix: Vec<usize> = segment_ids.iter().map(|id| user_msg_index[id]).collect();

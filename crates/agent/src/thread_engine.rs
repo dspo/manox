@@ -117,6 +117,10 @@ pub trait ThreadEngine: Send + Sync {
     /// Wake the private Title agent after a user-created/replaced Goal starts.
     fn goal_started(&self) {}
 
+    /// Wake the goal gate after a user resumes an active Goal while the
+    /// agent is idle, so automatic continuation rounds resume.
+    fn goal_gate(&self) {}
+
     /// Execute an approved plan: optional compaction toward the plan file,
     /// then the execution seed turn.
     fn approve_plan(

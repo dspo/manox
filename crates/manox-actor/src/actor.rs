@@ -835,16 +835,20 @@ fn handle_command(
             let action = cmd["action"].as_str().unwrap_or_default();
             let objective = cmd["objective"].as_str().unwrap_or_default().to_string();
             let budget = cmd["budget"].as_u64();
+            let max_rounds = cmd["maxRounds"].as_u64();
             let actor = agent::db::GoalActor::User;
             let result = cx.update(|app| {
                 session.thread.update(app, |t, cx| match action {
                     "create" => t.set_goal(objective, cx),
-                    "edit" => t.edit_goal(objective, budget, actor, cx),
-                    "replace" => t.replace_goal(objective, budget, actor, cx),
+                    "edit" => t.edit_goal(objective, budget, max_rounds, actor, cx),
+                    "replace" => t.replace_goal(objective, budget, max_rounds, actor, cx),
                     "clear" => t.clear_goal(actor, cx),
                     "pause" => t.set_goal_status(
                         agent::goal::GoalStatus::Paused,
-                        Some("paused by user".into()),
+                        Some(agent::goal::GoalBlockReason {
+                            code: "user-paused".into(),
+                            message: "paused by user".into(),
+                        }),
                         actor,
                         cx,
                     ),

@@ -6,8 +6,9 @@
 //!   so a long history stays cheap to enumerate.
 //! - `thread_data`: a single zstd-compressed JSON BLOB per thread holding the
 //!   full `messages` array and the `request_token_usage` map (the heavy state).
-//! - `thread_events`: an append-only lifecycle and Goal audit stream.
-//! - `thread_goals`: the one durable current Goal per main thread.
+//! - `thread_events`: an append-only lifecycle and Goal event stream. The
+//!   current Goal is the strict fold of its `goal_*` events — no table stores
+//!   the snapshot.
 //! - `token_usage`: per-user-message token breakdown, queryable without
 //!   decompressing the message BLOB.
 //! - `terminal_sessions`: per-terminal metadata (cwd/env/title) for tab
@@ -35,9 +36,8 @@ use std::sync::Mutex;
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 
-pub use crate::goal::ThreadGoal;
+pub use crate::goal::{GoalActor, ThreadGoal};
 pub use events::{ThreadEventRecord, ThreadEventType};
-pub use goals::GoalActor;
 pub use terminals::TerminalSession;
 pub use threads::{ThreadRecord, ThreadSummary};
 pub use token_usage::TokenUsageRecord;
@@ -79,11 +79,21 @@ impl ThreadsDatabase {
             .context("enable SQLite foreign keys")?;
         threads::create_table(conn)?;
         events::create_table(conn)?;
-        goals::create_table(conn)?;
         token_usage::create_table(conn)?;
         terminals::create_table(conn)?;
         projects::create_table(conn)?;
         Ok(())
+    }
+
+    /// In-memory database for tests, schema included. The goal event stream
+    /// replaced the `thread_goals` table, so goal tests fold events instead.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory_test() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 }
 
@@ -420,155 +430,161 @@ mod tests {
     }
 
     #[test]
-    fn goal_crud_is_atomic_with_audit_events() {
+    fn goal_event_stream_folds_created_round_cleared() {
         let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        let goal = crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), Some(20)).unwrap();
-        db.create_goal(&goal, GoalActor::User).unwrap();
-        assert_eq!(db.load_goal("t1").unwrap(), Some(goal.clone()));
-
-        let accounted = db
-            .account_goal("t1", &goal.goal_id, 20, 3, Some("turn-1"))
-            .unwrap();
-        assert_eq!(accounted.status, crate::goal::GoalStatus::BudgetLimited);
-        assert_eq!(accounted.tokens_used, 20);
-        assert_eq!(accounted.time_used_seconds, 3);
-
-        db.clear_goal("t1", &goal.goal_id, GoalActor::User, 0, 0, None)
-            .unwrap();
-        assert!(db.load_goal("t1").unwrap().is_none());
+        let goal =
+            crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), Some(20), None).unwrap();
+        let created = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Created {
+                actor: GoalActor::User,
+                goal: goal.clone(),
+                created_at: goal.created_at,
+            },
+        };
+        let round = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Round {
+                goal_id: goal.goal_id.clone(),
+                revision: 1,
+                round: 1,
+                turn_id: "turn-1".into(),
+                tokens_delta: 20,
+                admitted_at: goal.created_at + 10,
+            },
+        };
+        let cleared = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Cleared {
+                actor: GoalActor::User,
+                goal_id: goal.goal_id.clone(),
+                revision: 2,
+                cleared_at: goal.created_at + 20,
+            },
+        };
+        db.append_goal_events(
+            "t1",
+            &[
+                ("goal_created", &serde_json::to_string(&created).unwrap()),
+                ("goal_round", &serde_json::to_string(&round).unwrap()),
+                ("goal_cleared", &serde_json::to_string(&cleared).unwrap()),
+            ],
+        )
+        .unwrap();
         let events = db.query_events("t1", None).unwrap();
         assert_eq!(
             events
                 .iter()
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
-            vec!["goal_created", "goal_accounted", "goal_cleared"]
+            vec!["goal_created", "goal_round", "goal_cleared"]
+        );
+        let stream = db
+            .goal_events("t1", 0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, t, d)| (t, d))
+            .collect::<Vec<_>>();
+        let state = crate::goal::fold_goal_events(&stream).unwrap();
+        assert!(state.current.is_none());
+    }
+
+    #[test]
+    fn goal_round_flips_budget_limited_in_the_fold() {
+        let db = open_mem();
+        let goal =
+            crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), Some(10), None).unwrap();
+        let created = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Created {
+                actor: GoalActor::User,
+                goal: goal.clone(),
+                created_at: goal.created_at,
+            },
+        };
+        let round = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Round {
+                goal_id: goal.goal_id.clone(),
+                revision: 1,
+                round: 1,
+                turn_id: "turn-1".into(),
+                tokens_delta: 12,
+                admitted_at: goal.created_at + 10,
+            },
+        };
+        db.append_goal_events(
+            "t1",
+            &[
+                ("goal_created", &serde_json::to_string(&created).unwrap()),
+                ("goal_round", &serde_json::to_string(&round).unwrap()),
+            ],
+        )
+        .unwrap();
+        let stream = db
+            .goal_events("t1", 0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, t, d)| (t, d))
+            .collect::<Vec<_>>();
+        let current = crate::goal::fold_goal_events(&stream)
+            .unwrap()
+            .current
+            .unwrap();
+        assert_eq!(current.status, crate::goal::GoalStatus::BudgetLimited);
+        assert_eq!(
+            current.blocked_reason.as_ref().unwrap().code,
+            "budget-limited"
         );
     }
 
     #[test]
-    fn goal_persists_for_file_backed_session_without_threads_row() {
+    fn goal_events_seed_own_parent_row() {
         // Pi sessions never upsert `threads`; the Goal write must seed its
         // own parent row or the FK rejects every lifecycle op.
         let db = open_mem();
         let goal =
-            crate::goal::ThreadGoal::new("pi-1".into(), "Ship Goal".into(), Some(10)).unwrap();
-        db.create_goal(&goal, GoalActor::User).unwrap();
-        assert_eq!(db.load_goal("pi-1").unwrap(), Some(goal.clone()));
-        // The audit event rides the same transaction's parent row.
-        assert_eq!(db.query_events("pi-1", None).unwrap().len(), 1);
-        // Restart restore pauses the Active snapshot instead of failing.
-        let restored = db.restore_goal("pi-1").unwrap().unwrap();
-        assert_eq!(restored.status, crate::goal::GoalStatus::Paused);
-    }
-
-    #[test]
-    fn goal_cas_rejects_stale_callbacks_without_mutation() {
-        let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        let goal = crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), None).unwrap();
-        db.create_goal(&goal, GoalActor::User).unwrap();
-        assert!(db.account_goal("t1", "stale", 10, 1, None).is_err());
-        let loaded = db.load_goal("t1").unwrap().unwrap();
-        assert_eq!(loaded.tokens_used, 0);
-        assert_eq!(db.query_events("t1", None).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn goal_replace_is_atomic_and_resets_identity_and_accounting() {
-        let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        let original =
-            crate::goal::ThreadGoal::new("t1".into(), "Old Goal".into(), Some(50)).unwrap();
-        db.create_goal(&original, GoalActor::User).unwrap();
-        let replacement =
-            crate::goal::ThreadGoal::new("t1".into(), "New Goal".into(), None).unwrap();
-        db.replace_goal(
-            &original.goal_id,
-            &replacement,
-            GoalActor::User,
-            7,
-            2,
-            Some("turn-1"),
+            crate::goal::ThreadGoal::new("pi-1".into(), "Ship Goal".into(), None, None).unwrap();
+        let created = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Created {
+                actor: GoalActor::User,
+                goal,
+                created_at: 0,
+            },
+        };
+        db.append_goal_events(
+            "pi-1",
+            &[("goal_created", &serde_json::to_string(&created).unwrap())],
         )
         .unwrap();
-
-        assert_eq!(db.load_goal("t1").unwrap(), Some(replacement.clone()));
-        assert_ne!(original.goal_id, replacement.goal_id);
-        assert_eq!(replacement.tokens_used, 0);
-        assert_eq!(replacement.time_used_seconds, 0);
-        assert!(
-            db.replace_goal(
-                &original.goal_id,
-                &crate::goal::ThreadGoal::new("t1".into(), "Stale".into(), None).unwrap(),
-                GoalActor::User,
-                0,
-                0,
-                None,
-            )
-            .is_err()
-        );
-        let events = db.query_events("t1", None).unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.event_type.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "goal_created",
-                "goal_accounted",
-                "goal_cleared",
-                "goal_created"
-            ]
-        );
+        assert_eq!(db.goal_events("pi-1", 0).unwrap().len(), 1);
     }
 
     #[test]
-    fn active_goal_restores_paused() {
+    fn deleting_thread_cascades_goal_events() {
         let db = open_mem();
         db.upsert(&sample_record("t1"), true).unwrap();
-        let goal = crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), None).unwrap();
-        db.create_goal(&goal, GoalActor::User).unwrap();
-        let restored = db.restore_goal("t1").unwrap().unwrap();
-        assert_eq!(restored.status, crate::goal::GoalStatus::Paused);
-        assert_eq!(
-            restored.status_reason.as_deref(),
-            Some("paused after application restart")
-        );
-    }
-
-    #[test]
-    fn non_active_goal_statuses_restore_exactly() {
-        for status in [
-            crate::goal::GoalStatus::Paused,
-            crate::goal::GoalStatus::Blocked,
-            crate::goal::GoalStatus::BudgetLimited,
-            crate::goal::GoalStatus::Complete,
-        ] {
-            let db = open_mem();
-            db.upsert(&sample_record("t1"), true).unwrap();
-            let mut goal =
-                crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), None).unwrap();
-            db.create_goal(&goal, GoalActor::User).unwrap();
-            goal.status = status;
-            db.update_goal(&goal.goal_id.clone(), &goal, GoalActor::System, None)
-                .unwrap();
-            assert_eq!(db.restore_goal("t1").unwrap().unwrap().status, status);
-        }
-    }
-
-    #[test]
-    fn deleting_thread_cascades_current_goal_but_keeps_constraints_enabled() {
-        let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        let goal = crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), None).unwrap();
-        db.create_goal(&goal, GoalActor::User).unwrap();
+        let goal =
+            crate::goal::ThreadGoal::new("t1".into(), "Ship Goal".into(), None, None).unwrap();
+        let created = crate::goal::GoalEvent {
+            version: crate::goal::GOAL_EVENT_VERSION,
+            kind: crate::goal::GoalEventKind::Created {
+                actor: GoalActor::User,
+                goal: goal.clone(),
+                created_at: goal.created_at,
+            },
+        };
+        db.append_goal_events(
+            "t1",
+            &[("goal_created", &serde_json::to_string(&created).unwrap())],
+        )
+        .unwrap();
         db.conn
             .lock()
             .unwrap()
             .execute("DELETE FROM threads WHERE id='t1'", [])
             .unwrap();
-        assert!(db.load_goal("t1").unwrap().is_none());
+        assert!(db.goal_events("t1", 0).unwrap().is_empty());
     }
 }

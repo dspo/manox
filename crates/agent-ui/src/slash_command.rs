@@ -460,9 +460,13 @@ impl SlashCommand for GoalCommand {
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
             thread.update(cx, |t, cx| {
-                if let Err(error) =
-                    t.replace_goal(objective.to_string(), None, agent::db::GoalActor::User, cx)
-                {
+                if let Err(error) = t.replace_goal(
+                    objective.to_string(),
+                    None,
+                    None,
+                    agent::db::GoalActor::User,
+                    cx,
+                ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
             });
@@ -470,10 +474,13 @@ impl SlashCommand for GoalCommand {
         }
         if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
             thread.update(cx, |t, cx| {
-                let budget = t.goal().and_then(|goal| goal.token_budget);
+                let current = t.goal();
+                let budget = current.as_ref().and_then(|goal| goal.token_budget);
+                let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
                 if let Err(error) = t.edit_goal(
                     objective.to_string(),
                     budget,
+                    max_rounds,
                     agent::db::GoalActor::User,
                     cx,
                 ) {
@@ -501,9 +508,44 @@ impl SlashCommand for GoalCommand {
                         }
                     }
                 };
-                if let Err(error) =
-                    t.edit_goal(goal.objective, budget, agent::db::GoalActor::User, cx)
-                {
+                if let Err(error) = t.edit_goal(
+                    goal.objective,
+                    budget,
+                    goal.max_rounds,
+                    agent::db::GoalActor::User,
+                    cx,
+                ) {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                let Some(goal) = t.goal() else {
+                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                        "thread has no Goal"
+                    )));
+                    return;
+                };
+                let max_rounds = if matches!(value, "none" | "unlimited") {
+                    None
+                } else {
+                    match value.parse::<u64>() {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            return;
+                        }
+                    }
+                };
+                if let Err(error) = t.edit_goal(
+                    goal.objective,
+                    goal.token_budget,
+                    max_rounds,
+                    agent::db::GoalActor::User,
+                    cx,
+                ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
             });
@@ -531,7 +573,10 @@ impl SlashCommand for GoalCommand {
                 thread.update(cx, |t, cx| {
                     if let Err(error) = t.set_goal_status(
                         agent::goal::GoalStatus::Paused,
-                        Some("paused by user".into()),
+                        Some(agent::goal::GoalBlockReason {
+                            code: "user-paused".into(),
+                            message: "paused by user".into(),
+                        }),
                         agent::db::GoalActor::User,
                         cx,
                     ) {
@@ -553,6 +598,7 @@ impl SlashCommand for GoalCommand {
                 });
                 SlashResult::Handled
             }
+
             "edit" => {
                 workspace.begin_goal_edit(window, cx);
                 SlashResult::Handled
