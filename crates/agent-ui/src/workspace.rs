@@ -1806,12 +1806,24 @@ impl Workspace {
         // home dir), so a project-scoped session would operate on the wrong
         // tree.
         let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        // claude's conversation id is assigned here (up front) so the sidecar
+        // targets it on resume without racing any on-disk discovery; codex /
+        // copilot name their own sessions (codex is captured by the watcher
+        // while live).
+        let spawn_cli_session_id =
+            (kind == SessionKind::ClaudeCode).then(|| uuid::Uuid::new_v4().to_string());
+        let mut spawn_args: Vec<String> = Vec::new();
+        if let Some(sid) = &spawn_cli_session_id {
+            spawn_args.push("--session-id".into());
+            spawn_args.push(sid.clone());
+        }
         let handle = match cx::AgentBuilder::new()
             .agent(agent)
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
             .cwd(cwd.clone())
+            .passthrough(spawn_args)
             .spawn()
         {
             Ok(h) => Arc::new(h),
@@ -1874,7 +1886,7 @@ impl Workspace {
             provider: provider_name,
             model: model_id,
             title: None,
-            cli_session_id: None,
+            cli_session_id: spawn_cli_session_id,
         };
         if let Err(e) = write_sidecar(&sidecar) {
             tracing::warn!(error = %e, id, "external session sidecar write failed");
@@ -2228,10 +2240,13 @@ impl Workspace {
     /// Watch the CLI's on-disk conversation storage for this live session and
     /// record its native session id in the sidecar the moment it appears —
     /// the capture that lets a later resume target exactly this session's
-    /// conversation. Runs for fresh spawns and resumes alike (a resumed CLI
-    /// may fork its conversation into a new file). The task polls every 500ms
-    /// and self-terminates when the session is removed. No-op for kinds
-    /// without capture support (copilot / plain terminal).
+    /// conversation. claude's id is assigned by manox at spawn
+    /// (`--session-id`), so the watcher there only tracks later forks
+    /// (`/clear`, resume-forks); codex names its own sessions, so the watcher
+    /// is the primary capture. Runs for fresh spawns and resumes alike. The
+    /// task polls every 500ms, self-terminates when the session is removed,
+    /// and releases its ledger claims on exit. No-op for kinds without
+    /// capture support (copilot / plain terminal).
     fn start_cli_session_watch(
         &mut self,
         id: &str,
@@ -2285,6 +2300,7 @@ impl Workspace {
             let mut snapshot = snapshot;
             let mut claimed_any = initial_cli_session_id.is_some();
             let mut adoption_done = false;
+            let mut my_claims: Vec<String> = Vec::new();
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
@@ -2351,8 +2367,8 @@ impl Workspace {
                     .map(|(name, _)| name.clone())
                     .collect();
                 let dir_for_claims = watch_dir.clone();
-                let alive = this
-                    .update(cx, |this, _cx| -> Option<bool> {
+                let claimed_files = this
+                    .update(cx, |this, _cx| -> Option<Vec<String>> {
                         if !this
                             .external_sessions
                             .iter()
@@ -2361,10 +2377,10 @@ impl Workspace {
                             return None;
                         }
                         let ledger = this.cli_session_claims.entry(dir_for_claims).or_default();
-                        let mut claimed_now = false;
+                        let mut claimed = Vec::new();
                         for (file, sid) in candidates {
                             let Some(sid) = sid else { continue };
-                            if !ledger.insert(file) {
+                            if !ledger.insert(file.clone()) {
                                 continue;
                             }
                             if let Some(session) = this
@@ -2381,18 +2397,19 @@ impl Workspace {
                                         "external session sidecar cli-session-id update failed"
                                     );
                                 }
-                                claimed_now = true;
+                                claimed.push(file);
                             }
                         }
-                        Some(claimed_now)
+                        Some(claimed)
                     })
                     .unwrap_or(None);
-                let Some(claimed_now) = alive else {
+                let Some(claimed_files) = claimed_files else {
                     break;
                 };
                 snapshot.extend(resolved_names);
-                if claimed_now {
+                if !claimed_files.is_empty() {
                     claimed_any = true;
+                    my_claims.extend(claimed_files);
                 }
                 if let Some((dir, _listing)) = adopted {
                     // The adopted dir did not exist at session start, so every
@@ -2403,6 +2420,19 @@ impl Workspace {
                     root_dir_names.clear();
                     adoption_done = true;
                 }
+            }
+            // The session is gone: release this watcher's claims so the
+            // ledger does not grow unboundedly (future watchers snapshot the
+            // dirs afresh at their own spawn).
+            if !my_claims.is_empty() {
+                let _ = this.update(cx, |this, _cx| {
+                    this.cli_session_claims.retain(|_dir, claimed| {
+                        for name in &my_claims {
+                            claimed.remove(name);
+                        }
+                        !claimed.is_empty()
+                    });
+                });
             }
         })
         .detach();

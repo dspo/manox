@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -457,27 +457,29 @@ pub(crate) fn list_top_level_jsonl(dir: &Path) -> HashSet<String> {
     out
 }
 
-/// Names of `*.jsonl` files anywhere under `root` (recursive — codex nests
-/// rollouts in `YYYY/MM/DD/`). Symlinked entries are skipped. Missing dir →
-/// empty.
+/// Paths of `*.jsonl` files anywhere under `root`, relative to `root`
+/// (recursive — codex nests rollouts in `YYYY/MM/DD/`, and callers join the
+/// relative path back onto `root` to open it). Symlinked entries are
+/// skipped. Missing dir → empty.
 pub(crate) fn list_nested_jsonl(root: &Path) -> HashSet<String> {
-    fn walk(dir: &Path, out: &mut HashSet<String>) {
+    fn walk(dir: &Path, prefix: &Path, out: &mut HashSet<String>) {
         let entries = match fs::read_dir(dir) {
             Ok(d) => d,
             Err(_) => return,
         };
         for e in entries.flatten() {
             let Ok(t) = e.file_type() else { continue };
+            let name = e.file_name().to_string_lossy().into_owned();
             if t.is_dir() {
-                walk(&e.path(), out);
+                walk(&e.path(), &prefix.join(&name), out);
             } else if t.is_file() && e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
             {
-                out.insert(e.file_name().to_string_lossy().into_owned());
+                out.insert(prefix.join(&name).to_string_lossy().into_owned());
             }
         }
     }
     let mut out = HashSet::new();
-    walk(root, &mut out);
+    walk(root, Path::new(""), &mut out);
     out
 }
 
@@ -488,28 +490,37 @@ pub(crate) fn claude_session_id_from_file_name(name: &str) -> Option<String> {
     (!stem.is_empty()).then(|| stem.to_string())
 }
 
-/// The session id recorded in a codex rollout's first `session_meta` line
-/// (`payload.id`, then `payload.session_id`). Stable across resume forks — a
-/// resumed session writes a new rollout file with the same id. `None`:
-/// unreadable or the first line is not a `session_meta`.
+/// The session id recorded in a codex rollout's leading `session_meta` line
+/// (`payload.id`, then `payload.session_id`), searching the first few lines.
+/// Stable across resume forks — a resumed session writes a new rollout file
+/// with the same id. `None`: unreadable or no `session_meta` in the head.
 pub(crate) fn codex_session_id_from_rollout(path: &Path) -> Option<String> {
+    use std::io::BufRead;
     let file = fs::File::open(path).ok()?;
-    let mut first = String::new();
-    std::io::BufReader::new(file).read_line(&mut first).ok()?;
-    let v: serde_json::Value = serde_json::from_str(first.trim_end()).ok()?;
-    if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-        return None;
+    for line in std::io::BufReader::new(file).lines().take(16) {
+        let Ok(line) = line else { return None };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
+            continue;
+        };
+        if v.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = v.get("payload") else {
+            continue;
+        };
+        if let Some(id) = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+        {
+            return Some(id.to_string());
+        }
     }
-    let payload = v.get("payload")?;
-    payload
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            payload
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::to_string)
+    None
 }
 
 /// The first `"cwd":"…"` value in the leading `cap` bytes of a claude jsonl —
@@ -826,8 +837,8 @@ mod tests {
             list_nested_jsonl(root.path()),
             HashSet::from([
                 "a.jsonl".to_string(),
-                "b.jsonl".to_string(),
-                "c.jsonl".to_string()
+                "sub/b.jsonl".to_string(),
+                "sub/deeper/c.jsonl".to_string()
             ])
         );
         assert!(list_top_level_jsonl(&root.path().join("missing")).is_empty());
@@ -872,6 +883,16 @@ mod tests {
         let not_meta = dir.path().join("r3.jsonl");
         fs::write(&not_meta, "{\"type\":\"turn_context\",\"payload\":{}}\n").unwrap();
         assert_eq!(codex_session_id_from_rollout(&not_meta), None);
+        let meta_on_line_two = dir.path().join("r4.jsonl");
+        fs::write(
+            &meta_on_line_two,
+            "{\"type\":\"turn_context\",\"payload\":{}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"sess-B\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_session_id_from_rollout(&meta_on_line_two).as_deref(),
+            Some("sess-B")
+        );
         assert_eq!(
             codex_session_id_from_rollout(&dir.path().join("missing.jsonl")),
             None
