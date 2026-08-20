@@ -125,10 +125,9 @@ impl SidebarRow {
     }
 }
 
-/// One ordered sidebar row plus its team nesting metadata: `indent` offsets
-/// members under their leader, `team_leader` marks a row that can collapse
-/// its member group, `team_collapsed` the fold state.
-/// Row geometry + team nesting metadata for [`SidebarThreadItem::from_thread`].
+/// Row geometry + team nesting metadata for [`SidebarThreadItem::from_thread`]:
+/// `indent` offsets members under their leader, `nested` draws the left guide
+/// rail, `member_role` renders the team-worker badge.
 struct RowNesting {
     indent: gpui::Pixels,
     team_leader: bool,
@@ -139,6 +138,9 @@ struct RowNesting {
     member_role: Option<String>,
 }
 
+/// One ordered sidebar row plus its team nesting metadata: `indent` offsets
+/// members under their leader, `team_leader` marks a row that can collapse
+/// its member group, `team_collapsed` the fold state.
 struct ThreadRender {
     row: SidebarRow,
     indent: f32,

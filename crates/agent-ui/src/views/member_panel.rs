@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use agent::i18n;
 use agent::language_model::TokenUsage;
-use agent::team::{Task, TaskListEvent, Team};
+use agent::team::{Task, TaskListEvent, Team, TeamEvent};
 use agent::{Thread, ThreadEvent};
 use gpui::prelude::*;
 use gpui::{
@@ -42,6 +42,7 @@ pub struct MemberPanel {
     conversation: Entity<ConversationState>,
     sub: Option<Subscription>,
     task_sub: Option<Subscription>,
+    team_sub: Option<Subscription>,
     scroll_handle: ScrollHandle,
     stick_to_bottom: bool,
 }
@@ -90,6 +91,7 @@ impl MemberPanel {
             conversation,
             sub: None,
             task_sub: None,
+            team_sub: None,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
         });
@@ -136,6 +138,13 @@ impl MemberPanel {
                     cx.notify();
                 });
                 this.task_sub = Some(task_sub);
+                // Roster changes (stop chip landing, dismiss, disband)
+                // redraw the header; the member Thread alone never emits
+                // for them.
+                let team_sub = cx.subscribe(&team_ent, |_this, _t, _ev: &TeamEvent, cx| {
+                    cx.notify();
+                });
+                this.team_sub = Some(team_sub);
             }
         });
 
