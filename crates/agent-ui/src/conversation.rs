@@ -2514,6 +2514,69 @@ mod tests {
         });
     }
 
+    /// Several notes anchored to the same tool call keep emit order when
+    /// spliced after their tool item (grouped splice applied in descending
+    /// index order; one-by-one insertion at ix+1 would reverse them).
+    #[gpui::test]
+    fn rebuild_from_display_keeps_emit_order_for_notes_on_same_tool(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let display = vec![
+            HistoryEntry::Message(msg_with_id("u1", Role::User, "run")),
+            HistoryEntry::Message(Message::assistant(vec![MessageContent::ToolUse(
+                LanguageModelToolUse {
+                    id: "tu_1".to_string(),
+                    name: Arc::from("Bash"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            )])),
+            HistoryEntry::Message(Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "ok".to_string(),
+                }),
+            ])),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "first", "tu_1")),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "second", "tu_1")),
+            HistoryEntry::Message(msg_with_id("u2", Role::User, "next")),
+        ];
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            let conv = ConversationState::rebuild_from_display(
+                &display,
+                &HashMap::new(),
+                "model",
+                false,
+                ctx,
+                cx,
+            );
+            let kinds: Vec<ConvItem> = conv
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind().clone())
+                .collect();
+            assert_eq!(
+                signature(&kinds),
+                vec![
+                    "U:run",
+                    "?", // Thinking container carrying tu_1
+                    "N:first",
+                    "N:second",
+                    "U:next",
+                ]
+            );
+        });
+    }
+
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
     /// preceding assistant message, so a reloaded historical thread shows tool output.
     #[test]
