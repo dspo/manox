@@ -193,6 +193,23 @@ pub fn is_likely_secret_file(path: &Path) -> bool {
     )
 }
 
+/// Temp-scratch roots treated as freely writable scratch space (plan mode
+/// opens them alongside the plans dir; `WritePolicy` always carries them).
+pub fn temp_scratch_roots() -> [PathBuf; 2] {
+    [PathBuf::from("/tmp"), PathBuf::from("/private/tmp")]
+}
+
+/// Whether a path falls under a temp-scratch root. Canonicalizes first so
+/// `/tmp` classifies correctly on macOS (where it is a symlink to
+/// `/private/tmp`); `PathBuf::starts_with` is component-based, so a
+/// sibling like `/tmp-evil` never matches.
+pub fn is_temp_scratch(path: &Path) -> bool {
+    let canon = canonicalize_best_effort(path);
+    temp_scratch_roots()
+        .iter()
+        .any(|root| canon.starts_with(root))
+}
+
 /// Write confinement for the FS write tools (`Write`/`Edit`): writable set =
 /// project root + temp scratch + the global plans dir; protected set = any
 /// `.git` component (the c5aefe4d escape class: writes into a repo's `.git`
@@ -209,8 +226,7 @@ impl WritePolicy {
     /// plan-file directory (plan mode drafts its plan file there).
     pub fn for_project(project_root: &Path) -> Self {
         let mut writable_roots = vec![canonicalize_best_effort(project_root)];
-        writable_roots.push(PathBuf::from("/tmp"));
-        writable_roots.push(PathBuf::from("/private/tmp"));
+        writable_roots.extend(temp_scratch_roots());
         if let Ok(plans) = crate::paths::plans_dir() {
             writable_roots.push(canonicalize_best_effort(&plans));
         }
@@ -354,6 +370,18 @@ mod tests {
                 .check(Path::new("/tmp/manox-policy-test/git_notes.md"))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn temp_scratch_classification() {
+        assert!(is_temp_scratch(Path::new("/tmp/a")));
+        assert!(is_temp_scratch(Path::new("/private/tmp/b")));
+        assert!(!is_temp_scratch(Path::new("/etc/a")));
+        // Component-boundary match: a sibling prefix dir is not scratch.
+        assert!(!is_temp_scratch(Path::new("/tmp-evil/a")));
+        // `$TMPDIR` (`/var/folders/.../T` on macOS) is deliberately not
+        // part of the scratch set.
+        assert!(!is_temp_scratch(Path::new("/var/folders/xx/T/a")));
     }
 
     #[test]

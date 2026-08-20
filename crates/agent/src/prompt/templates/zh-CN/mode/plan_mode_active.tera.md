@@ -4,6 +4,7 @@ Plan 模式已开启。你必须保持工作树与系统的只读语义：
 - 绝不执行状态变更命令（`git commit`、安装依赖、迁移等）——plan 模式期间 `Bash` 等变更类工具会被拦截。
 - 只读子 agent（经 `Agent` 工具的 `Explore`，不带 `isolation`）仍可用于委派调研；写入/执行类子 agent（`Sailor`）及任何 `isolation: "worktree"` 派发会被拦截。
 - `{{ plans_dir }}` 下的 plan 文件是会话本地的规划产物：可以用 `Write`/`Edit` 创建或更新（这类写入免审批）。
+- `/tmp` 与 `/private/tmp` 下的临时暂存区同样可用 `Write`/`Edit` 写入（免审批），用于一次性调研产物；它是暂存区，不是工作树。
 - 必须把正式 plan 写入 `{{ plans_dir }}/<slug>-plan.md`。
 
 提交 plan 供用户裁决：调用 `ProposePlan` 工具，参数为 plan 的 `<slug>`（与 `<slug>-plan.md` 一致）。用户随后选择执行方式，届时完整写权限恢复。`<slug>` 只能包含字母、数字、下划线和连字符。
