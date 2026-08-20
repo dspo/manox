@@ -908,7 +908,7 @@ mod tests {
         // worktree-isolated dispatch are blocked.
         assert!(
             run(
-                "Agent",
+                "Steer",
                 serde_json::json!({"to": {"agent_address": "e1", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x"})
             )
             .block_reason
@@ -916,7 +916,7 @@ mod tests {
         );
         assert!(
             run(
-                "Agent",
+                "Steer",
                 serde_json::json!({"to": {"agent_address": "s1", "spawn": "Sailor"}, "reason": "Dispatch", "prompt": "x"})
             )
             .block_reason
@@ -924,14 +924,14 @@ mod tests {
         );
         assert!(
             run(
-                "Agent",
+                "Steer",
                 serde_json::json!({"to": {"agent_address": "e2", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x", "isolation": "worktree"})
             )
             .block_reason
             .is_some()
         );
         assert!(
-            run("Agent", serde_json::json!({"prompt": "x"}))
+            run("Steer", serde_json::json!({"prompt": "x"}))
                 .block_reason
                 .is_some()
         );

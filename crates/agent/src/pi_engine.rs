@@ -5429,7 +5429,7 @@ mod tests {
         assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
         assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
         assert!(
-            prompt.contains("multiple `Agent(Sailor)` calls over forming a `Team`"),
+            prompt.contains("multiple `Steer` calls in one turn"),
             "prefers Sailors over Team: {prompt}"
         );
     }
