@@ -269,8 +269,10 @@ pub struct ResumeSidecar {
     /// `claude` / `codex` / `copilot` — the `SessionKind` is recovered via
     /// [`SessionKind::from_agent_id`]; plain PTY sessions never write a sidecar.
     pub agent_id: String,
-    /// The directory the CLI was launched in; `--continue`-style resume runs
-    /// there so the CLI picks the same project's conversation.
+    /// The directory the CLI was launched in; resume runs there — it scopes
+    /// claude's conversations (`~/.claude/projects/<slug>`), filters codex's
+    /// `resume` picker to the cwd's sessions, and is where copilot's
+    /// `--continue` looks.
     pub cwd: String,
     /// The project folder the session was bound to at spawn (`+` button), if
     /// any — the sidebar groups the resumable row under the same folder.
@@ -284,9 +286,10 @@ pub struct ResumeSidecar {
     pub model: String,
     /// The agent's last mirrored OSC title, if it ever set one.
     pub title: Option<String>,
-    /// The CLI's own session id (claude conversation UUID / codex session
-    /// UUID) captured from the CLI's on-disk conversation storage while the
-    /// session runs; resume targets it exactly. `None` until captured.
+    /// The CLI's own session id, making resume target exactly this session's
+    /// conversation. claude: assigned by manox at spawn (`--session-id`) and
+    /// recorded before the CLI writes anything; codex: captured from the
+    /// rollout's `session_meta` by the live watcher; copilot: always `None`.
     pub cli_session_id: Option<String>,
 }
 

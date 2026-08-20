@@ -1888,6 +1888,7 @@ impl Workspace {
             title: None,
             cli_session_id: spawn_cli_session_id,
         };
+        let watch_cli_session_id = sidecar.cli_session_id.clone();
         if let Err(e) = write_sidecar(&sidecar) {
             tracing::warn!(error = %e, id, "external session sidecar write failed");
         }
@@ -1904,7 +1905,7 @@ impl Workspace {
             _exit_sub: exit_sub,
             sidecar: Some(sidecar),
         });
-        self.start_cli_session_watch(&id, kind, &cwd, None, cx);
+        self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, window, cx);
     }
@@ -2241,7 +2242,8 @@ impl Workspace {
     /// record its native session id in the sidecar the moment it appears —
     /// the capture that lets a later resume target exactly this session's
     /// conversation. claude's id is assigned by manox at spawn
-    /// (`--session-id`), so the watcher there only tracks later forks
+    /// (`--session-id`) and seeded into the snapshot + claims ledger
+    /// synchronously, so the watcher there only tracks later forks
     /// (`/clear`, resume-forks); codex names its own sessions, so the watcher
     /// is the primary capture. Runs for fresh spawns and resumes alike. The
     /// task polls every 500ms, self-terminates when the session is removed,
@@ -2257,23 +2259,37 @@ impl Workspace {
     ) {
         // Watch root + synchronous pre-session snapshot: any conversation
         // file appearing after this point belongs to this session.
-        let (watch_dir, snapshot, nested) = match kind {
+        let (watch_dir, snapshot, nested, seed_claims) = match kind {
             SessionKind::ClaudeCode => {
                 let Some(dir) = claude_project_dir_for_cwd(cwd) else {
                     return;
                 };
                 let mut snap = list_top_level_jsonl(&dir);
+                let mut seeds: Vec<String> = Vec::new();
                 if let Some(sid) = &initial_cli_session_id {
-                    snap.insert(format!("{sid}.jsonl"));
+                    let name = format!("{sid}.jsonl");
+                    snap.insert(name.clone());
+                    // Seed the ledger synchronously: without this, a second
+                    // same-cwd watcher started inside this watcher's first
+                    // tick window (~500ms) could claim this session's file
+                    // and record the wrong id in its own sidecar.
+                    self.cli_session_claims
+                        .entry(dir.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    seeds.push(name);
                 }
-                (dir, snap, false)
+                (dir, snap, false, seeds)
             }
             SessionKind::Codex => {
                 let Some(dir) = codex_sessions_dir() else {
                     return;
                 };
+                // Full recursive walk of the sessions tree every tick — fine
+                // at current scale; date-dir pruning or a slower cadence is
+                // the lever if the history grows huge.
                 let snap = list_nested_jsonl(&dir);
-                (dir, snap, true)
+                (dir, snap, true, Vec::new())
             }
             SessionKind::GithubCopilot | SessionKind::Terminal => return,
         };
@@ -2300,7 +2316,7 @@ impl Workspace {
             let mut snapshot = snapshot;
             let mut claimed_any = initial_cli_session_id.is_some();
             let mut adoption_done = false;
-            let mut my_claims: Vec<String> = Vec::new();
+            let mut my_claims: Vec<String> = seed_claims;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(500))
