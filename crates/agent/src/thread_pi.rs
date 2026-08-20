@@ -1265,7 +1265,7 @@ impl Thread {
             .unwrap_or_else(|_| format!("[from {}] {}", msg.from, msg.content));
             let ui = MessageUiMetadata {
                 author: Some(crate::team::author_for(&msg.from)),
-                peer: Some(true),
+                peer: true,
                 display_text: Some(msg.content.clone()),
                 ..Default::default()
             };
@@ -1922,7 +1922,7 @@ impl Thread {
         };
         let record = pi_extensions::session_meta::UserAttributionMeta {
             author: author.routing().to_string(),
-            peer: ui.peer.unwrap_or(false),
+            peer: ui.peer,
         };
         persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
     }

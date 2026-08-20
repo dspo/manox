@@ -811,6 +811,8 @@ fn handle_command(
                         )
                     });
                     let ui = MessageUiMetadata {
+                        model_id: t.model().map(|m| m.id.clone()),
+                        approval_mode: Some(t.approval_mode().as_i64()),
                         author: Some(t.self_author()),
                         ..Default::default()
                     };

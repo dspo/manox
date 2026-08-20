@@ -77,7 +77,7 @@ impl UserTurnMeta {
             approval_mode: ui.and_then(|m| m.approval_mode).map(ApprovalMode::from_i64),
             steered: ui.and_then(|m| m.steered).unwrap_or(false),
             author: ui.and_then(|m| m.author.clone()),
-            peer: ui.and_then(|m| m.peer).unwrap_or(false),
+            peer: ui.map(|m| m.peer).unwrap_or(false),
         }
     }
 }

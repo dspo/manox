@@ -4649,7 +4649,7 @@ mod tests {
         let mut peer = Message::user("[from alice]: report".into());
         peer.ui = Some(agent::MessageUiMetadata {
             author: Some(agent::MessageAuthor::Agent("alice".into())),
-            peer: Some(true),
+            peer: true,
             display_text: Some("report".into()),
             ..Default::default()
         });

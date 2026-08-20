@@ -82,8 +82,8 @@ pub struct MessageUiMetadata {
     pub author: Option<MessageAuthor>,
     /// This user message entered the session via team peer delivery
     /// (`SendMessage`); the reload path rebuilds it as a team bubble.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub peer: bool,
     /// UI-only display form of this user message — e.g. the compact
     /// `/name args` invocation for a registry slash turn whose model-facing
     /// text is the expanded macro/skill body. When set, the conversation
@@ -91,6 +91,10 @@ pub struct MessageUiMetadata {
     /// reload alike. The model request path never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A single conversation message.
@@ -219,7 +223,7 @@ mod tests {
 
         let named = MessageUiMetadata {
             author: Some(MessageAuthor::Agent("Sailor".into())),
-            peer: Some(true),
+            peer: true,
             ..Default::default()
         };
         let value = serde_json::to_value(&named).unwrap();
@@ -227,7 +231,7 @@ mod tests {
         assert_eq!(value["peer"], true);
         let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
         assert_eq!(back.author, Some(MessageAuthor::Agent("Sailor".into())));
-        assert_eq!(back.peer, Some(true));
+        assert!(back.peer);
 
         // Human turns carry no attribution in the persisted form.
         let plain = MessageUiMetadata::default();

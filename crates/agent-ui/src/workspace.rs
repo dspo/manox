@@ -4460,7 +4460,7 @@ impl Workspace {
             steered: meta.steered.then_some(true),
             external_event: None,
             author: meta.author.clone(),
-            peer: meta.peer.then_some(true),
+            peer: meta.peer,
             display_text: None,
         }
     }

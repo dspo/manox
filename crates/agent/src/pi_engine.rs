@@ -3729,9 +3729,7 @@ fn attach_user_attributions(
             if let Some(record) = attributions.get(&ordinal) {
                 let ui = message.ui.get_or_insert_with(Default::default);
                 ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
-                if record.peer {
-                    ui.peer = Some(true);
-                }
+                ui.peer = record.peer;
             }
             ordinal += 1;
         }
@@ -4198,7 +4196,7 @@ mod tests {
 
         let seed = history[0].ui.as_ref().expect("seed carries attribution");
         assert_eq!(seed.author, Some(crate::message::MessageAuthor::Lead));
-        assert_eq!(seed.peer, None);
+        assert!(!seed.peer);
         assert!(history[1].ui.is_none(), "assistant turns stay unattributed");
         // Ordinal 2 skips the three-prompt history: only ordinals 0/1 exist.
         assert!(

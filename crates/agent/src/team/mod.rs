@@ -531,7 +531,7 @@ mod tests {
             .as_ref()
             .expect("peer delivery carries attribution");
         assert_eq!(ui.author, Some(crate::message::MessageAuthor::Lead));
-        assert_eq!(ui.peer, Some(true));
+        assert!(ui.peer);
         assert_eq!(ui.display_text.as_deref(), Some("hello"));
         let evs = events.lock().unwrap();
         assert_eq!(evs.len(), 1, "PeerMessage emitted once: {evs:?}");
