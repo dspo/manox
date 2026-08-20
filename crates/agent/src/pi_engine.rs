@@ -135,6 +135,9 @@ struct EngineState {
     /// Bumped on every note append / authoritative sync so live ticks can
     /// skip re-merge churn when nothing moved.
     notes_gen: AtomicU64,
+    /// Mid-run `AppendUiNote`s park here (the run owns the session); the
+    /// idle loop drains and persists them.
+    pending_ui_notes: Mutex<Vec<UiNoteRecord>>,
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
@@ -223,6 +226,7 @@ pub fn spawn_engine(
         history: Mutex::new(Vec::new()),
         notes: Mutex::new(Vec::new()),
         notes_gen: AtomicU64::new(0),
+        pending_ui_notes: Mutex::new(Vec::new()),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
@@ -858,6 +862,48 @@ fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
     }
 }
 
+/// Merge a freshly appended UI note into the engine mirror at the tail and
+/// record its position over the mapped-message count — the same base
+/// `merge_positioned_notes` re-derives on live ticks.
+fn mirror_ui_note(state: &Arc<EngineState>, record: UiNoteRecord) {
+    let after_message = state
+        .history
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry, HistoryEntry::Message(_)))
+        .count();
+    state
+        .history
+        .lock()
+        .unwrap()
+        .push(HistoryEntry::Note(record.clone()));
+    state.notes.lock().unwrap().push(PositionedNote {
+        note: record,
+        after_message,
+    });
+    state.notes_gen.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Serialize and append one UI note as a `custom` entry at the session leaf.
+async fn persist_ui_note(session: &AgentSession, record: &UiNoteRecord) -> bool {
+    let data = match serde_json::to_value(record) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            // A None payload renders as a ghost entry on reload; name the
+            // impossible case loudly instead of silently dropping the card.
+            tracing::warn!(error = %err, "UI note serialization failed");
+            None
+        }
+    };
+    if let Err(err) = session.append_custom(UI_NOTE_CUSTOM_TYPE, data).await {
+        tracing::warn!(error = %err, "failed to persist UI note");
+        false
+    } else {
+        true
+    }
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
@@ -951,7 +997,15 @@ where
                         let _ = notice_tx.send(BackendNotice::SessionListDirty);
                     }
                 }
-                Some(_) => {} // queued prompts/reconfigs wait for settle
+                Some(SessionCmd::AppendUiNote(record)) => {
+                    // A mid-run switch-back must already show the card:
+                    // merge it into the mirror now and park persistence for
+                    // the idle loop (the run owns the `Session`; a second
+                    // writer could fork the leaf cursor).
+                    mirror_ui_note(state, record.clone());
+                    state.pending_ui_notes.lock().unwrap().push(record);
+                }
+                Some(_) => {} // not serviceable mid-run; dropped (facade re-syncs after settle)
                 None => {
                     // Facade dropped mid-run: abort, settle, exit.
                     channel_open = false;
@@ -1876,6 +1930,12 @@ async fn run_actor(
     let mut shutdown_after_run = false;
 
     loop {
+        // Mid-run appends parked their persistence (the run owned the
+        // session); drain before blocking on the next command.
+        let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
+        for record in parked {
+            let _ = persist_ui_note(&session, &record).await;
+        }
         // Between runs the actor wakes on either a facade command or a
         // monitor idle-wakeup (steered events queued while the session was
         // idle). Mid-run wakeups simply accumulate and are re-checked after
@@ -2589,39 +2649,11 @@ async fn run_actor(
                 }
             }
             SessionCmd::AppendUiNote(record) => {
-                // Persist at the leaf through the append queue; refresh the
-                // mirror so an idle switch-away sees the note before the next
-                // authoritative sync.
-                let data = match serde_json::to_value(&record) {
-                    Ok(value) => Some(value),
-                    Err(err) => {
-                        // A None payload renders as a ghost entry on reload;
-                        // name the impossible case loudly instead of silently
-                        // dropping the card.
-                        tracing::warn!(error = %err, "UI note serialization failed");
-                        None
-                    }
-                };
-                match session.append_custom(UI_NOTE_CUSTOM_TYPE, data).await {
-                    Ok(_) => {
-                        // Live-transcript count, not the post-compaction
-                        // projection the reload path counts over: a mid-run
-                        // compaction can make this overshoot, and
-                        // `merge_positioned_notes` clamps the excess to the
-                        // tail (notes always append at the leaf anyway).
-                        let after_message = live_mirror.lock().unwrap().messages.len();
-                        state
-                            .history
-                            .lock()
-                            .unwrap()
-                            .push(HistoryEntry::Note(record.clone()));
-                        state.notes.lock().unwrap().push(PositionedNote {
-                            note: record,
-                            after_message,
-                        });
-                        state.notes_gen.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Err(err) => tracing::warn!(error = %err, "failed to persist UI note"),
+                // Persist at the leaf through the append queue and refresh
+                // the mirror so an idle switch-away sees the note before the
+                // next authoritative sync.
+                if persist_ui_note(&session, &record).await {
+                    mirror_ui_note(&state, record);
                 }
             }
             SessionCmd::Shutdown => break,
@@ -4019,6 +4051,7 @@ mod tests {
             history: Mutex::new(Vec::new()),
             notes: Mutex::new(Vec::new()),
             notes_gen: AtomicU64::new(0),
+        pending_ui_notes: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
@@ -4340,6 +4373,116 @@ mod tests {
         assert!(
             jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
             "the mid-run switch must persist a model_change entry for the new model"
+        );
+    }
+
+    /// `AppendUiNote` arriving while a turn is in flight must not be dropped
+    /// like the other unserviceable mid-run commands: the card merges into
+    /// the mirror immediately (a mid-run switch-back renders it) and parks
+    /// its persistence for the idle loop, which appends the `custom` entry
+    /// at the leaf once the run owns no borrow of the session.
+    #[tokio::test]
+    async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(MidRunModelStream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            turn1_started: Arc::new(tokio::sync::Notify::new()),
+            release1: Arc::new(tokio::sync::Notify::new()),
+            turn2_started: Arc::new(tokio::sync::Notify::new()),
+            release2: Arc::new(tokio::sync::Notify::new()),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: pi::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn pi::agent_loop::StreamFn>)
+        });
+        let runtime = ModelRuntime::new(resolver);
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(runtime)
+            .with_model(test_model())
+            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let run = drive_run(
+            session.prompt("first turn"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+        );
+        let record = UiNoteRecord {
+            kind: crate::db::UiNoteKind::Notice,
+            data: serde_json::json!({ "text": "mid-run card" }),
+        };
+
+        let ((result, _aborted), ()) = tokio::join!(run, async {
+            stream.turn1_started.notified().await;
+            cmd_tx.send(SessionCmd::AppendUiNote(record)).unwrap();
+            // The mirror takes the card while the turn is still in flight.
+            for _ in 0..10_000 {
+                if state.notes.lock().unwrap().len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                state.notes.lock().unwrap().len(),
+                1,
+                "mid-run AppendUiNote must merge into the mirror immediately"
+            );
+            assert!(
+                matches!(state.history.lock().unwrap().last(), Some(HistoryEntry::Note(_))),
+                "the mirrored tail is the note"
+            );
+            stream.release1.notify_waiters();
+            stream.turn2_started.notified().await;
+            stream.release2.notify_waiters();
+        });
+        result.unwrap();
+
+        // Persistence waited for the settle (the run owned the session);
+        // the idle loop's drain is what appends the custom entry.
+        let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
+        assert!(
+            !jsonl.contains("manox_ui_note"),
+            "no custom entry before the idle loop drains the parked note"
+        );
+        let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
+        assert_eq!(parked.len(), 1, "the mid-run append parks exactly one note");
+        for record in &parked {
+            assert!(persist_ui_note(&session, record).await);
+        }
+        let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
+        assert!(
+            jsonl.contains("\"customType\":\"manox_ui_note\"") && jsonl.contains("mid-run card"),
+            "the drained parked note must append the custom entry"
         );
     }
 

@@ -620,7 +620,7 @@ impl Default for ConversationState {
     }
 }
 
-/// Workspace context threaded through `apply` / `rebuild_from_messages`: the
+/// Workspace context threaded through `apply` / `rebuild_from_display`: the
 /// weak handle (for item toggle callbacks) plus the thread cwd snapshot (for
 /// the `TerminalPanel` prompt line). Bundled so the signatures stay under
 /// clippy's argument-count limit. The cwd is a per-call snapshot taken by the
@@ -1929,6 +1929,12 @@ impl ConversationState {
             builder.extend(&pending, usage, &mut kinds);
         }
         builder.finish(&mut kinds, running);
+        // Group by splice target so several notes anchored to the same tool
+        // keep emit order (inserting one-by-one at ix+1 would reverse them);
+        // applying the groups in descending index order keeps earlier
+        // positions valid.
+        let mut grouped: Vec<(usize, Vec<ConvItem>)> = Vec::new();
+        let mut tail: Vec<ConvItem> = Vec::new();
         for note in deferred {
             let tool_id = note
                 .data
@@ -1937,10 +1943,17 @@ impl ConversationState {
                 .unwrap_or_default();
             let kind = note_to_item(note);
             match kinds.iter().position(|it| item_contains_tool(it, tool_id)) {
-                Some(ix) => kinds.insert(ix + 1, kind),
-                None => kinds.push(kind),
+                Some(ix) => match grouped.last_mut() {
+                    Some((last_ix, items)) if *last_ix == ix => items.push(kind),
+                    _ => grouped.push((ix, vec![kind])),
+                },
+                None => tail.push(kind),
             }
         }
+        for (ix, items) in grouped.into_iter().rev() {
+            kinds.splice(ix + 1..ix + 1, items);
+        }
+        kinds.extend(tail);
         let items = kinds
             .into_iter()
             .enumerate()
@@ -1961,8 +1974,8 @@ impl ConversationState {
     /// Append a batch of newly loaded history messages to the conversation
     /// (the streaming preview). Carries the item builder's turn/segment state
     /// across batches so the result matches a one-shot
-    /// `rebuild_from_messages` over the same prefix; the final authoritative
-    /// history lands through `rebuild_from_messages` (`HistoryRestored`),
+    /// `rebuild_from_display` over the same prefix; the final authoritative
+    /// history lands through `rebuild_from_display` (`HistoryRestored`),
     /// which drops the builder.
     pub fn append_history_messages(
         &mut self,
@@ -2033,7 +2046,7 @@ impl ConversationState {
 /// Construct a `MessageItem` for a rebuilt/history item: full text parse +
 /// finalize for assistant bubbles, persistent reasoning/tool panels for
 /// historical activity segments. Shared by the one-shot
-/// `rebuild_from_messages` and the streaming `append_history_messages`.
+/// `rebuild_from_display` and the streaming `append_history_messages`.
 fn new_history_item(
     kind: ConvItem,
     id: usize,

@@ -2,7 +2,7 @@
 //!
 //! Holds `Entity<agent::Thread>` + `Entity<Sidebar>`; `cx.subscribe` handles:
 //! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens an approval overlay;
-//!   the terminal `Stop` (non-ToolUse) triggers `save_thread`.
+//!   the terminal `Stop` (non-ToolUse) triggers `refresh_thread_list`.
 //! - `SidebarEvent`: new conversation / open history / delete.
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
@@ -18,7 +18,7 @@ use agent::i18n;
 use agent::language_model::StopReason;
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
-use agent::{Thread, ThreadEvent, ThreadId, save_thread};
+use agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
@@ -1055,7 +1055,6 @@ impl Workspace {
                 }
                 ThreadEvent::ReasoningEffortChanged { .. } => {
                     // Persist effort change to the thread record immediately.
-                    save_thread(this.thread.clone(), false, cx);
                     cx.notify();
                 }
                 ThreadEvent::TokenUsageUpdated(_) => {
@@ -1109,7 +1108,7 @@ impl Workspace {
                     // false, so a queued follow-up can safely start a new turn.
                     this.mark_stranded_steers_failed(stranded_steer_ids, cx);
                     let thread_id = this.thread.read(cx).id.0.clone();
-                    save_thread(this.thread.clone(), true, cx);
+                    refresh_thread_list(cx);
                     // Sidebar running indicator: the turn released the running
                     // slot, so the row stops spinning. A successful or
                     // cancelled turn also supersedes a stale error flag. The
@@ -1173,7 +1172,7 @@ impl Workspace {
                     // engaged — re-pins to the end on the next layout.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        save_thread(this.thread.clone(), true, cx);
+                        refresh_thread_list(cx);
                         // `Stop` is a provider-round boundary. Queue draining,
                         // idle state, and git refresh wait for `TurnFinished`.
                     }
@@ -1394,7 +1393,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         let id = thread.read(cx).id.0.clone();
-        let parked_thread = thread.clone();
         cx.subscribe(
             &thread,
             move |this, _thread, ev: &ThreadEvent, cx| match ev {
@@ -1498,7 +1496,6 @@ impl Workspace {
                     });
                 }
                 ThreadEvent::BackgroundTaskUpdated { .. } => {
-                    save_thread(parked_thread.clone(), false, cx);
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_background_work(
@@ -2893,7 +2890,6 @@ impl Workspace {
         // Persist the old thread's current state before switching away. The
         // spawned-task save backstop in `run_turn` will persist again when the
         // turn actually finishes, capturing the final assistant messages.
-        save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
@@ -3444,7 +3440,7 @@ impl Workspace {
             });
         }
         // Persist on submit so the sidebar shows the new entry immediately.
-        save_thread(self.thread.clone(), true, cx);
+        refresh_thread_list(cx);
         cx.notify();
     }
 
@@ -3507,7 +3503,7 @@ impl Workspace {
         // The conversation exists the moment the message is sent: refresh
         // the sidebar list now (the transcript-side refresh on the user
         // MessageEnd notice then fills in the summary text).
-        save_thread(self.thread.clone(), true, cx);
+        refresh_thread_list(cx);
     }
 
     /// Push a user turn into the conversation UI and the thread's message
@@ -3619,7 +3615,7 @@ impl Workspace {
         self.append_user_turn(turn, weak, true, cx);
         self.thread.update(cx, |thread, cx| thread.run_turn(cx));
         // Persist on submit so the sidebar shows the new entry immediately.
-        save_thread(self.thread.clone(), true, cx);
+        refresh_thread_list(cx);
         cx.notify();
     }
 
@@ -3652,7 +3648,7 @@ impl Workspace {
         self.queued_follow_ups.extend(retain);
         if drained {
             self.thread.update(cx, |thread, cx| thread.run_turn(cx));
-            save_thread(self.thread.clone(), true, cx);
+            refresh_thread_list(cx);
         }
         cx.notify();
     }
@@ -4134,7 +4130,7 @@ impl Workspace {
             thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             thread.run_turn(cx);
         });
-        save_thread(self.thread.clone(), true, cx);
+        refresh_thread_list(cx);
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -4538,7 +4534,7 @@ impl Workspace {
                 t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui), cx);
             });
             self.attach_thread(new, window, cx);
-            save_thread(self.thread.clone(), true, cx);
+            refresh_thread_list(cx);
             agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
         } else {
             // Compact/keep-context: the engine exits plan mode, optionally

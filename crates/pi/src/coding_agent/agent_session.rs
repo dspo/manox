@@ -871,7 +871,7 @@ impl AgentSession {
     /// Append a `custom` entry whose payload the harness does not interpret
     /// (host extension data riding the session tree in append order).
     pub async fn append_custom(
-        &mut self,
+        &self,
         custom_type: &str,
         data: Option<serde_json::Value>,
     ) -> Result<String, anyhow::Error> {

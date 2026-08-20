@@ -342,6 +342,9 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
 /// become `HistoryEntry::Note` at their persisted position. Returns the
 /// positioned notes alongside so live mirror refreshes can re-merge them
 /// (the live transcript carries no custom entries).
+/// A compaction boundary carrying a materialized `retained_tail` also folds
+/// away notes inside the kept segment (the tail payload holds only
+/// messages) — the same loss as the summarized history itself.
 pub fn entries_to_display(
     entries: &[pi::session::SessionTreeEntry],
 ) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {

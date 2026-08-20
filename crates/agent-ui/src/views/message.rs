@@ -267,7 +267,7 @@ impl MessageItem {
     }
 
     /// Run the parser's final full parse so the frozen prefix + tail match a
-    /// one-shot parse. Used by `rebuild_from_messages` for non-streaming text
+    /// one-shot parse. Used by `rebuild_from_display` for non-streaming text
     /// items loaded from history.
     pub fn finalize_parser(&mut self, cx: &mut gpui::Context<Self>) {
         if let Some(md) = &self.markdown {
@@ -3108,9 +3108,9 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// Build a flat `ConvItem` list from a `Thread`'s canonical message list.
-/// Shared by `ConversationState::rebuild_from_messages` (top-level, wraps each
-/// item in its own `Entity`) and the nested sub-agent panel (renders plain
-/// items inline, since the snapshot is static once expanded).
+/// Used by the nested sub-agent panel and the tests; the top-level rebuild
+/// (`ConversationState::rebuild_from_display`) drives `ItemBuilder` directly
+/// so persisted UI notes can interleave between message batches.
 ///
 /// Tool calls pair ToolUse with ToolResult by `tool_use_id`; an unpaired side
 /// becomes its own item. Ordinary tool uses within one user turn aggregate into

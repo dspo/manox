@@ -70,7 +70,9 @@ pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{
     SideCallMetric, SubagentChildEvent, Thread, ThreadEvent, ThreadId, ToolCallStatus,
 };
-pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
+pub use thread_store::{
+    ThreadStore, ThreadStoreEvent, global as thread_store_global, refresh_thread_list,
+};
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
 /// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the

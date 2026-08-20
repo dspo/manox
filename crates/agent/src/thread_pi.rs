@@ -4,8 +4,9 @@
 // the `ThreadEngine` contract. Run events flow back through a channel, are
 // adapted into `ThreadEvent`s (see `pi_engine::adapt`), and are emitted on
 // this entity so the workspace's existing `subscribe_thread` handler renders
-// them unchanged. History is exposed as `agent::Message`s so the rebuild
-// path (`ConversationState::rebuild_from_messages`) is reused as-is.
+// them unchanged. History is exposed as a display sequence (messages
+// interleaved with persisted UI annotation cards) so the rebuild path
+// (`ConversationState::rebuild_from_display`) replays it in order.
 //
 // The public surface mirrors the manox `Thread`'s — the workspace compiles
 // against one shape. manox-only affordances (pin/archive/notes/goal/team/
@@ -468,7 +469,7 @@ impl Thread {
                 archived: false,
                 running: false,
                 restored: false,
-            display: Vec::new(),
+                display: Vec::new(),
                 request_usage: HashMap::new(),
                 pending_prompts: Vec::new(),
                 pending_images: Vec::new(),
@@ -1060,9 +1061,11 @@ impl Thread {
     }
 
     /// Persist a UI annotation card as a session `custom` entry (fire and
-    /// forget; the actor queue orders it against prompts). No-op without an
-    /// engine (landing thread).
-    pub fn append_ui_note(&self, record: UiNoteRecord) {
+    /// forget; the actor queue orders it against prompts). The facade mirror
+    /// takes the card immediately so a switch-back before the next engine
+    /// notice already renders it. No engine (landing thread): live-only.
+    pub fn append_ui_note(&mut self, record: UiNoteRecord) {
+        self.display.push(HistoryEntry::Note(record.clone()));
         if let Some(engine) = &self.engine {
             engine.append_ui_note(record);
         }

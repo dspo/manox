@@ -418,14 +418,11 @@ impl ThreadStore {
     }
 }
 
-/// Refresh the sidebar list on real user activity. The transcript and its
-/// UI annotation entries persist themselves; the sidecar no longer carries
-/// thread state here.
-pub fn save_thread(_thread: Entity<Thread>, touch: bool, cx: &mut App) {
-    let store = global();
-    if touch {
-        store.update(cx, |s, cx| s.refresh(cx));
-    }
+/// Refresh the sidebar summary list from the store (new threads surface at
+/// send time, not at turn end). The transcript and its UI annotation entries
+/// persist themselves; nothing else rides this path.
+pub fn refresh_thread_list(cx: &mut App) {
+    global().update(cx, |s, cx| s.refresh(cx));
 }
 
 /// Read every session plus its sidecar into the sidebar summary shape.
