@@ -64,7 +64,7 @@ use gpui::App;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
-pub use message::{Message, MessageProvenance, MessageUiMetadata};
+pub use message::{Message, MessageAuthor, MessageProvenance, MessageUiMetadata};
 pub use permission::{
     PendingAuthMeta, PermissionCache, PermissionDecision, ToolAuthorizationResponse,
 };

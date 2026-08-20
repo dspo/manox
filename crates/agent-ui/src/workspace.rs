@@ -4459,6 +4459,8 @@ impl Workspace {
             approval_mode: meta.approval_mode.map(|mode| mode.as_i64()),
             steered: meta.steered.then_some(true),
             external_event: None,
+            author: meta.author.clone(),
+            peer: meta.peer.then_some(true),
             display_text: None,
         }
     }
@@ -4821,7 +4823,10 @@ impl Workspace {
                     )
                 }
             };
-        let meta = self.user_turn_meta(cx);
+        let mut meta = self.user_turn_meta(cx);
+        // The seed is harness-authored: attribute it to the session's own
+        // agent so the bubble header names the agent, not the human.
+        meta.author = Some(self.thread.read(cx).self_author());
         let ui = Self::message_ui_metadata(&meta);
         if matches!(choice, PlanReviewChoice::ExecuteFresh) {
             // Fresh context: archive this thread and continue on a new one
@@ -4874,7 +4879,7 @@ impl Workspace {
                 agent::collaboration_mode::plan_compact_instructions(lang, &review.plan_file)
             });
             self.thread.update(cx, |thread, cx| {
-                thread.approve_plan(compact, compact_instructions, seed_text, cx);
+                thread.approve_plan(compact, compact_instructions, seed_text, Some(ui), cx);
             });
         }
         cx.notify();

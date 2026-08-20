@@ -870,9 +870,15 @@ fn spawn_member(
         }
     };
     member.update(cx, |t, cx| {
-        t.insert_user_message_with_ui_metadata(prompt, None, cx);
+        // The leader authors the opening dispatch; the member panel
+        // header attributes it to the main agent instead of the human.
+        let ui = crate::MessageUiMetadata {
+            author: Some(crate::message::MessageAuthor::Lead),
+            ..Default::default()
+        };
+        t.insert_user_message_with_ui_metadata(prompt, Some(ui.clone()), cx);
         if !obligations.is_empty() {
-            t.insert_user_message_with_ui_metadata(obligations, None, cx);
+            t.insert_user_message_with_ui_metadata(obligations, Some(ui), cx);
         }
         t.run_turn(cx);
     });
