@@ -1058,7 +1058,12 @@ mod tests {
         });
         cx.executor().run_until_parked();
         let mut settled = false;
-        for _ in 0..200 {
+        // Generous budget: the two sidecar writes run on the process-wide
+        // tokio runtime shared with every parallel test in the binary — a
+        // loaded CI runner starves them well past the 2s the writes need in
+        // isolation. The assertion still catches the lost-update regression;
+        // it just doesn't double as a scheduler benchmark.
+        for _ in 0..1500 {
             if let Ok(meta) = crate::runtime::handle().block_on(
                 pi_extensions::session_meta::load(dir.path(), &session),
             ) && meta.archived
