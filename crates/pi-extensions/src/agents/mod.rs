@@ -10,11 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pi::coding_agent::ModelRuntime;
-use pi::coding_agent::create_agent_session;
+use pi::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use pi::ext_point_agent::{AgentDef, AgentRegistry};
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError, ToolProgress};
-use pi::tools::truncate::{self, TruncateConfig};
+use pi::tool::{AgentTool, ToolContext, ToolError};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -147,103 +145,27 @@ impl SubagentTool {
     }
 }
 
-#[async_trait::async_trait]
-impl AgentTool for SubagentTool {
-    fn name(&self) -> &str {
-        "Agent"
-    }
-
-    fn description(&self) -> &str {
-        self.description_override
-            .as_deref()
-            .unwrap_or(SUBAGENT_TOOL_DEFAULT_DESCRIPTION)
-    }
-
-    fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn requires_approval(&self, _params: &JsonValue) -> bool {
-        false
-    }
-
-    fn parameters_schema(&self) -> JsonValue {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "subagent_type": {
-                    "type": "string",
-                    "description": "Name of the registered agent definition to invoke (e.g. Explore)"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The task for the subagent"
-                },
-                "isolation": {
-                    "type": "string",
-                    "description": "Optional dispatch-time isolation. Set to \"worktree\" to run the sub-agent in its own git worktree on a throwaway branch — full filesystem isolation from the parent's working tree (the child cannot write the parent's project root); a clean worktree is auto-removed when the sub-agent finishes. Omit for same-workspace collaborative work.",
-                    "enum": ["worktree"]
-                }
-            },
-            "required": ["subagent_type", "prompt"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
-        ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        self.execute_inner(tool_call_id, params, signal, ctx, None)
-            .await
-    }
-
-    async fn execute_with_progress(
-        &self,
-        tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
-        ctx: &dyn ToolContext,
-        progress: &dyn ToolProgress,
-    ) -> Result<AgentToolResult, ToolError> {
-        self.execute_inner(tool_call_id, params, signal, ctx, Some(progress))
-            .await
-    }
-}
-
 impl SubagentTool {
-    async fn execute_inner(
+    /// Build a child agent session from a registered definition. The caller
+    /// (the host's `AgentBus`) drives `session.prompt(prompt)` and handles
+    /// termination; this function only constructs the session.
+    /// `extra_tools` are appended after `select_tools` (the host injects
+    /// `SteerTool(from=Subagent(addr))` here).
+    pub async fn spawn_subagent_session(
         &self,
-        _tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
+        subagent_type: &str,
+        isolation: Option<&str>,
         ctx: &dyn ToolContext,
-        progress: Option<&dyn ToolProgress>,
-    ) -> Result<AgentToolResult, ToolError> {
-        let subagent_type = params["subagent_type"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("subagent_type is required".into()))?;
-        let prompt = params["prompt"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("prompt is required".into()))?;
+        extra_tools: Vec<Arc<dyn AgentTool>>,
+    ) -> Result<(AgentSession, tempfile::TempDir, Option<Worktree>), ToolError> {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
-        // A definition's `model` override wins over the caller's pinned
-        // model — that is the manifest's intent. Resolution needs the
-        // injected provider registry; refuse loudly when the override is
-        // declared but cannot be resolved (missing registry or unknown
-        // reference), never silently fall back.
         let model_override =
             resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
-
-        let selected = select_tools(&self.tools, def);
-        // Optional dispatch-time worktree isolation. The subagent session's
-        // cwd becomes the worktree path so every tool operates inside it;
-        // the worktree is torn down after the session exits.
-        let worktree = if params["isolation"].as_str() == Some("worktree") {
+        let mut selected = select_tools(&self.tools, def);
+        selected.extend(extra_tools);
+        let worktree = if isolation == Some("worktree") {
             Some(Worktree::prepare(ctx).await?)
         } else {
             None
@@ -252,8 +174,6 @@ impl SubagentTool {
             .as_ref()
             .map(|w| w.path.as_path())
             .unwrap_or(ctx.cwd());
-        // The subagent transcript lives in a throwaway temp directory so a
-        // read-only Explore call does not litter the user's project.
         let session_dir =
             tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
         let mut builder = create_agent_session()
@@ -264,96 +184,14 @@ impl SubagentTool {
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
-        // Definition override first, then the caller's pinned model.
         if let Some(model) = model_override.or_else(|| self.model.clone()) {
             builder = builder.with_model(model);
         }
-        let mut session = builder
+        let session = builder
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
-
-        // Live observation: the child session's streaming events are bridged
-        // to the parent's ToolProgress channel (the host surfaces them as
-        // the Agent tool call's drill-down transcript + rail activity).
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<pi::types::AgentEvent>();
-        let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
-            let _ = ev_tx.send(event);
-            Box::pin(async move {})
-        }));
-        let forward_child = |event: &pi::types::AgentEvent| {
-            if let Some(progress) = progress
-                && let Some(payload) = subagent_event_json(event)
-            {
-                progress.emit(payload);
-            }
-        };
-
-        // The caller's abort signal must interrupt the subagent mid-run; the
-        // inner session runs on its own token, so race it here.
-        let sig = signal.clone();
-        let mut prompt_fut = Box::pin(session.prompt(prompt));
-        let run_outcome: Result<Vec<pi::types::AgentMessage>, ToolError> = loop {
-            tokio::select! {
-                r = prompt_fut.as_mut() => {
-                    break r.map_err(|e| {
-                        ToolError::ExecutionFailed(format!("subagent failed: {e}"))
-                    });
-                }
-                Some(event) = ev_rx.recv() => forward_child(&event),
-                _ = sig.cancelled() => {
-                    drop(prompt_fut);
-                    let _ = session.abort();
-                    break Err(ToolError::Aborted);
-                }
-            }
-        };
-        // Drain child events queued before settlement so the observer sees
-        // the whole run.
-        while let Ok(event) = ev_rx.try_recv() {
-            forward_child(&event);
-        }
-        // Tear down the worktree (if any) now that the session is done. A
-        // pristine worktree is removed; one with work is kept and its
-        // branch + path ride the result (or, on a real failure, the error)
-        // so the caller can find and later clean up the kept branch.
-        let kept_worktree = if let Some(worktree) = worktree {
-            worktree.clean_up(ctx).await
-        } else {
-            None
-        };
-        let messages = match run_outcome {
-            Ok(m) => m,
-            // A user/TaskStop abort settles silently; the kept worktree (if
-            // any) persists on disk for `git worktree list` to find.
-            Err(ToolError::Aborted) => return Err(ToolError::Aborted),
-            Err(e) => {
-                return Err(match kept_worktree {
-                    Some(kept) => ToolError::ExecutionFailed(format!("{e}\n\n{kept}")),
-                    None => e,
-                });
-            }
-        };
-
-        let text = collect_text(&messages);
-
-        let config = TruncateConfig {
-            max_bytes: DEFAULT_MAX_BYTES,
-            max_lines: DEFAULT_MAX_LINES,
-        };
-        let truncated = truncate::truncate(&text, &config);
-        let mut out = truncated.content;
-        if truncated.was_truncated {
-            let kept = out.lines().count();
-            out.push_str(&format!(
-                "\n\n[output truncated: {kept} of {} lines kept, {} bytes]",
-                truncated.original_lines, truncated.original_bytes
-            ));
-        }
-        if let Some(kept) = kept_worktree {
-            out.push_str(&format!("\n\n{kept}"));
-        }
-        Ok(AgentToolResult::text(out))
+        Ok((session, session_dir, worktree))
     }
 }
 
@@ -364,17 +202,17 @@ impl SubagentTool {
 /// auto-removes a pristine worktree (no commits, no uncommitted changes)
 /// and its branch; a worktree with work is kept and its branch + path are
 /// reported back so the caller never silently loses edits.
-struct Worktree {
-    path: PathBuf,
-    branch: String,
-    repo: PathBuf,
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: String,
+    pub repo: PathBuf,
     /// The repo HEAD SHA captured at `prepare` time; `clean_up` compares the
     /// branch tip against it to detect committed work.
-    base: String,
+    pub base: String,
 }
 
 impl Worktree {
-    async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
+    pub async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
         let repo = ctx.cwd().to_path_buf();
         let suffix = unique_suffix();
         let branch = format!("sailor-{suffix}");
@@ -425,7 +263,7 @@ impl Worktree {
     /// return a message naming the kept branch + path. Best-effort: a git
     /// failure during the pristine check falls back to keeping the worktree
     /// (never destroy work silently).
-    async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
+    pub async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
         if self.is_pristine(ctx).await {
             let rm = format!(
                 "git -C {repo_q} worktree remove {path_q}",
@@ -579,12 +417,13 @@ fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
 }
 
 /// Resolve a definition's tool names against the caller's tool snapshot.
-/// An empty `tools` list means the full snapshot, minus the `agent` tool
-/// itself: a subagent must not inherit the ability to spawn subagents.
+/// An empty `tools` list means the full snapshot, minus the `Steer` tool
+/// itself: a subagent must not inherit the parent's full-privilege Steer
+/// (the host injects a limited `SteerTool(from=Subagent)` via `extra_tools`).
 fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
     let selected: Vec<_> = tools
         .iter()
-        .filter(|t| t.name() != "Agent")
+        .filter(|t| t.name() != "Steer")
         .filter(|t| def.tools.is_empty() || def.tools.iter().any(|n| n == t.name()))
         .cloned()
         .collect();

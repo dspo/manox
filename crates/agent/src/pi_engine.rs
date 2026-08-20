@@ -727,83 +727,6 @@ impl pi::tool::AgentTool for LegacyAwareTaskStop {
 /// completion notification, while read-only subagents (Explore) stay on the
 /// kernel's synchronous path. Routing is by capability, not name, so a
 /// user/plugin definition declaring a write/bash toolset is also async.
-struct SailorRoutingTool {
-    inner: Arc<SubagentTool>,
-    registry: Arc<pi::ext_point_agent::AgentRegistry>,
-    sailor: Arc<crate::sailor_manager::SailorManager>,
-}
-
-impl SailorRoutingTool {
-    /// Whether `params` selects a subagent that should run asynchronously.
-    /// Any definition whose capability is not `read-only` (i.e. it can write
-    /// or run bash) goes through `SailorManager`; read-only ones stay sync.
-    fn is_async_dispatch(&self, params: &serde_json::Value) -> bool {
-        params["subagent_type"]
-            .as_str()
-            .and_then(|t| self.registry.get(t))
-            .map(subagent_capability)
-            .is_some_and(|c| c != "read-only")
-    }
-
-    fn split_params(&self, params: serde_json::Value) -> (String, String, Option<String>) {
-        let st = params["subagent_type"].as_str().unwrap_or("").to_string();
-        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
-        let isolation = params["isolation"].as_str().map(String::from);
-        (st, prompt, isolation)
-    }
-}
-
-#[async_trait::async_trait]
-impl pi::tool::AgentTool for SailorRoutingTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-    fn is_read_only(&self) -> bool {
-        false
-    }
-    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
-        false
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        params: serde_json::Value,
-        signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-        if self.is_async_dispatch(&params) {
-            let (st, prompt, isolation) = self.split_params(params);
-            self.sailor.dispatch(st, prompt, isolation, signal).await
-        } else {
-            self.inner.execute(tool_call_id, params, signal, ctx).await
-        }
-    }
-
-    async fn execute_with_progress(
-        &self,
-        tool_call_id: &str,
-        params: serde_json::Value,
-        signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-        progress: &dyn pi::tool::ToolProgress,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-        if self.is_async_dispatch(&params) {
-            let (st, prompt, isolation) = self.split_params(params);
-            self.sailor.dispatch(st, prompt, isolation, signal).await
-        } else {
-            self.inner
-                .execute_with_progress(tool_call_id, params, signal, ctx, progress)
-                .await
-        }
-    }
-}
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
@@ -958,28 +881,6 @@ fn build_tools(
     // rides PlanUpdated to the context rail. Ungated (mutates nothing on
     // disk); plan mode's ToolCall hook blocks it while planning.
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
-        notice_tx.clone(),
-    )));
-    // Team coordination tools: every session registers the full set; the
-    // facade routes ops through the calling thread's team (leader or
-    // member), and ops without a team return clean errors. Write-axis
-    // governance rides the thread's approval mode like any other tool.
-    tools.push(Arc::new(crate::team::tools::TeamCreateTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TeamSpawnTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TeamDisbandTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TeamDismissTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TeamStatusTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::SendMessageTool::new(
         notice_tx.clone(),
     )));
     tools.push(Arc::new(crate::team::tools::TaskCreateTool::new(
@@ -1191,34 +1092,17 @@ fn build_tools(
                 subagent
             }
         };
-        // Wrap the SubagentTool so write/bash subagents (Sailor + any
-        // user/plugin def with that capability) dispatch asynchronously
-        // through SailorManager; read-only subagents (Explore) stay on the
-        // kernel's synchronous path. The manager owns an env-backed
-        // ToolContext (cwd = the session's project root) so the spawned
-        // child run needs no borrow of the caller's context.
         let subagent = Arc::new(subagent);
-        let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
-            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
-            cwd.to_path_buf(),
-            Arc::new(pi::tool::ToolState::new()),
-        ));
-        let sailor = Arc::new(crate::sailor_manager::SailorManager::new(
-            subagent.clone(),
-            sailor_ctx,
-            notice_tx.clone(),
-            // Attributing the Sailor to this thread lets
-            // `thread_has_running_tasks` count it (sidebar indicator) and
-            // `cancel_all_for_thread` cancel it on thread delete (run_actor
-            // cancels before `cleanup_thread` removes the entry — otherwise
-            // the Sailor would keep burning tokens, unfindable by Stop).
+        let bus = Arc::new(crate::steer_bus::AgentBus::new(
             owner_thread_id.to_string(),
+            notice_tx.clone(),
         ));
-        tools.push(Arc::new(SailorRoutingTool {
-            inner: subagent,
-            registry,
-            sailor,
-        }));
+        tools.push(Arc::new(crate::steer_bus::SteerTool::new(
+            Arc::clone(&bus),
+            pi_extensions::steer_bus::AgentId::Captain,
+        )));
+        // Phase D wires: bus.bind_captain + spawn_subagent_session.
+        let _ = subagent;
         resolver
     } else {
         Arc::new(|_: &str| false)
