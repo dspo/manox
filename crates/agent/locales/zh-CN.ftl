@@ -490,7 +490,7 @@ about-copy = 复制
 background-task-kind-command = 监视器（命令）
 background-task-kind-websocket = 监视器（WebSocket）
 background-task-kind-bash = 后台 Bash
-background-task-kind-sailor = 水手（子代理）
+background-task-kind-subagent = 子代理
 background-task-status-running = 运行中
 background-task-status-stopping = 正在停止
 background-task-status-completed = 已完成
@@ -585,4 +585,4 @@ team-drawer-empty = 暂无成员
 team-drawer-tasks = { $count ->
     [one] { $count } 个任务
    *[other] { $count } 个任务
-}
+}steer-peer-from = 来自 { $agent }

@@ -547,7 +547,7 @@ about-copy = Copy
 background-task-kind-command = Monitor (command)
 background-task-kind-websocket = Monitor (WebSocket)
 background-task-kind-bash = Background Bash
-background-task-kind-sailor = Sailor (subagent)
+background-task-kind-subagent = Subagent
 background-task-status-running = Running
 background-task-status-stopping = Stopping
 background-task-status-completed = Completed
@@ -642,4 +642,4 @@ team-drawer-empty = No members
 team-drawer-tasks = { $count ->
     [one] { $count } task
    *[other] { $count } tasks
-}
+}steer-peer-from = from { $agent }
