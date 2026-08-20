@@ -183,43 +183,53 @@ fn resolve_with_existing_prefix(path: &Path) -> PathBuf {
 }
 
 /// True when a Write/Edit call targets only plan-mode-writable locations:
-/// the plans dir or temp scratch. Write carries `{path}`; Edit carries
-/// `{patch}` (hashline) — every `[path#TAG]` section target must be
-/// writable, with relative paths resolved against the session cwd.
-/// Unparseable or empty patches fail closed. Plans-dir containment is
-/// checked symlink-aware: the longest existing prefix is canonicalized, so a
-/// symlinked directory cannot smuggle a write out of (or into) the plans
-/// dir; the not-yet-created tail (the plan file itself) is appended
-/// lexically after resolution.
+/// the plans dir or temp scratch. Validation follows what each tool
+/// actually consumes — Write reads `{path}`; Edit reads `{patch}`
+/// (hashline) and ignores any decoy `path` field, so every `[path#TAG]`
+/// section target must be writable, with relative paths resolved against
+/// the session cwd. Missing or unparseable fields fail closed. Plans-dir
+/// containment is checked symlink-aware: the longest existing prefix is
+/// canonicalized, so a symlinked directory cannot smuggle a write out of
+/// (or into) the plans dir; the not-yet-created tail (the plan file
+/// itself) is appended lexically after resolution.
 pub fn is_plan_mode_writable_param(
+    tool_name: &str,
     params: &serde_json::Value,
     plans_dir: &Path,
     cwd: &Path,
 ) -> bool {
-    if let Some(raw) = params.get("path").and_then(|v| v.as_str()) {
-        let candidate = Path::new(raw);
-        let absolute = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            cwd.join(candidate)
-        };
-        return is_plan_mode_writable_path(&absolute, plans_dir);
-    }
-    let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    let Ok(file_patches) = pi::hashline::parse_patch(patch) else {
-        return false;
-    };
-    !file_patches.is_empty()
-        && file_patches.iter().all(|file_patch| {
-            let target = if file_patch.path.is_absolute() {
-                file_patch.path.clone()
-            } else {
-                cwd.join(&file_patch.path)
+    match tool_name {
+        "Write" => {
+            let Some(raw) = params.get("path").and_then(|v| v.as_str()) else {
+                return false;
             };
-            is_plan_mode_writable_path(&target, plans_dir)
-        })
+            let candidate = Path::new(raw);
+            let absolute = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                cwd.join(candidate)
+            };
+            is_plan_mode_writable_path(&absolute, plans_dir)
+        }
+        "Edit" => {
+            let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
+                return false;
+            };
+            let Ok(file_patches) = pi::hashline::parse_patch(patch) else {
+                return false;
+            };
+            !file_patches.is_empty()
+                && file_patches.iter().all(|file_patch| {
+                    let target = if file_patch.path.is_absolute() {
+                        file_patch.path.clone()
+                    } else {
+                        cwd.join(&file_patch.path)
+                    };
+                    is_plan_mode_writable_path(&target, plans_dir)
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Plans-dir containment (symlink-aware) or temp-scratch containment.
@@ -249,7 +259,7 @@ impl PlanGatePolicy {
     pub fn is_exempt(&self, tool_name: &str, params: &serde_json::Value) -> bool {
         self.state.enabled()
             && PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
-            && is_plan_mode_writable_param(params, &self.plans_dir, &self.cwd)
+            && is_plan_mode_writable_param(tool_name, params, &self.plans_dir, &self.cwd)
     }
 }
 
@@ -274,10 +284,9 @@ fn is_read_only_subagent_dispatch(
 /// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
 /// tools and the proposal devices pass; Write/Edit pass only for plan-file
 /// and temp-scratch targets; an `Agent` call passes only for a read-only
-/// subagent
-/// (e.g. `Explore`) without worktree isolation; every other tool (Bash,
-/// Monitor, write/bash sub-agents, MCP, …) is blocked with a reason the
-/// model can act on.
+/// subagent (e.g. `Explore`) without worktree isolation; every other tool
+/// (Bash, Monitor, write/bash sub-agents, MCP, …) is blocked with a reason
+/// the model can act on.
 pub fn gate_handler(
     state: Arc<PlanSessionState>,
     plans_dir: PathBuf,
@@ -295,7 +304,7 @@ pub fn gate_handler(
             .unwrap_or_default();
         let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
             || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
-                && is_plan_mode_writable_param(&ctx.data["args"], &plans_dir, &cwd))
+                && is_plan_mode_writable_param(tool_name, &ctx.data["args"], &plans_dir, &cwd))
             || (tool_name == crate::tools::AGENT
                 && is_read_only_subagent_dispatch(&ctx.data["args"], &is_read_only_subagent));
         if !allowed {
@@ -589,47 +598,67 @@ mod tests {
 
         // Absolute inside.
         assert!(is_plan_mode_writable_param(
+            "Write",
             &params("/home/u/.manox/plans/auth-plan.md"),
             plans,
             cwd
         ));
         // Traversal cannot escape.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &params("/home/u/.manox/plans/../../proj/src/main.rs"),
             plans,
             cwd
         ));
         // Relative resolves against cwd → outside.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &params("src/main.rs"),
             plans,
             cwd
         ));
         // A sibling prefix dir is not contained.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &params("/home/u/.manox/plans-evil/x.md"),
             plans,
             cwd
         ));
         // Temp scratch is plan-mode-writable.
         assert!(is_plan_mode_writable_param(
+            "Write",
             &params("/tmp/scratch.md"),
             plans,
             cwd
         ));
         assert!(is_plan_mode_writable_param(
+            "Write",
             &params("/private/tmp/scratch.md"),
             plans,
             cwd
         ));
         // A sibling prefix of a scratch root is not scratch.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &params("/tmp-evil/x.md"),
+            plans,
+            cwd
+        ));
+        // A decoy `patch` field cannot narrow a legitimate Write: Write
+        // consumes only `path`, so validation follows `path` alone.
+        let decoy_patch = serde_json::json!({
+            "path": "/home/u/.manox/plans/auth-plan.md",
+            "patch": edit_patch("/home/u/proj/src/main.rs"),
+        });
+        assert!(is_plan_mode_writable_param(
+            "Write",
+            &decoy_patch,
             plans,
             cwd
         ));
         // Missing path param.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &serde_json::json!({}),
             plans,
             cwd
@@ -653,12 +682,14 @@ mod tests {
 
         // Through the escaping symlink → outside → blocked.
         assert!(!is_plan_mode_writable_param(
+            "Write",
             &params(&plans.join("escape").join("evil.md")),
             &plans,
             tmp.path()
         ));
         // Through the inside-pointing symlink → still inside → allowed.
         assert!(is_plan_mode_writable_param(
+            "Write",
             &params(&plans.join("inner").join("ok-plan.md")),
             &plans,
             tmp.path()
@@ -678,23 +709,27 @@ mod tests {
 
         // A plan-file Edit passes — the regression this change fixes.
         assert!(is_plan_mode_writable_param(
+            "Edit",
             &params(&edit_patch("/home/u/.manox/plans/auth-plan.md")),
             plans,
             cwd
         ));
         // Temp-scratch Edits pass.
         assert!(is_plan_mode_writable_param(
+            "Edit",
             &params(&edit_patch("/tmp/notes.md")),
             plans,
             cwd
         ));
         // Working-tree Edits stay blocked (absolute and traversal escape).
         assert!(!is_plan_mode_writable_param(
+            "Edit",
             &params(&edit_patch("/home/u/proj/src/main.rs")),
             plans,
             cwd
         ));
         assert!(!is_plan_mode_writable_param(
+            "Edit",
             &params(&edit_patch("/home/u/.manox/plans/../../proj/src/main.rs")),
             plans,
             cwd
@@ -704,14 +739,46 @@ mod tests {
             "{}\n[/home/u/proj/src/bad.rs#3C4D]\nDEL 1",
             edit_patch("/home/u/.manox/plans/ok-plan.md")
         );
-        assert!(!is_plan_mode_writable_param(&params(&mixed), plans, cwd));
+        assert!(!is_plan_mode_writable_param(
+            "Edit",
+            &params(&mixed),
+            plans,
+            cwd
+        ));
         // Unparseable and empty patches fail closed.
         assert!(!is_plan_mode_writable_param(
+            "Edit",
             &params("[src/lib.rs#1A2B\nDEL 1"),
             plans,
             cwd
         ));
-        assert!(!is_plan_mode_writable_param(&params(""), plans, cwd));
+        assert!(!is_plan_mode_writable_param(
+            "Edit",
+            &params(""),
+            plans,
+            cwd
+        ));
+        // A decoy `path` field cannot smuggle a working-tree patch past the
+        // gate: Edit consumes only `patch`, so validation follows `patch`
+        // regardless of any accompanying `path`.
+        let decoy_path = serde_json::json!({
+            "path": "/tmp/decoy.md",
+            "patch": edit_patch("/home/u/proj/src/main.rs"),
+        });
+        assert!(!is_plan_mode_writable_param(
+            "Edit",
+            &decoy_path,
+            plans,
+            cwd
+        ));
+        // Edit without a `patch` field fails closed even with a writable
+        // decoy `path`.
+        assert!(!is_plan_mode_writable_param(
+            "Edit",
+            &serde_json::json!({ "path": "/tmp/decoy.md" }),
+            plans,
+            cwd
+        ));
     }
 
     #[test]
@@ -803,6 +870,18 @@ mod tests {
             run(
                 "Edit",
                 serde_json::json!({"patch": "*** Begin Patch\n[src/main.rs#1A2B]\nDEL 1\n*** End Patch"})
+            )
+            .block_reason
+            .is_some()
+        );
+        // Decoy `path` cannot smuggle a working-tree Edit past the gate.
+        assert!(
+            run(
+                "Edit",
+                serde_json::json!({
+                    "path": "/tmp/decoy.md",
+                    "patch": "*** Begin Patch\n[src/main.rs#1A2B]\nDEL 1\n*** End Patch"
+                })
             )
             .block_reason
             .is_some()
