@@ -236,7 +236,7 @@ impl AgentBus {
         let child_steer = Arc::new(SteerTool::new(bus_arc, AgentId::Subagent(addr.to_string())));
 
         // Spawn the session.
-        let (mut session, _dir, worktree) = subagent_tool
+        let (mut session, session_dir, worktree) = subagent_tool
             .spawn_subagent_session(
                 &spawn_type,
                 isolation.as_deref(),
@@ -282,7 +282,10 @@ impl AgentBus {
         );
         let tool_ctx2 = tool_ctx.clone();
 
+        // session_dir (TempDir) must outlive the spawned task — the session
+        // JSONL file lives inside it; dropping it mid-run deletes the dir.
         crate::runtime::handle().spawn(async move {
+            let _session_dir = session_dir; // hold TempDir alive for session lifetime
             let result = session.prompt(&full_prompt).await;
             // Clean up worktree.
             if let Some(wt) = worktree {
