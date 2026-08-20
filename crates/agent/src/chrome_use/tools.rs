@@ -376,12 +376,10 @@ impl AgentTool for ChromeUseClickTool {
         let input: RefInput = parse(params)?;
         let ref_id = input.ref_id.clone();
         let report = super::bridge::run(signal, move |cancel| {
-            let rt = runtime::runtime();
-            let selector = rt.ref_selector(input.tab_id, &input.ref_id)?;
-            rt.with_tab(input.tab_id, |entry| {
+            runtime::runtime().act_on_ref(input.tab_id, &input.ref_id, |entry, selector| {
                 entry
                     .page
-                    .click_with_cancel(&selector, Some(runtime::ACTION_TIMEOUT_MS), cancel)
+                    .click_with_cancel(selector, Some(runtime::ACTION_TIMEOUT_MS), cancel)
                     .map_err(|e| format!("click failed: {e}"))?;
                 entry.refs.clear();
                 let (text, refs) = snapshot::take(&entry.page, cancel)?;
@@ -423,13 +421,11 @@ impl AgentTool for ChromeUseTypeTool {
         let ref_id = input.ref_id.clone();
         let submitted = input.submit;
         let report = super::bridge::run(signal, move |cancel| {
-            let rt = runtime::runtime();
-            let selector = rt.ref_selector(input.tab_id, &input.ref_id)?;
-            rt.with_tab(input.tab_id, |entry| {
+            runtime::runtime().act_on_ref(input.tab_id, &input.ref_id, |entry, selector| {
                 entry
                     .page
                     .fill_with_cancel(
-                        &selector,
+                        selector,
                         &input.text,
                         Some(runtime::ACTION_TIMEOUT_MS),
                         cancel,
@@ -439,7 +435,7 @@ impl AgentTool for ChromeUseTypeTool {
                     entry
                         .page
                         .press_key_with_timeout_and_cancel(
-                            Some(&selector),
+                            Some(selector),
                             "Enter",
                             Some(runtime::ACTION_TIMEOUT_MS),
                             cancel,
@@ -488,15 +484,11 @@ impl AgentTool for ChromeUsePressKeyTool {
         let key = input.key.clone();
         let report = super::bridge::run(signal, move |cancel| {
             let rt = runtime::runtime();
-            let selector = match &input.ref_id {
-                Some(ref_id) => Some(rt.ref_selector(input.tab_id, ref_id)?),
-                None => None,
-            };
-            rt.with_tab(input.tab_id, |entry| {
+            let press = |entry: &mut runtime::TabEntry, selector: Option<&str>| {
                 entry
                     .page
                     .press_key_with_timeout_and_cancel(
-                        selector.as_deref(),
+                        selector,
                         &input.key,
                         Some(runtime::ACTION_TIMEOUT_MS),
                         cancel,
@@ -506,7 +498,13 @@ impl AgentTool for ChromeUsePressKeyTool {
                 let (text, refs) = snapshot::take(&entry.page, cancel)?;
                 entry.refs = refs;
                 Ok(text)
-            })
+            };
+            match &input.ref_id {
+                Some(ref_id) => rt.act_on_ref(input.tab_id, ref_id, |entry, selector| {
+                    press(entry, Some(selector))
+                }),
+                None => rt.with_tab(input.tab_id, |entry| press(entry, None)),
+            }
         })
         .await?;
         Ok(AgentToolResult::text(format!("Pressed {key}.\n\n{report}")))
@@ -539,13 +537,11 @@ impl AgentTool for ChromeUseSelectOptionTool {
         let input: SelectOptionInput = parse(params)?;
         let ref_id = input.ref_id.clone();
         let report = super::bridge::run(signal, move |cancel| {
-            let rt = runtime::runtime();
-            let selector = rt.ref_selector(input.tab_id, &input.ref_id)?;
-            rt.with_tab(input.tab_id, |entry| {
+            runtime::runtime().act_on_ref(input.tab_id, &input.ref_id, |entry, selector| {
                 let selected = entry
                     .page
                     .select_options_with_cancel(
-                        &selector,
+                        selector,
                         &input.values,
                         Some(runtime::ACTION_TIMEOUT_MS),
                         cancel,
@@ -597,16 +593,12 @@ impl AgentTool for ChromeUseScrollTool {
         let ref_id = input.ref_id.clone();
         let report = super::bridge::run(signal, move |cancel| {
             let rt = runtime::runtime();
-            let selector = match &input.ref_id {
-                Some(ref_id) => Some(rt.ref_selector(input.tab_id, ref_id)?),
-                None => None,
-            };
-            rt.with_tab(input.tab_id, |entry| {
+            let scroll = |entry: &mut runtime::TabEntry, selector: Option<&str>| {
                 match selector {
                     Some(selector) => entry
                         .page
                         .scroll_into_view_with_cancel(
-                            &selector,
+                            selector,
                             Some(runtime::ACTION_TIMEOUT_MS),
                             cancel,
                         )
@@ -630,7 +622,13 @@ impl AgentTool for ChromeUseScrollTool {
                 let (text, refs) = snapshot::take(&entry.page, cancel)?;
                 entry.refs = refs;
                 Ok(text)
-            })
+            };
+            match &input.ref_id {
+                Some(ref_id) => rt.act_on_ref(input.tab_id, ref_id, |entry, selector| {
+                    scroll(entry, Some(selector))
+                }),
+                None => rt.with_tab(input.tab_id, |entry| scroll(entry, None)),
+            }
         })
         .await?;
         let confirmation = match &ref_id {
@@ -648,8 +646,8 @@ impl AgentTool for ChromeUseWaitForTool {
     }
     fn description(&self) -> &str {
         "Block until page `text` appears, `text_gone` disappears (10s budget each), or \
-         `time` seconds elapse — exactly one of the three must be given. Read-only — no \
-         approval needed."
+         `time` seconds elapse — exactly one of the three must be given. Every variant \
+         validates that `tab_id` exists. Read-only — no approval needed."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<WaitForInput>()
@@ -678,7 +676,9 @@ impl AgentTool for ChromeUseWaitForTool {
             }
         };
         let outcome = super::bridge::run(signal, move |cancel| {
-            runtime::runtime().wait_for(input.tab_id, target, cancel)
+            let rt = runtime::runtime();
+            rt.require_tab(input.tab_id)?;
+            rt.wait_for(input.tab_id, target, cancel)
         })
         .await?;
         Ok(AgentToolResult::text(outcome))
@@ -756,21 +756,14 @@ impl AgentTool for ChromeUseTabsTool {
     fn description(&self) -> &str {
         "Manage the Chrome session's tabs: `list` (also adopts tabs opened outside \
          ChromeUse), `new` (optionally navigated via `url`), `select` (report a tab — \
-         ChromeUse tools address tabs by explicit tab_id), or `close`. `list` is read-only; \
-         the other actions require approval (subject to the thread's approval mode)."
+         ChromeUse tools address tabs by explicit tab_id), or `close`. All actions require \
+         approval (subject to the thread's approval mode)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TabsInput>()
     }
-    fn requires_approval(&self, params: &serde_json::Value) -> bool {
-        let input: Result<TabsInput, _> = serde_json::from_value(params.clone());
-        !matches!(
-            input,
-            Ok(TabsInput {
-                action: TabAction::List,
-                ..
-            })
-        )
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        true
     }
     async fn execute(
         &self,
@@ -942,13 +935,20 @@ mod tests {
     }
 
     #[test]
-    fn tabs_approval_depends_on_action() {
+    fn tabs_actions_all_gated() {
+        // The approval wrapper gates on `requires_approval || !is_read_only`,
+        // and Tabs is not read-only — so every action, including `list`,
+        // rides the gate. The inner tool agrees rather than promising an
+        // ungated path the wrapper cannot keep.
         let tool = ChromeUseTabsTool;
-        assert!(!tool.requires_approval(&serde_json::json!({"action": "list"})));
-        assert!(tool.requires_approval(&serde_json::json!({"action": "new"})));
-        assert!(tool.requires_approval(&serde_json::json!({"action": "close", "tab_id": 1})));
-        // Unparseable params stay gated (fail closed).
-        assert!(tool.requires_approval(&serde_json::json!({"action": "bogus"})));
+        for params in [
+            serde_json::json!({"action": "list"}),
+            serde_json::json!({"action": "new"}),
+            serde_json::json!({"action": "close", "tab_id": 1}),
+            serde_json::json!({"action": "bogus"}),
+        ] {
+            assert!(tool.requires_approval(&params), "{params}");
+        }
     }
 
     #[test]
@@ -978,6 +978,22 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, ToolError::InvalidArguments(_)), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn wait_for_time_validates_the_tab_exists() {
+        // The `time` variant never reads page state, but it must still fail
+        // against a missing session instead of silently sleeping.
+        let err = ChromeUseWaitForTool
+            .execute(
+                "c1",
+                serde_json::json!({"tab_id": 1, "time": 0.1}),
+                CancellationToken::new(),
+                &tool_ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no Chrome session"), "{err}");
     }
 
     #[tokio::test]

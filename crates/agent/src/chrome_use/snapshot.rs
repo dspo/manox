@@ -5,8 +5,10 @@
 //! (clearing the previous snapshot's marks first) and reports each entry's
 //! depth, role, name, and value. Rendering happens here; refs stay valid
 //! until the next snapshot or navigation, and actions address elements
-//! through the `[data-manox-ref="eN"]` selector. Cross-origin iframe content
-//! is out of scope for this builder (known limitation).
+//! through the `[data-manox-ref="eN"]` selector. Known limitations:
+//! cross-origin iframe content is out of scope, and the walker traverses the
+//! light DOM only — shadow-DOM internals (web components) neither get refs
+//! nor contribute leaf text.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -134,13 +136,13 @@ const WALKER_JS: &str = r###"(() => {
       walk(el, depth, insideInteresting);
       if (!insideInteresting && el.childElementCount === 0) {
         const text = ws(el.textContent);
-        if (text) out.push({ d: depth, x: text.slice(0, NAME_CAP) });
+        if (out.length < MAX && text) out.push({ d: depth, x: text.slice(0, NAME_CAP) });
       }
     }
   };
 
   walk(document.body || document.documentElement, 0, false);
-  return { url: location.href, title: document.title, items: out };
+  return { url: location.href, title: document.title, items: out, truncated: out.length >= MAX };
 })()"###;
 
 /// Snapshot a page through the walker and render it.
@@ -229,6 +231,14 @@ pub fn render(payload: &serde_json::Value) -> Result<(String, HashSet<String>), 
         }
         line.push_str(&format!(" [{ref_id}]\n"));
         out.push_str(&line);
+    }
+    // The walker reports when it hit its own entry cap; surface that instead
+    // of letting the model read a seemingly complete tree.
+    if payload.get("truncated") == Some(&serde_json::Value::Bool(true)) {
+        out.push_str(
+            "... [snapshot hit the walker's 800-entry cap; elements beyond it were not \
+             captured — narrow the page or scroll and re-snapshot]\n",
+        );
     }
     Ok((out, refs))
 }
@@ -325,5 +335,14 @@ mod tests {
         let s = "中文".repeat(200);
         let cut = truncate(&s, 3);
         assert_eq!(cut, "中文中…");
+    }
+
+    #[test]
+    fn render_reports_the_walker_entry_cap() {
+        let mut payload = payload(json!([]));
+        payload["truncated"] = json!(true);
+        let (text, refs) = render(&payload).unwrap();
+        assert!(text.contains("800-entry cap"), "{text}");
+        assert!(refs.is_empty());
     }
 }

@@ -66,8 +66,11 @@ pub fn shutdown() {
 
 /// Wire JSON for the engine's launch facade. `headless` is always explicit —
 /// the engine's own default is headless, the opposite of the ChromeUse
-/// default (a user-visible Chrome). `DISABLE_TELEMETRY` rides the launched
-/// process's env so the engine never phones home.
+/// default (a user-visible Chrome). The `env` table stays empty on purpose:
+/// it only reaches the spawned Chrome child. The engine's telemetry opt-out
+/// reads this (manox's) process environment, set at process start — see the
+/// `DISABLE_TELEMETRY` writes in `crates/manox/src/main.rs` and the napi
+/// `start`.
 fn launch_options(chrome: &ChromeSettings, headless: Option<bool>) -> String {
     let user_data_dir = chrome
         .user_data_dir
@@ -81,7 +84,7 @@ fn launch_options(chrome: &ChromeSettings, headless: Option<bool>) -> String {
         "ignore_all_default_args": false,
         "ignore_default_args": [],
         "user_data_dir": user_data_dir,
-        "env": { "DISABLE_TELEMETRY": "1" },
+        "env": {},
         "chromium_sandbox": false,
         "proxy": null,
     })
@@ -205,21 +208,40 @@ impl ChromeUseRuntime {
         f(entry)
     }
 
-    /// Translate a live snapshot ref into the CSS selector addressing it.
-    /// Membership in the latest snapshot implies the `eN` shape, so a
-    /// selector built from a live ref is injection-safe.
-    pub fn ref_selector(&self, tab_id: ChromeTabId, ref_id: &str) -> Result<String, String> {
+    /// Resolve a live snapshot ref and run `f` against the tab in a single
+    /// lock scope, so a concurrent re-snapshot cannot invalidate the ref
+    /// between resolution and use. Membership in the latest snapshot implies
+    /// the `eN` shape, so the selector built from a live ref is
+    /// injection-safe.
+    pub fn act_on_ref<F, R>(&self, tab_id: ChromeTabId, ref_id: &str, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut TabEntry, &str) -> Result<R, String>,
+    {
         let mut guard = self.lock();
         let session = Self::session_mut(&mut guard)?;
         let entry = session
             .tabs
-            .get(&tab_id)
+            .get_mut(&tab_id)
             .ok_or_else(|| format!("unknown tab_id {tab_id}; list open tabs with ChromeUseTabs"))?;
-        if entry.refs.contains(ref_id) {
-            Ok(format!("[data-manox-ref=\"{ref_id}\"]"))
+        if !entry.refs.contains(ref_id) {
+            return Err(format!(
+                "stale or unknown ref `{ref_id}` on tab {tab_id}; take a fresh ChromeUseSnapshot"
+            ));
+        }
+        let selector = format!("[data-manox-ref=\"{ref_id}\"]");
+        f(entry, &selector)
+    }
+
+    /// Verify the tab exists without touching the page (cheap existence
+    /// probe for waits that never read page state).
+    pub fn require_tab(&self, tab_id: ChromeTabId) -> Result<(), String> {
+        let mut guard = self.lock();
+        let session = Self::session_mut(&mut guard)?;
+        if session.tabs.contains_key(&tab_id) {
+            Ok(())
         } else {
             Err(format!(
-                "stale or unknown ref `{ref_id}` on tab {tab_id}; take a fresh ChromeUseSnapshot"
+                "unknown tab_id {tab_id}; list open tabs with ChromeUseTabs"
             ))
         }
     }
@@ -398,6 +420,10 @@ impl ChromeUseRuntime {
         }
     }
 
+    /// Poll the page's body text until presence matches expectation or the
+    /// budget expires. Each probe borrows the session lock briefly; sleeps
+    /// happen outside the lock so other threads keep driving the shared
+    /// browser while a wait is parked.
     fn poll_text(
         &self,
         tab_id: ChromeTabId,
@@ -407,40 +433,40 @@ impl ChromeUseRuntime {
     ) -> Result<String, String> {
         const BODY_TEXT_JS: &str = "(document.body && document.body.innerText) || \"\"";
         let start = Instant::now();
-        self.with_tab(tab_id, |entry| {
-            loop {
-                if cancel.is_some_and(CancelToken::is_cancelled) {
-                    return Err("operation cancelled".into());
-                }
+        loop {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Err("operation cancelled".into());
+            }
+            let body: String = self.with_tab(tab_id, |entry| {
                 let wire = entry
                     .page
                     .evaluate_with_cancel(BODY_TEXT_JS, None, Some(ACTION_TIMEOUT_MS), cancel)
                     .map_err(|e| format!("text probe failed: {e}"))?;
                 let json = rustwright_core::decode_wire_value(&wire)
                     .map_err(|e| format!("text probe decode failed: {e}"))?;
-                let body: String = serde_json::from_str(&json).unwrap_or_default();
-                if body.contains(text) == want_present {
-                    let state = if want_present {
-                        "appeared"
-                    } else {
-                        "disappeared"
-                    };
-                    return Ok(format!("\"{text}\" {state}."));
-                }
-                if start.elapsed() >= WAIT_TIMEOUT {
-                    let expectation = if want_present {
-                        "to appear"
-                    } else {
-                        "to disappear"
-                    };
-                    return Err(format!(
-                        "timed out after {}s waiting for \"{text}\" {expectation}",
-                        WAIT_TIMEOUT.as_secs()
-                    ));
-                }
-                std::thread::sleep(WAIT_POLL);
+                Ok(serde_json::from_str(&json).unwrap_or_default())
+            })?;
+            if body.contains(text) == want_present {
+                let state = if want_present {
+                    "appeared"
+                } else {
+                    "disappeared"
+                };
+                return Ok(format!("\"{text}\" {state}."));
             }
-        })
+            if start.elapsed() >= WAIT_TIMEOUT {
+                let expectation = if want_present {
+                    "to appear"
+                } else {
+                    "to disappear"
+                };
+                return Err(format!(
+                    "timed out after {}s waiting for \"{text}\" {expectation}",
+                    WAIT_TIMEOUT.as_secs()
+                ));
+            }
+            std::thread::sleep(WAIT_POLL);
+        }
     }
 }
 
@@ -456,13 +482,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_options_pin_headless_default_and_disable_telemetry() {
+    fn launch_options_pin_headless_default_and_empty_env() {
         let chrome = ChromeSettings::default();
         let value: serde_json::Value =
             serde_json::from_str(&launch_options(&chrome, None)).unwrap();
         // The engine's own default is headless; ChromeUse must override it.
         assert_eq!(value["headless"], serde_json::json!(false));
-        assert_eq!(value["env"]["DISABLE_TELEMETRY"], serde_json::json!("1"));
+        // The env table only reaches the spawned Chrome child; the telemetry
+        // opt-out rides manox's own process environment (set at process
+        // start in the bin / napi host).
+        assert_eq!(value["env"], serde_json::json!({}));
         assert_eq!(value["chromium_sandbox"], serde_json::json!(false));
     }
 
@@ -528,6 +557,9 @@ mod tests {
             eprintln!("skipping: MANOX_RUN_LIVE not set");
             return;
         }
+        // The engine checks the telemetry opt-out against the test process's
+        // own environment; mirror what main()/napi start do for live runs.
+        unsafe { std::env::set_var("DISABLE_TELEMETRY", "1") };
         let dir =
             std::env::temp_dir().join(format!("manox-chrome-use-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -537,7 +569,10 @@ mod tests {
 
         let rt = runtime();
         // Close any session a prior test left behind, then launch headless
-        // (the override applies because this starts the session).
+        // (the override applies because this starts the session). The launch
+        // uses the default `~/.manox/chrome-profile/` user-data-dir, which is
+        // disjoint from the user's daily Chrome profile, so coexisting with a
+        // running manox app or Chrome instance is safe.
         let _ = rt.close_session();
         rt.ensure_session(None, Some(true), None).expect("launch");
 
@@ -550,12 +585,11 @@ mod tests {
 
         // Click the button through its snapshot ref; the handler flips the
         // status paragraph, which the fresh snapshot must show.
-        let selector = rt.ref_selector(tab, &button_ref).expect("button ref");
         let after_click = rt
-            .with_tab(tab, |entry| {
+            .act_on_ref(tab, &button_ref, |entry, selector| {
                 entry
                     .page
-                    .click_with_cancel(&selector, Some(ACTION_TIMEOUT_MS), None)
+                    .click_with_cancel(selector, Some(ACTION_TIMEOUT_MS), None)
                     .expect("click");
                 entry.refs.clear();
                 let (text, refs) = super::super::snapshot::take(&entry.page, None).expect("take");
@@ -565,17 +599,16 @@ mod tests {
             .expect("click round");
         assert!(after_click.contains("clicked"), "{after_click}");
 
-        // A stale ref (issued before the click's snapshot) must fail fast.
-        let stale = rt.ref_selector(tab, "e9999");
+        // A stale ref must fail fast before any engine round trip.
+        let stale = rt.act_on_ref(tab, "e9999", |_, _| Ok(()));
         assert!(stale.is_err(), "stale ref must not resolve");
 
         // Type into the text input and read the value back via snapshot.
-        let selector = rt.ref_selector(tab, &input_ref).expect("input ref");
         let after_type = rt
-            .with_tab(tab, |entry| {
+            .act_on_ref(tab, &input_ref, |entry, selector| {
                 entry
                     .page
-                    .fill_with_cancel(&selector, "manox", Some(ACTION_TIMEOUT_MS), None)
+                    .fill_with_cancel(selector, "manox", Some(ACTION_TIMEOUT_MS), None)
                     .expect("fill");
                 entry.refs.clear();
                 let (text, refs) = super::super::snapshot::take(&entry.page, None).expect("take");
@@ -586,13 +619,12 @@ mod tests {
         assert!(after_type.contains("value=\"manox\""), "{after_type}");
 
         // Select an option by label.
-        let selector = rt.ref_selector(tab, &select_ref).expect("select ref");
         let selected = rt
-            .with_tab(tab, |entry| {
+            .act_on_ref(tab, &select_ref, |entry, selector| {
                 entry
                     .page
                     .select_options_with_cancel(
-                        &selector,
+                        selector,
                         &["green".to_string()],
                         Some(ACTION_TIMEOUT_MS),
                         None,

@@ -35,6 +35,11 @@ fn main() {
     // Edition 2024 marks `set_var` unsafe because it can race with reads on
     // other threads; safe here because this runs before any other thread exists.
     unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    // The built-in Chrome engine (rustwright-core, via ChromeUse) checks
+    // DISABLE_TELEMETRY against this process's own environment at launch;
+    // the launch-options env table only reaches the spawned Chrome child.
+    // Same single-threaded-phase justification as RUST_BACKTRACE above.
+    unsafe { std::env::set_var("DISABLE_TELEMETRY", "1") };
     std::panic::set_hook(Box::new(|info| {
         let location = info
             .location()
@@ -417,10 +422,6 @@ fn main() {
     // supervisor's per-process timeouts. The main thread is not a tokio worker
     // (gpui's `run` returned here), so `Handle::block_on` is safe. Only manox's
     // own children are signaled — a server the user ran elsewhere is untouched.
-    // ChromeUse: close the shared Chrome session so a launched (owned) Chrome
-    // process does not outlive manox; an attached browser is detached and
-    // left running.
-    agent::chrome_use::shutdown();
     match agent::runtime::try_handle() {
         Some(handle) => {
             handle.block_on(async {
@@ -432,6 +433,10 @@ fn main() {
             supervisor::global().terminate_all();
         }
     }
+    // ChromeUse: close the shared Chrome session so a launched (owned) Chrome
+    // process does not outlive manox; an attached browser is detached and
+    // left running.
+    agent::chrome_use::shutdown();
 }
 
 /// Open the main window over the process-lifetime `Workspace`, creating the
