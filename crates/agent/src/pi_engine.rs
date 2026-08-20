@@ -877,17 +877,20 @@ fn build_tools(
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
-    tools.push(Arc::new(crate::team::tools::TaskCreateTool::new(
-        notice_tx.clone(),
+    let task_list = Arc::new(std::sync::Mutex::new(
+        crate::team::tools::PlainTaskList::new(),
+    ));
+    tools.push(Arc::new(crate::team::tools::TaskCreateTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TaskListTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskListTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TaskUpdateTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskUpdateTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TaskGetTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskGetTool::with_list(
+        Arc::clone(&task_list),
     )));
     // Goal lifecycle tools (GetGoal/CreateGoal/UpdateGoal): ungated like
     // AskUserQuestion/ProposePlan — they persist the durable goal contract,
