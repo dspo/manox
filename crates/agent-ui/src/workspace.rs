@@ -3472,7 +3472,7 @@ impl Workspace {
     ) {
         // Phase E: dismiss_member retired with Entity<Team> — use
         // Steer(Abort, to=member_thread_id) instead. Stubbed for now.
-        let _ = (team, name);
+        let _ = (team, name, cx);
     }
 
     /// Archive the active thread and open a fresh one that inherits the

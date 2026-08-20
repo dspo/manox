@@ -272,13 +272,19 @@ fn is_read_only_subagent_dispatch(
     args: &serde_json::Value,
     is_read_only_subagent: &ReadOnlySubagentResolver,
 ) -> bool {
-    let Some(subagent_type) = args.get("subagent_type").and_then(|v| v.as_str()) else {
+    let Some(to) = args.get("to") else {
         return false;
     };
+    let Some(spawn) = to.get("spawn").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if args.get("reason").and_then(|v| v.as_str()) != Some("Dispatch") {
+        return false;
+    }
     if args.get("isolation").and_then(|v| v.as_str()) == Some("worktree") {
         return false;
     }
-    is_read_only_subagent(subagent_type)
+    is_read_only_subagent(spawn)
 }
 
 /// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
@@ -305,14 +311,14 @@ pub fn gate_handler(
         let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
             || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
                 && is_plan_mode_writable_param(tool_name, &ctx.data["args"], &plans_dir, &cwd))
-            || (tool_name == crate::tools::AGENT
+            || (tool_name == "Steer"
                 && is_read_only_subagent_dispatch(&ctx.data["args"], &is_read_only_subagent));
         if !allowed {
             ctx.block_reason = Some(format!(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} and temp scratch (/tmp, /private/tmp) may be \
                  written (Write/Edit); research with Read/Grep/Glob/Ls or a read-only \
-                 `Explore` subagent (no worktree isolation), ask with AskUserQuestion, \
+                 read-only subagent via Steer (no worktree isolation), ask with AskUserQuestion, \
                  and submit the plan with {PROPOSE_PLAN}.",
                 plans_dir.display()
             ));
@@ -903,7 +909,7 @@ mod tests {
         assert!(
             run(
                 "Agent",
-                serde_json::json!({"subagent_type": "Explore", "prompt": "x"})
+                serde_json::json!({"to": {"agent_address": "e1", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x"})
             )
             .block_reason
             .is_none()
@@ -911,7 +917,7 @@ mod tests {
         assert!(
             run(
                 "Agent",
-                serde_json::json!({"subagent_type": "Sailor", "prompt": "x"})
+                serde_json::json!({"to": {"agent_address": "s1", "spawn": "Sailor"}, "reason": "Dispatch", "prompt": "x"})
             )
             .block_reason
             .is_some()
@@ -919,7 +925,7 @@ mod tests {
         assert!(
             run(
                 "Agent",
-                serde_json::json!({"subagent_type": "Explore", "prompt": "x", "isolation": "worktree"})
+                serde_json::json!({"to": {"agent_address": "e2", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x", "isolation": "worktree"})
             )
             .block_reason
             .is_some()
