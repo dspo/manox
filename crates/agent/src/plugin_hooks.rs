@@ -292,9 +292,24 @@ fn registry() -> Option<&'static HookRegistry> {
 /// user's project, not the plugin install dir. No-op when no hooks are
 /// registered.
 pub fn fire(event: HookEvent, project_cwd: Option<&str>, payload: Value) {
+    #[cfg(test)]
+    TEST_FIRED
+        .lock()
+        .unwrap()
+        .push((event, payload.to_string()));
     if let Some(reg) = registry() {
         reg.fire(event, project_cwd, payload);
     }
+}
+
+/// Test seam: recorded `(event, payload)` pairs — the real registry is empty
+/// in unit tests, so lifecycle tests count `SessionEnd` fires through this.
+#[cfg(test)]
+static TEST_FIRED: std::sync::Mutex<Vec<(HookEvent, String)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub fn drain_fired_for_test() -> Vec<(HookEvent, String)> {
+    TEST_FIRED.lock().unwrap().drain(..).collect()
 }
 
 /// `ToolCall` hook handler: fires `PreToolUse` across plugin hooks with the

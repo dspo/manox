@@ -258,6 +258,12 @@ pub enum TeamOp {
         content: String,
     },
     Disband,
+    /// Dismiss one worker member: cancel, archive, release its tasks.
+    Dismiss {
+        name: String,
+    },
+    /// Read-only roster status report (running/idle, stop reasons, reported).
+    Status,
     TaskCreate {
         subject: String,
         description: Option<String>,

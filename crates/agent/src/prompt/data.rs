@@ -67,6 +67,14 @@ pub struct MainSystemPromptData {
     pub runtime: RuntimeIdentityPromptData,
 }
 
+/// Team lifecycle playbook payload. `is_leader` gates the leader section
+/// (stop-notification reactions, dismiss/nudge/replace, cleanup etiquette);
+/// members get the obligations section (final report before stopping).
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamPromptData {
+    pub is_leader: bool,
+}
+
 /// Final system-message assembly at the `build_completion_request` boundary.
 ///
 /// `base` is the pre-rendered base prompt: for the main thread, the rendered

@@ -1659,6 +1659,10 @@ impl Workspace {
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let is_current = this.thread.read(cx).id.0 == *id;
                     let store = agent::thread_store_global();
+                    // Team teardown is the store's centralized invariant
+                    // (leader-gated); an explicit disband here would destroy
+                    // a whole team when a member row is archived and strand
+                    // the leader with a dangling team ref.
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.

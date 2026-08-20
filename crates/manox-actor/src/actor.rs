@@ -213,6 +213,10 @@ fn archive_and_dispose_session(
     {
         cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
     }
+    // The store's centralized archive-teardown (archive_thread) cancels and
+    // archives any live team led by the archived session; no explicit
+    // disband here (an explicit one would bypass the is_leader gate and
+    // blow up a whole team when a mere member row is archived).
     cx.update(|app| {
         let store = agent::thread_store::global();
         store.update(app, |s, cx| {

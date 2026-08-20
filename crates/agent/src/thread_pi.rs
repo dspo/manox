@@ -939,6 +939,13 @@ impl Thread {
     pub(crate) fn set_label_for_test(&mut self, label: String) {
         self.label = label;
     }
+
+    /// Override the thread id for tests that exercise `parent_id` cascades
+    /// (the default `test-thread` id would self-collide across threads).
+    #[cfg(test)]
+    pub(crate) fn set_id_for_test(&mut self, id: String) {
+        self.id = ThreadId(id);
+    }
     // ── Thread duck-type: read accessors ───────────────────────────────────
 
     pub fn messages(&self) -> &[Message] {
@@ -1208,9 +1215,15 @@ impl Thread {
     }
 
     /// Attach this thread to a team (leader at `TeamCreate`, member at
-    /// spawn).
-    pub fn set_team(&mut self, team: Entity<Team>, _cx: &mut Context<Self>) {
+    /// spawn). Registers the thread as live so the store's centralized
+    /// archive-teardown can reach a leader's team from its id alone.
+    pub fn set_team(&mut self, team: Entity<Team>, cx: &mut Context<Self>) {
         self.team = Some(team);
+        if let Some(store) = crate::thread_store::try_global() {
+            let id = self.id.0.clone();
+            let weak = cx.weak_entity();
+            store.update(cx, |s, _| s.register_live_thread(&id, weak));
+        }
     }
 
     /// Detach from the team (disband path).

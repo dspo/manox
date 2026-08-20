@@ -149,6 +149,23 @@ impl TaskList {
         Ok(())
     }
 
+    /// Return a departed member's in-flight tasks to the unassigned pool
+    /// (`pending`, no owner) so a replacement can claim them.
+    pub fn release_owner(&mut self, owner: &str, cx: &mut Context<Self>) {
+        let mut released = Vec::new();
+        for task in &mut self.tasks {
+            if task.owner.as_deref() == Some(owner) && task.status == TaskStatus::InProgress {
+                task.status = TaskStatus::Pending;
+                task.owner = None;
+                released.push(task.id.clone());
+            }
+        }
+        for id in released {
+            cx.emit(TaskListEvent::Updated(id));
+        }
+        cx.notify();
+    }
+
     /// Delete a task by id. Emits `Deleted`. Returns `Err` if the id is unknown.
     pub fn delete(&mut self, id: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let before = self.tasks.len();
@@ -325,5 +342,61 @@ mod tests {
         assert!(matches!(got[0], TaskListEvent::Created(ref s) if s == &id));
         assert!(matches!(got[1], TaskListEvent::Updated(ref s) if s == &id));
         assert!(matches!(got[2], TaskListEvent::Deleted(ref s) if s == &id));
+    }
+
+    /// `release_owner` returns a departed member's in-flight tasks to the
+    /// unassigned pool; completed tasks and other owners stay untouched.
+    #[test]
+    fn release_owner_returns_in_progress_tasks_to_pool() {
+        let cx = TestAppContext::single();
+        let list = cx.update(make);
+        cx.update(|cx| {
+            list.update(cx, |l, cx| {
+                l.create("gone-mid-work".into(), None, cx);
+                l.create("gone-done".into(), None, cx);
+                l.create("other-mid-work".into(), None, cx);
+            })
+        });
+        cx.update(|cx| {
+            list.update(cx, |l, cx| {
+                l.update(
+                    "T1",
+                    Some(TaskStatus::InProgress),
+                    Some(Some("gone".into())),
+                    None,
+                    cx,
+                )
+                .unwrap();
+                l.update(
+                    "T2",
+                    Some(TaskStatus::Completed),
+                    Some(Some("gone".into())),
+                    None,
+                    cx,
+                )
+                .unwrap();
+                l.update(
+                    "T3",
+                    Some(TaskStatus::InProgress),
+                    Some(Some("other".into())),
+                    None,
+                    cx,
+                )
+                .unwrap();
+            })
+        });
+        cx.update(|cx| list.update(cx, |l, cx| l.release_owner("gone", cx)));
+        cx.update(|cx| {
+            list.read_with(cx, |l, _| {
+                assert_eq!(l.get("T1").unwrap().status, TaskStatus::Pending);
+                assert_eq!(l.get("T1").unwrap().owner, None);
+                // Completed work is history, not a claimable task.
+                assert_eq!(l.get("T2").unwrap().status, TaskStatus::Completed);
+                assert_eq!(l.get("T2").unwrap().owner.as_deref(), Some("gone"));
+                // Other members keep their work.
+                assert_eq!(l.get("T3").unwrap().status, TaskStatus::InProgress);
+                assert_eq!(l.get("T3").unwrap().owner.as_deref(), Some("other"));
+            })
+        });
     }
 }
