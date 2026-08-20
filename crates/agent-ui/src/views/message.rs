@@ -884,6 +884,16 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
+/// Display name of the agent that authored a user-role message: the main
+/// agent uses the localized Captain label (shared with the context rail),
+/// named agents keep their manifest / member name verbatim.
+pub fn author_display(author: &agent::MessageAuthor) -> String {
+    match author {
+        agent::MessageAuthor::Lead => i18n::t("context-agents-captain").to_string(),
+        agent::MessageAuthor::Agent(name) => name.clone(),
+    }
+}
+
 /// Render a user message as one full-width turn frame. The frame itself owns
 /// the accent border; the bottom edge keeps only the two corners so the center
 /// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
@@ -913,7 +923,11 @@ fn render_user(
         .map(|m| m.model_id.as_str())
         .filter(|m| !m.is_empty())
         .unwrap_or(model);
-    let mut header_parts = vec![i18n::t("message-user-role").to_string()];
+    let sender = meta
+        .and_then(|m| m.author.as_ref())
+        .map(author_display)
+        .unwrap_or_else(|| i18n::t("message-user-role").to_string());
+    let mut header_parts = vec![sender];
     if let Some(meta) = meta {
         header_parts.push(format_user_turn_time(meta.timestamp));
     }
@@ -3248,12 +3262,24 @@ impl ItemBuilder {
                         })
                         .collect();
                     if !external_event && (!text.is_empty() || !images.is_empty()) {
-                        items.push(ConvItem::User {
-                            text,
-                            images,
-                            meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
-                            display_state: crate::conversation::UserMessageDisplayState::Normal,
-                        });
+                        let meta = crate::conversation::UserTurnMeta::from_message(m);
+                        if meta.peer {
+                            // Peer deliveries render as team bubbles live;
+                            // rebuild the same item on reload so historical
+                            // views keep the sender, not a "You" bubble.
+                            let from = meta.author.as_ref().map(author_display).unwrap_or_default();
+                            items.push(ConvItem::TeamMessage {
+                                from,
+                                content: text,
+                            });
+                        } else {
+                            items.push(ConvItem::User {
+                                text,
+                                images,
+                                meta: Some(meta),
+                                display_state: crate::conversation::UserMessageDisplayState::Normal,
+                            });
+                        }
                     }
                     for c in &m.content {
                         match c {
@@ -4615,6 +4641,43 @@ mod tests {
                 .count(),
             1,
             "machine-generated events must not be attributed to the user"
+        );
+    }
+
+    #[test]
+    fn build_items_rebuilds_peer_messages_as_team_bubbles() {
+        let mut peer = Message::user("[from alice]: report".into());
+        peer.ui = Some(agent::MessageUiMetadata {
+            author: Some(agent::MessageAuthor::Agent("alice".into())),
+            peer: true,
+            display_text: Some("report".into()),
+            ..Default::default()
+        });
+        let items = build_items(&[peer], &HashMap::new(), false);
+        assert!(
+            matches!(
+                items.first(),
+                Some(ConvItem::TeamMessage { from, content }) if from == "alice" && content == "report"
+            ),
+            "a reloaded peer delivery keeps its sender, got: {:?}",
+            items.first()
+        );
+    }
+
+    #[test]
+    fn build_items_keeps_author_on_user_bubble() {
+        let mut seed = Message::user("implement the approved plan".into());
+        seed.ui = Some(agent::MessageUiMetadata {
+            author: Some(agent::MessageAuthor::Lead),
+            ..Default::default()
+        });
+        let items = build_items(&[seed], &HashMap::new(), false);
+        let Some(ConvItem::User { meta, .. }) = items.first() else {
+            panic!("agent-authored seed stays a user bubble");
+        };
+        assert_eq!(
+            meta.as_ref().unwrap().author,
+            Some(agent::MessageAuthor::Lead)
         );
     }
 

@@ -796,9 +796,11 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
+        let ordinal = self.user_prompt_ordinal();
         let mut message = Message::user(text.clone());
         message.ui = ui.clone();
         self.messages.push(message);
+        self.persist_user_attribution(ordinal, &ui);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
         cx.notify();
@@ -813,6 +815,7 @@ impl Thread {
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
         // parity).
+        let ordinal = self.user_prompt_ordinal();
         let mut images = Vec::new();
         let text: String = content
             .iter()
@@ -832,6 +835,7 @@ impl Thread {
         let mut message = Message::user_with_content(content);
         message.ui = ui.clone();
         self.messages.push(message);
+        self.persist_user_attribution(ordinal, &ui);
         if !text.trim().is_empty() {
             self.pending_prompts.push(text);
         }
@@ -1209,6 +1213,13 @@ impl Thread {
         &self.label
     }
 
+    /// The routing identity of the agent this thread runs (`Lead` for the
+    /// main thread, the member name for team workers) as an attribution
+    /// value for harness-seeded user turns.
+    pub fn self_author(&self) -> crate::message::MessageAuthor {
+        crate::team::author_for(&self.label)
+    }
+
     /// The team this thread belongs to (leader owns; member holds).
     pub fn team(&self) -> Option<&Entity<Team>> {
         self.team.as_ref()
@@ -1252,7 +1263,13 @@ impl Thread {
                 },
             )
             .unwrap_or_else(|_| format!("[from {}] {}", msg.from, msg.content));
-            self.insert_user_message_with_ui_metadata(rendered, None, cx);
+            let ui = MessageUiMetadata {
+                author: Some(crate::team::author_for(&msg.from)),
+                peer: true,
+                display_text: Some(msg.content.clone()),
+                ..Default::default()
+            };
+            self.insert_user_message_with_ui_metadata(rendered, Some(ui), cx);
             cx.emit(ThreadEvent::PeerMessage {
                 from: msg.from.clone(),
                 content: msg.content.clone(),
@@ -1434,9 +1451,14 @@ impl Thread {
         compact: bool,
         compact_instructions: Option<String>,
         seed_text: String,
+        ui: Option<MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
         self.plan_mode = false;
+        // The engine injects the seed into its own transcript; record the
+        // attribution now so the mirrored history keeps it after refresh.
+        self.persist_user_attribution(self.user_prompt_ordinal(), &ui);
+        self.last_user_ui = ui;
         if let Some(engine) = &self.engine {
             engine.approve_plan(compact, compact_instructions, seed_text);
         }
@@ -1879,6 +1901,32 @@ impl Thread {
         persist_registry_display_spawn(sessions_dir, session_path, ordinal, display);
     }
 
+    /// Persist the attribution of an injected user turn in the session
+    /// sidecar so a reload restores the send-time header. Same ordinal
+    /// convention as `persist_registry_display`; a compaction clears both.
+    fn persist_user_attribution(&self, ordinal: usize, ui: &Option<MessageUiMetadata>) {
+        let Some(ui) = ui else {
+            return;
+        };
+        let Some(author) = &ui.author else {
+            return;
+        };
+        let Some(sessions_dir) = crate::paths::manox_config_dir()
+            .ok()
+            .map(|dir| dir.join("pi-sessions"))
+        else {
+            return;
+        };
+        let Some(session_path) = self.active_session_path() else {
+            return;
+        };
+        let record = pi_extensions::session_meta::UserAttributionMeta {
+            author: author.routing().to_string(),
+            peer: ui.peer,
+        };
+        persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
+    }
+
     /// Whether the pi backend restored an existing session at startup.
     pub fn restored(&self) -> bool {
         self.restored
@@ -1927,6 +1975,24 @@ fn persist_registry_display_spawn(
             .await
         {
             tracing::warn!(error = %err, "failed to persist registry display text");
+        }
+    })
+}
+
+fn persist_user_attribution_spawn(
+    sessions_dir: PathBuf,
+    session_path: PathBuf,
+    ordinal: usize,
+    record: pi_extensions::session_meta::UserAttributionMeta,
+) -> tokio::task::JoinHandle<()> {
+    crate::runtime::handle().spawn(async move {
+        if let Err(err) =
+            pi_extensions::session_meta::update(&sessions_dir, &session_path, |meta| {
+                meta.user_attributions.insert(ordinal, record);
+            })
+            .await
+        {
+            tracing::warn!(error = %err, "failed to persist user message attribution");
         }
     })
 }

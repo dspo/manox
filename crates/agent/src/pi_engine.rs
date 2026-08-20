@@ -1655,7 +1655,7 @@ fn subscribe_harness_events(
             // forms no longer align; drop them so a reload never mislabels a
             // prompt. Fire-and-forget: the manual `/compact` path awaits the
             // same clear before mirroring.
-            clear_registry_displays_spawn(sessions_dir.clone(), session_path.clone());
+            clear_user_chrome_spawn(sessions_dir.clone(), session_path.clone());
             let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
                 summary: result.summary,
                 messages_compacted: 0,
@@ -2623,7 +2623,7 @@ async fn run_actor(
                         // Await the display-form clear: the mirror below would
                         // otherwise attach the pre-compaction ordinals to the
                         // wrong prompts.
-                        clear_registry_displays(&sessions_dir, session.path()).await;
+                        clear_user_chrome(&sessions_dir, session.path()).await;
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
                         refresh_session_list(&repo, &state).await;
@@ -3607,14 +3607,19 @@ async fn resync_approval_mode(
 }
 
 /// Mirror the session's authoritative transcript into engine state, then
-/// re-attach the registry slash turns' compact display forms from the
-/// sidecar (the transcript stores only the expanded macro/skill body, so
-/// the attach is what keeps a reloaded thread's bubbles compact).
+/// re-attach the sidecar's per-ordinal user-turn chrome (registry slash
+/// display forms + agent attributions): the transcript stores only wire
+/// content, so the attach is what keeps a reloaded thread's bubbles
+/// send-time accurate.
 async fn sync_history(session: &AgentSession, sessions_dir: &Path, state: &Arc<EngineState>) {
     let mut mapped = adapt::harness_messages_to_messages(session.harness_messages());
     attach_registry_displays(
         &mut mapped,
         &load_registry_displays(sessions_dir, session.path()).await,
+    );
+    attach_user_attributions(
+        &mut mapped,
+        &load_user_attributions(sessions_dir, session.path()).await,
     );
     *state.history.lock().unwrap() = mapped;
 }
@@ -3632,34 +3637,49 @@ async fn load_registry_displays(
         .unwrap_or_default()
 }
 
-/// Drop the persisted registry display forms. A compaction rebuilds the
-/// transcript as a summary user message plus the retained tail, which shifts
-/// every persisted display ordinal; the stale forms would otherwise attach to
-/// the wrong user prompt on the next `sync_history`. New registry turns after
-/// the compaction persist fresh ordinals over the rebuilt sequence.
-async fn clear_registry_displays(sessions_dir: &Path, session_path: &Path) {
-    // Probe first: clearing an empty map would only churn the sidecar.
+/// The agent attributions persisted per user-message ordinal by
+/// `Thread::persist_user_attribution`. Missing sidecar or field reads as
+/// empty (human-only transcript).
+async fn load_user_attributions(
+    sessions_dir: &Path,
+    session_path: &Path,
+) -> std::collections::HashMap<usize, pi_extensions::session_meta::UserAttributionMeta> {
+    pi_extensions::session_meta::load(sessions_dir, session_path)
+        .await
+        .map(|meta| meta.user_attributions)
+        .unwrap_or_default()
+}
+
+/// Drop the per-ordinal user-turn chrome (registry display forms + agent
+/// attributions). A compaction rebuilds the transcript as a summary user
+/// message plus the retained tail, which shifts every persisted ordinal;
+/// the stale records would otherwise attach to the wrong user prompt on
+/// the next `sync_history`. New turns after the compaction persist fresh
+/// ordinals over the rebuilt sequence.
+async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
+    // Probe first: clearing empty maps would only churn the sidecar.
     let meta = pi_extensions::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
-    if meta.registry_displays.is_empty() {
+    if meta.registry_displays.is_empty() && meta.user_attributions.is_empty() {
         return;
     }
     if let Err(err) = pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
         meta.registry_displays.clear();
+        meta.user_attributions.clear();
     })
     .await
     {
-        tracing::warn!(error = %err, "failed to clear registry display text");
+        tracing::warn!(error = %err, "failed to clear user turn chrome");
     }
 }
 
-/// `clear_registry_displays` from a harness event listener, which is
-/// synchronous — the clear runs on the runtime and its outcome is only a
-/// display form, so a lost write just narrows the reload window.
-fn clear_registry_displays_spawn(sessions_dir: PathBuf, session_path: PathBuf) {
+/// `clear_user_chrome` from a harness event listener, which is
+/// synchronous — the clear runs on the runtime and its outcome is only
+/// display chrome, so a lost write just narrows the reload window.
+fn clear_user_chrome_spawn(sessions_dir: PathBuf, session_path: PathBuf) {
     tokio::spawn(async move {
-        clear_registry_displays(&sessions_dir, &session_path).await;
+        clear_user_chrome(&sessions_dir, &session_path).await;
     });
 }
 
@@ -3681,6 +3701,35 @@ fn attach_registry_displays(
         {
             if let Some(text) = displays.get(&ordinal) {
                 message.ui.get_or_insert_with(Default::default).display_text = Some(text.clone());
+            }
+            ordinal += 1;
+        }
+    }
+}
+
+/// Re-attach `author`/`peer` to the user prompt message at each persisted
+/// ordinal. The ordinal counts `Role::User` messages with a `User`
+/// provenance — the same set `Thread` counts when persisting — so steers
+/// (user prompts too) and tool results (excluded) align between the two.
+fn attach_user_attributions(
+    history: &mut [Message],
+    attributions: &std::collections::HashMap<
+        usize,
+        pi_extensions::session_meta::UserAttributionMeta,
+    >,
+) {
+    if attributions.is_empty() {
+        return;
+    }
+    let mut ordinal = 0usize;
+    for message in history {
+        if message.role == crate::language_model::Role::User
+            && message.provenance == crate::message::MessageProvenance::User
+        {
+            if let Some(record) = attributions.get(&ordinal) {
+                let ui = message.ui.get_or_insert_with(Default::default);
+                ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
+                ui.peer = record.peer;
             }
             ordinal += 1;
         }
@@ -4099,34 +4148,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_registry_displays_drops_sidecar_ordinals() {
+    async fn attach_user_attributions_restores_sidecar_authorship() {
         let dir = tempfile::tempdir().unwrap();
-        let session = dir.path().join("sess-display-clear.jsonl");
+        let session = dir.path().join("sess-author.jsonl");
         let meta = pi_extensions::session_meta::SessionMeta {
-            registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
-                .into_iter()
-                .collect(),
+            user_attributions: [
+                (
+                    0usize,
+                    pi_extensions::session_meta::UserAttributionMeta {
+                        author: "lead".into(),
+                        peer: false,
+                    },
+                ),
+                (
+                    2usize,
+                    pi_extensions::session_meta::UserAttributionMeta {
+                        author: "Sailor".into(),
+                        peer: true,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         pi_extensions::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
-        clear_registry_displays(dir.path(), &session).await;
+        let attributions = load_user_attributions(dir.path(), &session).await;
+        // Same ordinal convention as the display forms: tool results and
+        // assistant turns never consume one.
+        let mut history = vec![
+            Message::user("plan seed".to_string()), // ordinal 0
+            Message::assistant(vec![MessageContent::Text("ok".into())]),
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                crate::language_model::LanguageModelToolResult {
+                    tool_use_id: "tu_1".into(),
+                    tool_name: "Read".into(),
+                    is_error: false,
+                    content: "ok".into(),
+                },
+            )]),
+            Message::user("peer body".to_string()), // ordinal 1...
+        ];
+        attach_user_attributions(&mut history, &attributions);
+
+        let seed = history[0].ui.as_ref().expect("seed carries attribution");
+        assert_eq!(seed.author, Some(crate::message::MessageAuthor::Lead));
+        assert!(!seed.peer);
+        assert!(history[1].ui.is_none(), "assistant turns stay unattributed");
+        // Ordinal 2 skips the three-prompt history: only ordinals 0/1 exist.
+        assert!(
+            history[3].ui.is_none(),
+            "an ordinal beyond the transcript attaches nowhere"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_user_chrome_drops_sidecar_ordinals() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("sess-display-clear.jsonl");
+        let meta = pi_extensions::session_meta::SessionMeta {
+            registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
+                .into_iter()
+                .collect(),
+            user_attributions: [(
+                0usize,
+                pi_extensions::session_meta::UserAttributionMeta {
+                    author: "lead".into(),
+                    peer: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+            .await
+            .unwrap();
+
+        clear_user_chrome(dir.path(), &session).await;
 
         let displays = load_registry_displays(dir.path(), &session).await;
         assert!(
             displays.is_empty(),
             "a compaction clears the stale display ordinals"
         );
+        let attributions = load_user_attributions(dir.path(), &session).await;
+        assert!(
+            attributions.is_empty(),
+            "a compaction clears the stale attributions"
+        );
     }
 
     #[tokio::test]
-    async fn clear_registry_displays_is_noop_when_empty() {
+    async fn clear_user_chrome_is_noop_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-display-empty.jsonl");
 
-        clear_registry_displays(dir.path(), &session).await;
+        clear_user_chrome(dir.path(), &session).await;
 
         let displays = load_registry_displays(dir.path(), &session).await;
         assert!(displays.is_empty());

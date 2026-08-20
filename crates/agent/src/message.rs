@@ -17,6 +17,41 @@ pub enum MessageProvenance {
     Tool,
 }
 
+/// Originating agent of a user-role message the human did not type
+/// (harness-seeded turns, team peer deliveries, member opening tasks).
+///
+/// The value is the agent's routing identity; the UI resolves it to a
+/// display name at render time. New agents (built-in, user-authored,
+/// plugin) flow through `Agent` verbatim — no per-agent code paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAuthor {
+    /// The session's main agent (Captain).
+    Lead,
+    /// A named agent: team member name or agent-manifest name.
+    Agent(String),
+}
+
+impl MessageAuthor {
+    /// Routing identity: `"lead"` for the main agent, the manifest /
+    /// member name otherwise. The session sidecar persists this string.
+    pub fn routing(&self) -> &str {
+        match self {
+            MessageAuthor::Lead => crate::team::LEADER_NAME,
+            MessageAuthor::Agent(name) => name,
+        }
+    }
+
+    /// Inverse of [`MessageAuthor::routing`].
+    pub fn from_routing(name: &str) -> Self {
+        if name == crate::team::LEADER_NAME {
+            MessageAuthor::Lead
+        } else {
+            MessageAuthor::Agent(name.to_string())
+        }
+    }
+}
+
 /// UI-only metadata captured when a user message is submitted.
 ///
 /// The model request path ignores this data; it is persisted with the message
@@ -41,6 +76,14 @@ pub struct MessageUiMetadata {
     /// human user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_event: Option<bool>,
+    /// The agent that authored this user-role message; absent = human
+    /// input. The model request path never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<MessageAuthor>,
+    /// This user message entered the session via team peer delivery
+    /// (`SendMessage`); the reload path rebuilds it as a team bubble.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub peer: bool,
     /// UI-only display form of this user message — e.g. the compact
     /// `/name args` invocation for a registry slash turn whose model-facing
     /// text is the expanded macro/skill body. When set, the conversation
@@ -48,6 +91,10 @@ pub struct MessageUiMetadata {
     /// reload alike. The model request path never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A single conversation message.
@@ -163,5 +210,43 @@ mod tests {
         assert!(value.get("display_text").is_none());
         let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
         assert_eq!(back.display_text, None);
+    }
+
+    #[test]
+    fn ui_metadata_author_round_trips_and_skips_when_absent() {
+        let lead = MessageUiMetadata {
+            author: Some(MessageAuthor::Lead),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&lead).unwrap();
+        assert_eq!(value["author"], "lead");
+
+        let named = MessageUiMetadata {
+            author: Some(MessageAuthor::Agent("Sailor".into())),
+            peer: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(value["author"], serde_json::json!({ "agent": "Sailor" }));
+        assert_eq!(value["peer"], true);
+        let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(back.author, Some(MessageAuthor::Agent("Sailor".into())));
+        assert!(back.peer);
+
+        // Human turns carry no attribution in the persisted form.
+        let plain = MessageUiMetadata::default();
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("author").is_none() && value.get("peer").is_none());
+    }
+
+    #[test]
+    fn author_routing_round_trips_through_lead_sentinel() {
+        assert_eq!(MessageAuthor::Lead.routing(), "lead");
+        assert_eq!(MessageAuthor::Agent("Sailor".into()).routing(), "Sailor");
+        assert_eq!(MessageAuthor::from_routing("lead"), MessageAuthor::Lead);
+        assert_eq!(
+            MessageAuthor::from_routing("Sailor"),
+            MessageAuthor::Agent("Sailor".into())
+        );
     }
 }
