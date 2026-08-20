@@ -81,6 +81,8 @@ export const ModelPicker = ({
               <span className={cn('max-w-40 truncate', apiTint(current.api))}>
                 {current.name}
               </span>
+              <span className="text-muted-foreground shrink-0">·</span>
+              <span className="shrink-0">{reasoningEffort}</span>
             </>
           ) : (
             <span>{t('no_model_configured')}</span>

@@ -6,7 +6,7 @@
 //! are skipped by the caller.
 //!
 //! Variants intentionally not projected (silently dropped; surface them here
-//! when the host grows the matching UI): `ApprovalDecision`, `Retry`,
+//! when the host grows the matching UI): `Retry`,
 //! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
 //! `MainCallMetricsUpdated`, `CompactionStarted`, `PeerMessage`,
 //! `BrowserNotification`, `InboundAuthorization`, `HistoryRestored`.
@@ -17,7 +17,7 @@
 //! `SubagentChild` are projected here (the mini-panel and task cards consume
 //! them).
 
-use agent::{ThreadEvent, ToolCallStatus};
+use agent::{ThreadEvent, ToolCallStatus, approval::ReviewVerdict};
 use serde_json::{Value, json};
 
 fn status_str(status: &ToolCallStatus) -> Value {
@@ -90,6 +90,29 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
         }
         ThreadEvent::ApprovalModeChanged { mode } => {
             json!({"type": "approval_mode_changed", "mode": mode})
+        }
+        ThreadEvent::ApprovalDecision {
+            tool_call_id,
+            tool_name,
+            tool_title,
+            verdict,
+        } => {
+            let mut v = json!({
+                "type": "approval_decision",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_title": tool_title,
+                "verdict": match verdict {
+                    ReviewVerdict::Allow => "allow",
+                    ReviewVerdict::Ask { .. } => "ask",
+                },
+            });
+            // `reason` rides only on escalations; omit the key on Allow so
+            // the wire matches the TS `reason?: string` exactly.
+            if let ReviewVerdict::Ask { reason } = verdict {
+                v["reason"] = json!(reason);
+            }
+            v
         }
         ThreadEvent::Error(e) => json!({"type": "error", "message": e.to_string()}),
         ThreadEvent::TokenUsageUpdated(u) => json!({
@@ -219,6 +242,45 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "reasoning_effort_changed");
         assert_eq!(v["effort"], "max");
+        assert_eq!(v["sessionId"], "s1");
+    }
+
+    #[test]
+    fn projects_approval_decision_verdicts() {
+        let allow = thread_event_to_json(
+            &ThreadEvent::ApprovalDecision {
+                tool_call_id: "tu_1".into(),
+                tool_name: "Bash".into(),
+                tool_title: "ls".into(),
+                verdict: ReviewVerdict::Allow,
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&allow).unwrap();
+        assert_eq!(v["type"], "approval_decision");
+        assert_eq!(v["tool_call_id"], "tu_1");
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["tool_title"], "ls");
+        assert_eq!(v["verdict"], "allow");
+        assert!(v.get("reason").is_none(), "Allow omits the reason key");
+        assert_eq!(v["sessionId"], "s1");
+
+        let ask = thread_event_to_json(
+            &ThreadEvent::ApprovalDecision {
+                tool_call_id: "tu_2".into(),
+                tool_name: "Bash".into(),
+                tool_title: "rm -rf".into(),
+                verdict: ReviewVerdict::Ask {
+                    reason: "destructive".into(),
+                },
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&ask).unwrap();
+        assert_eq!(v["verdict"], "ask");
+        assert_eq!(v["reason"], "destructive");
         assert_eq!(v["sessionId"], "s1");
     }
     #[test]

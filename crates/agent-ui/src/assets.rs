@@ -111,6 +111,7 @@ mod tests {
         // ExtrasAssetSource so call sites can use Icon::default().path(…).
         for path in [
             "icons/circle-check-big.svg",
+            "icons/check-check.svg",
             "icons/download.svg",
             "icons/ship-wheel.svg",
             "icons/corner-right-up.svg",
