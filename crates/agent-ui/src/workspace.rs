@@ -594,6 +594,18 @@ enum RecallStep {
     Clear,
 }
 
+/// The cascade selection backing [`Workspace::spawn_external_session`]; one
+/// struct keeps the spawn entry point under clippy's argument cap.
+pub(crate) struct ExternalSpawn {
+    kind: SessionKind,
+    provider_name: String,
+    model_id: String,
+    /// Cx wire key pinning the endpoint variant (`anthropic` /
+    /// `responses` / `completions`); `None` = default derivation.
+    wire_api: Option<String>,
+    project_cwd: Option<PathBuf>,
+}
+
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1596,12 +1608,15 @@ impl Workspace {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
-                SidebarEvent::SpawnExternalSession(kind, provider, model, project) => {
+                SidebarEvent::SpawnExternalSession(kind, provider, model, wire, project) => {
                     this.spawn_external_session(
-                        *kind,
-                        provider.clone(),
-                        model.clone(),
-                        project.clone(),
+                        ExternalSpawn {
+                            kind: *kind,
+                            provider_name: provider.clone(),
+                            model_id: model.clone(),
+                            wire_api: wire.clone(),
+                            project_cwd: project.clone(),
+                        },
                         window,
                         cx,
                     );
@@ -1782,15 +1797,19 @@ impl Workspace {
     /// `project_cwd` is `Some(path)` when launched from a project folder's `+`
     /// button — the CLI runs in that project's directory. `None` uses the
     /// workspace's default cwd.
-    pub fn spawn_external_session(
+    pub(crate) fn spawn_external_session(
         &mut self,
-        kind: SessionKind,
-        provider_name: String,
-        model_id: String,
-        project_cwd: Option<PathBuf>,
+        spawn: ExternalSpawn,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ExternalSpawn {
+            kind,
+            provider_name,
+            model_id,
+            wire_api,
+            project_cwd,
+        } = spawn;
         let agent_id = kind.agent_id();
         let Some(agent) = kind.agent() else {
             tracing::warn!(
@@ -1817,15 +1836,17 @@ impl Workspace {
             spawn_args.push("--session-id".into());
             spawn_args.push(sid.clone());
         }
-        let handle = match cx::AgentBuilder::new()
+        let mut builder = cx::AgentBuilder::new()
             .agent(agent)
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
             .cwd(cwd.clone())
-            .passthrough(spawn_args)
-            .spawn()
-        {
+            .passthrough(spawn_args);
+        if let Some(w) = &wire_api {
+            builder = builder.wire_api(w.clone());
+        }
+        let handle = match builder.spawn() {
             Ok(h) => Arc::new(h),
             Err(e) => {
                 tracing::error!(error = %e, agent = agent_id, "external agent spawn failed");
@@ -1885,6 +1906,7 @@ impl Workspace {
             created_at,
             provider: provider_name,
             model: model_id,
+            wire_api: wire_api.clone(),
             title: None,
             cli_session_id: spawn_cli_session_id,
         };
@@ -2154,6 +2176,7 @@ impl Workspace {
         let args = resume_args(&sidecar.agent_id, sidecar.cli_session_id.as_deref());
         let provider = sidecar.provider.clone();
         let model = sidecar.model.clone();
+        let wire = sidecar.wire_api.clone();
         let cwd = PathBuf::from(&sidecar.cwd);
         let project = sidecar.project.clone();
         let created_at = sidecar.created_at;
@@ -2161,14 +2184,17 @@ impl Workspace {
         cx.spawn_in(window, async move |_window, cx| {
             let handle = match cx
                 .background_spawn(async move {
-                    cx::AgentBuilder::new()
+                    let mut builder = cx::AgentBuilder::new()
                         .agent(agent)
                         .pty(true)
                         .provider(provider)
                         .model(model)
                         .cwd(cwd)
-                        .passthrough(args)
-                        .spawn()
+                        .passthrough(args);
+                    if let Some(w) = wire {
+                        builder = builder.wire_api(w);
+                    }
+                    builder.spawn()
                 })
                 .await
             {
@@ -4807,7 +4833,7 @@ impl Workspace {
     }
 
     /// Wire api string → Tag variant + label for the pi model menu.
-    fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
+    pub(crate) fn pi_wire_tag_variant(api: &str) -> (TagVariant, &'static str) {
         match api {
             "anthropic" => (TagVariant::Color(ColorName::Blue), "Anthropic"),
             "openai_responses" => (TagVariant::Color(ColorName::Cyan), "Responses"),

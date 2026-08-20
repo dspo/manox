@@ -225,6 +225,17 @@ fn wire_api_to_api(wire_api: &str) -> Option<Api> {
     }
 }
 
+/// Inverse of [`wire_api_to_api`] for kernel model api strings (`Model.api`):
+/// the cx wire key the wire protocol registers under. `None` for non-cx apis.
+pub fn model_api_to_wire_key(api: &str) -> Option<&'static str> {
+    match api {
+        "anthropic" => Some("anthropic"),
+        "openai_responses" => Some("responses"),
+        "openai_completions" => Some("completions"),
+        _ => None,
+    }
+}
+
 /// cx `wire_apis` semantics: empty/absent means compatible with every
 /// endpoint wire api.
 fn model_supports_wire_api(wire_apis: Option<&[String]>, endpoint_wire_api: &str) -> bool {
@@ -955,5 +966,16 @@ agents:
             model.metadata.get("provider_display_name").unwrap(),
             "DeepSeek"
         );
+    }
+
+    #[test]
+    fn model_api_to_wire_key_inverts_wire_api_to_api() {
+        assert_eq!(model_api_to_wire_key("anthropic"), Some("anthropic"));
+        assert_eq!(model_api_to_wire_key("openai_responses"), Some("responses"));
+        assert_eq!(
+            model_api_to_wire_key("openai_completions"),
+            Some("completions")
+        );
+        assert_eq!(model_api_to_wire_key("anthropic-messages"), None);
     }
 }

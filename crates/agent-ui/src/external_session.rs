@@ -284,6 +284,12 @@ pub struct ResumeSidecar {
     pub provider: String,
     /// The model id the session was launched with, replayed on resume.
     pub model: String,
+    /// Cx wire key of the endpoint variant the session was launched with
+    /// (`anthropic` / `responses` / `completions`); replayed on resume so a
+    /// multi-wire model re-spawns on the same endpoint. Absent on pre-wire
+    /// sidecars = resume falls back to the default wire derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<String>,
     /// The agent's last mirrored OSC title, if it ever set one.
     pub title: Option<String>,
     /// The CLI's own session id, making resume target exactly this session's
@@ -623,6 +629,7 @@ mod tests {
             created_at: 42,
             provider: "DeepSeek".into(),
             model: "deepseek-v4-flash[1m]".into(),
+            wire_api: Some("anthropic".into()),
             title: None,
             cli_session_id: None,
         }
@@ -924,5 +931,20 @@ mod tests {
             claude_cwd_from_file_head(&dir.path().join("missing"), 4096),
             None
         );
+    }
+
+    /// Pre-wire sidecars (no `wire_api` key) still parse; resume falls back
+    /// to the default wire derivation.
+    #[test]
+    fn sidecar_without_wire_api_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("external:claude:old.json"),
+            r#"{"id":"external:claude:old","agent_id":"claude","cwd":"/repo","project":null,"created_at":1,"provider":"DeepSeek","model":"deepseek-v4-flash[1m]","title":null}"#,
+        )
+        .unwrap();
+        let listed = list_sidecars_in(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].wire_api, None);
     }
 }

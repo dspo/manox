@@ -2730,6 +2730,57 @@ struct LaunchSpec {
     cwd: Option<PathBuf>,
 }
 
+/// Resolve an explicit (provider, model) launch selection to the concrete
+/// endpoint variant plus the wire api to launch with. An explicit wire pins
+/// the endpoint variant and must be agent-supported; without one the first
+/// agent-visible registration wins and the wire falls back to the first
+/// agent-supported wire the model offers, then the endpoint's own wire.
+pub(crate) fn resolve_launch_model(
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+    agent: &ResolvedAgent,
+    model_id: &str,
+    wire: Option<WireApi>,
+) -> Result<(ResolvedModel, WireApi)> {
+    if let Some(w) = wire {
+        anyhow::ensure!(
+            agent.supports_wire_api(w),
+            "agent `{}` 不支持 wire `{}`",
+            agent.id,
+            w.display()
+        );
+    }
+    let model = all_models
+        .iter()
+        .find(|m| {
+            m.provider_name == provider_name
+                && resolved_model_supports_agent(m, &agent.id)
+                && m.id == model_id
+                && wire.map(|w| m.wire_api == w).unwrap_or(true)
+        })
+        .with_context(|| {
+            format!(
+                "provider `{}` 下未找到支持 `{}` 的 model `{}`{}",
+                provider_name,
+                agent.id,
+                model_id,
+                wire.map(|w| format!("（wire `{}`）", w.display()))
+                    .unwrap_or_default()
+            )
+        })?
+        .clone();
+    let selected = wire
+        .or_else(|| {
+            model
+                .model_wire_apis
+                .iter()
+                .find(|w| agent.supported_wire_apis.contains(w))
+                .copied()
+        })
+        .unwrap_or(model.wire_api);
+    Ok((model, selected))
+}
+
 fn build_launch_spec(
     selection: &Selection,
     passthrough_args: &[String],
@@ -2787,9 +2838,10 @@ fn build_launch_spec(
 
         // Inject a unified model identifier so agents and their tooling can
         // detect which model cx configured, regardless of the agent type.
-        // 用剥除上下文后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
-        // ctx_hint（[1m] → 1_000_000）由各 agent 分支按需消费：copilot 写入
-        // COPILOT_PROVIDER_MAX_PROMPT_TOKENS，codex 写入 model_context_window。
+        // The wire-facing id is the base id (context suffix stripped; providers
+        // do not recognize cx's suffix). ctx_hint ([1m] → 1_000_000) is consumed
+        // per agent branch: claude writes CLAUDE_CODE_MAX_CONTEXT_TOKENS, copilot
+        // COPILOT_PROVIDER_MAX_PROMPT_TOKENS, codex model_context_window.
         let (api_model_id, ctx_hint) = parse_model_context_suffix(&model.id);
         env.insert("CX_MODEL".into(), api_model_id.to_string());
 
@@ -2845,6 +2897,12 @@ fn build_launch_spec(
                 env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
                 env.insert("ANTHROPIC_API_KEY".into(), apikey);
                 env.insert("ANTHROPIC_MODEL".into(), api_model_id.to_string());
+                // [1m] context declaration travels with the injection: LaunchSpec
+                // env overrides the inherited env at spawn, and suffix-less models
+                // leave any shell-exported value untouched (apply_byok_env parity).
+                if let Some(tokens) = ctx_hint {
+                    env.insert("CLAUDE_CODE_MAX_CONTEXT_TOKENS".into(), tokens.to_string());
+                }
                 args.push("--model".into());
                 args.push(api_model_id.to_string());
                 args.extend(passthrough_args.iter().cloned());
@@ -5207,6 +5265,8 @@ agents:
             spec.env.get("ANTHROPIC_MODEL"),
             Some(&"qwen3.6-plus".into())
         );
+        // Suffix-less model: no context declaration injected.
+        assert!(!spec.env.contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
         assert_eq!(
             spec.args,
             vec![
@@ -5262,6 +5322,10 @@ agents:
         );
         assert!(spec.args.iter().any(|a| a == "glm-5.2"));
         assert!(!spec.args.iter().any(|a| a.contains("[1m]")));
+        assert_eq!(
+            spec.env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+            Some(&"1000000".to_string())
+        );
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
@@ -7169,5 +7233,66 @@ agents:
         );
         assert_eq!(resolved.env.get("PROVIDER_ONLY"), Some(&"yes".to_string()));
         assert_eq!(resolved.env.get("MODEL_ONLY"), Some(&"yes".to_string()));
+    }
+
+    fn wire_test_agent(id: &str, wires: &[WireApi]) -> ResolvedAgent {
+        ResolvedAgent {
+            id: id.into(),
+            binary: id.into(),
+            args: Vec::new(),
+            supported_wire_apis: wires.to_vec(),
+            env: BTreeMap::new(),
+            hidden: false,
+        }
+    }
+
+    /// One config model registered through every wire endpoint; `visible_agents`
+    /// narrowed to copilot (the only built-in seeing all three wires).
+    fn wire_variant_model(wire: WireApi) -> ResolvedModel {
+        let mut m = test_resolved_model("m", "https://p.example", wire);
+        m.provider_name = "P".into();
+        m.visible_agents = vec!["copilot".into()];
+        m.model_wire_apis = vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions];
+        m
+    }
+
+    #[test]
+    fn resolve_launch_model_explicit_wire_pins_variant() {
+        let models = vec![
+            wire_variant_model(WireApi::Anthropic),
+            wire_variant_model(WireApi::Completions),
+        ];
+        let agent = wire_test_agent(
+            "copilot",
+            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        );
+        let (model, selected) =
+            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).unwrap();
+        assert_eq!(model.wire_api, WireApi::Completions);
+        assert_eq!(selected, WireApi::Completions);
+    }
+
+    #[test]
+    fn resolve_launch_model_without_wire_keeps_first_match() {
+        let models = vec![
+            wire_variant_model(WireApi::Anthropic),
+            wire_variant_model(WireApi::Completions),
+        ];
+        let agent = wire_test_agent(
+            "copilot",
+            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        );
+        let (model, selected) = resolve_launch_model(&models, "P", &agent, "m", None).unwrap();
+        assert_eq!(model.wire_api, WireApi::Anthropic);
+        assert_eq!(selected, WireApi::Anthropic);
+    }
+
+    #[test]
+    fn resolve_launch_model_rejects_agent_unsupported_wire() {
+        let models = vec![wire_variant_model(WireApi::Anthropic)];
+        let agent = wire_test_agent("claude", &[WireApi::Anthropic]);
+        assert!(
+            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).is_err()
+        );
     }
 }
