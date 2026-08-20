@@ -575,8 +575,22 @@ impl pi::tool::AgentTool for SubagentBashTool {
     fn requires_approval(&self, params: &serde_json::Value) -> bool {
         self.inner.requires_approval(params)
     }
+    fn execution_mode(&self) -> pi::tool::ExecutionMode {
+        // Delegate: the kernel BashTool declares Sequential (a stateful
+        // persistent shell on non-macOS); the wrapper must inherit it so a
+        // single Sailor session doesn't interleave parallel bash state.
+        self.inner.execution_mode()
+    }
     fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
+        // Strip `run_in_background` (refused by this wrapper — N1) and
+        // `unsandboxed` (no escalation path in the ungated subagent session)
+        // so the model never proposes them.
+        let mut schema = self.inner.parameters_schema();
+        if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.remove("run_in_background");
+            props.remove("unsandboxed");
+        }
+        schema
     }
 
     async fn execute(
@@ -1126,8 +1140,10 @@ fn build_tools(
             sailor_ctx,
             notice_tx.clone(),
             // Attributing the Sailor to this thread lets
-            // `thread_has_running_tasks` / `cleanup_thread` find + cancel
-            // it (sidebar indicator + no token burn after thread delete).
+            // `thread_has_running_tasks` count it (sidebar indicator) and
+            // `cancel_all_for_thread` cancel it on thread delete (run_actor
+            // cancels before `cleanup_thread` removes the entry — otherwise
+            // the Sailor would keep burning tokens, unfindable by Stop).
             owner_thread_id.to_string(),
         ));
         tools.push(Arc::new(SailorRoutingTool {
@@ -2903,9 +2919,13 @@ async fn run_actor(
     }
 
     let _ = session.close().await;
-    // Thread-lifetime cleanup: monitors/background tasks are stopped and the
-    // monitor bridge has exited with the orchestrator senders, so the legacy
-    // registry entries and mailbox can be released now.
+    // Thread-lifetime cleanup: cancel (SessionEnded) every task this thread
+    // owns — including in-flight asynchronously-dispatched Sailors — then
+    // release the legacy registry entries + mailbox. `cleanup_thread` alone
+    // only `retain`s (drops entries without cancelling tokens); the cancel
+    // must run first or a deleted thread's Sailors become unfindable zombies
+    // still burning tokens.
+    crate::background_task::cancel_all_for_thread(&thread_id).await;
     crate::background_task::cleanup_thread(&thread_id);
 }
 
@@ -5142,7 +5162,17 @@ mod tests {
             false
         }
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({})
+            // Mirror the kernel BashTool's shape so the wrapper's strip is
+            // exercised (run_in_background + unsandboxed get removed).
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "run_in_background": {"type": "boolean"},
+                    "unsandboxed": {"type": "boolean"}
+                },
+                "required": ["command"]
+            })
         }
         async fn execute(
             &self,
@@ -5202,5 +5232,25 @@ mod tests {
             })
             .collect();
         assert_eq!(fg_text, "foreground-ok", "foreground reached the inner");
+    }
+
+    #[test]
+    fn subagent_bash_schema_strips_background_and_unsandboxed() {
+        let tool = SubagentBashTool {
+            inner: Arc::new(MarkerBash),
+        };
+        let schema = tool.parameters_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(
+            !props.contains_key("run_in_background"),
+            "run_in_background stripped from the subagent schema"
+        );
+        assert!(
+            !props.contains_key("unsandboxed"),
+            "unsandboxed stripped from the subagent schema"
+        );
+        assert!(props.contains_key("command"), "command still advertised");
     }
 }
