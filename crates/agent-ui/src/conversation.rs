@@ -2031,8 +2031,7 @@ impl ConversationState {
             // Auto-approval markers stamp the badge instead of rendering a
             // conversation item.
             if note.kind == UiNoteKind::AutoApproval {
-                if let Some(target) = kinds.iter_mut().find(|it| item_contains_tool(it, tool_id))
-                {
+                if let Some(target) = kinds.iter_mut().find(|it| item_contains_tool(it, tool_id)) {
                     stamp_auto_approval(target, tool_id);
                 }
                 continue;
@@ -2182,7 +2181,6 @@ fn new_history_item(
         item
     })
 }
-
 
 /// Whether `it` is the item carrying the given tool call: a top-level
 /// `ToolCall` card or an activity segment holding the tool entry.
@@ -2638,9 +2636,7 @@ mod tests {
     /// spliced after their tool item (grouped splice applied in descending
     /// index order; one-by-one insertion at ix+1 would reverse them).
     #[gpui::test]
-    fn rebuild_from_display_keeps_emit_order_for_notes_on_same_tool(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn rebuild_from_display_keeps_emit_order_for_notes_on_same_tool(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let display = vec![
             HistoryEntry::Message(msg_with_id("u1", Role::User, "run")),
@@ -2687,11 +2683,8 @@ mod tests {
             assert_eq!(
                 signature(&kinds),
                 vec![
-                    "U:run",
-                    "?", // Thinking container carrying tu_1
-                    "N:first",
-                    "N:second",
-                    "U:next",
+                    "U:run", "?", // Thinking container carrying tu_1
+                    "N:first", "N:second", "U:next",
                 ]
             );
         });
@@ -2702,9 +2695,7 @@ mod tests {
     /// instead, so a rebuilt thread reproduces the live badge without a
     /// notice card. A marker whose tool item is gone applies nothing.
     #[gpui::test]
-    fn rebuild_from_display_stamps_auto_approval_badge_without_item(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn rebuild_from_display_stamps_auto_approval_badge_without_item(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let display = vec![
             HistoryEntry::Message(msg_with_id("u1", Role::User, "read it")),

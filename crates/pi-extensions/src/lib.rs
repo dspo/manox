@@ -14,6 +14,7 @@ pub mod provider;
 pub mod read;
 pub mod session_meta;
 pub mod session_stream;
+pub mod steer_bus;
 
 pub use agents::SubagentTool;
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};

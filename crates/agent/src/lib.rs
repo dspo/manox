@@ -44,6 +44,7 @@ pub mod sandbox;
 pub mod settings;
 pub mod skill;
 pub mod slash_builtins;
+pub mod steer_bus;
 pub mod team;
 pub mod title;
 pub mod tools;
