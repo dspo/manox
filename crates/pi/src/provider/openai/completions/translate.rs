@@ -77,19 +77,12 @@ fn thinking_params(context: &AgentContext) -> (Option<ThinkingParam>, Option<Str
     let level = context.thinking_level.as_deref();
     match context.model.thinking {
         ThinkingKind::Adaptive => match level {
-            None => (None, Some("high".to_string())),
+            None => (None, None),
             Some("off") => (None, Some("none".to_string())),
             Some(level) => (None, Some(level.to_string())),
         },
-        ThinkingKind::None => match level {
-            // No level: omit both fields (defensive — registry never produces None).
+        _ => match level {
             None => (None, None),
-            // Explicit level: honor it using the enabled wire shape.
-            Some("off") => (Some(ThinkingParam::Disabled), None),
-            Some(level) => (Some(ThinkingParam::Enabled), Some(level.to_string())),
-        },
-        ThinkingKind::Enabled => match level {
-            None => (Some(ThinkingParam::Enabled), Some("high".to_string())),
             Some("off") => (Some(ThinkingParam::Disabled), None),
             Some(level) => (Some(ThinkingParam::Enabled), Some(level.to_string())),
         },
@@ -441,19 +434,11 @@ mod tests {
 
     #[test]
     fn none_level_omits_thinking_fields() {
-        // Thinking models now default to "high" when no level is set.
-        // Enabled kind emits the on/off switch + effort.
-        let v = request(&ctx(vec![user("hi")], ThinkingKind::Enabled, None));
-        assert_eq!(v["thinking"], json!({"type": "enabled"}));
-        assert_eq!(v["reasoning_effort"], "high");
-        // Adaptive kind emits effort only (no thinking switch).
-        let v = request(&ctx(vec![user("hi")], ThinkingKind::Adaptive, None));
-        assert!(v.get("thinking").is_none());
-        assert_eq!(v["reasoning_effort"], "high");
-        // Non-thinking models still omit the fields.
-        let v = request(&ctx(vec![user("hi")], ThinkingKind::None, None));
-        assert!(v.get("thinking").is_none());
-        assert!(v.get("reasoning_effort").is_none());
+        for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
+            let v = request(&ctx(vec![user("hi")], kind, None));
+            assert!(v.get("thinking").is_none(), "{kind:?}");
+            assert!(v.get("reasoning_effort").is_none(), "{kind:?}");
+        }
         // Unregistered metadata uses the enabled wire shape rather than
         // silently dropping an explicit effort selection.
         let v = request(&ctx(vec![user("hi")], ThinkingKind::None, Some("high")));
