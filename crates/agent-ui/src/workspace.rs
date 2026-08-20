@@ -1635,16 +1635,10 @@ impl Workspace {
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let is_current = this.thread.read(cx).id.0 == *id;
                     let store = agent::thread_store_global();
-                    if *archived {
-                        let target = if is_current {
-                            Some(this.thread.clone())
-                        } else {
-                            store.read_with(cx, |s, _| s.live_thread(id))
-                        };
-                        if let Some(t) = target {
-                            Self::disband_team_of(&t, cx);
-                        }
-                    }
+                    // Team teardown is the store's centralized invariant
+                    // (leader-gated); an explicit disband here would destroy
+                    // a whole team when a member row is archived and strand
+                    // the leader with a dangling team ref.
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
@@ -3204,22 +3198,10 @@ impl Workspace {
             return false;
         }
         let id = self.thread.read(cx).id.0.clone();
-        Self::disband_team_of(&self.thread.clone(), cx);
         self.thread.update(cx, |t, cx| t.set_archived(true, cx));
         let store = agent::thread_store_global();
         store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
         true
-    }
-
-    /// Archive-leader invariant: a thread that holds an active team disbands
-    /// it before the store cascade archives the member rows — running
-    /// members are cancelled and their sessions archived with the leader.
-    fn disband_team_of(thread: &Entity<agent::Thread>, cx: &mut Context<Self>) {
-        let Some(team) = thread.read(cx).team().cloned() else {
-            return;
-        };
-        team.update(cx, |t, cx| t.disband(cx));
-        thread.update(cx, |t, cx| t.clear_team(cx));
     }
 
     /// Archive the active thread and open a fresh one that inherits the

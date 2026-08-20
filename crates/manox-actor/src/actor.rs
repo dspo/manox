@@ -213,18 +213,10 @@ fn archive_and_dispose_session(
     {
         cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
     }
-    // Archive-leader invariant: an archived leader disbands its active team
-    // so running members are cancelled and archived with it (the store
-    // cascade archives the member rows regardless).
-    if let Some(session) = state.sessions.get(id) {
-        cx.update(|app| {
-            let thread = session.thread.clone();
-            if let Some(team) = thread.read(app).team().cloned() {
-                team.update(app, |t, cx| t.disband(cx));
-                thread.update(app, |t, cx| t.clear_team(cx));
-            }
-        });
-    }
+    // The store's centralized archive-teardown (archive_thread) cancels and
+    // archives any live team led by the archived session; no explicit
+    // disband here (an explicit one would bypass the is_leader gate and
+    // blow up a whole team when a mere member row is archived).
     cx.update(|app| {
         let store = agent::thread_store::global();
         store.update(app, |s, cx| {

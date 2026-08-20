@@ -845,6 +845,133 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
+    /// N1 regression: archiving a MEMBER row only clears its back-ref and
+    /// archives the row — it must not disband the team or touch the leader.
+    #[test]
+    fn archive_member_row_does_not_destroy_team() {
+        let _store_lock = crate::thread_store::store_test_lock().lock().unwrap();
+        let mut cx = TestAppContext::single();
+        let db_path =
+            std::env::temp_dir().join(format!("team-archmember-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let leader = bare_thread("lead", &mut cx);
+        let member_thread = bare_thread("plan", &mut cx);
+        let sibling = bare_thread("rev", &mut cx);
+        cx.update(|cx| {
+            leader.update(cx, |t, _| t.set_id_for_test("lead-m".into()));
+            member_thread.update(cx, |t, _| t.set_id_for_test("plan-m".into()));
+            sibling.update(cx, |t, _| t.set_id_for_test("rev-m".into()));
+        });
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            member_thread.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            sibling.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            let store = crate::thread_store::global();
+            store.update(cx, |s, _| {
+                s.insert_summary_for_test("lead-m", None);
+                s.insert_summary_for_test("plan-m", Some("lead-m"));
+                s.insert_summary_for_test("rev-m", Some("lead-m"));
+            });
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("rev".into(), "reviewer".into(), sibling.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+        });
+
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            store.update(cx, |s, cx| s.archive_thread("plan-m", true, cx));
+        });
+
+        cx.update(|cx| {
+            // Team intact: leader still leads, sibling untouched.
+            assert!(leader.read(cx).team().is_some(), "leader keeps its team");
+            assert!(sibling.read(cx).team().is_some(), "sibling back-ref kept");
+            assert!(
+                team.read(cx).members().contains_key("rev"),
+                "sibling remains in roster"
+            );
+            // Only the archived member lost its back-ref.
+            assert!(member_thread.read(cx).team().is_none());
+        });
+        crate::thread_store::drop_for_test();
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// N2: disband (archives members) followed by archiving the leader fires
+    /// `SessionEnd` exactly once per thread — the cascade skip guard holds.
+    #[test]
+    fn session_end_fires_once_across_disband_then_leader_archive() {
+        let _store_lock = crate::thread_store::store_test_lock().lock().unwrap();
+        let _ = crate::plugin_hooks::drain_fired_for_test();
+        let mut cx = TestAppContext::single();
+        let db_path = std::env::temp_dir().join(format!("team-once-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let leader = bare_thread("lead", &mut cx);
+        let member_thread = bare_thread("plan", &mut cx);
+        cx.update(|cx| {
+            leader.update(cx, |t, _| t.set_id_for_test("lead-o".into()));
+            member_thread.update(cx, |t, _| t.set_id_for_test("plan-o".into()));
+        });
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            member_thread.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            let store = crate::thread_store::global();
+            store.update(cx, |s, _| {
+                s.insert_summary_for_test("lead-o", None);
+                s.insert_summary_for_test("plan-o", Some("lead-o"));
+            });
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+        });
+
+        cx.update(|cx| team.update(cx, |t, cx| t.disband(cx)));
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            store.update(cx, |s, cx| s.archive_thread("lead-o", true, cx));
+        });
+
+        let fired = crate::plugin_hooks::drain_fired_for_test();
+        let ends_for = |id: &str| {
+            fired
+                .iter()
+                .filter(|(ev, payload)| {
+                    *ev == crate::plugin_hooks::HookEvent::SessionEnd
+                        && payload.contains(&format!("\"{id}\""))
+                })
+                .count()
+        };
+        assert_eq!(ends_for("plan-o"), 1, "member SessionEnd exactly once");
+        assert_eq!(ends_for("lead-o"), 1, "leader SessionEnd exactly once");
+        crate::thread_store::drop_for_test();
+        std::fs::remove_file(db_path).ok();
+    }
+
     /// `reported` is set by a member→leader delivery and cleared when the
     /// member starts its next turn.
     #[test]
