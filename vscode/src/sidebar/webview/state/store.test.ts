@@ -1360,6 +1360,27 @@ describe('plan / goal / task folding', () => {
     expect(askCards[0]?.id).toBe('ask1');
   });
 
+  it('thread_history supersedes parked auto-approval verdicts', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['t1']);
+    // A whole-snapshot replay replaces the live state; the restored
+    // transcript carries its own auto_approved_tools stamps.
+    store.dispatch(
+      event({ type: 'thread_history', sessionId: 's', messages: [] }),
+    );
+    expect(thread(store)?.pendingAutoApprovals).toEqual([]);
+  });
+
   it('plan_ready replay replaces the previous card', () => {
     const store = startSession();
     const ready = (title: string, planFile: string) =>
