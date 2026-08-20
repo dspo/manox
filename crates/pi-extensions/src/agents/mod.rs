@@ -13,13 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pi::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use pi::ext_point_agent::{AgentDef, AgentRegistry};
 use pi::tool::{AgentTool, ToolContext, ToolError};
-use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
-
-/// Default max bytes for the subagent's returned text.
-const DEFAULT_MAX_BYTES: usize = 128 * 1024;
-/// Default max lines for the subagent's returned text.
-const DEFAULT_MAX_LINES: usize = 2000;
 
 /// The built-in Explore definition, embedded as a manifest.
 pub fn explore_agent_def() -> AgentDef {
@@ -92,12 +86,6 @@ pub struct SubagentTool {
     /// `subagent_type` values without probing the filesystem.
     description_override: Option<String>,
 }
-
-/// Static fallback for [`SubagentTool::description`] when no host override is
-/// injected (e.g. unit tests constructing the tool directly).
-const SUBAGENT_TOOL_DEFAULT_DESCRIPTION: &str = "Spawn a subagent from a registered \
-    agent definition to handle a focused task in isolation. Returns the subagent's \
-    final text.";
 
 impl SubagentTool {
     pub fn new(registry: Arc<AgentRegistry>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
@@ -357,65 +345,6 @@ fn shell_quote(path: &Path) -> String {
 /// (`{"subagent_event": {...}}`). Only observer-relevant events are
 /// forwarded: assistant text/thinking deltas and tool start/end. Everything
 /// else returns `None` (no emit).
-fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
-    use pi::types::{AgentEvent, AssistantMessageEvent};
-    let inner = match event {
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
-            ..
-        } => match assistant_message_event {
-            AssistantMessageEvent::TextDelta { delta, .. } if !delta.is_empty() => {
-                serde_json::json!({ "kind": "text", "text": delta })
-            }
-            AssistantMessageEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
-                serde_json::json!({ "kind": "thinking", "text": delta })
-            }
-            _ => return None,
-        },
-        AgentEvent::ToolExecutionStart {
-            tool_call_id,
-            tool_name,
-            arguments,
-        } => {
-            // A one-field hint (path / command / pattern) keeps the rail
-            // activity line informative without shipping full arguments;
-            // the child call id lets observers pair start/end under
-            // parallel child tool execution.
-            let (summary_key, summary) = ["path", "command", "pattern", "query"]
-                .iter()
-                .find_map(|key| {
-                    arguments.get(*key).and_then(|v| v.as_str()).map(|s| {
-                        let trimmed = s.trim();
-                        let value = if trimmed.len() > 80 {
-                            format!("{}…", &trimmed[..trimmed.floor_char_boundary(80)])
-                        } else {
-                            trimmed.to_string()
-                        };
-                        ((*key).to_string(), value)
-                    })
-                })
-                .unzip();
-            serde_json::json!({
-                "kind": "tool_start",
-                "id": tool_call_id,
-                "tool": tool_name,
-                "summary_key": summary_key,
-                "summary": summary
-            })
-        }
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id,
-            tool_name,
-            is_error,
-            ..
-        } => {
-            serde_json::json!({ "kind": "tool_end", "id": tool_call_id, "tool": tool_name, "is_error": is_error })
-        }
-        _ => return None,
-    };
-    Some(serde_json::json!({ "subagent_event": inner }))
-}
-
 /// Resolve a definition's tool names against the caller's tool snapshot.
 /// An empty `tools` list means the full snapshot, minus the `Steer` tool
 /// itself: a subagent must not inherit the parent's full-privilege Steer
@@ -444,30 +373,6 @@ fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn Age
 /// Concatenate the subagent's final answer: the text blocks of the last
 /// assistant message that carried no tool calls, skipping intermediate
 /// narration and tool-result turns.
-fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
-    use pi::types::{AgentMessage, ContentBlock};
-    for message in messages.iter().rev() {
-        let AgentMessage::Assistant { content, .. } = message else {
-            continue;
-        };
-        if content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-        {
-            continue;
-        }
-        let mut out = String::new();
-        for block in content {
-            if let ContentBlock::Text { text, .. } = block {
-                out.push_str(text);
-                out.push('\n');
-            }
-        }
-        return out.trim().to_string();
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,25 +418,6 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name(), "Read");
     }
-
-    #[test]
-    fn select_tools_never_inherits_the_agent_tool() {
-        // A subagent must not be able to spawn subagents implicitly.
-        let subagent = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
-        let tools: Vec<Arc<dyn AgentTool>> =
-            vec![Arc::new(pi::tools::read::ReadTool), Arc::new(subagent)];
-        let def = AgentDef {
-            name: "X".into(),
-            description: "d".into(),
-            tools: vec![],
-            model: None,
-            system_prompt: "p".into(),
-        };
-        let selected = select_tools(&tools, &def);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name(), "Read");
-    }
-
     #[test]
     fn select_tools_empty_means_all() {
         let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(pi::tools::read::ReadTool)];
@@ -868,99 +754,6 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
-
-    #[test]
-    fn collect_text_takes_assistant_text_blocks() {
-        use pi::types::{AgentMessage, ContentBlock};
-        let messages = vec![
-            AgentMessage::User {
-                content: vec![ContentBlock::Text {
-                    text: "user text".into(),
-                    signature: None,
-                }],
-                timestamp: chrono::Utc::now(),
-            },
-            AgentMessage::Assistant {
-                content: vec![
-                    ContentBlock::Text {
-                        text: "answer".into(),
-                        signature: None,
-                    },
-                    ContentBlock::Text {
-                        text: " part 2".into(),
-                        signature: None,
-                    },
-                ],
-                model: "m".into(),
-                provider: "p".into(),
-                api: "anthropic".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                stop_reason: None,
-                raw_stop_reason: None,
-                usage: Box::default(),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-        ];
-        assert_eq!(collect_text(&messages), "answer\n part 2");
-    }
-
-    #[test]
-    fn subagent_event_json_forwards_observer_events_only() {
-        use pi::types::{AgentEvent, AssistantMessageEvent};
-
-        // Text delta → forwarded.
-        let payload = subagent_event_json(&AgentEvent::MessageUpdate {
-            message: Box::new(pi::types::AgentMessage::Assistant {
-                content: vec![],
-                model: "m".into(),
-                provider: "p".into(),
-                api: "anthropic".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                stop_reason: None,
-                raw_stop_reason: None,
-                usage: Box::default(),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            }),
-            assistant_message_event: AssistantMessageEvent::TextDelta {
-                content_index: 0,
-                delta: "hello".into(),
-            },
-        })
-        .expect("text delta forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "text");
-        assert_eq!(payload["subagent_event"]["text"], "hello");
-
-        // Tool start carries the one-field hint.
-        let payload = subagent_event_json(&AgentEvent::ToolExecutionStart {
-            tool_call_id: "c1".into(),
-            tool_name: "Read".into(),
-            arguments: serde_json::json!({ "path": "src/main.rs" }),
-        })
-        .expect("tool start forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "tool_start");
-        assert_eq!(payload["subagent_event"]["summary"], "src/main.rs");
-
-        // Tool end carries the error flag.
-        let payload = subagent_event_json(&AgentEvent::ToolExecutionEnd {
-            tool_call_id: "c1".into(),
-            tool_name: "Read".into(),
-            result: pi::tool::AgentToolResult::text("ok"),
-            is_error: false,
-        })
-        .expect("tool end forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "tool_end");
-        assert_eq!(payload["subagent_event"]["is_error"], false);
-
-        // Lifecycle noise (turn start) is not forwarded.
-        assert!(subagent_event_json(&AgentEvent::TurnStart).is_none());
-    }
-
     fn registry_with_model(id: &str) -> Arc<pi::ProviderRegistry> {
         use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
         let registry = Arc::new(pi::ProviderRegistry::new());
