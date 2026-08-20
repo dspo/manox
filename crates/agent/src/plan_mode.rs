@@ -17,13 +17,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
+/// Resolves whether a subagent type is read-only (eligible to dispatch under
+/// plan mode). Built by the host from the live `AgentRegistry` so the gate
+/// shares the `SailorRoutingTool`'s capability routing — write/bash
+/// subagents (`Sailor`) stay blocked.
+pub type ReadOnlySubagentResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Tool name the model calls to submit a plan for review.
 pub const PROPOSE_PLAN: &str = "ProposePlan";
 
 /// Tools that stay available while plan mode is active. Read-only research
 /// tools plus the interaction/proposal devices; everything else is blocked
-/// (the working tree must stay untouched while planning).
+/// (the working tree must stay untouched while planning). The `Agent` tool
+/// is conditionally allowed for read-only subagents (e.g. `Explore`) — see
+/// the gate's dispatch check; write/bash subagents (`Sailor`) and worktree
+/// isolation stay blocked.
 const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "Read",
     "Grep",
@@ -214,14 +222,35 @@ impl PlanGatePolicy {
     }
 }
 
+/// Whether an `Agent` tool call targets a read-only subagent eligible to run
+/// under plan mode. Requires an explicit `subagent_type` that the resolver
+/// resolves read-only, and rejects `isolation: "worktree"` (materializing a
+/// working tree is a working-tree write, blocked under plan mode's read-only
+/// guarantee).
+fn is_read_only_subagent_dispatch(
+    args: &serde_json::Value,
+    is_read_only_subagent: &ReadOnlySubagentResolver,
+) -> bool {
+    let Some(subagent_type) = args.get("subagent_type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if args.get("isolation").and_then(|v| v.as_str()) == Some("worktree") {
+        return false;
+    }
+    is_read_only_subagent(subagent_type)
+}
+
 /// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
 /// tools and the proposal devices pass; Write/Edit pass only for plan-file
-/// targets; every other tool (Bash, Monitor, sub-agents, MCP, …) is blocked
-/// with a reason the model can act on.
+/// targets; an `Agent` call passes only for a read-only subagent
+/// (e.g. `Explore`) without worktree isolation; every other tool (Bash,
+/// Monitor, write/bash sub-agents, MCP, …) is blocked with a reason the
+/// model can act on.
 pub fn gate_handler(
     state: Arc<PlanSessionState>,
     plans_dir: PathBuf,
     cwd: PathBuf,
+    is_read_only_subagent: ReadOnlySubagentResolver,
 ) -> pi::harness::HookHandler {
     Arc::new(move |mut ctx| {
         if !state.enabled() {
@@ -234,13 +263,15 @@ pub fn gate_handler(
             .unwrap_or_default();
         let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
             || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
-                && is_plan_dir_path_param(&ctx.data["args"], &plans_dir, &cwd));
+                && is_plan_dir_path_param(&ctx.data["args"], &plans_dir, &cwd))
+            || (tool_name == crate::tools::AGENT
+                && is_read_only_subagent_dispatch(&ctx.data["args"], &is_read_only_subagent));
         if !allowed {
             ctx.block_reason = Some(format!(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} may be written (Write/Edit); research with \
-                 Read/Grep/Glob/Ls, ask with AskUserQuestion, and submit the plan with \
-                 {PROPOSE_PLAN}.",
+                 Read/Grep/Glob/Ls or a read-only `Explore` subagent (no worktree isolation), \
+                 ask with AskUserQuestion, and submit the plan with {PROPOSE_PLAN}.",
                 plans_dir.display()
             ));
         }
@@ -581,7 +612,9 @@ mod tests {
         let state = PlanSessionState::new();
         let plans = PathBuf::from("/home/u/.manox/plans");
         let cwd = PathBuf::from("/home/u/proj");
-        let hook = gate_handler(Arc::clone(&state), plans.clone(), cwd.clone());
+        // Read-only resolver: Explore is read-only; Sailor is not.
+        let read_only: ReadOnlySubagentResolver = Arc::new(|name: &str| name == "Explore");
+        let hook = gate_handler(Arc::clone(&state), plans.clone(), cwd.clone(), read_only);
 
         let run = |tool: &str, args: serde_json::Value| {
             let ctx = pi::harness::HookContext::new(pi::harness::HookPoint::ToolCall).with_data(
@@ -646,6 +679,37 @@ mod tests {
         assert!(run("Monitor", serde_json::json!({})).block_reason.is_some());
         assert!(
             run("mcp__srv__tool", serde_json::json!({}))
+                .block_reason
+                .is_some()
+        );
+        // Read-only subagent (Explore) passes; write/bash (Sailor) and
+        // worktree-isolated dispatch are blocked.
+        assert!(
+            run(
+                "Agent",
+                serde_json::json!({"subagent_type": "Explore", "prompt": "x"})
+            )
+            .block_reason
+            .is_none()
+        );
+        assert!(
+            run(
+                "Agent",
+                serde_json::json!({"subagent_type": "Sailor", "prompt": "x"})
+            )
+            .block_reason
+            .is_some()
+        );
+        assert!(
+            run(
+                "Agent",
+                serde_json::json!({"subagent_type": "Explore", "prompt": "x", "isolation": "worktree"})
+            )
+            .block_reason
+            .is_some()
+        );
+        assert!(
+            run("Agent", serde_json::json!({"prompt": "x"}))
                 .block_reason
                 .is_some()
         );
