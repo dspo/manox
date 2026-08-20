@@ -96,20 +96,24 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             tool_name,
             tool_title,
             verdict,
-        } => json!({
-            "type": "approval_decision",
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "tool_title": tool_title,
-            "verdict": match verdict {
-                ReviewVerdict::Allow => "allow",
-                ReviewVerdict::Ask { .. } => "ask",
-            },
-            "reason": match verdict {
-                ReviewVerdict::Ask { reason } => Some(reason.clone()),
-                ReviewVerdict::Allow => None,
-            },
-        }),
+        } => {
+            let mut v = json!({
+                "type": "approval_decision",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_title": tool_title,
+                "verdict": match verdict {
+                    ReviewVerdict::Allow => "allow",
+                    ReviewVerdict::Ask { .. } => "ask",
+                },
+            });
+            // `reason` rides only on escalations; omit the key on Allow so
+            // the wire matches the TS `reason?: string` exactly.
+            if let ReviewVerdict::Ask { reason } = verdict {
+                v["reason"] = json!(reason);
+            }
+            v
+        }
         ThreadEvent::Error(e) => json!({"type": "error", "message": e.to_string()}),
         ThreadEvent::TokenUsageUpdated(u) => json!({
             "type": "token_usage",
@@ -259,7 +263,7 @@ mod tests {
         assert_eq!(v["tool_name"], "Bash");
         assert_eq!(v["tool_title"], "ls");
         assert_eq!(v["verdict"], "allow");
-        assert!(v["reason"].is_null());
+        assert!(v.get("reason").is_none(), "Allow omits the reason key");
         assert_eq!(v["sessionId"], "s1");
 
         let ask = thread_event_to_json(

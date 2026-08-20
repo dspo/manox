@@ -58,6 +58,11 @@ export interface ThreadState {
   turnStartedAt: number | null;
   /** Duration of the most recent finished turn, for the meta line. */
   lastTurnDurationSec: number | null;
+  /** Auto-approval verdicts parked before their tool card landed — the
+   * documented `approval_decision`-before-`tool_call` ordering race (the
+   * gpui host's `pending_auto_approvals` mirror); the `tool_call` upsert
+   * drains them onto the fresh card. */
+  pendingAutoApprovals: string[];
 }
 
 export interface ChatState {
@@ -104,6 +109,7 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   error: null,
   turnStartedAt: null,
   lastTurnDurationSec: null,
+  pendingAutoApprovals: [],
 });
 const emptyInfo = (): ThreadInfoSnapshot => ({
   reasoning_effort: 'high',
@@ -543,7 +549,11 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
         items.splice(askIdx, 1);
         base = { ...t, items };
       }
-      return upsertToolItem(base, ev.id, (prev) => {
+      // Drain a parked auto-approval verdict (the `approval_decision`-before-
+      // `tool_call` race): the card landing now owns the badge, and the id
+      // leaves the pending set.
+      const drained = base.pendingAutoApprovals.includes(ev.id);
+      const next = upsertToolItem(base, ev.id, (prev) => {
         const status = foldToolStatus(ev.status);
         return {
           id: ev.id,
@@ -555,9 +565,12 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           status,
           output: prev?.output ?? '',
           isError: status === 'failed' ? true : (prev?.isError ?? false),
-          autoApproved: prev?.autoApproved,
+          autoApproved: prev?.autoApproved || drained || undefined,
         };
       });
+      return drained
+        ? { ...next, pendingAutoApprovals: next.pendingAutoApprovals.filter((x) => x !== ev.id) }
+        : next;
     }
     case 'tool_output':
       return upsertToolItem(t, ev.id, (prev) => ({
@@ -625,10 +638,23 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       };
     }
     case 'approval_decision': {
-      // An `allow` verdict stamps the tool card's auto-approval badge; the
-      // card exists by construction (the live `tool_call` precedes the
-      // review). `ask` escalations ride the authorization card instead.
+      // An `allow` verdict stamps the tool card's auto-approval badge. The
+      // verdict can win the race against the creating `tool_call` (two
+      // concurrent tasks feed the same event channel), in which case the
+      // card does not exist yet — park the id so the `tool_call` upsert
+      // drains it onto the fresh card, mirroring the gpui host's
+      // `pending_auto_approvals` buffer. `ask` escalations ride the
+      // authorization card instead.
       if (ev.verdict !== 'allow') return t;
+      const exists = t.items.some(
+        (i) => i.kind === 'tool' && i.id === ev.tool_call_id,
+      );
+      if (!exists) {
+        return {
+          ...t,
+          pendingAutoApprovals: [...t.pendingAutoApprovals, ev.tool_call_id],
+        };
+      }
       return {
         ...t,
         items: t.items.map((i) =>
@@ -656,6 +682,9 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
           new Set(ev.auto_approved_tools ?? []),
         ),
         loading: false,
+        // A whole-snapshot replace supersedes any live parked verdicts; the
+        // restored transcript carries its own `auto_approved_tools` stamps.
+        pendingAutoApprovals: [],
       };
     case 'thread_info':
       return mergeInfo(t, ev.info);

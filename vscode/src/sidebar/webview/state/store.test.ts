@@ -339,7 +339,8 @@ describe('transcript folding', () => {
     expect(toolCard(store, 't1')?.status).toBe('completed');
 
     // An `ask` verdict leaves the card untouched (the authorization card
-    // surfaces the escalation); an unknown id spawns no stub.
+    // surfaces the escalation); a verdict for an id without a card parks in
+    // the pending buffer instead of spawning a stub.
     store.dispatch(
       event({
         type: 'approval_decision',
@@ -366,6 +367,37 @@ describe('transcript folding', () => {
     );
     expect(toolCard(store, 't2')?.autoApproved).toBeUndefined();
     expect(thread(store)?.items.find((i) => i.kind === 'tool' && i.id === 'ghost')).toBeUndefined();
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['ghost']);
+  });
+
+  it('approval_decision racing ahead of tool_call is drained onto the late card', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    // No card yet: the verdict parks, nothing renders.
+    expect(toolCard(store, 't1')).toBeUndefined();
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['t1']);
+
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(thread(store)?.pendingAutoApprovals).toEqual([]);
+
+    // The badge survives the terminal status update too.
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'success' }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
   });
 
   it('adds authorization cards and removes them on decision', () => {

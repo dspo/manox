@@ -1257,6 +1257,29 @@ fn subscribe_thread(
                         );
                     });
                 }
+                ThreadEvent::ApprovalDecision {
+                    tool_call_id,
+                    verdict,
+                    ..
+                } => {
+                    // The actor-only host has no workspace `record_ui_note`;
+                    // persist the auto-approval marker here so a VS Code
+                    // session's `thread_history.auto_approved_tools` rebuild
+                    // reproduces the badge exactly like the gpui host's.
+                    if matches!(verdict, agent::approval::ReviewVerdict::Allow) {
+                        let anchor = entity.read(app).last_user_message_id().map(str::to_owned);
+                        let note = agent::db::UiNoteRecord {
+                            anchor_user_id: anchor,
+                            kind: agent::db::UiNoteKind::AutoApproval,
+                            data: serde_json::json!({
+                                "text": "",
+                                "tool_call_id": tool_call_id,
+                            }),
+                        };
+                        entity.update(app, |t, _| t.push_ui_note(note));
+                        agent::save_thread(entity.clone(), false, app);
+                    }
+                }
                 _ => {}
             }
             if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id)) {

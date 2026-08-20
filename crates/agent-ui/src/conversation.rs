@@ -940,7 +940,8 @@ impl ConversationState {
     /// the workspace parks the verdict via `buffer_auto_approval` (the
     /// documented `ApprovalDecision`-before-`ToolCall` ordering race).
     pub fn mark_auto_approved(&mut self, tool_call_id: &str, cx: &mut App) -> bool {
-        let mut marked = false;
+        // Tool call ids are unique to one item, so the first hit is the only
+        // hit — stop scanning instead of leasing every trailing entity.
         for item in &self.items {
             let hit = item.update(cx, |item, cx| {
                 let found = match item.kind_mut() {
@@ -964,10 +965,10 @@ impl ConversationState {
                 found
             });
             if hit {
-                marked = true;
+                return true;
             }
         }
-        marked
+        false
     }
 
     /// Park an auto-approval verdict whose tool item has not landed yet —
