@@ -440,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn none_level_omits_thinking_fields() {
+    fn none_level_defaults_to_high() {
         // Thinking models now default to "high" when no level is set.
         // Enabled kind emits the on/off switch + effort.
         let v = request(&ctx(vec![user("hi")], ThinkingKind::Enabled, None));
