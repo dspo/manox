@@ -735,6 +735,18 @@ impl Thread {
                 let store = crate::thread_store::global();
                 store.update(cx, |s, cx| s.refresh(cx));
             }
+            BackendNotice::SailorCompleted { sailor_id, content } => {
+                // Deliver the Sailor's final text as a peer message and let
+                // a turn fire — the Captain reliably observes the result
+                // without polling. Mirrors the Team leader-inbox path.
+                self.deliver_peer_messages(
+                    vec![crate::team::PeerMessage {
+                        from: sailor_id,
+                        content,
+                    }],
+                    cx,
+                );
+            }
         }
     }
 
@@ -929,6 +941,13 @@ impl Thread {
     #[cfg(test)]
     pub(crate) fn set_label_for_test(&mut self, label: String) {
         self.label = label;
+    }
+
+    /// Override the thread id for tests that exercise `parent_id` cascades
+    /// (the default `test-thread` id would self-collide across threads).
+    #[cfg(test)]
+    pub(crate) fn set_id_for_test(&mut self, id: String) {
+        self.id = ThreadId(id);
     }
     // ── Thread duck-type: read accessors ───────────────────────────────────
 
@@ -1213,9 +1232,15 @@ impl Thread {
     }
 
     /// Attach this thread to a team (leader at `TeamCreate`, member at
-    /// spawn).
-    pub fn set_team(&mut self, team: Entity<Team>, _cx: &mut Context<Self>) {
+    /// spawn). Registers the thread as live so the store's centralized
+    /// archive-teardown can reach a leader's team from its id alone.
+    pub fn set_team(&mut self, team: Entity<Team>, cx: &mut Context<Self>) {
         self.team = Some(team);
+        if let Some(store) = crate::thread_store::try_global() {
+            let id = self.id.0.clone();
+            let weak = cx.weak_entity();
+            store.update(cx, |s, _| s.register_live_thread(&id, weak));
+        }
     }
 
     /// Detach from the team (disband path).
@@ -2302,6 +2327,32 @@ pub(crate) mod tests {
             assert!(t.pending_prompts.is_empty(), "text queue drained");
             assert!(t.pending_images.is_empty(), "image queue drained");
         });
+    }
+
+    #[gpui::test]
+    fn sailor_completed_notice_injects_peer_message_and_fires_turn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::SailorCompleted {
+                    sailor_id: "sailor-1".into(),
+                    content: "PR #601 LGTM".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "the Sailor completion fired one turn");
+        assert!(runs[0].0.contains("PR #601 LGTM"), "final text rode the prompt: {:?}", runs[0].0);
+        drop(runs);
+        let has_user = thread.read_with(cx, |t, _| {
+            t.messages.iter().any(|m| matches!(m.role, crate::language_model::Role::User))
+        });
+        assert!(has_user, "a user message was injected for the completion");
     }
 
     /// An image-only insert (no text) still starts a turn — the guard keys on

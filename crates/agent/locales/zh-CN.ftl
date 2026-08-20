@@ -375,7 +375,6 @@ workspace-mode-notice = { $mode ->
     [autopilot] 自动驾驶模式：安全工具调用免提示，风险操作将被拒绝。
    *[danger] 危险驾驶：工具调用免审批，bash 在沙箱外运行。
 }
-workspace-approval-autopilot-allowed = ✔ 自动批准：{$tool}
 workspace-approval-autopilot-escalated = ✗ 已升级待裁决：{$tool} — {$reason}
 workspace-project-choose = 选择项目
 workspace-project-new = 新建项目
@@ -491,6 +490,7 @@ about-copy = 复制
 background-task-kind-command = 监视器（命令）
 background-task-kind-websocket = 监视器（WebSocket）
 background-task-kind-bash = 后台 Bash
+background-task-kind-sailor = 水手（子代理）
 background-task-status-running = 运行中
 background-task-status-stopping = 正在停止
 background-task-status-completed = 已完成
@@ -568,6 +568,12 @@ plugins-notice-plugin-disabled = 插件已禁用。重启 manox 后会卸载启�
 member-running = 运行中
 member-idle = 空闲
 member-disbanded = 已离线
+member-dismiss = 回收
+member-stop-end-turn = 停止：正常结束
+member-stop-max-tokens = 停止：超出长度
+member-stop-cancelled = 停止：已取消
+member-stop-refusal = 停止：拒答
+member-stop-tool-use = 停止：工具调用
 member-tasks = 任务
 member-tasks-mine = 我的
 member-tasks-unassigned = 未分配

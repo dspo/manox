@@ -226,11 +226,7 @@ impl ProviderRegistry {
                     id: model.id.clone(),
                     context_window: model.context_window as usize,
                     max_tokens: model.max_tokens as usize,
-                    thinking: if model.reasoning {
-                        ThinkingKind::Enabled
-                    } else {
-                        ThinkingKind::None
-                    },
+                    thinking: ThinkingKind::Enabled,
                     metadata: {
                         let mut merged = model.metadata.clone();
                         // Kernel-owned keys win over extension-supplied ones.

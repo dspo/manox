@@ -236,6 +236,11 @@ pub enum BackendNotice {
         op: BrowserOp,
         responder: async_channel::Sender<Result<BrowserReply, String>>,
     },
+    /// A dispatched Sailor subagent (async `Agent` dispatch) finished. The
+    /// facade delivers the final text to the Captain as a peer message and
+    /// triggers a turn, mirroring the Team leader-inbox path so the Captain
+    /// reliably observes the result without polling.
+    SailorCompleted { sailor_id: String, content: String },
 }
 
 /// One team operation a team tool asks the facade to run.
@@ -253,6 +258,12 @@ pub enum TeamOp {
         content: String,
     },
     Disband,
+    /// Dismiss one worker member: cancel, archive, release its tasks.
+    Dismiss {
+        name: String,
+    },
+    /// Read-only roster status report (running/idle, stop reasons, reported).
+    Status,
     TaskCreate {
         subject: String,
         description: Option<String>,

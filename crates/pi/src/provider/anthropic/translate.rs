@@ -111,12 +111,28 @@ fn tools_param(
 /// A configured thinking level always reaches the wire: `"off"` forces
 /// `disabled`; adaptive models use `adaptive`; all other models use `enabled`
 /// with a level-derived `budget_tokens` clamped below `max_tokens`. An absent
-/// level omits the field and leaves the server default in place. Model metadata
-/// selects the wire shape but never suppresses an explicit user choice.
+/// level defaults to `"high"` for thinking models so the server never rejects
+/// a request for a model that requires thinking. Model metadata selects the
+/// wire shape but never suppresses an explicit user choice.
 fn thinking_config(context: &AgentContext, max_tokens: usize) -> Option<ThinkingConfig> {
     let display = Some(ThinkingDisplay::Summarized);
     match context.thinking_level.as_deref() {
-        None => None,
+        None => {
+            // Default to "high" for thinking models so the server doesn't
+            // reject the request. This app registers all models with
+            // ThinkingKind::Enabled, so this branch is always taken.
+            if context.model.supports_thinking() {
+                Some(match context.model.thinking {
+                    ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
+                    _ => ThinkingConfig::Enabled {
+                        display,
+                        budget_tokens: Some(map_budget("high", max_tokens)),
+                    },
+                })
+            } else {
+                None
+            }
+        }
         Some("off") => Some(ThinkingConfig::Disabled),
         Some(level) => Some(match context.model.thinking {
             ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
@@ -565,15 +581,18 @@ mod tests {
             assert!(req.output_config.is_none(), "{kind:?}");
         }
     }
-
     #[test]
-    fn no_level_omits_thinking_field() {
+    fn no_level_defaults_to_high_for_thinking_models() {
+        // Thinking models now default to "high" when no level is set.
         for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
             let ctx = ctx(vec![user("hi")], kind, None);
             let req = to_request(&ctx, &StreamOptions::default());
-            assert!(req.thinking.is_none(), "{kind:?}");
-            assert!(req.output_config.is_none(), "{kind:?}");
+            assert!(req.thinking.is_some(), "{kind:?}");
         }
+        // Non-thinking models still omit the field.
+        let ctx = ctx(vec![user("hi")], ThinkingKind::None, None);
+        let req = to_request(&ctx, &StreamOptions::default());
+        assert!(req.thinking.is_none());
     }
 
     #[test]

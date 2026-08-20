@@ -51,6 +51,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
+- ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
 - **百炼 anthropic 兼容端点**（`*.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（恒 0），只报 `cache_read_input_tokens`。故 manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug（三链路均正确，记的就是端点报的 0）。`LastBreakpointOnly` 与 `Full` policy 对该端点均有效。
@@ -100,7 +101,7 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 
 - 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
 - 每 PR 门禁：`cargo clippy -D warnings --all-targets` + 全量 `cargo test` + `cargo fmt`。
-- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归。
+- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归；整机并发 timing flake（manox-actor actor 套件、`agent::monitor_bridge::monitor_spawn_bridges_snapshots`：全量跑偶发失败、单独跑恒过）同样不计回归。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
 
 ## 项目规则
@@ -109,7 +110,6 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 - **禁止 vendor / submodule**：所有依赖经 Cargo 声明，不允许 vendor 目录或 git submodule。
 - **crate 依赖只认 crate 索引或 git 地址**：外部 crate 只能是 crates.io 版本或 `git = "..."`，禁止 `path = "..."` 指向本机路径（CI 不可复现）；workspace 内部成员间 `path` 例外。
 - **只允许单二进制、单进程交付**：最终产物一个二进制，运行时一个进程。
-- **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，多轮交锋达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：可参考架构思想，禁止复制粘贴后修改。`git2` 即因此被禁（plugin marketplace shell out 系统 `git`）。
 - **注释一律英文，面向终态**（描述不变量/意图）而非过程流水账，非必要不注释。详见 `~/.claude/rules/code-comments.md`。
 - **迭代时不得破坏前缀缓存**：provider 侧前缀缓存是透明优化（命中零成本，击穿静默回退）。任何对 `build_completion_request` 或消息组装管线的改动，必须保持跨 turn 请求前缀字节一致；若需重写历史，须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）或显式禁用该路径缓存。

@@ -165,6 +165,16 @@ rfd = "0.15"
 arboard = "3"
 open = "5"
 
+# rustwright-core — ChromeUse's in-process Chromium CDP engine (Rust rewrite
+# of Playwright's automation core; no driver subprocess, fits the
+# single-binary deliverable). default-features = false strips the `python`
+# feature (PyO3). The dep key carries the crate's Rust identifier: its lib
+# target is `_rustwright` (the PyO3 module name), so `rustwright-core` would
+# be unusable as a path prefix. Alpha crate: pinned by rev, upgraded
+# deliberately (same discipline as the gpui stack); switch back to the
+# crates.io index version once a release catches up with main.
+rustwright_core = { package = "rustwright-core", git = "https://github.com/Skyvern-AI/rustwright.git", rev = "af71449ea25ad45b1028581edefab1f523f9550d", default-features = false }
+
 # i18n —— fluent + BCP47 LanguageIdentifier。仅 UI chrome 走 t!()；模型面向字符串一律英文，不经此栈。
 fluent = "0.17"
 unic-langid = "0.9"

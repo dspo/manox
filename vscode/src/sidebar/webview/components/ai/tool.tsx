@@ -1,4 +1,4 @@
-import { Ban, Check, ChevronRight, Circle, Clock, MinusCircle, X } from 'lucide-react';
+import { Ban, Check, CheckCheck, ChevronRight, Circle, Clock, MinusCircle, X } from 'lucide-react';
 import type { ComponentProps, ReactNode } from 'react';
 import { useState } from 'react';
 
@@ -41,9 +41,12 @@ const statusIcons: Record<ToolStatus, ReactNode> = {
 export type ToolHeaderProps = ComponentProps<typeof CollapsibleTrigger> & {
   title?: string;
   status: string;
+  /** Autopilot auto-approval badge: a muted check-check ahead of the
+   * call's own status icon. */
+  autoApproved?: boolean;
 };
 
-export const ToolHeader = ({ className, title, status, ...props }: ToolHeaderProps) => (
+export const ToolHeader = ({ className, title, status, autoApproved, ...props }: ToolHeaderProps) => (
   <CollapsibleTrigger
     className={cn(
       'font-code text-muted-foreground hover:bg-accent/50 flex w-full cursor-pointer items-center gap-1.5 px-2 py-1 text-[13px] italic transition-colors',
@@ -53,6 +56,7 @@ export const ToolHeader = ({ className, title, status, ...props }: ToolHeaderPro
   >
     <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
     <span className="min-w-0 flex-1 truncate text-left">{title}</span>
+    {autoApproved && <CheckCheck className="text-muted-foreground size-3.5 shrink-0" />}
     {(statusIcons as Record<string, ReactNode>)[status] ?? null}
   </CollapsibleTrigger>
 );

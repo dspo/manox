@@ -425,7 +425,6 @@ workspace-mode-notice = { $mode ->
     [autopilot] AutoPilot mode: safe tool calls run without prompting, risky ones are denied.
    *[danger] Danger: tool calls need no approval, bash runs outside the sandbox.
 }
-workspace-approval-autopilot-allowed = ✔ Auto-approved: {$tool}
 workspace-approval-autopilot-escalated = ✗ Escalated for your review: {$tool} — {$reason}
 workspace-project-choose = Choose project
 workspace-project-new = New project
@@ -548,6 +547,7 @@ about-copy = Copy
 background-task-kind-command = Monitor (command)
 background-task-kind-websocket = Monitor (WebSocket)
 background-task-kind-bash = Background Bash
+background-task-kind-sailor = Sailor (subagent)
 background-task-status-running = Running
 background-task-status-stopping = Stopping
 background-task-status-completed = Completed
@@ -625,6 +625,12 @@ plugins-notice-plugin-disabled = Plugin disabled. Restart manox to unload runtim
 member-running = running
 member-idle = idle
 member-disbanded = gone
+member-dismiss = dismiss
+member-stop-end-turn = stopped: end turn
+member-stop-max-tokens = stopped: output limit
+member-stop-cancelled = stopped: cancelled
+member-stop-refusal = stopped: refusal
+member-stop-tool-use = stopped: tool use
 member-tasks = Tasks
 member-tasks-mine = Mine
 member-tasks-unassigned = Unassigned

@@ -452,8 +452,9 @@ fn message_error_text(message: &AgentMessage) -> String {
 }
 
 /// Human-readable tool card title from the pi tool name + arguments.
-/// Falls back to the bare name for tools without a recognized target
-/// field.
+/// Browser tools (WebExplore* / ChromeUse*) surface their url, tab id, or
+/// element ref so approval cards carry the decision-relevant target. Falls
+/// back to the bare name for tools without a recognized target field.
 pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| -> Option<String> {
         args.get(key)
@@ -489,6 +490,22 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(kind) => format!("Agent {kind}"),
             None => "Agent".to_string(),
         },
+        "WebExploreOpen" | "ChromeUseOpen" => match arg("url").or_else(|| arg("cdp_endpoint")) {
+            Some(target) => format!("{name} {target}"),
+            None => name.to_string(),
+        },
+        "WebExploreNavigate" | "ChromeUseNavigate" => match arg("url") {
+            Some(url) => format!("{name} {url}"),
+            None => name.to_string(),
+        },
+        other if other.starts_with("WebExplore") || other.starts_with("ChromeUse") => {
+            let tab = args.get("tab_id").and_then(|v| v.as_u64());
+            match (tab, arg("ref")) {
+                (Some(tab), Some(element_ref)) => format!("{other} tab {tab} [{element_ref}]"),
+                (Some(tab), None) => format!("{other} tab {tab}"),
+                _ => other.to_string(),
+            }
+        }
         _ => name.to_string(),
     }
 }
@@ -584,5 +601,33 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["m", "m", "n", "m"]);
+    }
+    use serde_json::json;
+
+    #[test]
+    fn tool_titles_carry_browser_targets() {
+        assert_eq!(
+            tool_title("ChromeUseOpen", &json!({"url": "https://example.com"})),
+            "ChromeUseOpen https://example.com"
+        );
+        assert_eq!(
+            tool_title(
+                "ChromeUseOpen",
+                &json!({"cdp_endpoint": "ws://127.0.0.1:9222/x"})
+            ),
+            "ChromeUseOpen ws://127.0.0.1:9222/x"
+        );
+        assert_eq!(
+            tool_title("ChromeUseClick", &json!({"tab_id": 2, "ref": "e7"})),
+            "ChromeUseClick tab 2 [e7]"
+        );
+        assert_eq!(
+            tool_title("WebExploreScreenshot", &json!({"tab_id": 1})),
+            "WebExploreScreenshot tab 1"
+        );
+        // Unrecognized shapes fall back to the bare name.
+        assert_eq!(tool_title("ChromeUseClose", &json!({})), "ChromeUseClose");
+        assert_eq!(tool_title("Bash", &json!({})), "Bash");
+
     }
 }

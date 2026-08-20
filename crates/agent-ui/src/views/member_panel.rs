@@ -16,14 +16,18 @@ use std::collections::HashMap;
 
 use agent::i18n;
 use agent::language_model::TokenUsage;
-use agent::team::{Task, TaskListEvent, Team};
+use agent::team::{Task, TaskListEvent, Team, TeamEvent};
 use agent::{Thread, ThreadEvent};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, Pixels, Render, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, px,
 };
-use gpui_component::{ActiveTheme as _, ElementExt as _, Theme, h_flex, v_flex};
+use gpui_component::{
+    ActiveTheme as _, ElementExt as _, Sizable as _, Theme,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 
 use crate::Workspace;
 use crate::conversation::ConversationState;
@@ -38,6 +42,7 @@ pub struct MemberPanel {
     conversation: Entity<ConversationState>,
     sub: Option<Subscription>,
     task_sub: Option<Subscription>,
+    team_sub: Option<Subscription>,
     scroll_handle: ScrollHandle,
     stick_to_bottom: bool,
 }
@@ -91,6 +96,7 @@ impl MemberPanel {
             conversation,
             sub: None,
             task_sub: None,
+            team_sub: None,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
         });
@@ -137,6 +143,13 @@ impl MemberPanel {
                     cx.notify();
                 });
                 this.task_sub = Some(task_sub);
+                // Roster changes (stop chip landing, dismiss, disband)
+                // redraw the header; the member Thread alone never emits
+                // for them.
+                let team_sub = cx.subscribe(&team_ent, |_this, _t, _ev: &TeamEvent, cx| {
+                    cx.notify();
+                });
+                this.team_sub = Some(team_sub);
             }
         });
 
@@ -150,6 +163,23 @@ impl MemberPanel {
     /// Whether the member `Thread` is still alive (team not disbanded).
     fn alive(&self) -> bool {
         self.member.upgrade().is_some()
+    }
+
+    /// The member's last terminal stop reason from the roster, for the
+    /// header chip; `None` while it has never stopped.
+    fn last_stop_label(&self, cx: &mut Context<Self>) -> Option<SharedString> {
+        let team = self.team.upgrade()?;
+        let member = team.read(cx).members().get(&self.member_name)?;
+        member.last_stop().map(|reason| {
+            let key = match reason {
+                agent::language_model::StopReason::EndTurn => "member-stop-end-turn",
+                agent::language_model::StopReason::MaxTokens => "member-stop-max-tokens",
+                agent::language_model::StopReason::Cancelled => "member-stop-cancelled",
+                agent::language_model::StopReason::Refusal => "member-stop-refusal",
+                agent::language_model::StopReason::ToolUse => "member-stop-tool-use",
+            };
+            i18n::t(key)
+        })
     }
 
     fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -202,6 +232,25 @@ impl MemberPanel {
                     .text_color(theme.muted_foreground)
                     .child(format!("· {}", self.role)),
             )
+            .when_some(self.last_stop_label(cx), |el, label| {
+                el.child(gpui::div().text_xs().text_color(theme.warning).child(label))
+            })
+            .when(alive, |el| {
+                let weak_ws = self.weak_workspace.clone();
+                let name = self.member_name.clone();
+                let team = self.team.clone();
+                el.child(
+                    Button::new(format!("dismiss-{}", self.member_name))
+                        .ghost()
+                        .small()
+                        .label(i18n::t("member-dismiss"))
+                        .on_click(move |_, _, cx| {
+                            let team = team.clone();
+                            let _ = weak_ws
+                                .update(cx, |ws, cx| ws.dismiss_member(team, name.clone(), cx));
+                        }),
+                )
+            })
     }
 
     fn render_task_board(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {

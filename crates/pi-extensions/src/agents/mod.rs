@@ -6,7 +6,9 @@
 // registry, mounting the definition's tool subset, and collecting the
 // subagent's final text.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pi::coding_agent::ModelRuntime;
 use pi::coding_agent::create_agent_session;
@@ -27,9 +29,20 @@ pub fn explore_agent_def() -> AgentDef {
         .expect("built-in Explore manifest must parse")
 }
 
+/// The built-in Sailor definition, embedded as a manifest. General-purpose
+/// coding worker with the full env-backed tool snapshot (read/write/edit +
+/// bash). Unlike the read-only Explore, Sailor can modify files and run
+/// commands — it is the default dispatch target for parallel
+/// implementation/review/build-verification subtasks.
+pub fn sailor_agent_def() -> AgentDef {
+    AgentDef::parse_md(include_str!("../../agents/sailor.md"))
+        .expect("built-in Sailor manifest must parse")
+}
+
 /// Register the built-in agent definitions.
 pub fn register_defaults(registry: &mut AgentRegistry) {
     registry.register(explore_agent_def());
+    registry.register(sailor_agent_def());
 }
 
 /// Resolve a definition's `model` override (assembly-layer concern per
@@ -75,7 +88,18 @@ pub struct SubagentTool {
     /// override (id or alias). Assembly-layer concern per `AgentDef.model`;
     /// injected by the harness that owns the registry.
     provider_registry: Option<Arc<pi::ProviderRegistry>>,
+    /// Host-rendered description override. When set, `description()` returns
+    /// this (a live-rendered list of registered subagent types) instead of
+    /// the static default — so the model sees the available
+    /// `subagent_type` values without probing the filesystem.
+    description_override: Option<String>,
 }
+
+/// Static fallback for [`SubagentTool::description`] when no host override is
+/// injected (e.g. unit tests constructing the tool directly).
+const SUBAGENT_TOOL_DEFAULT_DESCRIPTION: &str = "Spawn a subagent from a registered \
+    agent definition to handle a focused task in isolation. Returns the subagent's \
+    final text.";
 
 impl SubagentTool {
     pub fn new(registry: Arc<AgentRegistry>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
@@ -85,6 +109,7 @@ impl SubagentTool {
             model_runtime: None,
             model: None,
             provider_registry: None,
+            description_override: None,
         }
     }
 
@@ -109,6 +134,17 @@ impl SubagentTool {
         self.provider_registry = Some(registry);
         self
     }
+
+    /// Override the tool description with a host-rendered string. The host
+    /// renders the `AgentToolDescription` template against the live
+    /// `AgentRegistry` (listing registered `subagent_type` values with their
+    /// capability tags) so the model sees what it can dispatch without
+    /// probing the filesystem. When unset, the static
+    /// [`SUBAGENT_TOOL_DEFAULT_DESCRIPTION`] is returned.
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description_override = Some(description);
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -118,8 +154,9 @@ impl AgentTool for SubagentTool {
     }
 
     fn description(&self) -> &str {
-        "Spawn a subagent from a registered agent definition to handle a focused task \
-         in isolation. Returns the subagent's final text."
+        self.description_override
+            .as_deref()
+            .unwrap_or(SUBAGENT_TOOL_DEFAULT_DESCRIPTION)
     }
 
     fn is_read_only(&self) -> bool {
@@ -141,6 +178,11 @@ impl AgentTool for SubagentTool {
                 "prompt": {
                     "type": "string",
                     "description": "The task for the subagent"
+                },
+                "isolation": {
+                    "type": "string",
+                    "description": "Optional dispatch-time isolation. Set to \"worktree\" to run the sub-agent in its own git worktree on a throwaway branch — full filesystem isolation from the parent's working tree (the child cannot write the parent's project root); a clean worktree is auto-removed when the sub-agent finishes. Omit for same-workspace collaborative work.",
+                    "enum": ["worktree"]
                 }
             },
             "required": ["subagent_type", "prompt"]
@@ -198,12 +240,24 @@ impl SubagentTool {
             resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
 
         let selected = select_tools(&self.tools, def);
+        // Optional dispatch-time worktree isolation. The subagent session's
+        // cwd becomes the worktree path so every tool operates inside it;
+        // the worktree is torn down after the session exits.
+        let worktree = if params["isolation"].as_str() == Some("worktree") {
+            Some(Worktree::prepare(ctx).await?)
+        } else {
+            None
+        };
+        let child_cwd = worktree
+            .as_ref()
+            .map(|w| w.path.as_path())
+            .unwrap_or(ctx.cwd());
         // The subagent transcript lives in a throwaway temp directory so a
         // read-only Explore call does not litter the user's project.
         let session_dir =
             tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
         let mut builder = create_agent_session()
-            .with_cwd(ctx.cwd())
+            .with_cwd(child_cwd.to_path_buf())
             .with_session_dir(session_dir.path())
             .with_system_prompt(def.system_prompt.clone())
             .with_tools(selected);
@@ -239,18 +293,18 @@ impl SubagentTool {
         // inner session runs on its own token, so race it here.
         let sig = signal.clone();
         let mut prompt_fut = Box::pin(session.prompt(prompt));
-        let messages = loop {
+        let run_outcome: Result<Vec<pi::types::AgentMessage>, ToolError> = loop {
             tokio::select! {
                 r = prompt_fut.as_mut() => {
                     break r.map_err(|e| {
                         ToolError::ExecutionFailed(format!("subagent failed: {e}"))
-                    })?;
+                    });
                 }
                 Some(event) = ev_rx.recv() => forward_child(&event),
                 _ = sig.cancelled() => {
                     drop(prompt_fut);
                     let _ = session.abort();
-                    return Err(ToolError::Aborted);
+                    break Err(ToolError::Aborted);
                 }
             }
         };
@@ -259,6 +313,27 @@ impl SubagentTool {
         while let Ok(event) = ev_rx.try_recv() {
             forward_child(&event);
         }
+        // Tear down the worktree (if any) now that the session is done. A
+        // pristine worktree is removed; one with work is kept and its
+        // branch + path ride the result (or, on a real failure, the error)
+        // so the caller can find and later clean up the kept branch.
+        let kept_worktree = if let Some(worktree) = worktree {
+            worktree.clean_up(ctx).await
+        } else {
+            None
+        };
+        let messages = match run_outcome {
+            Ok(m) => m,
+            // A user/TaskStop abort settles silently; the kept worktree (if
+            // any) persists on disk for `git worktree list` to find.
+            Err(ToolError::Aborted) => return Err(ToolError::Aborted),
+            Err(e) => {
+                return Err(match kept_worktree {
+                    Some(kept) => ToolError::ExecutionFailed(format!("{e}\n\n{kept}")),
+                    None => e,
+                });
+            }
+        };
 
         let text = collect_text(&messages);
 
@@ -275,8 +350,169 @@ impl SubagentTool {
                 truncated.original_lines, truncated.original_bytes
             ));
         }
+        if let Some(kept) = kept_worktree {
+            out.push_str(&format!("\n\n{kept}"));
+        }
         Ok(AgentToolResult::text(out))
     }
+}
+
+/// An isolated git worktree a subagent runs in when the caller passes
+/// `isolation: "worktree"`. Created at dispatch time on a throwaway branch
+/// under the system temp dir; the subagent session's cwd is the worktree
+/// path, so every tool operates inside it without manual `cd`. `clean_up`
+/// auto-removes a pristine worktree (no commits, no uncommitted changes)
+/// and its branch; a worktree with work is kept and its branch + path are
+/// reported back so the caller never silently loses edits.
+struct Worktree {
+    path: PathBuf,
+    branch: String,
+    repo: PathBuf,
+    /// The repo HEAD SHA captured at `prepare` time; `clean_up` compares the
+    /// branch tip against it to detect committed work.
+    base: String,
+}
+
+impl Worktree {
+    async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
+        let repo = ctx.cwd().to_path_buf();
+        let suffix = unique_suffix();
+        let branch = format!("sailor-{suffix}");
+        let path = std::env::temp_dir().join(format!("manox-sailor-{suffix}"));
+        let cmd = format!(
+            "git -C {repo_q} rev-parse --verify HEAD",
+            repo_q = shell_quote(&repo),
+        );
+        let base = ctx
+            .env()
+            .exec(&cmd, Duration::from_secs(10), CancellationToken::new())
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("git rev-parse HEAD: {e}")))?;
+        if base.exit_code != 0 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "cannot resolve repo HEAD (exit {}): {}",
+                base.exit_code,
+                base.stderr.trim()
+            )));
+        }
+        let base = base.stdout.trim().to_string();
+        let cmd = format!(
+            "git -C {repo_q} worktree add {path_q} -b {branch} {base}",
+            repo_q = shell_quote(&repo),
+            path_q = shell_quote(&path),
+        );
+        let res = ctx
+            .env()
+            .exec(&cmd, Duration::from_secs(30), CancellationToken::new())
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("git worktree add: {e}")))?;
+        if res.exit_code != 0 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "git worktree add failed (exit {}): {}",
+                res.exit_code,
+                res.stderr.trim()
+            )));
+        }
+        Ok(Worktree {
+            path,
+            branch,
+            repo,
+            base,
+        })
+    }
+
+    /// Remove a pristine worktree + branch; keep a worktree with work and
+    /// return a message naming the kept branch + path. Best-effort: a git
+    /// failure during the pristine check falls back to keeping the worktree
+    /// (never destroy work silently).
+    async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
+        if self.is_pristine(ctx).await {
+            let rm = format!(
+                "git -C {repo_q} worktree remove {path_q}",
+                repo_q = shell_quote(&self.repo),
+                path_q = shell_quote(&self.path),
+            );
+            let _ = ctx
+                .env()
+                .exec(&rm, Duration::from_secs(30), CancellationToken::new())
+                .await;
+            let del = format!(
+                "git -C {repo_q} branch -D {branch}",
+                repo_q = shell_quote(&self.repo),
+                branch = self.branch,
+            );
+            let _ = ctx
+                .env()
+                .exec(&del, Duration::from_secs(10), CancellationToken::new())
+                .await;
+            let _ = std::fs::remove_dir(&self.path);
+            None
+        } else {
+            Some(format!(
+                "[worktree kept: branch={}, path={}]",
+                self.branch,
+                self.path.display()
+            ))
+        }
+    }
+
+    /// Pristine = no commits beyond the dispatch base AND no uncommitted
+    /// changes in the worktree. Either check failing (git error) is treated
+    /// as not-pristine so the worktree is kept rather than destroyed.
+    async fn is_pristine(&self, ctx: &dyn ToolContext) -> bool {
+        let commits = format!(
+            "git -C {repo_q} rev-list --count {base}..{branch}",
+            repo_q = shell_quote(&self.repo),
+            base = self.base.as_str(),
+            branch = self.branch.as_str(),
+        );
+        let res = ctx
+            .env()
+            .exec(&commits, Duration::from_secs(10), CancellationToken::new())
+            .await;
+        let committed = res
+            .ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().parse::<u64>().unwrap_or(1))
+            .unwrap_or(1);
+        if committed > 0 {
+            return false;
+        }
+        let dirty = format!(
+            "git -C {path_q} status --porcelain",
+            path_q = shell_quote(&self.path)
+        );
+        let res = ctx
+            .env()
+            .exec(&dirty, Duration::from_secs(10), CancellationToken::new())
+            .await;
+        res.ok()
+            .filter(|r| r.exit_code == 0)
+            .map(|r| r.stdout.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// A dependency-free uniqueness suffix for parallel-Sailor branch names:
+/// pid + the full nanosecond timestamp. An atomic counter guarantees no two
+/// dispatches in the same process collide even if the clock stalls.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", std::process::id(), nanos, n)
+}
+
+/// Single-quote a path for a shell command string with the standard `'\''`
+/// escape, so a cwd containing `$`, backticks, `"`, or `'` cannot break or
+/// inject into the command.
+fn shell_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Map a child-session event to the host-facing progress payload
@@ -396,7 +632,6 @@ fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
 
     #[test]
     fn explore_manifest_parses() {
@@ -405,6 +640,22 @@ mod tests {
         assert_eq!(def.tools, vec!["Read", "Grep", "Glob", "Ls"]);
         assert!(def.system_prompt.contains("read-only codebase"));
         assert!(def.description.to_lowercase().contains("read-only"));
+    }
+
+    #[test]
+    fn sailor_manifest_parses() {
+        let def = sailor_agent_def();
+        assert_eq!(def.name, "Sailor");
+        assert!(def.tools.is_empty(), "empty tools means full snapshot");
+        assert!(def.model.is_none(), "inherits the Captain's model");
+        assert!(
+            def.description.to_lowercase().contains("general-purpose"),
+            "description advertises the general-purpose role"
+        );
+        assert!(
+            def.system_prompt.contains("concise summary"),
+            "system prompt requires a summary on completion"
+        );
     }
 
     #[test]
@@ -453,6 +704,188 @@ mod tests {
             system_prompt: "p".into(),
         };
         assert_eq!(select_tools(&tools, &def).len(), 1);
+    }
+
+    /// The host snapshot now carries Bash/Write/Edit alongside the read-only
+    /// four. A definition with `tools: []` (Sailor) inherits the full set
+    /// minus `Agent`; a read-only definition (Explore) names an explicit
+    /// allowlist that keeps the write/exec axis out.
+    #[test]
+    fn select_tools_sailor_gets_full_snapshot_explorer_stays_readonly() {
+        let tools: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(pi::tools::read::ReadTool),
+            Arc::new(pi::tools::grep::GrepTool),
+            Arc::new(pi::tools::glob::GlobTool),
+            Arc::new(pi::tools::ls::LsTool),
+            Arc::new(pi::tools::bash::BashTool::new(None)),
+            Arc::new(pi::tools::write::WriteTool),
+            Arc::new(pi::tools::edit::EditTool),
+            Arc::new(SubagentTool::new(Arc::new(AgentRegistry::new()), vec![])),
+        ];
+        let sailor = AgentDef {
+            name: "Sailor".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let sailor_tools = select_tools(&tools, &sailor);
+        let sailor_names: Vec<&str> = sailor_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(sailor_names.len(), 7, "full snapshot minus Agent");
+        assert!(
+            sailor_names.contains(&"Bash"),
+            "Sailor gets Bash: {sailor_names:?}"
+        );
+        assert!(
+            sailor_names.contains(&"Write"),
+            "Sailor gets Write: {sailor_names:?}"
+        );
+        assert!(
+            sailor_names.contains(&"Edit"),
+            "Sailor gets Edit: {sailor_names:?}"
+        );
+        assert!(!sailor_names.contains(&"Agent"), "Agent is never inherited");
+
+        let explore = explore_agent_def();
+        let explore_tools = select_tools(&tools, &explore);
+        let explore_names: Vec<&str> = explore_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            explore_names,
+            &["Read", "Grep", "Glob", "Ls"],
+            "Explore stays read-only despite the expanded snapshot: {explore_names:?}"
+        );
+    }
+
+    /// A real-git round-trip: `Worktree::prepare` creates a worktree on a
+    /// throwaway branch; `clean_up` removes it and the branch. Guards against
+    /// the two Step-4 invariants: the child cwd lands in the worktree, and
+    /// no worktree lingers after the subagent exits.
+    #[tokio::test]
+    async fn worktree_prepare_and_clean_up_round_trip() {
+        let dir = tempfile::tempdir().expect("temp repo dir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t"][..],
+            &["config", "user.name", "t"][..],
+            &["commit", "-q", "-m", "init", "--allow-empty"][..],
+        ] {
+            assert!(git(args).status.success(), "git {:?} failed", args);
+        }
+
+        let env: Arc<dyn pi::env::ExecutionEnv> =
+            Arc::new(pi::env::TokioExecutionEnv::new(repo.to_path_buf()));
+        let ctx = pi::tool::LocalToolContext::new(
+            env,
+            repo.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+
+        let wt = Worktree::prepare(&ctx).await.expect("worktree prepares");
+        assert!(wt.path.is_dir(), "worktree working tree exists");
+        assert!(
+            wt.path.join(".git").is_file(),
+            "worktree has a .git file (linked worktree)"
+        );
+        let path = wt.path.clone();
+        let branch = wt.branch.clone();
+        let kept = wt.clean_up(&ctx).await;
+        assert!(kept.is_none(), "pristine worktree is removed, not kept");
+
+        assert!(!path.exists(), "worktree removed after clean_up");
+        let branches = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["branch", "--list"])
+                .output()
+                .expect("git branch --list")
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            !branches.contains(&branch),
+            "branch {branch} deleted: {branches}"
+        );
+    }
+
+    /// A worktree with committed work is kept (not destroyed) and its branch +
+    /// path are reported back — the B2 invariant: edits never vanish.
+    #[tokio::test]
+    async fn worktree_with_commits_is_kept_not_destroyed() {
+        let dir = tempfile::tempdir().expect("temp repo dir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t"][..],
+            &["config", "user.name", "t"][..],
+            &["commit", "-q", "-m", "init", "--allow-empty"][..],
+        ] {
+            assert!(git(args).status.success(), "git {:?} failed", args);
+        }
+
+        let env: Arc<dyn pi::env::ExecutionEnv> =
+            Arc::new(pi::env::TokioExecutionEnv::new(repo.to_path_buf()));
+        let ctx = pi::tool::LocalToolContext::new(
+            env,
+            repo.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+
+        let wt = Worktree::prepare(&ctx).await.expect("worktree prepares");
+        // Commit on the worktree's branch so it carries work past the base.
+        let commit = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt.path)
+            .args(["commit", "-q", "-m", "sailor work", "--allow-empty"])
+            .output()
+            .expect("commit in worktree");
+        assert!(commit.status.success(), "commit in worktree");
+
+        let path = wt.path.clone();
+        let branch = wt.branch.clone();
+        let kept = wt.clean_up(&ctx).await;
+        assert!(
+            kept.is_some(),
+            "a worktree with commits is kept, not removed"
+        );
+        assert!(
+            kept.as_deref().unwrap().contains(&branch),
+            "the kept message names the branch: {:?}",
+            kept
+        );
+        assert!(
+            path.exists(),
+            "the working tree still exists after clean_up"
+        );
+        // Clean up the kept worktree so the test leaves nothing behind.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&path)
+            .output();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["branch", "-D", &branch])
+            .output();
     }
 
     #[test]

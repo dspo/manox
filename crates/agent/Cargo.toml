@@ -56,6 +56,7 @@ fluent.workspace = true
 unic-langid.workspace = true
 tera.workspace = true
 tokio-tungstenite = { workspace = true }
+rustwright_core.workspace = true
 
 [dev-dependencies]
 # Self-reference with `test-support`: integration tests (`tests/`) compile the

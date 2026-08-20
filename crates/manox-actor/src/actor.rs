@@ -213,6 +213,10 @@ fn archive_and_dispose_session(
     {
         cx.update(|app| session.thread.update(app, |t, cx| t.cancel(cx)));
     }
+    // The store's centralized archive-teardown (archive_thread) cancels and
+    // archives any live team led by the archived session; no explicit
+    // disband here (an explicit one would bypass the is_leader gate and
+    // blow up a whole team when a mere member row is archived).
     cx.update(|app| {
         let store = agent::thread_store::global();
         store.update(app, |s, cx| {
@@ -1257,6 +1261,26 @@ fn subscribe_thread(
                         );
                     });
                 }
+                ThreadEvent::ApprovalDecision {
+                    tool_call_id,
+                    verdict,
+                    ..
+                } => {
+                    // The actor-only host has no workspace `record_ui_note`;
+                    // persist the auto-approval marker here so a VS Code
+                    // session's `thread_history.auto_approved_tools` rebuild
+                    // reproduces the badge exactly like the gpui host's.
+                    if matches!(verdict, agent::approval::ReviewVerdict::Allow) {
+                        let note = agent::db::UiNoteRecord {
+                            kind: agent::db::UiNoteKind::AutoApproval,
+                            data: serde_json::json!({
+                                "text": "",
+                                "tool_call_id": tool_call_id,
+                            }),
+                        };
+                        entity.update(app, |t, _| t.append_ui_note(note));
+                    }
+                }
                 _ => {}
             }
             if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id)) {
@@ -1277,11 +1301,31 @@ fn emit_history_and_info(
     sink: &EventSink,
 ) {
     let messages = strip_messages_for_wire(thread.read(app).messages());
+    // Auto-approval badges ride the ui_notes sidecar, which the webview's
+    // `wireMessagesToTranscriptItems` rebuild never sees; project just the
+    // marked tool ids so the restored transcript stamps the same badges.
+    let auto_approved_tools: Vec<String> = thread
+        .read(app)
+        .display_history()
+        .iter()
+        .filter_map(|entry| match entry {
+            agent::db::HistoryEntry::Note(note) => Some(note),
+            _ => None,
+        })
+        .filter(|n| n.kind == agent::db::UiNoteKind::AutoApproval)
+        .filter_map(|n| {
+            n.data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
     sink.emit(
         json!({
             "type": "thread_history",
             "sessionId": session_id,
             "messages": messages,
+            "auto_approved_tools": auto_approved_tools,
         })
         .to_string(),
     );

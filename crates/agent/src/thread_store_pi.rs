@@ -102,15 +102,18 @@ pub fn init(cx: &mut App) {
 
 /// Returns the global `ThreadStore` `Entity`. Panics if `init` was not called.
 pub fn global() -> Entity<ThreadStore> {
+    try_global().expect("ThreadStore not initialized; call agent::init first")
+}
+
+/// The global store when initialized (`agent::init`, or `init_for_test`);
+/// `None` before init so teardown paths (team disband) can skip archival
+/// instead of panicking in store-less environments.
+pub fn try_global() -> Option<Entity<ThreadStore>> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(entity) = TEST_OVERRIDE.lock().unwrap().clone() {
-        return entity;
+        return Some(entity);
     }
-    GLOBAL
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("ThreadStore not initialized; call agent::init first")
+    GLOBAL.lock().unwrap().clone()
 }
 
 /// Drop the global store entity — test-support only, so a gpui test app can
@@ -325,32 +328,128 @@ impl ThreadStore {
         Some(entity)
     }
 
+    /// The live (in-memory) thread for `id`, if its entity is still alive.
+    /// Unlike [`ThreadStore::load_thread`], never restores from disk — the
+    /// archive path only needs threads that could still hold a live team.
+    pub fn live_thread(&self, id: &str) -> Option<Entity<Thread>> {
+        self.live_threads.get(id).and_then(WeakEntity::upgrade)
+    }
+
+    /// Track a live thread (team leader/member at `set_team`) so the
+    /// centralized archive-teardown can reach its team from the id alone.
+    pub fn register_live_thread(&mut self, id: &str, t: WeakEntity<Thread>) {
+        self.live_threads.insert(id.to_string(), t);
+    }
+
+    /// Seed an active summary row without touching disk — lets foreign test
+    /// modules (team lifecycle) exercise the archive cascade against real
+    /// thread ids.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_summary_for_test(&mut self, id: &str, parent: Option<&str>) {
+        self.summaries.push(crate::db::ThreadSummary {
+            id: id.to_string(),
+            summary: id.to_string(),
+            title: None,
+            title_override: None,
+            model_id: String::new(),
+            provider_id: None,
+            approval_mode: 0,
+            project: String::new(),
+            depth: parent.is_some() as i32,
+            parent_id: parent.map(str::to_string),
+            archived: false,
+            pinned: false,
+            has_unread: false,
+            errored: false,
+            created_at: 0,
+            interacted_at: 0,
+            updated_at: 0,
+            cumulative_total_tokens: 0,
+        });
+    }
+
     /// Archive (or unarchive) a session. The row moves between the active
     /// and archived partitions immediately; the post-write refresh in
-    /// `write_meta` re-syncs both partitions from disk.
+    /// `write_meta` re-syncs both partitions from disk. Archiving cascades
+    /// to every descendant along `parent_id` (team members, fork children —
+    /// one hierarchy rule); unarchiving moves only the requested row.
+    /// Re-asserting the current state is a no-op: no partition move, meta
+    /// write, or lifecycle hook.
     pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
+        if self.summary_by_id(id).is_some_and(|s| s.archived == archived) {
+            return;
+        }
+        let ids = if archived {
+            self.descendant_ids(id)
+        } else {
+            vec![id.to_string()]
+        };
         if archived {
-            if let Some(pos) = self.summaries.iter().position(|s| s.id == id) {
-                let mut summary = self.summaries.swap_remove(pos);
-                summary.archived = true;
-                self.archived_summaries.push(summary);
+            // Archive-leader invariant, centralized: any live thread in the
+            // cascade that still leads a team is torn down here (running
+            // members cancelled, roster released) so no orphan keeps working
+            // after its row is archived — covers every current and future
+            // archive entry point. `teardown` is store-free, keeping this
+            // method re-entrancy-safe; the cascade below archives the rows.
+            for tid in &ids {
+                if let Some(thread) = self.live_thread(tid) {
+                    if let Some(team) = thread.read(cx).team().cloned() {
+                        // Only a leader's archive tears the team down; a
+                        // dismissed member must not cancel its siblings.
+                        if team.read_with(cx, |t, _| t.is_leader(&thread)) {
+                            team.update(cx, |t, cx| t.teardown(cx));
+                        }
+                    }
+                    thread.update(cx, |t, cx| t.clear_team(cx));
+                }
             }
-        } else if let Some(pos) = self.archived_summaries.iter().position(|s| s.id == id) {
-            let mut summary = self.archived_summaries.swap_remove(pos);
-            summary.archived = false;
-            self.summaries.push(summary);
         }
-        self.write_meta(id, move |meta| meta.archived = archived, cx);
-        if archived {
-            // Plugin lifecycle: archiving ends the session's working life
-            // (the retired harness fired on thread deletion; the pi path
-            // keeps sessions and archives instead). Fail-open, detached.
-            crate::plugin_hooks::fire(
-                crate::plugin_hooks::HookEvent::SessionEnd,
-                None,
-                serde_json::json!({ "thread_id": id }),
-            );
+        for tid in ids {
+            // A row already at the target state (e.g. archived by the
+            // caller's disband earlier) skips move + meta + hook: one
+            // SessionEnd per working life.
+            if self.summary_by_id(&tid).is_some_and(|s| s.archived == archived) {
+                continue;
+            }
+            if archived {
+                if let Some(pos) = self.summaries.iter().position(|s| s.id == tid) {
+                    let mut summary = self.summaries.swap_remove(pos);
+                    summary.archived = true;
+                    self.archived_summaries.push(summary);
+                }
+            } else if let Some(pos) = self.archived_summaries.iter().position(|s| s.id == tid) {
+                let mut summary = self.archived_summaries.swap_remove(pos);
+                summary.archived = false;
+                self.summaries.push(summary);
+            }
+            self.write_meta(&tid, move |meta| meta.archived = archived, cx);
+            if archived {
+                // Plugin lifecycle: archiving ends the session's working life
+                // (the retired harness fired on thread deletion; the pi path
+                // keeps sessions and archives instead). Fail-open, detached.
+                crate::plugin_hooks::fire(
+                    crate::plugin_hooks::HookEvent::SessionEnd,
+                    None,
+                    serde_json::json!({ "thread_id": tid }),
+                );
+            }
         }
+    }
+
+    /// `id` plus every transitive child across both partitions, each parent
+    /// before its children (the archive cascade set).
+    fn descendant_ids(&self, id: &str) -> Vec<String> {
+        let mut out = vec![id.to_string()];
+        let mut frontier = vec![id.to_string()];
+        while let Some(parent) = frontier.pop() {
+            for s in self.summaries.iter().chain(self.archived_summaries.iter()) {
+                if s.parent_id.as_deref() == Some(parent.as_str()) && !out.contains(&s.id) {
+                    frontier.push(s.id.clone());
+                    out.push(s.id.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
@@ -597,6 +696,15 @@ pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut Ap
 #[cfg(any(test, feature = "test-support"))]
 pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
+}
+
+/// Serializes tests that install the process-global store override
+/// (`init_for_test` / `drop_for_test`); the override is a single slot, so
+/// store-backed tests in different modules must not interleave.
+#[cfg(any(test, feature = "test-support"))]
+pub fn store_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(std::sync::Mutex::default)
 }
 
 #[cfg(test)]
@@ -981,7 +1089,12 @@ mod tests {
         });
         cx.executor().run_until_parked();
         let mut settled = false;
-        for _ in 0..200 {
+        // Generous budget: the two sidecar writes run on the process-wide
+        // tokio runtime shared with every parallel test in the binary — a
+        // loaded CI runner starves them well past the 2s the writes need in
+        // isolation. The assertion still catches the lost-update regression;
+        // it just doesn't double as a scheduler benchmark.
+        for _ in 0..1500 {
             if let Ok(meta) = crate::runtime::handle().block_on(
                 pi_extensions::session_meta::load(dir.path(), &session),
             ) && meta.archived
@@ -993,6 +1106,92 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(settled, "archived flag lost to a concurrent pinned write");
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Minimal summary row for hierarchy tests; only id / parent / archived
+    /// matter to the cascade.
+    fn cascade_summary(id: &str, parent: Option<&str>) -> ThreadSummary {
+        ThreadSummary {
+            id: id.to_string(),
+            summary: id.to_string(),
+            title: None,
+            title_override: None,
+            model_id: String::new(),
+            provider_id: None,
+            approval_mode: 0,
+            project: String::new(),
+            depth: parent.is_some() as i32,
+            parent_id: parent.map(str::to_string),
+            archived: false,
+            pinned: false,
+            has_unread: false,
+            errored: false,
+            created_at: 0,
+            interacted_at: 0,
+            updated_at: 0,
+            cumulative_total_tokens: 0,
+        }
+    }
+
+    /// Archiving a leader cascades to every transitive descendant (team
+    /// members and fork children share the one `parent_id` hierarchy rule).
+    #[test]
+    fn archive_cascades_to_descendants() {
+        let (db, db_path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db);
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.summaries.push(cascade_summary("lead", None));
+                s.summaries.push(cascade_summary("member", Some("lead")));
+                s.summaries.push(cascade_summary("grand", Some("member")));
+                s.summaries.push(cascade_summary("sibling", None));
+            });
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", true, cx)));
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                // lead + member + grand archived; unrelated row untouched.
+                assert_eq!(s.summaries.len(), 1);
+                assert_eq!(s.summaries[0].id, "sibling");
+                let archived: Vec<&str> = s
+                    .archived_summaries
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect();
+                for id in ["lead", "member", "grand"] {
+                    assert!(archived.contains(&id), "{id} not archived");
+                }
+                assert!(s.archived_summaries.iter().all(|s| s.archived));
+            });
+        });
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// Unarchiving moves only the requested row; descendants stay archived.
+    #[test]
+    fn unarchive_does_not_cascade() {
+        let (db, db_path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db);
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.summaries.push(cascade_summary("lead", None));
+                s.summaries.push(cascade_summary("member", Some("lead")));
+            });
+        });
+        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", true, cx)));
+        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", false, cx)));
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                assert!(s.summaries.iter().any(|s| s.id == "lead" && !s.archived));
+                assert!(s
+                    .archived_summaries
+                    .iter()
+                    .any(|s| s.id == "member" && s.archived));
+            });
+        });
         std::fs::remove_file(db_path).ok();
     }
 }

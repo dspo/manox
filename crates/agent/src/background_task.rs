@@ -54,6 +54,17 @@ pub enum TaskKind {
     MonitorCommand,
     MonitorWebSocket,
     BackgroundBash,
+    /// An asynchronously-dispatched Sailor subagent (general-purpose coding
+    /// worker) running in a background pi session. Completion is delivered to
+    /// the Captain via `BackendNotice::SailorCompleted`; a Running snapshot
+    /// is emitted at dispatch + at settlement so the UI card surfaces during
+    /// the run and its Stop button (`background_task::stop`) cancels the
+    /// child token. The model-facing `TaskStop` stops a Sailor via the
+    /// `LegacyAwareTaskStop` host wrapper (which calls `background_task::stop`
+    /// for legacy-registry ids); `BashOutput` does not yet recognize Sailor
+    /// ids (progress-pull follow-up). A parent-turn abort also cancels the
+    /// child token.
+    Sailor,
 }
 
 /// The terminal status of a background task.
@@ -140,6 +151,7 @@ pub fn format_event_for_model(event: &TaskEvent) -> String {
         TaskKind::MonitorCommand => "Monitor (command)",
         TaskKind::MonitorWebSocket => "Monitor (WebSocket)",
         TaskKind::BackgroundBash => "Background Bash",
+        TaskKind::Sailor => "Sailor",
     };
     let body = match &event.event {
         TaskEventKind::StateChanged => return String::new(),
@@ -908,6 +920,7 @@ fn next_id(kind: &TaskKind) -> TaskId {
         TaskKind::MonitorCommand => "monitor",
         TaskKind::MonitorWebSocket => "ws",
         TaskKind::BackgroundBash => "bash",
+        TaskKind::Sailor => "sailor",
     };
     TaskId::new(prefix, n)
 }
@@ -1067,6 +1080,7 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
                 TaskKind::MonitorCommand => "monitor (command)",
                 TaskKind::MonitorWebSocket => "monitor (WebSocket)",
                 TaskKind::BackgroundBash => "background bash",
+                TaskKind::Sailor => "sailor (subagent)",
             };
             lines.push(format!(
                 "  {id} — {kind_str} — \"{desc}\" (events: {n})",
@@ -1629,5 +1643,36 @@ mod tests {
             thread_notify("t-cleanup").is_none(),
             "mailbox removed from the per-thread map"
         );
+    }
+
+    /// `cancel_all_for_thread` is the cancel half of thread teardown —
+    /// `cleanup_thread` only drops entries. A Sailor owned by the deleting
+    /// thread must have its token cancelled + status driven to SessionEnded,
+    /// while another thread's task is untouched.
+    #[tokio::test]
+    async fn cancel_all_for_thread_cancels_owned_tasks() {
+        use tokio_util::sync::CancellationToken;
+        let cancel = CancellationToken::new();
+        let (_id, task) = register(
+            TaskKind::Sailor,
+            "t-x1".into(),
+            "test".into(),
+            cancel.clone(),
+        );
+        assert!(!cancel.is_cancelled(), "pre: token not yet cancelled");
+        cancel_all_for_thread("t-x1").await;
+        assert!(cancel.is_cancelled(), "owned task's token was cancelled");
+        assert_eq!(task.status(), TaskStatus::SessionEnded);
+
+        // A different thread's task is not affected.
+        let other = CancellationToken::new();
+        let (_id2, _task2) = register(
+            TaskKind::Sailor,
+            "t-other".into(),
+            "other".into(),
+            other.clone(),
+        );
+        cancel_all_for_thread("t-x1").await; // already terminal — no-op
+        assert!(!other.is_cancelled(), "other thread's task untouched");
     }
 }

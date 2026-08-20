@@ -8,7 +8,7 @@
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,8 +54,10 @@ use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
 use crate::external_session::{
-    ExternalSession, ResumeSidecar, SessionKind, list_sidecars, merge_external_summaries,
-    remove_sidecar, resume_args, write_sidecar,
+    ExternalSession, ResumeSidecar, SessionKind, claude_cwd_from_file_head,
+    claude_project_dir_for_cwd, claude_session_id_from_file_name, codex_session_id_from_rollout,
+    codex_sessions_dir, list_nested_jsonl, list_sidecars, list_top_level_jsonl,
+    merge_external_summaries, new_file_names, remove_sidecar, resume_args, write_sidecar,
 };
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
@@ -463,6 +465,10 @@ pub struct Workspace {
     /// shows a loading indicator on each such row. A set (not a single slot)
     /// so resuming two rows concurrently cannot steal each other's spinner.
     resuming_external: std::collections::HashSet<String>,
+    /// Conversation file names already claimed by a live session's CLI-session
+    /// watcher, keyed by watched directory — concurrent watchers on the same
+    /// directory (two sessions in one cwd) can never claim the same file.
+    cli_session_claims: std::collections::HashMap<PathBuf, std::collections::HashSet<String>>,
     /// The currently-displayed external session id when
     /// `view_mode == ExternalSession`. Mirrors `terminal_view`'s "one at a
     /// time" model; switching away parks the session (its terminal keeps
@@ -712,6 +718,7 @@ impl Workspace {
             external_sessions: Vec::new(),
             resumable_external: list_sidecars(),
             resuming_external: std::collections::HashSet::new(),
+            cli_session_claims: std::collections::HashMap::new(),
             active_external: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
@@ -1024,28 +1031,45 @@ impl Workspace {
                     verdict,
                     ..
                 } => {
-                    // Show a brief autopilot decision record in the
-                    // MessageList, mirroring Codex's approval cell. Anchored
-                    // next to the tool call that triggered it, so approval
-                    // records cluster at their occurrence position instead of
-                    // piling at the conversation tail.
-                    let msg = match &verdict {
-                        agent::approval::ReviewVerdict::Allow => i18n::t_str(
-                            "workspace-approval-autopilot-allowed",
-                            &[("tool", tool_title.as_str())],
-                        )
-                        .to_string(),
-                        agent::approval::ReviewVerdict::Ask { reason } => i18n::t_str(
-                            "workspace-approval-autopilot-escalated",
-                            &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
-                        )
-                        .to_string(),
-                    };
-                    let anchor = this
-                        .conversation
-                        .read(cx)
-                        .notice_anchor_for_tool(tool_call_id, cx);
-                    this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
+                    match &verdict {
+                        // Auto-approved: no notice card. The badge rides the
+                        // tool-call row itself (check-check ahead of the
+                        // status icon); persist a marker note so a rebuild
+                        // reproduces it. The verdict may land before the
+                        // creating `ToolCall` event (documented ordering
+                        // race) — park it so the `ToolCall` arm stamps the
+                        // item once it exists, and persist the note either
+                        // way so live and rebuild agree.
+                        agent::approval::ReviewVerdict::Allow => {
+                            this.conversation.update(cx, |c, cx| {
+                                if !c.mark_auto_approved(tool_call_id, cx) {
+                                    c.buffer_auto_approval(tool_call_id);
+                                }
+                            });
+                            this.append_ui_note(
+                                agent::db::UiNoteKind::AutoApproval,
+                                String::new(),
+                                Some(tool_call_id.as_str()),
+                                cx,
+                            );
+                            cx.notify();
+                        }
+                        // Escalated for review: keep the anchored decision
+                        // record so the reason clusters at the tool call that
+                        // triggered it instead of piling at the tail.
+                        agent::approval::ReviewVerdict::Ask { reason } => {
+                            let msg = i18n::t_str(
+                                "workspace-approval-autopilot-escalated",
+                                &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
+                            )
+                            .to_string();
+                            let anchor = this
+                                .conversation
+                                .read(cx)
+                                .notice_anchor_for_tool(tool_call_id, cx);
+                            this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
+                        }
+                    }
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -1634,6 +1658,10 @@ impl Workspace {
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let is_current = this.thread.read(cx).id.0 == *id;
                     let store = agent::thread_store_global();
+                    // Team teardown is the store's centralized invariant
+                    // (leader-gated); an explicit disband here would destroy
+                    // a whole team when a member row is archived and strand
+                    // the leader with a dangling team ref.
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
@@ -1817,12 +1845,24 @@ impl Workspace {
         // home dir), so a project-scoped session would operate on the wrong
         // tree.
         let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        // claude's conversation id is assigned here (up front) so the sidecar
+        // targets it on resume without racing any on-disk discovery; codex /
+        // copilot name their own sessions (codex is captured by the watcher
+        // while live).
+        let spawn_cli_session_id =
+            (kind == SessionKind::ClaudeCode).then(|| uuid::Uuid::new_v4().to_string());
+        let mut spawn_args: Vec<String> = Vec::new();
+        if let Some(sid) = &spawn_cli_session_id {
+            spawn_args.push("--session-id".into());
+            spawn_args.push(sid.clone());
+        }
         let mut builder = cx::AgentBuilder::new()
             .agent(agent)
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
-            .cwd(cwd.clone());
+            .cwd(cwd.clone())
+            .passthrough(spawn_args);
         if let Some(w) = &wire_api {
             builder = builder.wire_api(w.clone());
         }
@@ -1888,7 +1928,9 @@ impl Workspace {
             model: model_id,
             wire_api: wire_api.clone(),
             title: None,
+            cli_session_id: spawn_cli_session_id,
         };
+        let watch_cli_session_id = sidecar.cli_session_id.clone();
         if let Err(e) = write_sidecar(&sidecar) {
             tracing::warn!(error = %e, id, "external session sidecar write failed");
         }
@@ -1905,6 +1947,7 @@ impl Workspace {
             _exit_sub: exit_sub,
             sidecar: Some(sidecar),
         });
+        self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, window, cx);
     }
@@ -2150,7 +2193,7 @@ impl Workspace {
         // The cx spawn (config load, keychain resolve, process spawn, socket
         // bind) is pure I/O, so it runs off the UI thread and the spinner
         // stays live while the CLI boots.
-        let args = resume_args(&sidecar.agent_id);
+        let args = resume_args(&sidecar.agent_id, sidecar.cli_session_id.as_deref());
         let provider = sidecar.provider.clone();
         let model = sidecar.model.clone();
         let wire = sidecar.wire_api.clone();
@@ -2213,6 +2256,9 @@ impl Workspace {
                     .and_then(crate::external_session::cx_session_id_from_socket)
                     .unwrap_or_default();
                 let view = TerminalView::new(terminal, cx);
+                // Watch inputs captured before `sidecar` moves into the session.
+                let watch_cwd = PathBuf::from(&sidecar.cwd);
+                let watch_initial = sidecar.cli_session_id.clone();
                 this.external_sessions.push(ExternalSession {
                     id: id.clone(),
                     kind,
@@ -2229,10 +2275,227 @@ impl Workspace {
                     // keeps the row fresh for a possible later exit.
                     sidecar: Some(sidecar),
                 });
+                this.start_cli_session_watch(&id, kind, &watch_cwd, watch_initial, cx);
                 this.resuming_external.remove(&id);
                 this.sync_sidebar_external(cx);
                 this.attach_external_session(&id, window, cx);
             });
+        })
+        .detach();
+    }
+
+    /// Watch the CLI's on-disk conversation storage for this live session and
+    /// record its native session id in the sidecar the moment it appears —
+    /// the capture that lets a later resume target exactly this session's
+    /// conversation. claude's id is assigned by manox at spawn
+    /// (`--session-id`) and seeded into the snapshot + claims ledger
+    /// synchronously, so the watcher there only tracks later forks
+    /// (`/clear`, resume-forks); codex names its own sessions, so the watcher
+    /// is the primary capture. Runs for fresh spawns and resumes alike. The
+    /// task polls every 500ms, self-terminates when the session is removed,
+    /// and releases its ledger claims on exit. No-op for kinds without
+    /// capture support (copilot / plain terminal).
+    fn start_cli_session_watch(
+        &mut self,
+        id: &str,
+        kind: SessionKind,
+        cwd: &Path,
+        initial_cli_session_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Watch root + synchronous pre-session snapshot: any conversation
+        // file appearing after this point belongs to this session.
+        let (watch_dir, snapshot, nested, seed_claims) = match kind {
+            SessionKind::ClaudeCode => {
+                let Some(dir) = claude_project_dir_for_cwd(cwd) else {
+                    return;
+                };
+                let mut snap = list_top_level_jsonl(&dir);
+                let mut seeds: Vec<String> = Vec::new();
+                if let Some(sid) = &initial_cli_session_id {
+                    let name = format!("{sid}.jsonl");
+                    snap.insert(name.clone());
+                    // Seed the ledger synchronously: without this, a second
+                    // same-cwd watcher started inside this watcher's first
+                    // tick window (~500ms) could claim this session's file
+                    // and record the wrong id in its own sidecar.
+                    self.cli_session_claims
+                        .entry(dir.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    seeds.push(name);
+                }
+                (dir, snap, false, seeds)
+            }
+            SessionKind::Codex => {
+                let Some(dir) = codex_sessions_dir() else {
+                    return;
+                };
+                // Full recursive walk of the sessions tree every tick — fine
+                // at current scale; date-dir pruning or a slower cadence is
+                // the lever if the history grows huge.
+                let snap = list_nested_jsonl(&dir);
+                (dir, snap, true, Vec::new())
+            }
+            SessionKind::GithubCopilot | SessionKind::Terminal => return,
+        };
+        // claude only: a newly appearing sibling project dir whose transcripts
+        // carry the session's cwd wins over the computed slug (adoption).
+        let canonical_cwd = std::fs::canonicalize(cwd)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string));
+        let mut root_dir_names: HashSet<String> = watch_dir
+            .parent()
+            .and_then(|root| std::fs::read_dir(root).ok())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let session_id_key = id.to_string();
+        let this = cx.weak_entity();
+        cx.spawn(async move |_this, cx| {
+            let mut watch_dir = watch_dir;
+            let mut snapshot = snapshot;
+            let mut claimed_any = initial_cli_session_id.is_some();
+            let mut adoption_done = false;
+            let mut my_claims: Vec<String> = seed_claims;
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let dir = watch_dir.clone();
+                let snap = snapshot.clone();
+                let roots = root_dir_names.clone();
+                let canonical = canonical_cwd.clone();
+                let scan_nested = nested;
+                let do_adoption = !nested && !claimed_any && !adoption_done;
+                let (candidates, adopted) = cx
+                    .background_spawn(async move {
+                        let current = if scan_nested {
+                            list_nested_jsonl(&dir)
+                        } else {
+                            list_top_level_jsonl(&dir)
+                        };
+                        let candidates: Vec<(String, Option<String>)> =
+                            new_file_names(&snap, &current)
+                                .into_iter()
+                                .map(|name| {
+                                    let sid = if scan_nested {
+                                        codex_session_id_from_rollout(&dir.join(&name))
+                                    } else {
+                                        claude_session_id_from_file_name(&name)
+                                    };
+                                    (name, sid)
+                                })
+                                .collect();
+                        let mut adopted: Option<(PathBuf, HashSet<String>)> = None;
+                        if do_adoption
+                            && let Some(canonical) = &canonical
+                            && let Some(root) = dir.parent()
+                            && let Ok(entries) = std::fs::read_dir(root)
+                        {
+                            for e in entries.flatten() {
+                                let name = e.file_name().to_string_lossy().into_owned();
+                                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                                if !is_dir || roots.contains(&name) {
+                                    continue;
+                                }
+                                let candidate_dir = e.path();
+                                let listing = list_top_level_jsonl(&candidate_dir);
+                                let matches = listing.iter().any(|f| {
+                                    claude_cwd_from_file_head(&candidate_dir.join(f), 8 * 1024)
+                                        .as_deref()
+                                        == Some(canonical.as_str())
+                                });
+                                if matches {
+                                    adopted = Some((candidate_dir, listing));
+                                    break;
+                                }
+                            }
+                        }
+                        (candidates, adopted)
+                    })
+                    .await;
+                // Candidates whose id resolved join the snapshot whatever the
+                // claim outcome (claimed here, or owned by another watcher);
+                // id-less codex rollouts stay out so the next tick retries.
+                let resolved_names: Vec<String> = candidates
+                    .iter()
+                    .filter(|(_, sid)| sid.is_some())
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let dir_for_claims = watch_dir.clone();
+                let claimed_files = this
+                    .update(cx, |this, _cx| -> Option<Vec<String>> {
+                        if !this
+                            .external_sessions
+                            .iter()
+                            .any(|s| s.id == session_id_key)
+                        {
+                            return None;
+                        }
+                        let ledger = this.cli_session_claims.entry(dir_for_claims).or_default();
+                        let mut claimed = Vec::new();
+                        for (file, sid) in candidates {
+                            let Some(sid) = sid else { continue };
+                            if !ledger.insert(file.clone()) {
+                                continue;
+                            }
+                            if let Some(session) = this
+                                .external_sessions
+                                .iter_mut()
+                                .find(|s| s.id == session_id_key)
+                                && let Some(sidecar) = session.sidecar.as_mut()
+                            {
+                                sidecar.cli_session_id = Some(sid);
+                                if let Err(e) = write_sidecar(sidecar) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        id = session_id_key,
+                                        "external session sidecar cli-session-id update failed"
+                                    );
+                                }
+                                claimed.push(file);
+                            }
+                        }
+                        Some(claimed)
+                    })
+                    .unwrap_or(None);
+                let Some(claimed_files) = claimed_files else {
+                    break;
+                };
+                snapshot.extend(resolved_names);
+                if !claimed_files.is_empty() {
+                    claimed_any = true;
+                    my_claims.extend(claimed_files);
+                }
+                if let Some((dir, _listing)) = adopted {
+                    // The adopted dir did not exist at session start, so every
+                    // file in it belongs to this session: reset the snapshot to
+                    // empty and let the next tick claim them all.
+                    watch_dir = dir;
+                    snapshot = HashSet::new();
+                    root_dir_names.clear();
+                    adoption_done = true;
+                }
+            }
+            // The session is gone: release this watcher's claims so the
+            // ledger does not grow unboundedly (future watchers snapshot the
+            // dirs afresh at their own spawn).
+            if !my_claims.is_empty() {
+                let _ = this.update(cx, |this, _cx| {
+                    this.cli_session_claims.retain(|_dir, claimed| {
+                        for name in &my_claims {
+                            claimed.remove(name);
+                        }
+                        !claimed.is_empty()
+                    });
+                });
+            }
         })
         .detach();
     }
@@ -3161,6 +3424,7 @@ impl Workspace {
                     streaming: false,
                     collapsed: false,
                     user_toggled: false,
+                    auto_approved: false,
                     panel: None,
                 },
                 role,
@@ -3195,6 +3459,30 @@ impl Workspace {
         let store = agent::thread_store_global();
         store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
         true
+    }
+
+    /// UI entry for the member panel's dismiss button: the `TeamDismiss`
+    /// op on the leader thread (cancel, archive session, release tasks,
+    /// drop from roster).
+    pub(crate) fn dismiss_member(
+        &mut self,
+        team: gpui::WeakEntity<agent::team::Team>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Route through the team's leader thread, not the active one: the
+        // panel outlives thread switches, and `execute_team_op` resolves the
+        // roster off the calling thread's team.
+        let Some(leader) = team.upgrade().and_then(|t| t.read(cx).leader().upgrade()) else {
+            return;
+        };
+        leader.update(cx, |t, cx| {
+            let _ = agent::team::tools::execute_team_op(
+                t,
+                agent::thread_engine::TeamOp::Dismiss { name },
+                cx,
+            );
+        });
     }
 
     /// Archive the active thread and open a fresh one that inherits the
@@ -4589,11 +4877,12 @@ impl Workspace {
 
     /// The pi-harness model selector. Reads the shared pi provider registry
     /// (the streaming source of truth): closed, a ghost button showing
-    /// `provider · model` with the model name tinted by wire api; open, a
-    /// PopupMenu of provider submenus.
+    /// `provider · model · effort` with the model name tinted by wire api;
+    /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
         let model = self.thread.read(cx).model().cloned();
+        let effort = self.thread.read(cx).reasoning_effort();
 
         let trigger = h_flex()
             .id("model-trigger")
@@ -4623,6 +4912,12 @@ impl Workspace {
                         .text_xs()
                         .text_color(model_color)
                         .child(agent::pi_providers::display_name(m))
+                        .into_any_element(),
+                    dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(effort.wire_value().to_string())
                         .into_any_element(),
                 ]
             } else {
