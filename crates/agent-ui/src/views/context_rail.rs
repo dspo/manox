@@ -699,12 +699,9 @@ impl ContextRail {
                 .gap_1p5()
                 .items_center()
                 .child(Self::captain_status_indicator(main_status, theme))
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.foreground)
-                        .child(i18n::t("context-agents-captain")),
-                )
+                .child(gpui::div().text_xs().text_color(theme.foreground).child(
+                    crate::views::message::author_display(&agent::MessageAuthor::Lead),
+                ))
                 .into_any_element(),
         ];
         // Flat list: pi sub-agents are ephemeral nested sessions that never

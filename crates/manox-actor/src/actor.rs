@@ -810,7 +810,13 @@ fn handle_command(
                             &pending.plan_file,
                         )
                     });
-                    t.approve_plan(compact, compact_instructions, seed_text, cx);
+                    let ui = MessageUiMetadata {
+                        model_id: t.model().map(|m| m.id.clone()),
+                        approval_mode: Some(t.approval_mode().as_i64()),
+                        author: Some(t.self_author()),
+                        ..Default::default()
+                    };
+                    t.approve_plan(compact, compact_instructions, seed_text, Some(ui), cx);
                 });
             });
         }),
@@ -824,6 +830,7 @@ fn handle_command(
                     let ui = MessageUiMetadata {
                         model_id: t.model().map(|m| m.id.clone()),
                         approval_mode: Some(t.approval_mode().as_i64()),
+                        author: Some(t.self_author()),
                         ..Default::default()
                     };
                     let lang = t.agent_language();

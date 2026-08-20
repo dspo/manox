@@ -38,6 +38,12 @@ pub struct UserTurnMeta {
     /// path so `render_user` can show a "steered" badge and historical reload
     /// keeps the marker.
     pub steered: bool,
+    /// The agent that authored this user turn; `None` = human input and
+    /// the bubble header shows the localized "You".
+    pub author: Option<agent::MessageAuthor>,
+    /// Mirrors `MessageUiMetadata::peer`: team peer delivery, rebuilt as a
+    /// team bubble on reload.
+    pub peer: bool,
 }
 
 /// Live-only presentation state for a user bubble submitted as a steer.
@@ -58,6 +64,8 @@ impl UserTurnMeta {
             model_id,
             approval_mode,
             steered: false,
+            author: None,
+            peer: false,
         }
     }
 
@@ -68,6 +76,8 @@ impl UserTurnMeta {
             model_id: ui.and_then(|m| m.model_id.clone()).unwrap_or_default(),
             approval_mode: ui.and_then(|m| m.approval_mode).map(ApprovalMode::from_i64),
             steered: ui.and_then(|m| m.steered).unwrap_or(false),
+            author: ui.and_then(|m| m.author.clone()),
+            peer: ui.map(|m| m.peer).unwrap_or(false),
         }
     }
 }

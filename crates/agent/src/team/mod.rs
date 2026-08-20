@@ -33,6 +33,12 @@ pub const LEADER_NAME: &str = "lead";
 /// notifications) delivered to the leader like peer mail.
 pub const TEAM_NOTICE_FROM: &str = "team";
 
+/// Attribution for a routing name: the leader resolves to the main agent,
+/// every other name is a named agent (team member / manifest definition).
+pub fn author_for(name: &str) -> crate::message::MessageAuthor {
+    crate::message::MessageAuthor::from_routing(name)
+}
+
 /// Maximum worker members (excluding the leader). The whole team — leader +
 /// workers — is bounded at 6.
 pub const MAX_WORKERS: usize = 5;
@@ -520,6 +526,13 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("lead"), "got: {text}");
         assert!(text.contains("hello"), "got: {text}");
+        let ui = msgs[0]
+            .ui
+            .as_ref()
+            .expect("peer delivery carries attribution");
+        assert_eq!(ui.author, Some(crate::message::MessageAuthor::Lead));
+        assert!(ui.peer);
+        assert_eq!(ui.display_text.as_deref(), Some("hello"));
         let evs = events.lock().unwrap();
         assert_eq!(evs.len(), 1, "PeerMessage emitted once: {evs:?}");
         assert_eq!(evs[0], ("lead".to_string(), "hello".to_string()));
