@@ -998,6 +998,14 @@ fn build_tools(
             }
         }
     }
+    // Steer bus: constructed before the model-gated subagent block so the
+    // SteerTool is always registered (even when no model is resolved yet —
+    // Dispatch returns an error until set_subagent_tool is called).
+    let bus = crate::steer_bus::AgentBus::new(owner_thread_id.to_string(), notice_tx.clone());
+    tools.push(Arc::new(crate::steer_bus::SteerTool::new(
+        Arc::clone(&bus),
+        pi_extensions::steer_bus::AgentId::Captain,
+    )));
     // Plan-mode gate resolver: whether a subagent type is read-only. The
     // sub-agent tool needs a concrete model; a session assembled before
     // registration landed (first seconds after launch) skips it, defaulting
@@ -1087,16 +1095,13 @@ fn build_tools(
             }
         };
         let subagent = Arc::new(subagent);
-        let bus = Arc::new(crate::steer_bus::AgentBus::new(
-            owner_thread_id.to_string(),
-            notice_tx.clone(),
+        let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
+            cwd.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
         ));
-        tools.push(Arc::new(crate::steer_bus::SteerTool::new(
-            Arc::clone(&bus),
-            pi_extensions::steer_bus::AgentId::Captain,
-        )));
-        // Phase D wires: bus.bind_captain + spawn_subagent_session.
-        let _ = subagent;
+        bus.set_subagent_tool(subagent);
+        bus.set_tool_ctx(sailor_ctx);
         resolver
     } else {
         Arc::new(|_: &str| false)
@@ -1106,6 +1111,7 @@ fn build_tools(
         SessionOrchestrators {
             monitor,
             background: manager,
+            bus,
         },
         read_only_subagent,
     )
@@ -1134,26 +1140,22 @@ fn worktree_policy(
         crate::sandbox::SandboxPolicy::for_project(cwd)
     }
 }
-
-/// Session-scoped orchestrators that attach once a session exists: the
-/// monitor manager (background command / WebSocket monitors) and the bash
-/// background manager. Both are held by the session's tools as well, so the
-/// managers live exactly as long as their session — a replaced session drops
-/// its tools, and the monitor manager's `Drop` stops every monitor.
 struct SessionOrchestrators {
     monitor: Arc<MonitorManager>,
     background: Arc<BackgroundManager>,
+    bus: Arc<crate::steer_bus::AgentBus>,
 }
 
 /// Bind the orchestrators to a freshly built session: the monitor steerer
-/// lands events in the session's steering queue, and the background manager
-/// subscribes to the session's lifecycle.
+/// lands events in the session's steering queue, the background manager
+/// subscribes to the session's lifecycle, and the Steer bus gets the
+/// Captain's session handle for late-bind routing.
 fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators) {
     let handle = session.handle();
     orch.monitor.attach(&handle);
     orch.background.attach(session);
+    orch.bus.bind_captain(handle);
 }
-
 fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
     let mut content = vec![ContentBlock::Text {
         text,

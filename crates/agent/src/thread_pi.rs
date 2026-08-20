@@ -582,10 +582,54 @@ impl Thread {
                 self.refresh_history(cx);
             }
             BackendNotice::BusRequest { op, responder } => {
-                // Phase D stub: BusOp handler (SpawnMember/InjectMember/
-                // AbortMember) not yet wired — reply with error.
-                let _ = op;
-                let _ = responder.try_send(Err("BusRequest handler not implemented yet".to_string()));
+                use pi_extensions::steer_bus::BusOp;
+                let result: Result<String, String> = match op {
+                    BusOp::SpawnMember { name, prompt } => {
+                        let member = self.new_team_member(name.clone(), cx);
+                        let mid = member.read(cx).id.0.clone();
+                        let store = crate::thread_store::global();
+                        store.update(cx, |s, cx| {
+                            s.register_live_thread(&mid, member.downgrade());
+                            s.refresh(cx);
+                        });
+                        member.update(cx, |t, cx| {
+                            let ui = crate::MessageUiMetadata {
+                                author: Some(crate::team::author_for("captain")),
+                                ..Default::default()
+                            };
+                            t.insert_user_message_with_ui_metadata(prompt, Some(ui), cx);
+                            t.run_turn(cx);
+                        });
+                        Ok(mid)
+                    }
+                    BusOp::InjectMember { thread_id, payload } => {
+                        let store = crate::thread_store::global();
+                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
+                            let _ = responder.try_send(Err(format!("member {thread_id} not found")));
+                            return;
+                        };
+                        thread.update(cx, |t, cx| {
+                            t.deliver_peer_messages(
+                                vec![crate::team::PeerMessage {
+                                    from: "captain".into(),
+                                    content: payload,
+                                }],
+                                cx,
+                            );
+                        });
+                        Ok("injected".into())
+                    }
+                    BusOp::AbortMember { thread_id } => {
+                        let store = crate::thread_store::global();
+                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
+                            let _ = responder.try_send(Err(format!("member {thread_id} not found")));
+                            return;
+                        };
+                        thread.update(cx, |t, cx| t.cancel(cx));
+                        Ok("aborted".into())
+                    }
+                };
+                let _ = responder.try_send(result);
             }
             BackendNotice::BrowserRequest { op, responder } => {
                 // The browser host is a gpui main-thread surface; the tool
@@ -718,6 +762,12 @@ impl Thread {
                     failed,
                     stranded_steer_ids: stranded,
                 });
+                // Re-fire: if peer messages arrived during the run
+                // (pending_prompts non-empty), start a follow-up turn.
+                // Mirrors manox-actor pending_submits drain.
+                if !self.pending_prompts.is_empty() {
+                    self.run_turn(cx);
+                }
             }
             BackendNotice::Fatal(err) => {
                 self.running = false;
