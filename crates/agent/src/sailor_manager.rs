@@ -129,9 +129,10 @@ impl SailorManager {
                     // Only revive the Captain with real content; an empty
                     // summary is a no-op turn.
                     if !content.is_empty() {
-                        let _ = notice_tx.send(BackendNotice::SailorCompleted {
-                            sailor_id: sailor_label,
-                            content,
+                        let _ = notice_tx.send(BackendNotice::SteerDelivered {
+                            from: pi_extensions::steer_bus::AgentId::Subagent(sailor_label),
+                            reason: pi_extensions::steer_bus::SteerReason::Complete,
+                            payload: pi_extensions::steer_bus::SteerPayload { text: content },
                         });
                     }
                 }
@@ -152,9 +153,12 @@ impl SailorManager {
                             snapshot: task.snapshot(&task_id),
                         },
                     )));
-                    let _ = notice_tx.send(BackendNotice::SailorCompleted {
-                        sailor_id: sailor_label,
-                        content: format!("Sailor failed before producing output: {e}"),
+                    let _ = notice_tx.send(BackendNotice::SteerDelivered {
+                        from: pi_extensions::steer_bus::AgentId::Subagent(sailor_label),
+                        reason: pi_extensions::steer_bus::SteerReason::Complete,
+                        payload: pi_extensions::steer_bus::SteerPayload {
+                            text: format!("Sailor failed before producing output: {e}"),
+                        },
                     });
                 }
             }

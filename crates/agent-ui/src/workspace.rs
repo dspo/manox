@@ -3470,19 +3470,9 @@ impl Workspace {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        // Route through the team's leader thread, not the active one: the
-        // panel outlives thread switches, and `execute_team_op` resolves the
-        // roster off the calling thread's team.
-        let Some(leader) = team.upgrade().and_then(|t| t.read(cx).leader().upgrade()) else {
-            return;
-        };
-        leader.update(cx, |t, cx| {
-            let _ = agent::team::tools::execute_team_op(
-                t,
-                agent::thread_engine::TeamOp::Dismiss { name },
-                cx,
-            );
-        });
+        // Phase E: dismiss_member retired with Entity<Team> — use
+        // Steer(Abort, to=member_thread_id) instead. Stubbed for now.
+        let _ = (team, name);
     }
 
     /// Archive the active thread and open a fresh one that inherits the

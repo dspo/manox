@@ -581,11 +581,11 @@ impl Thread {
                 // replaces this mirror.
                 self.refresh_history(cx);
             }
-            BackendNotice::TeamRequest { op, responder } => {
-                // Team state is gpui-side (entities); execute the op here
-                // and reply through the tool's responder channel.
-                let result = crate::team::tools::execute_team_op(self, op, cx);
-                let _ = responder.try_send(result);
+            BackendNotice::BusRequest { op, responder } => {
+                // Phase D stub: BusOp handler (SpawnMember/InjectMember/
+                // AbortMember) not yet wired — reply with error.
+                let _ = op;
+                let _ = responder.try_send(Err("BusRequest handler not implemented yet".to_string()));
             }
             BackendNotice::BrowserRequest { op, responder } => {
                 // The browser host is a gpui main-thread surface; the tool
@@ -735,14 +735,19 @@ impl Thread {
                 let store = crate::thread_store::global();
                 store.update(cx, |s, cx| s.refresh(cx));
             }
-            BackendNotice::SailorCompleted { sailor_id, content } => {
-                // Deliver the Sailor's final text as a peer message and let
-                // a turn fire — the Captain reliably observes the result
-                // without polling. Mirrors the Team leader-inbox path.
+            BackendNotice::SteerDelivered { from, reason: _, payload } => {
+                // Deliver the subagent's final text as a peer message and
+                // let a turn fire — the Captain reliably observes the
+                // result without polling.
+                let sender = match &from {
+                    pi_extensions::steer_bus::AgentId::Subagent(addr) => addr.clone(),
+                    pi_extensions::steer_bus::AgentId::Captain => "captain".to_string(),
+                    pi_extensions::steer_bus::AgentId::User => "user".to_string(),
+                };
                 self.deliver_peer_messages(
                     vec![crate::team::PeerMessage {
-                        from: sailor_id,
-                        content,
+                        from: sender,
+                        content: payload.text,
                     }],
                     cx,
                 );
