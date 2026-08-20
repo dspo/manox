@@ -826,7 +826,11 @@ fn build_tools(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
     owner_thread_id: &str,
-) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
+) -> (
+    Vec<Arc<dyn PiAgentTool>>,
+    SessionOrchestrators,
+    crate::plan_mode::ReadOnlySubagentResolver,
+) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (writes + network confined; shell state does
     // not persist — the tool's `cwd` parameter pins each call), otherwise
@@ -1099,9 +1103,14 @@ fn build_tools(
             }
         }
     }
-    // The sub-agent tool needs a concrete model; a session assembled before
-    // registration landed (first seconds after launch) skips it.
-    if let Some(model) = model {
+    // Plan-mode gate resolver: whether a subagent type is read-only. The
+    // sub-agent tool needs a concrete model; a session assembled before
+    // registration landed (first seconds after launch) skips it, defaulting
+    // to a resolver that blocks every `Agent` call. When the registry is
+    // built below the resolver shares that exact `AgentRegistry` Arc so the
+    // gate's read-only notion can never diverge from `SailorRoutingTool`'s
+    // capability routing.
+    let read_only_subagent = if let Some(model) = model {
         let mut registry = AgentRegistry::new();
         register_defaults(&mut registry);
         // User-authored (~/.manox/agents) + plugin-provided
@@ -1122,6 +1131,14 @@ fn build_tools(
             })
             .collect();
         let registry = Arc::new(registry);
+        let resolver: crate::plan_mode::ReadOnlySubagentResolver = {
+            let r = Arc::clone(&registry);
+            Arc::new(move |name: &str| {
+                r.get(name)
+                    .map(subagent_capability)
+                    .is_some_and(|c| c == "read-only")
+            })
+        };
         let subagent = SubagentTool::new(
             registry.clone(),
             vec![
@@ -1202,13 +1219,17 @@ fn build_tools(
             registry,
             sailor,
         }));
-    }
+        resolver
+    } else {
+        Arc::new(|_: &str| false)
+    };
     (
         tools,
         SessionOrchestrators {
             monitor,
             background: manager,
         },
+        read_only_subagent,
     )
 }
 
@@ -1812,8 +1833,12 @@ fn session_builder(
     worktree: &crate::worktree::WorktreeState,
     parent_session: Option<&str>,
     owner_thread_id: &str,
-) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
-    let (tools, orchestrators) = build_tools(
+) -> (
+    pi::coding_agent::AgentSessionBuilder,
+    SessionOrchestrators,
+    crate::plan_mode::ReadOnlySubagentResolver,
+) {
+    let (tools, orchestrators, read_only_subagent) = build_tools(
         cwd,
         runtime,
         model,
@@ -1841,7 +1866,7 @@ fn session_builder(
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
     }
-    (builder, orchestrators)
+    (builder, orchestrators, read_only_subagent)
 }
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
@@ -1861,6 +1886,7 @@ fn attach_plan_hooks(
     session: &mut AgentSession,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     cwd: &Path,
+    read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver,
 ) {
     session.on(
         pi::harness::HookPoint::BeforeAgentStart,
@@ -1869,7 +1895,12 @@ fn attach_plan_hooks(
     let plans_dir = crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans"));
     session.on(
         pi::harness::HookPoint::ToolCall,
-        crate::plan_mode::gate_handler(Arc::clone(plan), plans_dir, cwd.to_path_buf()),
+        crate::plan_mode::gate_handler(
+            Arc::clone(plan),
+            plans_dir,
+            cwd.to_path_buf(),
+            read_only_subagent,
+        ),
     );
 }
 
@@ -2142,7 +2173,7 @@ async fn run_actor(
         // projects the session's own model only when the builder carries
         // none (TS `options.model > restored model`), and the actor adopts
         // it right after the open below.
-        let (builder, orchestrators) = session_builder(
+        let (builder, orchestrators, read_only_subagent) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
@@ -2165,7 +2196,7 @@ async fn run_actor(
                     notice_tx.clone(),
                     thread_id.clone(),
                 );
-                attach_plan_hooks(&mut s, &state.plan, &tool_cwd);
+                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_path_policy_hooks(&mut s, &tool_cwd, &state.gate);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 adopt_session_model(&s, &mut pi_model, &state);
@@ -2184,7 +2215,7 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, orchestrators) = session_builder(
+            let (builder, orchestrators, read_only_subagent) = session_builder(
                 &cwd,
                 &sessions_dir,
                 &runtime,
@@ -2210,7 +2241,7 @@ async fn run_actor(
                         notice_tx.clone(),
                         thread_id.clone(),
                     );
-                    attach_plan_hooks(&mut s, &state.plan, &cwd);
+                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                     attach_plugin_hooks(&mut s, &cwd);
                     s
@@ -2979,7 +3010,7 @@ async fn run_actor(
                 refresh_session_list(&repo, &state).await;
             }
             SessionCmd::NewSession { cwd, project } => {
-                let (builder, orchestrators) = session_builder(
+                let (builder, orchestrators, read_only_subagent) = session_builder(
                     &cwd,
                     &sessions_dir,
                     &runtime,
@@ -3006,7 +3037,7 @@ async fn run_actor(
                             notice_tx.clone(),
                             thread_id.clone(),
                         );
-                        attach_plan_hooks(&mut s, &state.plan, &cwd);
+                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                         attach_path_policy_hooks(&mut s, &cwd, &state.gate);
                         attach_plugin_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
@@ -3132,7 +3163,7 @@ async fn rebuild_session(
     // Like the startup restore, a session swap passes no model override so
     // the opened session's own persisted model wins (TS `options.model >
     // restored model`); the actor adopts it right after the open.
-    let (builder, orchestrators) = session_builder(
+    let (builder, orchestrators, read_only_subagent) = session_builder(
         &cwd,
         sessions_dir,
         runtime,
@@ -3155,7 +3186,7 @@ async fn rebuild_session(
                 notice_tx.clone(),
                 thread_id.to_string(),
             );
-            attach_plan_hooks(&mut s, plan, &cwd);
+            attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
             // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
             // the same path policy as fresh builds — without it the
             // replaced session loses write confinement entirely.

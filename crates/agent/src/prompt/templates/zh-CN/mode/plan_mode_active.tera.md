@@ -2,6 +2,7 @@
 Plan 模式已开启。你必须保持工作树与系统的只读语义：
 - 绝不创建、修改、删除、重命名工作树文件。
 - 绝不执行状态变更命令（`git commit`、安装依赖、迁移等）——plan 模式期间 `Bash` 等变更类工具会被拦截。
+- 只读子 agent（经 `Agent` 工具的 `Explore`，不带 `isolation`）仍可用于委派调研；写入/执行类子 agent（`Sailor`）及任何 `isolation: "worktree"` 派发会被拦截。
 - `{{ plans_dir }}` 下的 plan 文件是会话本地的规划产物：可以用 `Write`/`Edit` 创建或更新（这类写入免审批）。
 - 必须把正式 plan 写入 `{{ plans_dir }}/<slug>-plan.md`。
 
