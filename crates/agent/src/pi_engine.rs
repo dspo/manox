@@ -1044,6 +1044,12 @@ async fn settle_run(
         ))));
     }
     state.running.store(false, Ordering::Relaxed);
+    // Mid-run appends parked their persistence (the run owned the session);
+    // persist before the authoritative sync so the rebuilt mirror keeps them.
+    let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
+    for record in parked {
+        let _ = persist_ui_note(session, &record).await;
+    }
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
     refresh_session_list(repo, state).await;
@@ -4051,7 +4057,7 @@ mod tests {
             history: Mutex::new(Vec::new()),
             notes: Mutex::new(Vec::new()),
             notes_gen: AtomicU64::new(0),
-        pending_ui_notes: Mutex::new(Vec::new()),
+            pending_ui_notes: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
@@ -4465,24 +4471,41 @@ mod tests {
             stream.turn2_started.notified().await;
             stream.release2.notify_waiters();
         });
+        // Settlement persists the parked note BEFORE the authoritative
+        // sync, so the rebuilt mirror retains it — no loss window between
+        // the mid-run mirror and the next reload.
+        let repo = pi::session::repository::SessionRepository::new(&sessions_path);
+        settle_run(
+            &result,
+            false,
+            &session,
+            &state,
+            &repo,
+            &sessions_path,
+            &cwd,
+            &notice_tx,
+            &mut run_steers,
+        )
+        .await;
         result.unwrap();
 
-        // Persistence waited for the settle (the run owned the session);
-        // the idle loop's drain is what appends the custom entry.
-        let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
         assert!(
-            !jsonl.contains("manox_ui_note"),
-            "no custom entry before the idle loop drains the parked note"
+            state.pending_ui_notes.lock().unwrap().is_empty(),
+            "settlement drains the parked queue"
         );
-        let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
-        assert_eq!(parked.len(), 1, "the mid-run append parks exactly one note");
-        for record in &parked {
-            assert!(persist_ui_note(&session, record).await);
-        }
+        assert!(
+            matches!(state.history.lock().unwrap().last(), Some(HistoryEntry::Note(_))),
+            "the authoritative rebuild must retain the parked note"
+        );
+        assert_eq!(
+            state.notes.lock().unwrap().len(),
+            1,
+            "the positioned-note mirror survives settlement"
+        );
         let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
         assert!(
             jsonl.contains("\"customType\":\"manox_ui_note\"") && jsonl.contains("mid-run card"),
-            "the drained parked note must append the custom entry"
+            "settlement must persist the parked note"
         );
     }
 

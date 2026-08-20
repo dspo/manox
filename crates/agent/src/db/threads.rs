@@ -199,7 +199,7 @@ impl ThreadsDatabase {
         // land together or not at all — a partial write would leave a sidebar
         // entry that fails to load. One transaction wraps all three.
         let tx = conn.transaction().context("begin upsert transaction")?;
-        // Stale-snapshot guard: `save_thread` is fire-and-forget, so an older
+        // Stale-snapshot guard: `refresh_thread_list` is fire-and-forget, so an older
         // snapshot (e.g. taken at submit, before the turn produced any assistant
         // content) can commit after a newer snapshot (taken at turn end) if the
         // background executor reorders them. Without this guard the older write

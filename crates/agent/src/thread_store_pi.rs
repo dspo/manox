@@ -2,8 +2,8 @@
 //
 // The sidebar's session list comes from the pi session repository (jsonl)
 // plus a per-session UI-metadata sidecar (`pi_extensions::session_meta`).
-// The pi transcript persists itself, so `save_thread` is a no-op and the
-// manox SQLite timeline/note records are not produced.
+// The pi transcript persists itself, so `refresh_thread_list` only refreshes
+// the sidebar list; manox SQLite timeline/note records are not produced.
 // Archived sessions are excluded from the sidebar list but stay in
 // `session_paths` so their sidecar remains addressable.
 
