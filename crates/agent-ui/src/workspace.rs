@@ -3461,6 +3461,8 @@ impl Workspace {
         true
     }
 
+    // Phase E stub — retained until Entity<Team> retirement removes the call sites.
+    #[allow(dead_code)]
     /// UI entry for the member panel's dismiss button: the `TeamDismiss`
     /// op on the leader thread (cancel, archive session, release tasks,
     /// drop from roster).
