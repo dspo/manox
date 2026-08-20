@@ -3,7 +3,7 @@
 //!
 //! `Agent(Sailor)` is synchronous in the kernel (`SubagentTool::execute`
 //! awaits the child session). The host wraps it: a non-read-only dispatch is
-//! spawned in a tokio task, registered as a `TaskKind::Sailor` background
+//! spawned in a tokio task, registered as a `TaskKind::Subagent` background
 //! task, and its final text is delivered to the Captain via
 //! `BackendNotice::SailorCompleted` — the facade injects that as a peer
 //! message and fires a turn, so the Captain reliably observes the result
@@ -81,7 +81,7 @@ impl SailorManager {
             "isolation": isolation,
         });
         let (task_id, task) = background_task::register(
-            TaskKind::Sailor,
+            TaskKind::Subagent,
             self.owner_thread_id.clone(),
             description,
             task_cancel.clone(),

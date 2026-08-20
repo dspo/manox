@@ -64,7 +64,7 @@ pub enum TaskKind {
     /// for legacy-registry ids); `BashOutput` does not yet recognize Sailor
     /// ids (progress-pull follow-up). A parent-turn abort also cancels the
     /// child token.
-    Sailor,
+    Subagent,
 }
 
 /// The terminal status of a background task.
@@ -151,7 +151,7 @@ pub fn format_event_for_model(event: &TaskEvent) -> String {
         TaskKind::MonitorCommand => "Monitor (command)",
         TaskKind::MonitorWebSocket => "Monitor (WebSocket)",
         TaskKind::BackgroundBash => "Background Bash",
-        TaskKind::Sailor => "Sailor",
+        TaskKind::Subagent => "Subagent",
     };
     let body = match &event.event {
         TaskEventKind::StateChanged => return String::new(),
@@ -920,7 +920,7 @@ fn next_id(kind: &TaskKind) -> TaskId {
         TaskKind::MonitorCommand => "monitor",
         TaskKind::MonitorWebSocket => "ws",
         TaskKind::BackgroundBash => "bash",
-        TaskKind::Sailor => "sailor",
+        TaskKind::Subagent => "subagent",
     };
     TaskId::new(prefix, n)
 }
@@ -1080,7 +1080,7 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
                 TaskKind::MonitorCommand => "monitor (command)",
                 TaskKind::MonitorWebSocket => "monitor (WebSocket)",
                 TaskKind::BackgroundBash => "background bash",
-                TaskKind::Sailor => "sailor (subagent)",
+                TaskKind::Subagent => "Subagent",
             };
             lines.push(format!(
                 "  {id} — {kind_str} — \"{desc}\" (events: {n})",
@@ -1654,7 +1654,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
         let cancel = CancellationToken::new();
         let (_id, task) = register(
-            TaskKind::Sailor,
+            TaskKind::Subagent,
             "t-x1".into(),
             "test".into(),
             cancel.clone(),
@@ -1667,7 +1667,7 @@ mod tests {
         // A different thread's task is not affected.
         let other = CancellationToken::new();
         let (_id2, _task2) = register(
-            TaskKind::Sailor,
+            TaskKind::Subagent,
             "t-other".into(),
             "other".into(),
             other.clone(),
