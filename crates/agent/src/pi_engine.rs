@@ -523,31 +523,31 @@ fn system_prompt(cwd: &Path) -> String {
     // what exists.
     prompt.push_str("\n\n## Subagents & parallel work\n");
     prompt.push_str(
-        "You can dispatch subagents via the `Agent` tool — each runs in its \
-         own fresh context (no parent history). The `Agent` tool description \
-         lists the live subagent types and their capability tags; the tag \
-         also says whether the subagent runs synchronously or asynchronously. \
-         Two are built in:\n\
-         - `Explore` (read-only, synchronous): locates code by file, symbol, \
-         or keyword and returns conclusions; it cannot write files or run \
-         commands. The tool call blocks and returns Explore's answer.\n\
-         - `Sailor` (write+bash, asynchronous): a general-purpose coding \
-         worker that reads, writes, and edits files and runs shell commands \
-         (including cargo/clippy/test). The tool returns immediately with a \
-         `{\"sailor_id\": ...}` dispatch handle — NOT the output. Sailor \
-         runs in the background; when it settles its final summary arrives \
-         as a peer message and triggers your next turn. Continue with other \
-         work while Sailors run; do not poll.\n\n\
+        "You can dispatch subagents via the `Steer` tool — each runs in its \
+         own fresh context (no parent history). Set `to.spawn` to a capability \
+         def name (e.g. 'Sailor','Explore') to create an in-thread subagent \
+         coroutine, or 'TeamMember' to create a real manox Thread (a process: \
+         persisted, sidebar-visible, resumable, with its own Captain session). \
+         Only the Captain may spawn. `reason` is Dispatch (start a task), \
+         Inject (mid-run message), or Abort (cancel). Complete is harness-\
+         emitted on subagent termination — not callable; when a subagent \
+         finishes, its final summary arrives as a peer message and triggers \
+         your next turn. Continue with other work while subagents run; do \
+         not poll.\n\n\
+         Built-in subagent types: `Explore` (read-only: locates code by \
+         file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
+         edits files, runs shell commands including cargo/clippy/test). \
+         TeamMembers are real threads — they persist, appear in the sidebar, \
+         and can be resumed; they report back via `Steer(to=<parent_thread_id>, \
+         reason=Inject)`. A subagent (coroutine) is transient; it ends with \
+         a concise summary as its final assistant text (the harness emits \
+         Complete with that summary).\n\n\
          Prefer parallel subagents over serial self-work. For splittable \
          tasks — reviewing multiple PRs, modifying independent files, \
-         exploring alternatives — emit multiple `Agent` calls in one turn so \
-         they run concurrently. Pass `isolation: \"worktree\"` when a \
+         exploring alternatives — emit multiple `Steer` calls in one turn \
+         so they run concurrently. Pass `isolation: \"worktree\"` when a \
          subagent needs its own working tree (builds won't collide, edits \
-         won't clash; a worktree with work is kept + reported back).\n\n\
-         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use \
-         `TeamCreate` only for long-lived work that needs a shared task list \
-         and peer messaging between members; for independent parallel \
-         subtasks, Sailors are lighter and report back directly.\n\n\
+         won't clash).\n\n\
          Each subagent starts from a blank context, so pin any contract it \
          must honor (exact paths, signatures, gate requirements) directly in \
          the prompt.",
