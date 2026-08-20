@@ -2,12 +2,16 @@
 //!
 //! These cards are host-only UI state that never enters the model-facing
 //! canonical `Thread::messages` (so `build_completion_request` — and the
-//! provider prompt-cache prefix — is unaffected). They are persisted in the
-//! per-session sidecar (see `SessionMeta::ui_notes`) and restored on session
-//! reopen; the `Thread` facade carries the in-memory `Vec<UiNoteRecord>` and
-//! `Workspace` snapshots it to the sidecar via `save_thread`.
+//! provider prompt-cache prefix — is unaffected). They persist as `custom`
+//! entries in the session jsonl tree (`custom_type = UI_NOTE_CUSTOM_TYPE`,
+//! payload = the serialized `UiNoteRecord`), appended at emit time so the
+//! append order — and therefore every reload — reproduces their
+//! chronological position among the messages.
 
 use serde::{Deserialize, Serialize};
+
+/// The `custom_type` tag of session entries carrying a [`UiNoteRecord`].
+pub const UI_NOTE_CUSTOM_TYPE: &str = "manox_ui_note";
 
 /// Persisted UI note kind. The string value is the stable wire identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,17 +38,27 @@ pub enum UiNoteKind {
 /// One UI annotation card. `data` carries the render payload — currently
 /// `{ "text": String }`, plus `tool_call_id` for approval decision records —
 /// and is left as raw JSON so future note shapes extend without a schema
-/// change. Array order (in memory / in the sidecar) equals emit order.
-///
-/// The struct doubles as the sidecar wire shape (`SessionMeta::ui_notes`),
-/// so it carries no SQLite-row artifacts (id / seq / ts / thread_id): the
-/// per-thread in-memory Vec and the per-session sidecar both provide order
-/// and ownership.
+/// change. Entry append order in the session jsonl equals emit order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNoteRecord {
-    /// User message id whose turn this note belongs to; `None` for notes
-    /// emitted before any user message (placed at the top on rebuild).
-    pub anchor_user_id: Option<String>,
     pub kind: UiNoteKind,
     pub data: serde_json::Value,
+}
+
+/// A note plus its position in the session entry sequence: the count of
+/// message entries preceding it. Stable across reloads (derived from the
+/// tree) and across mid-run live mirror refreshes (re-merged by this count).
+#[derive(Debug, Clone)]
+pub struct PositionedNote {
+    pub note: UiNoteRecord,
+    pub after_message: usize,
+}
+
+/// One element of the display sequence the engine mirror and the
+/// conversation rebuild share: messages interleaved with the UI annotation
+/// cards that landed between them.
+#[derive(Debug, Clone)]
+pub enum HistoryEntry {
+    Message(crate::message::Message),
+    Note(UiNoteRecord),
 }

@@ -1243,6 +1243,31 @@ mod tests {
         let entries = build_context_entries(path);
         assert_eq!(ids(&entries), ["c1", "m3"]);
     }
+
+    #[tokio::test]
+    async fn append_custom_lands_in_context_order_at_its_append_position() {
+        let storage = crate::harness::tests::MemStorage::new();
+        let session = Session::new(storage);
+        session
+            .append_message(AgentMessage::user("one"))
+            .await
+            .unwrap();
+        session
+            .append_custom("manox_ui_note", Some(serde_json::json!({ "k": 1 })))
+            .await
+            .unwrap();
+        session
+            .append_message(AgentMessage::user("two"))
+            .await
+            .unwrap();
+        let entries = session.build_context_entries().await.unwrap();
+        assert!(matches!(&entries[0], SessionTreeEntry::Message { .. }));
+        assert!(
+            matches!(&entries[1], SessionTreeEntry::Custom { custom_type, .. } if custom_type == "manox_ui_note"),
+            "the custom entry keeps its append position between the messages"
+        );
+        assert!(matches!(&entries[2], SessionTreeEntry::Message { .. }));
+    }
 }
 
 /// The TS `SessionTreeEntry["type"]` discriminator used by branch queries.

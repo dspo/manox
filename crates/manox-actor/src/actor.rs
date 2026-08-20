@@ -1278,17 +1278,14 @@ fn subscribe_thread(
                     // session's `thread_history.auto_approved_tools` rebuild
                     // reproduces the badge exactly like the gpui host's.
                     if matches!(verdict, agent::approval::ReviewVerdict::Allow) {
-                        let anchor = entity.read(app).last_user_message_id().map(str::to_owned);
                         let note = agent::db::UiNoteRecord {
-                            anchor_user_id: anchor,
                             kind: agent::db::UiNoteKind::AutoApproval,
                             data: serde_json::json!({
                                 "text": "",
                                 "tool_call_id": tool_call_id,
                             }),
                         };
-                        entity.update(app, |t, _| t.push_ui_note(note));
-                        agent::save_thread(entity.clone(), false, app);
+                        entity.update(app, |t, _| t.append_ui_note(note));
                     }
                 }
                 _ => {}
@@ -1316,8 +1313,12 @@ fn emit_history_and_info(
     // marked tool ids so the restored transcript stamps the same badges.
     let auto_approved_tools: Vec<String> = thread
         .read(app)
-        .ui_notes()
+        .display_history()
         .iter()
+        .filter_map(|entry| match entry {
+            agent::db::HistoryEntry::Note(note) => Some(note),
+            _ => None,
+        })
         .filter(|n| n.kind == agent::db::UiNoteKind::AutoApproval)
         .filter_map(|n| {
             n.data
@@ -4261,7 +4262,7 @@ mod tests {
             false
         }
 
-        fn history(&self) -> Vec<agent::Message> {
+        fn history(&self) -> Vec<agent::db::HistoryEntry> {
             Vec::new()
         }
 

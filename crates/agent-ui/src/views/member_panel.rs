@@ -59,7 +59,13 @@ impl MemberPanel {
         weak_workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Entity<Self> {
-        let messages = member.read(cx).messages().to_vec();
+        let display: Vec<agent::db::HistoryEntry> = member
+            .read(cx)
+            .messages()
+            .iter()
+            .cloned()
+            .map(agent::db::HistoryEntry::Message)
+            .collect();
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
         let weak_ws = weak_workspace.clone();
         let cwd = {
@@ -71,12 +77,11 @@ impl MemberPanel {
             }
         };
         let conversation = cx.new(|cx| {
-            ConversationState::rebuild_from_messages(
-                &messages,
+            ConversationState::rebuild_from_display(
+                &display,
                 &empty_usage,
                 &role,
                 false,
-                &[],
                 crate::conversation::ApplyCtx { weak: weak_ws, cwd },
                 cx,
             )

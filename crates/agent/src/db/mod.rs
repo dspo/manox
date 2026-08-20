@@ -16,8 +16,8 @@
 //! - `projects`: registered project roots retained independently of threads.
 //!
 //! UI annotation cards (Error / Notice / PlanReview) are NOT stored here —
-//! they persist in the per-session sidecar (`SessionMeta::ui_notes`) so the
-//! pi harness restores them on reopen without a SQLite round-trip.
+//! they persist as `custom` entries in the session jsonl tree (see
+//! `ui_notes::UI_NOTE_CUSTOM_TYPE`) so reload replays them in append order.
 //!
 //! `ThreadsDatabase` holds a `Mutex<Connection>`; all methods are synchronous
 //! and blocking (callers wrap them in `background_spawn`).
@@ -41,7 +41,7 @@ pub use events::{ThreadEventRecord, ThreadEventType};
 pub use terminals::TerminalSession;
 pub use threads::{ThreadRecord, ThreadSummary};
 pub use token_usage::TokenUsageRecord;
-pub use ui_notes::{UiNoteKind, UiNoteRecord};
+pub use ui_notes::{HistoryEntry, PositionedNote, UI_NOTE_CUSTOM_TYPE, UiNoteKind, UiNoteRecord};
 
 use crate::paths;
 

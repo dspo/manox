@@ -868,6 +868,27 @@ impl AgentSession {
         self.harness.session().stats().await
     }
 
+    /// Append a `custom` entry whose payload the harness does not interpret
+    /// (host extension data riding the session tree in append order).
+    pub async fn append_custom(
+        &self,
+        custom_type: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<String, anyhow::Error> {
+        self.harness
+            .session()
+            .append_custom(custom_type, data)
+            .await
+    }
+
+    /// The compaction-aware active entry list (every entry type, in tree
+    /// order) — the display projection source for host UI mirrors.
+    pub async fn context_entries(
+        &self,
+    ) -> Result<Vec<crate::session::SessionTreeEntry>, anyhow::Error> {
+        self.harness.session().build_context_entries().await
+    }
+
     /// The current transcript messages.
     pub fn harness_messages(&self) -> &[AgentMessage] {
         &self.harness.agent().state().messages

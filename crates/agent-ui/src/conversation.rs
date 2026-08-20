@@ -12,14 +12,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent::ThreadEvent;
-use agent::db::{UiNoteKind, UiNoteRecord};
-use agent::language_model::{MessageContent, Role, StopReason};
+use agent::db::{HistoryEntry, UiNoteKind, UiNoteRecord};
+use agent::language_model::StopReason;
 use agent::thread::ApprovalMode;
 use agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
-use crate::views::message::{AutoCollapseTarget, MessageItem, build_items, schedule_auto_collapse};
+use crate::views::message::{AutoCollapseTarget, ItemBuilder, MessageItem, schedule_auto_collapse};
 
 /// A decoded image attached to a user message, kept only for UI preview. The
 /// canonical bytes live in the `Thread`'s `MessageContent::Image`; this holds
@@ -577,7 +577,7 @@ pub struct ConversationState {
     /// Carry-over state for the streaming history preview
     /// (`append_history_messages`): the item builder's turn/segment state, so
     /// a tool loop spanning a batch boundary folds into one activity segment.
-    /// Dropped when the authoritative `rebuild_from_messages` replaces this
+    /// Dropped when the authoritative `rebuild_from_display` replaces this
     /// conversation (`HistoryRestored`).
     history_builder: Option<crate::views::message::ItemBuilder>,
     /// Auto-approval verdicts parked before their tool item exists
@@ -588,8 +588,8 @@ pub struct ConversationState {
 
 /// Where a notice lands in the item list.
 ///
-/// `TurnEnd` mirrors the persisted placement (`merge_ui_notes` splices a note
-/// at the end of its anchor turn — the list tail when that turn is the last
+/// `TurnEnd` mirrors the persisted placement (the rebuild renders a note at
+/// its session append position — the list tail when that turn is the last
 /// one). `After` anchors a notice to a specific item (e.g. the tool call that
 /// triggered an approval decision) so it reads at its occurrence position
 /// instead of the global tail.
@@ -641,7 +641,7 @@ impl Default for ConversationState {
     }
 }
 
-/// Workspace context threaded through `apply` / `rebuild_from_messages`: the
+/// Workspace context threaded through `apply` / `rebuild_from_display`: the
 /// weak handle (for item toggle callbacks) plus the thread cwd snapshot (for
 /// the `TerminalPanel` prompt line). Bundled so the signatures stay under
 /// clippy's argument-count limit. The cwd is a per-call snapshot taken by the
@@ -1970,28 +1970,87 @@ impl ConversationState {
         self.items.clear();
     }
 
-    /// Rebuild view state from a `Thread`'s canonical message list (used when loading a historical thread).
+    /// Rebuild view state from a `Thread`'s display sequence (used when
+    /// loading a historical thread): messages interleaved with the persisted
+    /// UI annotation cards, in session append order — reload reproduces the
+    /// live placement without the model request ever learning the cards
+    /// exist.
     ///
-    /// `notes` are the persisted UI annotations (`Error` / `Notice` /
-    /// `PlanReview` / `AutoApproval`) that live outside the canonical message
-    /// list — they are spliced back at the end of the turn they belong to
-    /// (anchored by user-message id), or stamped onto their tool item in the
-    /// `AutoApproval` case, so a reloaded thread reproduces what the user saw
-    /// without the model request ever learning they exist. The request prefix
-    /// is untouched.
-    pub fn rebuild_from_messages(
-        messages: &[Message],
+    /// Plain notes render in place; notes carrying a `data.tool_call_id`
+    /// (approval decision records) splice in right after the item holding
+    /// their tool call — matching the live anchored placement — falling back
+    /// to the tail when compaction dropped the tool item. `AutoApproval`
+    /// notes splice no item: their `tool_call_id` stamps the matching tool
+    /// item's `auto_approved` badge instead (silently skipped when the item
+    /// is gone).
+    pub fn rebuild_from_display(
+        display: &[HistoryEntry],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
         running: bool,
-        notes: &[UiNoteRecord],
         ctx: ApplyCtx,
         cx: &mut App,
     ) -> Self {
         let ApplyCtx { weak, cwd } = ctx;
-        let plain = build_items(messages, usage, running);
-        let merged = merge_ui_notes(messages, plain, notes);
-        let items = merged
+        let mut builder = ItemBuilder::new();
+        let mut kinds: Vec<ConvItem> = Vec::new();
+        let mut pending: Vec<Message> = Vec::new();
+        let mut deferred: Vec<&UiNoteRecord> = Vec::new();
+        for entry in display {
+            match entry {
+                HistoryEntry::Message(message) => pending.push(message.clone()),
+                HistoryEntry::Note(note) => {
+                    if note.data.get("tool_call_id").is_some() {
+                        deferred.push(note);
+                    } else {
+                        if !pending.is_empty() {
+                            builder.extend(&pending, usage, &mut kinds);
+                            pending.clear();
+                        }
+                        kinds.push(note_to_item(note));
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            builder.extend(&pending, usage, &mut kinds);
+        }
+        builder.finish(&mut kinds, running);
+        // Group by splice target so several notes anchored to the same tool
+        // keep emit order (inserting one-by-one at ix+1 would reverse them);
+        // applying the groups in descending index order keeps earlier
+        // positions valid.
+        let mut grouped: Vec<(usize, Vec<ConvItem>)> = Vec::new();
+        let mut tail: Vec<ConvItem> = Vec::new();
+        for note in deferred {
+            let tool_id = note
+                .data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            // Auto-approval markers stamp the badge instead of rendering a
+            // conversation item.
+            if note.kind == UiNoteKind::AutoApproval {
+                if let Some(target) = kinds.iter_mut().find(|it| item_contains_tool(it, tool_id))
+                {
+                    stamp_auto_approval(target, tool_id);
+                }
+                continue;
+            }
+            let kind = note_to_item(note);
+            match kinds.iter().position(|it| item_contains_tool(it, tool_id)) {
+                Some(ix) => match grouped.last_mut() {
+                    Some((last_ix, items)) if *last_ix == ix => items.push(kind),
+                    _ => grouped.push((ix, vec![kind])),
+                },
+                None => tail.push(kind),
+            }
+        }
+        for (ix, items) in grouped.into_iter().rev() {
+            kinds.splice(ix + 1..ix + 1, items);
+        }
+        kinds.extend(tail);
+        let items = kinds
             .into_iter()
             .enumerate()
             .map(|(id, kind)| new_history_item(kind, id, role, weak.clone(), cwd.clone(), cx))
@@ -2012,8 +2071,8 @@ impl ConversationState {
     /// Append a batch of newly loaded history messages to the conversation
     /// (the streaming preview). Carries the item builder's turn/segment state
     /// across batches so the result matches a one-shot
-    /// `rebuild_from_messages` over the same prefix; the final authoritative
-    /// history lands through `rebuild_from_messages` (`HistoryRestored`),
+    /// `rebuild_from_display` over the same prefix; the final authoritative
+    /// history lands through `rebuild_from_display` (`HistoryRestored`),
     /// which drops the builder.
     pub fn append_history_messages(
         &mut self,
@@ -2084,7 +2143,7 @@ impl ConversationState {
 /// Construct a `MessageItem` for a rebuilt/history item: full text parse +
 /// finalize for assistant bubbles, persistent reasoning/tool panels for
 /// historical activity segments. Shared by the one-shot
-/// `rebuild_from_messages` and the streaming `append_history_messages`.
+/// `rebuild_from_display` and the streaming `append_history_messages`.
 fn new_history_item(
     kind: ConvItem,
     id: usize,
@@ -2124,226 +2183,6 @@ fn new_history_item(
     })
 }
 
-/// Splice persisted UI notes back into the rebuilt canonical item list.
-///
-/// A note is anchored to the user message whose turn it belongs to. The
-/// canonical `items` list has one `ConvItem::User` bubble per text/image-
-/// bearing user message (in message order), so those bubbles align 1:1 with
-/// the "segment anchors" derived from `messages`. Each note lands at the end
-/// of its segment — i.e. right before the next turn's user bubble — mirroring
-/// where it appeared live. A note carrying a `data.tool_call_id` (an
-/// escalated approval record) lands directly after the item containing that
-/// tool call — a top-level `ToolCall` card or the activity segment holding
-/// the entry — matching the live anchored placement, and falls back to the
-/// segment end when the tool item is absent (compaction dropped it).
-/// `AutoApproval` notes splice no item: their `tool_call_id` stamps the
-/// matching tool item's `auto_approved` badge instead (silently skipped when
-/// the item is gone). Notes whose anchor was a pure-tool-result user message
-/// (no bubble) fold into the nearest preceding segment; notes whose anchor
-/// was dropped by compaction land at the tail; notes emitted before any user
-/// message (anchor `None`) land at the top.
-///
-/// Notes arrive already sorted by `seq` from `list_ui_notes`, so per-segment
-/// order preserves emit order with no extra sort.
-fn merge_ui_notes(
-    messages: &[Message],
-    items: Vec<ConvItem>,
-    notes: &[UiNoteRecord],
-) -> Vec<ConvItem> {
-    if notes.is_empty() {
-        return items;
-    }
-
-    // Auto-approval markers stamp the tool item's badge; every other kind
-    // splices in as a conversation item.
-    let mut auto_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut renderable: Vec<&UiNoteRecord> = Vec::new();
-    for n in notes {
-        if n.kind == UiNoteKind::AutoApproval {
-            if let Some(id) = n
-                .data
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                auto_ids.insert(id);
-            }
-        } else {
-            renderable.push(n);
-        }
-    }
-    // Segment anchors: user messages that produce a User bubble, in message
-    // order. These align 1:1 with the User bubbles in `items` because
-    // `build_items` pushes exactly one User bubble per such message and none
-    // otherwise. The predicate mirrors `build_items` exactly: a bubble is
-    // pushed iff the message has a non-empty display form, a non-empty
-    // Text/Thinking join, or any Image.
-    let segment_ids: Vec<&str> = messages
-        .iter()
-        .filter(|m| {
-            if m.role != Role::User {
-                return false;
-            }
-            if m.ui
-                .as_ref()
-                .and_then(|ui| ui.external_event)
-                .unwrap_or(false)
-            {
-                return false;
-            }
-            let has_text =
-                m.ui.as_ref()
-                    .and_then(|ui| ui.display_text.as_deref())
-                    .is_some_and(|text| !text.is_empty())
-                    || m.content.iter().any(|c| match c {
-                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
-                            !t.is_empty()
-                        }
-                        _ => false,
-                    });
-            let has_image = m
-                .content
-                .iter()
-                .any(|c| matches!(c, MessageContent::Image { .. }));
-            has_text || has_image
-        })
-        .map(|m| m.id.as_str())
-        .collect();
-
-    // Message index of every user message (including pure-tool-result ones),
-    // so a note anchored to a no-bubble user message can be folded into the
-    // nearest preceding segment instead of orphaning.
-    let user_msg_index: HashMap<&str, usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
-        .map(|(i, m)| (m.id.as_str(), i))
-        .collect();
-    let segment_msg_ix: Vec<usize> = segment_ids.iter().map(|id| user_msg_index[id]).collect();
-
-    // User-bubble positions in `items`, aligned with `segment_ids` by order.
-    let bubble_ix: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, it)| matches!(it, ConvItem::User { .. }))
-        .map(|(i, _)| i)
-        .collect();
-
-    // The 1:1 alignment between segment anchors (from messages) and User
-    // bubbles (from items) is what lets a note be placed at its turn's end.
-    // If these ever diverge — e.g. `build_items` changes its bubble rule —
-    // placement would silently misfire, so assert in dev builds and warn in
-    // release: a crash on misplacement is worse than a logged divergence, but
-    // silence is worse than either.
-    if segment_ids.len() != bubble_ix.len() {
-        tracing::warn!(
-            anchors = segment_ids.len(),
-            bubbles = bubble_ix.len(),
-            "merge_ui_notes: segment anchors and User bubbles diverged; \
-             UI-note placement may be wrong until build_items is realigned"
-        );
-    }
-    debug_assert_eq!(
-        segment_ids.len(),
-        bubble_ix.len(),
-        "segment anchors and User bubbles diverged: build_items and merge_ui_notes disagree"
-    );
-
-    // Bucket each note by its target segment.
-    let mut buckets: Vec<Vec<&UiNoteRecord>> = (0..segment_ids.len()).map(|_| Vec::new()).collect();
-    let mut top: Vec<&UiNoteRecord> = Vec::new();
-    let mut orphan: Vec<&UiNoteRecord> = Vec::new();
-    for &n in &renderable {
-        match &n.anchor_user_id {
-            None => top.push(n),
-            Some(aid) => {
-                if let Some(k) = segment_ids.iter().position(|id| *id == aid.as_str()) {
-                    buckets[k].push(n);
-                } else if let Some(&mi) = user_msg_index.get(aid.as_str()) {
-                    // Anchor is a no-bubble user message (e.g. a tool-result
-                    // message mid-loop): fold into the nearest preceding segment.
-                    let seg = segment_msg_ix
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, smi)| **smi <= mi)
-                        .map(|(k, _)| k)
-                        .next_back();
-                    match seg {
-                        Some(k) => buckets[k].push(n),
-                        None => top.push(n),
-                    }
-                } else {
-                    // Anchor references a message compaction dropped — tail it.
-                    orphan.push(n);
-                }
-            }
-        }
-    }
-
-    let mut out: Vec<ConvItem> = Vec::with_capacity(items.len() + notes.len());
-    let first_bubble = bubble_ix.first().copied().unwrap_or(items.len());
-    for n in &top {
-        out.push(note_to_item(n));
-    }
-    // Canonical items before the first User bubble (a no-user-message prefix,
-    // normally empty since conversations start with a user message).
-    for it in items.iter().take(first_bubble) {
-        out.push(it.clone());
-    }
-    for (k, &start) in bubble_ix.iter().enumerate() {
-        let end = bubble_ix.get(k + 1).copied().unwrap_or(items.len());
-        let bucket = buckets.get(k).map(Vec::as_slice).unwrap_or(&[]);
-        // Split the segment's notes: tool-anchored ones (carrying
-        // `data.tool_call_id`) splice in right after the item holding their
-        // tool call; everything else lands at the segment end as before.
-        let mut by_item: HashMap<usize, Vec<&UiNoteRecord>> = HashMap::new();
-        let mut turn_end: Vec<&UiNoteRecord> = Vec::new();
-        for n in bucket {
-            let placed = n
-                .data
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|id| (start..end).find(|&j| item_contains_tool(&items[j], id)));
-            match placed {
-                Some(j) => by_item.entry(j).or_default().push(n),
-                None => turn_end.push(n),
-            }
-        }
-        for (j, it) in items.iter().enumerate().take(end).skip(start) {
-            out.push(it.clone());
-            if let Some(notes) = by_item.get(&j) {
-                for n in notes {
-                    out.push(note_to_item(n));
-                }
-            }
-        }
-        for n in turn_end {
-            out.push(note_to_item(n));
-        }
-    }
-    for n in &orphan {
-        out.push(note_to_item(n));
-    }
-    if !auto_ids.is_empty() {
-        for it in out.iter_mut() {
-            match it {
-                ConvItem::ToolCall(t) if auto_ids.contains(t.id.as_str()) => {
-                    t.auto_approved = true;
-                }
-                ConvItem::Thinking(t) => {
-                    for e in t.entries.iter_mut() {
-                        if let ActivityEntry::Tool(tool) = e
-                            && auto_ids.contains(tool.id.as_str())
-                        {
-                            tool.auto_approved = true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
 
 /// Whether `it` is the item carrying the given tool call: a top-level
 /// `ToolCall` card or an activity segment holding the tool entry.
@@ -2352,6 +2191,25 @@ fn item_contains_tool(it: &ConvItem, tool_call_id: &str) -> bool {
         ConvItem::ToolCall(t) => t.id == tool_call_id,
         ConvItem::Thinking(t) => t.find_tool_entry_index(tool_call_id).is_some(),
         _ => false,
+    }
+}
+
+/// Stamp the auto-approval badge onto the item owning the tool call (a
+/// top-level card or an activity entry); `AutoApproval` notes render no
+/// conversation item of their own.
+fn stamp_auto_approval(kind: &mut ConvItem, tool_call_id: &str) {
+    match kind {
+        ConvItem::ToolCall(t) if t.id == tool_call_id => t.auto_approved = true,
+        ConvItem::Thinking(container) => {
+            if let Some(ActivityEntry::Tool(tool)) = container
+                .entries
+                .iter_mut()
+                .find(|e| matches!(e, ActivityEntry::Tool(t) if t.id == tool_call_id))
+            {
+                tool.auto_approved = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2383,6 +2241,7 @@ fn note_to_item(n: &UiNoteRecord) -> ConvItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::message::build_items;
     use agent::Message;
     use agent::language_model::{
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
@@ -2644,11 +2503,17 @@ mod tests {
         }
     }
 
-    fn note(kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
+    fn note(kind: UiNoteKind, text: &str) -> UiNoteRecord {
         UiNoteRecord {
-            anchor_user_id: anchor.map(str::to_owned),
             kind,
             data: serde_json::json!({ "text": text }),
+        }
+    }
+
+    fn note_with_tool(kind: UiNoteKind, text: &str, tool_call_id: &str) -> UiNoteRecord {
+        UiNoteRecord {
+            kind,
+            data: serde_json::json!({ "text": text, "tool_call_id": tool_call_id }),
         }
     }
 
@@ -2667,311 +2532,238 @@ mod tests {
             .collect()
     }
 
-    /// Persisted Error/Notice cards are spliced back at the end of their owning
-    /// turn; None-anchor notes top the list; notes whose anchor was dropped by
-    /// compaction land at the tail.
-    #[test]
-    fn merge_ui_notes_places_notes_at_turn_end() {
-        let messages = vec![
-            msg_with_id("u1", Role::User, "hello"),
-            msg_with_id("a1", Role::Assistant, "hi"),
-            msg_with_id("u2", Role::User, "again"),
-            msg_with_id("a2", Role::Assistant, "yo"),
+    /// Rebuild interleaves persisted cards at their session position: a note
+    /// recorded before any message tops the list, an error recorded between
+    /// two turns renders between them — never at the tail.
+    #[gpui::test]
+    fn rebuild_from_display_keeps_notes_at_their_persisted_position(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let display = vec![
+            HistoryEntry::Note(note(UiNoteKind::Notice, "early")),
+            HistoryEntry::Message(msg_with_id("u1", Role::User, "hello")),
+            HistoryEntry::Message(msg_with_id("a1", Role::Assistant, "hi")),
+            HistoryEntry::Note(note(UiNoteKind::Error, "boom")),
+            HistoryEntry::Message(msg_with_id("u2", Role::User, "again")),
+            HistoryEntry::Message(msg_with_id("a2", Role::Assistant, "yo")),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        // Notes arrive seq-sorted from list_ui_notes.
-        let notes = vec![
-            note(UiNoteKind::Notice, None, "top"),
-            note(UiNoteKind::Notice, Some("u1"), "t0end"),
-            note(UiNoteKind::Error, Some("u2"), "t1end"),
-            note(UiNoteKind::Notice, Some("ghost"), "orphan"),
-        ];
-        let merged = merge_ui_notes(&messages, items, &notes);
-        assert_eq!(
-            signature(&merged),
-            vec![
-                "N:top",   // None-anchor → top
-                "U:hello", // turn 0
-                "A:hi", "N:t0end", // anchor u1 → end of turn 0
-                "U:again", // turn 1
-                "A:yo", "E:t1end",  // anchor u2 → end of turn 1
-                "N:orphan", // unknown anchor → tail
-            ]
-        );
-    }
-
-    /// A note anchored to a pure-tool-result user message (no User bubble)
-    /// folds into the nearest preceding segment rather than orphaning.
-    #[test]
-    fn merge_ui_notes_folds_no_bubble_anchor_into_preceding_turn() {
-        // Turn 0: user prompt + assistant; then a tool-result user message
-        // (no text → no bubble) + assistant reply. A note anchored to the
-        // tool-result user message should land at the end of turn 0.
-        let mut tr = msg_with_id("u2", Role::User, "");
-        tr.content = vec![MessageContent::ToolResult(LanguageModelToolResult {
-            tool_use_id: "tu_1".to_string(),
-            tool_name: Arc::from("Read"),
-            is_error: false,
-            content: "done".to_string(),
-        })];
-        let messages = vec![
-            msg_with_id("u1", Role::User, "do it"),
-            msg_with_id("a1", Role::Assistant, "ok"),
-            tr,
-            msg_with_id("a2", Role::Assistant, "done"),
-        ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        // No second User bubble — both assistant replies belong to turn 0.
-        assert_eq!(
-            items
-                .iter()
-                .filter(|i| matches!(i, ConvItem::User { .. }))
-                .count(),
-            1
-        );
-        let notes = vec![note(UiNoteKind::Notice, Some("u2"), "mid")];
-        let merged = merge_ui_notes(&messages, items, &notes);
-        assert_eq!(
-            signature(&merged).last(),
-            Some(&"N:mid".to_string()),
-            "no-bubble anchor folds to the nearest preceding segment's tail"
-        );
-    }
-
-    #[test]
-    fn merge_ui_notes_counts_display_text_on_tool_result_bubbles() {
-        let mut tool_result = msg_with_id("u2", Role::User, "");
-        tool_result.content = vec![MessageContent::ToolResult(LanguageModelToolResult {
-            tool_use_id: "tu_1".to_string(),
-            tool_name: Arc::from("Read"),
-            is_error: false,
-            content: "done".to_string(),
-        })];
-        tool_result.ui = Some(agent::MessageUiMetadata {
-            display_text: Some("/gitwork:deliver fast".to_string()),
-            ..Default::default()
-        });
-        let messages = vec![msg_with_id("u1", Role::User, "plain turn"), tool_result];
-        let items = build_items(&messages, &HashMap::new(), false);
-        let notes = vec![note(UiNoteKind::Error, Some("u2"), "failed")];
-
-        let merged = merge_ui_notes(&messages, items, &notes);
-
-        assert_eq!(
-            signature(&merged),
-            vec!["U:plain turn", "U:/gitwork:deliver fast", "?", "E:failed",]
-        );
-    }
-
-    /// A dismissed plan persists as a `PlanReview` note anchored to the user
-    /// message that triggered the plan's turn. The rebuild must splice the
-    /// collapsed plan card back at the end of that turn — ahead of the
-    /// dismissing user message — so a switched-away-and-back thread reproduces
-    /// the live order rather than silently dropping the plan.
-    #[test]
-    fn merge_ui_notes_places_dismissed_plan_before_dismissing_message() {
-        // u1 triggers the plan turn (a1 proposes a plan); u2 is the free-form
-        // message that dismissed it; a2 is the re-proposal turn.
-        let messages = vec![
-            msg_with_id("u1", Role::User, "plan it"),
-            msg_with_id("a1", Role::Assistant, "here is the plan"),
-            msg_with_id("u2", Role::User, "revise step 2"),
-            msg_with_id("a2", Role::Assistant, "revised"),
-        ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        // Anchored to u1 — the plan turn's triggering message — so the card
-        // lands at the end of turn 0, before the u2 bubble that dismissed it.
-        let notes = vec![note(UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
-        let merged = merge_ui_notes(&messages, items, &notes);
-        assert_eq!(
-            signature(&merged),
-            vec![
-                "U:plan it", // turn 0
-                "A:here is the plan",
-                "P:PLAN BODY",     // dismissed plan → end of turn 0
-                "U:revise step 2", // the dismissing message
-                "A:revised",
-            ]
-        );
-        // The rebuilt card is the inactive record form (no verdict buttons).
-        assert!(matches!(
-            merged[2],
-            ConvItem::PlanReview { active: false, .. }
-        ));
-    }
-
-    /// A note carrying `data.tool_call_id` (an approval decision record) is
-    /// spliced directly after the item containing that tool call — a top-level
-    /// `ToolCall` card or the activity segment holding the entry — matching
-    /// the live anchored placement instead of the turn end. A note whose tool
-    /// item is absent (compaction dropped it) falls back to the segment end.
-    #[test]
-    fn merge_ui_notes_places_tool_anchored_note_after_its_tool_item() {
-        // Turn 0: a user prompt + an assistant tool batch (rebuilds into one
-        // Thinking container) + reply; turn 1: a plain user turn.
-        let messages = vec![
-            msg_with_id("u1", Role::User, "read it"),
-            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
-                id: "tu_1".to_string(),
-                name: Arc::from("Read"),
-                raw_input: String::new(),
-                input: serde_json::Value::Null,
-                is_input_complete: true,
-                thought_signature: None,
-            })]),
-            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
-                tool_use_id: "tu_1".to_string(),
-                tool_name: Arc::from("Read"),
-                is_error: false,
-                content: "ok".to_string(),
-            })]),
-            msg_with_id("a1", Role::Assistant, "done"),
-            msg_with_id("u2", Role::User, "again"),
-            msg_with_id("a2", Role::Assistant, "yo"),
-        ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        assert!(
-            items.iter().any(|i| matches!(i, ConvItem::Thinking(_))),
-            "the tool batch rebuilds into one Thinking container"
-        );
-        let tool_note = |text: &str, tool_id: &str| {
-            let mut data = serde_json::json!({ "text": text });
-            data["tool_call_id"] = serde_json::Value::String(tool_id.to_string());
-            UiNoteRecord {
-                anchor_user_id: Some("u1".to_string()),
-                kind: UiNoteKind::Notice,
-                data,
-            }
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
         };
-        let notes = vec![
-            tool_note("Bash allowed", "tu_1"),
-            tool_note("dropped tool", "ghost"),
+        cx.update(|cx| {
+            let conv = ConversationState::rebuild_from_display(
+                &display,
+                &HashMap::new(),
+                "model",
+                false,
+                ctx,
+                cx,
+            );
+            let kinds: Vec<ConvItem> = conv
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind().clone())
+                .collect();
+            assert_eq!(
+                signature(&kinds),
+                vec!["N:early", "U:hello", "A:hi", "E:boom", "U:again", "A:yo"]
+            );
+        });
+    }
+
+    /// Approval records (notes carrying `tool_call_id`) splice directly after
+    /// the item holding their tool call even when later turns follow; an
+    /// unresolvable tool id degrades to the tail.
+    #[gpui::test]
+    fn rebuild_from_display_splices_tool_anchored_note_after_its_tool_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let display = vec![
+            HistoryEntry::Message(msg_with_id("u1", Role::User, "read it")),
+            HistoryEntry::Message(Message::assistant(vec![MessageContent::ToolUse(
+                LanguageModelToolUse {
+                    id: "tu_1".to_string(),
+                    name: Arc::from("Read"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            )])),
+            HistoryEntry::Message(Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    tool_name: Arc::from("Read"),
+                    is_error: false,
+                    content: "ok".to_string(),
+                }),
+            ])),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "approved", "tu_1")),
+            HistoryEntry::Message(msg_with_id("u2", Role::User, "again")),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "lost", "ghost")),
         ];
-        let merged = merge_ui_notes(&messages, items, &notes);
-        assert_eq!(
-            signature(&merged),
-            vec![
-                "U:read it",
-                "?",              // Thinking container carrying tu_1
-                "N:Bash allowed", // tool-anchored → right after its item
-                "A:done",
-                "N:dropped tool", // unresolvable tool → segment end fallback
-                "U:again",
-                "A:yo",
-            ]
-        );
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            let conv = ConversationState::rebuild_from_display(
+                &display,
+                &HashMap::new(),
+                "model",
+                false,
+                ctx,
+                cx,
+            );
+            let kinds: Vec<ConvItem> = conv
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind().clone())
+                .collect();
+            assert_eq!(
+                signature(&kinds),
+                vec![
+                    "U:read it",
+                    "?",          // Thinking container carrying tu_1
+                    "N:approved", // tool-anchored → right after its item
+                    "U:again",
+                    "N:lost", // unresolvable tool → tail fallback
+                ]
+            );
+        });
+    }
+
+    /// Several notes anchored to the same tool call keep emit order when
+    /// spliced after their tool item (grouped splice applied in descending
+    /// index order; one-by-one insertion at ix+1 would reverse them).
+    #[gpui::test]
+    fn rebuild_from_display_keeps_emit_order_for_notes_on_same_tool(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let display = vec![
+            HistoryEntry::Message(msg_with_id("u1", Role::User, "run")),
+            HistoryEntry::Message(Message::assistant(vec![MessageContent::ToolUse(
+                LanguageModelToolUse {
+                    id: "tu_1".to_string(),
+                    name: Arc::from("Bash"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            )])),
+            HistoryEntry::Message(Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "ok".to_string(),
+                }),
+            ])),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "first", "tu_1")),
+            HistoryEntry::Note(note_with_tool(UiNoteKind::Notice, "second", "tu_1")),
+            HistoryEntry::Message(msg_with_id("u2", Role::User, "next")),
+        ];
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            let conv = ConversationState::rebuild_from_display(
+                &display,
+                &HashMap::new(),
+                "model",
+                false,
+                ctx,
+                cx,
+            );
+            let kinds: Vec<ConvItem> = conv
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind().clone())
+                .collect();
+            assert_eq!(
+                signature(&kinds),
+                vec![
+                    "U:run",
+                    "?", // Thinking container carrying tu_1
+                    "N:first",
+                    "N:second",
+                    "U:next",
+                ]
+            );
+        });
     }
 
     /// `AutoApproval` notes splice no conversation item: their
     /// `tool_call_id` stamps the matching tool entry's `auto_approved` badge
     /// instead, so a rebuilt thread reproduces the live badge without a
     /// notice card. A marker whose tool item is gone applies nothing.
-    #[test]
-    fn merge_ui_notes_stamps_auto_approval_badge_without_item() {
-        let messages = vec![
-            msg_with_id("u1", Role::User, "read it"),
-            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
-                id: "tu_1".to_string(),
-                name: Arc::from("Read"),
-                raw_input: String::new(),
-                input: serde_json::Value::Null,
-                is_input_complete: true,
-                thought_signature: None,
-            })]),
-            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
-                tool_use_id: "tu_1".to_string(),
-                tool_name: Arc::from("Read"),
-                is_error: false,
-                content: "ok".to_string(),
-            })]),
-            msg_with_id("a1", Role::Assistant, "done"),
-        ];
-        let items = build_items(&messages, &HashMap::new(), false);
-        let marker = |tool_id: &str| {
-            let mut data = serde_json::json!({ "text": "" });
-            data["tool_call_id"] = serde_json::Value::String(tool_id.to_string());
-            UiNoteRecord {
-                anchor_user_id: Some("u1".to_string()),
-                kind: UiNoteKind::AutoApproval,
-                data,
-            }
-        };
-        let merged = merge_ui_notes(&messages, items, &[marker("tu_1"), marker("ghost")]);
-        assert_eq!(
-            signature(&merged),
-            vec![
-                "U:read it",
-                "?", // Thinking container carrying tu_1 — no notice spliced
-                "A:done",
-            ]
-        );
-        let tool = merged
-            .iter()
-            .find_map(|i| match i {
-                ConvItem::Thinking(t) => t.entries.iter().find_map(|e| match e {
-                    ActivityEntry::Tool(tool) if tool.id == "tu_1" => Some(tool),
-                    _ => None,
+    #[gpui::test]
+    fn rebuild_from_display_stamps_auto_approval_badge_without_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let display = vec![
+            HistoryEntry::Message(msg_with_id("u1", Role::User, "read it")),
+            HistoryEntry::Message(Message::assistant(vec![MessageContent::ToolUse(
+                LanguageModelToolUse {
+                    id: "tu_1".to_string(),
+                    name: Arc::from("Read"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            )])),
+            HistoryEntry::Message(Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_1".to_string(),
+                    tool_name: Arc::from("Read"),
+                    is_error: false,
+                    content: "ok".to_string(),
                 }),
-                _ => None,
-            })
-            .expect("tool entry present");
-        assert!(tool.auto_approved, "the AutoApproval note stamps the badge");
-    }
-
-    /// A tool-anchored note also lands after a top-level `ToolCall` card
-    /// (the `AskUserQuestion` path — not folded into an activity segment),
-    /// matching the live `notice_anchor_for_tool` resolution.
-    #[test]
-    fn merge_ui_notes_places_tool_anchored_note_after_top_level_card() {
-        let messages = vec![
-            msg_with_id("u1", Role::User, "clarify"),
-            msg_with_id("a1", Role::Assistant, "answered"),
-        ];
-        let items = vec![
-            ConvItem::User {
-                text: "clarify".into(),
-                images: Vec::new(),
-                meta: None,
-                display_state: UserMessageDisplayState::Normal,
-            },
-            ConvItem::ToolCall(ToolCallItem {
-                id: "ask_1".into(),
-                name: agent::tools::ASK_USER_QUESTION.into(),
-                title: "which?".into(),
-                status: ToolCallStatus::Success,
-                output: String::new(),
-                is_error: false,
-                input: serde_json::Value::Null,
-                streaming: false,
-                collapsed: false,
-                user_toggled: false,
-                auto_approved: false,
-                panel: None,
+            ])),
+            HistoryEntry::Note(UiNoteRecord {
+                kind: UiNoteKind::AutoApproval,
+                data: serde_json::json!({ "tool_call_id": "tu_1" }),
             }),
-            ConvItem::Assistant {
-                text: "answered".into(),
-                streaming: false,
-                token_usage: None,
-                activity_summary: None,
-            },
+            HistoryEntry::Note(UiNoteRecord {
+                kind: UiNoteKind::AutoApproval,
+                data: serde_json::json!({ "tool_call_id": "ghost" }),
+            }),
         ];
-        let mut data = serde_json::json!({ "text": "allowed" });
-        data["tool_call_id"] = serde_json::Value::String("ask_1".into());
-        let note_rec = UiNoteRecord {
-            anchor_user_id: Some("u1".to_string()),
-            kind: UiNoteKind::Notice,
-            data,
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
         };
-        let merged = merge_ui_notes(&messages, items, &[note_rec]);
-        assert_eq!(
-            signature(&merged),
-            vec![
-                "U:clarify",
-                "?",         // top-level ToolCall card
-                "N:allowed", // tool-anchored → right after the card
-                "A:answered",
-            ]
-        );
+        cx.update(|cx| {
+            let conv = ConversationState::rebuild_from_display(
+                &display,
+                &HashMap::new(),
+                "model",
+                false,
+                ctx,
+                cx,
+            );
+            let kinds: Vec<ConvItem> = conv
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind().clone())
+                .collect();
+            assert_eq!(signature(&kinds), vec!["U:read it", "?"]);
+            match &kinds[1] {
+                ConvItem::Thinking(t) => match &t.entries[0] {
+                    ActivityEntry::Tool(tool) => {
+                        assert!(tool.auto_approved, "the AutoApproval note stamps the badge")
+                    }
+                    other => panic!("expected tool entry, got {other:?}"),
+                },
+                other => panic!("expected thinking segment, got {other:?}"),
+            }
+        });
     }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the

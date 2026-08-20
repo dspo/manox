@@ -22,7 +22,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
 impl ThreadsDatabase {
     /// Register a project path so it persists in the sidebar even when all its
     /// threads are archived. `INSERT OR IGNORE` makes this idempotent — calling
-    /// on every `save_thread` with a project is safe and cheap.
+    /// on every `refresh_thread_list` with a project is safe and cheap.
     pub fn register_project(&self, path: &str) -> Result<()> {
         if path.is_empty() {
             return Ok(());

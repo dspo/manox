@@ -31,8 +31,14 @@ impl ThreadEngine for FakeEngine {
     fn is_running(&self) -> bool {
         false
     }
-    fn history(&self) -> Vec<Message> {
-        self.history.lock().unwrap().clone()
+    fn history(&self) -> Vec<agent::db::HistoryEntry> {
+        self.history
+            .lock()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .map(agent::db::HistoryEntry::Message)
+            .collect()
     }
     fn request_token_usage(&self) -> std::collections::HashMap<String, TokenUsage> {
         std::collections::HashMap::new()

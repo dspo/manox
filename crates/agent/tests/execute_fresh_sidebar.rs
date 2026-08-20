@@ -1,7 +1,7 @@
 //! Live reproduction for the "execute plan in fresh context" handoff: after
 //! an `ExecuteFresh` verdict the workspace spawns a fresh thread seeded with
 //! the execution directive and runs its first turn. The sidebar renders the
-//! `ThreadStore` summary list, which is refreshed on `save_thread(touch)` and
+//! `ThreadStore` summary list, which is refreshed on `refresh_thread_list` and
 //! the actor's `SessionListDirty` notices. The pi session file for a fresh
 //! session is deferred until the first assistant message, so a refresh that
 //! scans before the file materializes misses the thread entirely.
@@ -9,7 +9,7 @@
 //! This test mirrors the workspace's ExecuteFresh orchestration at the
 //! facade + store level (no UI): create the fresh thread, seed the execution
 //! turn, wait for the turn to settle, then apply the workspace's
-//! `TurnFinished` `save_thread(touch)` refresh and assert the new thread's
+//! `TurnFinished` `refresh_thread_list` refresh and assert the new thread's
 //! session surfaces in `ThreadStore::summaries` — the sidebar's list.
 //!
 //! Hermetic: the provider config points at a fake Anthropic endpoint served
@@ -181,7 +181,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // The workspace's `TurnFinished` handler persists with `touch=true`,
     // which re-scans the session repository into the store summaries.
     // Apply the same call, then pump the async refresh.
-    cx.update(|cx| agent::save_thread(thread.clone(), true, cx));
+    cx.update(agent::refresh_thread_list);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         cx.run_until_parked();
