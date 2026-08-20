@@ -740,6 +740,18 @@ impl Thread {
                 let store = crate::thread_store::global();
                 store.update(cx, |s, cx| s.refresh(cx));
             }
+            BackendNotice::SailorCompleted { sailor_id, content } => {
+                // Deliver the Sailor's final text as a peer message and let
+                // a turn fire — the Captain reliably observes the result
+                // without polling. Mirrors the Team leader-inbox path.
+                self.deliver_peer_messages(
+                    vec![crate::team::PeerMessage {
+                        from: sailor_id,
+                        content,
+                    }],
+                    cx,
+                );
+            }
         }
     }
 
@@ -2293,6 +2305,32 @@ pub(crate) mod tests {
             assert!(t.pending_prompts.is_empty(), "text queue drained");
             assert!(t.pending_images.is_empty(), "image queue drained");
         });
+    }
+
+    #[gpui::test]
+    fn sailor_completed_notice_injects_peer_message_and_fires_turn(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::SailorCompleted {
+                    sailor_id: "sailor-1".into(),
+                    content: "PR #601 LGTM".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "the Sailor completion fired one turn");
+        assert!(runs[0].0.contains("PR #601 LGTM"), "final text rode the prompt: {:?}", runs[0].0);
+        drop(runs);
+        let has_user = thread.read_with(cx, |t, _| {
+            t.messages.iter().any(|m| matches!(m.role, crate::language_model::Role::User))
+        });
+        assert!(has_user, "a user message was injected for the completion");
     }
 
     /// An image-only insert (no text) still starts a turn — the guard keys on

@@ -462,12 +462,31 @@ impl ThreadEngine for PiEngine {
 
 // ── The pi actor ───────────────────────────────────────────────────────────
 
+/// Infer a capability tag for an agent definition from its declared tool
+/// allowlist. The host snapshot carries Read/Grep/Glob/Ls (read),
+/// Write/Edit (write), and Bash (exec); `tools: []` means the full
+/// snapshot. The tag rides the `AgentToolDescription` template so the model
+/// knows what each subagent can do before dispatching.
+fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
+    if def.tools.is_empty() {
+        return "write+bash";
+    }
+    let has_write = def.tools.iter().any(|t| t == "Write" || t == "Edit");
+    let has_bash = def.tools.iter().any(|t| t == "Bash");
+    match (has_write, has_bash) {
+        (true, true) => "write+bash",
+        (true, false) => "write",
+        (false, true) => "bash",
+        (false, false) => "read-only",
+    }
+}
+
 /// Minimal builtin coding-agent prompt. Deliberately not the manox
 /// `system_prompt` assembly — that belongs to the manox harness.
 fn system_prompt(cwd: &Path) -> String {
     let date = chrono::Local::now().format("%Y-%m-%d");
     let mut prompt = format!(
-        "You are Manox Pi, a coding agent running inside the manox app on the pi harness.\n\
+        "You are the Captain, the main agent running inside the manox app on the pi harness.\n\
          Working directory: {cwd}\n\
          Date: {date}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
@@ -480,6 +499,37 @@ fn system_prompt(cwd: &Path) -> String {
     // system prompt, which rendered `skill::summaries_or_empty()` into its
     // template; the pi path has no skill tool, so the wording only promises
     // what exists.
+    prompt.push_str("\n\n## Subagents & parallel work\n");
+    prompt.push_str(
+        "You can dispatch subagents via the `Agent` tool — each runs in its \
+         own fresh context (no parent history). The `Agent` tool description \
+         lists the live subagent types and their capability tags; the tag \
+         also says whether the subagent runs synchronously or asynchronously. \
+         Two are built in:\n\
+         - `Explore` (read-only, synchronous): locates code by file, symbol, \
+         or keyword and returns conclusions; it cannot write files or run \
+         commands. The tool call blocks and returns Explore's answer.\n\
+         - `Sailor` (write+bash, asynchronous): a general-purpose coding \
+         worker that reads, writes, and edits files and runs shell commands \
+         (including cargo/clippy/test). The tool returns immediately with a \
+         `{\"sailor_id\": ...}` dispatch handle — NOT the output. Sailor \
+         runs in the background; when it settles its final summary arrives \
+         as a peer message and triggers your next turn. Continue with other \
+         work while Sailors run; do not poll.\n\n\
+         Prefer parallel subagents over serial self-work. For splittable \
+         tasks — reviewing multiple PRs, modifying independent files, \
+         exploring alternatives — emit multiple `Agent` calls in one turn so \
+         they run concurrently. Pass `isolation: \"worktree\"` when a \
+         subagent needs its own working tree (builds won't collide, edits \
+         won't clash; a worktree with work is kept + reported back).\n\n\
+         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use \
+         `TeamCreate` only for long-lived work that needs a shared task list \
+         and peer messaging between members; for independent parallel \
+         subtasks, Sailors are lighter and report back directly.\n\n\
+         Each subagent starts from a blank context, so pin any contract it \
+         must honor (exact paths, signatures, gate requirements) directly in \
+         the prompt.",
+    );
     let summaries = crate::skill::summaries_or_empty();
     if !summaries.is_empty() {
         prompt.push_str("\n\n## Available skills\n");
@@ -489,6 +539,248 @@ fn system_prompt(cwd: &Path) -> String {
         }
     }
     prompt
+}
+
+/// Host wrapper around `pi_extensions::bash::BashTool` for the subagent
+/// snapshot. A Sailor is already an async primitive, so a background bash
+/// inside a subagent session is pointless AND dangerous — the subagent's
+/// registry has no manager/seatbelt-wrap, so `run_in_background` would
+/// spawn a bare process that bypasses the seatbelt, eludes
+/// `TaskStop`/`BashOutput`/UI, and outlives the session (no `Drop` reap).
+/// Reject `run_in_background` outright; the description is also corrected
+/// for the subagent context (one-shot, no state persistence, no gating
+/// claim) since the kernel BashTool's static text assumes the host session.
+struct SubagentBashTool {
+    inner: Arc<dyn pi::tool::AgentTool>,
+}
+
+const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
+    one-shot shell at the current cwd (no persistent cwd/vars across calls), under the same \
+    backend as the Captain (seatbelt-confined where the host has one). `run_in_background` is \
+    not available inside a subagent — the subagent itself is the async primitive, so run long \
+    commands in the foreground. Use `head_lines`/`tail_lines` to keep a selection of output \
+    instead of piping through `head`/`tail`.";
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for SubagentBashTool {
+    fn name(&self) -> &str {
+        "Bash"
+    }
+    fn description(&self) -> &str {
+        SUBAGENT_BASH_DESCRIPTION
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+    fn execution_mode(&self) -> pi::tool::ExecutionMode {
+        // Delegate: the kernel BashTool declares Sequential (a stateful
+        // persistent shell on non-macOS); the wrapper must inherit it so a
+        // single Sailor session doesn't interleave parallel bash state.
+        self.inner.execution_mode()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        // Strip `run_in_background` (refused by this wrapper — N1) and
+        // `unsandboxed` (no escalation path in the ungated subagent session)
+        // so the model never proposes them.
+        let mut schema = self.inner.parameters_schema();
+        if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.remove("run_in_background");
+            props.remove("unsandboxed");
+        }
+        schema
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if params["run_in_background"].as_bool().unwrap_or(false) {
+            return Err(pi::tool::ToolError::ExecutionFailed(
+                "`run_in_background` is not available inside a subagent session — the subagent \
+                 itself is the async primitive. Run the command in the foreground instead."
+                    .into(),
+            ));
+        }
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if params["run_in_background"].as_bool().unwrap_or(false) {
+            return Err(pi::tool::ToolError::ExecutionFailed(
+                "`run_in_background` is not available inside a subagent session — the subagent \
+                 itself is the async primitive. Run the command in the foreground instead."
+                    .into(),
+            ));
+        }
+        self.inner
+            .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+            .await
+    }
+}
+
+/// Host wrapper around `pi_extensions::bash::TaskStopTool` that also stops
+/// legacy-registry tasks (asynchronously-dispatched Sailors). The kernel
+/// `TaskStopTool` only knows the pi-extensions bash/monitor registries; a
+/// Sailor registers in the legacy `background_task` registry, so the model
+/// could not stop a runaway Sailor. This wrapper checks the legacy registry
+/// first (calling `background_task::stop`, the same path the UI card uses),
+/// and falls back to the kernel tool for bash/monitor/ws ids — one
+/// `TaskStop` for every task kind.
+struct LegacyAwareTaskStop {
+    inner: Arc<TaskStopTool>,
+}
+
+const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a background bash, a monitor, \
+    or an asynchronously-dispatched Sailor subagent (`sailor_id`). Cancels the task's token; the \
+    task settles to Stopped. Idempotent for an already-terminal task.";
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for LegacyAwareTaskStop {
+    fn name(&self) -> &str {
+        "TaskStop"
+    }
+    fn description(&self) -> &str {
+        TASKSTOP_DESCRIPTION
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        // Legacy tasks (Sailors) live in background_task; stop there first.
+        if let Some(id) = params["task_id"].as_str()
+            && crate::background_task::get_by_str(id).is_some()
+        {
+            crate::background_task::stop(id)
+                .await
+                .map_err(pi::tool::ToolError::ExecutionFailed)?;
+            return Ok(pi::tool::AgentToolResult::text(format!(
+                "Stopped background task `{id}`"
+            )));
+        }
+        // Else bash/monitor/ws — delegate to the kernel TaskStop.
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        _progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        // TaskStop never streams; route both entry points through execute.
+        self.execute(tool_call_id, params, signal, ctx).await
+    }
+}
+
+/// Host wrapper around [`SubagentTool`] that routes general-purpose
+/// (write+bash) subagents through [`SailorManager`] for async dispatch +
+/// completion notification, while read-only subagents (Explore) stay on the
+/// kernel's synchronous path. Routing is by capability, not name, so a
+/// user/plugin definition declaring a write/bash toolset is also async.
+struct SailorRoutingTool {
+    inner: Arc<SubagentTool>,
+    registry: Arc<pi::ext_point_agent::AgentRegistry>,
+    sailor: Arc<crate::sailor_manager::SailorManager>,
+}
+
+impl SailorRoutingTool {
+    /// Whether `params` selects a subagent that should run asynchronously.
+    /// Any definition whose capability is not `read-only` (i.e. it can write
+    /// or run bash) goes through `SailorManager`; read-only ones stay sync.
+    fn is_async_dispatch(&self, params: &serde_json::Value) -> bool {
+        params["subagent_type"]
+            .as_str()
+            .and_then(|t| self.registry.get(t))
+            .map(subagent_capability)
+            .is_some_and(|c| c != "read-only")
+    }
+
+    fn split_params(&self, params: serde_json::Value) -> (String, String, Option<String>) {
+        let st = params["subagent_type"].as_str().unwrap_or("").to_string();
+        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+        let isolation = params["isolation"].as_str().map(String::from);
+        (st, prompt, isolation)
+    }
+}
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for SailorRoutingTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        false
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if self.is_async_dispatch(&params) {
+            let (st, prompt, isolation) = self.split_params(params);
+            self.sailor.dispatch(st, prompt, isolation, signal).await
+        } else {
+            self.inner.execute(tool_call_id, params, signal, ctx).await
+        }
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        if self.is_async_dispatch(&params) {
+            let (st, prompt, isolation) = self.split_params(params);
+            self.sailor.dispatch(st, prompt, isolation, signal).await
+        } else {
+            self.inner
+                .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+                .await
+        }
+    }
 }
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
@@ -511,6 +803,7 @@ fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    owner_thread_id: &str,
 ) -> (Vec<Arc<dyn PiAgentTool>>, SessionOrchestrators) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (writes + network confined; shell state does
@@ -537,6 +830,10 @@ fn build_tools(
     } else {
         Arc::new(PersistentShellOperations::new(cwd))
     };
+    // Subagent snapshot inherits the same seatbelt backend so a Sailor's
+    // Bash is confined exactly like the Captain's (B4: no ungated bypass).
+    let subagent_bash_ops: Arc<dyn pi::tools::bash::BashOperations> = Arc::clone(&bash_ops);
+    let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Escalation backend: no confinement at all. Selected per call when the
@@ -583,7 +880,9 @@ fn build_tools(
         Arc::new(bash),
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
-        Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        Arc::new(LegacyAwareTaskStop {
+            inner: Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        }),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
     // Plan-mode gate exemption: plan-file writes stay approval-free while
@@ -758,13 +1057,52 @@ fn build_tools(
         // (`<plugin>/agents/`, namespaced) definitions layer over the
         // built-ins; same-name user files override built-ins.
         crate::agent_defs::register_user_and_plugin(&mut registry);
+        // Render the Agent tool description against the live registry so the
+        // model sees the available `subagent_type` values (Explore, Sailor,
+        // user/plugin defs) with capability tags — no filesystem probing.
+        // Tool descriptions are model-facing English, so always `Language::En`.
+        let subagent_descriptions: Vec<crate::prompt::SubagentTypeData> = registry
+            .all()
+            .iter()
+            .map(|def| crate::prompt::SubagentTypeData {
+                name: def.name.clone(),
+                capability: subagent_capability(def),
+                description: def.description.clone(),
+            })
+            .collect();
+        let registry = Arc::new(registry);
         let subagent = SubagentTool::new(
-            Arc::new(registry),
+            registry.clone(),
             vec![
                 Arc::new(pi_extensions::read::SelectorReadTool::new()),
                 Arc::new(pi::tools::grep::GrepTool),
                 Arc::new(pi::tools::glob::GlobTool),
                 Arc::new(pi::tools::ls::LsTool),
+                // Write/exec axis: definitions that opt into the full
+                // snapshot (e.g. Sailor, `tools: []`) get these; read-only
+                // definitions (Explore) name an explicit allowlist that
+                // `select_tools` filters against, so they never reach a
+                // read-only subagent. Bash inherits the Captain's seatbelt
+                // backend (no ungated bypass); Write/Edit carry the process
+                // write lock so parallel Sailors clobbering the same path
+                // surface a named-holder conflict instead of silently racing.
+                Arc::new(SubagentBashTool {
+                    inner: Arc::new(
+                        pi_extensions::bash::BashTool::new(
+                            Arc::clone(&subagent_bash_ops),
+                            subagent_background.clone(),
+                        )
+                        .with_sandbox_available(sandbox_available),
+                    ),
+                }),
+                Arc::new(crate::file_lock::FileLockedTool::new(
+                    Arc::new(pi::tools::write::WriteTool),
+                    "sailor",
+                )),
+                Arc::new(crate::file_lock::FileLockedTool::new(
+                    Arc::new(pi::tools::edit::EditTool),
+                    "sailor",
+                )),
             ],
         )
         .with_model_runtime(runtime.clone())
@@ -772,7 +1110,47 @@ fn build_tools(
         // Resolve agent-definition `model` overrides against the live
         // registry (registration has landed before session assembly).
         .with_provider_registry(crate::pi_providers::global());
-        tools.push(Arc::new(subagent));
+        let subagent = match crate::prompt::render(
+            crate::prompt::PromptTemplate::AgentToolDescription,
+            crate::language::Language::En,
+            &crate::prompt::AgentToolDescriptionData {
+                subagents: subagent_descriptions,
+            },
+        ) {
+            Ok(desc) => subagent.with_description(desc),
+            Err(e) => {
+                tracing::warn!("Agent tool description render failed: {e}");
+                subagent
+            }
+        };
+        // Wrap the SubagentTool so write/bash subagents (Sailor + any
+        // user/plugin def with that capability) dispatch asynchronously
+        // through SailorManager; read-only subagents (Explore) stay on the
+        // kernel's synchronous path. The manager owns an env-backed
+        // ToolContext (cwd = the session's project root) so the spawned
+        // child run needs no borrow of the caller's context.
+        let subagent = Arc::new(subagent);
+        let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
+            cwd.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        ));
+        let sailor = Arc::new(crate::sailor_manager::SailorManager::new(
+            subagent.clone(),
+            sailor_ctx,
+            notice_tx.clone(),
+            // Attributing the Sailor to this thread lets
+            // `thread_has_running_tasks` count it (sidebar indicator) and
+            // `cancel_all_for_thread` cancel it on thread delete (run_actor
+            // cancels before `cleanup_thread` removes the entry — otherwise
+            // the Sailor would keep burning tokens, unfindable by Stop).
+            owner_thread_id.to_string(),
+        ));
+        tools.push(Arc::new(SailorRoutingTool {
+            inner: subagent,
+            registry,
+            sailor,
+        }));
     }
     (
         tools,
@@ -1285,6 +1663,7 @@ fn session_builder(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
     parent_session: Option<&str>,
+    owner_thread_id: &str,
 ) -> (pi::coding_agent::AgentSessionBuilder, SessionOrchestrators) {
     let (tools, orchestrators) = build_tools(
         cwd,
@@ -1296,6 +1675,7 @@ fn session_builder(
         goal_bridge,
         cmd_tx,
         worktree,
+        owner_thread_id,
     );
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
@@ -1626,6 +2006,7 @@ async fn run_actor(
             &cmd_tx,
             &state.worktree,
             None,
+            &thread_id,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -1667,6 +2048,7 @@ async fn run_actor(
                 &cmd_tx,
                 &state.worktree,
                 parent_session.as_deref(),
+                &thread_id,
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -2457,6 +2839,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     parent_session.as_deref(),
+                    &thread_id,
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -2536,9 +2919,13 @@ async fn run_actor(
     }
 
     let _ = session.close().await;
-    // Thread-lifetime cleanup: monitors/background tasks are stopped and the
-    // monitor bridge has exited with the orchestrator senders, so the legacy
-    // registry entries and mailbox can be released now.
+    // Thread-lifetime cleanup: cancel (SessionEnded) every task this thread
+    // owns — including in-flight asynchronously-dispatched Sailors — then
+    // release the legacy registry entries + mailbox. `cleanup_thread` alone
+    // only `retain`s (drops entries without cancelling tokens); the cancel
+    // must run first or a deleted thread's Sailors become unfindable zombies
+    // still burning tokens.
+    crate::background_task::cancel_all_for_thread(&thread_id).await;
     crate::background_task::cleanup_thread(&thread_id);
 }
 
@@ -2597,6 +2984,7 @@ async fn rebuild_session(
         cmd_tx,
         worktree,
         None,
+        thread_id,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
@@ -4661,5 +5049,208 @@ mod tests {
         // id for a message the mapping would not emit.
         let history = adapt::harness_messages_to_messages(&messages[..1]);
         let _ = request_attribution(&history, &messages);
+    }
+
+    #[test]
+    fn agent_tool_description_lists_built_in_subagents_with_capability() {
+        let mut registry = pi::ext_point_agent::AgentRegistry::new();
+        pi_extensions::agents::register_defaults(&mut registry);
+        let subagents: Vec<crate::prompt::SubagentTypeData> = registry
+            .all()
+            .iter()
+            .map(|def| crate::prompt::SubagentTypeData {
+                name: def.name.clone(),
+                capability: subagent_capability(def),
+                description: def.description.clone(),
+            })
+            .collect();
+        let rendered = crate::prompt::render(
+            crate::prompt::PromptTemplate::AgentToolDescription,
+            crate::language::Language::En,
+            &crate::prompt::AgentToolDescriptionData { subagents },
+        )
+        .expect("AgentToolDescription renders");
+        assert!(
+            rendered.contains("Explore (read-only)"),
+            "Explore read-only tag present: {rendered}"
+        );
+        assert!(
+            rendered.contains("Sailor (write+bash)"),
+            "Sailor write+bash tag present: {rendered}"
+        );
+        assert!(
+            rendered.contains("synchronously"),
+            "template declares synchronous read-only subagents: {rendered}"
+        );
+        assert!(
+            rendered.contains("asynchronously"),
+            "template declares asynchronous write+bash subagents: {rendered}"
+        );
+    }
+
+    /// The async/sync split is a model-facing contract: a `write+bash`
+    /// def routes through SailorManager (async dispatch handle), a
+    /// read-only def stays synchronous. `subagent_capability` is the routing
+    /// key, so this doubles as the `SailorRoutingTool::is_async_dispatch`
+    /// predicate test.
+    #[test]
+    fn subagent_capability_routes_sailor_async_explore_sync() {
+        let mut registry = pi::ext_point_agent::AgentRegistry::new();
+        pi_extensions::agents::register_defaults(&mut registry);
+        let sailor = registry.get("Sailor").expect("Sailor registered");
+        let explore = registry.get("Explore").expect("Explore registered");
+        assert_eq!(subagent_capability(sailor), "write+bash");
+        assert_ne!(
+            subagent_capability(sailor),
+            "read-only",
+            "Sailor routes async (not read-only)"
+        );
+        assert_eq!(
+            subagent_capability(explore),
+            "read-only",
+            "Explore stays synchronous"
+        );
+    }
+
+    #[test]
+    fn system_prompt_mentions_captain_and_sailors() {
+        let prompt = system_prompt(std::path::Path::new("/tmp"));
+        assert!(prompt.contains("Captain"), "names the Captain: {prompt}");
+        assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
+        assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
+        assert!(
+            prompt.contains("multiple `Agent(Sailor)` calls over forming a `Team`"),
+            "prefers Sailors over Team: {prompt}"
+        );
+    }
+
+    #[test]
+    fn subagent_bash_description_forbids_background_and_drops_host_claims() {
+        // The subagent Bash wrapper rejects `run_in_background` (N1: no
+        // bare-spawn escape hatch) and its description must not carry the
+        // host-session BashTool's false claims (state persists / approval).
+        assert!(
+            SUBAGENT_BASH_DESCRIPTION.contains("run_in_background"),
+            "description flags background refusal"
+        );
+        assert!(
+            !SUBAGENT_BASH_DESCRIPTION.contains("State persists"),
+            "no state-persistence claim"
+        );
+        assert!(
+            !SUBAGENT_BASH_DESCRIPTION.contains("requires user approval"),
+            "no approval-gating claim for the ungated subagent session"
+        );
+    }
+
+    /// `SubagentBashTool` must reject `run_in_background` (N1: no bare-spawn
+    /// escape hatch) while leaving foreground calls untouched. Uses a marker
+    /// inner so the gate is exercised without constructing a real BashTool.
+    struct MarkerBash;
+    #[async_trait::async_trait]
+    impl pi::tool::AgentTool for MarkerBash {
+        fn name(&self) -> &str {
+            "Bash"
+        }
+        fn description(&self) -> &str {
+            "marker"
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn requires_approval(&self, _: &serde_json::Value) -> bool {
+            false
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            // Mirror the kernel BashTool's shape so the wrapper's strip is
+            // exercised (run_in_background + unsandboxed get removed).
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "run_in_background": {"type": "boolean"},
+                    "unsandboxed": {"type": "boolean"}
+                },
+                "required": ["command"]
+            })
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: tokio_util::sync::CancellationToken,
+            _: &dyn pi::tool::ToolContext,
+        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+            Ok(pi::tool::AgentToolResult::text("foreground-ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_bash_refuses_background_but_allows_foreground() {
+        use std::path::PathBuf;
+        let tool = SubagentBashTool {
+            inner: Arc::new(MarkerBash),
+        };
+        let ctx = pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(PathBuf::from("/tmp"))),
+            PathBuf::from("/tmp"),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+        // Background: refused at the gate; the inner is never reached.
+        let bg = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "echo hi", "run_in_background": true}),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await;
+        let err = bg.unwrap_err().to_string();
+        assert!(
+            err.contains("not available inside a subagent"),
+            "background refused: {err}"
+        );
+        // Foreground: the gate passes and the inner runs.
+        let fg = tool
+            .execute(
+                "c2",
+                serde_json::json!({"command": "echo hi"}),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("foreground gate passes");
+        let fg_text: String = fg
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let pi::types::ContentBlock::Text { text, .. } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(fg_text, "foreground-ok", "foreground reached the inner");
+    }
+
+    #[test]
+    fn subagent_bash_schema_strips_background_and_unsandboxed() {
+        let tool = SubagentBashTool {
+            inner: Arc::new(MarkerBash),
+        };
+        let schema = tool.parameters_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(
+            !props.contains_key("run_in_background"),
+            "run_in_background stripped from the subagent schema"
+        );
+        assert!(
+            !props.contains_key("unsandboxed"),
+            "unsandboxed stripped from the subagent schema"
+        );
+        assert!(props.contains_key("command"), "command still advertised");
     }
 }
