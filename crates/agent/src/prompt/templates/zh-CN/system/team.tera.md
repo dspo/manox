@@ -2,7 +2,7 @@
 ## 团队生命周期 playbook（leader）
 
 member 的 turn 结束时你会收到系统通知，形如
-`[from team]: <name> stopped: reason=<StopReason>, reported=<bool>`。
+`[来自 team]：<name> stopped: reason=<StopReason>, reported=<bool>`。
 逐条检查 reason 与 `reported` 后行动：
 
 - `EndTurn` 且 `reported=true`：仅表示 member 本轮发过消息——可能是汇报，
