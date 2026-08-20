@@ -125,6 +125,19 @@ impl SidebarRow {
     }
 }
 
+/// Row geometry + team nesting metadata for [`SidebarThreadItem::from_thread`]:
+/// `indent` offsets members under their leader, `nested` draws the left guide
+/// rail, `member_role` renders the team-worker badge.
+struct RowNesting {
+    indent: gpui::Pixels,
+    team_leader: bool,
+    team_collapsed: bool,
+    /// Nested row (team member or fork child): draws the left guide rail.
+    nested: bool,
+    /// Team-worker role label for the member badge; `None` outside teams.
+    member_role: Option<String>,
+}
+
 /// One ordered sidebar row plus its team nesting metadata: `indent` offsets
 /// members under their leader, `team_leader` marks a row that can collapse
 /// its member group, `team_collapsed` the fold state.
@@ -722,9 +735,15 @@ impl Sidebar {
                                         pending_plan: store.pending_plan_contains(&s.id),
                                         background_work: store.background_work_contains(&s.id),
                                     },
-                                    px(16. + tr.indent),
-                                    tr.team_leader,
-                                    tr.team_collapsed,
+                                    RowNesting {
+                                        indent: px(16. + tr.indent),
+                                        team_leader: tr.team_leader,
+                                        team_collapsed: tr.team_collapsed,
+                                        nested: tr.indent > 0.0,
+                                        member_role: (tr.indent > 0.0)
+                                            .then(|| member_role_for(store, &s.id, cx))
+                                            .flatten(),
+                                    },
                                     &theme,
                                 ),
                                 slide,
@@ -951,9 +970,19 @@ impl Render for Sidebar {
                                                             background_work: store
                                                                 .background_work_contains(&s.id),
                                                         },
-                                                        px(tr.indent),
-                                                        tr.team_leader,
-                                                        tr.team_collapsed,
+                                                        RowNesting {
+                                                            indent: px(tr.indent),
+                                                            team_leader: tr.team_leader,
+                                                            team_collapsed: tr.team_collapsed,
+                                                            nested: tr.indent > 0.0,
+                                                            member_role: (tr.indent > 0.0)
+                                                                .then(|| {
+                                                                    member_role_for(
+                                                                        store, &s.id, cx,
+                                                                    )
+                                                                })
+                                                                .flatten(),
+                                                        },
                                                         &theme,
                                                     ),
                                                     &slide,
@@ -1203,6 +1232,11 @@ struct SidebarThreadItem {
     team_leader: bool,
     /// The leader's member group is folded; the chevron shows the fold.
     team_collapsed: bool,
+    /// Nested row (team member or fork child): draws the left guide rail
+    /// tying the row to its parent.
+    nested: bool,
+    /// Team-worker role label for the member badge; `None` outside teams.
+    member_role: Option<String>,
     icon: RowIcon,
     /// A plan-review verdict is due; the icon stays blue static, not spinning.
     pending_plan: bool,
@@ -1229,9 +1263,7 @@ impl SidebarThreadItem {
         summary: &agent::ThreadSummary,
         selected: bool,
         live: ThreadLiveState,
-        indent: gpui::Pixels,
-        team_leader: bool,
-        team_collapsed: bool,
+        nesting: RowNesting,
         theme: &Theme,
     ) -> Self {
         let display = summary.display_title();
@@ -1256,9 +1288,11 @@ impl SidebarThreadItem {
             resumable: false,
             resuming: false,
             selected,
-            indent,
-            team_leader,
-            team_collapsed,
+            indent: nesting.indent,
+            team_leader: nesting.team_leader,
+            team_collapsed: nesting.team_collapsed,
+            nested: nesting.nested,
+            member_role: nesting.member_role,
             icon: RowIcon::Thread,
             wash: approval_mode_color(summary.approval_mode, theme),
             kind: RowKind::Thread {
@@ -1318,6 +1352,8 @@ impl SidebarThreadItem {
             // External CLI sessions never lead a team; no collapse affordance.
             team_leader: false,
             team_collapsed: false,
+            nested: false,
+            member_role: None,
             icon: RowIcon::External(summary.kind.icon_asset()),
             // Same wash as AutoPilot threads: `theme.accent` resolves to
             // `neutral-100` (near-white) in the forced Light theme, which made
@@ -1327,6 +1363,18 @@ impl SidebarThreadItem {
             kind: RowKind::External,
         }
     }
+}
+
+/// Team-worker role for a nested row, read from the live roster; `None`
+/// when the member thread is gone (team disbanded) — the badge degrades.
+fn member_role_for(store: &agent::ThreadStore, id: &str, cx: &App) -> Option<String> {
+    let thread = store.live_thread(id)?;
+    let team = thread.read(cx).team().cloned()?;
+    team.read(cx)
+        .members()
+        .values()
+        .find(|m| m.thread().read(cx).id.0 == id)
+        .map(|m| m.role().to_string())
 }
 
 /// Render one unified sidebar row — threads and external agent sessions share
@@ -1358,6 +1406,7 @@ fn render_thread_item(
     let wash = item.wash;
     let icon = item.icon.clone();
     let open_kind = item.kind.clone();
+    let member_role = item.member_role.clone();
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // The loop can still self-advance (turn in flight, monitors / background
     // bash alive): the row spins and the id tag stays highlighted.
@@ -1515,6 +1564,19 @@ fn render_thread_item(
         .w_full()
         .relative()
         .overflow_hidden()
+        // Left guide rail for nested rows ties a member/fork row to its
+        // parent, making the leader→member hierarchy visually explicit.
+        .when(item.nested, |this| {
+            this.child(
+                gpui::div()
+                    .absolute()
+                    .left(px(12.))
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .w(px(1.))
+                    .bg(theme.border),
+            )
+        })
         .pl(px(8.) + item.indent)
         .pr_2()
         .py_1()
@@ -1601,7 +1663,16 @@ fn render_thread_item(
                                 .text_sm()
                                 .text_color(title_color)
                                 .child(title),
-                        ),
+                        )
+                        .when_some(member_role, |this, role| {
+                            this.child(
+                                Tag::new()
+                                    .with_variant(TagVariant::Secondary)
+                                    .outline()
+                                    .small()
+                                    .child(role),
+                            )
+                        }),
                 )
                 .child(
                     h_flex()
@@ -1839,9 +1910,13 @@ mod tests {
             &sample_thread(),
             true,
             ThreadLiveState::default(),
-            px(0.),
-            false,
-            false,
+            RowNesting {
+                indent: px(0.),
+                team_leader: false,
+                team_collapsed: false,
+                nested: false,
+                member_role: None,
+            },
             &theme,
         );
         assert!(thread.selected);
@@ -1888,9 +1963,13 @@ mod tests {
             &sample_thread(),
             false,
             ThreadLiveState::default(),
-            px(0.),
-            false,
-            false,
+            RowNesting {
+                indent: px(0.),
+                team_leader: false,
+                team_collapsed: false,
+                nested: false,
+                member_role: None,
+            },
             &theme,
         );
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
