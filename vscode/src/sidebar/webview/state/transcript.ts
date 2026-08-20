@@ -39,6 +39,9 @@ export interface ToolCallState {
   status: ToolUiStatus;
   output: string;
   isError: boolean;
+  /** The autopilot reviewer allowed this call without escalation; the card
+   * header renders a check-check badge ahead of the status icon. */
+  autoApproved?: boolean;
 }
 
 /** Pasted attachment: live sessions carry a renderable data url, restored

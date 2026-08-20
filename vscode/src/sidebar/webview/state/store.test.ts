@@ -312,6 +312,94 @@ describe('transcript folding', () => {
     expect(toolCard(store, 't1')?.isError).toBe(true);
   });
 
+  it('approval_decision allow stamps the tool card badge; ask and unknown ids pass', () => {
+    const store = startSession();
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' }),
+    );
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+
+    // The badge rides the card through the streamed output and the final
+    // result, which rebuild the tool object in place.
+    store.dispatch(event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: 'ok\n' }));
+    store.dispatch(
+      event({ type: 'tool_result', sessionId: 's', id: 't1', output: 'done', is_error: false }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
+
+    // An `ask` verdict leaves the card untouched (the authorization card
+    // surfaces the escalation); a verdict for an id without a card parks in
+    // the pending buffer instead of spawning a stub.
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 'ghost',
+        tool_name: 'bash',
+        tool_title: 'rm',
+        verdict: 'allow',
+      }),
+    );
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't2', name: 'bash', title: 'pwd', status: 'running' }),
+    );
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't2',
+        tool_name: 'bash',
+        tool_title: 'pwd',
+        verdict: 'ask',
+        reason: 'risky',
+      }),
+    );
+    expect(toolCard(store, 't2')?.autoApproved).toBeUndefined();
+    expect(thread(store)?.items.find((i) => i.kind === 'tool' && i.id === 'ghost')).toBeUndefined();
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['ghost']);
+  });
+
+  it('approval_decision racing ahead of tool_call is drained onto the late card', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    // No card yet: the verdict parks, nothing renders.
+    expect(toolCard(store, 't1')).toBeUndefined();
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['t1']);
+
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'running' }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(thread(store)?.pendingAutoApprovals).toEqual([]);
+
+    // The badge survives the terminal status update too.
+    store.dispatch(
+      event({ type: 'tool_call', sessionId: 's', id: 't1', name: 'bash', title: 'ls', status: 'success' }),
+    );
+    expect(toolCard(store, 't1')?.autoApproved).toBe(true);
+    expect(toolCard(store, 't1')?.status).toBe('completed');
+  });
+
   it('adds authorization cards and removes them on decision', () => {
     const store = startSession();
     store.dispatch(
@@ -790,6 +878,47 @@ describe('wireMessagesToTranscriptItems', () => {
       }),
     ]);
   });
+
+  it('stamps auto-approved badges from the thread_history id set', () => {
+    const messages = [
+      wire({
+        id: 'a1',
+        content: [
+          {
+            ToolUse: {
+              id: 'tu1',
+              name: 'bash',
+              raw_input: '{}',
+              input: {},
+              is_input_complete: true,
+              thought_signature: null,
+            },
+          },
+        ],
+      }),
+      wire({
+        id: 't1',
+        role: 'system',
+        provenance: 'tool',
+        content: [
+          { ToolResult: { tool_use_id: 'tu1', tool_name: 'bash', is_error: false, content: 'ok' } },
+        ],
+      }),
+    ];
+    const items = wireMessagesToTranscriptItems(messages, new Set(['tu1']));
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'tool',
+      tool: expect.objectContaining({ id: 'tu1', autoApproved: true }),
+    });
+    // Without the set (older actors) the badge stays absent.
+    const bare = wireMessagesToTranscriptItems(messages);
+    expect(bare[0]).toMatchObject({
+      kind: 'tool',
+      tool: expect.objectContaining({ id: 'tu1' }),
+    });
+    expect((bare[0] as { tool: { autoApproved?: boolean } }).tool.autoApproved).toBeUndefined();
+  });
 });
 
 describe('Store notifications', () => {
@@ -1229,6 +1358,27 @@ describe('plan / goal / task folding', () => {
     const askCards = (thread(store)?.items ?? []).filter((i) => i.kind === 'ask_question');
     expect(askCards).toHaveLength(1);
     expect(askCards[0]?.id).toBe('ask1');
+  });
+
+  it('thread_history supersedes parked auto-approval verdicts', () => {
+    const store = startSession();
+    store.dispatch(
+      event({
+        type: 'approval_decision',
+        sessionId: 's',
+        tool_call_id: 't1',
+        tool_name: 'bash',
+        tool_title: 'ls',
+        verdict: 'allow',
+      }),
+    );
+    expect(thread(store)?.pendingAutoApprovals).toEqual(['t1']);
+    // A whole-snapshot replay replaces the live state; the restored
+    // transcript carries its own auto_approved_tools stamps.
+    store.dispatch(
+      event({ type: 'thread_history', sessionId: 's', messages: [] }),
+    );
+    expect(thread(store)?.pendingAutoApprovals).toEqual([]);
   });
 
   it('plan_ready replay replaces the previous card', () => {

@@ -368,6 +368,15 @@ export type ActorEvent =
 			summary: string;
 			input: unknown;
 	  }
+	| {
+			type: 'approval_decision';
+			sessionId: string;
+			tool_call_id: string;
+			tool_name: string;
+			tool_title: string;
+			verdict: 'allow' | 'ask';
+			reason?: string;
+	  }
 	// state
 	| { type: 'model_changed'; sessionId: string; from: string | null; to: string }
 	| { type: 'reasoning_effort_changed'; sessionId: string; effort: ReasoningEffort }
@@ -392,7 +401,15 @@ export type ActorEvent =
 	| { type: 'threads_updated'; threads: ThreadListItem[] }
 	| { type: 'commands'; commands: CommandEntry[] }
 	// restored-history and info snapshots
-	| { type: 'thread_history'; sessionId: string; messages: WireMessage[] }
+	| {
+			type: 'thread_history';
+			sessionId: string;
+			messages: WireMessage[];
+			/** Tool ids the autopilot reviewer auto-approved; the rebuild
+			 * stamps their cards with the check-check badge. Absent from
+			 * older actors. */
+			auto_approved_tools?: string[];
+	  }
 	| { type: 'thread_info'; sessionId: string; info: ThreadInfoSnapshot }
 	| { type: 'branch'; sessionId: string; branch: string }
 	| { type: 'git_stats'; sessionId: string; stats: GitStats }

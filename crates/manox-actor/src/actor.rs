@@ -1257,6 +1257,29 @@ fn subscribe_thread(
                         );
                     });
                 }
+                ThreadEvent::ApprovalDecision {
+                    tool_call_id,
+                    verdict,
+                    ..
+                } => {
+                    // The actor-only host has no workspace `record_ui_note`;
+                    // persist the auto-approval marker here so a VS Code
+                    // session's `thread_history.auto_approved_tools` rebuild
+                    // reproduces the badge exactly like the gpui host's.
+                    if matches!(verdict, agent::approval::ReviewVerdict::Allow) {
+                        let anchor = entity.read(app).last_user_message_id().map(str::to_owned);
+                        let note = agent::db::UiNoteRecord {
+                            anchor_user_id: anchor,
+                            kind: agent::db::UiNoteKind::AutoApproval,
+                            data: serde_json::json!({
+                                "text": "",
+                                "tool_call_id": tool_call_id,
+                            }),
+                        };
+                        entity.update(app, |t, _| t.push_ui_note(note));
+                        agent::save_thread(entity.clone(), false, app);
+                    }
+                }
                 _ => {}
             }
             if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id)) {
@@ -1277,11 +1300,27 @@ fn emit_history_and_info(
     sink: &EventSink,
 ) {
     let messages = strip_messages_for_wire(thread.read(app).messages());
+    // Auto-approval badges ride the ui_notes sidecar, which the webview's
+    // `wireMessagesToTranscriptItems` rebuild never sees; project just the
+    // marked tool ids so the restored transcript stamps the same badges.
+    let auto_approved_tools: Vec<String> = thread
+        .read(app)
+        .ui_notes()
+        .iter()
+        .filter(|n| n.kind == agent::db::UiNoteKind::AutoApproval)
+        .filter_map(|n| {
+            n.data
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
     sink.emit(
         json!({
             "type": "thread_history",
             "sessionId": session_id,
             "messages": messages,
+            "auto_approved_tools": auto_approved_tools,
         })
         .to_string(),
     );
