@@ -551,7 +551,7 @@ fn system_prompt(cwd: &Path) -> String {
 /// for the subagent context (one-shot, no state persistence, no gating
 /// claim) since the kernel BashTool's static text assumes the host session.
 struct SubagentBashTool {
-    inner: Arc<pi_extensions::bash::BashTool>,
+    inner: Arc<dyn pi::tool::AgentTool>,
 }
 
 const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
@@ -614,6 +614,75 @@ impl pi::tool::AgentTool for SubagentBashTool {
         self.inner
             .execute_with_progress(tool_call_id, params, signal, ctx, progress)
             .await
+    }
+}
+
+/// Host wrapper around `pi_extensions::bash::TaskStopTool` that also stops
+/// legacy-registry tasks (asynchronously-dispatched Sailors). The kernel
+/// `TaskStopTool` only knows the pi-extensions bash/monitor registries; a
+/// Sailor registers in the legacy `background_task` registry, so the model
+/// could not stop a runaway Sailor. This wrapper checks the legacy registry
+/// first (calling `background_task::stop`, the same path the UI card uses),
+/// and falls back to the kernel tool for bash/monitor/ws ids — one
+/// `TaskStop` for every task kind.
+struct LegacyAwareTaskStop {
+    inner: Arc<TaskStopTool>,
+}
+
+const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a background bash, a monitor, \
+    or an asynchronously-dispatched Sailor subagent (`sailor_id`). Cancels the task's token; the \
+    task settles to Stopped. Idempotent for an already-terminal task.";
+
+#[async_trait::async_trait]
+impl pi::tool::AgentTool for LegacyAwareTaskStop {
+    fn name(&self) -> &str {
+        "TaskStop"
+    }
+    fn description(&self) -> &str {
+        TASKSTOP_DESCRIPTION
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        // Legacy tasks (Sailors) live in background_task; stop there first.
+        if let Some(id) = params["task_id"].as_str()
+            && crate::background_task::get_by_str(id).is_some()
+        {
+            crate::background_task::stop(id)
+                .await
+                .map_err(pi::tool::ToolError::ExecutionFailed)?;
+            return Ok(pi::tool::AgentToolResult::text(format!(
+                "Stopped background task `{id}`"
+            )));
+        }
+        // Else bash/monitor/ws — delegate to the kernel TaskStop.
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn pi::tool::ToolContext,
+        _progress: &dyn pi::tool::ToolProgress,
+    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        // TaskStop never streams; route both entry points through execute.
+        self.execute(tool_call_id, params, signal, ctx).await
     }
 }
 
@@ -797,7 +866,9 @@ fn build_tools(
         Arc::new(bash),
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
-        Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        Arc::new(LegacyAwareTaskStop {
+            inner: Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        }),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
     // Plan-mode gate exemption: plan-file writes stay approval-free while
@@ -5050,5 +5121,86 @@ mod tests {
             !SUBAGENT_BASH_DESCRIPTION.contains("requires user approval"),
             "no approval-gating claim for the ungated subagent session"
         );
+    }
+
+    /// `SubagentBashTool` must reject `run_in_background` (N1: no bare-spawn
+    /// escape hatch) while leaving foreground calls untouched. Uses a marker
+    /// inner so the gate is exercised without constructing a real BashTool.
+    struct MarkerBash;
+    #[async_trait::async_trait]
+    impl pi::tool::AgentTool for MarkerBash {
+        fn name(&self) -> &str {
+            "Bash"
+        }
+        fn description(&self) -> &str {
+            "marker"
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn requires_approval(&self, _: &serde_json::Value) -> bool {
+            false
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: tokio_util::sync::CancellationToken,
+            _: &dyn pi::tool::ToolContext,
+        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+            Ok(pi::tool::AgentToolResult::text("foreground-ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_bash_refuses_background_but_allows_foreground() {
+        use std::path::PathBuf;
+        let tool = SubagentBashTool {
+            inner: Arc::new(MarkerBash),
+        };
+        let ctx = pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(PathBuf::from("/tmp"))),
+            PathBuf::from("/tmp"),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+        // Background: refused at the gate; the inner is never reached.
+        let bg = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "echo hi", "run_in_background": true}),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await;
+        let err = bg.unwrap_err().to_string();
+        assert!(
+            err.contains("not available inside a subagent"),
+            "background refused: {err}"
+        );
+        // Foreground: the gate passes and the inner runs.
+        let fg = tool
+            .execute(
+                "c2",
+                serde_json::json!({"command": "echo hi"}),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("foreground gate passes");
+        let fg_text: String = fg
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let pi::types::ContentBlock::Text { text, .. } = b {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(fg_text, "foreground-ok", "foreground reached the inner");
     }
 }
