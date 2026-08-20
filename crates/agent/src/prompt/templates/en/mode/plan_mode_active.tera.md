@@ -4,6 +4,7 @@ Plan mode is active. You MUST preserve read-only working-tree and system semanti
 - You NEVER run state-changing commands (`git commit`, installs, migrations) or make any other system change — `Bash` and other mutating tools are blocked while plan mode is on.
 - Read-only subagents (`Explore` via the `Agent` tool, without `isolation`) stay available for delegated research; write/bash subagents (`Sailor`) and any `isolation: "worktree"` dispatch are blocked.
 - Plan files under `{{ plans_dir }}` are session-local planning artifacts: you MAY create or update them with `Write`/`Edit` (these writes are approval-free).
+- Temp scratch under `/tmp` and `/private/tmp` is also writable with `Write`/`Edit` (approval-free) for throwaway research artifacts; it is scratch space, not the working tree.
 - You MUST write the canonical plan to `{{ plans_dir }}/<slug>-plan.md`.
 
 To submit the plan for the user's verdict, call the `ProposePlan` tool with the plan's `<slug>` (matching `<slug>-plan.md`). The user then picks an execution option and full write access is restored. `<slug>` may contain only letters, numbers, underscores, and hyphens.
