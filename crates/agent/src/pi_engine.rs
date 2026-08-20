@@ -1014,6 +1014,29 @@ fn build_tools(
                 .with_plan_policy(Arc::clone(&plan_policy)),
         ));
     }
+    // ChromeUse (real Chrome via the in-process rustwright CDP engine): same
+    // trust axes as WebExplore — reads stay ungated; writes ride the approval
+    // gate. Plan mode's ToolCall hook blocks both (fixed allowlist).
+    tools.push(Arc::new(crate::chrome_use::ChromeUseSnapshotTool));
+    tools.push(Arc::new(crate::chrome_use::ChromeUseWaitForTool));
+    tools.push(Arc::new(crate::chrome_use::ChromeUseScreenshotTool));
+    for tool in [
+        Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn PiAgentTool>,
+        Arc::new(crate::chrome_use::ChromeUseNavigateTool),
+        Arc::new(crate::chrome_use::ChromeUseClickTool),
+        Arc::new(crate::chrome_use::ChromeUseTypeTool),
+        Arc::new(crate::chrome_use::ChromeUsePressKeyTool),
+        Arc::new(crate::chrome_use::ChromeUseSelectOptionTool),
+        Arc::new(crate::chrome_use::ChromeUseScrollTool),
+        Arc::new(crate::chrome_use::ChromeUseTabsTool),
+        Arc::new(crate::chrome_use::ChromeUseEvaluateTool),
+        Arc::new(crate::chrome_use::ChromeUseCloseTool),
+    ] {
+        tools.push(Arc::new(
+            ApprovalGatedTool::new(tool, Arc::clone(gate))
+                .with_plan_policy(Arc::clone(&plan_policy)),
+        ));
+    }
     // Git worktree management: the tools run the git phase and queue the
     // session swap (actor-side, between turns); both approval-gated.
     tools.push(Arc::new(crate::worktree::EnterWorktreeTool::new(

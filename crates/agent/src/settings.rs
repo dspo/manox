@@ -107,6 +107,11 @@ pub struct Settings {
     /// startup, so changes apply on the next launch.
     #[serde(default)]
     pub mcp: McpSettings,
+
+    /// ChromeUse engine settings (executable / headless / profile / attach
+    /// endpoint). Read lazily at the first ChromeUse tool call.
+    #[serde(default)]
+    pub chrome: ChromeSettings,
 }
 
 /// MCP toggles: server names the user switched off in the settings panel.
@@ -116,6 +121,28 @@ pub struct Settings {
 pub struct McpSettings {
     /// Server names skipped by `mcp::init` (persisted by the settings UI).
     pub disabled: Vec<String>,
+}
+
+/// ChromeUse session settings for the built-in Chrome automation engine
+/// (`chrome_use` module). Every field is optional; absent values resolve to
+/// engine defaults at launch time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ChromeSettings {
+    /// Chrome/Chromium executable path. `None` → engine discovery
+    /// (`RUSTWRIGHT_CHROMIUM` / `CHROME` / `CHROMIUM` env, then the common
+    /// install locations).
+    pub executable: Option<String>,
+    /// Launch Chrome headless. Default `false`: ChromeUse drives a real,
+    /// user-visible Chrome window.
+    pub headless: bool,
+    /// Chrome user-data (profile) directory. `None` →
+    /// `~/.manox/chrome-profile/`, so logins persist across sessions.
+    pub user_data_dir: Option<String>,
+    /// Attach to an already-running Chrome over its DevTools endpoint
+    /// (`ws://127.0.0.1:9222/...`) instead of launching a new process;
+    /// keeps the user's existing logins and tabs.
+    pub cdp_endpoint: Option<String>,
 }
 
 /// Network allowlist settings for the sandbox. Read once at startup by

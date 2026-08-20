@@ -8,6 +8,7 @@ pub mod agent_defs;
 pub mod approval;
 pub mod approval_review;
 pub mod background_task;
+pub mod chrome_use;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
