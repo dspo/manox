@@ -367,8 +367,10 @@ impl Team {
     /// Record a member's terminal stop and deliver the lifecycle
     /// notification to the leader like peer mail: an idle leader wakes
     /// immediately, a busy one drains it at turn end. The leader's playbook
-    /// decides the reaction (dismiss / nudge / replace).
-    pub fn member_stopped(&mut self, name: &str, reason: StopReason, cx: &mut App) {
+    /// decides the reaction (dismiss / nudge / replace). Emits
+    /// [`TeamEvent::MembersChanged`] so roster observers (member panel chip)
+    /// re-read `last_stop` without waiting for an unrelated redraw.
+    pub fn member_stopped(&mut self, name: &str, reason: StopReason, cx: &mut Context<Self>) {
         let Some(m) = self.members.get_mut(name) else {
             return;
         };
@@ -382,17 +384,16 @@ impl Team {
             },
             cx,
         );
+        cx.emit(TeamEvent::MembersChanged);
+        cx.notify();
     }
 
-    /// Tear down the team: stop running members, archive every member
-    /// session (cleanup invariant — the sidebar row leaves the active list;
-    /// the jsonl stays on disk for audit), then clear each member's `team`
-    /// back-reference (breaking the team↔member strong cycle so the member
-    /// `Entity<Thread>`s actually drop), release the leader/member
-    /// subscriptions, and drain inboxes. The leader's own `team` field is
-    /// cleared separately by the `TeamDisband` op — the team entity holds
-    /// the leader only weakly and cannot reach it.
-    pub fn disband(&mut self, cx: &mut App) {
+    /// Stop running members, break the team↔member cycle, and release
+    /// roster state — the store-free half of [`Team::disband`]. Exposed so
+    /// [`crate::thread_store::ThreadStore::archive_thread`] can tear down a
+    /// live team without re-entering the store (disband itself archives and
+    /// would double-borrow if called from inside a store update).
+    pub fn teardown(&mut self, cx: &mut Context<Self>) {
         for m in self.members.values() {
             m.thread.update(cx, |t, cx| {
                 if t.is_running() {
@@ -401,21 +402,32 @@ impl Team {
                 t.clear_team(cx);
             });
         }
-        if let Some(store) = crate::thread_store::try_global() {
-            let ids: Vec<String> = self
-                .members
-                .values()
-                .map(|m| m.thread.read(cx).id.0.clone())
-                .collect();
-            for id in ids {
-                store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
-            }
-        }
         self.members.clear();
         self.member_subs.clear();
         self.leader_sub = None;
         self.leader_inbox.clear();
         self.child_auth.clear();
+        cx.emit(TeamEvent::MembersChanged);
+        cx.notify();
+    }
+
+    /// Tear down the team and archive every member session (cleanup
+    /// invariant — the sidebar row leaves the active list; the jsonl stays
+    /// on disk for audit). The leader's own `team` field is cleared
+    /// separately by the `TeamDisband` op — the team entity holds the leader
+    /// only weakly and cannot reach it.
+    pub fn disband(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .members
+            .values()
+            .map(|m| m.thread.read(cx).id.0.clone())
+            .collect();
+        self.teardown(cx);
+        if let Some(store) = crate::thread_store::try_global() {
+            for id in ids {
+                store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+            }
+        }
     }
 }
 
@@ -774,6 +786,63 @@ mod tests {
             "notice content: {:?}",
             evs[1].1
         );
+    }
+
+    /// Centralized archive invariant: archiving a live leader through the
+    /// store tears the team down (roster released, member back-refs
+    /// cleared) even when no caller disbanded first.
+    #[test]
+    fn archive_leader_tears_down_team_via_store() {
+        let _store_lock = crate::thread_store::store_test_lock().lock().unwrap();
+        let mut cx = TestAppContext::single();
+        let db_path =
+            std::env::temp_dir().join(format!("team-archive-{}.db", uuid::Uuid::new_v4()));
+        let db = std::sync::Arc::new(
+            crate::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let leader = bare_thread("lead", &mut cx);
+        let member_thread = bare_thread("plan", &mut cx);
+        cx.update(|cx| {
+            leader.update(cx, |t, _| t.set_id_for_test("lead-t".into()));
+            member_thread.update(cx, |t, _| t.set_id_for_test("plan-t".into()));
+        });
+        let (leader_id, member_id) = ("lead-t".to_string(), "plan-t".to_string());
+        let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            member_thread.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            let store = crate::thread_store::global();
+            store.update(cx, |s, _| {
+                s.insert_summary_for_test(&leader_id, None);
+                s.insert_summary_for_test(&member_id, Some(&leader_id));
+            });
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member_thread.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+        });
+
+        // No disband: the store cascade alone must tear the team down.
+        cx.update(|cx| {
+            let store = crate::thread_store::global();
+            store.update(cx, |s, cx| s.archive_thread(&leader_id, true, cx));
+        });
+
+        cx.update(|cx| {
+            assert!(team.read(cx).members().is_empty(), "roster released");
+            assert!(
+                member_thread.read(cx).team().is_none(),
+                "member back-ref cleared"
+            );
+            assert!(leader.read(cx).team().is_none(), "leader back-ref cleared");
+        });
+        crate::thread_store::drop_for_test();
+        std::fs::remove_file(db_path).ok();
     }
 
     /// `reported` is set by a member→leader delivery and cleared when the

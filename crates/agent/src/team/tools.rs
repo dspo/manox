@@ -737,7 +737,7 @@ fn op_status(this: &mut Thread, cx: &mut Context<Thread>) -> Result<String, Stri
                     "idle"
                 };
                 let stop = match (m.last_stop(), m.last_stop_at()) {
-                    (Some(reason), Some(at)) => format!("{reason:?} at {at}"),
+                    (Some(reason), Some(at)) => format!("{reason:?}, {} ago", ago_label(at)),
                     _ => "never stopped".to_string(),
                 };
                 format!(
@@ -753,6 +753,19 @@ fn op_status(this: &mut Thread, cx: &mut Context<Thread>) -> Result<String, Stri
             .join("\n")
     });
     Ok(rendered)
+}
+
+/// Compact relative age for roster output (`3s` / `4m` / `2h`), so the
+/// leader reads "how long ago" without parsing Unix seconds.
+fn ago_label(at: i64) -> String {
+    let secs = (chrono::Utc::now().timestamp() - at).max(0);
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 90 * 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// Spawn a long-lived team worker: an independent pi `Entity<Thread>`
@@ -849,8 +862,13 @@ fn spawn_member(
     // Opening task + member obligations (final report before stopping);
     // the member runs both in its first turn (fire-and-forget worker).
     let prompt = spec.prompt.clone();
-    let obligations =
-        crate::team::render_member_obligations(leader.agent_language()).unwrap_or_default();
+    let obligations = match crate::team::render_member_obligations(leader.agent_language()) {
+        Ok(text) => text,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to render team member obligations");
+            String::new()
+        }
+    };
     member.update(cx, |t, cx| {
         t.insert_user_message_with_ui_metadata(prompt, None, cx);
         if !obligations.is_empty() {
@@ -891,7 +909,11 @@ mod tests {
 
         let leader = bare_thread("lead", &mut cx);
         let member_thread = bare_thread("plan", &mut cx);
-        let member_id = cx.update(|cx| member_thread.read(cx).id.0.clone());
+        cx.update(|cx| {
+            leader.update(cx, |t, _| t.set_id_for_test("lead-d".into()));
+            member_thread.update(cx, |t, _| t.set_id_for_test("plan-d".into()));
+        });
+        let member_id = "plan-d".to_string();
         let team = cx.update(|cx| Team::new("squad".into(), leader.downgrade(), cx));
         cx.update(|cx| {
             let store = crate::thread_store::global();

@@ -2,11 +2,12 @@
 ## 团队生命周期 playbook（leader）
 
 member 的 turn 结束时你会收到系统通知，形如
-`[from team] <name> stopped: reason=<StopReason>, reported=<bool>`。
+`[from team]: <name> stopped: reason=<StopReason>, reported=<bool>`。
 逐条检查 reason 与 `reported` 后行动：
 
-- `EndTurn` 且 `reported=true`：member 已完成并汇报。阅读报告；用
-  `TeamDismiss <name>` 回收，或工作未完成时 `SendMessage` 追问。
+- `EndTurn` 且 `reported=true`：仅表示 member 本轮发过消息——可能是汇报，
+  不保证完成。读它最后一条消息判断：完成则 `TeamDismiss <name>` 回收，
+  未完成则 `SendMessage` 跟进。
 - `EndTurn` 且 `reported=false`：member 停下但未汇报。`SendMessage <name>`
   催促，点名缺失的交付物，并要求它在停止前汇报。
 - `Error` / `Cancelled` / `MaxTokens` / `Refusal`：member 死亡或被截断。

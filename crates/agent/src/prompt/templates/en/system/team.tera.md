@@ -2,12 +2,13 @@
 ## Team lifecycle playbook (leader)
 
 Members send you a system notice when their turn ends, shaped
-`[from team] <name> stopped: reason=<StopReason>, reported=<bool>`.
+`[from team]: <name> stopped: reason=<StopReason>, reported=<bool>`.
 On each notice, check the reason and `reported`, then act:
 
-- `EndTurn` and `reported=true`: the member finished and reported. Read its
-  report; `TeamDismiss <name>` to collect it, or `SendMessage` to ask a
-  follow-up if the work is incomplete.
+- `EndTurn` and `reported=true`: the member sent at least one message this
+  turn — a likely report, not a guaranteed completion. Read its last message
+  and judge: `TeamDismiss <name>` to collect finished work, or `SendMessage`
+  to follow up if the work is incomplete.
 - `EndTurn` and `reported=false`: the member stopped without reporting.
   `SendMessage <name>` a nudge naming the missing deliverable and require a
   report before it stops.
