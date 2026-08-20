@@ -12,7 +12,7 @@ use std::time::Duration;
 use pi::agent_loop::{StreamFn, StreamResolver};
 use pi::coding_agent::{ModelRuntime, create_agent_session};
 use pi::tool::AgentTool;
-use pi::types::{AgentMessage, ContentBlock, Model, StopReason};
+use pi::types::{AgentEvent, AgentMessage, ContentBlock, Model, StopReason};
 use pi_extensions::bash::BashTool;
 use pi_extensions::bash::orchestration::{BackgroundEvent, BackgroundManager, OutputShape};
 use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};

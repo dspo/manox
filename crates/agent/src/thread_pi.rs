@@ -2408,9 +2408,12 @@ pub(crate) mod tests {
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
         thread.update(cx, |t, cx| {
             t.handle_notice(
-                BackendNotice::SailorCompleted {
-                    sailor_id: "sailor-1".into(),
-                    content: "PR #601 LGTM".into(),
+                BackendNotice::SteerDelivered {
+                    from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
+                    reason: pi_extensions::steer_bus::SteerReason::Complete,
+                    payload: pi_extensions::steer_bus::SteerPayload {
+                        text: "PR #601 LGTM".into(),
+                    },
                 },
                 cx,
             );

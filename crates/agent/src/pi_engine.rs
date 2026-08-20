@@ -722,12 +722,6 @@ impl pi::tool::AgentTool for LegacyAwareTaskStop {
     }
 }
 
-/// Host wrapper around [`SubagentTool`] that routes general-purpose
-/// (write+bash) subagents through [`SailorManager`] for async dispatch +
-/// completion notification, while read-only subagents (Explore) stay on the
-/// kernel's synchronous path. Routing is by capability, not name, so a
-/// user/plugin definition declaring a write/bash toolset is also async.
-
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
