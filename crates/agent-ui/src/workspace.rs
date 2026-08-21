@@ -302,6 +302,10 @@ pub struct Workspace {
     /// Accumulated child-session events per Agent tool-call id, so a panel
     /// opened mid-run backfills from the start.
     subagent_transcripts: HashMap<String, Vec<agent::SubagentChildEvent>>,
+    /// Latest completion text per subagent address (from SubagentProgress
+    /// status=Success/Error), used as the panel's final answer when the
+    /// Agent tool-result is absent (new Steer bus has no ToolResult).
+    subagent_final_text: HashMap<String, String>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -664,6 +668,7 @@ impl Workspace {
             member_panels: HashMap::new(),
             subagent_panels: HashMap::new(),
             subagent_transcripts: HashMap::new(),
+            subagent_final_text: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -1356,6 +1361,17 @@ impl Workspace {
                                 cx,
                             );
                         });
+                        // Record the completion text so a panel opened later
+                        // (after the Agent tool-result is gone) can show it.
+                        if matches!(
+                            *status,
+                            agent::ToolCallStatus::Success
+                                | agent::ToolCallStatus::Error
+                                | agent::ToolCallStatus::Denied
+                        ) && let Some(text) = &latest_activity
+                        {
+                            this.subagent_final_text.insert(id.clone(), text.clone());
+                        }
                         if let Some(panel) = this.subagent_panels.get(&id) {
                             panel.update(cx, |p, cx| p.set_status(*status, cx));
                         }
@@ -4299,6 +4315,7 @@ impl Workspace {
             .unwrap_or_default();
         let final_text = if backfill.is_empty() {
             self.agent_final_text(id, cx)
+                .or_else(|| self.subagent_final_text.get(id).cloned())
         } else {
             None
         };

@@ -319,7 +319,7 @@ impl AgentBus {
                             subagent_type: spawn_type.clone(),
                             tool_uses: 0,
                             token_usage: crate::language_model::TokenUsage::default(),
-                            latest_activity: Some(content.chars().take(80).collect()),
+                            latest_activity: Some(content.clone()),
                             status: crate::thread::ToolCallStatus::Success,
                         },
                     )));
