@@ -402,6 +402,30 @@ async fn run_loop_inner(
         break;
     }
 
+    // A cancelled run always settles with a terminal Aborted assistant
+    // message, whether the cancel landed between turns or cut a tool
+    // execution short mid-turn — consumers learn of the abort from a
+    // message, not a silent end.
+    if signal.is_cancelled() {
+        let message = terminal_message(context, signal, &context.model.api, "aborted".into());
+        sink.emit(AgentEvent::TurnStart).await?;
+        sink.emit(AgentEvent::MessageStart {
+            message: Box::new(message.clone()),
+        })
+        .await?;
+        sink.emit(AgentEvent::MessageEnd {
+            message: Box::new(message.clone()),
+        })
+        .await?;
+        context.messages.push(message.clone());
+        new_messages.push(message.clone());
+        sink.emit(AgentEvent::TurnEnd {
+            message: Box::new(message),
+            tool_results: Vec::new(),
+        })
+        .await?;
+    }
+
     sink.emit(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
     })
@@ -1454,14 +1478,27 @@ mod tests {
         // Should complete without error (loop exits early).
         assert!(result.is_ok());
         let messages = result.unwrap();
-        // The user message was prepended, but no assistant message should be produced.
+        // The cancelled run settles with exactly one assistant message —
+        // the terminal Aborted one. A cancel always materializes as a
+        // message, never a silent end.
         let assistant_count = messages
             .iter()
             .filter(|m| matches!(m, AgentMessage::Assistant { .. }))
             .count();
         assert_eq!(
-            assistant_count, 0,
-            "aborted loop should not produce assistant messages"
+            assistant_count, 1,
+            "aborted loop settles with a terminal Aborted assistant message"
+        );
+        let aborted = messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::Assistant { stop_reason, .. }
+                if *stop_reason == Some(StopReason::Aborted)
+            )
+        });
+        assert!(
+            aborted,
+            "the single assistant message must be the terminal Aborted one"
         );
     }
 
@@ -1919,6 +1956,130 @@ mod tests {
         assert!(
             aborted,
             "abort must materialize as a terminal Aborted assistant message"
+        );
+    }
+
+    // ── Cancel enforcement: a tool that ignores its signal ───────────────────
+
+    /// A tool that ignores its cancel signal and parks forever — the worst
+    /// case. Only the enforcement race in `execute_one` can settle a run it
+    /// participates in.
+    struct HungTool {
+        /// Fired once when execution starts, so the test cancels
+        /// deterministically while the tool is in flight.
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for HungTool {
+        fn name(&self) -> &str {
+            "hung"
+        }
+        fn description(&self) -> &str {
+            "hangs forever"
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: JsonValue,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            if let Some(tx) = self.started.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            std::future::pending::<Result<AgentToolResult, ToolError>>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_settles_a_run_with_a_hung_tool() {
+        let sink = Arc::new(MockSink::new());
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let mut context = minimal_context();
+        context.tools = Arc::from(vec![Arc::new(HungTool {
+            started: std::sync::Mutex::new(Some(started_tx)),
+        }) as Arc<dyn AgentTool>]);
+
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "hung".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Box::new(Usage::default()),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let config = AgentLoopConfig::default();
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![tool_call_msg]));
+        let run_sink = Arc::clone(&sink);
+        let run = tokio::spawn(async move {
+            run_loop(
+                &[AgentMessage::user("hang")],
+                &mut context,
+                &config,
+                Some(token),
+                stream_fn,
+                &TestToolContext::new(),
+                &*run_sink,
+            )
+            .await
+        });
+
+        // Cancel while the hung tool is in flight. Without the enforcement
+        // race the tool would hold the turn forever and the timeout below
+        // would fail.
+        started_rx.await.expect("the hung tool started");
+        cancel.cancel();
+
+        let messages = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("cancel must settle the run promptly; a hung tool cannot hold the turn")
+            .expect("the run task must not panic")
+            .expect("a cancelled run closes out cleanly");
+
+        let aborted = messages.iter().any(|m| {
+            matches!(
+                m,
+                AgentMessage::Assistant { stop_reason, .. }
+                if *stop_reason == Some(StopReason::Aborted)
+            )
+        });
+        assert!(
+            aborted,
+            "cancel must materialize as a terminal Aborted assistant message"
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolExecutionEnd { is_error, .. } if *is_error
+            )),
+            "the abandoned tool call still emits an error ToolExecutionEnd"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "the cancelled run emits AgentEnd"
         );
     }
 
