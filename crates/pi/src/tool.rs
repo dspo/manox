@@ -503,14 +503,29 @@ async fn execute_one(
         }
     });
     let mut result = {
+        // Cancellation is raced against the execution itself, not merely
+        // checked around it: a tool that ignores its signal must not hold the
+        // turn hostage, so on cancel the execution future is dropped where it
+        // stands and settled as an error through the normal tail below.
+        // Dropped tools owe drop-cleanup of live resources (process trees,
+        // host round trips) — see the bash backends and `host_round_trip`.
+        //
+        // Deliberate deviation from upstream TS Pi, which is cooperative-only
+        // (it checks `signal.aborted` around tool calls but never races tool
+        // execution): manox's GUI has host-round-trip tools TS lacks, with a
+        // hard requirement that a user cancel always settles the turn.
+        // Mechanism, not policy.
+        let cancel = signal.clone();
         let execution =
             tool.execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress);
         tokio::pin!(execution);
         tokio::select! {
+            biased;
             outcome = &mut execution => match outcome {
                 Ok(r) => r,
                 Err(e) => AgentToolResult::error(format!("{e}")),
             },
+            () = cancel.cancelled() => AgentToolResult::error("aborted"),
             // The forwarder ends only when the sender closes, and the sender
             // lives in `progress`, borrowed by the running execution — so
             // this arm is unreachable while execution is in flight.

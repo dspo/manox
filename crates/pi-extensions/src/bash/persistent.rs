@@ -83,9 +83,13 @@ impl BashOperations for PersistentShellOperations {
         let mut err_buf: Vec<u8> = Vec::new();
 
         // Serialize through the one shell: a shell session cannot run two
-        // commands concurrently without interleaving their state.
-        let mut guard = self.shell.lock().await;
-        if guard.is_none() {
+        // commands concurrently without interleaving their state. The reap
+        // guard owns the lock for the run's whole lifetime: the kernel's
+        // cancel race can drop this future from outside at any await point,
+        // and the guard's Drop is what still reaps the run's process groups
+        // and releases the shell in that case.
+        let mut lock = Arc::clone(&self.shell).lock_owned().await;
+        if lock.is_none() {
             let mut s = Shell::builder()
                 .default_builtins(brush_builtins::BuiltinSet::BashMode)
                 .build()
@@ -97,11 +101,12 @@ impl BashOperations for PersistentShellOperations {
                 var.export();
                 s.set_env_global(k, var).map_err(brush_err)?;
             }
-            *guard = Some(s);
+            *lock = Some(s);
         }
+        let mut reap = ReapGuard::arm(lock);
 
         let outcome = {
-            let sh = guard.as_mut().expect("shell initialized");
+            let sh = reap.shell_mut();
             // A cwd override re-pins the shell; `None` keeps the current
             // directory so `cd` persists across calls.
             if let Some(cwd) = request.cwd {
@@ -145,12 +150,13 @@ impl BashOperations for PersistentShellOperations {
 
             // brush does not kill_on_drop, so a cancelled/timed-out run leaves
             // the spawned groups orphaned. Reap them now that the `run_string`
-            // borrow is released.
+            // borrow is released. Residual gap (brush 0.5.0): only jobs with
+            // a signalable pgid are tracked — foreground commands never enter
+            // the job table and `&` jobs track a join handle, not a pgid — so
+            // those processes outlive the reap and exit on their own. The
+            // job table is left intact — a previous `&` task must stay
+            // waitable across a cancelled run.
             if matches!(outcome, Outcome::Cancelled | Outcome::TimedOut) {
-                // brush only tracks stopped/background jobs, so a foreground
-                // command may not be reaped here; it exits on its own. The
-                // job table is left intact — a previous `&` task must stay
-                // waitable across a cancelled run.
                 kill_jobs(sh, libc::SIGTERM);
                 tokio::time::sleep(Duration::from_millis(CANCELLATION_GRACE_MS)).await;
                 kill_jobs(sh, libc::SIGKILL);
@@ -160,12 +166,15 @@ impl BashOperations for PersistentShellOperations {
             // hit EOF.
             outcome
         };
-        drop(guard);
+        // The run settled or was reaped explicitly: the guard disarms and the
+        // shell lock releases without further kills.
+        reap.defuse();
+        drop(reap);
 
-        // A cancelled command's process group can outlive the reap: brush
-        // only tracks stopped/background jobs, so a foreground process is not
-        // in `jobs` and keeps its pipes open. Bound the drain so a hung
-        // command cannot stall the turn (the process reaps on its own exit).
+        // A cancelled command's process group can outlive the reap (see the
+        // residual gap above) and keeps its pipes open. Bound the drain so a
+        // hung command cannot stall the turn (the process reaps on its own
+        // exit).
         let _ = tokio::time::timeout(Duration::from_secs(IO_DRAIN_TIMEOUT_SECS), async {
             loop {
                 tokio::select! {
@@ -195,6 +204,55 @@ impl BashOperations for PersistentShellOperations {
             Outcome::Ran(Err(e)) => Err(ExecutionError::Other(format!("{e}"))),
             Outcome::TimedOut => Err(ExecutionError::Timeout(request.timeout.unwrap_or_default())),
             Outcome::Cancelled => Err(ExecutionError::Aborted),
+        }
+    }
+}
+
+/// Reaps the process groups of an abandoned run.
+///
+/// brush does not kill_on_drop, so a run cut short by cancel/timeout — or
+/// dropped outright by the kernel's cancel race at any await point — leaves
+/// its spawned process groups orphaned unless something signals them. The
+/// guard owns the shell lock for the run's whole lifetime and is declared
+/// before the run future, so on any unwind the run future drops first and
+/// the guard's Drop still runs the reap with the shell borrow released —
+/// even when the exec future itself is dropped from outside. Drop has no
+/// await points, so the escalation skips the cooperative path's grace
+/// window.
+struct ReapGuard {
+    shell: Option<tokio::sync::OwnedMutexGuard<Option<Shell>>>,
+    armed: bool,
+}
+
+impl ReapGuard {
+    fn arm(shell: tokio::sync::OwnedMutexGuard<Option<Shell>>) -> Self {
+        ReapGuard {
+            shell: Some(shell),
+            armed: true,
+        }
+    }
+
+    fn shell_mut(&mut self) -> &mut Shell {
+        self.shell
+            .as_mut()
+            .and_then(|g| g.as_mut())
+            .expect("shell initialized")
+    }
+
+    /// The run settled or was reaped explicitly; no further kills.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(sh) = self.shell.as_ref().and_then(|g| g.as_ref()) {
+            kill_jobs(sh, libc::SIGTERM);
+            kill_jobs(sh, libc::SIGKILL);
         }
     }
 }
@@ -471,5 +529,90 @@ mod tests {
             String::from_utf8_lossy(&captured).contains("hello"),
             "on_data receives the output chunks"
         );
+    }
+
+    /// The kernel's enforcement race drops a cancelled tool's future from
+    /// outside, so the exec future must survive external drop: the reap
+    /// guard's Drop performs the reap and releases the shell lock even
+    /// though the internal cancel arm never runs.
+    #[tokio::test]
+    async fn external_drop_of_exec_future_releases_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = Arc::new(PersistentShellOperations::new(dir.path()));
+        let dir_path = dir.path().to_path_buf();
+        let ops2 = Arc::clone(&ops);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let exec = tokio::spawn(async move {
+            ops2.exec(BashExecRequest {
+                command: "sleep 30",
+                cwd: Some(dir_path.as_path()),
+                timeout: Some(Duration::from_secs(60)),
+                signal,
+                on_data: None,
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Drop without cancelling: the internal select observes nothing, so
+        // only the guard's Drop can reap and release the shell.
+        exec.abort();
+        let _ = exec.await;
+
+        // The abandoned run must not leave the shell locked: the next call
+        // acquires the guard-released lock and completes.
+        let next = tokio::time::timeout(
+            Duration::from_secs(10),
+            ops.exec(request(
+                "echo alive",
+                Some(dir.path()),
+                Some(Duration::from_secs(5)),
+                tokio_util::sync::CancellationToken::new(),
+            )),
+        )
+        .await
+        .expect("the shell must survive an externally dropped exec future")
+        .unwrap();
+        assert_eq!(next.stdout.trim(), "alive");
+    }
+
+    /// Cancel-and-drop in the same instant, as the enforcement race does:
+    /// whichever of the internal race or the external drop wins, the shell
+    /// stays usable.
+    #[tokio::test]
+    async fn cancel_and_drop_in_the_same_instant_keeps_the_shell_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = Arc::new(PersistentShellOperations::new(dir.path()));
+        let token = tokio_util::sync::CancellationToken::new();
+        let dir_path = dir.path().to_path_buf();
+        let ops2 = Arc::clone(&ops);
+        let signal = token.clone();
+        let exec = tokio::spawn(async move {
+            ops2.exec(BashExecRequest {
+                command: "sleep 30",
+                cwd: Some(dir_path.as_path()),
+                timeout: Some(Duration::from_secs(60)),
+                signal,
+                on_data: None,
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+        exec.abort();
+        let _ = exec.await;
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(10),
+            ops.exec(request(
+                "echo alive",
+                Some(dir.path()),
+                Some(Duration::from_secs(5)),
+                tokio_util::sync::CancellationToken::new(),
+            )),
+        )
+        .await
+        .expect("the shell must survive cancel + external drop")
+        .unwrap();
+        assert_eq!(next.stdout.trim(), "alive");
     }
 }

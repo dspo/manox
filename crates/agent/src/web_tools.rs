@@ -24,12 +24,18 @@ use crate::thread_engine::{BackendNotice, BrowserOp, BrowserReply};
 use crate::webview_host::BrowserTabId;
 
 /// Send `op` to the facade and await the host's reply. Clean errors for the
-/// two "nobody is listening" cases (no host registered / engine gone) so the
-/// model gets an actionable message instead of a hang.
+/// two "nobody is listening" cases (no host registered / engine gone) and
+/// `Aborted` on cancel, so the model gets an actionable message instead of a
+/// hang.
 async fn host_round_trip(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     op: BrowserOp,
+    signal: &CancellationToken,
 ) -> Result<BrowserReply, ToolError> {
+    // An already-cancelled run settles without touching the host.
+    if signal.is_cancelled() {
+        return Err(ToolError::Aborted);
+    }
     if crate::webview_host::host().is_none() {
         return Err(ToolError::ExecutionFailed(
             "browser host not available (non-UI context)".into(),
@@ -39,10 +45,15 @@ async fn host_round_trip(
     notice_tx
         .send(BackendNotice::BrowserRequest { op, responder: tx })
         .map_err(|_| ToolError::ExecutionFailed("engine actor gone".into()))?;
-    rx.recv()
-        .await
-        .map_err(|_| ToolError::ExecutionFailed("browser request dropped".into()))?
-        .map_err(ToolError::ExecutionFailed)
+    // The reply rides the gpui main thread and may never come (e.g. a yield
+    // the user answers with cancel instead of handback): race the cancel
+    // token so a user abort always settles the round trip.
+    tokio::select! {
+        reply = rx.recv() => reply
+            .map_err(|_| ToolError::ExecutionFailed("browser request dropped".into()))?
+            .map_err(ToolError::ExecutionFailed),
+        () = signal.cancelled() => Err(ToolError::Aborted),
+    }
 }
 
 fn schema<T: JsonSchema>() -> serde_json::Value {
@@ -225,7 +236,7 @@ impl AgentTool for WebExploreOpenTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: OpenInput = serde_json::from_value(params)
@@ -235,6 +246,7 @@ impl AgentTool for WebExploreOpenTool {
             BrowserOp::Open {
                 url: input.url.clone(),
             },
+            &signal,
         )
         .await?;
         match reply {
@@ -265,7 +277,7 @@ impl AgentTool for WebExploreNavigateTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: NavigateInput = serde_json::from_value(params)
@@ -276,6 +288,7 @@ impl AgentTool for WebExploreNavigateTool {
                 id: input.tab_id,
                 url: input.url.clone(),
             },
+            &signal,
         )
         .await?;
         unit_reply(
@@ -304,13 +317,17 @@ impl AgentTool for WebExploreReadTextTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: TabIdInput = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let reply =
-            host_round_trip(&self.notice_tx, BrowserOp::ReadText { id: input.tab_id }).await?;
+        let reply = host_round_trip(
+            &self.notice_tx,
+            BrowserOp::ReadText { id: input.tab_id },
+            &signal,
+        )
+        .await?;
         text_reply(reply)
     }
 }
@@ -335,7 +352,7 @@ impl AgentTool for WebExploreReadDomTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: ReadDomInput = serde_json::from_value(params)
@@ -346,6 +363,7 @@ impl AgentTool for WebExploreReadDomTool {
                 id: input.tab_id,
                 selector: input.selector.clone(),
             },
+            &signal,
         )
         .await?;
         text_reply(reply)
@@ -371,7 +389,7 @@ impl AgentTool for WebExploreClickTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: ClickInput = serde_json::from_value(params)
@@ -382,6 +400,7 @@ impl AgentTool for WebExploreClickTool {
                 id: input.tab_id,
                 selector: input.selector.clone(),
             },
+            &signal,
         )
         .await?;
         unit_reply(
@@ -411,7 +430,7 @@ impl AgentTool for WebExploreTypeTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: TypeInput = serde_json::from_value(params)
@@ -423,6 +442,7 @@ impl AgentTool for WebExploreTypeTool {
                 selector: input.selector.clone(),
                 text: input.text.clone(),
             },
+            &signal,
         )
         .await?;
         unit_reply(
@@ -452,7 +472,7 @@ impl AgentTool for WebExploreScrollTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: ScrollInput = serde_json::from_value(params)
@@ -464,6 +484,7 @@ impl AgentTool for WebExploreScrollTool {
                 dx: input.dx,
                 dy: input.dy,
             },
+            &signal,
         )
         .await?;
         unit_reply(
@@ -495,13 +516,17 @@ impl AgentTool for WebExploreScreenshotTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: TabIdInput = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let reply =
-            host_round_trip(&self.notice_tx, BrowserOp::Screenshot { id: input.tab_id }).await?;
+        let reply = host_round_trip(
+            &self.notice_tx,
+            BrowserOp::Screenshot { id: input.tab_id },
+            &signal,
+        )
+        .await?;
         text_reply(reply)
     }
 }
@@ -528,13 +553,23 @@ impl AgentTool for WebExploreYieldTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: TabIdInput = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let reply =
-            host_round_trip(&self.notice_tx, BrowserOp::YieldToUser { id: input.tab_id }).await?;
+        let reply = host_round_trip(
+            &self.notice_tx,
+            BrowserOp::YieldToUser { id: input.tab_id },
+            &signal,
+        )
+        .await
+        .map_err(|e| match e {
+            // Model-facing, never localized: the model must learn that the
+            // yield ended by cancel, not by handback.
+            ToolError::Aborted => ToolError::ExecutionFailed("yield to user was cancelled".into()),
+            other => other,
+        })?;
         unit_reply(
             reply,
             format!("User handed tab {} back; control returned", input.tab_id),
@@ -561,12 +596,17 @@ impl AgentTool for WebExploreCloseTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
         let input: TabIdInput = serde_json::from_value(params)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let reply = host_round_trip(&self.notice_tx, BrowserOp::Close { id: input.tab_id }).await?;
+        let reply = host_round_trip(
+            &self.notice_tx,
+            BrowserOp::Close { id: input.tab_id },
+            &signal,
+        )
+        .await?;
         unit_reply(reply, format!("Closed tab {}", input.tab_id))
     }
 }
@@ -660,5 +700,18 @@ mod tests {
             WebExploreYieldTool::new(notice_tx.clone()).requires_approval(&serde_json::json!({}))
         );
         assert!(WebExploreCloseTool::new(notice_tx).requires_approval(&serde_json::json!({})));
+    }
+
+    /// A cancelled run settles the round trip as `Aborted` before any reply
+    /// can arrive.
+    #[tokio::test]
+    async fn host_round_trip_aborts_when_cancelled_before_any_reply() {
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+        let signal = CancellationToken::new();
+        signal.cancel();
+        let err = host_round_trip(&notice_tx, BrowserOp::ReadText { id: 1 }, &signal)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Aborted), "{err}");
     }
 }
