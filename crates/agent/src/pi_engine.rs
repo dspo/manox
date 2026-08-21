@@ -1095,108 +1095,141 @@ fn build_tools(
         pi_extensions::steer_bus::AgentId::Captain,
     )));
     // Plan-mode gate resolver: whether a subagent type is read-only. The
-    // sub-agent tool needs a concrete model; a session assembled before
-    // registration landed (first seconds after launch) skips it, defaulting
-    // to a resolver that blocks every `Agent` call. When the registry is
-    // built below the resolver shares that exact `AgentRegistry` Arc so the
-    // gate's read-only notion can never diverge from the `AgentRegistry`'s
-    // capability routing.
-    let read_only_subagent = if let Some(model) = model {
-        let mut registry = AgentRegistry::new();
-        register_defaults(&mut registry);
-        // User-authored (~/.manox/agents) + plugin-provided
-        // (`<plugin>/agents/`, namespaced) definitions layer over the
-        // built-ins; same-name user files override built-ins.
-        crate::agent_defs::register_user_and_plugin(&mut registry);
-        // Render the Agent tool description against the live registry so the
-        // model sees the available `subagent_type` values (Explore, Sailor,
-        // user/plugin defs) with capability tags — no filesystem probing.
-        // Tool descriptions are model-facing English, so always `Language::En`.
-        let subagent_descriptions: Vec<crate::prompt::SubagentTypeData> = registry
-            .all()
-            .iter()
-            .map(|def| crate::prompt::SubagentTypeData {
-                name: def.name.clone(),
-                capability: subagent_capability(def),
-                description: def.description.clone(),
-            })
-            .collect();
-        let registry = Arc::new(registry);
-        let resolver: crate::plan_mode::ReadOnlySubagentResolver = {
-            let r = Arc::clone(&registry);
-            Arc::new(move |name: &str| {
-                r.get(name)
-                    .map(subagent_capability)
-                    .is_some_and(|c| c == "read-only")
-            })
-        };
-        let subagent = SubagentTool::new(
-            registry.clone(),
-            vec![
-                Arc::new(pi_extensions::read::SelectorReadTool::new()),
-                Arc::new(pi::tools::grep::GrepTool),
-                Arc::new(pi::tools::glob::GlobTool),
-                Arc::new(pi::tools::ls::LsTool),
-                // Write/exec axis: definitions that opt into the full
-                // snapshot (e.g. Sailor, `tools: []`) get these; read-only
-                // definitions (Explore) name an explicit allowlist that
-                // `select_tools` filters against, so they never reach a
-                // read-only subagent. Bash inherits the Captain's seatbelt
-                // backend (no ungated bypass); Write/Edit carry the process
-                // write lock so parallel Sailors clobbering the same path
-                // surface a named-holder conflict instead of silently racing.
-                Arc::new(SubagentBashTool {
-                    inner: Arc::new(
-                        pi_extensions::bash::BashTool::new(
-                            Arc::clone(&subagent_bash_ops),
-                            subagent_background.clone(),
-                        )
-                        .with_sandbox_available(sandbox_available),
-                    ),
-                }),
-                Arc::new(crate::file_lock::FileLockedTool::new(
-                    Arc::new(pi::tools::write::WriteTool),
-                    "sailor",
-                )),
-                Arc::new(crate::file_lock::FileLockedTool::new(
-                    Arc::new(pi::tools::edit::EditTool),
-                    "sailor",
-                )),
-            ],
-        )
-        .with_model_runtime(runtime.clone())
-        .with_model(model.clone())
-        // Inherit the Captain's live model at dispatch time (a mid-thread
-        // model switch is honored instead of falling back to the default).
-        .with_model_slot(gate.model_slot())
-        // Resolve agent-definition `model` overrides against the live
-        // registry (registration has landed before session assembly).
-        .with_provider_registry(crate::pi_providers::global());
-        let subagent = match crate::prompt::render(
-            crate::prompt::PromptTemplate::AgentToolDescription,
-            crate::language::Language::En,
-            &crate::prompt::AgentToolDescriptionData {
-                subagents: subagent_descriptions,
-            },
-        ) {
-            Ok(desc) => subagent.with_description(desc),
-            Err(e) => {
-                tracing::warn!("Agent tool description render failed: {e}");
-                subagent
-            }
-        };
-        let subagent = Arc::new(subagent);
-        let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
-            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
-            cwd.to_path_buf(),
-            Arc::new(pi::tool::ToolState::new()),
-        ));
-        bus.set_subagent_tool(subagent);
-        bus.set_tool_ctx(sailor_ctx);
-        resolver
-    } else {
-        Arc::new(|_: &str| false)
+    // resolver shares the `AgentRegistry` Arc built below so the gate's
+    // read-only notion can never diverge from the registry's capability
+    // routing; it is model-independent and always live. The `SubagentTool`
+    // itself needs a concrete model: wired eagerly when one is resolved at
+    // assembly, otherwise on first Steer dispatch via the bus's late
+    // configurator (resume-at-launch resolves the model shortly after).
+    // Registry, plan-mode resolver, and sailor tool context are
+    // model-independent: build them unconditionally so a session assembled
+    // before a model resolved (resume-at-launch) still gets a live resolver.
+    // The model-bound `SubagentTool` is wired eagerly when a model is present
+    // and lazily on first Steer dispatch otherwise.
+    let mut registry = AgentRegistry::new();
+    register_defaults(&mut registry);
+    // User-authored (~/.manox/agents) + plugin-provided
+    // (`<plugin>/agents/`, namespaced) definitions layer over the
+    // built-ins; same-name user files override built-ins.
+    crate::agent_defs::register_user_and_plugin(&mut registry);
+    // Render the Agent tool description against the live registry so the
+    // model sees the available `subagent_type` values (Explore, Sailor,
+    // user/plugin defs) with capability tags — no filesystem probing.
+    // Tool descriptions are model-facing English, so always `Language::En`.
+    let subagent_descriptions: Vec<crate::prompt::SubagentTypeData> = registry
+        .all()
+        .iter()
+        .map(|def| crate::prompt::SubagentTypeData {
+            name: def.name.clone(),
+            capability: subagent_capability(def),
+            description: def.description.clone(),
+        })
+        .collect();
+    let registry = Arc::new(registry);
+    let read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver = {
+        let r = Arc::clone(&registry);
+        Arc::new(move |name: &str| {
+            r.get(name)
+                .map(subagent_capability)
+                .is_some_and(|c| c == "read-only")
+        })
     };
+    let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
+        Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
+        cwd.to_path_buf(),
+        Arc::new(pi::tool::ToolState::new()),
+    ));
+    let subagent_description = match crate::prompt::render(
+        crate::prompt::PromptTemplate::AgentToolDescription,
+        crate::language::Language::En,
+        &crate::prompt::AgentToolDescriptionData {
+            subagents: subagent_descriptions,
+        },
+    ) {
+        Ok(desc) => Some(desc),
+        Err(e) => {
+            tracing::warn!("Agent tool description render failed: {e}");
+            None
+        }
+    };
+    let model_slot = gate.model_slot();
+    let build_subagent = {
+        let registry = Arc::clone(&registry);
+        let runtime = runtime.clone();
+        let model_slot = Arc::clone(&model_slot);
+        let provider_registry = crate::pi_providers::global();
+        let subagent_bash_ops = Arc::clone(&subagent_bash_ops);
+        let subagent_background = subagent_background.clone();
+        let subagent_description = subagent_description.clone();
+        move |model: &PiModel| {
+            let subagent = SubagentTool::new(
+                registry.clone(),
+                vec![
+                    Arc::new(pi_extensions::read::SelectorReadTool::new()),
+                    Arc::new(pi::tools::grep::GrepTool),
+                    Arc::new(pi::tools::glob::GlobTool),
+                    Arc::new(pi::tools::ls::LsTool),
+                    // Write/exec axis: definitions that opt into the full
+                    // snapshot (e.g. Sailor, `tools: []`) get these; read-only
+                    // definitions (Explore) name an explicit allowlist that
+                    // `select_tools` filters against, so they never reach a
+                    // read-only subagent. Bash inherits the Captain's seatbelt
+                    // backend (no ungated bypass); Write/Edit carry the process
+                    // write lock so parallel Sailors clobbering the same path
+                    // surface a named-holder conflict instead of silently racing.
+                    Arc::new(SubagentBashTool {
+                        inner: Arc::new(
+                            pi_extensions::bash::BashTool::new(
+                                Arc::clone(&subagent_bash_ops),
+                                subagent_background.clone(),
+                            )
+                            .with_sandbox_available(sandbox_available),
+                        ),
+                    }),
+                    Arc::new(crate::file_lock::FileLockedTool::new(
+                        Arc::new(pi::tools::write::WriteTool),
+                        "sailor",
+                    )),
+                    Arc::new(crate::file_lock::FileLockedTool::new(
+                        Arc::new(pi::tools::edit::EditTool),
+                        "sailor",
+                    )),
+                ],
+            )
+            .with_model_runtime(runtime.clone())
+            .with_model(model.clone())
+            // Inherit the Captain's live model at dispatch time (a mid-thread
+            // model switch is honored instead of falling back to the default).
+            .with_model_slot(Arc::clone(&model_slot))
+            // Resolve agent-definition `model` overrides against the live
+            // registry (registration has landed before session assembly).
+            .with_provider_registry(provider_registry.clone());
+            let subagent = match subagent_description.clone() {
+                Some(desc) => subagent.with_description(desc),
+                None => subagent,
+            };
+            Arc::new(subagent)
+        }
+    };
+    bus.set_tool_ctx(sailor_ctx);
+    match model {
+        Some(model) => bus.set_subagent_tool(build_subagent(model)),
+        None => {
+            // Launch-time resume assembles the session before the provider
+            // catalog resolves a model; the model slot fills in shortly via
+            // `SetModel`, so wire on first dispatch instead of dropping
+            // subagent support for the session's lifetime.
+            let late_bus = Arc::clone(&bus);
+            let configure: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                let Some(model) = model_slot.lock().unwrap().clone() else {
+                    return false;
+                };
+                late_bus.set_subagent_tool(build_subagent(&model));
+                true
+            });
+            bus.set_late_configure(configure);
+        }
+    }
     (
         tools,
         SessionOrchestrators {
