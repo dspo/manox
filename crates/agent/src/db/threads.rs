@@ -24,6 +24,7 @@ pub struct ThreadSummary {
     pub title_override: Option<String>,
     pub model_id: String,
     pub provider_id: Option<String>,
+    /// Permission mode (`PermissionMode::as_i64` mapping); sidebar wash color.
     pub approval_mode: i64,
     pub project: String,
     pub depth: i32,
@@ -77,9 +78,9 @@ pub struct ThreadRecord {
     /// post-creation; a global settings change only affects threads created
     /// afterwards, so an existing thread's prompt-cache prefix stays byte-stable.
     pub agent_language: String,
-    /// Two-state approval mode (0 = AutoPilot, 1 = Danger).
-    /// Persisted as INTEGER for schema-stability across enum reorderings;
-    /// `from_i64` also folds the legacy Yolo value (2) into Danger.
+    /// Permission mode (0 = ReadOnly, 1 = WorkspaceWrite, 2 = FullAccess).
+    /// Persisted as INTEGER; `PermissionMode::from_i64` folds any unknown
+    /// value into the bounded default.
     pub approval_mode: i64,
     /// Reasoning effort (2 = High, 4 = Max).
     /// Persisted as INTEGER matching `ReasoningEffort::as_i64`.
@@ -110,10 +111,6 @@ pub struct ThreadRecord {
     /// thread the moment it opens, without waiting for a fresh stream.
     pub per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
     pub background_tasks: Vec<crate::background_task::TaskSnapshot>,
-    /// Tools the user permanently allowed in this thread (the AlwaysAllow
-    /// grant). Persisted so a restart does not silently revoke the grant and
-    /// push every approval-required call back through the reviewer.
-    pub always_allowed_tools: Vec<String>,
 }
 
 /// Decompressed payload of the `thread_data` BLOB.
@@ -124,8 +121,6 @@ struct ThreadData {
     per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
     #[serde(default)]
     background_tasks: Vec<crate::background_task::TaskSnapshot>,
-    #[serde(default)]
-    always_allowed_tools: Vec<String>,
 }
 
 const COMPRESSION_LEVEL: i32 = 3;
@@ -185,7 +180,6 @@ impl ThreadsDatabase {
             request_token_usage: rec.request_token_usage.clone(),
             per_model_token_usage: rec.per_model_token_usage.clone(),
             background_tasks: rec.background_tasks.clone(),
-            always_allowed_tools: rec.always_allowed_tools.clone(),
         };
         let json = serde_json::to_vec(&data).context("serialize thread data")?;
         let compressed =
@@ -360,7 +354,6 @@ impl ThreadsDatabase {
                     request_token_usage: std::collections::HashMap::new(),
                     per_model_token_usage: std::collections::HashMap::new(),
                     background_tasks: Vec::new(),
-                    always_allowed_tools: Vec::new(),
                 })
             },
         );
@@ -389,7 +382,6 @@ impl ThreadsDatabase {
         rec.request_token_usage = data.request_token_usage;
         rec.per_model_token_usage = data.per_model_token_usage;
         rec.background_tasks = data.background_tasks;
-        rec.always_allowed_tools = data.always_allowed_tools;
         Ok(Some(rec))
     }
 
@@ -543,7 +535,6 @@ impl ThreadRecord {
             request_token_usage: std::collections::HashMap::new(),
             per_model_token_usage: std::collections::HashMap::new(),
             background_tasks: Vec::new(),
-            always_allowed_tools: Vec::new(),
         }
     }
 }

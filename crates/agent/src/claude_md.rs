@@ -86,8 +86,8 @@ pub struct InstructionSet {
     pub eager: Vec<InstructionSource>,
     /// Path-scoped rules awaiting a matching read.
     pub scoped: Vec<ScopedRule>,
-    /// External imports encountered during expansion (deduped, sorted), for
-    /// the approval preflight.
+    /// External imports encountered during expansion (deduped, sorted), kept
+    /// so callers can see references outside the trusted roots.
     pub external_imports: Vec<PathBuf>,
 }
 
@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!(eager_paths(&set), vec![top.as_path()]);
 
         // Elsewhere under home (not `~/.claude`) is external — the
-        // `@~/.ssh/id_rsa` exfiltration shape stays behind the approval gate.
+        // `@~/.ssh/id_rsa` exfiltration shape stays outside the trusted set.
         let dotfile = home.write(".ssh/id_rsa", "KEY");
         t.write("proj/CLAUDE.local.md", &format!("@{}", dotfile.display()));
         let set = load(&t.0.join("proj"), &ctx_with(Some(home.0.clone()), None));

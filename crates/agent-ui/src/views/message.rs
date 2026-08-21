@@ -27,7 +27,7 @@ use crate::conversation::{
     UserImage, UserTurnMeta,
 };
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
-use agent::thread::ApprovalMode;
+use agent::thread::PermissionMode;
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
@@ -1015,10 +1015,11 @@ fn render_user(
         .into_any_element()
 }
 
-fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> gpui::Hsla {
+fn approval_mode_color(mode: PermissionMode, theme: &Theme) -> gpui::Hsla {
     match mode {
-        ApprovalMode::AutoPilot => theme.info,
-        ApprovalMode::Danger => theme.danger,
+        PermissionMode::ReadOnly => theme.warning,
+        PermissionMode::WorkspaceWrite => theme.info,
+        PermissionMode::FullAccess => theme.danger,
     }
 }
 
@@ -1227,7 +1228,7 @@ pub fn render_error(
     )
 }
 /// Render an ephemeral system notice — status toggles, slash-command acks.
-/// Neutral tones so positive state changes (e.g. "Danger mode is on") do not
+/// Neutral tones so positive state changes (e.g. a mode switch) do not
 /// read as a runtime error. The body is the persistent paginated
 /// `TerminalPanel` (`notice_panel`) — the same folded surface as tool output,
 /// defaulting to `PAGE_SIZE` lines with a `+N` load-more row. The defensive
@@ -1918,16 +1919,6 @@ fn render_tool_entry(
         };
         icon.xsmall().text_color(status_color).into_any_element()
     };
-    // The autopilot reviewer's sign-off: an auto-approved call carries a
-    // muted check-check badge ahead of the call's own status icon, in every
-    // status (the decision lands before the result).
-    let auto_approved_el: Option<gpui::AnyElement> = e.auto_approved.then(|| {
-        Icon::default()
-            .path("icons/check-check.svg")
-            .xsmall()
-            .text_color(theme.muted_foreground)
-            .into_any_element()
-    });
     // Live tools play open; the delayed auto-collapse folds the output once
     // the result lands. The status icon still spins while running.
     let show_output = !e.collapsed;
@@ -1993,7 +1984,6 @@ fn render_tool_entry(
                     });
                 })
                 .child(disclosure_icon(e.collapsed, theme))
-                .children(auto_approved_el)
                 .child(status_el)
                 .child(
                     gpui::div()
@@ -2635,13 +2625,6 @@ pub fn render_tool_call(
                     format!("tool-{ix}"),
                     item.output.clone(),
                 ))
-                .children(item.auto_approved.then(|| {
-                    Icon::default()
-                        .path("icons/check-check.svg")
-                        .xsmall()
-                        .text_color(theme.muted_foreground)
-                        .into_any_element()
-                }))
                 .child(
                     gpui::div()
                         .text_sm()
@@ -3469,7 +3452,6 @@ impl ItemBuilder {
                                         streaming: false,
                                         collapsed: false,
                                         user_toggled: false,
-                                        auto_approved: false,
                                         panel: None,
                                     }));
                                 } else {
@@ -3494,7 +3476,6 @@ impl ItemBuilder {
                                         streaming: false,
                                         collapsed: true,
                                         user_toggled: false,
-                                        auto_approved: false,
                                         panel: None,
                                     });
                                     match self.active_segment_ix {
@@ -3627,7 +3608,6 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
                     ToolCallStatus::Running | ToolCallStatus::PendingApproval
                 ),
                 user_toggled: false,
-                auto_approved: false,
                 panel: None,
             })],
             accepting_entries: false,
@@ -3752,7 +3732,6 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: true,
-                auto_approved: false,
                 panel: None,
             }));
             thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
@@ -3766,7 +3745,6 @@ mod tests {
                 streaming: true,
                 collapsed: false,
                 user_toggled: true,
-                auto_approved: false,
                 panel: None,
             }));
 
@@ -4283,7 +4261,6 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
-                auto_approved: false,
                 panel: None,
             })
         };
@@ -4332,7 +4309,6 @@ mod tests {
                 streaming: false,
                 collapsed: true,
                 user_toggled: false,
-                auto_approved: false,
                 panel: None,
             })
         };

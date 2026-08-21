@@ -115,10 +115,12 @@ settings-row-work-mode-workday = 适用于日常工作
 settings-desc-work-mode-workday = 同样强大，技术细节更少
 
 settings-section-permissions = 权限
-settings-row-permission-autopilot = 自动驾驶
-settings-desc-permission-autopilot = manox 可以读取和编辑其工作区中的文件。安全审查器自动批准额外访问权限请求。自动审批可能会出错。
-settings-row-permission-danger = 危险驾驶
-settings-desc-permission-danger = 当 manox 以危险驾驶模式运行时，无需你批准，即可编辑你的电脑上的任何文件并运行互联网命令。这会显著增加数据丢失、泄露或意外行为的风险。
+settings-row-permission-readonly = 只读
+settings-desc-permission-readonly = manox 可以读取工作区内的文件，但所有变更类工具调用都会被拒绝。适合审查与调研场景。
+settings-row-permission-workspaceread = 工作区写入
+settings-desc-permission-workspaceread = manox 可以在工作区内写入文件并运行沙箱内的 shell 命令；工作区之外的写入会被拒绝。
+settings-row-permission-fullaccess = 完全访问
+settings-desc-permission-fullaccess = manox 可以不受限制地编辑你电脑上的任何文件，并在沙箱外运行命令。这会显著增加数据丢失、泄露或意外行为的风险。
 settings-link-learn-more = 了解更多
 
 settings-section-general-misc = 常规
@@ -340,32 +342,27 @@ workspace-no-model = 未配置模型
 workspace-reasoning-effort = 推理强度
 workspace-reasoning-high = 高
 workspace-reasoning-max = 最高
-workspace-approval-title = 工具调用审批
-workspace-escalation-allow-once = 允许一次
-workspace-escalation-allow-once-desc = 仅本次允许该调用。
-workspace-escalation-always-allow = 始终允许
-workspace-escalation-always-allow-desc = 本次会话内始终允许该工具。
-workspace-escalation-deny = 拒绝
-workspace-escalation-deny-desc = 拒绝执行；原因将返回给模型。
-workspace-escalation-no-verdict-reason = 安全审查器未对此次调用运行。
 workspace-clarify-title = 澄清问题
 workspace-ask-supplement-label = 补充说明
 workspace-ask-supplement-placeholder = 添加可选补充说明
 workspace-ask-recommended = 推荐
 workspace-cancel = 取消
-workspace-mode-autopilot-title = 自动驾驶
-workspace-mode-autopilot-desc = 安全审查器自动批准安全工具调用，风险操作将被拒绝
-workspace-mode-danger-title = 危险驾驶
-workspace-mode-danger-desc = 工具调用免审批，bash 在沙箱外运行
-workspace-chip-mode-autopilot = 自动驾驶
-workspace-chip-mode-danger = 危险驾驶
-workspace-mode-title = 如何批准 manox 操作？
+workspace-mode-readonly-title = 只读
+workspace-mode-readonly-desc = 拒绝变更类工具调用；读取保持开放
+workspace-mode-workspacewrite-title = 工作区写入
+workspace-mode-workspacewrite-desc = 工作区内写入与沙箱 bash 放行；工作区之外的目标被拒绝
+workspace-mode-fullaccess-title = 完全访问
+workspace-mode-fullaccess-desc = 一切操作放行；bash 在沙箱外运行
+workspace-chip-mode-readonly = 只读
+workspace-chip-mode-workspacewrite = 工作区写入
+workspace-chip-mode-fullaccess = 完全访问
+workspace-mode-title = 允许 manox 做什么？
 workspace-mode-learn-more = 了解更多
 workspace-mode-notice = { $mode ->
-    [autopilot] 自动驾驶模式：安全工具调用免提示，风险操作将被拒绝。
-   *[danger] 危险驾驶：工具调用免审批，bash 在沙箱外运行。
+    [readonly] 只读模式：变更类工具调用被拒绝；读取保持开放。
+    [workspacewrite] 工作区写入：工作区内写入与沙箱 bash 放行；工作区之外的目标被拒绝。
+   *[fullaccess] 完全访问：一切操作免门控；bash 在沙箱外运行。
 }
-workspace-approval-autopilot-escalated = ✗ 已升级待裁决：{$tool} — {$reason}
 workspace-project-choose = 选择项目
 workspace-project-new = 新建项目
 workspace-project-blank = 新建空白项目
@@ -393,9 +390,10 @@ turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
-slash-danger-desc = 切换到危险驾驶（免审批 + bash 沙箱外）；带提示词则切换后直接开工
+slash-mode-desc = 循环切换权限模式（只读 → 工作区写入 → 完全访问）；`/mode <名称>` 指定模式，带提示词则切换后直接开工
+slash-mode-unknown = 未知权限模式“{ $mode }”— 应为 read-only、workspace-write 或 full-access
 slash-exit-desc = 归档当前会话并开始一个新会话
-slash-new-desc = 归档当前会话并开始新会话，保留项目、驾驶模式与模型
+slash-new-desc = 归档当前会话并开始新会话，保留项目、权限模式与模型
 ### main.rs (system menus)
 menu-settings = Settings…
 menu-quit = 退出

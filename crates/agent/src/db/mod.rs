@@ -184,7 +184,6 @@ mod tests {
                 anchor_message_id: None,
                 output_tail: String::new(),
             }],
-            always_allowed_tools: vec!["Bash".to_string()],
         }
     }
 
@@ -207,7 +206,6 @@ mod tests {
         assert_eq!(loaded.background_tasks[0].task_id, "monitor_1");
         assert!(!loaded.messages[0].id.is_empty());
         assert_eq!(loaded.cumulative_token_usage.input_tokens, 100);
-        assert_eq!(loaded.always_allowed_tools, vec!["Bash".to_string()]);
         assert_eq!(loaded.cumulative_token_usage.cache_read_input_tokens, 20);
         let u = loaded.request_token_usage.get("u1").unwrap();
         assert_eq!(u.output_tokens, 50);

@@ -9,8 +9,8 @@ use pi::types::StopReason as PiStopReason;
 ///
 /// Events with no UI counterpart (run/turn lifecycle handled by the facade,
 /// message boundaries, block start/end markers) map to nothing.
-/// `ToolCallAuthorization` never comes from this mapping — the approval
-/// gate (`pi_approval`) emits it directly while parked on a verdict.
+/// `ToolCallAuthorization` never comes from this mapping — the permission
+/// gate (`pi_approval`) emits it directly while parked on a user answer.
 /// `Plan*` and sub-agent events remain manox-only and are never produced.
 pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     match event {
@@ -453,7 +453,7 @@ fn message_error_text(message: &AgentMessage) -> String {
 
 /// Human-readable tool card title from the pi tool name + arguments.
 /// Browser tools (WebExplore* / ChromeUse*) surface their url, tab id, or
-/// element ref so approval cards carry the decision-relevant target. Falls
+/// element ref so interaction cards carry the decision-relevant target. Falls
 /// back to the bare name for tools without a recognized target field.
 pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| -> Option<String> {

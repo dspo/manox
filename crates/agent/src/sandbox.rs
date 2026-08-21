@@ -30,7 +30,7 @@
 //! Escalation: the engine also installs [`UnsandboxedBashOperations`] into
 //! the bash tool's escalation slot — direct `bash -c` with no confinement.
 //! A call escalates when the model passes `unsandboxed: true` or the host's
-//! force resolver (Danger mode) says so; authorization is host policy, never
+//! force resolver (Full Access mode) says so; authorization is host policy, never
 //! the model's word.
 //!
 //! ## Honest gaps
@@ -552,7 +552,7 @@ impl SandboxedBashOperations {
         if patterns.is_empty() {
             return Err(ExecutionError::Other(format!(
                 "sandbox network proxy unavailable: no valid hostname patterns in `[network] allowlist` ({}). \
-                 Fix the allowlist in settings, or use `unsandboxed: true` (user approval).",
+                 Fix the allowlist in settings, or use `unsandboxed: true` (full-access mode).",
                 allowlist.join(", ")
             )));
         }
@@ -564,7 +564,7 @@ impl SandboxedBashOperations {
         let handle = http_proxy::ProxyHandle::spawn(config).map_err(|e| {
             ExecutionError::Other(format!(
                 "sandbox network proxy unavailable: {e}. \
-                 Use `unsandboxed: true` (user approval) or fix the allowlist settings."
+                 Use `unsandboxed: true` (full-access mode) or fix the allowlist settings."
             ))
         })?;
         let port = handle.port();
@@ -682,7 +682,7 @@ async fn run_to_completion(
 
 /// One-shot unsandboxed bash backend: direct `bash -c` execution with no
 /// seatbelt confinement. Installed as the `BashTool` escalation slot and
-/// selected by Danger mode (host-forced) or a per-call `unsandboxed: true`;
+/// selected by Full Access mode (host-forced) or a per-call `unsandboxed: true`;
 /// the escalation counterpart of [`SandboxedBashOperations`]. The same
 /// non-interactive git env and login PATH are injected so escalated git/gh
 /// runs behave identically minus the confinement.

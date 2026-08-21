@@ -9,8 +9,8 @@
 //! snapshots.
 //!
 //! The runtime is a process-wide singleton — one Chrome session shared across
-//! threads. Reads (`Snapshot` / `WaitFor` / `Screenshot`) are approval-free
-//! and read-only; writes ride the owning thread's approval mode like `Bash`
+//! threads. Reads (`Snapshot` / `WaitFor` / `Screenshot`) are ungated
+//! and read-only; writes ride the owning thread's permission mode like `Bash`
 //! / `Write`. Chrome's network egress bypasses the bash sandbox proxy.
 
 mod bridge;

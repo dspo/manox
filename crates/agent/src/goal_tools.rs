@@ -796,7 +796,6 @@ mod tests {
             request_token_usage: std::collections::HashMap::new(),
             per_model_token_usage: std::collections::HashMap::new(),
             background_tasks: Vec::new(),
-            always_allowed_tools: Vec::new(),
         }
     }
 

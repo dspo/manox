@@ -4,7 +4,7 @@
 //! by the leader facade). Every call rides the `BackendNotice::TeamRequest`
 //! round trip: the tool posts the op with a responder channel, the facade
 //! executes it on the gpui thread and replies with the model-facing string —
-//! the same architecture as the approval gate and browser round trips.
+//! the same architecture as the permission gate and browser round trips.
 
 use gpui::{Context, Entity};
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -769,7 +769,7 @@ fn ago_label(at: i64) -> String {
 }
 
 /// Spawn a long-lived team worker: an independent pi `Entity<Thread>`
-/// inheriting the leader's cwd / model / approval mode / reasoning effort,
+/// inheriting the leader's cwd / model / permission mode / reasoning effort,
 /// labeled with the member name. The member's `team` back-reference is set
 /// so its `Task*`/`SendMessage` calls reach the shared list + router; the
 /// subscription bubbles its authorizations to the leader under a composite

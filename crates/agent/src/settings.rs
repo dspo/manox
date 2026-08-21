@@ -99,7 +99,7 @@ pub struct Settings {
     #[serde(default)]
     pub context_optimization: ContextOptimizationSettings,
 
-    /// Per-purpose side-call policies: title and approval review.
+    /// Per-purpose side-call policies: title generation.
     #[serde(default)]
     pub side_calls: SideCallsSettings,
 
@@ -268,8 +268,6 @@ pub enum CodeModeToggle {
 pub struct SideCallsSettings {
     #[serde(default)]
     pub title: SideCallPolicy,
-    #[serde(default)]
-    pub approval: SideCallPolicy,
 }
 
 /// A side-call policy: which model, reasoning effort, output cap, and
@@ -301,10 +299,6 @@ impl SideCallsSettings {
     /// Resolved title policy: user config overlaid on the title preset.
     pub fn title_policy(&self) -> SideCallPolicy {
         resolve_side_call_policy(&self.title, SideCallPolicy::title_default())
-    }
-    /// Resolved approval-review policy.
-    pub fn approval_policy(&self) -> SideCallPolicy {
-        resolve_side_call_policy(&self.approval, SideCallPolicy::approval_default())
     }
 }
 
@@ -338,15 +332,6 @@ impl SideCallPolicy {
             model: String::new(),
             reasoning_effort: Some("low".into()),
             max_output_tokens: 128,
-            enabled: true,
-        }
-    }
-
-    pub fn approval_default() -> Self {
-        Self {
-            model: String::new(),
-            reasoning_effort: Some("medium".into()),
-            max_output_tokens: 2048,
             enabled: true,
         }
     }
@@ -657,13 +642,6 @@ follow_up_behavior = "Steer"
     #[test]
     fn side_call_presets() {
         assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
-        assert_eq!(SideCallPolicy::approval_default().max_output_tokens, 2048);
-        assert_eq!(
-            SideCallPolicy::approval_default()
-                .reasoning_effort
-                .as_deref(),
-            Some("medium")
-        );
     }
 
     #[test]

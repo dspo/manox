@@ -29,7 +29,7 @@ use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
-use crate::thread::{ApprovalMode, ThreadEvent};
+use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
 
 /// How often the engine refreshes its history mirror while a run is in
@@ -59,8 +59,8 @@ pub(crate) enum SessionCmd {
     SetModel(PiModel),
     /// Map the reasoning effort onto pi's thinking level.
     SetThinkingLevel(Option<String>),
-    /// Switch the approval policy and persist it in the session sidecar.
-    SetApprovalMode(ApprovalMode),
+    /// Switch the permission mode and persist it in the session sidecar.
+    SetPermissionMode(PermissionMode),
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
     /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
@@ -148,16 +148,16 @@ struct EngineState {
     /// boundary costing); 0 until the session carries priced usage.
     cumulative_cost: Mutex<f64>,
     per_model_cost: Mutex<HashMap<String, f64>>,
-    /// Shared with the approval gate so `SetModel` is visible to the
-    /// reviewer without a second synchronization point.
+    /// The actor's working model; `SetModel` mirrors here so session
+    /// builds always read the latest choice.
     model: Arc<Mutex<Option<PiModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
-    /// The host approval gate wrapping every tool (mode, always-allow
-    /// cache, pending UI round trips).
+    /// The host permission gate wrapping every mutating tool (mode +
+    /// pending interaction round trips).
     gate: Arc<ApprovalGate>,
     /// Shared goal state with the thread facade; the goal tools read/write
     /// through it, `GoalChanged` rides the notice channel. `None` when the
@@ -217,10 +217,7 @@ pub fn spawn_engine(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
     let model_slot = Arc::new(Mutex::new(model.clone()));
-    let gate = Arc::new(ApprovalGate::new(
-        notice_tx.clone(),
-        Arc::clone(&model_slot),
-    ));
+    let gate = Arc::new(ApprovalGate::new(notice_tx.clone()));
     let state = Arc::new(EngineState {
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
@@ -405,8 +402,8 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
-    fn set_approval_mode(&self, mode: ApprovalMode) {
-        let _ = self.cmd_tx.send(SessionCmd::SetApprovalMode(mode));
+    fn set_permission_mode(&self, mode: PermissionMode) {
+        let _ = self.cmd_tx.send(SessionCmd::SetPermissionMode(mode));
     }
 
     fn set_plan_mode(&self, enabled: bool) {
@@ -808,7 +805,7 @@ impl pi::tool::AgentTool for SailorRoutingTool {
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
-/// no gate — approval policy is a harness concern); `AskUserQuestion` joins
+/// no gate — permission policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
 ///
 /// Returns the tools plus the session-scoped orchestrators that must attach
@@ -834,7 +831,7 @@ fn build_tools(
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
     // OS backend is available (writes + network confined; shell state does
     // not persist — the tool's `cwd` parameter pins each call), otherwise
-    // the unsandboxed persistent brush shell (approval-gated as always).
+    // the unsandboxed persistent brush shell (permission-gated as always).
     // Background tasks ride the same policy: the registry's sandbox wrapper
     // reuses this backend's `wrap_command`, so a non-escalated background
     // task is confined exactly like a foreground call. Inside a worktree
@@ -864,7 +861,7 @@ fn build_tools(
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Escalation backend: no confinement at all. Selected per call when the
     // model passes `unsandboxed: true` or the host's force resolver
-    // (Danger mode) says so — authorization is host policy, never the
+    // (Full Access mode) says so — authorization is host policy, never the
     // model's word. Installed only where a seatbelt exists to escape from:
     // on other platforms the default backend is already unsandboxed, and
     // swapping it for a stateless one-shot would only discard shell state.
@@ -875,7 +872,7 @@ fn build_tools(
             ops
         });
     let force_gate = Arc::clone(gate);
-    let force_unsandboxed = Arc::new(move || force_gate.mode() == ApprovalMode::Danger);
+    let force_unsandboxed = Arc::new(move || force_gate.mode() == PermissionMode::FullAccess);
     let mut bash = BashTool::new(bash_ops, background.clone())
         .with_manager(Arc::clone(&manager))
         .with_sandbox_available(sandbox_available);
@@ -911,24 +908,31 @@ fn build_tools(
         }),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
-    // Plan-mode gate exemption: plan-file writes stay approval-free while
+    // Plan-mode gate exemption: plan-file writes stay ungated while
     // plan mode is active (the `ToolCall` hook blocks everything else).
     let plan_policy = Arc::new(crate::plan_mode::PlanGatePolicy {
         state: Arc::clone(plan),
         plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
         cwd: cwd.to_path_buf(),
     });
-    // Preserve the existing sandboxed Bash bypass in AutoPilot. The
-    // intelligent reviewer only sees actions that genuinely require approval
-    // (not confined, non-escalated shell calls).
-    let bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> =
-        sandbox_available.then(|| {
+    // Sandbox-confined bash rides the OS confinement instead of the gate in
+    // WorkspaceWrite: `Bash` without `unsandboxed` and the `Monitor` command
+    // half (its commands spawn through the same sandbox-wrapped background
+    // registry). Escalated calls stay gated in every mode.
+    let confined_bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> = sandbox_available
+        .then(|| {
             let gate = Arc::clone(gate);
             let allow: crate::pi_approval::AutoAllowResolver =
                 Arc::new(move |name: &str, params: &serde_json::Value| {
-                    name == "Bash"
-                        && gate.mode() == ApprovalMode::AutoPilot
-                        && !params["unsandboxed"].as_bool().unwrap_or(false)
+                    gate.mode() == PermissionMode::WorkspaceWrite
+                        && match name {
+                            "Bash" => !params["unsandboxed"].as_bool().unwrap_or(false),
+                            "Monitor" => params
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| !c.trim().is_empty()),
+                            _ => false,
+                        }
                 });
             allow
         });
@@ -938,8 +942,8 @@ fn build_tools(
             let name = tool.name().to_string();
             let mut wrapper = ApprovalGatedTool::new(tool, Arc::clone(gate))
                 .with_plan_policy(Arc::clone(&plan_policy));
-            if let Some(allow) = &bash_auto_allow
-                && name == "Bash"
+            if let Some(allow) = &confined_bash_auto_allow
+                && matches!(name.as_str(), "Bash" | "Monitor")
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
             }
@@ -963,7 +967,7 @@ fn build_tools(
     // Team coordination tools: every session registers the full set; the
     // facade routes ops through the calling thread's team (leader or
     // member), and ops without a team return clean errors. Write-axis
-    // governance rides the thread's approval mode like any other tool.
+    // governance rides the thread's permission mode like any other tool.
     tools.push(Arc::new(crate::team::tools::TeamCreateTool::new(
         notice_tx.clone(),
     )));
@@ -1010,7 +1014,7 @@ fn build_tools(
     }
 
     // Browser tools (main-thread host round trips via the facade): the read
-    // axis stays ungated; the write axis rides the same approval gate as
+    // axis stays ungated; the write axis rides the same permission gate as
     // built-ins. Plan mode's ToolCall hook blocks both (fixed allowlist).
     tools.push(Arc::new(crate::web_tools::WebExploreReadTextTool::new(
         notice_tx.clone(),
@@ -1047,7 +1051,7 @@ fn build_tools(
         ));
     }
     // ChromeUse (real Chrome via the in-process rustwright CDP engine): same
-    // trust axes as WebExplore — reads stay ungated; writes ride the approval
+    // trust axes as WebExplore — reads stay ungated; writes ride the permission
     // gate. Plan mode's ToolCall hook blocks both (fixed allowlist).
     tools.push(Arc::new(crate::chrome_use::ChromeUseSnapshotTool));
     tools.push(Arc::new(crate::chrome_use::ChromeUseWaitForTool));
@@ -1070,7 +1074,7 @@ fn build_tools(
         ));
     }
     // Git worktree management: the tools run the git phase and queue the
-    // session swap (actor-side, between turns); both approval-gated.
+    // session swap (actor-side, between turns); both permission-gated.
     tools.push(Arc::new(crate::worktree::EnterWorktreeTool::new(
         cmd_tx.clone(),
         Arc::clone(worktree),
@@ -1088,7 +1092,7 @@ fn build_tools(
         tools.extend(crate::lsp_tools::tools());
     }
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
-    // behind the same approval gate as built-ins (remote calls are mutating
+    // behind the same permission gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`agent::init`
     // tests) contributes nothing.
     if let Some(registry) = crate::mcp::try_global() {
@@ -1393,8 +1397,8 @@ where
                     // next provider request immediately and persists a
                     // model_change entry at the turn boundary (the kernel's
                     // TS mid-run setModel path). Mirror the shared slot and
-                    // the actor's working model so the approval gate and
-                    // settlement (title, session rebuilds) see it too.
+                    // the actor's working model so settlement (title,
+                    // session rebuilds) sees it too.
                     handle.set_model(new_model.clone());
                     *state.model.lock().unwrap() = Some(new_model.clone());
                     *pi_model = new_model;
@@ -1612,13 +1616,11 @@ fn subscribe_session(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     live: Arc<Mutex<LiveTranscript>>,
     title: TitleScheduler,
-    gate: Arc<ApprovalGate>,
 ) -> pi::agent::Subscription {
     let event_tx = notice_tx.clone();
     // Seed the live mirror with the completed transcript so a mid-run tick
     // never drops restored history; the listener below appends from here.
     live.lock().unwrap().messages = session.harness_messages().to_vec();
-    gate.set_transcript(session.harness_messages());
     // A fresh session's jsonl file is deferred until the first assistant
     // message, so the sidebar only learns the thread exists once that file
     // materializes. The user MessageEnd fires before it; the first assistant
@@ -1631,7 +1633,6 @@ fn subscribe_session(
         let assistant_flag = std::sync::Arc::clone(&assistant_flag);
         let live = std::sync::Arc::clone(&live);
         let title = title.clone();
-        let gate = Arc::clone(&gate);
         Box::pin(async move {
             // Mirror the in-flight transcript for the live-history ticker:
             // completed messages accumulate, the streaming partial replaces
@@ -1645,7 +1646,6 @@ fn subscribe_session(
                     let mut guard = live.lock().unwrap();
                     guard.streaming = None;
                     guard.messages.push((**message).clone());
-                    gate.set_transcript(&guard.messages);
                 }
                 _ => {}
             }
@@ -1708,7 +1708,7 @@ fn live_fingerprint(mapped: &[HistoryEntry]) -> (usize, usize) {
 /// Refresh the engine's history mirror from the live transcript snapshot
 /// (completed messages + the streaming partial). Returns whether the mirror
 /// changed, so the caller can skip the facade notice on idle ticks (e.g. a
-/// run parked on an approval verdict where nothing is streaming).
+/// run parked on a user interaction where nothing is streaming).
 fn sync_live_history(live: &Arc<Mutex<LiveTranscript>>, state: &Arc<EngineState>) -> bool {
     let mut msgs: Vec<AgentMessage> = Vec::new();
     {
@@ -1870,8 +1870,8 @@ fn session_builder(
 }
 /// Adopt the session's own model after a restore: the reopened session
 /// projects its persisted model onto the harness, and the actor's working
-/// model plus the shared slot must follow so `Ready`, the approval
-/// reviewer, and the title scheduler all see the restored choice.
+/// model plus the shared slot must follow so `Ready` and the title
+/// scheduler all see the restored choice.
 fn adopt_session_model(session: &AgentSession, pi_model: &mut PiModel, state: &EngineState) {
     let restored = session.model().clone();
     *pi_model = restored.clone();
@@ -1933,24 +1933,22 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
 }
 
 /// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Glob`/`Ls`)
-/// are checked against the sensitive-path deny-list and write tools
-/// (`Write`/`Edit`) against write confinement (project root + temp + plans
-/// dir, `.git` protected). Block reasons surface to the model as tool
-/// errors. Bash stays approval-gated only (no seatbelt in the pi slice).
+/// are checked against the sensitive-path deny-list in every mode; write
+/// tools (`Write`/`Edit`) keep only the Full Access `.git` guard here —
+/// outside Full Access the permission gate owns write scope (its mode-named
+/// denials are the model-facing contract). Block reasons surface to the
+/// model as tool errors.
 ///
-/// Danger mode lifts write confinement — the user's highest authorization
-/// level honors the settings panel's "edit any file" promise. Reads keep
-/// the sensitive-path deny-list in every mode: a secret read is an
-/// irreversible exfiltration even under full trust.
+/// Reads keep the sensitive-path deny-list in every mode: a secret read is
+/// an irreversible exfiltration even under full trust.
 fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path, gate: &Arc<ApprovalGate>) {
     let cwd = cwd.to_path_buf();
     let read_policy = Arc::new(crate::path_policy::ReadPolicy::new());
-    let write_policy = Arc::new(crate::path_policy::WritePolicy::for_project(&cwd));
     let gate = Arc::clone(gate);
     session.on(
         pi::harness::HookPoint::ToolCall,
         Arc::new(move |mut ctx| {
-            let danger = gate.mode() == ApprovalMode::Danger;
+            let full_access = gate.mode() == PermissionMode::FullAccess;
             let tool_name = ctx
                 .data
                 .get("tool_name")
@@ -1962,8 +1960,7 @@ fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path, gate: &Arc<A
                 .and_then(|v| v.as_object())
                 .cloned()
                 .unwrap_or_default();
-            let verdict =
-                path_policy_verdict(tool_name, &args, &cwd, &read_policy, &write_policy, danger);
+            let verdict = path_policy_verdict(tool_name, &args, &cwd, &read_policy, full_access);
             if let Some(reason) = verdict {
                 ctx.block_reason = Some(reason);
             }
@@ -1973,15 +1970,14 @@ fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path, gate: &Arc<A
 }
 
 /// Pure verdict for the path-policy hook: `Some(reason)` blocks the call.
-/// Extracted from the hook closure so the danger/read/write matrix is
+/// Extracted from the hook closure so the mode/read/write matrix is
 /// unit-testable without a live session.
 fn path_policy_verdict(
     tool_name: &str,
     args: &serde_json::Map<String, serde_json::Value>,
     cwd: &Path,
     read_policy: &crate::path_policy::ReadPolicy,
-    write_policy: &crate::path_policy::WritePolicy,
-    danger: bool,
+    full_access: bool,
 ) -> Option<String> {
     match tool_name {
         "Read" | "Ls" | "Grep" | "Glob" => args
@@ -1994,38 +1990,31 @@ fn path_policy_verdict(
                 .and_then(|v| v.as_str())
                 .map(|raw| resolve_tool_path(raw, cwd));
             match target {
-                Some(p) if !danger => write_policy.check(&p).err(),
-                // Danger lifts write confinement but repo internals stay
+                // Full Access lifts write confinement but repo internals stay
                 // protected: `.git` is repository structure, not a file the
                 // "edit any file" promise covers (the c5aefe4d escape
                 // class — a direct write into `.git` bypasses git itself).
-                Some(p) if danger && has_git_component(&p) => Some(format!(
-                    "Write blocked by path policy (`.git` is protected even in Danger): {}. \
-                     Use git commands through bash (unsandboxed in Danger) for git state.",
+                Some(p) if full_access && has_git_component(&p) => Some(format!(
+                    "Write blocked by path policy (`.git` is protected even in Full Access): {}. \
+                     Use git commands through bash (unsandboxed in Full Access) for git state.",
                     p.display()
                 )),
                 _ => None,
             }
         }
-        // Edit carries `{patch}` (hashline) with no top-level `path`;
-        // confinement checks every `[path#TAG]` section target.
-        "Edit" if !danger => args
-            .get("patch")
-            .and_then(|v| v.as_str())
-            .and_then(|patch| write_policy.check_edit_patch(patch, cwd).err()),
-        // Danger: same `.git`-only guard across every patch target.
-        "Edit" if danger => args
+        // Full Access: same `.git`-only guard across every patch target.
+        "Edit" if full_access => args
             .get("patch")
             .and_then(|v| v.as_str())
             .and_then(|patch| {
                 // Fail closed on unparseable patches, mirroring the
-                // non-Danger arm — an unverifiable patch must not ride the
-                // Danger release.
+                // confined arm — an unverifiable patch must not ride the
+                // Full Access release.
                 let targets = match pi::hashline::parse_patch(patch) {
                     Ok(t) => t,
                     Err(e) => {
                         return Some(format!(
-                            "Edit blocked by path policy (patch targets unverifiable even in Danger): {e}. \
+                            "Edit blocked by path policy (patch targets unverifiable even in Full Access): {e}. \
                              Fix the hashline patch grammar and retry."
                         ));
                     }
@@ -2040,8 +2029,8 @@ fn path_policy_verdict(
                 });
                 hit.map(|fp| {
                     format!(
-                        "Edit blocked by path policy (`.git` is protected even in Danger): {}. \
-                     Use git commands through bash (unsandboxed in Danger) for git state.",
+                        "Edit blocked by path policy (`.git` is protected even in Full Access): {}. \
+                     Use git commands through bash (unsandboxed in Full Access) for git state.",
                         fp.path.display()
                     )
                 })
@@ -2113,8 +2102,6 @@ async fn run_actor(
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
     ));
-    // Reviewer side calls resolve their stream through this runtime.
-    state.gate.set_runtime(runtime.clone());
     // Goal tools emit `GoalChanged` through the notice channel once the
     // actor owns it (facade-side operations emit on the gpui thread).
     if let Some(bridge) = &state.goal_bridge {
@@ -2297,7 +2284,6 @@ async fn run_actor(
         &notice_tx,
         Arc::clone(&live_mirror),
         title_scheduler.clone(),
-        Arc::clone(&state.gate),
     );
     let mut _harness_subscription = subscribe_harness_events(
         &mut session,
@@ -2307,10 +2293,10 @@ async fn run_actor(
         &wakeup_tx,
     );
 
-    // The approval mode rides the session sidecar: restore it so a
-    // reopened Danger session doesn't silently gate (or vice versa).
-    let approval_mode = load_approval_mode(&sessions_dir, session.path()).await;
-    state.gate.set_mode(approval_mode);
+    // The permission mode rides the session sidecar: restore it so a
+    // reopened session keeps its mode.
+    let permission_mode = load_approval_mode(&sessions_dir, session.path()).await;
+    state.gate.set_mode(permission_mode);
     // The reasoning effort rides the same sidecar: restore it so a reopened
     // Max session keeps its effort. The engine clamps against the current
     // model and persists the change in the transcript (TS `setThinkingLevel`).
@@ -2351,7 +2337,7 @@ async fn run_actor(
     let _ = notice_tx.send(BackendNotice::Ready {
         restored,
         model: Some(pi_model.clone()),
-        approval_mode,
+        permission_mode,
         reasoning_effort,
         plan_mode: plan_mode_restored,
         plan_file: plan_file_restored,
@@ -2565,7 +2551,7 @@ async fn run_actor(
                 pi_model = new_model.clone();
                 *state.model.lock().unwrap() = Some(new_model);
             }
-            SessionCmd::SetApprovalMode(mode) => {
+            SessionCmd::SetPermissionMode(mode) => {
                 state.gate.set_mode(mode);
                 if let Err(err) =
                     write_approval_mode_sidecar(&sessions_dir, session.path(), mode).await
@@ -2841,7 +2827,6 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
-                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -2936,7 +2921,6 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
-                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -2989,7 +2973,6 @@ async fn run_actor(
                     &notice_tx,
                     Arc::clone(&live_mirror),
                     title_scheduler.clone(),
-                    Arc::clone(&state.gate),
                 );
                 _harness_subscription = subscribe_harness_events(
                     &mut session,
@@ -3071,7 +3054,6 @@ async fn run_actor(
                             &notice_tx,
                             Arc::clone(&live_mirror),
                             title_scheduler.clone(),
-                            Arc::clone(&state.gate),
                         );
                         _harness_subscription = subscribe_harness_events(
                             &mut session,
@@ -3537,21 +3519,20 @@ async fn persist_title(
     .await
 }
 
-/// The approval mode persisted in a session's sidecar; fresh sessions
-/// (missing sidecar or field) default to AutoPilot.
-async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> ApprovalMode {
+/// The permission mode persisted in a session's sidecar (wire field
+/// `approval_mode`); fresh sessions (missing sidecar or field) and unknown
+/// values land on the bounded default.
+async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> PermissionMode {
     match pi_extensions::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => meta
             .approval_mode
             .as_deref()
             .and_then(|raw| serde_json::from_value(serde_json::Value::String(raw.to_string())).ok())
             .unwrap_or_default(),
-        Err(_) => ApprovalMode::default(),
+        Err(_) => PermissionMode::default(),
     }
 }
 
-/// Persist the approval mode in the session sidecar so the session reopens
-/// with the same gate policy.
 /// Render the plan-mode-active instructions for the configured agent
 /// language (the actor renders them itself — language comes from settings,
 /// so no facade round-trip is needed on restore or session switches).
@@ -3690,15 +3671,18 @@ async fn resync_plan_state(
     )));
 }
 
+/// Persist the permission mode in the session sidecar (wire field
+/// `approval_mode`, kebab values) so the session reopens with the same
+/// gate policy.
 async fn write_approval_mode_sidecar(
     sessions_dir: &Path,
     session_path: &Path,
-    mode: ApprovalMode,
+    mode: PermissionMode,
 ) -> Result<(), anyhow::Error> {
     let raw = serde_json::to_value(mode)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "autopilot".to_string());
+        .expect("PermissionMode serializes to its kebab wire name");
     pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
         meta.approval_mode = Some(raw);
     })
@@ -3741,8 +3725,8 @@ fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     }
 }
 
-/// Re-read the session's persisted approval mode after a session switch and
-/// align the gate + the facade's chip with it.
+/// Re-read the session's persisted permission mode after a session switch
+/// and align the gate + the facade's chip with it.
 async fn resync_approval_mode(
     session: &AgentSession,
     sessions_dir: &Path,
@@ -3752,7 +3736,7 @@ async fn resync_approval_mode(
     let mode = load_approval_mode(sessions_dir, session.path()).await;
     state.gate.set_mode(mode);
     let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::ApprovalModeChanged { mode },
+        ThreadEvent::PermissionModeChanged { mode },
     )));
 }
 
@@ -4121,7 +4105,7 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
         title_override: None,
         model_id: String::new(),
         provider_id: None,
-        approval_mode: 0,
+        approval_mode: PermissionMode::default().as_i64(),
         project: if info.cwd == "/" {
             String::new()
         } else {
@@ -4177,30 +4161,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_mode_sidecar_round_trips() {
+    async fn permission_mode_sidecar_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-1.jsonl");
 
         // Fresh session: no sidecar -> default.
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
-            ApprovalMode::AutoPilot
+            PermissionMode::WorkspaceWrite
         );
 
-        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::Danger)
+        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::FullAccess)
             .await
             .unwrap();
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
-            ApprovalMode::Danger
+            PermissionMode::FullAccess
         );
 
-        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::AutoPilot)
+        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::ReadOnly)
             .await
             .unwrap();
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
-            ApprovalMode::AutoPilot
+            PermissionMode::ReadOnly
         );
     }
 
@@ -4373,7 +4357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_mode_sidecar_tolerates_unknown_values() {
+    async fn permission_mode_sidecar_tolerates_unknown_values() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-2.jsonl");
         let meta = pi_extensions::session_meta::SessionMeta {
@@ -4385,13 +4369,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
-            ApprovalMode::AutoPilot,
-            "unknown persisted modes fall back to the default"
+            PermissionMode::WorkspaceWrite,
+            "unknown persisted modes fall back to the bounded default"
         );
     }
 
     #[tokio::test]
-    async fn approval_mode_write_preserves_other_sidecar_fields() {
+    async fn permission_mode_write_preserves_other_sidecar_fields() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-3.jsonl");
         let meta = pi_extensions::session_meta::SessionMeta {
@@ -4403,7 +4387,7 @@ mod tests {
             .await
             .unwrap();
 
-        write_approval_mode_sidecar(dir.path(), &session, ApprovalMode::Danger)
+        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::FullAccess)
             .await
             .unwrap();
 
@@ -4412,7 +4396,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
-        assert_eq!(loaded.approval_mode.as_deref(), Some("danger"));
+        assert_eq!(loaded.approval_mode.as_deref(), Some("full-access"));
     }
 
     #[test]
@@ -4629,7 +4613,7 @@ mod tests {
     fn test_engine_state() -> Arc<EngineState> {
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
         let model_slot = Arc::new(Mutex::new(None));
-        let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
+        let gate = Arc::new(ApprovalGate::new(notice_tx));
         Arc::new(EngineState {
             running: AtomicBool::new(false),
             session_start_fired: AtomicBool::new(false),
@@ -5216,49 +5200,52 @@ mod tests {
     }
 
     #[test]
-    fn path_policy_verdict_blocks_outside_writes_outside_danger() {
+    fn path_policy_verdict_defers_write_scope_to_the_gate_outside_full_access() {
         let cwd = Path::new("/tmp/manox-policy-hook-proj");
         let read = crate::path_policy::ReadPolicy::new();
-        let write = crate::path_policy::WritePolicy::for_project(cwd);
         let args = serde_json::json!({ "path": "/etc/manox-hook-x" })
             .as_object()
             .unwrap()
             .clone();
-        let reason = path_policy_verdict("Write", &args, cwd, &read, &write, false).unwrap();
-        assert!(reason.contains("outside"), "{reason}");
+        // Outside Full Access the permission gate owns write scope; the hook
+        // adds no write confinement of its own.
+        assert!(path_policy_verdict("Write", &args, cwd, &read, false).is_none());
+        let edit_args = serde_json::json!({ "patch": "*** Begin Patch\n[/etc/manox-hook-x#1A2B]\nDEL 1\n*** End Patch" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(path_policy_verdict("Edit", &edit_args, cwd, &read, false).is_none());
     }
 
     #[test]
-    fn path_policy_verdict_danger_lifts_write_confinement_but_keeps_read_denylist() {
+    fn path_policy_verdict_full_access_lifts_write_confinement_but_keeps_read_denylist() {
         let cwd = Path::new("/tmp/manox-policy-hook-proj");
         let read = crate::path_policy::ReadPolicy::new();
-        let write = crate::path_policy::WritePolicy::for_project(cwd);
-        // Danger: an out-of-project Write and an out-of-project Edit both pass.
+        // Full Access: an out-of-project Write and an out-of-project Edit both pass.
         let write_args = serde_json::json!({ "path": "/etc/manox-hook-x" })
             .as_object()
             .unwrap()
             .clone();
         assert!(
-            path_policy_verdict("Write", &write_args, cwd, &read, &write, true).is_none(),
-            "danger Write passes"
+            path_policy_verdict("Write", &write_args, cwd, &read, true).is_none(),
+            "full-access Write passes"
         );
         let edit_args = serde_json::json!({ "patch": "*** Begin Patch\n[/etc/manox-hook-x#1A2B]\nDEL 1\n*** End Patch" })
             .as_object()
             .unwrap()
             .clone();
         assert!(
-            path_policy_verdict("Edit", &edit_args, cwd, &read, &write, true).is_none(),
-            "danger Edit passes"
+            path_policy_verdict("Edit", &edit_args, cwd, &read, true).is_none(),
+            "full-access Edit passes"
         );
-        // Repo internals stay protected even under Danger: `.git` is
+        // Repo internals stay protected even under Full Access: `.git` is
         // repository structure, not a file the "edit any file" promise
         // covers (a direct write bypasses git itself).
         let git_write_args = serde_json::json!({ "path": cwd.join(".git/config") })
             .as_object()
             .unwrap()
             .clone();
-        let reason =
-            path_policy_verdict("Write", &git_write_args, cwd, &read, &write, true).unwrap();
+        let reason = path_policy_verdict("Write", &git_write_args, cwd, &read, true).unwrap();
         assert!(reason.contains(".git"), "{reason}");
         let git_edit_args = serde_json::json!({
             "patch": format!(
@@ -5269,16 +5256,16 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        let reason = path_policy_verdict("Edit", &git_edit_args, cwd, &read, &write, true).unwrap();
+        let reason = path_policy_verdict("Edit", &git_edit_args, cwd, &read, true).unwrap();
         assert!(reason.contains(".git"), "{reason}");
-        // Reads keep the sensitive-path deny-list even under Danger: a
+        // Reads keep the sensitive-path deny-list even under Full Access: a
         // secret read is an irreversible exfiltration.
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
         let read_args = serde_json::json!({ "path": home.join(".ssh/id_rsa") })
             .as_object()
             .unwrap()
             .clone();
-        let reason = path_policy_verdict("Read", &read_args, cwd, &read, &write, true).unwrap();
+        let reason = path_policy_verdict("Read", &read_args, cwd, &read, true).unwrap();
         assert!(reason.contains("sensitive"), "{reason}");
     }
 
@@ -5318,17 +5305,16 @@ mod tests {
     }
 
     #[test]
-    fn danger_edit_fails_closed_on_unparseable_patch() {
+    fn full_access_edit_fails_closed_on_unparseable_patch() {
         let cwd = Path::new("/tmp/manox-policy-hook-proj");
         let read = crate::path_policy::ReadPolicy::new();
-        let write = crate::path_policy::WritePolicy::for_project(cwd);
-        // An unparseable hashline patch must not ride the Danger release —
-        // the non-Danger arm already fails closed on it.
+        // An unparseable hashline patch must not ride the Full Access release —
+        // the confined arm already fails closed on it.
         let bad_args = serde_json::json!({ "patch": "[src/lib.rs#1A2B\nDEL 1" })
             .as_object()
             .unwrap()
             .clone();
-        let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, &write, true).unwrap();
+        let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, true).unwrap();
         assert!(reason.contains("unverifiable"), "{reason}");
     }
 

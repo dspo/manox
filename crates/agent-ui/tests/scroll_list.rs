@@ -582,7 +582,6 @@ fn production_rows(cx: &mut TestAppContext) -> Vec<gpui::Entity<MessageItem>> {
             streaming: false,
             collapsed: false,
             user_toggled: true,
-            auto_approved: false,
             panel: None,
         }),
     ];

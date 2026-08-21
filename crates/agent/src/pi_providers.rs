@@ -126,7 +126,7 @@ pub fn default_model() -> Option<pi::types::Model> {
         .or_else(|| models.into_iter().next())
 }
 
-/// Resolve a side-call model override (title / approval reviewer). A
+/// Resolve a side-call model override (title generation). A
 /// non-empty `policy.model` reference (id or alias) resolved against the
 /// registry wins; an empty or unresolvable reference yields `None` so the
 /// caller inherits the session model — matching the `side_calls` contract

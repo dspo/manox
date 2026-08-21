@@ -7,8 +7,8 @@
 //! startup. Tools in `tools/web_explore/` reach the host through `host()`.
 //!
 //! The split keeps `agent` pure (no GPUI-webview coupling) while letting the
-//! outbound trust axis (agent → page, governed by `ApprovalMode`) and the
-//! inbound trust axis (page → agent, always-confirmed, `ApprovalMode`-blind)
+//! outbound trust axis (agent → page, governed by `PermissionMode`) and the
+//! inbound trust axis (page → agent, always-confirmed, `PermissionMode`-blind)
 //! meet at a single host surface.
 
 use std::sync::{Arc, OnceLock};
@@ -46,7 +46,7 @@ pub enum BrowserNotification {
 
 /// An inbound write request an untrusted page makes via
 /// `__manox_request_write__(intent, payload)`. This is never executed directly
-/// — the host routes it to a confirmation overlay that ignores `ApprovalMode`
+/// — the host routes it to a confirmation overlay that ignores `PermissionMode`
 /// (the inbound axis is orthogonal to outbound approval). `intent` is a closed
 /// command name; no intents are registered yet, so every request is rejected
 /// until a write surface is added.
@@ -66,7 +66,7 @@ pub struct BrowserInboundWrite {
 /// untrusted page never gains a lasting handle into manox. Outbound write
 /// operations (`click` / `type_text` / `scroll` / `navigate` / `open_tab` /
 /// `close_tab` / `yield_to_user`) are subject to the owning thread's
-/// `ApprovalMode`; `yield_to_user` blocks the tool's `Task` until the user
+/// `PermissionMode`; `yield_to_user` blocks the tool's `Task` until the user
 /// triggers a `UserHandback` notification.
 pub trait BrowserHost: Send + Sync {
     /// Open a new browser tab navigated to `url`; return its id.

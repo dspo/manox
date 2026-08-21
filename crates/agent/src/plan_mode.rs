@@ -4,7 +4,7 @@
 //! (`~/.manox/plans/<slug>-plan.md`), and submits it for the user's verdict
 //! through the [`ProposePlanTool`] — a structured tool call, not free-text
 //! parsing. While plan mode is active a `ToolCall` hook hard-blocks mutating
-//! tools (plan-file and temp-scratch writes excepted, approval-free) and a
+//! tools (plan-file and temp-scratch writes excepted, ungated) and a
 //! `BeforeAgentStart` hook injects the plan-mode instructions every turn. All
 //! wiring rides the kernel's existing extension points; `crates/pi` stays
 //! untouched.
@@ -242,11 +242,11 @@ fn is_plan_mode_writable_path(path: &Path, plans_dir: &Path) -> bool {
         || crate::path_policy::is_temp_scratch(path)
 }
 
-/// Approval-gate policy input: while plan mode is active, Write/Edit calls
-/// targeting the plans dir or temp scratch bypass the approval gate (the
-/// model drafts the plan incrementally and scribbles research artifacts without an
-/// approval card per write; the `ToolCall` gate blocks every other target
-/// before the approval layer sees it).
+/// Permission-gate policy input: while plan mode is active, Write/Edit calls
+/// targeting the plans dir or temp scratch bypass the permission gate (the
+/// model drafts the plan incrementally and scribbles research artifacts without a
+/// denial per write; the `ToolCall` hook blocks every other target before
+/// the permission gate sees it).
 pub struct PlanGatePolicy {
     pub state: Arc<PlanSessionState>,
     pub plans_dir: PathBuf,
@@ -255,7 +255,7 @@ pub struct PlanGatePolicy {
 
 impl PlanGatePolicy {
     /// True when this call is a plan-mode-writable Write/Edit and the
-    /// approval gate should stand down.
+    /// permission gate should stand down.
     pub fn is_exempt(&self, tool_name: &str, params: &serde_json::Value) -> bool {
         self.state.enabled()
             && PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)

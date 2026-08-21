@@ -17,7 +17,7 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::{i18n, settings as user_settings};
+use agent::{i18n, settings as user_settings, thread::PermissionMode};
 
 use crate::views::management_shell::back_control;
 use crate::views::plugin_manager::PluginManagerView;
@@ -181,8 +181,7 @@ pub struct SettingsView {
 
     // --- General panel state ---
     work_mode: WorkMode,
-    permission_autopilot: bool,
-    permission_danger: bool,
+    permission_mode: PermissionMode,
     file_target: SharedString,
     ui_language: SharedString,
     agent_language: SharedString,
@@ -255,8 +254,7 @@ impl SettingsView {
             selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
-            permission_autopilot: true,
-            permission_danger: false,
+            permission_mode: PermissionMode::default(),
             file_target: i18n::t("settings-value-vscode"),
             // Endonyms are fixed per language and never re-localized, so the
             // picker always reads `English` / `简体中文` regardless of the

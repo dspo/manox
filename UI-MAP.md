@@ -19,8 +19,8 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 会话主路径（流式文本 / thinking / 工具卡片 / cancel / steer） | ✅ | `pi_backend::session` + `adapt`；空闲 `prompt()`，运行中 `steer()` |
 | 会话持久化与重启恢复 | ✅ | pi jsonl + `session_meta` sidecar |
 | 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ | 共享渲染管线 |
-| 审批门控（ToolCallAuthorization / AskUserQuestion / AutoPilot reviewer） | ✅ | 宿主 `ApprovalGatedTool` wrapper；AccessChip 切 AutoPilot/Danger |
-| Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)、`/plan`、`/goal`；markdown/skill 适配器经共享 registry；`/danger` 随 manox 移除 |
+| 权限门控（PermissionMode / ToolCallAuthorization / AskUserQuestion） | ✅ | 宿主 `ApprovalGatedTool` wrapper（纯模式 allow/deny，无 reviewer/overlay）；AccessChip 切 ReadOnly/WorkspaceWrite/FullAccess |
+| Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)、`/plan`、`/goal`、`/mode`；markdown/skill 适配器经共享 registry |
 | 模型选择器 | ✅ | pi `ProviderRegistry`，按 provider 显示名分组 |
 | 项目（composer chip / 侧栏文件夹 / 绑定新会话） | ✅ | 共享 threads.db `projects` 表 |
 | Sidebar / 会话列表 / 新建切换归档 / LLM 标题 | ✅ | pi `SessionRepository` + sidecar；标题双模式语义移植自 manox |
@@ -115,7 +115,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### 状态
 
-- [ApprovalMode](#approval-modes) · [ToolCallStatus](#tool-call-statuses)
+- [PermissionMode](#permission-modes) · [ToolCallStatus](#tool-call-statuses)
 
 ---
 
@@ -247,7 +247,7 @@ Loose (non-project) threads + external sessions (scroll-body child 1). Its secti
 
 #### SidebarThreadItem
 
-Unified row projection (`SidebarThreadItem` struct: `id`/`short_id`/`title`/`updated`/`pinned`/`has_unread`/`errored`/`running`/`pending_auth`/`pending_plan`/`background_work`/`resumable`/`resuming`/`selected`/`indent`/`team_leader`/`team_collapsed`/`icon`/`wash`/`kind`, live flags packed in `ThreadLiveState`) rendered by one `render_thread_item` for both native threads and external-agent sessions. The two kinds are merged into one recency-ordered list (loose rows under "Conversations", project-bound rows inside their folder group) and share the selection-slide wash animation, the hover/active wash, and the hover archive action. A leader row (`team_leader`, from the store's `parent_id`/`depth` team hierarchy) renders a collapse chevron before the status icon (`ChevronDown` expanded / `ChevronRight` folded) that folds its indented member rows without opening the conversation; member rows render indented (`indent` = `depth * 14px`) under their leader with a 1px left guide rail (`nested`, team/fork 通用) tying them to the parent, and team-worker rows carry a role badge (`member_role` read from the live roster via `member_role_for`, degrading to none once the team disbands); both ride in `RowNesting` (indent/team_leader/team_collapsed/nested/member_role) so `from_thread` stays within the arg cap. Native thread row: leading `ship-wheel` icon with a five-state machine — danger `TriangleAlert` on `errored`; `theme.info` static while waiting on the user (`pending_auth` tool authorization / AskUserQuestion, or `pending_plan` plan-review verdict); `theme.success` + clockwise spin while the loop can self-advance (`running` turn in flight, or `background_work` live monitors / background bash — `ThreadLiveState.background_work` refreshed from `BackgroundTaskUpdated` via `thread_has_running_tasks`); `theme.info` static while a finished turn awaits the user's view (`has_unread`); `theme.foreground` static otherwise (read pause or never-run thread) — pinned star, pending-auth spinner (accent, tooltip "Waiting for approval", shown while a tool authorization awaits the user's verdict — the thread's approval card is only visible when it is the active thread), title, short-id tag (shimmer while the loop can self-advance), relative time, hover archive button. The hover/active/selected wash uses the thread's last saved approval-mode color (`theme.info` AutoPilot / `theme.danger` Danger). External rows reuse the same layout but swap the leading icon for the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`), carry the same visible wash as AutoPilot threads (`theme.info` — `theme.accent` resolves to the near-white `neutral-100` in the forced Light theme, invisible on the sidebar), show the cx session id prefix in the short-id tag (click-to-copy of the full id / socket path, traceable to `~/.manox/sessions/<id>.sock`), and drop the unread/pin/error/running-shimmer affordances. A resumable row (restored from a [`ResumeSidecar`](#resumesidecar), no live process) renders dimmed with a Play hover action (`render_hover_action` emits `OpenExternalSession`, same as the row click) instead of the Inbox archive button, and swaps its leading icon for a `BrailleSpinner` while a resume is in flight. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the open click and the hover archive button to the right `SidebarEvent` (`OpenThread` / `ArchiveThread` vs `OpenExternalSession` / `ArchiveExternalSession` — the latter kills + drops the `SessionHandle`, the unified archive semantics).
+Unified row projection (`SidebarThreadItem` struct: `id`/`short_id`/`title`/`updated`/`pinned`/`has_unread`/`errored`/`running`/`pending_auth`/`pending_plan`/`background_work`/`resumable`/`resuming`/`selected`/`indent`/`team_leader`/`team_collapsed`/`icon`/`wash`/`kind`, live flags packed in `ThreadLiveState`) rendered by one `render_thread_item` for both native threads and external-agent sessions. The two kinds are merged into one recency-ordered list (loose rows under "Conversations", project-bound rows inside their folder group) and share the selection-slide wash animation, the hover/active wash, and the hover archive action. A leader row (`team_leader`, from the store's `parent_id`/`depth` team hierarchy) renders a collapse chevron before the status icon (`ChevronDown` expanded / `ChevronRight` folded) that folds its indented member rows without opening the conversation; member rows render indented (`indent` = `depth * 14px`) under their leader with a 1px left guide rail (`nested`, team/fork 通用) tying them to the parent, and team-worker rows carry a role badge (`member_role` read from the live roster via `member_role_for`, degrading to none once the team disbands); both ride in `RowNesting` (indent/team_leader/team_collapsed/nested/member_role) so `from_thread` stays within the arg cap. Native thread row: leading `ship-wheel` icon with a five-state machine — danger `TriangleAlert` on `errored`; `theme.info` static while waiting on the user (`pending_auth` tool authorization / AskUserQuestion, or `pending_plan` plan-review verdict); `theme.success` + clockwise spin while the loop can self-advance (`running` turn in flight, or `background_work` live monitors / background bash — `ThreadLiveState.background_work` refreshed from `BackgroundTaskUpdated` via `thread_has_running_tasks`); `theme.info` static while a finished turn awaits the user's view (`has_unread`); `theme.foreground` static otherwise (read pause or never-run thread) — pinned star, pending-auth spinner (accent, tooltip "Waiting for approval", shown while a tool authorization awaits the user's verdict — the thread's approval card is only visible when it is the active thread), title, short-id tag (shimmer while the loop can self-advance), relative time, hover archive button. The hover/active/selected wash uses the thread's last saved permission-mode color (`theme.warning` ReadOnly / `theme.info` WorkspaceWrite / `theme.danger` FullAccess). External rows reuse the same layout but swap the leading icon for the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`), carry the same visible wash as Workspace Write threads (`theme.info` — `theme.accent` resolves to the near-white `neutral-100` in the forced Light theme, invisible on the sidebar), show the cx session id prefix in the short-id tag (click-to-copy of the full id / socket path, traceable to `~/.manox/sessions/<id>.sock`), and drop the unread/pin/error/running-shimmer affordances. A resumable row (restored from a [`ResumeSidecar`](#resumesidecar), no live process) renders dimmed with a Play hover action (`render_hover_action` emits `OpenExternalSession`, same as the row click) instead of the Inbox archive button, and swaps its leading icon for a `BrailleSpinner` while a resume is in flight. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the open click and the hover archive button to the right `SidebarEvent` (`OpenThread` / `ArchiveThread` vs `OpenExternalSession` / `ArchiveExternalSession` — the latter kills + drops the `SessionHandle`, the unified archive semantics).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -341,7 +341,7 @@ Single rendered conversation item, centered, full width (no fixed content cap �
 
 #### UserMessage
 
-Full-width user turn block rendered inside [TurnFrame](#turnframe): `You > Time/DateTime > ModelID` metadata header, persistent selectable markdown body, copy btn (hover), and an approval-mode-colored frame captured at send time.
+Full-width user turn block rendered inside [TurnFrame](#turnframe): `You > Time/DateTime > ModelID` metadata header, persistent selectable markdown body, copy btn (hover), and a permission-mode-colored frame captured at send time.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -359,13 +359,13 @@ Collapsible: chevron + "Reasoning" label + left-bordered muted body. Each reason
 
 #### ActivitySegment
 
-One contiguous thinking + tool-call segment within a user turn, rendered as a fold shell (`render_thinking`). Cover row: chevron + live braille spinner + per-kind counts (`Read×7`, `Edit×6`, `思考×8` via `message-reasoning`) + elapsed (`thinking-duration`) + red `activity-failed` / orange `activity-awaiting-approval` badges; clicking toggles the container's `collapsed` and sets `user_toggled` (manual state is sticky — auto-collapse never fights the user). Settled + collapsed shows the cover alone; live + collapsed adds the running/latest entry; expanded nests every entry under a slight indent with a left rail, each entry (`render_activity_entry`) itself collapsible to its full tool output via `render_tool_output`. Segments with fewer than two entries render flat with no cover. An approval-pending entry force-opens the segment so the interactive row is never hidden. The following reply's model row carries only the segment's elapsed (`activity_secs`); counts live on the cover alone. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls fold here instead of producing standalone cards. An autopilot auto-approved call renders a muted `check-check` badge immediately before its own status icon (the `ToolCallItem.auto_approved` flag, stamped live on `ApprovalDecision::Allow` and restored from a persisted `AutoApproval` note); the former "Auto-approved" notice card no longer exists, though escalated calls still post an anchored notice.
+One contiguous thinking + tool-call segment within a user turn, rendered as a fold shell (`render_thinking`). Cover row: chevron + live braille spinner + per-kind counts (`Read×7`, `Edit×6`, `思考×8` via `message-reasoning`) + elapsed (`thinking-duration`) + red `activity-failed` / orange `activity-awaiting-approval` badges; clicking toggles the container's `collapsed` and sets `user_toggled` (manual state is sticky — auto-collapse never fights the user). Settled + collapsed shows the cover alone; live + collapsed adds the running/latest entry; expanded nests every entry under a slight indent with a left rail, each entry (`render_activity_entry`) itself collapsible to its full tool output via `render_tool_output`. Segments with fewer than two entries render flat with no cover. An approval-pending entry force-opens the segment so the interactive row is never hidden. The following reply's model row carries only the segment's elapsed (`activity_secs`); counts live on the cover alone. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls fold here instead of producing standalone cards.
 
 > Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `segment_layout`, `segment_stats`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
 
 #### ToolCallCard
 
-A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into an [ActivitySegment](#activitysegment) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). An autopilot auto-approved call (`ToolCallItem.auto_approved`) renders a muted `check-check` badge ahead of its status label.
+A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into an [ActivitySegment](#activitysegment) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel).
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 
@@ -481,7 +481,7 @@ Dropdown chip showing `provider · model · effort` (the reasoning-effort wire v
 
 #### AccessChip
 
-Dropdown chip showing [ApprovalMode](#approval-modes) → [AccessMenu](#accessmenu) popup.
+Dropdown chip showing [PermissionMode](#permission-modes) → [AccessMenu](#accessmenu) popup.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -494,10 +494,9 @@ Dropdown chip showing current project → [ProjectMenu](#projectmenu) popup.
 ##### AskDrawer
 
 Replaces [Composer](#composer) when `pending_ask` is set. Every
-`ThreadEvent::ToolCallAuthorization` — interactive tools, bubbled sub-agent
-auth, and AutoPilot escalations (reviewer `Ask` verdicts awaiting a user
-verdict) — surfaces here as the question card; the payload's options carry
-the decision.
+`ThreadEvent::ToolCallAuthorization` — `AskUserQuestion` calls and bubbled
+team-member questions — surfaces here as the question card; the payload's
+options carry the decision.
 
 #### AskDrawer
 
@@ -559,7 +558,7 @@ Trigger: [ModelChip](#modelchip). Model selector dropdown: provider submenus for
 
 #### AccessMenu
 
-Trigger: [AccessChip](#accesschip). [ApprovalMode](#approval-modes) selector: AutoPilot / Danger.
+Trigger: [AccessChip](#accesschip). [PermissionMode](#permission-modes) selector: Read Only / Workspace Write / Full Access.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -930,17 +929,23 @@ Hover tooltip.
 
 ---
 
-## 8. Approval Modes
+## 8. Permission Modes
 
-Visual states of the [AccessChip](#accesschip).
+Visual states of the [AccessChip](#accesschip). Pure mode-based allow/deny —
+no reviewer, no per-call approval overlay; out-of-scope tool calls return a
+tool error to the model.
 
-#### AutoPilot
+#### Read Only
 
-Blue — a safety reviewer automatically approves safe tool calls; risky ones are denied (default).
+Amber — mutating tools denied; reads ungated.
 
-#### Danger
+#### Workspace Write
 
-Red — bypass all approvals, bash runs outside the sandbox.
+Green — in-workspace writes and sandbox-confined bash ungated; out-of-workspace targets denied (default).
+
+#### Full Access
+
+Red — everything ungated, bash runs outside the sandbox.
 ---
 
 ## 9. Tool Call Statuses

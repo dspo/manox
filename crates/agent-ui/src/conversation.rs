@@ -14,7 +14,7 @@ use std::time::Instant;
 use agent::ThreadEvent;
 use agent::db::{HistoryEntry, UiNoteKind, UiNoteRecord};
 use agent::language_model::StopReason;
-use agent::thread::ApprovalMode;
+use agent::thread::PermissionMode;
 use agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
@@ -31,7 +31,7 @@ pub struct UserImage(pub Arc<gpui::Image>);
 pub struct UserTurnMeta {
     pub timestamp: i64,
     pub model_id: String,
-    pub approval_mode: Option<ApprovalMode>,
+    pub approval_mode: Option<PermissionMode>,
     /// True when this user message entered the message list via the steer
     /// queue drain (mid-turn injection) rather than starting a fresh turn.
     /// Mirrors `MessageUiMetadata::steered`; set by the drain-driven enqueue
@@ -58,7 +58,7 @@ pub enum UserMessageDisplayState {
 }
 
 impl UserTurnMeta {
-    pub fn new(timestamp: i64, model_id: String, approval_mode: Option<ApprovalMode>) -> Self {
+    pub fn new(timestamp: i64, model_id: String, approval_mode: Option<PermissionMode>) -> Self {
         Self {
             timestamp,
             model_id,
@@ -74,7 +74,9 @@ impl UserTurnMeta {
         Self {
             timestamp: message.timestamp,
             model_id: ui.and_then(|m| m.model_id.clone()).unwrap_or_default(),
-            approval_mode: ui.and_then(|m| m.approval_mode).map(ApprovalMode::from_i64),
+            approval_mode: ui
+                .and_then(|m| m.approval_mode)
+                .map(PermissionMode::from_i64),
             steered: ui.and_then(|m| m.steered).unwrap_or(false),
             author: ui.and_then(|m| m.author.clone()),
             peer: ui.map(|m| m.peer).unwrap_or(false),
@@ -128,7 +130,7 @@ pub enum ConvItem {
     /// A runtime error from the agent (red danger styling).
     Error(String),
     /// An ephemeral system notice — status changes, slash-command acks, etc.
-    /// Plain text only (i18n chrome strings / reviewer reasons); the body
+    /// Plain text only (i18n chrome strings / mode-change notices); the body
     /// renders as a paginated `TerminalPanel`, so markdown syntax is not
     /// interpreted. Rendered with neutral tones, not danger colors.
     Notice(String),
@@ -267,12 +269,6 @@ pub struct ToolCallItem {
     /// manual choice survives subsequent status transitions within the same
     /// tool call.
     pub user_toggled: bool,
-    /// True when the autopilot safety reviewer allowed this call without
-    /// escalating to the user; the tool row renders a check-check badge
-    /// ahead of its own status icon. Stamped live on `ApprovalDecision`
-    /// (`mark_auto_approved`) and on rebuild from a persisted
-    /// `UiNoteKind::AutoApproval` note.
-    pub auto_approved: bool,
     /// Persistent `Entity<TerminalPanel>` carrying the terminal-styled output
     /// body + document-level selection. `None` until first sync
     /// (`MessageItem::sync_tool_*_panel`), so a freshly constructed entry
@@ -557,10 +553,6 @@ pub struct ConversationState {
     /// Dropped when the authoritative `rebuild_from_display` replaces this
     /// conversation (`HistoryRestored`).
     history_builder: Option<crate::views::message::ItemBuilder>,
-    /// Auto-approval verdicts parked before their tool item exists
-    /// (event-ordering race between `ApprovalDecision` and the creating
-    /// `ToolCall`); the `ToolCall` arm drains them onto the fresh item.
-    pending_auto_approvals: std::collections::HashSet<String>,
 }
 
 /// Where a notice lands in the item list.
@@ -613,7 +605,6 @@ impl Default for ConversationState {
             next_item_id: 0,
             turn_started_at: Instant::now(),
             history_builder: None,
-            pending_auto_approvals: std::collections::HashSet::new(),
         }
     }
 }
@@ -649,7 +640,7 @@ impl ConversationState {
     /// True when the conversation has no substantive items (user, assistant,
     /// reasoning, tool call, or agent task). Notice-only items (error cards
     /// used for slash-command acknowledgements and mode switches) don't count
-    /// so toggling Danger on the empty first screen doesn't prematurely leave
+    /// so a mode-switch notice on the empty first screen doesn't prematurely leave
     /// the hero layout.
     pub fn is_empty(&self, cx: &App) -> bool {
         self.items.iter().all(|e| {
@@ -919,59 +910,6 @@ impl ConversationState {
         self.items
             .iter()
             .position(|e| matches!(e.read(cx).kind(), ConvItem::ToolCall(t) if t.id == id))
-    }
-
-    /// Stamp the autopilot auto-approval badge onto the tool item carrying
-    /// `tool_call_id` — a top-level `ToolCall` card or an activity-segment
-    /// tool entry — in place. Returns true when an item matched; on a miss
-    /// the workspace parks the verdict via `buffer_auto_approval` (the
-    /// documented `ApprovalDecision`-before-`ToolCall` ordering race).
-    pub fn mark_auto_approved(&mut self, tool_call_id: &str, cx: &mut App) -> bool {
-        // Tool call ids are unique to one item, so the first hit is the only
-        // hit — stop scanning instead of leasing every trailing entity.
-        for item in &self.items {
-            let hit = item.update(cx, |item, cx| {
-                let found = match item.kind_mut() {
-                    ConvItem::ToolCall(t) if t.id == tool_call_id => {
-                        t.auto_approved = true;
-                        true
-                    }
-                    ConvItem::Thinking(t) => {
-                        if let Some(entry) = t.get_tool_entry_mut(tool_call_id) {
-                            entry.auto_approved = true;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                };
-                if found {
-                    cx.notify();
-                }
-                found
-            });
-            if hit {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Park an auto-approval verdict whose tool item has not landed yet —
-    /// the documented event-ordering race between `ApprovalDecision` and the
-    /// creating `ToolCall`. The `ToolCall` arm drains the buffer and stamps
-    /// the item once it exists, so the badge is never silently lost.
-    pub fn buffer_auto_approval(&mut self, tool_call_id: &str) {
-        self.pending_auto_approvals.insert(tool_call_id.to_string());
-    }
-
-    /// Stamp a buffered auto-approval onto the tool item that just landed for
-    /// `tool_call_id`; no-op when nothing was parked for this id.
-    fn drain_pending_auto_approval(&mut self, tool_call_id: &str, cx: &mut App) {
-        if self.pending_auto_approvals.remove(tool_call_id) {
-            let _ = self.mark_auto_approved(tool_call_id, cx);
-        }
     }
 
     fn find_agent_task(&self, id: &str, cx: &App) -> Option<usize> {
@@ -1382,7 +1320,6 @@ impl ConversationState {
                                     streaming: matches!(*status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
-                                    auto_approved: false,
                                     panel: None,
                                 }),
                                 role.to_string(),
@@ -1395,10 +1332,10 @@ impl ConversationState {
                 } else {
                     // Ordinary tool call: fold into the active activity
                     // segment, unless a top-level card already owns this id —
-                    // an AutoPilot escalation anchor (`name` = AskUserQuestion)
-                    // absorbs the real tool's lifecycle in place (renaming to
+                    // a pending interaction card (`name` = AskUserQuestion)
+                    // absorbs the follow-up lifecycle in place (renaming to
                     // the actual tool) instead of spawning a parallel segment.
-                    let outcome = if let Some(ix) = self.find_tool(id, cx) {
+                    if let Some(ix) = self.find_tool(id, cx) {
                         let name = name.clone();
                         let title = title.clone();
                         let status = *status;
@@ -1482,7 +1419,6 @@ impl ConversationState {
                                                 | ToolCallStatus::PendingApproval
                                         ),
                                         user_toggled: false,
-                                        auto_approved: false,
                                         panel: None,
                                     }));
                                 }
@@ -1495,12 +1431,7 @@ impl ConversationState {
                         } else {
                             ApplyOutcome::Remeasure(cix)
                         }
-                    };
-                    // Event-ordering race: an `ApprovalDecision(Allow)` that
-                    // landed before this item existed was parked by the
-                    // workspace; stamp the badge now that the item is here.
-                    self.drain_pending_auto_approval(id, cx);
-                    outcome
+                    }
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
@@ -1618,7 +1549,6 @@ impl ConversationState {
                             ToolCallStatus::Running | ToolCallStatus::PendingApproval
                         ),
                         user_toggled: false,
-                        auto_approved: false,
                         panel: None,
                     };
                     let mut container = ThinkingContainer::new();
@@ -1640,14 +1570,7 @@ impl ConversationState {
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
-                // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
-                ApplyOutcome::Unchanged
-            }
-            ThreadEvent::ApprovalDecision { .. } => {
-                // Handled by `Workspace`, not the conversation flow: an
-                // `Allow` verdict stamps the tool item's auto-approval badge
-                // (`mark_auto_approved`); an `Ask` verdict posts an anchored
-                // Notice card.
+                // Handled by `Workspace` (question card); not part of the conversation flow.
                 ApplyOutcome::Unchanged
             }
             ThreadEvent::Stop(reason) => {
@@ -1709,7 +1632,7 @@ impl ConversationState {
                 }));
                 ApplyOutcome::Appended
             }
-            ThreadEvent::ApprovalModeChanged { .. } => {
+            ThreadEvent::PermissionModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::Unchanged
             }
@@ -1954,12 +1877,9 @@ impl ConversationState {
     /// exist.
     ///
     /// Plain notes render in place; notes carrying a `data.tool_call_id`
-    /// (approval decision records) splice in right after the item holding
-    /// their tool call — matching the live anchored placement — falling back
-    /// to the tail when compaction dropped the tool item. `AutoApproval`
-    /// notes splice no item: their `tool_call_id` stamps the matching tool
-    /// item's `auto_approved` badge instead (silently skipped when the item
-    /// is gone).
+    /// splice in right after the item holding their tool call — matching
+    /// the live anchored placement — falling back to the tail when
+    /// compaction dropped the tool item.
     pub fn rebuild_from_display(
         display: &[HistoryEntry],
         usage: &std::collections::HashMap<String, TokenUsage>,
@@ -2005,14 +1925,6 @@ impl ConversationState {
                 .get("tool_call_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            // Auto-approval markers stamp the badge instead of rendering a
-            // conversation item.
-            if note.kind == UiNoteKind::AutoApproval {
-                if let Some(target) = kinds.iter_mut().find(|it| item_contains_tool(it, tool_id)) {
-                    stamp_auto_approval(target, tool_id);
-                }
-                continue;
-            }
             let kind = note_to_item(note);
             match kinds.iter().position(|it| item_contains_tool(it, tool_id)) {
                 Some(ix) => match grouped.last_mut() {
@@ -2040,7 +1952,6 @@ impl ConversationState {
             next_item_id,
             turn_started_at: Instant::now(),
             history_builder: None,
-            pending_auto_approvals: std::collections::HashSet::new(),
         }
     }
 
@@ -2169,25 +2080,6 @@ fn item_contains_tool(it: &ConvItem, tool_call_id: &str) -> bool {
     }
 }
 
-/// Stamp the auto-approval badge onto the item owning the tool call (a
-/// top-level card or an activity entry); `AutoApproval` notes render no
-/// conversation item of their own.
-fn stamp_auto_approval(kind: &mut ConvItem, tool_call_id: &str) {
-    match kind {
-        ConvItem::ToolCall(t) if t.id == tool_call_id => t.auto_approved = true,
-        ConvItem::Thinking(container) => {
-            if let Some(ActivityEntry::Tool(tool)) = container
-                .entries
-                .iter_mut()
-                .find(|e| matches!(e, ActivityEntry::Tool(t) if t.id == tool_call_id))
-            {
-                tool.auto_approved = true;
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Render a persisted note as its live `ConvItem` counterpart, reading the
 /// `text` payload from `data`.
 fn note_to_item(n: &UiNoteRecord) -> ConvItem {
@@ -2207,9 +2099,6 @@ fn note_to_item(n: &UiNoteRecord) -> ConvItem {
             plan_text: text,
             active: false,
         },
-        UiNoteKind::AutoApproval => {
-            unreachable!("AutoApproval notes are partitioned out before rendering")
-        }
     }
 }
 
@@ -2667,73 +2556,6 @@ mod tests {
         });
     }
 
-    /// `AutoApproval` notes splice no conversation item: their
-    /// `tool_call_id` stamps the matching tool entry's `auto_approved` badge
-    /// instead, so a rebuilt thread reproduces the live badge without a
-    /// notice card. A marker whose tool item is gone applies nothing.
-    #[gpui::test]
-    fn rebuild_from_display_stamps_auto_approval_badge_without_item(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let display = vec![
-            HistoryEntry::Message(msg_with_id("u1", Role::User, "read it")),
-            HistoryEntry::Message(Message::assistant(vec![MessageContent::ToolUse(
-                LanguageModelToolUse {
-                    id: "tu_1".to_string(),
-                    name: Arc::from("Read"),
-                    raw_input: String::new(),
-                    input: serde_json::Value::Null,
-                    is_input_complete: true,
-                    thought_signature: None,
-                },
-            )])),
-            HistoryEntry::Message(Message::user_with_content(vec![
-                MessageContent::ToolResult(LanguageModelToolResult {
-                    tool_use_id: "tu_1".to_string(),
-                    tool_name: Arc::from("Read"),
-                    is_error: false,
-                    content: "ok".to_string(),
-                }),
-            ])),
-            HistoryEntry::Note(UiNoteRecord {
-                kind: UiNoteKind::AutoApproval,
-                data: serde_json::json!({ "tool_call_id": "tu_1" }),
-            }),
-            HistoryEntry::Note(UiNoteRecord {
-                kind: UiNoteKind::AutoApproval,
-                data: serde_json::json!({ "tool_call_id": "ghost" }),
-            }),
-        ];
-        let ctx = ApplyCtx {
-            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
-            cwd: None,
-        };
-        cx.update(|cx| {
-            let conv = ConversationState::rebuild_from_display(
-                &display,
-                &HashMap::new(),
-                "model",
-                false,
-                ctx,
-                cx,
-            );
-            let kinds: Vec<ConvItem> = conv
-                .items()
-                .iter()
-                .map(|e| e.read(cx).kind().clone())
-                .collect();
-            assert_eq!(signature(&kinds), vec!["U:read it", "?"]);
-            match &kinds[1] {
-                ConvItem::Thinking(t) => match &t.entries[0] {
-                    ActivityEntry::Tool(tool) => {
-                        assert!(tool.auto_approved, "the AutoApproval note stamps the badge")
-                    }
-                    other => panic!("expected tool entry, got {other:?}"),
-                },
-                other => panic!("expected thinking segment, got {other:?}"),
-            }
-        });
-    }
-
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
     /// preceding assistant message, so a reloaded historical thread shows tool output.
     #[test]
@@ -2968,7 +2790,6 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
-            auto_approved: false,
             panel: None,
         }));
         // All entries terminal, but segment is still accepting (turn in progress).
@@ -3030,7 +2851,6 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
-            auto_approved: false,
             panel: None,
         }));
         t.recompute_streaming();
@@ -3074,7 +2894,6 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
-            auto_approved: false,
             panel: None,
         }));
         t.recompute_streaming();
@@ -3146,7 +2965,6 @@ mod tests {
             streaming: true,
             collapsed: false,
             user_toggled: false,
-            auto_approved: false,
             panel: None,
         }));
         // Still finds the streaming reasoning at index 1.
@@ -3175,7 +2993,6 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
-            auto_approved: false,
             panel: None,
         }));
         assert!(t.get_tool_entry_mut("tu_1").is_some());
@@ -3390,111 +3207,6 @@ mod tests {
                     fresh.find_tool_entry_index("tu_new").is_some(),
                     "new turn's tool call must open a fresh segment below the user bubble"
                 );
-            });
-        });
-    }
-
-    /// `mark_auto_approved` stamps the badge onto whichever item owns the id
-    /// — a top-level `ToolCall` card or an activity-segment tool entry — and
-    /// reports a miss for unknown ids so the workspace skips persisting the
-    /// marker note when there is nothing to badge.
-    #[gpui::test]
-    fn mark_auto_approved_stamps_the_owning_tool_item(cx: &mut gpui::TestAppContext) {
-        let (conversation, ctx) = stale_segment_conv(cx);
-        cx.update(|cx| {
-            conversation.update(cx, |c, cx| {
-                // Ordinary tool call → folds into the activity segment.
-                let _ = c.apply(
-                    &ThreadEvent::ToolCall {
-                        id: "tu_gated".into(),
-                        name: "Bash".into(),
-                        title: "ls".into(),
-                        status: ToolCallStatus::Running,
-                        input: None,
-                    },
-                    "model",
-                    None,
-                    ctx.clone(),
-                    cx,
-                );
-                // AskUserQuestion → top-level ToolCall card.
-                let _ = c.apply(
-                    &ThreadEvent::ToolCall {
-                        id: "ask_1".into(),
-                        name: agent::tools::ASK_USER_QUESTION.into(),
-                        title: "which?".into(),
-                        status: ToolCallStatus::PendingApproval,
-                        input: None,
-                    },
-                    "model",
-                    None,
-                    ctx.clone(),
-                    cx,
-                );
-                assert!(c.mark_auto_approved("tu_gated", cx));
-                assert!(c.mark_auto_approved("ask_1", cx));
-                assert!(!c.mark_auto_approved("tu_ghost", cx));
-            });
-        });
-        cx.update(|cx| {
-            conversation.read_with(cx, |c, cx| {
-                let (cix, eix) = c
-                    .find_thinking_entry("tu_gated", cx)
-                    .expect("segment tool entry present");
-                match &c.items()[cix].read(cx).kind() {
-                    ConvItem::Thinking(t) => match &t.entries[eix] {
-                        ActivityEntry::Tool(tool) => assert!(tool.auto_approved),
-                        _ => panic!("expected tool entry"),
-                    },
-                    _ => panic!("expected Thinking container"),
-                }
-                let ix = c.find_tool("ask_1", cx).expect("top-level card present");
-                match c.items()[ix].read(cx).kind() {
-                    ConvItem::ToolCall(t) => assert!(t.auto_approved),
-                    _ => panic!("expected ToolCall card"),
-                }
-            });
-        });
-    }
-
-    /// The event-ordering race: an `ApprovalDecision(Allow)` parked before
-    /// its `ToolCall` event lands is drained onto the item at creation, so
-    /// the badge is never lost regardless of arrival order.
-    #[gpui::test]
-    fn buffered_auto_approval_stamps_the_late_tool_entry(cx: &mut gpui::TestAppContext) {
-        let (conversation, ctx) = stale_segment_conv(cx);
-        cx.update(|cx| {
-            conversation.update(cx, |c, cx| {
-                c.buffer_auto_approval("tu_late");
-                let _ = c.apply(
-                    &ThreadEvent::ToolCall {
-                        id: "tu_late".into(),
-                        name: "Bash".into(),
-                        title: "ls".into(),
-                        status: ToolCallStatus::Running,
-                        input: None,
-                    },
-                    "model",
-                    None,
-                    ctx.clone(),
-                    cx,
-                );
-            });
-        });
-        cx.update(|cx| {
-            conversation.read_with(cx, |c, cx| {
-                let (cix, eix) = c
-                    .find_thinking_entry("tu_late", cx)
-                    .expect("late tool entry present");
-                match &c.items()[cix].read(cx).kind() {
-                    ConvItem::Thinking(t) => match &t.entries[eix] {
-                        ActivityEntry::Tool(tool) => {
-                            assert!(tool.auto_approved, "buffered verdict stamped on creation")
-                        }
-                        _ => panic!("expected tool entry"),
-                    },
-                    _ => panic!("expected Thinking container"),
-                }
             });
         });
     }
@@ -4100,12 +3812,12 @@ mod tests {
         });
     }
 
-    /// An `ApprovalDecision` notice for a tool call lands right after the item
-    /// carrying the tool call; without a resolvable item it lands at the turn
-    /// end. Mirrors the workspace handler's `notice_anchor_for_tool` + anchored
+    /// A notice anchored to a tool call lands right after the item carrying
+    /// the tool call; without a resolvable item it lands at the turn end.
+    /// Mirrors the workspace handler's `notice_anchor_for_tool` + anchored
     /// `push_notice` wiring.
     #[test]
-    fn approval_notice_anchors_near_its_tool_call() {
+    fn notice_anchors_near_its_tool_call() {
         let cx = gpui::TestAppContext::single();
         cx.update(gpui_component::init);
         let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
