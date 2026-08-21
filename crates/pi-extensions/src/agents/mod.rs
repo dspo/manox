@@ -76,6 +76,11 @@ pub struct SubagentTool {
     model_runtime: Option<ModelRuntime>,
     /// Optional explicit model; without one the session uses its default.
     model: Option<pi::types::Model>,
+    /// Live view of the owner's current model. Subagents inherit the caller's
+    /// model at dispatch time (not the snapshot pinned at assembly) so a
+    /// mid-thread model switch is honored instead of falling back to the
+    /// provider default.
+    model_slot: Option<Arc<std::sync::Mutex<Option<pi::types::Model>>>>,
     /// Optional provider registry for resolving a definition's `model`
     /// override (id or alias). Assembly-layer concern per `AgentDef.model`;
     /// injected by the harness that owns the registry.
@@ -94,6 +99,7 @@ impl SubagentTool {
             tools,
             model_runtime: None,
             model: None,
+            model_slot: None,
             provider_registry: None,
             description_override: None,
         }
@@ -109,6 +115,16 @@ impl SubagentTool {
     /// Pin the model the subagent session uses (wired to the caller's model).
     pub fn with_model(mut self, model: pi::types::Model) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Share the owner's live model slot so dispatch inherits the caller's
+    /// current model rather than the assembly-time snapshot.
+    pub fn with_model_slot(
+        mut self,
+        slot: Arc<std::sync::Mutex<Option<pi::types::Model>>>,
+    ) -> Self {
+        self.model_slot = Some(slot);
         self
     }
 
@@ -172,7 +188,8 @@ impl SubagentTool {
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
-        if let Some(model) = model_override.or_else(|| self.model.clone()) {
+        let inherited = self.model_slot.as_ref().and_then(|slot| slot.lock().unwrap().clone());
+        if let Some(model) = model_override.or_else(|| inherited.or_else(|| self.model.clone())) {
             builder = builder.with_model(model);
         }
         let session = builder

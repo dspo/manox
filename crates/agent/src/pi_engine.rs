@@ -1081,6 +1081,9 @@ fn build_tools(
         )
         .with_model_runtime(runtime.clone())
         .with_model(model.clone())
+        // Inherit the Captain's live model at dispatch time (a mid-thread
+        // model switch is honored instead of falling back to the default).
+        .with_model_slot(gate.model_slot())
         // Resolve agent-definition `model` overrides against the live
         // registry (registration has landed before session assembly).
         .with_provider_registry(crate::pi_providers::global());

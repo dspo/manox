@@ -107,6 +107,12 @@ impl ApprovalGate {
         self.model.lock().unwrap().clone()
     }
 
+    /// Live handle to the owner's model slot so dispatch-time readers (e.g.
+    /// subagent spawn) inherit the current model, not an assembly snapshot.
+    pub fn model_slot(&self) -> Arc<Mutex<Option<PiModel>>> {
+        Arc::clone(&self.model)
+    }
+
     pub fn set_transcript(&self, messages: &[AgentMessage]) {
         *self.transcript.lock().unwrap() = messages.to_vec();
     }
