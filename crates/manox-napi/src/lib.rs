@@ -30,10 +30,11 @@ pub fn ping() -> String {
 /// actor through a threadsafe function.
 #[napi]
 pub fn start(event_cb: JsFunction) -> Result<()> {
-    // The built-in Chrome engine (rustwright-core, via ChromeUse) checks
-    // DISABLE_TELEMETRY against this host process's environment at launch.
-    // Earliest controllable point in the Node host; the actor thread spawned
-    // below must not be able to launch the engine before this lands.
+    // The built-in Chrome engine (rustwright-core, via ChromeUse) is NOT
+    // linked into the VS Code host: the agent is built without the
+    // `chrome-use` feature on the manox-napi edge, so nothing here can ever
+    // launch it. DISABLE_TELEMETRY is still set as defense in depth in case
+    // the engine is ever enabled on this host.
     unsafe { std::env::set_var("DISABLE_TELEMETRY", "1") };
     let mut slot = actor_slot();
     if slot.is_some() {
