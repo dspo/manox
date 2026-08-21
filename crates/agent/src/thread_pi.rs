@@ -1662,9 +1662,12 @@ fn drain_engine_notices(
 ) {
     this.spawn(async move |this, cx| {
         while let Some(notice) = events.recv().await {
-            let ok = this.update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx)).is_ok();
-            if !ok {
-                break;
+            // Continue draining even if handle_notice panics — a single
+            // bad notice (e.g. engine None during Settled re-fire) must
+            // not silently kill the entire drain loop and lose all
+            // subsequent SteerDelivered messages.
+            if this.update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx)).is_err() {
+                tracing::error!("handle_notice panicked — continuing drain");
             }
         }
     })
