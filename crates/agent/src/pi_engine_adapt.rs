@@ -510,6 +510,89 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Map one child sub-agent `AgentEvent` onto the observation events the
+/// workspace accumulates for the sub-agent panel: `SubagentChild` (transcript
+/// deltas + tool lifecycle) plus a running `SubagentProgress` for rail rows.
+/// Mirrors the retired JSON bridge's kind mapping but reads the child session's
+/// events directly instead of a `{"subagent_event": ...}` progress payload.
+pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
+    let activity = |text: String| ThreadEvent::SubagentProgress {
+        id: id.to_string(),
+        subagent_type: String::new(),
+        tool_uses: 0,
+        token_usage: crate::language_model::TokenUsage::default(),
+        latest_activity: Some(text),
+        status: ToolCallStatus::Running,
+    };
+    match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            pi::types::AssistantMessageEvent::TextDelta { delta, .. } => {
+                vec![ThreadEvent::SubagentChild {
+                    id: id.to_string(),
+                    child: crate::thread::SubagentChildEvent::Text(delta.clone()),
+                }]
+            }
+            pi::types::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                vec![ThreadEvent::SubagentChild {
+                    id: id.to_string(),
+                    child: crate::thread::SubagentChildEvent::Thinking(delta.clone()),
+                }]
+            }
+            _ => Vec::new(),
+        },
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            arguments,
+        } => {
+            let hint = arg_hint(arguments);
+            let mut events = vec![ThreadEvent::SubagentChild {
+                id: id.to_string(),
+                child: crate::thread::SubagentChildEvent::ToolStart {
+                    id: tool_call_id.clone(),
+                    name: tool_name.clone(),
+                    hint: hint.clone(),
+                },
+            }];
+            events.push(activity(match hint {
+                Some((_, s)) => format!("▸ {tool_name} {s}"),
+                None => format!("▸ {tool_name}"),
+            }));
+            events
+        }
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            is_error,
+            ..
+        } => vec![ThreadEvent::SubagentChild {
+            id: id.to_string(),
+            child: crate::thread::SubagentChildEvent::ToolEnd {
+                id: tool_call_id.clone(),
+                name: tool_name.clone(),
+                is_error: *is_error,
+            },
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// First object entry of a tool-call's arguments as a `(key, short value)`
+/// hint, mirroring the retired bridge's `summary_key`/`summary`.
+fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)> {
+    arguments.as_object()?.iter().next().map(|(key, value)| {
+        let value = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let short: String = value.chars().take(40).collect();
+        (key.clone(), short)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

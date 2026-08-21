@@ -1,162 +1,336 @@
-//! Sub-agent observation panel — renders the child run's header, live
-//! activity (tool lifecycle + text deltas), and final answer.
+//! Read-only observation panel for a single pi sub-agent run.
+//!
+//! The panel renders through the same [`ConversationState`] + message
+//! pipeline as the main conversation: bridged child events are translated
+//! into the shared [`ThreadEvent`] contract (`AgentText` / `AgentThinking` /
+//! `ToolCall` / `ToolResult`), so a sub-agent run reads exactly like a
+//! miniature conversation (assistant bubbles, reasoning folds, tool cards).
+//!
+//! The workspace accumulates the child session's bridged events
+//! ([`agent::SubagentChildEvent`]) per Agent tool-call id; opening mid-run
+//! backfills from that accumulation by replaying the translated events.
+//! Pi sub-agent sessions are ephemeral (no persisted child transcript), so a
+//! panel opened after a reload falls back to the Agent tool result's final
+//! text plus a note.
 
-use agent::{ToolCallStatus, thread::SubagentChildEvent};
-use gpui::{Context, Entity, Render, SharedString, WeakEntity, Window, prelude::*};
-use gpui_component::{ActiveTheme as _, Theme, h_flex, v_flex};
+use std::collections::HashMap;
+
+use agent::Message;
+use agent::ToolCallStatus;
+use agent::i18n;
+use agent::language_model::{MessageContent, TokenUsage};
+use agent::thread::{SubagentChildEvent, ThreadEvent};
+use gpui::prelude::*;
+use gpui::{
+    AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, WeakEntity, Window, px,
+};
+use gpui_component::{ActiveTheme as _, ElementExt as _, h_flex, v_flex};
 
 use crate::Workspace;
+use crate::conversation::{ApplyCtx, ConversationState};
+use crate::views::subagents::status_indicator;
 
-pub struct SubagentPanel {
-    title: SharedString,
-    role: String,
+/// Translate one bridged child event into the shared [`ThreadEvent`]
+/// contract. Tool titles go through the same `tool_title` derivation as the
+/// main conversation, and the child call id pairs start/end under parallel
+/// child tool execution.
+fn thread_event_of(child: &SubagentChildEvent) -> ThreadEvent {
+    match child {
+        SubagentChildEvent::Text(text) => ThreadEvent::AgentText(text.clone()),
+        SubagentChildEvent::Thinking(text) => ThreadEvent::AgentThinking(text.clone()),
+        SubagentChildEvent::ToolStart { id, name, hint } => {
+            let input = hint
+                .as_ref()
+                .map(|(key, value)| serde_json::json!({ key: value }));
+            let title_value = input.clone().unwrap_or_default();
+            ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: agent::thread::tool_title(name, &title_value, None),
+                status: ToolCallStatus::Running,
+                input,
+            }
+        }
+        SubagentChildEvent::ToolEnd { id, is_error, .. } => ThreadEvent::ToolResult {
+            id: id.clone(),
+            output: String::new(),
+            is_error: *is_error,
+        },
+    }
+}
+
+pub(crate) struct SubagentPanel {
+    /// `{type} · {topic}` display title (call id last resort), also the tab
+    /// label.
+    title: String,
     status: ToolCallStatus,
-    activity: Vec<SharedString>,
-    final_text: Option<SharedString>,
-    #[allow(dead_code)]
+    /// The child run rendered as a miniature conversation through the shared
+    /// message pipeline.
+    conversation: Entity<ConversationState>,
+    /// Rendered above the transcript when the panel fell back to the final
+    /// answer (no live transcript survives a reload).
+    final_note: bool,
+    role: String,
     weak_workspace: WeakEntity<Workspace>,
+    scroll_handle: ScrollHandle,
+    stick_to_bottom: bool,
 }
 
 impl SubagentPanel {
-    pub fn new(
+    pub(crate) fn new(
         title: String,
         role: String,
         status: ToolCallStatus,
         backfill: &[SubagentChildEvent],
         final_text: Option<String>,
         weak_workspace: WeakEntity<Workspace>,
-        cx: &mut gpui::App,
+        cx: &mut App,
     ) -> Entity<Self> {
-        let activity: Vec<SharedString> = backfill.iter().filter_map(activity_line).collect();
+        let ctx = ApplyCtx {
+            weak: weak_workspace.clone(),
+            cwd: None,
+        };
+        let final_note = backfill.is_empty() && final_text.is_some();
+        let role_for_conv = role.clone();
+        let conversation = if backfill.is_empty() {
+            match final_text {
+                // Replay the final answer as a one-message conversation so
+                // the fallback renders through the same pipeline.
+                Some(final_text) => {
+                    let display = vec![agent::db::HistoryEntry::Message(Message::assistant(vec![
+                        MessageContent::Text(final_text),
+                    ]))];
+                    let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
+                    cx.new(|cx| {
+                        ConversationState::rebuild_from_display(
+                            &display,
+                            &empty_usage,
+                            &role_for_conv,
+                            false,
+                            ctx,
+                            cx,
+                        )
+                    })
+                }
+                None => cx.new(|_| ConversationState::new()),
+            }
+        } else {
+            cx.new(|cx| {
+                let mut conversation = ConversationState::new();
+                for child in backfill {
+                    conversation.apply(
+                        &thread_event_of(child),
+                        &role_for_conv,
+                        None,
+                        ctx.clone(),
+                        cx,
+                    );
+                }
+                conversation
+            })
+        };
         cx.new(|_| Self {
-            title: SharedString::from(title),
-            role,
+            title,
             status,
-            activity,
-            final_text: final_text.map(SharedString::from),
+            conversation,
+            final_note,
+            role,
             weak_workspace,
+            scroll_handle: ScrollHandle::new(),
+            stick_to_bottom: true,
         })
     }
 
-    pub fn title(&self) -> &str {
+    pub(crate) fn title(&self) -> &str {
         &self.title
     }
 
-    pub fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
-        if let Some(line) = activity_line(child) {
-            self.activity.push(line);
+    pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
+        let event = thread_event_of(child);
+        let role = self.role.clone();
+        let ctx = ApplyCtx {
+            weak: self.weak_workspace.clone(),
+            cwd: None,
+        };
+        self.conversation
+            .update(cx, |c, cx| c.apply(&event, &role, None, ctx, cx));
+        // Re-arm tail-follow only while the viewport is still near the
+        // bottom; a user who scrolled up to read history must not be yanked
+        // back by the next delta.
+        let off = self.scroll_handle.offset().y;
+        let max = self.scroll_handle.max_offset().y;
+        if (max + off).abs() < px(20.) {
+            self.stick_to_bottom = true;
         }
         cx.notify();
     }
 
-    pub fn set_status(&mut self, status: ToolCallStatus, cx: &mut Context<Self>) {
+    pub(crate) fn set_status(&mut self, status: ToolCallStatus, cx: &mut Context<Self>) {
         self.status = status;
         cx.notify();
-    }
-
-    /// Show the final answer (set when a finished run's panel is opened late).
-    pub fn set_final_text(&mut self, text: String, cx: &mut Context<Self>) {
-        self.final_text = Some(SharedString::from(text));
-        cx.notify();
-    }
-}
-
-/// One human-readable activity line from a child event.
-fn activity_line(child: &SubagentChildEvent) -> Option<SharedString> {
-    match child {
-        SubagentChildEvent::ToolStart { name, hint, .. } => Some(
-            match hint {
-                Some((key, value)) => format!("▸ {name} {key}={value}"),
-                None => format!("▸ {name}"),
-            }
-            .into(),
-        ),
-        SubagentChildEvent::ToolEnd { is_error, .. } => Some(
-            (if *is_error {
-                "✗ tool failed"
-            } else {
-                "✓ tool done"
-            })
-            .into(),
-        ),
-        SubagentChildEvent::Text(text) => {
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(SharedString::from(text.clone()))
-            }
-        }
-        SubagentChildEvent::Thinking(_) => None,
     }
 }
 
 impl Render for SubagentPanel {
-    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
-        let theme: Theme = cx.theme().clone();
-        let muted = theme.muted_foreground;
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
 
-        let status_text: SharedString = match self.status {
-            ToolCallStatus::Running | ToolCallStatus::PendingApproval => "running".into(),
-            ToolCallStatus::Success | ToolCallStatus::Continued => "done".into(),
-            ToolCallStatus::Cancelled => "cancelled".into(),
-            ToolCallStatus::Error | ToolCallStatus::Denied => "failed".into(),
-        };
+        let header = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1p5()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(status_indicator(self.status, theme))
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.foreground)
+                    .child(self.title.clone()),
+            );
+
+        let items: Vec<AnyElement> = self
+            .conversation
+            .read(cx)
+            .items()
+            .iter()
+            .cloned()
+            .map(|item| {
+                v_flex()
+                    .pt_1()
+                    .pb_4()
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .child(item)
+                    .into_any_element()
+            })
+            .collect();
+
+        let scroll = self.scroll_handle.clone();
+        let weak = cx.weak_entity();
 
         let mut body = v_flex()
-            .id("subagent-panel-scroll")
-            .h_full()
+            .id("subagent-transcript-scroll")
             .w_full()
-            .p_3()
-            .gap_2()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
             .overflow_y_scroll()
-            .bg(theme.background);
+            .overflow_x_hidden()
+            .track_scroll(&scroll)
+            .px_3()
+            .py_2();
 
-        // Header: role · title · status
-        body = body.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(format!("[{}] {}", self.role, self.title)),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(match self.status {
-                            ToolCallStatus::Error | ToolCallStatus::Denied => theme.danger,
-                            ToolCallStatus::Success | ToolCallStatus::Continued => theme.success,
-                            _ => muted,
-                        })
-                        .child(status_text),
-                ),
-        );
-
-        // Activity lines.
-        for line in &self.activity {
+        if self.final_note {
+            body = body.child(
+                gpui::div()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("subagent-panel-final-note")),
+            );
+        }
+        if items.is_empty() && !self.final_note {
             body = body.child(
                 gpui::div()
                     .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(muted)
-                    .child(line.clone()),
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("subagent-panel-waiting")),
             );
         }
+        body = body.children(items);
 
-        // Final answer block.
-        if let Some(final_text) = &self.final_text {
-            body = body.child(
-                gpui::div()
-                    .pt_2()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(final_text.clone()),
+        let body = body
+            .on_prepaint(move |_bounds, _window, cx| {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                if !this.read(cx).stick_to_bottom {
+                    return;
+                }
+                let off = scroll.offset().y;
+                let max = scroll.max_offset().y;
+                if (max + off).abs() < px(1.) {
+                    return;
+                }
+                scroll.scroll_to_bottom();
+            })
+            .on_scroll_wheel(
+                cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
+                    // An upward wheel breaks tail-follow so the user can
+                    // scroll back through history; the next push re-arms it
+                    // once the viewport is back near the bottom.
+                    let dy = ev.delta.pixel_delta(window.line_height()).y;
+                    if dy > Pixels::ZERO {
+                        this.stick_to_bottom = false;
+                        cx.notify();
+                    }
+                }),
             );
+
+        v_flex()
+            .h_full()
+            .w_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(header)
+            .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_events_translate_to_shared_thread_events() {
+        match thread_event_of(&SubagentChildEvent::ToolStart {
+            id: "c1".into(),
+            name: "Read".into(),
+            hint: Some(("path".into(), "src/x.rs".into())),
+        }) {
+            ThreadEvent::ToolCall {
+                id,
+                name,
+                title,
+                status,
+                input,
+            } => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "Read");
+                assert_eq!(status, ToolCallStatus::Running);
+                assert!(title.contains("src/x.rs"), "{title}");
+                assert_eq!(input.unwrap()["path"], "src/x.rs");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
         }
 
-        body
+        match thread_event_of(&SubagentChildEvent::ToolEnd {
+            id: "c1".into(),
+            name: "Read".into(),
+            is_error: true,
+        }) {
+            ThreadEvent::ToolResult { id, is_error, .. } => {
+                assert_eq!(id, "c1");
+                assert!(is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        assert!(matches!(
+            thread_event_of(&SubagentChildEvent::Text("hi".into())),
+            ThreadEvent::AgentText(t) if t == "hi"
+        ));
+        assert!(matches!(
+            thread_event_of(&SubagentChildEvent::Thinking("hmm".into())),
+            ThreadEvent::AgentThinking(t) if t == "hmm"
+        ));
     }
 }

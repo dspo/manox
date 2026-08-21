@@ -299,7 +299,26 @@ impl AgentBus {
         // JSONL file lives inside it; dropping it mid-run deletes the dir.
         crate::runtime::handle().spawn(async move {
             let _session_dir = session_dir; // hold TempDir alive for session lifetime
-            let result = session.prompt(&full_prompt).await;
+            // Bridge the child session's streamed events to the workspace so
+            // the sub-agent panel + rail show live dynamics (the retired
+            // JSON bridge's successor). The subscription must outlive the loop.
+            let (ev_tx, mut ev_rx) =
+                tokio::sync::mpsc::unbounded_channel::<pi::types::AgentEvent>();
+            let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
+                let _ = ev_tx.send(event);
+                Box::pin(async move {})
+            }));
+            let mut prompt_fut = Box::pin(session.prompt(&full_prompt));
+            let result = loop {
+                tokio::select! {
+                    r = prompt_fut.as_mut() => break r,
+                    Some(event) = ev_rx.recv() => {
+                        for ev in crate::pi_engine::adapt::child_events_of(&addr_clone, &event) {
+                            let _ = notice_tx.send(BackendNotice::Event(Box::new(ev)));
+                        }
+                    }
+                }
+            };
             // Clean up worktree.
             if let Some(wt) = worktree {
                 let _ = wt.clean_up(&*tool_ctx2).await;
