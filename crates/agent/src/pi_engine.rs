@@ -61,8 +61,9 @@ pub(crate) enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Switch the approval policy and persist it in the session sidecar.
     SetApprovalMode(ApprovalMode),
-    /// Set the active tool subset (opt-in browser tools activation).
-    SetActiveTools { names: Vec<String> },
+    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or
+    /// off; the engine merges/removes the suite names atomically.
+    SetBrowserSuite { suite: BrowserSuite, enable: bool },
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
     /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
@@ -155,9 +156,9 @@ struct EngineState {
     model: Arc<Mutex<Option<PiModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
-    /// The active tool subset the model sees; mirrored from the harness so
-    /// the facade can serve it without an actor round trip.
-    active_tool_names: Mutex<Option<Vec<String>>>,
+    /// A browser-suite toggle that arrived mid-run; the running turn owns the
+    /// session, so the toggle parks here and lands right after settle.
+    pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -241,7 +242,7 @@ pub fn spawn_engine(
         model: model_slot,
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
-        active_tool_names: Mutex::new(None),
+        pending_browser_suite: Mutex::new(None),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
@@ -419,12 +420,10 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::SetPlanMode { enabled });
     }
 
-    fn active_tool_names(&self) -> Option<Vec<String>> {
-        self.state.active_tool_names.lock().unwrap().clone()
-    }
-
-    fn set_active_tools(&self, names: Vec<String>) {
-        let _ = self.cmd_tx.send(SessionCmd::SetActiveTools { names });
+    fn set_browser_suite(&self, suite: BrowserSuite, enable: bool) {
+        let _ = self
+            .cmd_tx
+            .send(SessionCmd::SetBrowserSuite { suite, enable });
     }
 
     fn set_plan_review_pending(&self, pending: bool) {
@@ -866,6 +865,25 @@ fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
         .map(|t| t.name().to_string())
         .filter(|name| !browser.contains(name.as_str()))
         .collect()
+}
+
+/// An opt-in browser tool suite toggled from the composer `+` menu. The
+/// engine applies the toggle atomically against the session's authoritative
+/// active-tool set, so callers never compute the merged set themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserSuite {
+    ChromeUse,
+    WebExplore,
+}
+
+impl BrowserSuite {
+    /// The tool names belonging to this suite.
+    pub fn tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ChromeUse => CHROMEUSE_TOOL_NAMES,
+            Self::WebExplore => WEBEXPLORE_TOOL_NAMES,
+        }
+    }
 }
 
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
@@ -1398,6 +1416,40 @@ async fn persist_ui_note(session: &AgentSession, record: &UiNoteRecord) -> bool 
     }
 }
 
+/// Merge or strip a browser suite's tool names into an active-tool set.
+/// `enable` appends the suite's names (deduplicated); disable removes them.
+/// Pure — unit-tested without a session.
+fn toggle_browser_suite_names(
+    mut names: Vec<String>,
+    suite_names: &[&str],
+    enable: bool,
+) -> Vec<String> {
+    if enable {
+        for name in suite_names {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    } else {
+        names.retain(|n| !suite_names.contains(&n.as_str()));
+    }
+    names
+}
+
+/// Toggle a browser tool suite against the session's authoritative active-tool
+/// set. Reads the current set from the session, merges or strips the suite's
+/// names, and persists via `set_active_tools`.
+async fn apply_browser_suite(session: &mut AgentSession, suite: BrowserSuite, enable: bool) {
+    // `None` means the full mounted set is active.
+    let current = session
+        .active_tool_names()
+        .unwrap_or_else(|| session.tools());
+    let names = toggle_browser_suite_names(current, suite.tool_names(), enable);
+    if let Err(err) = session.set_active_tools(names).await {
+        tracing::warn!(error = %err, "failed to toggle browser tool suite");
+    }
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
@@ -1498,6 +1550,12 @@ where
                     // writer could fork the leaf cursor).
                     mirror_ui_note(state, record.clone());
                     state.pending_ui_notes.lock().unwrap().push(record);
+                }
+                Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
+                    // The run owns the session; park the toggle so the idle
+                    // loop applies it right after settle (P2: a mid-run click
+                    // must not be silently dropped).
+                    *state.pending_browser_suite.lock().unwrap() = Some((suite, enable));
                 }
                 Some(_) => {} // not serviceable mid-run; dropped (facade re-syncs after settle)
                 None => {
@@ -2452,6 +2510,13 @@ async fn run_actor(
         for record in parked {
             let _ = persist_ui_note(&session, &record).await;
         }
+        // A mid-run browser-suite toggle parked itself for the same reason;
+        // apply it now that the session is idle again. The guard is dropped
+        // before the await so the future stays `Send`.
+        let parked_suite = state.pending_browser_suite.lock().unwrap().take();
+        if let Some((suite, enable)) = parked_suite {
+            apply_browser_suite(&mut session, suite, enable).await;
+        }
         // Between runs the actor wakes on either a facade command or a
         // monitor idle-wakeup (steered events queued while the session was
         // idle). Mid-run wakeups simply accumulate and are re-checked after
@@ -2641,11 +2706,8 @@ async fn run_actor(
                     tracing::warn!(error = %err, "failed to persist approval mode");
                 }
             }
-            SessionCmd::SetActiveTools { names } => {
-                *state.active_tool_names.lock().unwrap() = Some(names.clone());
-                if let Err(err) = session.set_active_tools(names).await {
-                    tracing::warn!(error = %err, "failed to set active tools");
-                }
+            SessionCmd::SetBrowserSuite { suite, enable } => {
+                apply_browser_suite(&mut session, suite, enable).await;
             }
             SessionCmd::SetPlanMode { enabled } => {
                 let plan_file = enabled.then(|| state.plan.plan_file()).flatten();
@@ -4240,6 +4302,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_active_tool_names_excludes_browser_suites() {
+        // The default active set keeps every non-browser tool and drops both
+        // opt-in suites, so browser tools never ride the default system prompt.
+        let tools: Vec<Arc<dyn PiAgentTool>> = vec![
+            Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn PiAgentTool>,
+            Arc::new(crate::web_tools::WebExploreOpenTool::new(
+                tokio::sync::mpsc::unbounded_channel().0,
+            )),
+        ];
+        let default_names = default_active_tool_names(&tools);
+        assert!(default_names.is_empty(), "{default_names:?}");
+    }
+
+    #[test]
+    fn toggle_browser_suite_enable_merges_into_default_set() {
+        // P0 regression: activating a suite against the default set must ADD
+        // the suite's tools, not replace the defaults. Starting from the
+        // default (non-browser) set, enabling ChromeUse yields defaults + the
+        // ChromeUse suite — the defaults survive.
+        let defaults = vec!["Read".to_string(), "Bash".to_string(), "Edit".to_string()];
+        let merged = toggle_browser_suite_names(
+            defaults.clone(),
+            BrowserSuite::ChromeUse.tool_names(),
+            true,
+        );
+        // Every default survives.
+        for name in &defaults {
+            assert!(merged.contains(name), "default {name} lost: {merged:?}");
+        }
+        // Every ChromeUse tool is present.
+        for name in BrowserSuite::ChromeUse.tool_names() {
+            assert!(
+                merged.iter().any(|n| n == name),
+                "suite tool {name} missing: {merged:?}"
+            );
+        }
+        assert_eq!(
+            merged.len(),
+            defaults.len() + BrowserSuite::ChromeUse.tool_names().len()
+        );
+    }
+
+    #[test]
+    fn toggle_browser_suite_enable_is_idempotent() {
+        let once = toggle_browser_suite_names(
+            vec!["Read".to_string()],
+            BrowserSuite::WebExplore.tool_names(),
+            true,
+        );
+        let twice =
+            toggle_browser_suite_names(once.clone(), BrowserSuite::WebExplore.tool_names(), true);
+        assert_eq!(once, twice, "re-enabling must not duplicate");
+    }
+
+    #[test]
+    fn toggle_browser_suite_disable_strips_only_that_suite() {
+        // Start with defaults + both suites; disabling ChromeUse removes only
+        // the ChromeUse tools, leaving defaults + WebExplore intact.
+        let mut names = vec!["Read".to_string(), "Bash".to_string()];
+        names = toggle_browser_suite_names(names, BrowserSuite::ChromeUse.tool_names(), true);
+        names = toggle_browser_suite_names(names, BrowserSuite::WebExplore.tool_names(), true);
+        let stripped =
+            toggle_browser_suite_names(names, BrowserSuite::ChromeUse.tool_names(), false);
+        assert!(stripped.contains(&"Read".to_string()));
+        assert!(stripped.contains(&"Bash".to_string()));
+        for name in BrowserSuite::ChromeUse.tool_names() {
+            assert!(!stripped.iter().any(|n| n == name), "{name} should be gone");
+        }
+        for name in BrowserSuite::WebExplore.tool_names() {
+            assert!(stripped.iter().any(|n| n == name), "{name} should survive");
+        }
+    }
+
+    #[test]
     fn session_metadata_tags_host_and_optional_team_parent() {
         let tagged = session_metadata(Some("leader-1"));
         assert_eq!(tagged["host"], crate::host::current().slug());
@@ -4720,7 +4856,7 @@ mod tests {
             model: model_slot,
             sessions: Mutex::new(Vec::new()),
             active_path: Mutex::new(None),
-            active_tool_names: Mutex::new(None),
+            pending_browser_suite: Mutex::new(None),
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,

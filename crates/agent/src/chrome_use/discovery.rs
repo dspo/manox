@@ -2,10 +2,9 @@
 //! Chrome/Chromium binaries the engine could launch. Returns all matches
 //! (not just the first) so the agent can make an informed choice.
 //!
-//! The scan logic mirrors rustwright-core's `find_chromium_executable` search
-//! paths (env vars → Playwright cache → system paths → PATH) but returns
-//! every candidate instead of short-circuiting on the first hit. The paths
-//! are common platform knowledge; no engine internals are called.
+//! Scan order: env vars → Playwright browser cache → well-known system
+//! install paths → `PATH` lookup. Every candidate is reported with its
+//! source and variant instead of short-circuiting on the first hit.
 
 use std::path::{Path, PathBuf};
 

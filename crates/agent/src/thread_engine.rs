@@ -114,13 +114,8 @@ pub trait ThreadEngine: Send + Sync {
     /// Toggle plan mode (persisted sidecar + hooks + instructions).
     fn set_plan_mode(&self, _enabled: bool) {}
 
-    /// Set the active tool subset (opt-in browser tools activation/deactivation).
-    fn set_active_tools(&self, _names: Vec<String>) {}
-
-    /// The active tool subset the model currently sees (`None` = full set).
-    fn active_tool_names(&self) -> Option<Vec<String>> {
-        None
-    }
+    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
+    fn set_browser_suite(&self, _suite: crate::pi_engine::BrowserSuite, _enable: bool) {}
 
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     fn set_plan_review_pending(&self, _pending: bool) {}

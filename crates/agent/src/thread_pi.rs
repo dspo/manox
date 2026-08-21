@@ -1460,15 +1460,15 @@ impl Thread {
         cx.notify();
     }
 
-    /// The active tool subset the model currently sees (`None` = full set).
-    pub fn active_tool_names(&self) -> Option<Vec<String>> {
-        self.engine.as_ref().and_then(|e| e.active_tool_names())
-    }
-
-    /// Set the active tool subset (opt-in browser tools activation).
-    pub fn set_active_tools(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
+    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
+    pub fn set_browser_suite(
+        &mut self,
+        suite: crate::pi_engine::BrowserSuite,
+        enable: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(engine) = &self.engine {
-            engine.set_active_tools(names);
+            engine.set_browser_suite(suite, enable);
         }
         cx.notify();
     }

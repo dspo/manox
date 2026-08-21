@@ -67,6 +67,7 @@ use crate::views::completion::{
 };
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
+    render_browser_chips,
 };
 use crate::views::message::MessageItem;
 use crate::views::popup_menu;
@@ -368,6 +369,10 @@ pub struct Workspace {
     composer_placeholder_mode: ComposerPlaceholderMode,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
+    /// Opt-in browser tool suites activated via the `+` menu. Unlike file
+    /// attachments these persist across submits (they track session-level tool
+    /// activation); removing a chip deactivates the suite.
+    active_browser_suites: Vec<agent::pi_engine::BrowserSuite>,
     /// True while a native directory picker is open from the "Choose project" row.
     /// Guards against the user submitting a message before the picker resolves
     /// (which would make `set_project` a silent no-op once `messages` is non-empty).
@@ -692,6 +697,7 @@ impl Workspace {
             queued_follow_ups_by_thread: HashMap::new(),
             composer_placeholder_mode: ComposerPlaceholderMode::Normal,
             pending_attachments: Vec::new(),
+            active_browser_suites: Vec::new(),
             project_picker_pending: false,
             blank_project_parent: None,
             blank_project_name_input: None,
@@ -3637,10 +3643,6 @@ impl Workspace {
                                     extra.push(content);
                                 }
                             }
-                            PendingAttachment::BrowserCapability(_) => {
-                                // Tool activation already happened at chip-add
-                                // time; no message content to produce.
-                            }
                         }
                     }
                     (text, extra, failed)
@@ -6239,7 +6241,7 @@ impl Workspace {
                     let _ = ws_chrome.update(cx, |this, cx| {
                         this.close_plus_menu();
                         this.activate_browser_tool_suite(
-                            crate::views::composer_menu::BrowserKind::Chrome,
+                            agent::pi_engine::BrowserSuite::ChromeUse,
                             cx,
                         );
                     });
@@ -6248,7 +6250,7 @@ impl Workspace {
                     let _ = ws_internal.update(cx, |this, cx| {
                         this.close_plus_menu();
                         this.activate_browser_tool_suite(
-                            crate::views::composer_menu::BrowserKind::InternalWebBrowser,
+                            agent::pi_engine::BrowserSuite::WebExplore,
                             cx,
                         );
                     });
@@ -6264,64 +6266,37 @@ impl Workspace {
         self.plus_menu_sub = Some(sub);
     }
 
-    /// Activate a browser tool suite: stage a chip and widen the thread's
-    /// active tool set so the model gains the browser tools. Idempotent —
-    /// adding an already-present suite is a no-op.
+    /// Activate a browser tool suite: record the chip and tell the engine to
+    /// widen the thread's active tool set. Idempotent — activating an
+    /// already-present suite is a no-op. The engine merges the suite names
+    /// atomically against the session's authoritative active-tool set.
     fn activate_browser_tool_suite(
         &mut self,
-        kind: crate::views::composer_menu::BrowserKind,
+        suite: agent::pi_engine::BrowserSuite,
         cx: &mut Context<Self>,
     ) {
-        // Skip if the chip is already staged.
-        if self
-            .pending_attachments
-            .iter()
-            .any(|a| matches!(a, crate::views::composer_menu::PendingAttachment::BrowserCapability(k) if *k == kind))
-        {
+        if self.active_browser_suites.contains(&suite) {
             return;
         }
-        self.pending_attachments
-            .push(crate::views::composer_menu::PendingAttachment::BrowserCapability(kind));
-        let suite: &[&str] = match kind {
-            crate::views::composer_menu::BrowserKind::Chrome => {
-                agent::pi_engine::CHROMEUSE_TOOL_NAMES
-            }
-            crate::views::composer_menu::BrowserKind::InternalWebBrowser => {
-                agent::pi_engine::WEBEXPLORE_TOOL_NAMES
-            }
-        };
-        let mut names = self.thread.read(cx).active_tool_names().unwrap_or_default();
-        for name in suite {
-            if !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-        }
+        self.active_browser_suites.push(suite);
         self.thread
-            .update(cx, |t, cx| t.set_active_tools(names, cx));
+            .update(cx, |t, cx| t.set_browser_suite(suite, true, cx));
         cx.notify();
     }
 
-    /// Deactivate a browser tool suite: remove the chip and narrow the
-    /// thread's active tool set.
+    /// Deactivate a browser tool suite: drop the chip and tell the engine to
+    /// narrow the thread's active tool set.
     fn deactivate_browser_tool_suite(
         &mut self,
-        kind: crate::views::composer_menu::BrowserKind,
+        suite: agent::pi_engine::BrowserSuite,
         cx: &mut Context<Self>,
     ) {
-        self.pending_attachments
-            .retain(|a| !matches!(a, crate::views::composer_menu::PendingAttachment::BrowserCapability(k) if *k == kind));
-        let suite: &[&str] = match kind {
-            crate::views::composer_menu::BrowserKind::Chrome => {
-                agent::pi_engine::CHROMEUSE_TOOL_NAMES
-            }
-            crate::views::composer_menu::BrowserKind::InternalWebBrowser => {
-                agent::pi_engine::WEBEXPLORE_TOOL_NAMES
-            }
-        };
-        let mut names = self.thread.read(cx).active_tool_names().unwrap_or_default();
-        names.retain(|n| !suite.contains(&n.as_str()));
-        self.thread
-            .update(cx, |t, cx| t.set_active_tools(names, cx));
+        let before = self.active_browser_suites.len();
+        self.active_browser_suites.retain(|s| *s != suite);
+        if self.active_browser_suites.len() != before {
+            self.thread
+                .update(cx, |t, cx| t.set_browser_suite(suite, false, cx));
+        }
         cx.notify();
     }
 
@@ -6453,28 +6428,39 @@ impl Workspace {
         )
     }
 
-    /// Pending-attachment chips shown above the composer, each removable.
+    /// Attachment + browser-suite chips shown above the composer, each
+    /// removable. File attachments clear on submit; browser suites persist.
     fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.pending_attachments.is_empty() {
+        if self.pending_attachments.is_empty() && self.active_browser_suites.is_empty() {
             return None;
         }
-        let on_remove = cx.listener(|this, ix: &usize, _window, cx| {
-            if *ix < this.pending_attachments.len() {
-                let removed = this.pending_attachments.remove(*ix);
-                if let PendingAttachment::BrowserCapability(kind) = &removed {
-                    this.deactivate_browser_tool_suite(*kind, cx);
+        let mut col = v_flex().w_full().gap_1();
+        if !self.pending_attachments.is_empty() {
+            let on_remove = cx.listener(|this, ix: &usize, _window, cx| {
+                if *ix < this.pending_attachments.len() {
+                    this.pending_attachments.remove(*ix);
+                    cx.notify();
                 }
-                cx.notify();
-            }
-        });
-        Some(
-            centered(render_attachment_chips(
+            });
+            col = col.child(centered(render_attachment_chips(
                 &self.pending_attachments,
                 theme,
                 move |ix, window, cx| on_remove(&ix, window, cx),
-            ))
-            .into_any_element(),
-        )
+            )));
+        }
+        if !self.active_browser_suites.is_empty() {
+            let on_remove_suite = cx.listener(|this, ix: &usize, _window, cx| {
+                if let Some(suite) = this.active_browser_suites.get(*ix).copied() {
+                    this.deactivate_browser_tool_suite(suite, cx);
+                }
+            });
+            col = col.child(centered(render_browser_chips(
+                &self.active_browser_suites,
+                theme,
+                move |ix, window, cx| on_remove_suite(&ix, window, cx),
+            )));
+        }
+        Some(col.into_any_element())
     }
 
     /// The pi-harness project chip: bound-project indicator + dropdown with

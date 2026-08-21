@@ -202,21 +202,14 @@ pub fn build_plus_menu(
     menu
 }
 
-/// Which browser tool suite a [`PendingAttachment::BrowserCapability`] activates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserKind {
-    Chrome,
-    InternalWebBrowser,
-}
-
 /// An attachment staged in the composer but not yet submitted. Either a file
-/// picked from the `+` menu, an image pasted straight from the clipboard
-/// (resized off-thread on submit), or a browser tool-suite activation chip.
+/// picked from the `+` menu or an image pasted straight from the clipboard
+/// (resized off-thread on submit). Browser tool-suite chips are tracked
+/// separately by the workspace (they persist across submits).
 #[derive(Debug, Clone)]
 pub enum PendingAttachment {
     File { path: PathBuf, is_image: bool },
     ClipboardImage(gpui::Image),
-    BrowserCapability(BrowserKind),
 }
 
 impl PendingAttachment {
@@ -234,10 +227,6 @@ impl PendingAttachment {
         )
     }
 
-    pub fn is_browser_capability(&self) -> bool {
-        matches!(self, Self::BrowserCapability(_))
-    }
-
     pub fn file_name(&self) -> String {
         match self {
             Self::File { path, .. } => path
@@ -247,12 +236,6 @@ impl PendingAttachment {
                 .to_string(),
             // No filename on the clipboard; surface a localized label instead.
             Self::ClipboardImage(_) => i18n::t("composer-pasted-image").to_string(),
-            Self::BrowserCapability(BrowserKind::Chrome) => {
-                i18n::t("composer-add-chrome").to_string()
-            }
-            Self::BrowserCapability(BrowserKind::InternalWebBrowser) => {
-                i18n::t("composer-add-internal-browser").to_string()
-            }
         }
     }
 }
@@ -318,14 +301,10 @@ pub fn render_attachment_chips(
     let mut row = h_flex().w_full().flex_wrap().gap_1();
     for (ix, att) in attachments.iter().enumerate() {
         let on_remove = on_remove.clone();
-        let icon = match att {
-            PendingAttachment::File { is_image: true, .. }
-            | PendingAttachment::ClipboardImage(_) => IconName::Palette,
-            PendingAttachment::BrowserCapability(BrowserKind::Chrome) => IconName::Globe,
-            PendingAttachment::BrowserCapability(BrowserKind::InternalWebBrowser) => {
-                IconName::Frame
-            }
-            PendingAttachment::File { .. } => IconName::File,
+        let icon = if att.is_image() {
+            IconName::Palette
+        } else {
+            IconName::File
         };
         let name: SharedString = att.file_name().into();
         row = row.child(
@@ -353,6 +332,68 @@ pub fn render_attachment_chips(
                 .child(
                     gpui::div()
                         .id(("attachment-remove", ix))
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(IconName::Close)
+                                .xsmall()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .on_click(move |_, window, cx| on_remove(ix, window, cx)),
+                ),
+        );
+    }
+    v_flex().w_full().child(row).into_any_element()
+}
+
+/// Display metadata for an active browser tool suite chip.
+fn browser_chip_meta(suite: agent::pi_engine::BrowserSuite) -> (IconName, &'static str) {
+    match suite {
+        agent::pi_engine::BrowserSuite::ChromeUse => (IconName::Globe, "composer-add-chrome"),
+        agent::pi_engine::BrowserSuite::WebExplore => {
+            (IconName::Frame, "composer-add-internal-browser")
+        }
+    }
+}
+
+/// Render the active browser-tool-suite chips shown above the composer. These
+/// persist across submits (unlike file attachments); `on_remove(ix)` removes
+/// chip `ix` and deactivates its suite.
+pub fn render_browser_chips(
+    suites: &[agent::pi_engine::BrowserSuite],
+    theme: &Theme,
+    on_remove: impl Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let on_remove = std::rc::Rc::new(on_remove);
+    let mut row = h_flex().w_full().flex_wrap().gap_1();
+    for (ix, suite) in suites.iter().enumerate() {
+        let on_remove = on_remove.clone();
+        let (icon, label_key) = browser_chip_meta(*suite);
+        let name: SharedString = i18n::t(label_key);
+        row = row.child(
+            h_flex()
+                .id(("browser-chip", ix))
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    Icon::new(icon.clone())
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(name),
+                )
+                .child(
+                    gpui::div()
+                        .id(("browser-chip-remove", ix))
                         .cursor_pointer()
                         .child(
                             Icon::new(IconName::Close)
