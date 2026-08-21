@@ -1375,20 +1375,6 @@ impl Workspace {
                         if let Some(panel) = this.subagent_panels.get(&id) {
                             panel.update(cx, |p, cx| p.set_status(*status, cx));
                         }
-                        // A finished run needs no backfill for panels opened
-                        // later (they fall back to the final answer); drop the
-                        // accumulated transcript so long threads do not hold
-                        // every child delta until the thread switch.
-                        if matches!(
-                            *status,
-                            agent::ToolCallStatus::Success
-                                | agent::ToolCallStatus::Error
-                                | agent::ToolCallStatus::Denied
-                                | agent::ToolCallStatus::Cancelled
-                        ) && !this.subagent_panels.contains_key(&id)
-                        {
-                            this.subagent_transcripts.remove(&id);
-                        }
                     }
                     if let ThreadEvent::SubagentChild { id, child } = ev {
                         this.subagent_transcripts
