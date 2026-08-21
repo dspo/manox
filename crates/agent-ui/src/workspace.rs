@@ -2859,7 +2859,10 @@ impl Workspace {
                     if !still {
                         break;
                     }
-                    let task = entity.update(cx, |_this, cx| host.page_title(id, cx));
+                    // `page_title` reads the Workspace inside `inject_script`,
+                    // so it must not run under a Workspace lease — plain
+                    // `AsyncApp::update`, not `entity.update`.
+                    let task = cx.update(|cx| host.page_title(id, cx));
                     if let Ok(title) = task.await
                         && !title.is_empty()
                     {
