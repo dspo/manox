@@ -260,6 +260,19 @@ impl AgentBus {
                 snapshot: task.snapshot(&task_id),
             },
         )));
+        // Emit SubagentProgress so the "智能体" tab shows the subagent.
+        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
+            ThreadEvent::SubagentProgress {
+                id: addr.clone(),
+                subagent_type: spawn_type.clone(),
+                tool_uses: 0,
+                token_usage: crate::language_model::TokenUsage::default(),
+                latest_activity: Some(
+                    first_line(&prompt).unwrap_or_else(|| format!("Subagent {spawn_type}")),
+                ),
+                status: crate::thread::ToolCallStatus::Running,
+            },
+        )));
 
         // Track in live_subagents for Inject/Abort.
         self.live_subagents.lock().unwrap().insert(
@@ -300,6 +313,16 @@ impl AgentBus {
                             snapshot: task.snapshot(&task_id),
                         },
                     )));
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                        ThreadEvent::SubagentProgress {
+                            id: addr_clone.clone(),
+                            subagent_type: spawn_type.clone(),
+                            tool_uses: 0,
+                            token_usage: crate::language_model::TokenUsage::default(),
+                            latest_activity: Some(content.chars().take(80).collect()),
+                            status: crate::thread::ToolCallStatus::Success,
+                        },
+                    )));
                     if !content.is_empty() {
                         let _ = notice_tx.send(BackendNotice::SteerDelivered {
                             from: AgentId::Subagent(label),
@@ -313,6 +336,18 @@ impl AgentBus {
                     let _ = notice_tx.send(BackendNotice::Event(Box::new(
                         ThreadEvent::BackgroundTaskUpdated {
                             snapshot: task.snapshot(&task_id),
+                        },
+                    )));
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                        ThreadEvent::SubagentProgress {
+                            id: addr_clone.clone(),
+                            subagent_type: spawn_type.clone(),
+                            tool_uses: 0,
+                            token_usage: crate::language_model::TokenUsage::default(),
+                            latest_activity: Some(
+                                format!("failed: {e}").chars().take(80).collect(),
+                            ),
+                            status: crate::thread::ToolCallStatus::Error,
                         },
                     )));
                     let _ = notice_tx.send(BackendNotice::SteerDelivered {
