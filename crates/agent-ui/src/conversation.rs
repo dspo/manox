@@ -429,8 +429,9 @@ impl ThinkingContainer {
     /// reasoning rounds (idempotent with `finalize_reasoning_rounds`, which a
     /// mid-turn `Stop(ToolUse)` already ran) and re-derives `streaming` so the
     /// spinner stops and the elapsed timer pins. Unlike `finalize_segment`
-    /// (terminal stop), does NOT auto-collapse entries or the container: the
-    /// user may be inspecting the activity tree.
+    /// (terminal stop), does NOT auto-collapse entries or the container
+    /// itself; the caller (`MessageItem::close_segment_for_text`) folds the
+    /// shell to its cover at the text boundary.
     pub fn close_for_text(&mut self) {
         self.finalize_reasoning_rounds();
         self.accepting_entries = false;

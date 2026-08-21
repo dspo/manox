@@ -1492,24 +1492,27 @@ fn segment_stats(t: &ThinkingContainer) -> SegmentStats {
     stats
 }
 
-/// Which entries of a segment render below its cover row.
+/// Which entries of a segment render below its cover row, plus the cover's
+/// aggregated counts (computed once per render).
 struct SegmentLayout {
     /// False ⇒ too small to fold: entries render as a flat stack, no cover.
     cover: bool,
     /// True ⇒ every entry renders (user expanded, or an approval is pending).
     expanded: bool,
     visible: Vec<usize>,
+    stats: SegmentStats,
 }
 
 fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
+    let stats = segment_stats(t);
     if t.entries.len() < 2 {
         return SegmentLayout {
             cover: false,
             expanded: true,
             visible: (0..t.entries.len()).collect(),
+            stats,
         };
     }
-    let stats = segment_stats(t);
     // Awaiting approval is user-facing interaction: the segment stays open
     // even after auto-collapse so the pending row is never hidden (fail-closed
     // visibility at the UI layer).
@@ -1518,6 +1521,7 @@ fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
             cover: true,
             expanded: true,
             visible: (0..t.entries.len()).collect(),
+            stats,
         };
     }
     if !t.streaming {
@@ -1525,6 +1529,7 @@ fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
             cover: true,
             expanded: false,
             visible: Vec::new(),
+            stats,
         };
     }
     // Collapsed + live: play only the running (or latest) entry.
@@ -1550,6 +1555,7 @@ fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
         cover: true,
         expanded: false,
         visible,
+        stats,
     }
 }
 
@@ -1586,12 +1592,13 @@ pub fn render_thinking(
             )
             .into_any_element();
     }
-    let stats = segment_stats(t);
+    let stats = &layout.stats;
     let secs = if t.streaming {
         Some(t.started_at.elapsed().as_secs())
     } else {
         t.frozen_secs
     };
+    let interactive = tool_ctx.is_some();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let mut cover = h_flex()
         .id(("activity-cover", ix))
@@ -1601,9 +1608,14 @@ pub fn render_thinking(
         .py_0p5()
         .gap_1p5()
         .items_center()
+        // Long tool-name chips (WebExploreNavigate×N …) wrap instead of
+        // overflowing the message column.
+        .flex_wrap()
         .rounded(theme.radius)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.secondary.opacity(0.3)))
+        .when(interactive, |row| {
+            row.cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.3)))
+        })
         .on_click(move |_, _window, cx: &mut App| {
             let Some(weak) = weak_workspace.clone() else {
                 return;

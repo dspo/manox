@@ -84,14 +84,8 @@ plan-mode-on-notice = Plan mode on: the working tree is read-only; the model res
 plan-mode-off-notice = Plan mode off: full write access restored.
 thinking-tool-result = tool result
 thinking-duration = { $count }s
-activity-failed = { $count ->
-    [one] {$count} failed
-   *[other] {$count} failed
-}
-activity-awaiting-approval = { $count ->
-    [one] {$count} awaiting approval
-   *[other] {$count} awaiting approval
-}
+activity-failed = { $count } failed
+activity-awaiting-approval = { $count } awaiting approval
 
 ### views/settings.rs
 settings-group-general = General
