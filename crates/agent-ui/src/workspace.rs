@@ -1798,6 +1798,10 @@ impl Workspace {
                         this.start_new_thread(None, window, cx);
                     }
                 }
+                SidebarEvent::SetThreadTag(id, tag) => {
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.set_thread_tag(id, tag.clone(), cx));
+                }
             },
         )
     }
