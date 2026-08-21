@@ -2878,6 +2878,32 @@ impl Workspace {
         .detach();
     }
 
+    /// Show only the active browser tab's native webview and hide the rest.
+    /// No webview may draw while the pane is hidden or another view mode is
+    /// up (the platform view is not a gpui element and ignores layout).
+    fn sync_browser_visibility(&mut self, cx: &mut Context<Self>) {
+        let active_browser =
+            if matches!(self.view_mode, ViewMode::Workspace) && self.right_pane_open() {
+                match self.right_tabs.get(self.active_right_tab) {
+                    Some(RightTab::Browser(id)) => Some(*id),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        for (id, view) in self.browser_views.iter() {
+            let should_show = active_browser == Some(*id);
+            view.update(cx, |v, cx| {
+                let wv = v.webview().clone();
+                match (should_show, wv.read(cx).visible()) {
+                    (true, false) => wv.update(cx, |w, _| w.show()),
+                    (false, true) => wv.update(cx, |w, _| w.hide()),
+                    _ => {}
+                }
+            });
+        }
+    }
+
     /// Close and recycle a browser tab by id. Dropping the `BrowserView`
     /// drops the underlying native webview, whose `Drop` hides and detaches
     /// the platform view. No-op if the id is not live.
@@ -7356,6 +7382,11 @@ impl Workspace {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
         }
+        // The native webview keeps its last bounds until explicitly hidden,
+        // so every frame must pin which one may draw (the active browser tab
+        // of a visible right pane) — an inactive tab would otherwise paint
+        // over the pane's content.
+        self.sync_browser_visibility(cx);
         // Settings reuses the shared shell (`sidebar | divider | main`) — the
         // same layout container as the app page, only with the settings nav in
         // the sidebar slot and the settings panel as the main column. The
