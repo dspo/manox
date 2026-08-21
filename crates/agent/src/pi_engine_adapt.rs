@@ -628,6 +628,5 @@ mod tests {
         // Unrecognized shapes fall back to the bare name.
         assert_eq!(tool_title("ChromeUseClose", &json!({})), "ChromeUseClose");
         assert_eq!(tool_title("Bash", &json!({})), "Bash");
-
     }
 }
