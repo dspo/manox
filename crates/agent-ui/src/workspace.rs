@@ -1403,13 +1403,18 @@ impl Workspace {
                         && name == "Steer"
                         && let Some(args) = input
                     {
+                        // Only a Dispatch (to.spawn set) establishes the
+                        // opening prompt; a later Inject must not overwrite the
+                        // panel's first user bubble with a mid-run message.
+                        let is_dispatch = args.get("to").and_then(|t| t.get("spawn")).is_some();
                         let addr = args
                             .get("to")
                             .and_then(|t| t.get("agent_address"))
                             .and_then(|v| v.as_str());
                         let prompt = args.get("prompt").and_then(|v| v.as_str());
-                        if let (Some(addr), Some(prompt)) = (addr, prompt) {
-                            this.subagent_prompts.insert(addr.to_string(), prompt.to_string());
+                        if is_dispatch && let (Some(addr), Some(prompt)) = (addr, prompt) {
+                            this.subagent_prompts
+                                .insert(addr.to_string(), prompt.to_string());
                         }
                     }
                     let weak = cx.weak_entity();

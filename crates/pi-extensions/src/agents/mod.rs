@@ -188,7 +188,10 @@ impl SubagentTool {
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
-        let inherited = self.model_slot.as_ref().and_then(|slot| slot.lock().unwrap().clone());
+        let inherited = self
+            .model_slot
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap().clone());
         if let Some(model) = model_override.or_else(|| inherited.or_else(|| self.model.clone())) {
             builder = builder.with_model(model);
         }

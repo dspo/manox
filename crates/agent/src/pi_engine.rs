@@ -550,11 +550,12 @@ fn system_prompt(cwd: &Path) -> String {
          Built-in subagent types: `Explore` (read-only: locates code by \
          file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
          edits files, runs shell commands including cargo/clippy/test). \
-        TeamMembers are real threads — they persist, appear in the sidebar, \
-        and can be resumed; observe their progress by opening their tab (an \
-        autonomous member-to-parent report channel is not yet wired). \
-         a concise summary as its final assistant text (the harness emits \
-         Complete with that summary).\n\n\
+         TeamMembers are real threads — they persist, appear in the sidebar, \
+         and can be resumed; members do not report back autonomously, so \
+         Inject them to ask for status (an autonomous member-to-parent \
+         report channel is not yet wired). A subagent (coroutine) is \
+         transient; it ends with a concise summary as its final assistant \
+         text (the harness emits Complete with that summary).\n\n\
          Prefer parallel subagents over serial self-work. For splittable \
          tasks — reviewing multiple PRs, modifying independent files, \
          exploring alternatives — emit multiple `Steer` calls in one turn \

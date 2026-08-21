@@ -5,8 +5,8 @@
 //! has no cross-session agent bus — this is a manox host extension.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use pi::harness::HarnessHandle;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -238,6 +238,13 @@ impl AgentBus {
             .ok_or_else(|| ToolError::ExecutionFailed("bus gone".into()))?;
         let child_steer = Arc::new(SteerTool::new(bus_arc, AgentId::Subagent(addr.to_string())));
 
+        // Reserved addresses would collide with routing: an address of
+        // "Captain"/"User" would shadow the self-reject / user Inject arms.
+        if addr == "Captain" || addr == "User" {
+            return Err(ToolError::InvalidArguments(format!(
+                "cannot use reserved address {addr}"
+            )));
+        }
         // Existence check: re-dispatching a live address would overwrite the
         // first run and orphan it (un-Abort/Inject-able). Matches the schema's
         // "Error if address exists" contract.
@@ -299,7 +306,7 @@ impl AgentBus {
         let notice_tx = self.notice_tx.clone();
         let weak = self.weak_self.lock().unwrap().clone();
         let addr_clone = addr.clone();
-        let label = format!("subagent {addr}");
+        let label = addr.clone();
         let full_prompt = format!(
             "{prompt}\n\nWhen done, end your turn with a concise summary: \
              what you changed (files + intent), what you ran (commands + \
@@ -373,8 +380,10 @@ impl AgentBus {
             } else {
                 match result {
                     Ok(messages) => {
-                        let content =
-                            format!("{}{kept_note}", truncate_final(&extract_final_text(&messages)));
+                        let content = format!(
+                            "{}{kept_note}",
+                            truncate_final(&extract_final_text(&messages))
+                        );
                         task.set_terminal_status(TaskStatus::Completed);
                         let _ = notice_tx.send(BackendNotice::Event(Box::new(
                             ThreadEvent::BackgroundTaskUpdated {
@@ -519,7 +528,11 @@ fn extract_final_text(messages: &[AgentMessage]) -> String {
 const FINAL_MAX_BYTES: usize = 128 * 1024;
 const FINAL_MAX_LINES: usize = 2000;
 fn truncate_final(text: &str) -> String {
-    let by_lines: String = text.lines().take(FINAL_MAX_LINES).collect::<Vec<_>>().join("\n");
+    let by_lines: String = text
+        .lines()
+        .take(FINAL_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
     if by_lines.len() > FINAL_MAX_BYTES {
         by_lines.chars().take(FINAL_MAX_BYTES).collect()
     } else {
@@ -691,7 +704,10 @@ mod tests {
 
     #[test]
     fn truncate_final_caps_lines_and_bytes() {
-        let many_lines: String = (0..2500).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let many_lines: String = (0..2500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = truncate_final(&many_lines);
         assert_eq!(out.lines().count(), FINAL_MAX_LINES);
 
@@ -701,7 +717,10 @@ mod tests {
 
     #[test]
     fn first_line_skips_blank_lead() {
-        assert_eq!(first_line("\n  \n  do the thing\nmore"), Some("do the thing".into()));
+        assert_eq!(
+            first_line("\n  \n  do the thing\nmore"),
+            Some("do the thing".into())
+        );
         assert_eq!(first_line("   "), None);
     }
 
