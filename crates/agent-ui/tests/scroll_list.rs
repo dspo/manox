@@ -492,7 +492,7 @@ async fn list_remeasures_real_message_item_when_markdown_child_grows(cx: &mut Te
                 text: prefix.clone(),
                 streaming: true,
                 token_usage: None,
-                activity_secs: None,
+                activity_header: false,
             },
             "DeepSeek".into(),
             0,
@@ -505,7 +505,7 @@ async fn list_remeasures_real_message_item_when_markdown_child_grows(cx: &mut Te
                 text: "tail message".into(),
                 streaming: false,
                 token_usage: None,
-                activity_secs: None,
+                activity_header: false,
             },
             "DeepSeek".into(),
             1,
@@ -591,7 +591,7 @@ fn production_rows(cx: &mut TestAppContext) -> Vec<gpui::Entity<MessageItem>> {
             text: "所以这不是模型能力问题，而是 responses wire 独享的端点校验差异。".repeat(18),
             streaming: false,
             token_usage: None,
-            activity_secs: None,
+            activity_header: false,
         },
         ConvItem::User {
             text: "需要修本项目吗？".into(),
@@ -604,7 +604,7 @@ fn production_rows(cx: &mut TestAppContext) -> Vec<gpui::Entity<MessageItem>> {
             text: "需要。这是 manox 自己的 bug，上游修不到也不该修。".repeat(20),
             streaming: false,
             token_usage: None,
-            activity_secs: None,
+            activity_header: false,
         },
     ]
     .into_iter()

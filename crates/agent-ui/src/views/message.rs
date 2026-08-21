@@ -803,9 +803,9 @@ pub fn render_item(
             text,
             streaming: _,
             token_usage: _,
-            activity_secs,
-        } => render_assistant(text, ix, role, *activity_secs, theme, body, cx),
-        ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
+            activity_header,
+        } => render_assistant(text, ix, role, *activity_header, theme, body, cx),
+        ConvItem::Thinking(t) => render_thinking(t, ix, role, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
             if t.name == agent::tools::ASK_USER_QUESTION {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
@@ -1036,16 +1036,16 @@ fn format_user_turn_time(timestamp: i64) -> String {
     }
 }
 
-/// Render an assistant message: role label + copy button + markdown body.
-/// `blocks` carries the pre-parsed blocks from the `IncrementalParser` so the
-/// renderer never re-parses — the streaming path renders formatted markdown
-/// throughout, with a cursor on the last block. `role` is the model display
-/// name (dynamic).
+/// Render an assistant message. A reply that follows an activity segment
+/// (`activity_header`) renders the body alone — the segment's header row
+/// already carries the model name — with the copy button overlaid on the
+/// body's top-right corner; a bare reply renders its own model row + copy
+/// button over the body.
 pub fn render_assistant(
     text: &str,
     ix: usize,
     role: &str,
-    activity_secs: Option<u64>,
+    activity_header: bool,
     theme: &Theme,
     body: Option<Entity<Markdown>>,
     cx: &mut App,
@@ -1056,24 +1056,29 @@ pub fn render_assistant(
         Some(md) => md.into_any_element(),
         None => markdown_tv(("assistant", ix), text.to_string(), theme, false, cx),
     };
-    // Suffix for the model row: the elapsed of the activity segment that
-    // preceded this reply (" · 780s"). The segment's cover row carries the
-    // per-kind counts, so the model row stays model + duration only.
-    let summary_child = activity_secs.filter(|s| *s > 0).map(|s| {
-        gpui::div()
-            .text_sm()
-            .text_color(theme.muted_foreground)
-            .child(format!(
-                " · {}",
-                i18n::t_count("thinking-duration", s as i64)
-            ))
-    });
-    v_flex()
-        .group(format!("assistant-{ix}"))
+    let group = format!("assistant-{ix}");
+    let mut body_wrap = gpui::div()
+        .relative()
         .w_full()
         .min_w_0()
-        .gap_1()
-        .child(
+        .overflow_x_hidden()
+        .child(body_el);
+    if activity_header {
+        // No model row to host the copy button: overlay it on the body's
+        // top-right, revealed on hover like every other transcript copy.
+        body_wrap = body_wrap.child(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .opacity(0.0)
+                .group_hover(group.clone(), |s| s.opacity(1.0))
+                .child(copy_button(ix, "copy-assistant", text.to_string())),
+        );
+    }
+    let mut col = v_flex().group(group.clone()).w_full().min_w_0().gap_1();
+    if !activity_header {
+        col = col.child(
             h_flex()
                 .w_full()
                 .min_w_0()
@@ -1085,23 +1090,16 @@ pub fn render_assistant(
                         .text_color(theme.muted_foreground)
                         .child(role.to_string()),
                 )
-                .children(summary_child)
                 .child(gpui::div().flex_1())
                 .child(copy_button_hoverable(
                     ix,
                     "copy-assistant",
-                    format!("assistant-{ix}"),
+                    group,
                     text.to_string(),
                 )),
-        )
-        .child(
-            gpui::div()
-                .w_full()
-                .min_w_0()
-                .overflow_x_hidden()
-                .child(body_el),
-        )
-        .into_any_element()
+        );
+    }
+    col.child(body_wrap).into_any_element()
 }
 
 /// Optional collapsible slot for `render_banner`: turns the label row into a
@@ -1492,6 +1490,16 @@ fn segment_stats(t: &ThinkingContainer) -> SegmentStats {
     stats
 }
 
+/// The model display name on a segment header row. The assistant reply that
+/// follows a segment renders no model row of its own, so the header is the
+/// single place the turn's model shows.
+fn segment_header_model(role: &str, theme: &Theme) -> gpui::Div {
+    gpui::div()
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(role.to_string())
+}
+
 /// Which entries of a segment render below its cover row, plus the cover's
 /// aggregated counts (computed once per render).
 struct SegmentLayout {
@@ -1524,50 +1532,27 @@ fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
             stats,
         };
     }
-    if !t.streaming {
-        return SegmentLayout {
-            cover: true,
-            expanded: false,
-            visible: Vec::new(),
-            stats,
-        };
-    }
-    // Collapsed + live: play only the running (or latest) entry.
-    let visible = t
-        .entries
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, e)| match e {
-            ActivityEntry::Reasoning { streaming, .. } => *streaming,
-            ActivityEntry::Tool(tool) => {
-                tool.streaming
-                    || matches!(
-                        tool.status,
-                        ToolCallStatus::Running | ToolCallStatus::PendingApproval
-                    )
-            }
-        })
-        .or_else(|| t.entries.iter().enumerate().next_back())
-        .map(|(i, _)| vec![i])
-        .unwrap_or_default();
+    // Collapsed hides every entry regardless of liveness — the header's
+    // spinner, counts, and elapsed carry the live signal.
     SegmentLayout {
         cover: true,
         expanded: false,
-        visible,
+        visible: Vec::new(),
         stats,
     }
 }
 
-/// Render an activity segment as its shell: a clickable cover row (chevron +
-/// per-kind counts + elapsed + failure/approval badges) over the visible
-/// entries. Settled + collapsed shows the cover alone; live + collapsed adds
-/// the running/latest entry; expanded nests every entry under a slight indent
-/// with a left rail. Segments with fewer than two entries render as a flat
-/// stack with no cover — folding a single row would only add a click.
+/// Render an activity segment as its shell: a header row carrying the model
+/// display name plus the cover (chevron + per-kind counts + elapsed +
+/// failure/approval badges) over the visible entries. Collapsed shows the
+/// header alone (live or settled); expanded nests every entry under a slight
+/// indent with a left rail. Segments with fewer than two entries render flat
+/// under a model-name-only header — folding a single row would only add a
+/// click.
 pub fn render_thinking(
     t: &ThinkingContainer,
     ix: usize,
+    role: &str,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
@@ -1584,6 +1569,7 @@ pub fn render_thinking(
             .min_w_0()
             .gap_0p5()
             .debug_selector(|| format!("message-overflow-activity-tree-{ix}"))
+            .child(segment_header_model(role, theme))
             .children(
                 t.entries
                     .iter()
@@ -1604,7 +1590,6 @@ pub fn render_thinking(
         .id(("activity-cover", ix))
         .w_full()
         .min_w_0()
-        .px_2()
         .py_0p5()
         .gap_1p5()
         .items_center()
@@ -1636,6 +1621,7 @@ pub fn render_thinking(
                 cx.notify();
             });
         })
+        .child(segment_header_model(role, theme))
         .child(disclosure_icon(!layout.expanded, theme))
         .when(t.streaming, |row| {
             row.child(
@@ -3378,16 +3364,11 @@ impl ItemBuilder {
                         match c {
                             MessageContent::Text(t) => {
                                 // Assistant prose interrupts the activity segment:
-                                // reasoning after it starts a fresh round.
+                                // reasoning after it starts a fresh round. The
+                                // closed segment's header carries the model name,
+                                // so the reply suppresses its own model row.
                                 close_segment(items, self.active_segment_ix);
-                                // Snapshot the segment's elapsed (after close pins
-                                // `frozen_secs`) for this reply's model row.
-                                let activity_secs = self.active_segment_ix.and_then(|ix| {
-                                    items.get(ix).and_then(|item| match item {
-                                        ConvItem::Thinking(seg) => seg.activity_secs(),
-                                        _ => None,
-                                    })
-                                });
+                                let activity_header = self.active_segment_ix.is_some();
                                 self.active_segment_ix = None;
                                 items.push(ConvItem::Assistant {
                                     text: t.clone(),
@@ -3396,7 +3377,7 @@ impl ItemBuilder {
                                         .last_user_id
                                         .as_deref()
                                         .and_then(|id| usage.get(id).copied()),
-                                    activity_secs,
+                                    activity_header,
                                 });
                             }
                             MessageContent::Thinking { text, .. } => {
@@ -4101,18 +4082,19 @@ mod tests {
             matches!(
                 &second[0],
                 ConvItem::Assistant {
-                    activity_secs: None,
+                    activity_header: true,
                     ..
                 }
             ),
-            "stale segment index degrades to no activity summary"
+            "the reply follows the previous batch's segment, so its header carries the model"
         );
     }
 
     /// Historical `ThinkingContainer`s rebuilt from persisted messages must
-    /// have `frozen_secs` pinned so `activity_secs` reports a fixed duration
-    /// (not a live `started_at.elapsed()`) — otherwise the timer ticks forever
-    /// from zero on a reloaded thread (regression: the old "计时一直进行" bug).
+    /// have `frozen_secs` pinned so the header's elapsed label reports a
+    /// fixed duration (not a live `started_at.elapsed()`) — otherwise the
+    /// timer ticks forever from zero on a reloaded thread (regression: the
+    /// old "计时一直进行" bug).
     #[test]
     fn build_items_freezes_historical_segment_elapsed() {
         let messages = vec![
@@ -4315,9 +4297,9 @@ mod tests {
     }
 
     /// The segment shell's visibility rules: segments with fewer than two
-    /// entries render flat (no cover); settled + collapsed shows the cover
-    /// alone; live + collapsed plays the running/latest entry; expanded — or
-    /// collapsed with an approval pending — shows every entry.
+    /// entries render flat (no cover); collapsed shows the cover alone
+    /// whether live or settled; expanded — or collapsed with an approval
+    /// pending — shows every entry.
     #[test]
     fn render_thinking_collapsed_visibility_rules() {
         let tool = |id: &str, status: ToolCallStatus| {
@@ -4357,7 +4339,7 @@ mod tests {
             "settled + collapsed shows no entries"
         );
 
-        // Live + collapsed: the running (or latest) entry plays.
+        // Live + collapsed: still the cover alone.
         t.streaming = true;
         if let ActivityEntry::Tool(e) = &mut t.entries[0] {
             e.streaming = true;
@@ -4365,10 +4347,9 @@ mod tests {
         }
         let layout = segment_layout(&t);
         assert!(layout.cover && !layout.expanded);
-        assert_eq!(
-            layout.visible,
-            vec![0],
-            "live + collapsed plays the running entry"
+        assert!(
+            layout.visible.is_empty(),
+            "live + collapsed shows no entries"
         );
 
         // Expanded: every entry renders.
@@ -4528,24 +4509,6 @@ mod tests {
         ));
     }
 
-    /// `activity_secs` snapshots the segment's pinned elapsed for the
-    /// following reply's model row; empty segments keep the row bare.
-    #[test]
-    fn activity_secs_reports_frozen_duration() {
-        let mut t = ThinkingContainer::new();
-        // Empty segment → no row suffix.
-        assert!(t.activity_secs().is_none());
-        t.frozen_secs = Some(42);
-        t.entries.push(ActivityEntry::Reasoning {
-            text: "thinking...".into(),
-            streaming: false,
-            collapsed: true,
-            user_toggled: false,
-            markdown: None,
-        });
-        assert_eq!(t.activity_secs(), Some(42));
-    }
-
     /// Historical rebuild of the issue #216 scenario: text THEN thinking within
     /// one assistant message must produce two activity segments, not fold the
     /// post-text thinking into the pre-text segment. The `Text` arm calls
@@ -4676,7 +4639,7 @@ mod tests {
             text: "hi".into(),
             streaming: true,
             token_usage: None,
-            activity_secs: None,
+            activity_header: false,
         };
         assert_eq!(text_body_of(&assistant), Some((true, "hi".into())));
 

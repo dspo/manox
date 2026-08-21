@@ -98,28 +98,24 @@ pub enum ConvItem {
         /// preceded this assistant reply. Populated on turn `Stop`; `None`
         /// while streaming or when the provider didn't report usage.
         token_usage: Option<TokenUsage>,
-        /// Elapsed seconds of the activity segment that immediately preceded
-        /// this reply within the same user turn — rendered inline on the
-        /// model row (the segment's cover row carries the round/tool counts).
-        /// `None` when the reply had no preceding thinking/tool activity (a
-        /// pure-text answer) or the duration is unknown (reloaded history),
-        /// so the model row stays bare. Snapshot at `close_segment_for_text`
-        /// (live) / `build_items`'s `close_segment` (reload); the container
-        /// keeps evolving after the snapshot but this stays frozen for the
-        /// row.
-        activity_secs: Option<u64>,
+        /// True when an activity segment immediately precedes this reply:
+        /// the segment's header row carries the model name, so this reply
+        /// renders no model row of its own (pure-text answers stay bare).
+        activity_header: bool,
     },
     /// One contiguous activity segment within a user turn, rendered as a
-    /// segment shell: a clickable cover row (chevron + per-kind counts
-    /// "Read×7 · 思考×8" + elapsed + failure/approval badges) over the
-    /// segment's entries. A segment spans the whole tool-use loop of a turn —
-    /// `StopReason::ToolUse` (the model paused to run a tool) does NOT close
-    /// it; only a terminal stop (`EndTurn`/`MaxTokens`/`Refusal`/cancel/error)
-    /// freezes the segment. Collapsed + frozen shows only the cover;
-    /// collapsed + streaming shows the cover plus the running/latest entry;
-    /// expanded lists every entry (slight indent + left rail), each itself
-    /// expandable to its full tool output. Segments with fewer than two
-    /// entries render flat with no cover.
+    /// segment shell: a header row carrying the model display name plus the
+    /// clickable cover (chevron + per-kind counts "Read×7 · 思考×8", elapsed,
+    /// failure/approval badges) over the segment's entries. A segment spans
+    /// the whole tool-use loop of a turn — `StopReason::ToolUse` (the model
+    /// paused to run a tool) does NOT close it; only a terminal stop
+    /// (`EndTurn`/`MaxTokens`/`Refusal`/cancel/error) freezes the segment.
+    /// Collapsed shows only the header (live or settled); expanded lists
+    /// every entry (slight indent + left rail), each itself expandable to its
+    /// full tool output. The assistant reply that follows a segment renders
+    /// no model row of its own — the header is the single place the model
+    /// shows. Segments with fewer than two entries render flat under a
+    /// model-name-only header.
     Thinking(ThinkingContainer),
     /// A top-level tool-call card — the `AskUserQuestion` clarify card while
     /// pending and its answered-state fallback, plus any defensive orphan.
@@ -330,11 +326,10 @@ pub struct ThinkingContainer {
     /// streaming / non-terminal. Drives the spinner + "Thinking for Xs" label
     /// vs the frozen "Thought for Xs".
     pub streaming: bool,
-    /// True ⇒ the segment renders its cover row plus (while streaming) the
-    /// running/latest entry; settled + collapsed shows the cover alone.
-    /// False ⇒ every entry renders under the cover. Auto-flipped to true on
-    /// terminal `Stop` unless the user toggled. Segments with fewer than two
-    /// entries ignore this and render flat (no cover).
+    /// True ⇒ the segment renders its header row alone; false ⇒ every entry
+    /// renders under the header. Auto-flipped to true on terminal `Stop`
+    /// unless the user toggled. Segments with fewer than two entries ignore
+    /// this and render flat (no cover).
     pub collapsed: bool,
     pub user_toggled: bool,
     /// When the segment started; the live "for Xs" is
@@ -438,13 +433,6 @@ impl ThinkingContainer {
         self.recompute_streaming();
     }
 
-    /// True when at least one entry has produced output worth showing (the
-    /// `⎿` list is non-vacuous even while collapsed — the running/latest
-    /// entry's summary is the "what's happening right now" line).
-    pub fn has_entries(&self) -> bool {
-        !self.entries.is_empty()
-    }
-
     /// Find a tool entry by id. Returns its index within `entries`.
     pub fn find_tool_entry_index(&self, id: &str) -> Option<usize> {
         self.entries.iter().position(|e| match e {
@@ -474,16 +462,6 @@ impl ThinkingContainer {
                 }
             )
         })
-    }
-
-    /// Elapsed seconds of the segment for the model row of the assistant
-    /// reply that immediately follows it. `None` when the segment holds no
-    /// entries — the reply renders a bare model row.
-    pub fn activity_secs(&self) -> Option<u64> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        self.frozen_secs
     }
 }
 
@@ -1177,29 +1155,24 @@ impl ConversationState {
                     // `build_items`'s `close_segment` on `MessageContent::Text`.
                     // Without this, thinking arriving after the answer text
                     // folds into the pre-answer segment (issue #216).
-                    // Snapshot the just-closed segment's elapsed for the model
-                    // row *after* `close_segment_for_text` so `frozen_secs` is
-                    // pinned — the row shows the segment's elapsed instead of a
-                    // live timer that would keep growing on every re-render of
-                    // the reply. `close_segment_for_text` may also collapse
-                    // entries, dirtying the segment's height cache; carry the
-                    // index back so the caller remeasures it alongside splicing
-                    // in the new bubble (a bare `Appended` would only splice the
+                    // The closed segment's header carries the model name, so
+                    // the reply suppresses its own model row.
+                    // `close_segment_for_text` may also collapse entries,
+                    // dirtying the segment's height cache; carry the index
+                    // back so the caller remeasures it alongside splicing in
+                    // the new bubble (a bare `Appended` would only splice the
                     // tail and leave the closed segment's height stale).
-                    let (activity_secs, closed_segment_ix) =
+                    let closed_segment_ix =
                         if let Some(cix) = self.find_active_activity_segment(cx) {
                             self.items[cix].update(cx, |item, cx| {
                                 item.close_segment_for_text(cx);
                                 cx.notify();
                             });
-                            let secs = match self.items[cix].read(cx).kind() {
-                                ConvItem::Thinking(t) => t.activity_secs(),
-                                _ => None,
-                            };
-                            (secs, Some(cix))
+                            Some(cix)
                         } else {
-                            (None, None)
+                            None
                         };
+                    let activity_header = closed_segment_ix.is_some();
                     let id = self.alloc_id();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
@@ -1207,7 +1180,7 @@ impl ConversationState {
                                 text: delta.clone(),
                                 streaming: true,
                                 token_usage: None,
-                                activity_secs,
+                                activity_header,
                             },
                             role.to_string(),
                             id,
