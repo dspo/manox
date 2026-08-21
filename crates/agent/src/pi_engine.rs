@@ -551,9 +551,9 @@ fn system_prompt(cwd: &Path) -> String {
          file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
          edits files, runs shell commands including cargo/clippy/test). \
          TeamMembers are real threads — they persist, appear in the sidebar, \
-         and can be resumed; members do not report back autonomously, so \
-         Inject them to ask for status (an autonomous member-to-parent \
-         report channel is not yet wired). A subagent (coroutine) is \
+         and can be resumed; members do not report back autonomously — observe \
+         their progress by opening their tab and Inject guidance as needed \
+         (they cannot reply through the bus yet). A subagent (coroutine) is \
          transient; it ends with a concise summary as its final assistant \
          text (the harness emits Complete with that summary).\n\n\
          Prefer parallel subagents over serial self-work. For splittable \
@@ -5618,13 +5618,12 @@ mod tests {
         );
     }
 
-    /// The async/sync split is a model-facing contract: a `write+bash`
-    /// def routes through SailorManager (async dispatch handle), a
-    /// read-only def stays synchronous. `subagent_capability` is the routing
-    /// key, so this doubles as the `SailorRoutingTool::is_async_dispatch`
-    /// predicate test.
+    /// The capability tag distinguishes write+bash defs (Sailor) from
+    /// read-only defs (Explore). It is the routing key for the plan-mode
+    /// read-only resolver, which blocks write/bash subagents from being
+    /// dispatched while plan mode is active.
     #[test]
-    fn subagent_capability_routes_sailor_async_explore_sync() {
+    fn subagent_capability_tags_write_bash_vs_read_only() {
         let mut registry = pi::ext_point_agent::AgentRegistry::new();
         pi_extensions::agents::register_defaults(&mut registry);
         let sailor = registry.get("Sailor").expect("Sailor registered");

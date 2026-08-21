@@ -239,7 +239,8 @@ impl AgentBus {
         let child_steer = Arc::new(SteerTool::new(bus_arc, AgentId::Subagent(addr.to_string())));
 
         // Reserved addresses would collide with routing: an address of
-        // "Captain"/"User" would shadow the self-reject / user Inject arms.
+        // "Captain" would shadow the self-reject Inject arm; "User" is
+        // reserved for symmetry with the spawn-side guard.
         if addr == "Captain" || addr == "User" {
             return Err(ToolError::InvalidArguments(format!(
                 "cannot use reserved address {addr}"
