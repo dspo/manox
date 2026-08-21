@@ -474,7 +474,9 @@ message-steered-badge = 已引导
 ### about.rs (About window)
 about-title = 关于 Manox
 about-ok = 确定
-about-copied = 已复制
+about-copy = 复制
+about-commit = 提交
+about-version = 版本
 
 # Background task status card
 background-task-kind-command = 监视器（命令）

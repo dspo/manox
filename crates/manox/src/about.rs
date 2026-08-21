@@ -1,42 +1,48 @@
-//! About Manox window — shows app icon, version, commit SHA, and build type.
-//!
-//! Modeled after Zed's About dialog: centered floating window with app icon,
-//! version details, and an OK button. A ghost icon button in the version row
-//! copies a structured info block (`version::structured_about`) to the
-//! clipboard. Duplicate window detection ensures only one About window is
-//! open at a time.
+//! About window: centered floating dialog with the app icon, a headline
+//! version line, muted-label commit/version rows, and an OK / Copy action
+//! row. Copy writes the structured info block (`version::structured_about`)
+//! to the clipboard and closes the window; Escape closes as well. Duplicate
+//! window detection keeps a single instance.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use agent::{i18n, version};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    IconName, Sizable as _, StyledExt as _, Theme, ThemeMode,
+    StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
 };
 
-/// How long the copy button shows the "Copied" feedback state.
-const COPY_FEEDBACK: Duration = Duration::from_millis(1500);
-
 struct AboutWindow {
+    focus_handle: FocusHandle,
     app_icon: Arc<Image>,
-    full_version: SharedString,
+    message: SharedString,
     commit: Option<SharedString>,
-    copied: bool,
+    full_version: SharedString,
 }
 
 impl AboutWindow {
-    fn new(_: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let build_type = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
         Self {
+            focus_handle: cx.focus_handle(),
             app_icon: Arc::new(Image::from_bytes(
                 ImageFormat::Png,
                 include_bytes!("../resources/app-icon.png").to_vec(),
             )),
-            full_version: SharedString::from(version::full_version_string()),
+            message: SharedString::from(format!("Manox {} ({build_type})", version::PKG_VERSION)),
             commit: version::COMMIT_SHA.map(SharedString::from),
-            copied: false,
+            full_version: SharedString::from(version::full_version_string()),
         }
+    }
+
+    fn copy_details(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(version::structured_about()));
+        window.remove_window();
     }
 }
 
@@ -45,93 +51,75 @@ impl Render for AboutWindow {
         let theme = Theme::global(cx);
         let muted = theme.muted_foreground;
 
-        let entity = cx.entity();
-        let copy_button = if self.copied {
-            Button::new("about-copy")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Check)
-                .label(i18n::t("about-copied"))
-        } else {
-            Button::new("about-copy")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Copy)
-        }
-        .on_click(move |_ev, _window, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(version::structured_about()));
-            let entity = entity.clone();
-            entity.update(cx, |this, cx| {
-                this.copied = true;
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(COPY_FEEDBACK).await;
-                    let _ = this.update(cx, |this, _| this.copied = false);
-                })
-                .detach();
-            });
-        });
-
         div()
-            .v_flex()
+            .id("about-window")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|_, ev: &KeyDownEvent, window, _cx| {
+                if ev.keystroke.key == "escape" {
+                    window.remove_window();
+                }
+            }))
             .size_full()
-            .p_6()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .p_4()
+            .pt_10()
             .gap_4()
+            .text_center()
             .justify_between()
             .child(
-                // Top section: icon + version info.
                 div()
                     .v_flex()
-                    .gap_3()
+                    .w_full()
+                    .gap_2()
                     .items_center()
-                    .child(gpui::img(self.app_icon.clone()).size(px(48.)).flex_none())
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("Manox"))
+                    .child(gpui::img(self.app_icon.clone()).size_16().flex_none())
                     .child(
                         div()
-                            .h_flex()
-                            .gap_1()
-                            .items_center()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(self.full_version.clone())
-                            .child(copy_button),
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.message.clone()),
                     )
-                    .when_some(self.commit.as_ref(), |el, commit| {
-                        el.child(
+                    .when_some(self.commit.clone(), |this, commit| {
+                        this.child(
                             div()
-                                .text_xs()
-                                .text_color(muted.opacity(0.7))
-                                .child(format!("commit: {commit}")),
-                        )
-                    })
-                    .child(
-                        // Build type badge.
-                        div().flex().gap_2().child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .bg(muted.opacity(0.12))
                                 .text_xs()
                                 .text_color(muted)
-                                .child(if cfg!(debug_assertions) {
-                                    "debug"
-                                } else {
-                                    "release"
-                                }),
-                        ),
-                    ),
+                                .child(i18n::t("about-commit")),
+                        )
+                        .child(div().text_sm().child(commit))
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(i18n::t("about-version")),
+                    )
+                    .child(div().text_sm().child(self.full_version.clone())),
             )
             .child(
-                // Bottom section: OK button.
-                div().h_flex().w_full().gap_2().child(
-                    Button::new("about-ok")
-                        .label(i18n::t("about-ok"))
-                        .ghost()
-                        .w_full()
-                        .on_click(|_ev, window, _cx| {
-                            window.remove_window();
-                        }),
-                ),
+                div()
+                    .h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        Button::new("about-ok")
+                            .label(i18n::t("about-ok"))
+                            .ghost()
+                            .flex_1()
+                            .on_click(|_ev, window, _cx| {
+                                window.remove_window();
+                            }),
+                    )
+                    .child(
+                        Button::new("about-copy")
+                            .label(i18n::t("about-copy"))
+                            .primary()
+                            .flex_1()
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.copy_details(window, cx);
+                            })),
+                    ),
             )
     }
 }
@@ -150,19 +138,23 @@ pub fn open_about_window(cx: &mut App) {
     }
 
     // Compute bounds before spawning so we can use &App.
-    let bounds = WindowBounds::centered(size(px(380.), px(300.)), cx);
+    let bounds = WindowBounds::centered(size(px(440.), px(300.)), cx);
 
     cx.spawn(async move |cx| {
         let options = WindowOptions {
             window_bounds: Some(bounds),
             is_resizable: false,
+            is_minimizable: false,
+            kind: WindowKind::Floating,
             ..Default::default()
         };
         let _handle = cx
             .open_window(options, |window, cx| {
                 window.set_window_title(i18n::t("about-title").as_ref());
-                Theme::change(ThemeMode::Light, Some(window), cx);
-                cx.new(AboutWindow::new)
+                let about = cx.new(AboutWindow::new);
+                let focus = about.read(cx).focus_handle.clone();
+                window.focus(&focus, cx);
+                about
             })
             .expect("failed to open about window");
     })

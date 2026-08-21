@@ -495,7 +495,9 @@ message-steered-badge = Steered
 ### about.rs (About window)
 about-title = About Manox
 about-ok = OK
-about-copied = Copied
+about-copy = Copy
+about-commit = Commit
+about-version = Version
 
 # Background task status card
 background-task-kind-command = Monitor (command)
