@@ -480,6 +480,8 @@ message-steered-badge = 已引导
 about-title = 关于 Manox
 about-ok = 确定
 about-copy = 复制
+about-commit = 提交
+about-version = 版本
 
 # Background task status card
 background-task-kind-command = 监视器（命令）

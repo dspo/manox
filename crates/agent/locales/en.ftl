@@ -501,6 +501,8 @@ message-steered-badge = Steered
 about-title = About Manox
 about-ok = OK
 about-copy = Copy
+about-commit = Commit
+about-version = Version
 
 # Background task status card
 background-task-kind-command = Monitor (command)
