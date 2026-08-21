@@ -6,7 +6,8 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Full git commit SHA captured at build time, if git was available.
 pub const COMMIT_SHA: Option<&str> = option_env!("MANOX_COMMIT_SHA");
 
-fn build_type() -> &'static str {
+/// `"debug"` / `"release"` from the compile-time assertion profile.
+pub fn build_type() -> &'static str {
     if cfg!(debug_assertions) {
         "debug"
     } else {

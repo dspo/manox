@@ -23,18 +23,17 @@ struct AboutWindow {
 
 impl AboutWindow {
     fn new(cx: &mut Context<Self>) -> Self {
-        let build_type = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
         Self {
             focus_handle: cx.focus_handle(),
             app_icon: Arc::new(Image::from_bytes(
                 ImageFormat::Png,
                 include_bytes!("../resources/app-icon.png").to_vec(),
             )),
-            message: SharedString::from(format!("Manox {} ({build_type})", version::PKG_VERSION)),
+            message: SharedString::from(format!(
+                "Manox {} ({})",
+                version::PKG_VERSION,
+                version::build_type()
+            )),
             commit: version::COMMIT_SHA.map(SharedString::from),
             full_version: SharedString::from(version::full_version_string()),
         }

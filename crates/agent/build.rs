@@ -1,5 +1,5 @@
-//! Captures the current git commit SHA at build time so the binary can
-//! report exactly which revision it was built from.
+//! Captures build-time provenance (git commit SHA, rustc version) so the
+//! binary can report exactly which revision and toolchain it was built from.
 
 use std::path::PathBuf;
 
@@ -36,5 +36,17 @@ fn main() {
         println!(
             "cargo:warning=git not available or not in a git repo; MANOX_COMMIT_SHA will be None"
         );
+    }
+
+    // Cargo exports RUSTC as the compiler path; `--version` yields the
+    // toolchain string surfaced in the About window's structured block.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if let Ok(output) = std::process::Command::new(rustc).arg("--version").output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout);
+        println!("cargo:rustc-env=RUSTC_VERSION={}", version.trim());
+    } else {
+        println!("cargo:warning=rustc version probe failed; RUSTC_VERSION will be None");
     }
 }
