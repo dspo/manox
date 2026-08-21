@@ -100,6 +100,7 @@ const WALKER_JS: &str = r###"(() => {
     if (INTERACTIVE_TAGS.has(tag)) return true;
     if (INTERACTIVE_ROLES.has(role)) return true;
     if (el.isContentEditable) return true;
+    if (el.hasAttribute && el.hasAttribute("onclick")) return true;
     const ti = el.getAttribute && el.getAttribute("tabindex");
     if (ti !== null && ti !== undefined && parseInt(ti, 10) >= 0) return true;
     return false;
@@ -136,7 +137,12 @@ const WALKER_JS: &str = r###"(() => {
       walk(el, depth, insideInteresting);
       if (!insideInteresting && el.childElementCount === 0) {
         const text = ws(el.textContent);
-        if (out.length < MAX && text) out.push({ d: depth, x: text.slice(0, NAME_CAP) });
+        if (out.length < MAX && text) {
+          n += 1;
+          const ref = "e" + n;
+          el.setAttribute(REF, ref);
+          out.push({ d: depth, r: "text", n: text.slice(0, NAME_CAP), ref: ref });
+        }
       }
     }
   };
@@ -200,13 +206,6 @@ pub fn render(payload: &serde_json::Value) -> Result<(String, HashSet<String>), 
             .unwrap_or(0)
             .min(MAX_DEPTH as u64) as usize;
         let indent = "  ".repeat(depth);
-        if let Some(text) = item.get("x").and_then(|v| v.as_str()) {
-            out.push_str(&format!(
-                "{indent}- text \"{}\"\n",
-                truncate(text, DISPLAY_CAP)
-            ));
-            continue;
-        }
         let Some(ref_id) = item.get("ref").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -264,7 +263,7 @@ mod tests {
     fn render_builds_tree_and_collects_refs() {
         let (text, refs) = render(&payload(json!([
             { "d": 0, "r": "heading", "n": "Introduction", "ref": "e1" },
-            { "d": 0, "x": "Some leaf text." },
+            { "d": 0, "r": "text", "n": "Some leaf text.", "ref": "e5" },
             { "d": 1, "r": "textbox", "n": "Search", "ref": "e2", "t": "text", "v": "rust" },
             { "d": 1, "r": "checkbox", "n": "Remember me", "ref": "e3", "t": "checkbox", "c": true },
             { "d": 1, "r": "textbox", "n": "Password", "ref": "e4", "t": "password" },
@@ -275,7 +274,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("- heading \"Introduction\" [e1]"), "{text}");
-        assert!(text.contains("- text \"Some leaf text.\""), "{text}");
+        assert!(text.contains("- text \"Some leaf text.\" [e5]"), "{text}");
         assert!(
             text.contains("  - textbox \"Search\" value=\"rust\" [e2]"),
             "{text}"
@@ -290,13 +289,12 @@ mod tests {
         );
         assert_eq!(
             refs,
-            ["e1", "e2", "e3", "e4"]
+            ["e1", "e5", "e2", "e3", "e4"]
                 .into_iter()
                 .map(String::from)
                 .collect()
         );
     }
-
     #[test]
     fn render_masks_password_values() {
         // The walker reports `v: null` for password inputs; even a leaked
@@ -312,7 +310,7 @@ mod tests {
     #[test]
     fn render_truncates_oversized_snapshots_with_a_notice() {
         let items: Vec<serde_json::Value> = (0..2000)
-            .map(|i| json!({ "d": 0, "x": format!("paragraph text number {i} with some padding words to add bytes") }))
+            .map(|i| json!({ "d": 0, "r": "text", "n": format!("paragraph text number {i} with some padding words to add bytes"), "ref": format!("e{i}") }))
             .collect();
         let (text, refs) = render(&payload(json!(items))).unwrap();
         assert!(text.len() < MAX_TEXT_BYTES + 4096, "{}", text.len());
@@ -321,7 +319,7 @@ mod tests {
             "tail: {}",
             &text[text.len().saturating_sub(120)..]
         );
-        assert!(refs.is_empty());
+        assert!(!refs.is_empty());
     }
 
     #[test]

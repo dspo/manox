@@ -380,6 +380,11 @@ composer-add-files = 文件和文件夹
 composer-attach-editor = 附加编辑器
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
+composer-browser-label = 浏览器
+composer-add-chrome = Chrome
+composer-add-chrome-desc = 启用 ChromeUse 浏览器自动化工具
+composer-add-internal-browser = 内置浏览器
+composer-add-internal-browser-desc = 启用内置 WebView 浏览器工具
 completion-tag-command = 命令
 completion-tag-skill = 技能
 

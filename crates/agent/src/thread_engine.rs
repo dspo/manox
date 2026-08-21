@@ -114,6 +114,14 @@ pub trait ThreadEngine: Send + Sync {
     /// Toggle plan mode (persisted sidecar + hooks + instructions).
     fn set_plan_mode(&self, _enabled: bool) {}
 
+    /// Set the active tool subset (opt-in browser tools activation/deactivation).
+    fn set_active_tools(&self, _names: Vec<String>) {}
+
+    /// The active tool subset the model currently sees (`None` = full set).
+    fn active_tool_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     fn set_plan_review_pending(&self, _pending: bool) {}
 

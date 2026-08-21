@@ -3637,6 +3637,10 @@ impl Workspace {
                                     extra.push(content);
                                 }
                             }
+                            PendingAttachment::BrowserCapability(_) => {
+                                // Tool activation already happened at chip-add
+                                // time; no message content to produce.
+                            }
                         }
                     }
                     (text, extra, failed)
@@ -6210,6 +6214,8 @@ impl Workspace {
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
             let ws_goal = ws.clone();
+            let ws_chrome = ws.clone();
+            let ws_internal = ws.clone();
             build_plus_menu(
                 menu,
                 &theme,
@@ -6229,6 +6235,24 @@ impl Workspace {
                         cx.notify();
                     });
                 },
+                move |_window, cx| {
+                    let _ = ws_chrome.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.activate_browser_tool_suite(
+                            crate::views::composer_menu::BrowserKind::Chrome,
+                            cx,
+                        );
+                    });
+                },
+                move |_window, cx| {
+                    let _ = ws_internal.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.activate_browser_tool_suite(
+                            crate::views::composer_menu::BrowserKind::InternalWebBrowser,
+                            cx,
+                        );
+                    });
+                },
             )
         });
         let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
@@ -6238,6 +6262,67 @@ impl Workspace {
         self.plus_open = true;
         self.plus_menu = Some(menu);
         self.plus_menu_sub = Some(sub);
+    }
+
+    /// Activate a browser tool suite: stage a chip and widen the thread's
+    /// active tool set so the model gains the browser tools. Idempotent —
+    /// adding an already-present suite is a no-op.
+    fn activate_browser_tool_suite(
+        &mut self,
+        kind: crate::views::composer_menu::BrowserKind,
+        cx: &mut Context<Self>,
+    ) {
+        // Skip if the chip is already staged.
+        if self
+            .pending_attachments
+            .iter()
+            .any(|a| matches!(a, crate::views::composer_menu::PendingAttachment::BrowserCapability(k) if *k == kind))
+        {
+            return;
+        }
+        self.pending_attachments
+            .push(crate::views::composer_menu::PendingAttachment::BrowserCapability(kind));
+        let suite: &[&str] = match kind {
+            crate::views::composer_menu::BrowserKind::Chrome => {
+                agent::pi_engine::CHROMEUSE_TOOL_NAMES
+            }
+            crate::views::composer_menu::BrowserKind::InternalWebBrowser => {
+                agent::pi_engine::WEBEXPLORE_TOOL_NAMES
+            }
+        };
+        let mut names = self.thread.read(cx).active_tool_names().unwrap_or_default();
+        for name in suite {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+        self.thread
+            .update(cx, |t, cx| t.set_active_tools(names, cx));
+        cx.notify();
+    }
+
+    /// Deactivate a browser tool suite: remove the chip and narrow the
+    /// thread's active tool set.
+    fn deactivate_browser_tool_suite(
+        &mut self,
+        kind: crate::views::composer_menu::BrowserKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_attachments
+            .retain(|a| !matches!(a, crate::views::composer_menu::PendingAttachment::BrowserCapability(k) if *k == kind));
+        let suite: &[&str] = match kind {
+            crate::views::composer_menu::BrowserKind::Chrome => {
+                agent::pi_engine::CHROMEUSE_TOOL_NAMES
+            }
+            crate::views::composer_menu::BrowserKind::InternalWebBrowser => {
+                agent::pi_engine::WEBEXPLORE_TOOL_NAMES
+            }
+        };
+        let mut names = self.thread.read(cx).active_tool_names().unwrap_or_default();
+        names.retain(|n| !suite.contains(&n.as_str()));
+        self.thread
+            .update(cx, |t, cx| t.set_active_tools(names, cx));
+        cx.notify();
     }
 
     /// Open the native file picker and add chosen paths as pending
@@ -6375,7 +6460,10 @@ impl Workspace {
         }
         let on_remove = cx.listener(|this, ix: &usize, _window, cx| {
             if *ix < this.pending_attachments.len() {
-                this.pending_attachments.remove(*ix);
+                let removed = this.pending_attachments.remove(*ix);
+                if let PendingAttachment::BrowserCapability(kind) = &removed {
+                    this.deactivate_browser_tool_suite(*kind, cx);
+                }
                 cx.notify();
             }
         });

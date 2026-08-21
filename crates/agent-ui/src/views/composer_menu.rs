@@ -93,6 +93,25 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     },
 ];
 
+/// `+` menu "Browser" group. "Chrome" activates ChromeUse browser automation
+/// tools; "Internal Web Browser" activates the built-in webview browser tools.
+/// Both are wired by the caller (the workspace activates/deactivates the tool
+/// subset and tracks the chip).
+const PLUS_BROWSER_ROWS: &[MenuRow] = &[
+    MenuRow {
+        icon: IconName::Globe,
+        icon_path: None,
+        name: "composer-add-chrome",
+        desc: "composer-add-chrome-desc",
+    },
+    MenuRow {
+        icon: IconName::Frame,
+        icon_path: None,
+        name: "composer-add-internal-browser",
+        desc: "composer-add-internal-browser-desc",
+    },
+];
+
 /// Render one menu row (icon + name + muted description) as a popup-menu element
 fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     let fg = theme.foreground;
@@ -121,12 +140,14 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
 
 /// Build the `+` popup menu. `on_files` runs when the "Files and folders" row
 /// is clicked (index 0); `on_goal` runs when the "Goal" row is clicked
-/// (index 2).
+/// (index 2); `on_chrome` / `on_internal_browser` run for the browser rows.
 pub fn build_plus_menu(
     menu: PopupMenu,
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
     on_goal: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_chrome: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_internal_browser: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label(i18n::t("composer-add-label"));
@@ -151,6 +172,29 @@ pub fn build_plus_menu(
             }
         }
     }
+    menu = menu.separator().label(i18n::t("composer-browser-label"));
+    let on_chrome = std::rc::Rc::new(on_chrome);
+    let on_internal_browser = std::rc::Rc::new(on_internal_browser);
+    for (ix, row) in PLUS_BROWSER_ROWS.iter().enumerate() {
+        match ix {
+            0 => {
+                let on_chrome = on_chrome.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme).on_click(move |_, window, cx| on_chrome(window, cx)),
+                );
+            }
+            1 => {
+                let on_internal_browser = on_internal_browser.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme)
+                        .on_click(move |_, window, cx| on_internal_browser(window, cx)),
+                );
+            }
+            _ => {
+                menu = menu.item(menu_row_item(row, theme));
+            }
+        }
+    }
     menu = menu.separator().label(i18n::t("composer-plugins-label"));
     for row in PLUS_PLUGIN_ROWS {
         menu = menu.item(menu_row_item(row, theme));
@@ -158,13 +202,21 @@ pub fn build_plus_menu(
     menu
 }
 
+/// Which browser tool suite a [`PendingAttachment::BrowserCapability`] activates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserKind {
+    Chrome,
+    InternalWebBrowser,
+}
+
 /// An attachment staged in the composer but not yet submitted. Either a file
-/// picked from the `+` menu, or an image pasted straight from the clipboard
-/// (resized off-thread on submit).
+/// picked from the `+` menu, an image pasted straight from the clipboard
+/// (resized off-thread on submit), or a browser tool-suite activation chip.
 #[derive(Debug, Clone)]
 pub enum PendingAttachment {
     File { path: PathBuf, is_image: bool },
     ClipboardImage(gpui::Image),
+    BrowserCapability(BrowserKind),
 }
 
 impl PendingAttachment {
@@ -182,6 +234,10 @@ impl PendingAttachment {
         )
     }
 
+    pub fn is_browser_capability(&self) -> bool {
+        matches!(self, Self::BrowserCapability(_))
+    }
+
     pub fn file_name(&self) -> String {
         match self {
             Self::File { path, .. } => path
@@ -191,6 +247,12 @@ impl PendingAttachment {
                 .to_string(),
             // No filename on the clipboard; surface a localized label instead.
             Self::ClipboardImage(_) => i18n::t("composer-pasted-image").to_string(),
+            Self::BrowserCapability(BrowserKind::Chrome) => {
+                i18n::t("composer-add-chrome").to_string()
+            }
+            Self::BrowserCapability(BrowserKind::InternalWebBrowser) => {
+                i18n::t("composer-add-internal-browser").to_string()
+            }
         }
     }
 }
@@ -256,10 +318,14 @@ pub fn render_attachment_chips(
     let mut row = h_flex().w_full().flex_wrap().gap_1();
     for (ix, att) in attachments.iter().enumerate() {
         let on_remove = on_remove.clone();
-        let icon = if att.is_image() {
-            IconName::Palette
-        } else {
-            IconName::File
+        let icon = match att {
+            PendingAttachment::File { is_image: true, .. }
+            | PendingAttachment::ClipboardImage(_) => IconName::Palette,
+            PendingAttachment::BrowserCapability(BrowserKind::Chrome) => IconName::Globe,
+            PendingAttachment::BrowserCapability(BrowserKind::InternalWebBrowser) => {
+                IconName::Frame
+            }
+            PendingAttachment::File { .. } => IconName::File,
         };
         let name: SharedString = att.file_name().into();
         row = row.child(

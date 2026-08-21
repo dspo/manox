@@ -61,6 +61,8 @@ pub(crate) enum SessionCmd {
     SetThinkingLevel(Option<String>),
     /// Switch the approval policy and persist it in the session sidecar.
     SetApprovalMode(ApprovalMode),
+    /// Set the active tool subset (opt-in browser tools activation).
+    SetActiveTools { names: Vec<String> },
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
     /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
@@ -153,6 +155,9 @@ struct EngineState {
     model: Arc<Mutex<Option<PiModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
+    /// The active tool subset the model sees; mirrored from the harness so
+    /// the facade can serve it without an actor round trip.
+    active_tool_names: Mutex<Option<Vec<String>>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -236,6 +241,7 @@ pub fn spawn_engine(
         model: model_slot,
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
+        active_tool_names: Mutex::new(None),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
@@ -411,6 +417,14 @@ impl ThreadEngine for PiEngine {
 
     fn set_plan_mode(&self, enabled: bool) {
         let _ = self.cmd_tx.send(SessionCmd::SetPlanMode { enabled });
+    }
+
+    fn active_tool_names(&self) -> Option<Vec<String>> {
+        self.state.active_tool_names.lock().unwrap().clone()
+    }
+
+    fn set_active_tools(&self, names: Vec<String>) {
+        let _ = self.cmd_tx.send(SessionCmd::SetActiveTools { names });
     }
 
     fn set_plan_review_pending(&self, pending: bool) {
@@ -805,6 +819,55 @@ impl pi::tool::AgentTool for SailorRoutingTool {
     }
 }
 
+/// ChromeUse tool names — opt-in via the composer `+` menu, never in the
+/// default active set.
+pub const CHROMEUSE_TOOL_NAMES: &[&str] = &[
+    "ChromeUseOpen",
+    "ChromeUseNavigate",
+    "ChromeUseHover",
+    "ChromeUseClick",
+    "ChromeUseType",
+    "ChromeUsePressKey",
+    "ChromeUseSelectOption",
+    "ChromeUseScroll",
+    "ChromeUseSnapshot",
+    "ChromeUseWaitFor",
+    "ChromeUseScreenshot",
+    "ChromeUseTabs",
+    "ChromeUseEvaluate",
+    "ChromeUseClose",
+    "ChromeUseFindChromiumExecutable",
+];
+/// WebExplore (internal webview browser) tool names — opt-in, not default.
+pub const WEBEXPLORE_TOOL_NAMES: &[&str] = &[
+    "WebExploreOpen",
+    "WebExploreNavigate",
+    "WebExploreReadText",
+    "WebExploreReadDom",
+    "WebExploreClick",
+    "WebExploreType",
+    "WebExploreScroll",
+    "WebExploreScreenshot",
+    "WebExploreYield",
+    "WebExploreClose",
+];
+
+/// The default active tool subset: every mounted tool except the browser
+/// tool suites (ChromeUse + WebExplore), which stay dormant until the user
+/// opts in via the composer `+` menu.
+fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
+    let browser: std::collections::HashSet<&str> = CHROMEUSE_TOOL_NAMES
+        .iter()
+        .chain(WEBEXPLORE_TOOL_NAMES)
+        .copied()
+        .collect();
+    tools
+        .iter()
+        .map(|t| t.name().to_string())
+        .filter(|name| !browser.contains(name.as_str()))
+        .collect()
+}
+
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
@@ -1008,7 +1071,6 @@ fn build_tools(
             Arc::clone(bridge),
         )));
     }
-
     // Browser tools (main-thread host round trips via the facade): the read
     // axis stays ungated; the write axis rides the same approval gate as
     // built-ins. Plan mode's ToolCall hook blocks both (fixed allowlist).
@@ -1052,9 +1114,13 @@ fn build_tools(
     tools.push(Arc::new(crate::chrome_use::ChromeUseSnapshotTool));
     tools.push(Arc::new(crate::chrome_use::ChromeUseWaitForTool));
     tools.push(Arc::new(crate::chrome_use::ChromeUseScreenshotTool));
+    tools.push(Arc::new(
+        crate::chrome_use::ChromeUseFindChromiumExecutableTool,
+    ));
     for tool in [
         Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn PiAgentTool>,
         Arc::new(crate::chrome_use::ChromeUseNavigateTool),
+        Arc::new(crate::chrome_use::ChromeUseHoverTool),
         Arc::new(crate::chrome_use::ChromeUseClickTool),
         Arc::new(crate::chrome_use::ChromeUseTypeTool),
         Arc::new(crate::chrome_use::ChromeUsePressKeyTool),
@@ -1850,13 +1916,15 @@ fn session_builder(
         worktree,
         owner_thread_id,
     );
+    let default_active = default_active_tool_names(&tools);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
         .with_system_prompt(system_prompt(cwd))
         .with_resources(instruction_resources(cwd))
-        .with_tools(tools);
+        .with_tools(tools)
+        .with_initial_active_tools(default_active);
     // Every session a host creates is tagged with its identity so each
     // host's session list stays disjoint. A team worker additionally carries
     // its leader's session id: the link persists with the jsonl file, so the
@@ -2571,6 +2639,12 @@ async fn run_actor(
                     write_approval_mode_sidecar(&sessions_dir, session.path(), mode).await
                 {
                     tracing::warn!(error = %err, "failed to persist approval mode");
+                }
+            }
+            SessionCmd::SetActiveTools { names } => {
+                *state.active_tool_names.lock().unwrap() = Some(names.clone());
+                if let Err(err) = session.set_active_tools(names).await {
+                    tracing::warn!(error = %err, "failed to set active tools");
                 }
             }
             SessionCmd::SetPlanMode { enabled } => {
@@ -4646,6 +4720,7 @@ mod tests {
             model: model_slot,
             sessions: Mutex::new(Vec::new()),
             active_path: Mutex::new(None),
+            active_tool_names: Mutex::new(None),
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,

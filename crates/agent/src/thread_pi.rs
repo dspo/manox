@@ -1460,6 +1460,19 @@ impl Thread {
         cx.notify();
     }
 
+    /// The active tool subset the model currently sees (`None` = full set).
+    pub fn active_tool_names(&self) -> Option<Vec<String>> {
+        self.engine.as_ref().and_then(|e| e.active_tool_names())
+    }
+
+    /// Set the active tool subset (opt-in browser tools activation).
+    pub fn set_active_tools(&mut self, names: Vec<String>, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.set_active_tools(names);
+        }
+        cx.notify();
+    }
+
     /// Execute an approved plan on this thread: optionally compact the
     /// planning context first (distilled toward the plan file), then run
     /// the execution seed turn.
