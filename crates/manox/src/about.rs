@@ -1,23 +1,29 @@
 //! About Manox window — shows app icon, version, commit SHA, and build type.
 //!
 //! Modeled after Zed's About dialog: centered floating window with app icon,
-//! version details, and two action buttons (OK / Copy). Duplicate window
-//! detection ensures only one About window is open at a time.
+//! version details, and an OK button. A ghost icon button in the version row
+//! copies a structured info block (`version::structured_about`) to the
+//! clipboard. Duplicate window detection ensures only one About window is
+//! open at a time.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent::{i18n, version};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    StyledExt as _, Theme, ThemeMode,
+    IconName, Sizable as _, StyledExt as _, Theme, ThemeMode,
     button::{Button, ButtonVariants as _},
 };
 
+/// How long the copy button shows the "Copied" feedback state.
+const COPY_FEEDBACK: Duration = Duration::from_millis(1500);
+
 struct AboutWindow {
     app_icon: Arc<Image>,
-    message: SharedString,
     full_version: SharedString,
     commit: Option<SharedString>,
+    copied: bool,
 }
 
 impl AboutWindow {
@@ -27,9 +33,9 @@ impl AboutWindow {
                 ImageFormat::Png,
                 include_bytes!("../resources/app-icon.png").to_vec(),
             )),
-            message: i18n::t("about-title"),
             full_version: SharedString::from(version::full_version_string()),
             commit: version::COMMIT_SHA.map(SharedString::from),
+            copied: false,
         }
     }
 }
@@ -39,18 +45,31 @@ impl Render for AboutWindow {
         let theme = Theme::global(cx);
         let muted = theme.muted_foreground;
 
-        // Pre-compute the clipboard text so the Copy button closure can
-        // capture it without needing &self.
-        let copy_content: SharedString = match self.commit.as_ref() {
-            Some(commit) => {
-                format!(
-                    "{}\nVersion: {}\nCommit: {}",
-                    self.message, self.full_version, commit
-                )
-            }
-            None => format!("{}\nVersion: {}", self.message, self.full_version),
+        let entity = cx.entity();
+        let copy_button = if self.copied {
+            Button::new("about-copy")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Check)
+                .label(i18n::t("about-copied"))
+        } else {
+            Button::new("about-copy")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Copy)
         }
-        .into();
+        .on_click(move |_ev, _window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(version::structured_about()));
+            let entity = entity.clone();
+            entity.update(cx, |this, cx| {
+                this.copied = true;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(COPY_FEEDBACK).await;
+                    let _ = this.update(cx, |this, _| this.copied = false);
+                })
+                .detach();
+            });
+        });
 
         div()
             .v_flex()
@@ -68,9 +87,13 @@ impl Render for AboutWindow {
                     .child(div().text_lg().font_weight(FontWeight::BOLD).child("Manox"))
                     .child(
                         div()
+                            .h_flex()
+                            .gap_1()
+                            .items_center()
                             .text_sm()
                             .text_color(muted)
-                            .child(self.full_version.clone()),
+                            .child(self.full_version.clone())
+                            .child(copy_button),
                     )
                     .when_some(self.commit.as_ref(), |el, commit| {
                         el.child(
@@ -99,32 +122,16 @@ impl Render for AboutWindow {
                     ),
             )
             .child(
-                // Bottom section: action buttons.
-                div()
-                    .h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        Button::new("about-ok")
-                            .label(i18n::t("about-ok"))
-                            .ghost()
-                            .w_full()
-                            .on_click(|_ev, window, _cx| {
-                                window.remove_window();
-                            }),
-                    )
-                    .child(
-                        Button::new("about-copy")
-                            .label(i18n::t("about-copy"))
-                            .primary()
-                            .w_full()
-                            .on_click(move |_ev, window, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    copy_content.to_string(),
-                                ));
-                                window.remove_window();
-                            }),
-                    ),
+                // Bottom section: OK button.
+                div().h_flex().w_full().gap_2().child(
+                    Button::new("about-ok")
+                        .label(i18n::t("about-ok"))
+                        .ghost()
+                        .w_full()
+                        .on_click(|_ev, window, _cx| {
+                            window.remove_window();
+                        }),
+                ),
             )
     }
 }
