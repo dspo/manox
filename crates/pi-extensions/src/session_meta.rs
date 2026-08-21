@@ -63,6 +63,9 @@ pub struct SessionMeta {
     pub unread: bool,
     #[serde(default)]
     pub errored: bool,
+    /// User-assigned tag shown as a chip on the sidebar row. Absent = no tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// Compact display forms for registry slash turns (`/name args`), keyed
     /// by the user message's ordinal (0-based among user-role prompt messages)
     /// in the pi transcript. The transcript stores only the expanded

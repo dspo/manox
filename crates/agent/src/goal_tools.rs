@@ -786,6 +786,7 @@ mod tests {
             parent_id: None,
             archived: false,
             pinned: false,
+            tag: None,
             created_at: 0,
             interacted_at: 0,
             updated_at: 0,

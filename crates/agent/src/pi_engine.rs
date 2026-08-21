@@ -4160,6 +4160,8 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
             .or_else(|| info.parent_session_path.clone()),
         archived: false,
         pinned: false,
+        // The actor's mirror never reads the sidecar; tags stay sidebar-only.
+        tag: None,
         has_unread: false,
         errored: false,
         created_at: info.created_at.timestamp(),

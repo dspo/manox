@@ -32,6 +32,9 @@ pub struct ThreadSummary {
     /// Pinned flag toggled from the title bar menu. Pinned threads float to
     /// the top of the sidebar list (sorted first by `pinned DESC`).
     pub pinned: bool,
+    /// User-assigned tag shown as a chip on the sidebar row. Persisted in
+    /// the session sidecar (the sidebar's source of truth), not in SQL.
+    pub tag: Option<String>,
     /// Unread flag: the thread finished a turn the user has not yet viewed.
     /// Set on a background thread's terminal `Stop`/`Error`, cleared when the
     /// user switches into the thread. `upsert` never touches this column — only
@@ -88,6 +91,9 @@ pub struct ThreadRecord {
     pub parent_id: Option<String>,
     pub archived: bool,
     pub pinned: bool,
+    /// User-assigned sidebar tag. Lives in the session sidecar — the SQL
+    /// `threads` table is not the sidebar's source of truth for it.
+    pub tag: Option<String>,
     pub created_at: i64,
     pub interacted_at: i64,
     pub updated_at: i64,
@@ -344,6 +350,9 @@ impl ThreadsDatabase {
                     parent_id: row.get(12)?,
                     archived: row.get::<_, i64>(13)? != 0,
                     pinned: row.get::<_, i64>(14)? != 0,
+                    // The sidebar's tag source of truth is the pi session
+                    // sidecar; the dead SQL path carries no tag column.
+                    tag: None,
                     created_at: row.get(15)?,
                     interacted_at: row.get(16)?,
                     updated_at: row.get(17)?,
@@ -430,6 +439,8 @@ impl ThreadsDatabase {
                 parent_id: row.get(9)?,
                 archived: row.get::<_, i64>(10)? != 0,
                 pinned: row.get::<_, i64>(11)? != 0,
+                // Tag lives in the pi session sidecar; the dead SQL path has none.
+                tag: None,
                 created_at: row.get(12)?,
                 interacted_at: row.get(13)?,
                 updated_at: row.get(14)?,
@@ -533,6 +544,7 @@ impl ThreadRecord {
             parent_id: None,
             archived: false,
             pinned: false,
+            tag: None,
             created_at: 0,
             interacted_at: 0,
             updated_at: 0,
