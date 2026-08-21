@@ -79,7 +79,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [ProjectChip](#projectchip)
+- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [BrowserSuiteChip](#browsersuitechip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [ProjectChip](#projectchip)
 
 ### AskDrawer
 
@@ -445,13 +445,24 @@ Flat stack of follow-up items parked above the input while a turn is running. Ev
 
 #### AttachmentChips
 
-Horizontal row of file/plugin attachment chips (conditional).
+Vertical stack of up to two chip rows above the composer (conditional,
+rendered by `Workspace::render_attachments`): a file/image attachment row
+(`render_attachment_chips`, cleared on submit) and an opt-in browser-suite row
+(`render_browser_chips`, persists across submits; removing a chip deactivates
+the ChromeUse / WebExplore tool suite).
 
-> Source: `agent-ui/src/views/composer_menu.rs`
+> Source: `agent-ui/src/workspace.rs` + `agent-ui/src/views/composer_menu.rs`
 
 #### AttachmentChip
 
 Single attachment chip: icon + filename + remove btn.
+
+> Source: `agent-ui/src/views/composer_menu.rs`
+
+#### BrowserSuiteChip
+
+Single browser-tool-suite chip: globe/frame icon + localized suite name +
+remove btn. Removing it calls `deactivate_browser_tool_suite`.
 
 > Source: `agent-ui/src/views/composer_menu.rs`
 
