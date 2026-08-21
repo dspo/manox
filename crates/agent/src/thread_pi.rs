@@ -1515,6 +1515,19 @@ impl Thread {
         cx.notify();
     }
 
+    /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
+    pub fn set_browser_suite(
+        &mut self,
+        suite: crate::pi_engine::BrowserSuite,
+        enable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(engine) = &self.engine {
+            engine.set_browser_suite(suite, enable);
+        }
+        cx.notify();
+    }
+
     /// Execute an approved plan on this thread: optionally compact the
     /// planning context first (distilled toward the plan file), then run
     /// the execution seed turn.

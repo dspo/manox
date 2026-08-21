@@ -70,19 +70,9 @@ plan-chip-exit-tooltip = 退出计划模式
 plan-mode-on-notice = Plan 模式已开启：工作树只读；模型调研、写 plan 文件，并通过 ProposePlan 提交给你批准。
 plan-mode-off-notice = Plan 模式已关闭：完整写权限恢复。
 thinking-tool-result = 工具结果
-thinking-reading = 读取 { $count } 个文件
-thinking-writing = 写入 { $count } 个文件
-thinking-editing = 编辑 { $count } 个文件
-thinking-running = 运行 { $count } 条命令
-thinking-fetching = 抓取 { $count } 个页面
-thinking-browsing = 浏览器 { $count } 个动作
-thinking-searching = 搜索 { $count } 个模式
-thinking-globbing = 匹配 { $count } 个 glob
-thinking-listing = 列出 { $count } 个目录
-thinking-other = { $count } 个其他工具
-thinking-rounds = 思考了 { $count } 轮次
-thinking-tool-calls = 调用了 { $count } 次工具
 thinking-duration = { $count } 秒
+activity-failed = { $count } 失败
+activity-awaiting-approval = { $count } 待审批
 
 ### views/settings.rs
 settings-group-general = 通用
@@ -390,6 +380,11 @@ composer-add-files = 文件和文件夹
 composer-attach-editor = 附加编辑器
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
+composer-browser-label = 浏览器
+composer-add-chrome = Chrome
+composer-add-chrome-desc = 启用 ChromeUse 浏览器自动化工具
+composer-add-internal-browser = 内置浏览器
+composer-add-internal-browser-desc = 启用内置 WebView 浏览器工具
 completion-tag-command = 命令
 completion-tag-skill = 技能
 

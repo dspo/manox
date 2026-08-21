@@ -83,55 +83,9 @@ plan-chip-exit-tooltip = Exit plan mode
 plan-mode-on-notice = Plan mode on: the working tree is read-only; the model researches, writes the plan file, and submits it for your approval via ProposePlan.
 plan-mode-off-notice = Plan mode off: full write access restored.
 thinking-tool-result = tool result
-thinking-reading = { $count ->
-    [one] reading {$count} file
-   *[other] reading {$count} files
-}
-thinking-writing = { $count ->
-    [one] writing {$count} file
-   *[other] writing {$count} files
-}
-thinking-editing = { $count ->
-    [one] editing {$count} file
-   *[other] editing {$count} files
-}
-thinking-running = { $count ->
-    [one] running {$count} shell command
-   *[other] running {$count} shell commands
-}
-thinking-fetching = { $count ->
-    [one] fetching {$count} page
-   *[other] fetching {$count} pages
-}
-thinking-browsing = { $count ->
-    [one] browsing {$count} action
-   *[other] browsing {$count} actions
-}
-thinking-searching = { $count ->
-    [one] searching {$count} pattern
-   *[other] searching {$count} patterns
-}
-thinking-globbing = { $count ->
-    [one] matching {$count} glob
-   *[other] matching {$count} globs
-}
-thinking-listing = { $count ->
-    [one] listing {$count} directory
-   *[other] listing {$count} directories
-}
-thinking-other = { $count ->
-    [one] {$count} other tool
-   *[other] {$count} other tools
-}
-thinking-rounds = { $count ->
-    [one] thought {$count} round
-   *[other] thought {$count} rounds
-}
-thinking-tool-calls = { $count ->
-    [one] ran {$count} tool call
-   *[other] ran {$count} tool calls
-}
 thinking-duration = { $count }s
+activity-failed = { $count } failed
+activity-awaiting-approval = { $count } awaiting approval
 
 ### views/settings.rs
 settings-group-general = General
@@ -440,6 +394,11 @@ composer-add-files = Files and folders
 composer-attach-editor = Attach editor
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
+composer-browser-label = Browser
+composer-add-chrome = Chrome
+composer-add-chrome-desc = Enable ChromeUse browser automation tools
+composer-add-internal-browser = Internal Web Browser
+composer-add-internal-browser-desc = Enable the built-in webview browser tools
 completion-tag-command = Command
 completion-tag-skill = Skill
 

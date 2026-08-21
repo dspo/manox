@@ -594,6 +594,9 @@ impl MessageItem {
             return;
         };
         t.close_for_text();
+        // A text boundary settles the segment: fold to the cover unless the
+        // user pinned it open — mirrors `close_segment` on the rebuild path.
+        t.collapsed = !t.user_toggled;
         // Finalize reasoning markdown so the streaming cursor stops and the
         // final parse matches a one-shot parse; schedule the rounds' delayed
         // auto-collapse so a finished round folds ~1s after it stops
@@ -800,8 +803,8 @@ pub fn render_item(
             text,
             streaming: _,
             token_usage: _,
-            activity_summary,
-        } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
+            activity_secs,
+        } => render_assistant(text, ix, role, *activity_secs, theme, body, cx),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
             if t.name == agent::tools::ASK_USER_QUESTION {
@@ -1042,7 +1045,7 @@ pub fn render_assistant(
     text: &str,
     ix: usize,
     role: &str,
-    activity_summary: Option<&crate::conversation::ActivitySummary>,
+    activity_secs: Option<u64>,
     theme: &Theme,
     body: Option<Entity<Markdown>>,
     cx: &mut App,
@@ -1053,15 +1056,17 @@ pub fn render_assistant(
         Some(md) => md.into_any_element(),
         None => markdown_tv(("assistant", ix), text.to_string(), theme, false, cx),
     };
-    // Suffix for the model row summarizing the activity segment that preceded
-    // this reply: " · 思考了 N 轮次 · 调用了 M 次工具 · Ss". `None` (no
-    // preceding thinking/tool activity, or all counts zero) renders a bare
-    // row with just the model name.
-    let summary_child = activity_summary.and_then(activity_summary_text).map(|t| {
+    // Suffix for the model row: the elapsed of the activity segment that
+    // preceded this reply (" · 780s"). The segment's cover row carries the
+    // per-kind counts, so the model row stays model + duration only.
+    let summary_child = activity_secs.filter(|s| *s > 0).map(|s| {
         gpui::div()
             .text_sm()
             .text_color(theme.muted_foreground)
-            .child(t)
+            .child(format!(
+                " · {}",
+                i18n::t_count("thinking-duration", s as i64)
+            ))
     });
     v_flex()
         .group(format!("assistant-{ix}"))
@@ -1452,14 +1457,114 @@ fn disclosure_icon(collapsed: bool, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Render an activity segment as a flat stack of its entries — each a
-/// self-collapsible reasoning round or tool node, sitting at the same level
-/// as the surrounding assistant text (no segment-level header, no left rail,
-/// no branch connectors). Live entries play open so the stream is visible;
-/// each folds ~1s after it stops streaming / reaches a terminal status
-/// (unless the user toggled it). Restored-history segments mount collapsed.
-/// The segment's aggregated totals ("思考了 N 轮次 · 调用了 M 次工具 · Ss") are
-/// rendered on the following reply's model row via `activity_summary`.
+/// Aggregated per-kind counts rendered on a segment's cover row.
+struct SegmentStats {
+    thinking_rounds: usize,
+    /// Tool call counts in first-appearance order.
+    tools: Vec<(String, usize)>,
+    failed: usize,
+    pending_approval: usize,
+}
+
+fn segment_stats(t: &ThinkingContainer) -> SegmentStats {
+    let mut stats = SegmentStats {
+        thinking_rounds: 0,
+        tools: Vec::new(),
+        failed: 0,
+        pending_approval: 0,
+    };
+    for e in &t.entries {
+        match e {
+            ActivityEntry::Reasoning { .. } => stats.thinking_rounds += 1,
+            ActivityEntry::Tool(tool) => {
+                match stats.tools.iter_mut().find(|(name, _)| *name == tool.name) {
+                    Some((_, count)) => *count += 1,
+                    None => stats.tools.push((tool.name.clone(), 1)),
+                }
+                match tool.status {
+                    ToolCallStatus::Error | ToolCallStatus::Denied => stats.failed += 1,
+                    ToolCallStatus::PendingApproval => stats.pending_approval += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    stats
+}
+
+/// Which entries of a segment render below its cover row, plus the cover's
+/// aggregated counts (computed once per render).
+struct SegmentLayout {
+    /// False ⇒ too small to fold: entries render as a flat stack, no cover.
+    cover: bool,
+    /// True ⇒ every entry renders (user expanded, or an approval is pending).
+    expanded: bool,
+    visible: Vec<usize>,
+    stats: SegmentStats,
+}
+
+fn segment_layout(t: &ThinkingContainer) -> SegmentLayout {
+    let stats = segment_stats(t);
+    if t.entries.len() < 2 {
+        return SegmentLayout {
+            cover: false,
+            expanded: true,
+            visible: (0..t.entries.len()).collect(),
+            stats,
+        };
+    }
+    // Awaiting approval is user-facing interaction: the segment stays open
+    // even after auto-collapse so the pending row is never hidden (fail-closed
+    // visibility at the UI layer).
+    if !t.collapsed || stats.pending_approval > 0 {
+        return SegmentLayout {
+            cover: true,
+            expanded: true,
+            visible: (0..t.entries.len()).collect(),
+            stats,
+        };
+    }
+    if !t.streaming {
+        return SegmentLayout {
+            cover: true,
+            expanded: false,
+            visible: Vec::new(),
+            stats,
+        };
+    }
+    // Collapsed + live: play only the running (or latest) entry.
+    let visible = t
+        .entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, e)| match e {
+            ActivityEntry::Reasoning { streaming, .. } => *streaming,
+            ActivityEntry::Tool(tool) => {
+                tool.streaming
+                    || matches!(
+                        tool.status,
+                        ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                    )
+            }
+        })
+        .or_else(|| t.entries.iter().enumerate().next_back())
+        .map(|(i, _)| vec![i])
+        .unwrap_or_default();
+    SegmentLayout {
+        cover: true,
+        expanded: false,
+        visible,
+        stats,
+    }
+}
+
+/// Render an activity segment as its shell: a clickable cover row (chevron +
+/// per-kind counts + elapsed + failure/approval badges) over the visible
+/// entries. Settled + collapsed shows the cover alone; live + collapsed adds
+/// the running/latest entry; expanded nests every entry under a slight indent
+/// with a left rail. Segments with fewer than two entries render as a flat
+/// stack with no cover — folding a single row would only add a click.
 pub fn render_thinking(
     t: &ThinkingContainer,
     ix: usize,
@@ -1472,22 +1577,149 @@ pub fn render_thinking(
         // nothing — the first reasoning delta or tool call lands next frame.
         return gpui::div().into_any_element();
     }
-    // No segment-level header or rail-and-branch tree: each entry is a self-
-    // collapsible row at the same level as the surrounding assistant text,
-    // live entries open while streaming and fold ~1s after they finish. The
-    // segment's totals are summarized on the following reply's model row.
-    v_flex()
+    let layout = segment_layout(t);
+    if !layout.cover {
+        return v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_0p5()
+            .debug_selector(|| format!("message-overflow-activity-tree-{ix}"))
+            .children(
+                t.entries
+                    .iter()
+                    .enumerate()
+                    .map(|(eix, e)| render_activity_entry(e, eix, ix, theme, tool_ctx, cx)),
+            )
+            .into_any_element();
+    }
+    let stats = &layout.stats;
+    let secs = if t.streaming {
+        Some(t.started_at.elapsed().as_secs())
+    } else {
+        t.frozen_secs
+    };
+    let interactive = tool_ctx.is_some();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let mut cover = h_flex()
+        .id(("activity-cover", ix))
+        .w_full()
+        .min_w_0()
+        .px_2()
+        .py_0p5()
+        .gap_1p5()
+        .items_center()
+        // Long tool-name chips (WebExploreNavigate×N …) wrap instead of
+        // overflowing the message column.
+        .flex_wrap()
+        .rounded(theme.radius)
+        .when(interactive, |row| {
+            row.cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.3)))
+        })
+        .on_click(move |_, _window, cx: &mut App| {
+            let Some(weak) = weak_workspace.clone() else {
+                return;
+            };
+            let _ = weak.update(cx, |w, cx| {
+                let conv = w.conversation.clone();
+                conv.update(cx, |c, cx| {
+                    if let Some(item) = c.items().get(ix) {
+                        item.update(cx, |item, cx| {
+                            if let ConvItem::Thinking(t) = item.kind_mut() {
+                                t.collapsed = !t.collapsed;
+                                t.user_toggled = true;
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .child(disclosure_icon(!layout.expanded, theme))
+        .when(t.streaming, |row| {
+            row.child(
+                BrailleSpinner::new()
+                    .xsmall()
+                    .color(theme.muted_foreground)
+                    .into_any_element(),
+            )
+        });
+    if stats.thinking_rounds > 0 {
+        cover = cover.child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "{}×{}",
+                    i18n::t("message-reasoning"),
+                    stats.thinking_rounds
+                )),
+        );
+    }
+    for (name, count) in &stats.tools {
+        cover = cover.child(
+            gpui::div()
+                .text_sm()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(theme.muted_foreground)
+                .child(format!("{name}×{count}")),
+        );
+    }
+    if let Some(secs) = secs
+        && secs > 0
+    {
+        cover = cover.child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(i18n::t_count("thinking-duration", secs as i64).to_string()),
+        );
+    }
+    if stats.failed > 0 {
+        cover = cover.child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(i18n::t_count("activity-failed", stats.failed as i64).to_string()),
+        );
+    }
+    if stats.pending_approval > 0 {
+        cover = cover.child(gpui::div().text_sm().text_color(theme.warning).child(
+            i18n::t_count("activity-awaiting-approval", stats.pending_approval as i64).to_string(),
+        ));
+    }
+
+    let mut col = v_flex()
         .w_full()
         .min_w_0()
         .gap_0p5()
         .debug_selector(|| format!("message-overflow-activity-tree-{ix}"))
-        .children(
-            t.entries
+        .child(cover);
+    if !layout.visible.is_empty() {
+        let entries = v_flex().w_full().min_w_0().gap_0p5().children(
+            layout
+                .visible
                 .iter()
-                .enumerate()
-                .map(|(eix, e)| render_activity_entry(e, eix, ix, theme, tool_ctx, cx)),
-        )
-        .into_any_element()
+                .map(|&eix| render_activity_entry(&t.entries[eix], eix, ix, theme, tool_ctx, cx)),
+        );
+        col = col.child(if layout.expanded {
+            // Slight indent + left rail: the entries read as one batched
+            // block under the cover without eating horizontal space.
+            gpui::div()
+                .w_full()
+                .min_w_0()
+                .ml_1()
+                .border_l_1()
+                .border_color(theme.border)
+                .pl_2()
+                .child(entries)
+                .into_any_element()
+        } else {
+            entries.into_any_element()
+        });
+    }
+    col.into_any_element()
 }
 
 /// Render one activity entry (a reasoning round or a tool node) as a flat,
@@ -1781,36 +2013,6 @@ fn render_tool_entry(
     frame.into_any_element()
 }
 
-/// Format the activity segment summary for the model row of the reply that
-/// follows it: " · 思考了 N 轮次 · 调用了 M 次工具 · Ss". Returns `None`
-/// when every count is zero (or the duration is absent/zero) so the model
-/// row stays bare. The leading " · " separates it from the model name.
-fn activity_summary_text(s: &crate::conversation::ActivitySummary) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if s.thinking_rounds > 0 {
-        parts.push(i18n::t_count("thinking-rounds", s.thinking_rounds as i64).to_string());
-    }
-    if s.tool_calls > 0 {
-        parts.push(i18n::t_count("thinking-tool-calls", s.tool_calls as i64).to_string());
-    }
-    if let Some(secs) = s.duration_secs
-        && secs > 0
-    {
-        parts.push(i18n::t_count("thinking-duration", secs as i64).to_string());
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!(" · {}", parts.join(" · ")))
-    }
-}
-
-/// Aggregate a segment's tool calls into a comma-joined summary like
-/// "reading 2 files, running 1 shell command". File/search categories count
-/// unique targets (paths / patterns) extracted from the structured tool
-/// input, so editing the same file twice reports "edited 1 file"; `bash`
-/// counts command invocations. Categories with zero calls are omitted.
-/// Trailing "…" mirrors the Claude Code "still working" cadence.
 /// Open a file path in VS Code. Strips `:line` and `:line-end` suffixes
 /// from the path string and passes them as `--goto file:line` arguments.
 /// Falls back to `open -a "Visual Studio Code"` if the `code` CLI is not
@@ -1857,135 +2059,6 @@ fn open_file_in_vscode(raw: &str, cwd: Option<&Path>) {
             .spawn();
     }
 }
-#[cfg(test)]
-fn thinking_summary(entries: &[ActivityEntry]) -> String {
-    use std::collections::BTreeSet;
-    let mut reads: BTreeSet<String> = BTreeSet::new();
-    let mut writes: BTreeSet<String> = BTreeSet::new();
-    let mut edits: BTreeSet<String> = BTreeSet::new();
-    let mut searches: BTreeSet<String> = BTreeSet::new();
-    let mut globs: BTreeSet<String> = BTreeSet::new();
-    let mut lists: BTreeSet<String> = BTreeSet::new();
-    let mut running = 0u32;
-    let mut fetching = 0u32;
-    let mut browsing = 0u32;
-    let mut other = 0u32;
-    for e in entries {
-        let ActivityEntry::Tool(e) = e else { continue };
-        match e.name.as_str() {
-            x if x == agent::tools::READ || x == agent::tools::WRITE || x == agent::tools::LIST => {
-                if let Some(p) = e.input.get("path").and_then(|v| v.as_str()) {
-                    match e.name.as_str() {
-                        x if x == agent::tools::READ => {
-                            reads.insert(p.to_string());
-                        }
-                        x if x == agent::tools::WRITE => {
-                            writes.insert(p.to_string());
-                        }
-                        _ => {
-                            lists.insert(p.to_string());
-                        }
-                    }
-                } else {
-                    match e.name.as_str() {
-                        x if x == agent::tools::READ => {
-                            reads.insert(String::new());
-                        }
-                        x if x == agent::tools::WRITE => {
-                            writes.insert(String::new());
-                        }
-                        _ => {
-                            lists.insert(String::new());
-                        }
-                    }
-                }
-            }
-            x if x == agent::tools::EDIT => {
-                // The patch's first `[PATH#TAG]` header names the target file.
-                // Everything before the last `#` is the path (paths with `#`
-                // survive). Mirrors `tool_title`'s edit_file extraction.
-                let path = e
-                    .input
-                    .get("patch")
-                    .and_then(|v| v.as_str())
-                    .and_then(|patch| {
-                        patch.lines().find_map(|l| {
-                            let l = l.trim();
-                            let inner = l.strip_prefix('[')?.strip_suffix(']')?;
-                            Some(inner.rsplit_once('#')?.0.to_string())
-                        })
-                    })
-                    .unwrap_or_default();
-                edits.insert(path);
-            }
-            x if x == agent::tools::BASH => {
-                // Commands count by invocation, not by unique command text —
-                // running `cargo build` twice is "2 commands", not 1.
-                running += 1;
-            }
-            x if x == agent::tools::GREP => {
-                let p = e
-                    .input
-                    .get("pattern")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                searches.insert(p);
-            }
-            x if x == agent::tools::GLOB => {
-                let p = e
-                    .input
-                    .get("pattern")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                globs.insert(p);
-            }
-            x if x == agent::tools::WEB_FETCH => {
-                // Read-side network activity: fetching a doc URL or reading a
-                // browser tab's content. Counted by invocation.
-                fetching += 1;
-            }
-            "WebExploreOpen"
-            | "WebExploreNavigate"
-            | "WebExploreClick"
-            | "WebExploreType"
-            | "WebExploreScroll"
-            | "WebExploreYield"
-            | "web_explore_read_wait"
-            | "web_explore_write"
-            | "WebExploreClose" => {
-                // Driving the browser tab itself — navigation and interaction.
-                browsing += 1;
-            }
-            _ => {
-                other += 1;
-            }
-        }
-    }
-    let mut parts: Vec<String> = Vec::new();
-    let push = |count: u32, key: &str, parts: &mut Vec<String>| {
-        if count > 0 {
-            parts.push(i18n::t_count(key, count as i64).to_string());
-        }
-    };
-    push(reads.len() as u32, "thinking-reading", &mut parts);
-    push(writes.len() as u32, "thinking-writing", &mut parts);
-    push(edits.len() as u32, "thinking-editing", &mut parts);
-    push(searches.len() as u32, "thinking-searching", &mut parts);
-    push(globs.len() as u32, "thinking-globbing", &mut parts);
-    push(lists.len() as u32, "thinking-listing", &mut parts);
-    push(running, "thinking-running", &mut parts);
-    push(fetching, "thinking-fetching", &mut parts);
-    push(browsing, "thinking-browsing", &mut parts);
-    push(other, "thinking-other", &mut parts);
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("{}…", parts.join(", "))
-    }
-}
-
 /// Render a plan-review item as a drawer card that emerges from beneath the
 /// composer, mirroring `render_ask_user_card`'s shell (negative bottom margin +
 /// shadow + slide-in animation + `PlanDrawer` key context). The header carries
@@ -3307,11 +3380,11 @@ impl ItemBuilder {
                                 // Assistant prose interrupts the activity segment:
                                 // reasoning after it starts a fresh round.
                                 close_segment(items, self.active_segment_ix);
-                                // Snapshot the segment's totals (after close pins
+                                // Snapshot the segment's elapsed (after close pins
                                 // `frozen_secs`) for this reply's model row.
-                                let activity_summary = self.active_segment_ix.and_then(|ix| {
+                                let activity_secs = self.active_segment_ix.and_then(|ix| {
                                     items.get(ix).and_then(|item| match item {
-                                        ConvItem::Thinking(seg) => seg.activity_summary(),
+                                        ConvItem::Thinking(seg) => seg.activity_secs(),
                                         _ => None,
                                     })
                                 });
@@ -3323,7 +3396,7 @@ impl ItemBuilder {
                                         .last_user_id
                                         .as_deref()
                                         .and_then(|id| usage.get(id).copied()),
-                                    activity_summary,
+                                    activity_secs,
                                 });
                             }
                             MessageContent::Thinking { text, .. } => {
@@ -4028,7 +4101,7 @@ mod tests {
             matches!(
                 &second[0],
                 ConvItem::Assistant {
-                    activity_summary: None,
+                    activity_secs: None,
                     ..
                 }
             ),
@@ -4037,7 +4110,7 @@ mod tests {
     }
 
     /// Historical `ThinkingContainer`s rebuilt from persisted messages must
-    /// have `frozen_secs` pinned so `activity_summary` reports a fixed duration
+    /// have `frozen_secs` pinned so `activity_secs` reports a fixed duration
     /// (not a live `started_at.elapsed()`) — otherwise the timer ticks forever
     /// from zero on a reloaded thread (regression: the old "计时一直进行" bug).
     #[test]
@@ -4194,184 +4267,124 @@ mod tests {
         }
     }
 
-    /// `thinking_summary` deduplicates file targets: editing the same file
-    /// twice reports "edited 1 file", not 2. `bash` counts invocations.
+    /// `segment_stats` counts tool calls per name in first-appearance order
+    /// and flags failed / approval-pending entries for the cover badges.
     #[test]
-    fn thinking_summary_deduplicates_file_targets() {
-        let entries: Vec<ActivityEntry> = vec![
+    fn segment_stats_counts_tools_and_flags() {
+        let tool = |id: &str, name: &str, status: ToolCallStatus| {
             ActivityEntry::Tool(ToolCallItem {
-                id: "1".into(),
-                name: "Edit".into(),
+                id: id.into(),
+                name: name.into(),
                 title: String::new(),
-                status: ToolCallStatus::Success,
+                status,
                 output: String::new(),
                 is_error: false,
-                input: serde_json::json!({"patch": "[src/a.rs#T1]\nINS x"}),
+                input: serde_json::Value::Null,
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
                 auto_approved: false,
                 panel: None,
-            }),
-            ActivityEntry::Tool(ToolCallItem {
-                id: "2".into(),
-                name: "Edit".into(),
-                title: String::new(),
-                status: ToolCallStatus::Success,
-                output: String::new(),
-                is_error: false,
-                // Same path → deduped.
-                input: serde_json::json!({"patch": "[src/a.rs#T2]\nINS y"}),
-                streaming: false,
-                collapsed: false,
-                user_toggled: false,
-                auto_approved: false,
-                panel: None,
-            }),
-            ActivityEntry::Tool(ToolCallItem {
-                id: "3".into(),
-                name: "Edit".into(),
-                title: String::new(),
-                status: ToolCallStatus::Success,
-                output: String::new(),
-                is_error: false,
-                // Different path.
-                input: serde_json::json!({"patch": "[src/b.rs#T1]\nINS z"}),
-                streaming: false,
-                collapsed: false,
-                user_toggled: false,
-                auto_approved: false,
-                panel: None,
-            }),
-            ActivityEntry::Tool(ToolCallItem {
-                id: "4".into(),
-                name: "Bash".into(),
-                title: String::new(),
-                status: ToolCallStatus::Success,
-                output: String::new(),
-                is_error: false,
-                input: serde_json::json!({"command": "cargo build"}),
-                streaming: false,
-                collapsed: false,
-                user_toggled: false,
-                auto_approved: false,
-                panel: None,
-            }),
-            ActivityEntry::Tool(ToolCallItem {
-                id: "5".into(),
-                name: "Bash".into(),
-                title: String::new(),
-                status: ToolCallStatus::Success,
-                output: String::new(),
-                is_error: false,
-                // Same command → still counted as 2 invocations.
-                input: serde_json::json!({"command": "cargo build"}),
-                streaming: false,
-                collapsed: false,
-                user_toggled: false,
-                auto_approved: false,
-                panel: None,
-            }),
-        ];
-        let summary = thinking_summary(&entries);
-        // 2 unique files edited, 2 commands run.
-        assert!(
-            summary.contains("2"),
-            "summary should count 2 for files: {summary}"
+            })
+        };
+        let mut t = ThinkingContainer::new();
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "hmm".into(),
+            streaming: false,
+            collapsed: true,
+            user_toggled: false,
+            markdown: None,
+        });
+        t.entries.push(tool("1", "Read", ToolCallStatus::Success));
+        t.entries.push(tool("2", "Edit", ToolCallStatus::Error));
+        t.entries.push(tool("3", "Read", ToolCallStatus::Success));
+        t.entries
+            .push(tool("4", "Bash", ToolCallStatus::PendingApproval));
+        let stats = segment_stats(&t);
+        assert_eq!(stats.thinking_rounds, 1);
+        assert_eq!(
+            stats.tools,
+            vec![
+                ("Read".to_string(), 2),
+                ("Edit".to_string(), 1),
+                ("Bash".to_string(), 1)
+            ]
         );
-        // The summary is localized; just assert it's non-empty and ends with "…".
-        assert!(
-            summary.ends_with('…'),
-            "summary ends with ellipsis: {summary}"
-        );
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.pending_approval, 1);
     }
 
-    /// A frozen + collapsed segment shows NO entries in `render_thinking`'s
-    /// visible slice; a streaming + collapsed segment shows the running/latest
-    /// entry only. This mirrors the collapsed visibility rules without
-    /// requiring a gpui render context — we exercise the slice logic directly.
+    /// The segment shell's visibility rules: segments with fewer than two
+    /// entries render flat (no cover); settled + collapsed shows the cover
+    /// alone; live + collapsed plays the running/latest entry; expanded — or
+    /// collapsed with an approval pending — shows every entry.
     #[test]
     fn render_thinking_collapsed_visibility_rules() {
+        let tool = |id: &str, status: ToolCallStatus| {
+            ActivityEntry::Tool(ToolCallItem {
+                id: id.into(),
+                name: "Read".into(),
+                title: String::new(),
+                status,
+                output: String::new(),
+                is_error: false,
+                input: serde_json::Value::Null,
+                streaming: false,
+                collapsed: true,
+                user_toggled: false,
+                auto_approved: false,
+                panel: None,
+            })
+        };
         let mut t = ThinkingContainer::new();
         t.accepting_entries = false;
         t.streaming = false;
         t.collapsed = true;
-        t.entries.push(ActivityEntry::Tool(ToolCallItem {
-            id: "1".into(),
-            name: "Read".into(),
-            title: String::new(),
-            status: ToolCallStatus::Success,
-            output: String::new(),
-            is_error: false,
-            input: serde_json::Value::Null,
-            streaming: false,
-            collapsed: true,
-            user_toggled: false,
-            auto_approved: false,
-            panel: None,
-        }));
-        t.entries.push(ActivityEntry::Tool(ToolCallItem {
-            id: "2".into(),
-            name: "Bash".into(),
-            title: String::new(),
-            status: ToolCallStatus::Success,
-            output: String::new(),
-            is_error: false,
-            input: serde_json::Value::Null,
-            streaming: false,
-            collapsed: true,
-            user_toggled: false,
-            auto_approved: false,
-            panel: None,
-        }));
+        t.entries.push(tool("1", ToolCallStatus::Success));
 
-        /// Replicate the visibility logic from `render_thinking` for testing.
-        fn visible_entries(t: &ThinkingContainer) -> Vec<usize> {
-            if !t.collapsed {
-                (0..t.entries.len()).collect()
-            } else if t.streaming {
-                t.entries
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, e)| match e {
-                        ActivityEntry::Reasoning { streaming, .. } => *streaming,
-                        ActivityEntry::Tool(tool) => {
-                            tool.streaming
-                                || matches!(
-                                    tool.status,
-                                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
-                                )
-                        }
-                    })
-                    .or(t.entries.iter().enumerate().next_back())
-                    .map(|(i, _)| i)
-                    .into_iter()
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        }
+        // Single entry: flat, no cover.
+        let layout = segment_layout(&t);
+        assert!(!layout.cover);
+        assert_eq!(layout.visible, vec![0]);
 
-        // Frozen + collapsed: no entries visible.
+        t.entries.push(tool("2", ToolCallStatus::Success));
+
+        // Settled + collapsed: cover only, no entries.
+        let layout = segment_layout(&t);
+        assert!(layout.cover && !layout.expanded);
         assert!(
-            visible_entries(&t).is_empty(),
-            "frozen + collapsed shows no entries"
+            layout.visible.is_empty(),
+            "settled + collapsed shows no entries"
         );
 
-        // Streaming + collapsed: the running entry (or latest) is visible.
+        // Live + collapsed: the running (or latest) entry plays.
         t.streaming = true;
-        if let ActivityEntry::Tool(tool) = &mut t.entries[0] {
-            tool.streaming = true;
-            tool.status = ToolCallStatus::Running;
+        if let ActivityEntry::Tool(e) = &mut t.entries[0] {
+            e.streaming = true;
+            e.status = ToolCallStatus::Running;
         }
-        let vis = visible_entries(&t);
-        assert_eq!(vis.len(), 1, "streaming + collapsed shows 1 entry");
-        assert_eq!(vis[0], 0, "shows the running entry");
+        let layout = segment_layout(&t);
+        assert!(layout.cover && !layout.expanded);
+        assert_eq!(
+            layout.visible,
+            vec![0],
+            "live + collapsed plays the running entry"
+        );
 
-        // Expanded: all entries visible.
+        // Expanded: every entry renders.
         t.collapsed = false;
-        assert_eq!(visible_entries(&t).len(), 2, "expanded shows all entries");
+        let layout = segment_layout(&t);
+        assert!(layout.cover && layout.expanded);
+        assert_eq!(layout.visible, vec![0, 1]);
+
+        // Collapsed again but an approval is pending: forced open.
+        t.collapsed = true;
+        if let ActivityEntry::Tool(e) = &mut t.entries[1] {
+            e.status = ToolCallStatus::PendingApproval;
+        }
+        let layout = segment_layout(&t);
+        assert!(layout.expanded, "pending approval forces the segment open");
+        assert_eq!(layout.visible, vec![0, 1]);
     }
 
     #[test]
@@ -4515,13 +4528,13 @@ mod tests {
         ));
     }
 
-    /// `activity_summary` snapshots the segment's round/tool counts and the
-    /// pinned elapsed for the following reply's model row.
+    /// `activity_secs` snapshots the segment's pinned elapsed for the
+    /// following reply's model row; empty segments keep the row bare.
     #[test]
-    fn activity_summary_counts_rounds_tools_duration() {
+    fn activity_secs_reports_frozen_duration() {
         let mut t = ThinkingContainer::new();
         // Empty segment → no row suffix.
-        assert!(t.activity_summary().is_none());
+        assert!(t.activity_secs().is_none());
         t.frozen_secs = Some(42);
         t.entries.push(ActivityEntry::Reasoning {
             text: "thinking...".into(),
@@ -4530,43 +4543,7 @@ mod tests {
             user_toggled: false,
             markdown: None,
         });
-        t.entries.push(ActivityEntry::Tool(ToolCallItem {
-            id: "t1".into(),
-            name: "Read".into(),
-            title: String::new(),
-            status: ToolCallStatus::Success,
-            output: String::new(),
-            is_error: false,
-            input: serde_json::json!({"path": "a.rs"}),
-            streaming: false,
-            collapsed: true,
-            user_toggled: false,
-            auto_approved: false,
-            panel: None,
-        }));
-        t.entries.push(ActivityEntry::Tool(ToolCallItem {
-            id: "t2".into(),
-            name: "Bash".into(),
-            title: String::new(),
-            status: ToolCallStatus::Success,
-            output: String::new(),
-            is_error: false,
-            input: serde_json::json!({"command": "cargo build"}),
-            streaming: false,
-            collapsed: true,
-            user_toggled: false,
-            auto_approved: false,
-            panel: None,
-        }));
-        let s = t.activity_summary().expect("non-empty segment");
-        assert_eq!(s.thinking_rounds, 1);
-        assert_eq!(s.tool_calls, 2);
-        assert_eq!(s.duration_secs, Some(42));
-
-        // A segment whose only counts are zero still reports `None`.
-        let mut empty = ThinkingContainer::new();
-        empty.frozen_secs = Some(0);
-        assert!(empty.activity_summary().is_none());
+        assert_eq!(t.activity_secs(), Some(42));
     }
 
     /// Historical rebuild of the issue #216 scenario: text THEN thinking within
@@ -4699,7 +4676,7 @@ mod tests {
             text: "hi".into(),
             streaming: true,
             token_usage: None,
-            activity_summary: None,
+            activity_secs: None,
         };
         assert_eq!(text_body_of(&assistant), Some((true, "hi".into())));
 

@@ -75,11 +75,11 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### MessageItem 变体
 
-- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ThinkingStatusRow](#thinkingstatusrow) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [BackgroundTaskCard](#backgroundtaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [CacheMissDivider](#cachemissdivider) · [RetryBadge](#retrybadge)
+- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ActivitySegment](#activitysegment) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [BackgroundTaskCard](#backgroundtaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [CacheMissDivider](#cachemissdivider) · [RetryBadge](#retrybadge)
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [ProjectChip](#projectchip)
+- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [BrowserSuiteChip](#browsersuitechip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [ProjectChip](#projectchip)
 
 ### AskDrawer
 
@@ -357,15 +357,15 @@ Collapsible: chevron + "Reasoning" label + left-bordered muted body. Each reason
 
 > Source: `agent-ui/src/views/message.rs`
 
-#### ThinkingStatusRow
+#### ActivitySegment
 
-Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: braille spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards. An autopilot auto-approved call renders a muted `check-check` badge immediately before its own status icon (the `ToolCallItem.auto_approved` flag, stamped live on an `ApprovalDecision::Allow` and restored from a persisted `AutoApproval` note); the former "Auto-approved" notice card no longer exists, though escalated calls still post an anchored notice.
+One contiguous thinking + tool-call segment within a user turn, rendered as a fold shell (`render_thinking`). Cover row: chevron + live braille spinner + per-kind counts (`Read×7`, `Edit×6`, `思考×8` via `message-reasoning`) + elapsed (`thinking-duration`) + red `activity-failed` / orange `activity-awaiting-approval` badges; clicking toggles the container's `collapsed` and sets `user_toggled` (manual state is sticky — auto-collapse never fights the user). Settled + collapsed shows the cover alone; live + collapsed adds the running/latest entry; expanded nests every entry under a slight indent with a left rail, each entry (`render_activity_entry`) itself collapsible to its full tool output via `render_tool_output`. Segments with fewer than two entries render flat with no cover. An approval-pending entry force-opens the segment so the interactive row is never hidden. The following reply's model row carries only the segment's elapsed (`activity_secs`); counts live on the cover alone. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls fold here instead of producing standalone cards. An autopilot auto-approved call renders a muted `check-check` badge immediately before its own status icon (the `ToolCallItem.auto_approved` flag, stamped live on `ApprovalDecision::Allow` and restored from a persisted `AutoApproval` note); the former "Auto-approved" notice card no longer exists, though escalated calls still post an anchored notice.
 
-> Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `thinking_summary`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
+> Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `segment_layout`, `segment_stats`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
 
 #### ToolCallCard
 
-A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). An autopilot auto-approved call (`ToolCallItem.auto_approved`) renders a muted `check-check` badge ahead of its status label.
+A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into an [ActivitySegment](#activitysegment) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). An autopilot auto-approved call (`ToolCallItem.auto_approved`) renders a muted `check-check` badge ahead of its status label.
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 
@@ -445,13 +445,24 @@ Flat stack of follow-up items parked above the input while a turn is running. Ev
 
 #### AttachmentChips
 
-Horizontal row of file/plugin attachment chips (conditional).
+Vertical stack of up to two chip rows above the composer (conditional,
+rendered by `Workspace::render_attachments`): a file/image attachment row
+(`render_attachment_chips`, cleared on submit) and an opt-in browser-suite row
+(`render_browser_chips`, persists across submits; removing a chip deactivates
+the ChromeUse / WebExplore tool suite).
 
-> Source: `agent-ui/src/views/composer_menu.rs`
+> Source: `agent-ui/src/workspace.rs` + `agent-ui/src/views/composer_menu.rs`
 
 #### AttachmentChip
 
 Single attachment chip: icon + filename + remove btn.
+
+> Source: `agent-ui/src/views/composer_menu.rs`
+
+#### BrowserSuiteChip
+
+Single browser-tool-suite chip: globe/frame icon + localized suite name +
+remove btn. Removing it calls `deactivate_browser_tool_suite`.
 
 > Source: `agent-ui/src/views/composer_menu.rs`
 

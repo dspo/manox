@@ -1149,6 +1149,9 @@ pub struct AgentSessionBuilder {
     model_runtime: Option<ModelRuntime>,
     resources: Option<HarnessResources>,
     tools: Vec<Arc<dyn AgentTool>>,
+    /// Initial active tool subset; `None` when the full mounted set is in
+    /// play or the TS default four applies.
+    initial_active_tools: Option<Vec<String>>,
     model: Option<Model>,
     system_prompt: Option<String>,
     settings: Option<crate::settings::Settings>,
@@ -1212,6 +1215,14 @@ impl AgentSessionBuilder {
     /// Mount an allow list of tools; defaults to the seven built-ins.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Pin the initial active tool subset the model sees. `None` (default)
+    /// falls through to the TS default four (when no custom tools are given)
+    /// or the full mounted set (when custom tools are given).
+    pub fn with_initial_active_tools(mut self, names: Vec<String>) -> Self {
+        self.initial_active_tools = Some(names);
         self
     }
 
@@ -1322,16 +1333,19 @@ impl AgentSessionBuilder {
         // custom tool list is given. It drives BOTH the initial system
         // prompt and the in-memory harness state, and is the restore default
         // when a reopened path carries no `active_tools_change` entry.
-        let facade_initial_active: Option<Vec<String>> = if self.tools.is_empty() {
-            Some(vec![
-                "Read".into(),
-                "Bash".into(),
-                "Edit".into(),
-                "Write".into(),
-            ])
-        } else {
-            None
-        };
+        let facade_initial_active: Option<Vec<String>> =
+            self.initial_active_tools.clone().or_else(|| {
+                if self.tools.is_empty() {
+                    Some(vec![
+                        "Read".into(),
+                        "Bash".into(),
+                        "Edit".into(),
+                        "Write".into(),
+                    ])
+                } else {
+                    None
+                }
+            });
         let active_tools: Vec<String> = facade_initial_active
             .clone()
             .unwrap_or_else(|| tools.iter().map(|t| t.name().to_string()).collect());

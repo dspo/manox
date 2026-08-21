@@ -14,13 +14,15 @@
 //! / `Write`. Chrome's network egress bypasses the bash sandbox proxy.
 
 mod bridge;
+mod discovery;
 mod runtime;
 mod snapshot;
 mod tools;
 
 pub use runtime::{ChromeTabId, shutdown};
 pub use tools::{
-    ChromeUseClickTool, ChromeUseCloseTool, ChromeUseEvaluateTool, ChromeUseNavigateTool,
+    ChromeUseClickTool, ChromeUseCloseTool, ChromeUseEvaluateTool,
+    ChromeUseFindChromiumExecutableTool, ChromeUseHoverTool, ChromeUseNavigateTool,
     ChromeUseOpenTool, ChromeUsePressKeyTool, ChromeUseScreenshotTool, ChromeUseScrollTool,
     ChromeUseSelectOptionTool, ChromeUseSnapshotTool, ChromeUseTabsTool, ChromeUseTypeTool,
     ChromeUseWaitForTool,
