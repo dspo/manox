@@ -50,6 +50,7 @@ use gpui_component::{
 use gpui_component::{WindowExt as _, notification::Notification, tooltip::Tooltip};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
+use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
 use crate::cockpit::{CockpitPhase, format_elapsed};
@@ -102,6 +103,36 @@ enum RightTab {
     Subagent(String),
     /// An embedded terminal/CLI-agent session, keyed by `ExternalSession.id`.
     Session(String),
+}
+
+/// Persisted shape of a thread's right-pane state — one row per thread in
+/// `threads.db` (`thread_right_pane`). The UI layer owns this shape; the db
+/// stores opaque TEXT. Subagent tabs are ephemeral by design and never
+/// serialized.
+#[derive(Serialize, Deserialize)]
+struct PersistedRightPane {
+    visible: bool,
+    active: usize,
+    tabs: Vec<PersistedRightTab>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedRightTab {
+    Editor,
+    Launcher,
+    Browser { url: String },
+    Member { name: String },
+    Session { id: String },
+}
+
+/// In-session per-thread right-pane stash: the live tabs (browser views and
+/// member panels keep their entities across switches), the active index, and
+/// visibility. The persistent copy lives in `threads.db`.
+struct RightPaneSnapshot {
+    tabs: Vec<RightTab>,
+    active: usize,
+    visible: bool,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -304,6 +335,9 @@ pub struct Workspace {
     /// keeps every tab (and its state) alive for the next toggle. Closing the
     /// last tab hides the pane; the TitleBar toggle restores the tabs.
     right_pane_visible: bool,
+    /// Per-thread right-pane stash for in-session round trips; the persistent
+    /// copy lives in `threads.db` (`thread_right_pane`).
+    right_pane_by_thread: HashMap<String, RightPaneSnapshot>,
     /// The tab currently under the mouse — the close `×` reveals on hover.
     hovered_right_tab: Option<usize>,
     /// Generation counter for the browser page-title ticker; bumped when the
@@ -714,6 +748,7 @@ impl Workspace {
             right_tabs: Vec::new(),
             active_right_tab: 0,
             right_pane_visible: false,
+            right_pane_by_thread: HashMap::new(),
             hovered_right_tab: None,
             browser_title_ticker_gen: 0,
             launcher_menu: None,
@@ -2761,8 +2796,8 @@ impl Workspace {
             .position(|t| matches!(t, RightTab::Session(sid) if *sid == id))
         {
             self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
-            self.hide_right_pane_if_empty();
+            self.reseat_active_after_close(ix, cx);
+            self.hide_right_pane_if_empty(cx);
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
@@ -2806,24 +2841,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> BrowserTabId {
-        let url = if url.is_empty() {
-            crate::views::browser_view::DEFAULT_URL
-        } else {
-            url
-        };
-        let tab_id = crate::views::browser_view::allocate_tab_id();
-        let view =
-            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
-        self.browser_views.insert(tab_id, view);
-        // Route the UI-opened tab through the host so the title poll can
-        // reach it (tool-opened tabs register inside the host's `open_tab`).
-        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-            host.register_ui_tab(tab_id, self.thread.downgrade());
-        }
+        let tab_id = self.restore_browser_tab(url, window, cx);
         self.right_pane_visible = true;
         self.right_tabs.push(RightTab::Browser(tab_id));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);
-        self.spawn_browser_title_ticker(cx);
         tab_id
     }
 
@@ -2928,8 +2949,8 @@ impl Workspace {
             .position(|t| matches!(t, RightTab::Browser(id) if *id == tab_id))
         {
             self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
-            self.hide_right_pane_if_empty();
+            self.reseat_active_after_close(ix, cx);
+            self.hide_right_pane_if_empty(cx);
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
@@ -3311,7 +3332,12 @@ impl Workspace {
 
         // Sub-agent observation is per-thread ephemeral state; drop the
         // outgoing thread's panels and transcripts before rebinding.
-        self.clear_subagent_observation();
+        self.clear_subagent_observation(cx);
+        // The right pane belongs to a thread: stash the outgoing pane (live
+        // tabs, active index, visibility) to the in-session map + threads.db
+        // before the incoming thread rebinds. Subagent tabs were already
+        // stripped above, so the stash never carries ephemeral entries.
+        self.stash_right_pane(old_id.clone(), cx);
 
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
@@ -3436,6 +3462,10 @@ impl Workspace {
         let editor_saved = self.editor_drafts.remove(&new_id).unwrap_or_default();
         self.editor_state
             .update(cx, |s, cx| s.set_value(editor_saved, window, cx));
+        // Restore the incoming thread's right pane: the in-session stash,
+        // else the threads.db snapshot; a thread with neither gets the empty
+        // hidden pane.
+        self.restore_right_pane(&new_id, window, cx);
         // Reveal the latest turn for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. Both running and completed threads arm `FollowMode::Tail`:
@@ -4365,7 +4395,7 @@ impl Workspace {
 
     /// Closing the last tab hides the pane; the TitleBar toggle restores the
     /// surviving tabs on the next open.
-    fn hide_right_pane_if_empty(&mut self) {
+    fn hide_right_pane_if_empty(&mut self, cx: &mut Context<Self>) {
         if self.right_tabs.is_empty() {
             self.right_pane_visible = false;
         }
@@ -4375,6 +4405,215 @@ impl Workspace {
         {
             self.hovered_right_tab = None;
         }
+        self.persist_right_pane(cx);
+    }
+
+    /// Snapshot the live pane into its persistable form: subagent tabs drop
+    /// out (ephemeral) and the active index remaps into the filtered list
+    /// (falling back to the head when the active tab was one).
+    fn persisted_right_pane(&self, cx: &App) -> PersistedRightPane {
+        let mut tabs: Vec<PersistedRightTab> = Vec::new();
+        let mut active = 0usize;
+        for (ix, tab) in self.right_tabs.iter().enumerate() {
+            let persisted = match tab {
+                RightTab::Editor => Some(PersistedRightTab::Editor),
+                RightTab::Launcher => Some(PersistedRightTab::Launcher),
+                RightTab::Browser(id) => {
+                    let url = self
+                        .browser_views
+                        .get(id)
+                        .map(|v| v.read(cx).url().to_string())
+                        .unwrap_or_default();
+                    Some(PersistedRightTab::Browser { url })
+                }
+                RightTab::Member(name) => Some(PersistedRightTab::Member { name: name.clone() }),
+                RightTab::Session(id) => Some(PersistedRightTab::Session { id: id.clone() }),
+                RightTab::Subagent(_) => None,
+            };
+            if let Some(p) = persisted {
+                if ix == self.active_right_tab {
+                    active = tabs.len();
+                }
+                tabs.push(p);
+            }
+        }
+        PersistedRightPane {
+            visible: self.right_pane_visible,
+            active,
+            tabs,
+        }
+    }
+
+    /// Write the foreground thread's live pane state to `threads.db`. The
+    /// mutation primitives (tab activate/close, visibility toggle) call this,
+    /// so the persisted row tracks the pane on every change.
+    fn persist_right_pane(&mut self, cx: &mut Context<Self>) {
+        let thread_id = self.thread.read(cx).id.0.clone();
+        let persisted = self.persisted_right_pane(cx);
+        let json = match serde_json::to_string(&persisted) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize right pane failed");
+                return;
+            }
+        };
+        let db = agent::thread_store_global().read(cx).db().clone();
+        if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
+            tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
+        }
+    }
+
+    /// Per-thread isolation: move the outgoing thread's live pane (tabs,
+    /// active index, visibility) into the in-session stash and persist it to
+    /// `threads.db`, then reset the pane to the empty state for the incoming
+    /// thread.
+    fn stash_right_pane(&mut self, thread_id: String, cx: &mut Context<Self>) {
+        let persisted = self.persisted_right_pane(cx);
+        let json = serde_json::to_string(&persisted)
+            .inspect_err(|e| tracing::warn!(error = %e, "serialize right pane failed"))
+            .ok();
+        if let Some(json) = json {
+            let db = agent::thread_store_global().read(cx).db().clone();
+            if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
+                tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
+            }
+        }
+        self.right_pane_by_thread.insert(
+            thread_id,
+            RightPaneSnapshot {
+                tabs: std::mem::take(&mut self.right_tabs),
+                active: self.active_right_tab,
+                visible: self.right_pane_visible,
+            },
+        );
+        self.active_right_tab = 0;
+        self.right_pane_visible = false;
+        self.hovered_right_tab = None;
+        self.editor_open = false;
+    }
+
+    /// Restore the incoming thread's pane: the in-session stash first (live
+    /// tabs keep their webview/panel entities), else the `threads.db`
+    /// snapshot re-materialized; a thread with neither gets the empty hidden
+    /// pane.
+    fn restore_right_pane(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.right_pane_by_thread.remove(thread_id) {
+            Some(snapshot) => {
+                // A stashed tab may outlive its backing entity: browser
+                // views can be closed and external sessions can exit while
+                // another thread is foreground. Drop the orphaned tabs.
+                let mut tabs = snapshot.tabs;
+                tabs.retain(|t| match t {
+                    RightTab::Browser(id) => self.browser_views.contains_key(id),
+                    RightTab::Session(id) => self.external_sessions.iter().any(|s| s.id == *id),
+                    _ => true,
+                });
+                self.right_tabs = tabs;
+                self.right_pane_visible = snapshot.visible;
+                self.hovered_right_tab = None;
+                if self.right_tabs.is_empty() {
+                    self.active_right_tab = 0;
+                    self.right_pane_visible = false;
+                    self.editor_open = false;
+                } else {
+                    let active = snapshot.active.min(self.right_tabs.len() - 1);
+                    self.set_active_right_tab(active, cx);
+                }
+            }
+            None => {
+                let loaded = agent::thread_store_global()
+                    .read(cx)
+                    .db()
+                    .load_right_pane(thread_id);
+                let persisted = match loaded {
+                    Ok(Some(json)) => match serde_json::from_str::<PersistedRightPane>(&json) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(error = %e, thread_id = %thread_id, "decode right pane snapshot failed");
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, thread_id = %thread_id, "load right pane snapshot failed");
+                        None
+                    }
+                };
+                self.right_tabs.clear();
+                self.hovered_right_tab = None;
+                if let Some(persisted) = persisted {
+                    self.materialize_right_pane(persisted, window, cx);
+                } else {
+                    self.active_right_tab = 0;
+                    self.right_pane_visible = false;
+                    self.editor_open = false;
+                }
+            }
+        }
+    }
+
+    /// Rebuild a persisted pane into live tabs. Browser tabs recreate their
+    /// webview from the stored URL (the app-restart path); member tabs only
+    /// restore while the thread's team still has the member; session tabs
+    /// only while the external session is still alive — everything else
+    /// drops silently.
+    fn materialize_right_pane(
+        &mut self,
+        persisted: PersistedRightPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for tab in persisted.tabs {
+            match tab {
+                PersistedRightTab::Editor => self.right_tabs.push(RightTab::Editor),
+                PersistedRightTab::Launcher => self.right_tabs.push(RightTab::Launcher),
+                PersistedRightTab::Browser { url } => {
+                    let id = self.restore_browser_tab(&url, window, cx);
+                    self.right_tabs.push(RightTab::Browser(id));
+                }
+                // `open_member_tab` no-ops (pushes nothing) when the team or
+                // member is gone — exactly the drop semantics.
+                PersistedRightTab::Member { name } => self.open_member_tab(&name, cx),
+                PersistedRightTab::Session { id } => {
+                    if self.external_sessions.iter().any(|s| s.id == id) {
+                        self.right_tabs.push(RightTab::Session(id));
+                    }
+                }
+            }
+        }
+        self.right_pane_visible = persisted.visible && !self.right_tabs.is_empty();
+        if self.right_tabs.is_empty() {
+            self.active_right_tab = 0;
+            self.editor_open = false;
+        } else {
+            let active = persisted.active.min(self.right_tabs.len() - 1);
+            self.set_active_right_tab(active, cx);
+        }
+    }
+
+    /// Recreate a persisted browser tab's webview (app-restart path): build
+    /// the view, register it in the host routing table, arm the title poll —
+    /// tab-list placement is the caller's.
+    fn restore_browser_tab(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BrowserTabId {
+        let url = if url.is_empty() {
+            crate::views::browser_view::DEFAULT_URL
+        } else {
+            url
+        };
+        let tab_id = crate::views::browser_view::allocate_tab_id();
+        let view =
+            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
+        self.browser_views.insert(tab_id, view);
+        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+            host.register_ui_tab(tab_id, self.thread.downgrade());
+        }
+        self.spawn_browser_title_ticker(cx);
+        tab_id
     }
 
     /// Toggle the right pane's visibility from the TitleBar button. Hiding
@@ -4390,6 +4629,7 @@ impl Workspace {
                 self.active_right_tab = 0;
             }
         }
+        self.persist_right_pane(cx);
         cx.notify();
     }
 
@@ -4443,7 +4683,7 @@ impl Workspace {
             LauncherPick::Browser => {
                 if matches!(self.right_tabs.get(launcher_ix), Some(RightTab::Launcher)) {
                     self.right_tabs.remove(launcher_ix);
-                    self.reseat_active_after_close(launcher_ix);
+                    self.reseat_active_after_close(launcher_ix, cx);
                 }
                 let tab_id =
                     self.open_browser_tab(crate::views::browser_view::DEFAULT_URL, window, cx);
@@ -4573,6 +4813,7 @@ impl Workspace {
             .right_tabs
             .get(self.active_right_tab)
             .is_some_and(|t| matches!(t, RightTab::Editor));
+        self.persist_right_pane(cx);
         cx.notify();
     }
 
@@ -4581,7 +4822,7 @@ impl Workspace {
     /// `removed_ix` shift left by one, so a still-live active tab to the right
     /// must decrement; the active tab itself being removed (and being the
     /// last) falls back to the new last tab.
-    fn reseat_active_after_close(&mut self, removed_ix: usize) {
+    fn reseat_active_after_close(&mut self, removed_ix: usize, cx: &mut Context<Self>) {
         if self.active_right_tab > removed_ix {
             self.active_right_tab -= 1;
         } else if self.active_right_tab >= self.right_tabs.len() {
@@ -4590,6 +4831,7 @@ impl Workspace {
         // Tab indices shifted — the cached hover index would name the wrong
         // tab until the next mouse move recomputes it.
         self.hovered_right_tab = None;
+        self.persist_right_pane(cx);
     }
 
     /// Open the markdown editor: hide the inline composer and transfer its draft
@@ -4635,8 +4877,8 @@ impl Workspace {
         });
         self.editor_state
             .update(cx, |s, cx| s.set_value("", window, cx));
-        self.reseat_active_after_close(ix);
-        self.hide_right_pane_if_empty();
+        self.reseat_active_after_close(ix, cx);
+        self.hide_right_pane_if_empty(cx);
         self.editor_open = self
             .right_tabs
             .get(self.active_right_tab)
@@ -4656,23 +4898,23 @@ impl Workspace {
             Some(RightTab::Member(name)) => {
                 self.member_panels.remove(&name);
                 self.right_tabs.remove(ix);
-                self.reseat_active_after_close(ix);
-                self.hide_right_pane_if_empty();
+                self.reseat_active_after_close(ix, cx);
+                self.hide_right_pane_if_empty(cx);
                 cx.notify();
             }
             Some(RightTab::Subagent(id)) => {
                 self.subagent_panels.remove(&id);
                 self.right_tabs.remove(ix);
-                self.reseat_active_after_close(ix);
-                self.hide_right_pane_if_empty();
+                self.reseat_active_after_close(ix, cx);
+                self.hide_right_pane_if_empty(cx);
                 cx.notify();
             }
             Some(RightTab::Launcher) | None => {
                 if ix < self.right_tabs.len() {
                     self.close_launcher_menu();
                     self.right_tabs.remove(ix);
-                    self.reseat_active_after_close(ix);
-                    self.hide_right_pane_if_empty();
+                    self.reseat_active_after_close(ix, cx);
+                    self.hide_right_pane_if_empty(cx);
                     cx.notify();
                 }
             }
@@ -4799,7 +5041,7 @@ impl Workspace {
     }
 
     /// Drop per-thread sub-agent observation state and close its tabs.
-    fn clear_subagent_observation(&mut self) {
+    fn clear_subagent_observation(&mut self, cx: &mut Context<Self>) {
         self.subagent_panels.clear();
         self.subagent_transcripts.clear();
         let before = self.right_tabs.len();
@@ -4824,7 +5066,7 @@ impl Workspace {
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
         }
-        self.hide_right_pane_if_empty();
+        self.hide_right_pane_if_empty(cx);
     }
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
