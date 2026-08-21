@@ -1225,6 +1225,7 @@ fn build_tools(
                     return false;
                 };
                 late_bus.set_subagent_tool(build_subagent(&model));
+                tracing::info!("steer bus: subagent tool late-wired from live model slot");
                 true
             });
             bus.set_late_configure(configure);
