@@ -391,7 +391,7 @@ mod tests {
             text: text.to_string(),
             streaming: false,
             token_usage: None,
-            activity_summary: None,
+            activity_secs: None,
         }
     }
 
