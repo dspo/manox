@@ -306,6 +306,10 @@ pub struct Workspace {
     /// status=Success/Error), used as the panel's final answer when the
     /// Agent tool-result is absent (new Steer bus has no ToolResult).
     subagent_final_text: HashMap<String, String>,
+    /// The Captain's dispatch prompt per subagent address, captured from the
+    /// Steer tool call so a panel always shows the opening user message even
+    /// before the child streams anything.
+    subagent_prompts: HashMap<String, String>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -669,6 +673,7 @@ impl Workspace {
             subagent_panels: HashMap::new(),
             subagent_transcripts: HashMap::new(),
             subagent_final_text: HashMap::new(),
+            subagent_prompts: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -1383,6 +1388,22 @@ impl Workspace {
                             .push(child.clone());
                         if let Some(panel) = this.subagent_panels.get(id) {
                             panel.update(cx, |p, cx| p.push(child, cx));
+                        }
+                    }
+                    // Capture the Captain's dispatch prompt from the Steer
+                    // tool call so the subagent panel can show the opening
+                    // user message even before the child streams anything.
+                    if let ThreadEvent::ToolCall { name, input, .. } = ev
+                        && name == "Steer"
+                        && let Some(args) = input
+                    {
+                        let addr = args
+                            .get("to")
+                            .and_then(|t| t.get("agent_address"))
+                            .and_then(|v| v.as_str());
+                        let prompt = args.get("prompt").and_then(|v| v.as_str());
+                        if let (Some(addr), Some(prompt)) = (addr, prompt) {
+                            this.subagent_prompts.insert(addr.to_string(), prompt.to_string());
                         }
                     }
                     let weak = cx.weak_entity();
@@ -4312,11 +4333,13 @@ impl Workspace {
         } else {
             subagent_type.to_string()
         };
+        let prompt = self.subagent_prompts.get(id).cloned();
         let panel = crate::views::subagent_panel::SubagentPanel::new(
             title,
             role,
             status,
             &backfill,
+            prompt,
             final_text,
             cx.weak_entity(),
             cx,

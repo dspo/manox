@@ -77,11 +77,13 @@ pub(crate) struct SubagentPanel {
 }
 
 impl SubagentPanel {
+    #[allow(clippy::too_many_arguments)] // constructor inputs are distinct presentation values, not a bundleable config
     pub(crate) fn new(
         title: String,
         role: String,
         status: ToolCallStatus,
         backfill: &[SubagentChildEvent],
+        prompt: Option<String>,
         final_text: Option<String>,
         weak_workspace: WeakEntity<Workspace>,
         cx: &mut App,
@@ -92,43 +94,42 @@ impl SubagentPanel {
         };
         let final_note = backfill.is_empty() && final_text.is_some();
         let role_for_conv = role.clone();
-        let conversation = if backfill.is_empty() {
-            match final_text {
-                // Replay the final answer as a one-message conversation so
-                // the fallback renders through the same pipeline.
-                Some(final_text) => {
-                    let display = vec![agent::db::HistoryEntry::Message(Message::assistant(vec![
-                        MessageContent::Text(final_text),
-                    ]))];
-                    let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
-                    cx.new(|cx| {
-                        ConversationState::rebuild_from_display(
-                            &display,
-                            &empty_usage,
-                            &role_for_conv,
-                            false,
-                            ctx,
-                            cx,
-                        )
-                    })
-                }
-                None => cx.new(|_| ConversationState::new()),
+        // Seed the Captain's dispatch prompt as the opening user bubble so the
+        // panel always shows the conversation's first message; the final-answer
+        // fallback (when nothing was bridged) and the bridged child events
+        // follow through the same display/apply pipeline as the main thread.
+        let mut display = Vec::new();
+        if let Some(prompt) = prompt {
+            display.push(agent::db::HistoryEntry::Message(Message::user(prompt)));
+        }
+        if backfill.is_empty()
+            && let Some(final_text) = final_text
+        {
+            display.push(agent::db::HistoryEntry::Message(Message::assistant(vec![
+                MessageContent::Text(final_text),
+            ])));
+        }
+        let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
+        let conversation = cx.new(|cx| {
+            let mut conversation = ConversationState::rebuild_from_display(
+                &display,
+                &empty_usage,
+                &role_for_conv,
+                false,
+                ctx.clone(),
+                cx,
+            );
+            for child in backfill {
+                conversation.apply(
+                    &thread_event_of(child),
+                    &role_for_conv,
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
             }
-        } else {
-            cx.new(|cx| {
-                let mut conversation = ConversationState::new();
-                for child in backfill {
-                    conversation.apply(
-                        &thread_event_of(child),
-                        &role_for_conv,
-                        None,
-                        ctx.clone(),
-                        cx,
-                    );
-                }
-                conversation
-            })
-        };
+            conversation
+        });
         cx.new(|_| Self {
             title,
             status,
