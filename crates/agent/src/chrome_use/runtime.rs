@@ -119,6 +119,7 @@ impl ChromeUseRuntime {
         &self,
         cdp_endpoint: Option<&str>,
         headless: Option<bool>,
+        executable: Option<&str>,
         cancel: Option<&CancelToken>,
     ) -> Result<(), String> {
         let mut guard = self.lock();
@@ -129,7 +130,11 @@ impl ChromeUseRuntime {
             // The connection died (Chrome closed externally): rebuild below.
             *guard = None;
         }
-        let chrome = crate::settings::load().chrome;
+        let mut chrome = crate::settings::load().chrome;
+        // One-shot executable override wins over the settings.toml value.
+        if let Some(exe) = executable {
+            chrome.executable = Some(exe.to_string());
+        }
         let endpoint = cdp_endpoint
             .map(str::to_string)
             .or(chrome.cdp_endpoint.clone());
@@ -574,7 +579,8 @@ mod tests {
         // disjoint from the user's daily Chrome profile, so coexisting with a
         // running manox app or Chrome instance is safe.
         let _ = rt.close_session();
-        rt.ensure_session(None, Some(true), None).expect("launch");
+        rt.ensure_session(None, Some(true), None, None)
+            .expect("launch");
 
         let tab = rt.open_tab(Some(&url), None).expect("open tab");
         let snapshot = rt.snapshot(tab, None).expect("snapshot");

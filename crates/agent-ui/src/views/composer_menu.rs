@@ -93,6 +93,25 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     },
 ];
 
+/// `+` menu "Browser" group. "Chrome" activates ChromeUse browser automation
+/// tools; "Internal Web Browser" activates the built-in webview browser tools.
+/// Both are wired by the caller (the workspace activates/deactivates the tool
+/// subset and tracks the chip).
+const PLUS_BROWSER_ROWS: &[MenuRow] = &[
+    MenuRow {
+        icon: IconName::Globe,
+        icon_path: None,
+        name: "composer-add-chrome",
+        desc: "composer-add-chrome-desc",
+    },
+    MenuRow {
+        icon: IconName::Frame,
+        icon_path: None,
+        name: "composer-add-internal-browser",
+        desc: "composer-add-internal-browser-desc",
+    },
+];
+
 /// Render one menu row (icon + name + muted description) as a popup-menu element
 fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     let fg = theme.foreground;
@@ -121,12 +140,14 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
 
 /// Build the `+` popup menu. `on_files` runs when the "Files and folders" row
 /// is clicked (index 0); `on_goal` runs when the "Goal" row is clicked
-/// (index 2).
+/// (index 2); `on_chrome` / `on_internal_browser` run for the browser rows.
 pub fn build_plus_menu(
     menu: PopupMenu,
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
     on_goal: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_chrome: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_internal_browser: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label(i18n::t("composer-add-label"));
@@ -151,6 +172,29 @@ pub fn build_plus_menu(
             }
         }
     }
+    menu = menu.separator().label(i18n::t("composer-browser-label"));
+    let on_chrome = std::rc::Rc::new(on_chrome);
+    let on_internal_browser = std::rc::Rc::new(on_internal_browser);
+    for (ix, row) in PLUS_BROWSER_ROWS.iter().enumerate() {
+        match ix {
+            0 => {
+                let on_chrome = on_chrome.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme).on_click(move |_, window, cx| on_chrome(window, cx)),
+                );
+            }
+            1 => {
+                let on_internal_browser = on_internal_browser.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme)
+                        .on_click(move |_, window, cx| on_internal_browser(window, cx)),
+                );
+            }
+            _ => {
+                menu = menu.item(menu_row_item(row, theme));
+            }
+        }
+    }
     menu = menu.separator().label(i18n::t("composer-plugins-label"));
     for row in PLUS_PLUGIN_ROWS {
         menu = menu.item(menu_row_item(row, theme));
@@ -159,8 +203,9 @@ pub fn build_plus_menu(
 }
 
 /// An attachment staged in the composer but not yet submitted. Either a file
-/// picked from the `+` menu, or an image pasted straight from the clipboard
-/// (resized off-thread on submit).
+/// picked from the `+` menu or an image pasted straight from the clipboard
+/// (resized off-thread on submit). Browser tool-suite chips are tracked
+/// separately by the workspace (they persist across submits).
 #[derive(Debug, Clone)]
 pub enum PendingAttachment {
     File { path: PathBuf, is_image: bool },
@@ -287,6 +332,68 @@ pub fn render_attachment_chips(
                 .child(
                     gpui::div()
                         .id(("attachment-remove", ix))
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(IconName::Close)
+                                .xsmall()
+                                .text_color(theme.muted_foreground),
+                        )
+                        .on_click(move |_, window, cx| on_remove(ix, window, cx)),
+                ),
+        );
+    }
+    v_flex().w_full().child(row).into_any_element()
+}
+
+/// Display metadata for an active browser tool suite chip.
+fn browser_chip_meta(suite: agent::pi_engine::BrowserSuite) -> (IconName, &'static str) {
+    match suite {
+        agent::pi_engine::BrowserSuite::ChromeUse => (IconName::Globe, "composer-add-chrome"),
+        agent::pi_engine::BrowserSuite::WebExplore => {
+            (IconName::Frame, "composer-add-internal-browser")
+        }
+    }
+}
+
+/// Render the active browser-tool-suite chips shown above the composer. These
+/// persist across submits (unlike file attachments); `on_remove(ix)` removes
+/// chip `ix` and deactivates its suite.
+pub fn render_browser_chips(
+    suites: &[agent::pi_engine::BrowserSuite],
+    theme: &Theme,
+    on_remove: impl Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    let on_remove = std::rc::Rc::new(on_remove);
+    let mut row = h_flex().w_full().flex_wrap().gap_1();
+    for (ix, suite) in suites.iter().enumerate() {
+        let on_remove = on_remove.clone();
+        let (icon, label_key) = browser_chip_meta(*suite);
+        let name: SharedString = i18n::t(label_key);
+        row = row.child(
+            h_flex()
+                .id(("browser-chip", ix))
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    Icon::new(icon.clone())
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(name),
+                )
+                .child(
+                    gpui::div()
+                        .id(("browser-chip-remove", ix))
                         .cursor_pointer()
                         .child(
                             Icon::new(IconName::Close)

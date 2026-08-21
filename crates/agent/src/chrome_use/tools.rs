@@ -52,6 +52,11 @@ struct OpenInput {
     /// Headless override; only applied when the session starts.
     #[serde(default)]
     headless: Option<bool>,
+    /// One-shot Chromium executable path override. When set, it takes
+    /// priority over `[chrome].executable` in settings.toml. Use
+    /// `ChromeUseFindChromiumExecutable` to discover available paths.
+    #[serde(default)]
+    executable: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -203,6 +208,10 @@ struct EvaluateInput {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct FindChromiumInput {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CloseInput {
     /// Tab to close; omit to close the whole Chrome session.
     #[serde(default)]
@@ -219,6 +228,8 @@ pub struct ChromeUseNavigateTool;
 pub struct ChromeUseSnapshotTool;
 /// Click an element by snapshot ref.
 pub struct ChromeUseClickTool;
+/// Hover an element by snapshot ref (triggers CSS :hover dropdowns).
+pub struct ChromeUseHoverTool;
 /// Type text into an element by snapshot ref.
 pub struct ChromeUseTypeTool;
 /// Press a native key, optionally focusing a ref first.
@@ -237,6 +248,8 @@ pub struct ChromeUseTabsTool;
 pub struct ChromeUseEvaluateTool;
 /// Close one tab or the whole session.
 pub struct ChromeUseCloseTool;
+/// List Chromium executables discovered on the machine.
+pub struct ChromeUseFindChromiumExecutableTool;
 
 #[async_trait::async_trait]
 impl AgentTool for ChromeUseOpenTool {
@@ -266,7 +279,12 @@ impl AgentTool for ChromeUseOpenTool {
         let input: OpenInput = parse(params)?;
         let (tab_id, report) = super::bridge::run(signal, move |cancel| {
             let rt = runtime::runtime();
-            rt.ensure_session(input.cdp_endpoint.as_deref(), input.headless, cancel)?;
+            rt.ensure_session(
+                input.cdp_endpoint.as_deref(),
+                input.headless,
+                input.executable.as_deref(),
+                cancel,
+            )?;
             let tab_id = rt.open_tab(input.url.as_deref(), cancel)?;
             let report = match input.url {
                 Some(_) => Some(rt.snapshot(tab_id, cancel)?),
@@ -390,6 +408,50 @@ impl AgentTool for ChromeUseClickTool {
         .await?;
         Ok(AgentToolResult::text(format!(
             "Clicked [{ref_id}].\n\n{report}"
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ChromeUseHoverTool {
+    fn name(&self) -> &str {
+        "ChromeUseHover"
+    }
+    fn description(&self) -> &str {
+        "Hover the element `[ref]` from the tab's latest snapshot to trigger CSS :hover \
+         dropdowns and tooltips. Returns the fresh snapshot. Requires approval (subject to \
+         the thread's approval mode)."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        schema::<RefInput>()
+    }
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: serde_json::Value,
+        signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let input: RefInput = parse(params)?;
+        let ref_id = input.ref_id.clone();
+        let report = super::bridge::run(signal, move |cancel| {
+            runtime::runtime().act_on_ref(input.tab_id, &input.ref_id, |entry, selector| {
+                entry
+                    .page
+                    .hover_with_cancel(selector, cancel)
+                    .map_err(|e| format!("hover failed: {e}"))?;
+                entry.refs.clear();
+                let (text, refs) = snapshot::take(&entry.page, cancel)?;
+                entry.refs = refs;
+                Ok(text)
+            })
+        })
+        .await?;
+        Ok(AgentToolResult::text(format!(
+            "Hovered [{ref_id}].\n\n{report}"
         )))
     }
 }
@@ -789,7 +851,7 @@ impl AgentTool for ChromeUseTabsTool {
                 let url = input.url.clone();
                 let tab_id = super::bridge::run(signal, move |cancel| {
                     let rt = runtime::runtime();
-                    rt.ensure_session(None, None, cancel)?;
+                    rt.ensure_session(None, None, None, cancel)?;
                     rt.open_tab(url.as_deref(), cancel)
                 })
                 .await?;
@@ -894,6 +956,39 @@ impl AgentTool for ChromeUseCloseTool {
     }
 }
 
+#[async_trait::async_trait]
+impl AgentTool for ChromeUseFindChromiumExecutableTool {
+    fn name(&self) -> &str {
+        "ChromeUseFindChromiumExecutable"
+    }
+    fn description(&self) -> &str {
+        "List all Chromium/Chrome executables discovered on this machine (Playwright cache, \
+         system paths, PATH, env vars). Returns JSON with path, source, and variant for each. \
+         Read-only — no approval needed."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        schema::<FindChromiumInput>()
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        false
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let candidates = super::discovery::discover_chromium_executables();
+        let json = serde_json::to_string(&candidates)
+            .map_err(|e| ToolError::ExecutionFailed(format!("serialize failed: {e}")))?;
+        Ok(AgentToolResult::text(json))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,10 +1012,13 @@ mod tests {
         assert!(ChromeUseWaitForTool.is_read_only());
         assert!(!ChromeUseScreenshotTool.requires_approval(&serde_json::json!({})));
         assert!(ChromeUseScreenshotTool.is_read_only());
+        assert!(!ChromeUseFindChromiumExecutableTool.requires_approval(&serde_json::json!({})));
+        assert!(ChromeUseFindChromiumExecutableTool.is_read_only());
         // Write axis: approval-gated, not read-only.
         for gated in [
             ChromeUseOpenTool.requires_approval(&serde_json::json!({})),
             ChromeUseNavigateTool.requires_approval(&serde_json::json!({})),
+            ChromeUseHoverTool.requires_approval(&serde_json::json!({})),
             ChromeUseClickTool.requires_approval(&serde_json::json!({})),
             ChromeUseTypeTool.requires_approval(&serde_json::json!({})),
             ChromeUsePressKeyTool.requires_approval(&serde_json::json!({})),
