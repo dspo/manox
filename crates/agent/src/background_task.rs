@@ -54,16 +54,15 @@ pub enum TaskKind {
     MonitorCommand,
     MonitorWebSocket,
     BackgroundBash,
-    /// An asynchronously-dispatched Sailor subagent (general-purpose coding
-    /// worker) running in a background pi session. Completion is delivered to
-    /// the Captain via `BackendNotice::SailorCompleted`; a Running snapshot
-    /// is emitted at dispatch + at settlement so the UI card surfaces during
-    /// the run and its Stop button (`background_task::stop`) cancels the
-    /// child token. The model-facing `TaskStop` stops a Sailor via the
+    /// An asynchronously-dispatched subagent coroutine running in a background
+    /// pi session. Completion is delivered to the Captain as a
+    /// `BackendNotice::SteerDelivered{reason: Complete}` peer message; a
+    /// Running snapshot is emitted at dispatch + at settlement so the UI card
+    /// surfaces during the run and its Stop button (`background_task::stop`)
+    /// cancels the child token, which the run task observes to abort the child
+    /// session. The model-facing `TaskStop` stops a subagent via the
     /// `LegacyAwareTaskStop` host wrapper (which calls `background_task::stop`
-    /// for legacy-registry ids); `BashOutput` does not yet recognize Sailor
-    /// ids (progress-pull follow-up). A parent-turn abort also cancels the
-    /// child token.
+    /// for legacy-registry ids).
     Subagent,
 }
 

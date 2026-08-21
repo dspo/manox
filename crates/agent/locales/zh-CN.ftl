@@ -585,4 +585,4 @@ team-drawer-empty = 暂无成员
 team-drawer-tasks = { $count ->
     [one] { $count } 个任务
    *[other] { $count } 个任务
-}steer-peer-from = 来自 { $agent }
+}

@@ -1662,12 +1662,15 @@ fn drain_engine_notices(
 ) {
     this.spawn(async move |this, cx| {
         while let Some(notice) = events.recv().await {
-            // Continue draining even if handle_notice panics — a single
-            // bad notice (e.g. engine None during Settled re-fire) must
-            // not silently kill the entire drain loop and lose all
-            // subsequent SteerDelivered messages.
-            if this.update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx)).is_err() {
-                tracing::error!("handle_notice panicked — continuing drain");
+            // `update` returns Err only when the Thread entity has been
+            // released (a closure panic would unwind, not become Err) — the
+            // thread is gone, so stop draining instead of looping on a dead
+            // entity while in-flight run tasks keep the sender alive.
+            if this
+                .update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx))
+                .is_err()
+            {
+                break;
             }
         }
     })

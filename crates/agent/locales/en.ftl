@@ -642,4 +642,4 @@ team-drawer-empty = No members
 team-drawer-tasks = { $count ->
     [one] { $count } task
    *[other] { $count } tasks
-}steer-peer-from = from { $agent }
+}

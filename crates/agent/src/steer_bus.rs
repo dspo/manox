@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pi::harness::HarnessHandle;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -28,6 +29,9 @@ use crate::thread_engine::BackendNotice;
 pub struct LiveSubagent {
     pub handle: HarnessHandle,
     pub cancel: CancellationToken,
+    /// Monotonic dispatch generation; a settled run only removes its own
+    /// entry so a same-address re-dispatch is not orphaned by the old run.
+    pub run: u64,
 }
 
 /// Parent routing info injected into a member thread's bus so the member
@@ -46,6 +50,7 @@ pub struct AgentBus {
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     live_subagents: Mutex<BTreeMap<String, LiveSubagent>>,
     spawned_members: Mutex<HashSet<String>>,
+    run_seq: AtomicU64,
     parent_route: Mutex<Option<ParentRoute>>,
     task_list: Mutex<Option<Arc<Mutex<crate::team::TaskList>>>>,
     captain_handle: Mutex<Option<HarnessHandle>>,
@@ -70,6 +75,7 @@ impl AgentBus {
             parent_route: Mutex::new(None),
             task_list: Mutex::new(None),
             captain_handle: Mutex::new(None),
+            run_seq: AtomicU64::new(0),
             weak_self: Mutex::new(Weak::new()),
             subagent_tool: Mutex::new(None),
             tool_ctx: Mutex::new(None),
@@ -160,20 +166,17 @@ impl AgentBus {
             }
 
             // ── Abort subagent ──────────────────────────────────────────
+            // Cancel-only: the run task's select loop observes the token,
+            // aborts the child session and settles silently (no SteerDelivered
+            // here — Complete emission lives solely in the settle path, so an
+            // explicit abort neither double-reports nor revives the Captain).
             (AgentId::Captain, SteerReason::Abort, None)
                 if self.live_subagents.lock().unwrap().contains_key(addr) =>
             {
-                let mut map = self.live_subagents.lock().unwrap();
-                if let Some(live) = map.remove(addr) {
+                let live = self.live_subagents.lock().unwrap().get(addr).cloned();
+                if let Some(live) = live {
                     live.cancel.cancel();
-                    drop(map);
-                    let _ = self.notice_tx.send(BackendNotice::SteerDelivered {
-                        from: AgentId::Subagent(format!("subagent {addr}")),
-                        reason: SteerReason::Complete,
-                        payload: SteerPayload {
-                            text: "subagent aborted".into(),
-                        },
-                    });
+                    live.handle.abort();
                     Ok(ack(addr, false, None))
                 } else {
                     Err(ToolError::ExecutionFailed(format!("agent {addr} gone")))
@@ -235,6 +238,15 @@ impl AgentBus {
             .ok_or_else(|| ToolError::ExecutionFailed("bus gone".into()))?;
         let child_steer = Arc::new(SteerTool::new(bus_arc, AgentId::Subagent(addr.to_string())));
 
+        // Existence check: re-dispatching a live address would overwrite the
+        // first run and orphan it (un-Abort/Inject-able). Matches the schema's
+        // "Error if address exists" contract.
+        if self.live_subagents.lock().unwrap().contains_key(&addr) {
+            return Err(ToolError::InvalidArguments(format!(
+                "agent {addr} already exists"
+            )));
+        }
+        let run = self.run_seq.fetch_add(1, Ordering::SeqCst);
         // Spawn the session.
         let (mut session, session_dir, worktree) = subagent_tool
             .spawn_subagent_session(
@@ -280,9 +292,9 @@ impl AgentBus {
             LiveSubagent {
                 handle: handle.clone(),
                 cancel: task_cancel.clone(),
+                run,
             },
         );
-
         // Spawn the run task.
         let notice_tx = self.notice_tx.clone();
         let weak = self.weak_self.lock().unwrap().clone();
@@ -297,6 +309,8 @@ impl AgentBus {
 
         // session_dir (TempDir) must outlive the spawned task — the session
         // JSONL file lives inside it; dropping it mid-run deletes the dir.
+        let run_cancel = task_cancel.clone();
+        let run_handle = handle.clone();
         crate::runtime::handle().spawn(async move {
             let _session_dir = session_dir; // hold TempDir alive for session lifetime
             // Bridge the child session's streamed events to the workspace so
@@ -317,70 +331,110 @@ impl AgentBus {
                             let _ = notice_tx.send(BackendNotice::Event(Box::new(ev)));
                         }
                     }
+                    // Abort / TaskStop / thread-deletion cancel: stop the child
+                    // instead of letting it burn tokens to natural completion.
+                    _ = run_cancel.cancelled() => {
+                        drop(prompt_fut);
+                        run_handle.abort();
+                        break Err(anyhow::anyhow!("aborted"));
+                    }
                 }
             };
-            // Clean up worktree.
-            if let Some(wt) = worktree {
-                let _ = wt.clean_up(&*tool_ctx2).await;
-            }
-            match result {
-                Ok(messages) => {
-                    let content = extract_final_text(&messages);
-                    task.set_terminal_status(TaskStatus::Completed);
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::BackgroundTaskUpdated {
-                            snapshot: task.snapshot(&task_id),
-                        },
-                    )));
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::SubagentProgress {
-                            id: addr_clone.clone(),
-                            subagent_type: spawn_type.clone(),
-                            tool_uses: 0,
-                            token_usage: crate::language_model::TokenUsage::default(),
-                            latest_activity: Some(content.clone()),
-                            status: crate::thread::ToolCallStatus::Success,
-                        },
-                    )));
-                    if !content.is_empty() {
+            let aborted = run_cancel.is_cancelled();
+            // Clean up the worktree; a kept (non-pristine) worktree's note must
+            // ride the Complete payload so the caller can find the edits.
+            let kept = match worktree {
+                Some(wt) => wt.clean_up(&*tool_ctx2).await,
+                None => None,
+            };
+            let kept_note = kept
+                .as_ref()
+                .map(|k| format!("\n\n[worktree kept: {k}]"))
+                .unwrap_or_default();
+            if aborted {
+                task.set_terminal_status(TaskStatus::Stopped);
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::BackgroundTaskUpdated {
+                        snapshot: task.snapshot(&task_id),
+                    },
+                )));
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::SubagentProgress {
+                        id: addr_clone.clone(),
+                        subagent_type: spawn_type.clone(),
+                        tool_uses: 0,
+                        token_usage: crate::language_model::TokenUsage::default(),
+                        latest_activity: Some("aborted".into()),
+                        status: crate::thread::ToolCallStatus::Cancelled,
+                    },
+                )));
+                // Silent settle on explicit abort: no SteerDelivered, so the
+                // Captain is not revived for a cancellation it requested.
+            } else {
+                match result {
+                    Ok(messages) => {
+                        let content =
+                            format!("{}{kept_note}", truncate_final(&extract_final_text(&messages)));
+                        task.set_terminal_status(TaskStatus::Completed);
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::BackgroundTaskUpdated {
+                                snapshot: task.snapshot(&task_id),
+                            },
+                        )));
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::SubagentProgress {
+                                id: addr_clone.clone(),
+                                subagent_type: spawn_type.clone(),
+                                tool_uses: 0,
+                                token_usage: crate::language_model::TokenUsage::default(),
+                                latest_activity: Some(content.clone()),
+                                status: crate::thread::ToolCallStatus::Success,
+                            },
+                        )));
+                        if !content.is_empty() {
+                            let _ = notice_tx.send(BackendNotice::SteerDelivered {
+                                from: AgentId::Subagent(label),
+                                reason: SteerReason::Complete,
+                                payload: SteerPayload { text: content },
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        task.set_terminal_status(TaskStatus::Failed);
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::BackgroundTaskUpdated {
+                                snapshot: task.snapshot(&task_id),
+                            },
+                        )));
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::SubagentProgress {
+                                id: addr_clone.clone(),
+                                subagent_type: spawn_type.clone(),
+                                tool_uses: 0,
+                                token_usage: crate::language_model::TokenUsage::default(),
+                                latest_activity: Some(
+                                    format!("failed: {e}").chars().take(80).collect(),
+                                ),
+                                status: crate::thread::ToolCallStatus::Error,
+                            },
+                        )));
                         let _ = notice_tx.send(BackendNotice::SteerDelivered {
                             from: AgentId::Subagent(label),
                             reason: SteerReason::Complete,
-                            payload: SteerPayload { text: content },
+                            payload: SteerPayload {
+                                text: format!("subagent failed: {e}{kept_note}"),
+                            },
                         });
                     }
                 }
-                Err(e) => {
-                    task.set_terminal_status(TaskStatus::Failed);
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::BackgroundTaskUpdated {
-                            snapshot: task.snapshot(&task_id),
-                        },
-                    )));
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::SubagentProgress {
-                            id: addr_clone.clone(),
-                            subagent_type: spawn_type.clone(),
-                            tool_uses: 0,
-                            token_usage: crate::language_model::TokenUsage::default(),
-                            latest_activity: Some(
-                                format!("failed: {e}").chars().take(80).collect(),
-                            ),
-                            status: crate::thread::ToolCallStatus::Error,
-                        },
-                    )));
-                    let _ = notice_tx.send(BackendNotice::SteerDelivered {
-                        from: AgentId::Subagent(label),
-                        reason: SteerReason::Complete,
-                        payload: SteerPayload {
-                            text: format!("subagent failed: {e}"),
-                        },
-                    });
-                }
             }
-            // Remove from live_subagents.
+            // Remove only our own run (identity check) so an older settle can't
+            // orphan a same-address re-dispatch.
             if let Some(bus) = weak.upgrade() {
-                bus.live_subagents.lock().unwrap().remove(&addr_clone);
+                let mut map = bus.live_subagents.lock().unwrap();
+                if map.get(&addr_clone).is_some_and(|l| l.run == run) {
+                    map.remove(&addr_clone);
+                }
             }
         });
 
@@ -457,6 +511,20 @@ fn extract_final_text(messages: &[AgentMessage]) -> String {
         }
     }
     String::new()
+}
+
+/// Cap a subagent's final summary before it rides the Complete payload into the
+/// caller's next context window (the retired execute_inner truncated at the
+/// same order of magnitude).
+const FINAL_MAX_BYTES: usize = 128 * 1024;
+const FINAL_MAX_LINES: usize = 2000;
+fn truncate_final(text: &str) -> String {
+    let by_lines: String = text.lines().take(FINAL_MAX_LINES).collect::<Vec<_>>().join("\n");
+    if by_lines.len() > FINAL_MAX_BYTES {
+        by_lines.chars().take(FINAL_MAX_BYTES).collect()
+    } else {
+        by_lines
+    }
 }
 
 // ── SteerTool ────────────────────────────────────────────────────────────
@@ -597,5 +665,88 @@ impl AgentTool for SteerTool {
         self.bus
             .steer(self.from.clone(), to_spec, reason, payload)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bus() -> Arc<AgentBus> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        AgentBus::new("thread-1".into(), tx)
+    }
+
+    fn to(addr: &str, spawn: Option<&str>) -> ToSpec {
+        ToSpec {
+            agent_address: addr.into(),
+            spawn: spawn.map(String::from),
+            isolation: None,
+        }
+    }
+
+    fn payload(text: &str) -> SteerPayload {
+        SteerPayload { text: text.into() }
+    }
+
+    #[test]
+    fn truncate_final_caps_lines_and_bytes() {
+        let many_lines: String = (0..2500).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let out = truncate_final(&many_lines);
+        assert_eq!(out.lines().count(), FINAL_MAX_LINES);
+
+        let big = "x".repeat(FINAL_MAX_BYTES + 10);
+        assert!(truncate_final(&big).len() <= FINAL_MAX_BYTES);
+    }
+
+    #[test]
+    fn first_line_skips_blank_lead() {
+        assert_eq!(first_line("\n  \n  do the thing\nmore"), Some("do the thing".into()));
+        assert_eq!(first_line("   "), None);
+    }
+
+    #[tokio::test]
+    async fn subagent_cannot_spawn() {
+        let bus = bus();
+        let err = bus
+            .steer(
+                AgentId::Subagent("w1".into()),
+                to("w2", Some("Sailor")),
+                SteerReason::Dispatch,
+                payload("x"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn captain_cannot_inject_self() {
+        let bus = bus();
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to("Captain", None),
+                SteerReason::Inject,
+                payload("x"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot steer"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn abort_unknown_address_denied() {
+        let bus = bus();
+        let err = bus
+            .steer(
+                AgentId::Captain,
+                to("ghost", None),
+                SteerReason::Abort,
+                payload("x"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 }

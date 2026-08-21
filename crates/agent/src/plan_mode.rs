@@ -20,7 +20,7 @@ use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
 /// Resolves whether a subagent type is read-only (eligible to dispatch under
 /// plan mode). Built by the host from the live `AgentRegistry` so the gate
-/// shares the `SailorRoutingTool`'s capability routing — write/bash
+/// shares the `AgentRegistry`'s capability routing — write/bash
 /// subagents (`Sailor`) stay blocked.
 pub type ReadOnlySubagentResolver = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 

@@ -537,9 +537,9 @@ fn system_prompt(cwd: &Path) -> String {
          Built-in subagent types: `Explore` (read-only: locates code by \
          file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
          edits files, runs shell commands including cargo/clippy/test). \
-         TeamMembers are real threads — they persist, appear in the sidebar, \
-         and can be resumed; they report back via `Steer(to=<parent_thread_id>, \
-         reason=Inject)`. A subagent (coroutine) is transient; it ends with \
+        TeamMembers are real threads — they persist, appear in the sidebar, \
+        and can be resumed; observe their progress by opening their tab (an \
+        autonomous member-to-parent report channel is not yet wired). \
          a concise summary as its final assistant text (the harness emits \
          Complete with that summary).\n\n\
          Prefer parallel subagents over serial self-work. For splittable \
@@ -1014,7 +1014,7 @@ fn build_tools(
     // registration landed (first seconds after launch) skips it, defaulting
     // to a resolver that blocks every `Agent` call. When the registry is
     // built below the resolver shares that exact `AgentRegistry` Arc so the
-    // gate's read-only notion can never diverge from `SailorRoutingTool`'s
+    // gate's read-only notion can never diverge from the `AgentRegistry`'s
     // capability routing.
     let read_only_subagent = if let Some(model) = model {
         let mut registry = AgentRegistry::new();
