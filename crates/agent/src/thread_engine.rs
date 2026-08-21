@@ -85,6 +85,12 @@ pub trait ThreadEngine: Send + Sync {
     /// Abort the running turn.
     fn abort(&self);
 
+    /// Fan an explicit user cancel out to every TeamMember thread this
+    /// engine's agent bus spawned: each member aborts its active turn (the
+    /// member survives) and its own facade cancel recurses into its
+    /// derivatives. Fire-and-forget; engines without a member bus no-op.
+    fn abort_spawned_members(&self) {}
+
     /// Hot-swap the model for the next provider request.
     fn set_model(&self, model: PiModel);
 

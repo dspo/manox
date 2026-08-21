@@ -203,6 +203,7 @@ struct LiveTranscript {
 pub struct PiEngine {
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     state: Arc<EngineState>,
+    bus: Arc<crate::steer_bus::AgentBus>,
 }
 
 /// Spawn the pi actor and return the engine handle plus its notice receiver.
@@ -222,6 +223,10 @@ pub fn spawn_engine(
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+    // The Steer bus is engine-scoped, not session-scoped: spawned-member
+    // and live-subagent tracking must survive session swaps so a user
+    // cancel always reaches every derivative this thread spawned.
+    let bus = crate::steer_bus::AgentBus::new(thread_id.clone(), notice_tx.clone());
     let model_slot = Arc::new(Mutex::new(model.clone()));
     let gate = Arc::new(ApprovalGate::new(
         notice_tx.clone(),
@@ -264,6 +269,7 @@ pub fn spawn_engine(
         Arc::clone(&state),
         thread_id,
         parent_session,
+        Arc::clone(&bus),
     ));
     // Display-only streaming preview: while the actor's eager restore reads
     // the whole session file, stream its transcript into the mirrored history
@@ -273,7 +279,7 @@ pub fn spawn_engine(
         spawn_history_preview(path, Arc::clone(&state), notice_tx);
     }
     SpawnedEngine {
-        engine: Arc::new(PiEngine { cmd_tx, state }),
+        engine: Arc::new(PiEngine { cmd_tx, state, bus }),
         events: notice_rx,
     }
 }
@@ -406,6 +412,10 @@ impl ThreadEngine for PiEngine {
 
     fn abort(&self) {
         let _ = self.cmd_tx.send(SessionCmd::Abort);
+    }
+
+    fn abort_spawned_members(&self) {
+        self.bus.abort_all_members();
     }
 
     fn set_model(&self, model: PiModel) {
@@ -824,7 +834,7 @@ fn build_tools(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
-    owner_thread_id: &str,
+    bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
     Vec<Arc<dyn PiAgentTool>>,
     SessionOrchestrators,
@@ -1086,12 +1096,11 @@ fn build_tools(
             }
         }
     }
-    // Steer bus: constructed before the model-gated subagent block so the
-    // SteerTool is always registered (even when no model is resolved yet —
-    // Dispatch returns an error until set_subagent_tool is called).
-    let bus = crate::steer_bus::AgentBus::new(owner_thread_id.to_string(), notice_tx.clone());
+    // Steer bus: engine-scoped (created in `spawn_engine`), registered here
+    // before the model-gated subagent block so the SteerTool is always
+    // present (Dispatch returns an error until set_subagent_tool is called).
     tools.push(Arc::new(crate::steer_bus::SteerTool::new(
-        Arc::clone(&bus),
+        Arc::clone(bus),
         pi_extensions::steer_bus::AgentId::Captain,
     )));
     // Plan-mode gate resolver: whether a subagent type is read-only. The
@@ -1202,7 +1211,7 @@ fn build_tools(
         SessionOrchestrators {
             monitor,
             background: manager,
-            bus,
+            bus: Arc::clone(bus),
         },
         read_only_subagent,
     )
@@ -1843,7 +1852,7 @@ fn session_builder(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
     parent_session: Option<&str>,
-    owner_thread_id: &str,
+    bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
     pi::coding_agent::AgentSessionBuilder,
     SessionOrchestrators,
@@ -1859,7 +1868,7 @@ fn session_builder(
         goal_bridge,
         cmd_tx,
         worktree,
-        owner_thread_id,
+        bus,
     );
     let default_active = default_active_tool_names(&tools);
     let mut builder = create_agent_session()
@@ -2108,6 +2117,7 @@ async fn run_actor(
     state: Arc<EngineState>,
     thread_id: String,
     parent_session: Option<String>,
+    bus: Arc<crate::steer_bus::AgentBus>,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -2198,7 +2208,7 @@ async fn run_actor(
             &cmd_tx,
             &state.worktree,
             None,
-            &thread_id,
+            &bus,
         );
         match builder.open(info.path).await {
             Ok(mut s) => {
@@ -2240,7 +2250,7 @@ async fn run_actor(
                 &cmd_tx,
                 &state.worktree,
                 parent_session.as_deref(),
-                &thread_id,
+                &bus,
             );
             // The fresh session carries the facade thread's id so the
             // sidebar row (keyed by session id) and the in-memory thread
@@ -2847,6 +2857,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     &thread_id,
+                    &bus,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2942,6 +2953,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     &thread_id,
+                    &bus,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -2995,6 +3007,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     &thread_id,
+                    &bus,
                 )
                 .await;
                 title_scheduler.retarget(
@@ -3045,7 +3058,7 @@ async fn run_actor(
                     &cmd_tx,
                     &state.worktree,
                     parent_session.as_deref(),
-                    &thread_id,
+                    &bus,
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
@@ -3162,6 +3175,7 @@ async fn rebuild_session(
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
     thread_id: &str,
+    bus: &Arc<crate::steer_bus::AgentBus>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
@@ -3198,7 +3212,7 @@ async fn rebuild_session(
         cmd_tx,
         worktree,
         None,
-        thread_id,
+        bus,
     );
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {

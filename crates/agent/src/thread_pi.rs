@@ -956,9 +956,23 @@ impl Thread {
         cx.notify();
     }
 
+    /// Explicit user cancel (Go-style cancel context): aborts the active
+    /// run, stops every background task this thread owns with TaskStop
+    /// semantics, and aborts every spawned TeamMember's active turn — the
+    /// member's own `cancel` recurses into its derivatives. Natural turn
+    /// settle never reaches this path, so background work survives turns.
     pub fn cancel(&mut self, _cx: &mut Context<Self>) {
         if let Some(engine) = &self.engine {
             engine.abort();
+            engine.abort_spawned_members();
+        }
+        // The runtime is initialized before any UI/actor cancel can fire;
+        // tests that drive a facade without it hold no real tasks to stop.
+        if let Some(handle) = crate::runtime::try_handle() {
+            let thread_id = self.id.0.clone();
+            handle.spawn(async move {
+                crate::background_task::stop_all_for_thread(&thread_id).await;
+            });
         }
     }
 

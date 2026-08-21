@@ -479,6 +479,37 @@ impl AgentBus {
             .map_err(|_| ToolError::ExecutionFailed("bus request dropped".into()))?
             .map_err(ToolError::ExecutionFailed)
     }
+
+    /// Fire-and-forget user-cancel fan-out: one `BusOp::AbortMember` per
+    /// spawned member thread. The replies are discarded — a cancel must
+    /// never block the gpui thread on member round trips, and each member's
+    /// facade-side handler recurses into that member's own derivatives.
+    pub fn abort_all_members(&self) {
+        let members: Vec<String> = self
+            .spawned_members
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        for thread_id in members {
+            let (responder, _reply) = async_channel::bounded(1);
+            let _ = self.notice_tx.send(BackendNotice::BusRequest {
+                op: BusOp::AbortMember { thread_id },
+                responder,
+            });
+        }
+    }
+
+    /// Test-only: register a member id as spawned (production inserts via
+    /// the `dispatch_member` facade round trip).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_spawned_member_for_test(&self, thread_id: &str) {
+        self.spawned_members
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string());
+    }
 }
 
 /// Build a JSON ack tool_result.
@@ -768,5 +799,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    /// The user-cancel fan-out fires one `AbortMember` per spawned member
+    /// (fire-and-forget: replies discarded), and nothing else.
+    #[test]
+    fn abort_all_members_fires_one_abort_per_spawned_member() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = AgentBus::new("thread-1".into(), tx);
+        bus.register_spawned_member_for_test("m1");
+        bus.register_spawned_member_for_test("m2");
+        bus.register_spawned_member_for_test("m3");
+
+        bus.abort_all_members();
+
+        let mut aborted: Vec<String> = Vec::new();
+        while let Ok(notice) = rx.try_recv() {
+            match notice {
+                BackendNotice::BusRequest {
+                    op: BusOp::AbortMember { thread_id },
+                    ..
+                } => aborted.push(thread_id),
+                _ => panic!("unexpected non-AbortMember notice"),
+            }
+        }
+        aborted.sort();
+        assert_eq!(aborted, vec!["m1", "m2", "m3"]);
     }
 }
