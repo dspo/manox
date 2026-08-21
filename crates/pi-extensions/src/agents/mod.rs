@@ -10,18 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pi::coding_agent::ModelRuntime;
-use pi::coding_agent::create_agent_session;
+use pi::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use pi::ext_point_agent::{AgentDef, AgentRegistry};
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError, ToolProgress};
-use pi::tools::truncate::{self, TruncateConfig};
-use serde_json::Value as JsonValue;
+use pi::tool::{AgentTool, ToolContext, ToolError};
 use tokio_util::sync::CancellationToken;
-
-/// Default max bytes for the subagent's returned text.
-const DEFAULT_MAX_BYTES: usize = 128 * 1024;
-/// Default max lines for the subagent's returned text.
-const DEFAULT_MAX_LINES: usize = 2000;
 
 /// The built-in Explore definition, embedded as a manifest.
 pub fn explore_agent_def() -> AgentDef {
@@ -84,6 +76,11 @@ pub struct SubagentTool {
     model_runtime: Option<ModelRuntime>,
     /// Optional explicit model; without one the session uses its default.
     model: Option<pi::types::Model>,
+    /// Live view of the owner's current model. Subagents inherit the caller's
+    /// model at dispatch time (not the snapshot pinned at assembly) so a
+    /// mid-thread model switch is honored instead of falling back to the
+    /// provider default.
+    model_slot: Option<Arc<std::sync::Mutex<Option<pi::types::Model>>>>,
     /// Optional provider registry for resolving a definition's `model`
     /// override (id or alias). Assembly-layer concern per `AgentDef.model`;
     /// injected by the harness that owns the registry.
@@ -95,12 +92,6 @@ pub struct SubagentTool {
     description_override: Option<String>,
 }
 
-/// Static fallback for [`SubagentTool::description`] when no host override is
-/// injected (e.g. unit tests constructing the tool directly).
-const SUBAGENT_TOOL_DEFAULT_DESCRIPTION: &str = "Spawn a subagent from a registered \
-    agent definition to handle a focused task in isolation. Returns the subagent's \
-    final text.";
-
 impl SubagentTool {
     pub fn new(registry: Arc<AgentRegistry>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
         SubagentTool {
@@ -108,6 +99,7 @@ impl SubagentTool {
             tools,
             model_runtime: None,
             model: None,
+            model_slot: None,
             provider_registry: None,
             description_override: None,
         }
@@ -123,6 +115,16 @@ impl SubagentTool {
     /// Pin the model the subagent session uses (wired to the caller's model).
     pub fn with_model(mut self, model: pi::types::Model) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Share the owner's live model slot so dispatch inherits the caller's
+    /// current model rather than the assembly-time snapshot.
+    pub fn with_model_slot(
+        mut self,
+        slot: Arc<std::sync::Mutex<Option<pi::types::Model>>>,
+    ) -> Self {
+        self.model_slot = Some(slot);
         self
     }
 
@@ -147,103 +149,27 @@ impl SubagentTool {
     }
 }
 
-#[async_trait::async_trait]
-impl AgentTool for SubagentTool {
-    fn name(&self) -> &str {
-        "Agent"
-    }
-
-    fn description(&self) -> &str {
-        self.description_override
-            .as_deref()
-            .unwrap_or(SUBAGENT_TOOL_DEFAULT_DESCRIPTION)
-    }
-
-    fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn requires_approval(&self, _params: &JsonValue) -> bool {
-        false
-    }
-
-    fn parameters_schema(&self) -> JsonValue {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "subagent_type": {
-                    "type": "string",
-                    "description": "Name of the registered agent definition to invoke (e.g. Explore)"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The task for the subagent"
-                },
-                "isolation": {
-                    "type": "string",
-                    "description": "Optional dispatch-time isolation. Set to \"worktree\" to run the sub-agent in its own git worktree on a throwaway branch — full filesystem isolation from the parent's working tree (the child cannot write the parent's project root); a clean worktree is auto-removed when the sub-agent finishes. Omit for same-workspace collaborative work.",
-                    "enum": ["worktree"]
-                }
-            },
-            "required": ["subagent_type", "prompt"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
-        ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        self.execute_inner(tool_call_id, params, signal, ctx, None)
-            .await
-    }
-
-    async fn execute_with_progress(
-        &self,
-        tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
-        ctx: &dyn ToolContext,
-        progress: &dyn ToolProgress,
-    ) -> Result<AgentToolResult, ToolError> {
-        self.execute_inner(tool_call_id, params, signal, ctx, Some(progress))
-            .await
-    }
-}
-
 impl SubagentTool {
-    async fn execute_inner(
+    /// Build a child agent session from a registered definition. The caller
+    /// (the host's `AgentBus`) drives `session.prompt(prompt)` and handles
+    /// termination; this function only constructs the session.
+    /// `extra_tools` are appended after `select_tools` (the host injects
+    /// `SteerTool(from=Subagent(addr))` here).
+    pub async fn spawn_subagent_session(
         &self,
-        _tool_call_id: &str,
-        params: JsonValue,
-        signal: CancellationToken,
+        subagent_type: &str,
+        isolation: Option<&str>,
         ctx: &dyn ToolContext,
-        progress: Option<&dyn ToolProgress>,
-    ) -> Result<AgentToolResult, ToolError> {
-        let subagent_type = params["subagent_type"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("subagent_type is required".into()))?;
-        let prompt = params["prompt"]
-            .as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("prompt is required".into()))?;
+        extra_tools: Vec<Arc<dyn AgentTool>>,
+    ) -> Result<(AgentSession, tempfile::TempDir, Option<Worktree>), ToolError> {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
-        // A definition's `model` override wins over the caller's pinned
-        // model — that is the manifest's intent. Resolution needs the
-        // injected provider registry; refuse loudly when the override is
-        // declared but cannot be resolved (missing registry or unknown
-        // reference), never silently fall back.
         let model_override =
             resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
-
-        let selected = select_tools(&self.tools, def);
-        // Optional dispatch-time worktree isolation. The subagent session's
-        // cwd becomes the worktree path so every tool operates inside it;
-        // the worktree is torn down after the session exits.
-        let worktree = if params["isolation"].as_str() == Some("worktree") {
+        let mut selected = select_tools(&self.tools, def);
+        selected.extend(extra_tools);
+        let worktree = if isolation == Some("worktree") {
             Some(Worktree::prepare(ctx).await?)
         } else {
             None
@@ -252,8 +178,6 @@ impl SubagentTool {
             .as_ref()
             .map(|w| w.path.as_path())
             .unwrap_or(ctx.cwd());
-        // The subagent transcript lives in a throwaway temp directory so a
-        // read-only Explore call does not litter the user's project.
         let session_dir =
             tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
         let mut builder = create_agent_session()
@@ -264,96 +188,18 @@ impl SubagentTool {
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
-        // Definition override first, then the caller's pinned model.
-        if let Some(model) = model_override.or_else(|| self.model.clone()) {
+        let inherited = self
+            .model_slot
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap().clone());
+        if let Some(model) = model_override.or_else(|| inherited.or_else(|| self.model.clone())) {
             builder = builder.with_model(model);
         }
-        let mut session = builder
+        let session = builder
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
-
-        // Live observation: the child session's streaming events are bridged
-        // to the parent's ToolProgress channel (the host surfaces them as
-        // the Agent tool call's drill-down transcript + rail activity).
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<pi::types::AgentEvent>();
-        let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
-            let _ = ev_tx.send(event);
-            Box::pin(async move {})
-        }));
-        let forward_child = |event: &pi::types::AgentEvent| {
-            if let Some(progress) = progress
-                && let Some(payload) = subagent_event_json(event)
-            {
-                progress.emit(payload);
-            }
-        };
-
-        // The caller's abort signal must interrupt the subagent mid-run; the
-        // inner session runs on its own token, so race it here.
-        let sig = signal.clone();
-        let mut prompt_fut = Box::pin(session.prompt(prompt));
-        let run_outcome: Result<Vec<pi::types::AgentMessage>, ToolError> = loop {
-            tokio::select! {
-                r = prompt_fut.as_mut() => {
-                    break r.map_err(|e| {
-                        ToolError::ExecutionFailed(format!("subagent failed: {e}"))
-                    });
-                }
-                Some(event) = ev_rx.recv() => forward_child(&event),
-                _ = sig.cancelled() => {
-                    drop(prompt_fut);
-                    let _ = session.abort();
-                    break Err(ToolError::Aborted);
-                }
-            }
-        };
-        // Drain child events queued before settlement so the observer sees
-        // the whole run.
-        while let Ok(event) = ev_rx.try_recv() {
-            forward_child(&event);
-        }
-        // Tear down the worktree (if any) now that the session is done. A
-        // pristine worktree is removed; one with work is kept and its
-        // branch + path ride the result (or, on a real failure, the error)
-        // so the caller can find and later clean up the kept branch.
-        let kept_worktree = if let Some(worktree) = worktree {
-            worktree.clean_up(ctx).await
-        } else {
-            None
-        };
-        let messages = match run_outcome {
-            Ok(m) => m,
-            // A user/TaskStop abort settles silently; the kept worktree (if
-            // any) persists on disk for `git worktree list` to find.
-            Err(ToolError::Aborted) => return Err(ToolError::Aborted),
-            Err(e) => {
-                return Err(match kept_worktree {
-                    Some(kept) => ToolError::ExecutionFailed(format!("{e}\n\n{kept}")),
-                    None => e,
-                });
-            }
-        };
-
-        let text = collect_text(&messages);
-
-        let config = TruncateConfig {
-            max_bytes: DEFAULT_MAX_BYTES,
-            max_lines: DEFAULT_MAX_LINES,
-        };
-        let truncated = truncate::truncate(&text, &config);
-        let mut out = truncated.content;
-        if truncated.was_truncated {
-            let kept = out.lines().count();
-            out.push_str(&format!(
-                "\n\n[output truncated: {kept} of {} lines kept, {} bytes]",
-                truncated.original_lines, truncated.original_bytes
-            ));
-        }
-        if let Some(kept) = kept_worktree {
-            out.push_str(&format!("\n\n{kept}"));
-        }
-        Ok(AgentToolResult::text(out))
+        Ok((session, session_dir, worktree))
     }
 }
 
@@ -364,17 +210,17 @@ impl SubagentTool {
 /// auto-removes a pristine worktree (no commits, no uncommitted changes)
 /// and its branch; a worktree with work is kept and its branch + path are
 /// reported back so the caller never silently loses edits.
-struct Worktree {
-    path: PathBuf,
-    branch: String,
-    repo: PathBuf,
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: String,
+    pub repo: PathBuf,
     /// The repo HEAD SHA captured at `prepare` time; `clean_up` compares the
     /// branch tip against it to detect committed work.
-    base: String,
+    pub base: String,
 }
 
 impl Worktree {
-    async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
+    pub async fn prepare(ctx: &dyn ToolContext) -> Result<Self, ToolError> {
         let repo = ctx.cwd().to_path_buf();
         let suffix = unique_suffix();
         let branch = format!("sailor-{suffix}");
@@ -425,7 +271,7 @@ impl Worktree {
     /// return a message naming the kept branch + path. Best-effort: a git
     /// failure during the pristine check falls back to keeping the worktree
     /// (never destroy work silently).
-    async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
+    pub async fn clean_up(self, ctx: &dyn ToolContext) -> Option<String> {
         if self.is_pristine(ctx).await {
             let rm = format!(
                 "git -C {repo_q} worktree remove {path_q}",
@@ -519,72 +365,14 @@ fn shell_quote(path: &Path) -> String {
 /// (`{"subagent_event": {...}}`). Only observer-relevant events are
 /// forwarded: assistant text/thinking deltas and tool start/end. Everything
 /// else returns `None` (no emit).
-fn subagent_event_json(event: &pi::types::AgentEvent) -> Option<JsonValue> {
-    use pi::types::{AgentEvent, AssistantMessageEvent};
-    let inner = match event {
-        AgentEvent::MessageUpdate {
-            assistant_message_event,
-            ..
-        } => match assistant_message_event {
-            AssistantMessageEvent::TextDelta { delta, .. } if !delta.is_empty() => {
-                serde_json::json!({ "kind": "text", "text": delta })
-            }
-            AssistantMessageEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
-                serde_json::json!({ "kind": "thinking", "text": delta })
-            }
-            _ => return None,
-        },
-        AgentEvent::ToolExecutionStart {
-            tool_call_id,
-            tool_name,
-            arguments,
-        } => {
-            // A one-field hint (path / command / pattern) keeps the rail
-            // activity line informative without shipping full arguments;
-            // the child call id lets observers pair start/end under
-            // parallel child tool execution.
-            let (summary_key, summary) = ["path", "command", "pattern", "query"]
-                .iter()
-                .find_map(|key| {
-                    arguments.get(*key).and_then(|v| v.as_str()).map(|s| {
-                        let trimmed = s.trim();
-                        let value = if trimmed.len() > 80 {
-                            format!("{}…", &trimmed[..trimmed.floor_char_boundary(80)])
-                        } else {
-                            trimmed.to_string()
-                        };
-                        ((*key).to_string(), value)
-                    })
-                })
-                .unzip();
-            serde_json::json!({
-                "kind": "tool_start",
-                "id": tool_call_id,
-                "tool": tool_name,
-                "summary_key": summary_key,
-                "summary": summary
-            })
-        }
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id,
-            tool_name,
-            is_error,
-            ..
-        } => {
-            serde_json::json!({ "kind": "tool_end", "id": tool_call_id, "tool": tool_name, "is_error": is_error })
-        }
-        _ => return None,
-    };
-    Some(serde_json::json!({ "subagent_event": inner }))
-}
-
 /// Resolve a definition's tool names against the caller's tool snapshot.
-/// An empty `tools` list means the full snapshot, minus the `agent` tool
-/// itself: a subagent must not inherit the ability to spawn subagents.
+/// An empty `tools` list means the full snapshot, minus the `Steer` tool
+/// itself: a subagent must not inherit the parent's full-privilege Steer
+/// (the host injects a limited `SteerTool(from=Subagent)` via `extra_tools`).
 fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
     let selected: Vec<_> = tools
         .iter()
-        .filter(|t| t.name() != "Agent")
+        .filter(|t| t.name() != "Steer")
         .filter(|t| def.tools.is_empty() || def.tools.iter().any(|n| n == t.name()))
         .cloned()
         .collect();
@@ -605,30 +393,6 @@ fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn Age
 /// Concatenate the subagent's final answer: the text blocks of the last
 /// assistant message that carried no tool calls, skipping intermediate
 /// narration and tool-result turns.
-fn collect_text(messages: &[pi::types::AgentMessage]) -> String {
-    use pi::types::{AgentMessage, ContentBlock};
-    for message in messages.iter().rev() {
-        let AgentMessage::Assistant { content, .. } = message else {
-            continue;
-        };
-        if content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
-        {
-            continue;
-        }
-        let mut out = String::new();
-        for block in content {
-            if let ContentBlock::Text { text, .. } = block {
-                out.push_str(text);
-                out.push('\n');
-            }
-        }
-        return out.trim().to_string();
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,25 +438,6 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name(), "Read");
     }
-
-    #[test]
-    fn select_tools_never_inherits_the_agent_tool() {
-        // A subagent must not be able to spawn subagents implicitly.
-        let subagent = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
-        let tools: Vec<Arc<dyn AgentTool>> =
-            vec![Arc::new(pi::tools::read::ReadTool), Arc::new(subagent)];
-        let def = AgentDef {
-            name: "X".into(),
-            description: "d".into(),
-            tools: vec![],
-            model: None,
-            system_prompt: "p".into(),
-        };
-        let selected = select_tools(&tools, &def);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].name(), "Read");
-    }
-
     #[test]
     fn select_tools_empty_means_all() {
         let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(pi::tools::read::ReadTool)];
@@ -710,52 +455,6 @@ mod tests {
     /// four. A definition with `tools: []` (Sailor) inherits the full set
     /// minus `Agent`; a read-only definition (Explore) names an explicit
     /// allowlist that keeps the write/exec axis out.
-    #[test]
-    fn select_tools_sailor_gets_full_snapshot_explorer_stays_readonly() {
-        let tools: Vec<Arc<dyn AgentTool>> = vec![
-            Arc::new(pi::tools::read::ReadTool),
-            Arc::new(pi::tools::grep::GrepTool),
-            Arc::new(pi::tools::glob::GlobTool),
-            Arc::new(pi::tools::ls::LsTool),
-            Arc::new(pi::tools::bash::BashTool::new(None)),
-            Arc::new(pi::tools::write::WriteTool),
-            Arc::new(pi::tools::edit::EditTool),
-            Arc::new(SubagentTool::new(Arc::new(AgentRegistry::new()), vec![])),
-        ];
-        let sailor = AgentDef {
-            name: "Sailor".into(),
-            description: "d".into(),
-            tools: vec![],
-            model: None,
-            system_prompt: "p".into(),
-        };
-        let sailor_tools = select_tools(&tools, &sailor);
-        let sailor_names: Vec<&str> = sailor_tools.iter().map(|t| t.name()).collect();
-        assert_eq!(sailor_names.len(), 7, "full snapshot minus Agent");
-        assert!(
-            sailor_names.contains(&"Bash"),
-            "Sailor gets Bash: {sailor_names:?}"
-        );
-        assert!(
-            sailor_names.contains(&"Write"),
-            "Sailor gets Write: {sailor_names:?}"
-        );
-        assert!(
-            sailor_names.contains(&"Edit"),
-            "Sailor gets Edit: {sailor_names:?}"
-        );
-        assert!(!sailor_names.contains(&"Agent"), "Agent is never inherited");
-
-        let explore = explore_agent_def();
-        let explore_tools = select_tools(&tools, &explore);
-        let explore_names: Vec<&str> = explore_tools.iter().map(|t| t.name()).collect();
-        assert_eq!(
-            explore_names,
-            &["Read", "Grep", "Glob", "Ls"],
-            "Explore stays read-only despite the expanded snapshot: {explore_names:?}"
-        );
-    }
-
     /// A real-git round-trip: `Worktree::prepare` creates a worktree on a
     /// throwaway branch; `clean_up` removes it and the branch. Guards against
     /// the two Step-4 invariants: the child cwd lands in the worktree, and
@@ -886,240 +585,6 @@ mod tests {
             .arg(repo)
             .args(["branch", "-D", &branch])
             .output();
-    }
-
-    #[test]
-    fn subagent_tool_contract() {
-        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
-        assert_eq!(tool.name(), "Agent");
-        assert!(
-            tool.parameters_schema()["required"]
-                .as_array()
-                .unwrap()
-                .len()
-                == 2
-        );
-    }
-
-    /// Minimal `ExecutionEnv` standing in for the harness environment.
-    struct MockEnv {
-        cwd: PathBuf,
-    }
-
-    #[async_trait::async_trait]
-    impl pi::env::ExecutionEnv for MockEnv {
-        fn cwd(&self) -> &Path {
-            &self.cwd
-        }
-        fn join_path(&self, parts: &[&str]) -> PathBuf {
-            parts.iter().collect()
-        }
-        async fn absolute_path(&self, path: &Path) -> Result<PathBuf, pi::env::FileError> {
-            Ok(path.to_path_buf())
-        }
-        async fn read_file(
-            &self,
-            _path: &Path,
-            _offset: Option<usize>,
-            _limit: Option<usize>,
-        ) -> Result<String, pi::env::FileError> {
-            Ok(String::new())
-        }
-        async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), pi::env::FileError> {
-            Ok(())
-        }
-        async fn exists(&self, _path: &Path) -> Result<bool, pi::env::FileError> {
-            Ok(true)
-        }
-        async fn file_info(&self, _path: &Path) -> Result<pi::env::FileInfo, pi::env::FileError> {
-            Ok(pi::env::FileInfo {
-                path: _path.to_path_buf(),
-                is_dir: false,
-                size: 0,
-            })
-        }
-        async fn list_dir(
-            &self,
-            _path: &Path,
-        ) -> Result<Vec<pi::env::FileInfo>, pi::env::FileError> {
-            Ok(vec![])
-        }
-        async fn create_dir(&self, _path: &Path) -> Result<(), pi::env::FileError> {
-            Ok(())
-        }
-        async fn remove(&self, _path: &Path) -> Result<(), pi::env::FileError> {
-            Ok(())
-        }
-        async fn exec(
-            &self,
-            _command: &str,
-            _timeout: std::time::Duration,
-            _signal: CancellationToken,
-        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
-            Ok(pi::env::CommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-            })
-        }
-    }
-
-    fn ctx(cwd: &str) -> pi::tool::LocalToolContext {
-        pi::tool::LocalToolContext::new(
-            Arc::new(MockEnv {
-                cwd: PathBuf::from(cwd),
-            }),
-            PathBuf::from(cwd),
-            Arc::new(pi::tool::ToolState::new()),
-        )
-    }
-
-    #[tokio::test]
-    async fn unknown_subagent_type_errors_before_spawning() {
-        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
-        let result = tool
-            .execute(
-                "c1",
-                serde_json::json!({"subagent_type": "nope", "prompt": "hi"}),
-                CancellationToken::new(),
-                &ctx("/tmp"),
-            )
-            .await;
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("unknown subagent_type: nope"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn declared_model_override_without_registry_is_loud() {
-        let mut registry = AgentRegistry::new();
-        registry.register(AgentDef {
-            name: "M".into(),
-            description: "d".into(),
-            tools: vec![],
-            model: Some("some-model".into()),
-            system_prompt: "p".into(),
-        });
-        let tool = SubagentTool::new(Arc::new(registry), vec![]);
-        let result = tool
-            .execute(
-                "c1",
-                serde_json::json!({"subagent_type": "M", "prompt": "hi"}),
-                CancellationToken::new(),
-                &ctx("/tmp"),
-            )
-            .await;
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("no provider registry"),
-            "refuses loudly instead of silently running the caller's model: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_arguments_are_rejected() {
-        let tool = SubagentTool::new(Arc::new(AgentRegistry::new()), vec![]);
-        let result = tool
-            .execute(
-                "c1",
-                serde_json::json!({}),
-                CancellationToken::new(),
-                &ctx("/tmp"),
-            )
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn collect_text_takes_assistant_text_blocks() {
-        use pi::types::{AgentMessage, ContentBlock};
-        let messages = vec![
-            AgentMessage::User {
-                content: vec![ContentBlock::Text {
-                    text: "user text".into(),
-                    signature: None,
-                }],
-                timestamp: chrono::Utc::now(),
-            },
-            AgentMessage::Assistant {
-                content: vec![
-                    ContentBlock::Text {
-                        text: "answer".into(),
-                        signature: None,
-                    },
-                    ContentBlock::Text {
-                        text: " part 2".into(),
-                        signature: None,
-                    },
-                ],
-                model: "m".into(),
-                provider: "p".into(),
-                api: "anthropic".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                stop_reason: None,
-                raw_stop_reason: None,
-                usage: Box::default(),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            },
-        ];
-        assert_eq!(collect_text(&messages), "answer\n part 2");
-    }
-
-    #[test]
-    fn subagent_event_json_forwards_observer_events_only() {
-        use pi::types::{AgentEvent, AssistantMessageEvent};
-
-        // Text delta → forwarded.
-        let payload = subagent_event_json(&AgentEvent::MessageUpdate {
-            message: Box::new(pi::types::AgentMessage::Assistant {
-                content: vec![],
-                model: "m".into(),
-                provider: "p".into(),
-                api: "anthropic".into(),
-                response_model: None,
-                response_id: None,
-                diagnostics: None,
-                stop_reason: None,
-                raw_stop_reason: None,
-                usage: Box::default(),
-                error_message: None,
-                timestamp: chrono::Utc::now(),
-            }),
-            assistant_message_event: AssistantMessageEvent::TextDelta {
-                content_index: 0,
-                delta: "hello".into(),
-            },
-        })
-        .expect("text delta forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "text");
-        assert_eq!(payload["subagent_event"]["text"], "hello");
-
-        // Tool start carries the one-field hint.
-        let payload = subagent_event_json(&AgentEvent::ToolExecutionStart {
-            tool_call_id: "c1".into(),
-            tool_name: "Read".into(),
-            arguments: serde_json::json!({ "path": "src/main.rs" }),
-        })
-        .expect("tool start forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "tool_start");
-        assert_eq!(payload["subagent_event"]["summary"], "src/main.rs");
-
-        // Tool end carries the error flag.
-        let payload = subagent_event_json(&AgentEvent::ToolExecutionEnd {
-            tool_call_id: "c1".into(),
-            tool_name: "Read".into(),
-            result: pi::tool::AgentToolResult::text("ok"),
-            is_error: false,
-        })
-        .expect("tool end forwarded");
-        assert_eq!(payload["subagent_event"]["kind"], "tool_end");
-        assert_eq!(payload["subagent_event"]["is_error"], false);
-
-        // Lifecycle noise (turn start) is not forwarded.
-        assert!(subagent_event_json(&AgentEvent::TurnStart).is_none());
     }
 
     fn registry_with_model(id: &str) -> Arc<pi::ProviderRegistry> {

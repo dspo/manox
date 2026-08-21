@@ -536,31 +536,32 @@ fn system_prompt(cwd: &Path) -> String {
     // what exists.
     prompt.push_str("\n\n## Subagents & parallel work\n");
     prompt.push_str(
-        "You can dispatch subagents via the `Agent` tool — each runs in its \
-         own fresh context (no parent history). The `Agent` tool description \
-         lists the live subagent types and their capability tags; the tag \
-         also says whether the subagent runs synchronously or asynchronously. \
-         Two are built in:\n\
-         - `Explore` (read-only, synchronous): locates code by file, symbol, \
-         or keyword and returns conclusions; it cannot write files or run \
-         commands. The tool call blocks and returns Explore's answer.\n\
-         - `Sailor` (write+bash, asynchronous): a general-purpose coding \
-         worker that reads, writes, and edits files and runs shell commands \
-         (including cargo/clippy/test). The tool returns immediately with a \
-         `{\"sailor_id\": ...}` dispatch handle — NOT the output. Sailor \
-         runs in the background; when it settles its final summary arrives \
-         as a peer message and triggers your next turn. Continue with other \
-         work while Sailors run; do not poll.\n\n\
+        "You can dispatch subagents via the `Steer` tool — each runs in its \
+         own fresh context (no parent history). Set `to.spawn` to a capability \
+         def name (e.g. 'Sailor','Explore') to create an in-thread subagent \
+         coroutine, or 'TeamMember' to create a real manox Thread (a process: \
+         persisted, sidebar-visible, resumable, with its own Captain session). \
+         Only the Captain may spawn. `reason` is Dispatch (start a task), \
+         Inject (mid-run message), or Abort (cancel). Complete is harness-\
+         emitted on subagent termination — not callable; when a subagent \
+         finishes, its final summary arrives as a peer message and triggers \
+         your next turn. Continue with other work while subagents run; do \
+         not poll.\n\n\
+         Built-in subagent types: `Explore` (read-only: locates code by \
+         file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
+         edits files, runs shell commands including cargo/clippy/test). \
+         TeamMembers are real threads — they persist, appear in the sidebar, \
+         and can be resumed; members do not report back autonomously — observe \
+         their progress by opening their tab and Inject guidance as needed \
+         (they cannot reply through the bus yet). A subagent (coroutine) is \
+         transient; it ends with a concise summary as its final assistant \
+         text (the harness emits Complete with that summary).\n\n\
          Prefer parallel subagents over serial self-work. For splittable \
          tasks — reviewing multiple PRs, modifying independent files, \
-         exploring alternatives — emit multiple `Agent` calls in one turn so \
-         they run concurrently. Pass `isolation: \"worktree\"` when a \
+         exploring alternatives — emit multiple `Steer` calls in one turn \
+         so they run concurrently. Pass `isolation: \"worktree\"` when a \
          subagent needs its own working tree (builds won't collide, edits \
-         won't clash; a worktree with work is kept + reported back).\n\n\
-         Prefer multiple `Agent(Sailor)` calls over forming a `Team`. Use \
-         `TeamCreate` only for long-lived work that needs a shared task list \
-         and peer messaging between members; for independent parallel \
-         subtasks, Sailors are lighter and report back directly.\n\n\
+         won't clash).\n\n\
          Each subagent starts from a blank context, so pin any contract it \
          must honor (exact paths, signatures, gate requirements) directly in \
          the prompt.",
@@ -735,91 +736,8 @@ impl pi::tool::AgentTool for LegacyAwareTaskStop {
     }
 }
 
-/// Host wrapper around [`SubagentTool`] that routes general-purpose
-/// (write+bash) subagents through [`SailorManager`] for async dispatch +
-/// completion notification, while read-only subagents (Explore) stay on the
-/// kernel's synchronous path. Routing is by capability, not name, so a
-/// user/plugin definition declaring a write/bash toolset is also async.
-struct SailorRoutingTool {
-    inner: Arc<SubagentTool>,
-    registry: Arc<pi::ext_point_agent::AgentRegistry>,
-    sailor: Arc<crate::sailor_manager::SailorManager>,
-}
-
-impl SailorRoutingTool {
-    /// Whether `params` selects a subagent that should run asynchronously.
-    /// Any definition whose capability is not `read-only` (i.e. it can write
-    /// or run bash) goes through `SailorManager`; read-only ones stay sync.
-    fn is_async_dispatch(&self, params: &serde_json::Value) -> bool {
-        params["subagent_type"]
-            .as_str()
-            .and_then(|t| self.registry.get(t))
-            .map(subagent_capability)
-            .is_some_and(|c| c != "read-only")
-    }
-
-    fn split_params(&self, params: serde_json::Value) -> (String, String, Option<String>) {
-        let st = params["subagent_type"].as_str().unwrap_or("").to_string();
-        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
-        let isolation = params["isolation"].as_str().map(String::from);
-        (st, prompt, isolation)
-    }
-}
-
-#[async_trait::async_trait]
-impl pi::tool::AgentTool for SailorRoutingTool {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-    fn is_read_only(&self) -> bool {
-        false
-    }
-    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
-        false
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    async fn execute(
-        &self,
-        tool_call_id: &str,
-        params: serde_json::Value,
-        signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-        if self.is_async_dispatch(&params) {
-            let (st, prompt, isolation) = self.split_params(params);
-            self.sailor.dispatch(st, prompt, isolation, signal).await
-        } else {
-            self.inner.execute(tool_call_id, params, signal, ctx).await
-        }
-    }
-
-    async fn execute_with_progress(
-        &self,
-        tool_call_id: &str,
-        params: serde_json::Value,
-        signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-        progress: &dyn pi::tool::ToolProgress,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-        if self.is_async_dispatch(&params) {
-            let (st, prompt, isolation) = self.split_params(params);
-            self.sailor.dispatch(st, prompt, isolation, signal).await
-        } else {
-            self.inner
-                .execute_with_progress(tool_call_id, params, signal, ctx, progress)
-                .await
-        }
-    }
-}
-
 /// ChromeUse tool names — opt-in via the composer `+` menu, never in the
-/// default active set.
+/// default active set, and never offered to subagents.
 pub const CHROMEUSE_TOOL_NAMES: &[&str] = &[
     "ChromeUseOpen",
     "ChromeUseNavigate",
@@ -837,7 +755,8 @@ pub const CHROMEUSE_TOOL_NAMES: &[&str] = &[
     "ChromeUseClose",
     "ChromeUseFindChromiumExecutable",
 ];
-/// WebExplore (internal webview browser) tool names — opt-in, not default.
+/// WebExplore (internal webview browser) tool names — opt-in, not default,
+/// and never offered to subagents.
 pub const WEBEXPLORE_TOOL_NAMES: &[&str] = &[
     "WebExploreOpen",
     "WebExploreNavigate",
@@ -885,7 +804,6 @@ impl BrowserSuite {
         }
     }
 }
-
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
@@ -1041,39 +959,20 @@ fn build_tools(
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
-    // Team coordination tools: every session registers the full set; the
-    // facade routes ops through the calling thread's team (leader or
-    // member), and ops without a team return clean errors. Write-axis
-    // governance rides the thread's approval mode like any other tool.
-    tools.push(Arc::new(crate::team::tools::TeamCreateTool::new(
-        notice_tx.clone(),
+    let task_list = Arc::new(std::sync::Mutex::new(
+        crate::team::tools::PlainTaskList::new(),
+    ));
+    tools.push(Arc::new(crate::team::tools::TaskCreateTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TeamSpawnTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskListTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TeamDisbandTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskUpdateTool::with_list(
+        Arc::clone(&task_list),
     )));
-    tools.push(Arc::new(crate::team::tools::TeamDismissTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TeamStatusTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::SendMessageTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TaskCreateTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TaskListTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TaskUpdateTool::new(
-        notice_tx.clone(),
-    )));
-    tools.push(Arc::new(crate::team::tools::TaskGetTool::new(
-        notice_tx.clone(),
+    tools.push(Arc::new(crate::team::tools::TaskGetTool::with_list(
+        Arc::clone(&task_list),
     )));
     // Goal lifecycle tools (GetGoal/CreateGoal/UpdateGoal): ungated like
     // AskUserQuestion/ProposePlan — they persist the durable goal contract,
@@ -1187,12 +1086,20 @@ fn build_tools(
             }
         }
     }
+    // Steer bus: constructed before the model-gated subagent block so the
+    // SteerTool is always registered (even when no model is resolved yet —
+    // Dispatch returns an error until set_subagent_tool is called).
+    let bus = crate::steer_bus::AgentBus::new(owner_thread_id.to_string(), notice_tx.clone());
+    tools.push(Arc::new(crate::steer_bus::SteerTool::new(
+        Arc::clone(&bus),
+        pi_extensions::steer_bus::AgentId::Captain,
+    )));
     // Plan-mode gate resolver: whether a subagent type is read-only. The
     // sub-agent tool needs a concrete model; a session assembled before
     // registration landed (first seconds after launch) skips it, defaulting
     // to a resolver that blocks every `Agent` call. When the registry is
     // built below the resolver shares that exact `AgentRegistry` Arc so the
-    // gate's read-only notion can never diverge from `SailorRoutingTool`'s
+    // gate's read-only notion can never diverge from the `AgentRegistry`'s
     // capability routing.
     let read_only_subagent = if let Some(model) = model {
         let mut registry = AgentRegistry::new();
@@ -1259,6 +1166,9 @@ fn build_tools(
         )
         .with_model_runtime(runtime.clone())
         .with_model(model.clone())
+        // Inherit the Captain's live model at dispatch time (a mid-thread
+        // model switch is honored instead of falling back to the default).
+        .with_model_slot(gate.model_slot())
         // Resolve agent-definition `model` overrides against the live
         // registry (registration has landed before session assembly).
         .with_provider_registry(crate::pi_providers::global());
@@ -1275,34 +1185,14 @@ fn build_tools(
                 subagent
             }
         };
-        // Wrap the SubagentTool so write/bash subagents (Sailor + any
-        // user/plugin def with that capability) dispatch asynchronously
-        // through SailorManager; read-only subagents (Explore) stay on the
-        // kernel's synchronous path. The manager owns an env-backed
-        // ToolContext (cwd = the session's project root) so the spawned
-        // child run needs no borrow of the caller's context.
         let subagent = Arc::new(subagent);
         let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
             Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
             cwd.to_path_buf(),
             Arc::new(pi::tool::ToolState::new()),
         ));
-        let sailor = Arc::new(crate::sailor_manager::SailorManager::new(
-            subagent.clone(),
-            sailor_ctx,
-            notice_tx.clone(),
-            // Attributing the Sailor to this thread lets
-            // `thread_has_running_tasks` count it (sidebar indicator) and
-            // `cancel_all_for_thread` cancel it on thread delete (run_actor
-            // cancels before `cleanup_thread` removes the entry — otherwise
-            // the Sailor would keep burning tokens, unfindable by Stop).
-            owner_thread_id.to_string(),
-        ));
-        tools.push(Arc::new(SailorRoutingTool {
-            inner: subagent,
-            registry,
-            sailor,
-        }));
+        bus.set_subagent_tool(subagent);
+        bus.set_tool_ctx(sailor_ctx);
         resolver
     } else {
         Arc::new(|_: &str| false)
@@ -1312,6 +1202,7 @@ fn build_tools(
         SessionOrchestrators {
             monitor,
             background: manager,
+            bus,
         },
         read_only_subagent,
     )
@@ -1340,26 +1231,22 @@ fn worktree_policy(
         crate::sandbox::SandboxPolicy::for_project(cwd)
     }
 }
-
-/// Session-scoped orchestrators that attach once a session exists: the
-/// monitor manager (background command / WebSocket monitors) and the bash
-/// background manager. Both are held by the session's tools as well, so the
-/// managers live exactly as long as their session — a replaced session drops
-/// its tools, and the monitor manager's `Drop` stops every monitor.
 struct SessionOrchestrators {
     monitor: Arc<MonitorManager>,
     background: Arc<BackgroundManager>,
+    bus: Arc<crate::steer_bus::AgentBus>,
 }
 
 /// Bind the orchestrators to a freshly built session: the monitor steerer
-/// lands events in the session's steering queue, and the background manager
-/// subscribes to the session's lifecycle.
+/// lands events in the session's steering queue, the background manager
+/// subscribes to the session's lifecycle, and the Steer bus gets the
+/// Captain's session handle for late-bind routing.
 fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators) {
     let handle = session.handle();
     orch.monitor.attach(&handle);
     orch.background.attach(session);
+    orch.bus.bind_captain(handle);
 }
-
 fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
     let mut content = vec![ContentBlock::Text {
         text,
@@ -5731,13 +5618,12 @@ mod tests {
         );
     }
 
-    /// The async/sync split is a model-facing contract: a `write+bash`
-    /// def routes through SailorManager (async dispatch handle), a
-    /// read-only def stays synchronous. `subagent_capability` is the routing
-    /// key, so this doubles as the `SailorRoutingTool::is_async_dispatch`
-    /// predicate test.
+    /// The capability tag distinguishes write+bash defs (Sailor) from
+    /// read-only defs (Explore). It is the routing key for the plan-mode
+    /// read-only resolver, which blocks write/bash subagents from being
+    /// dispatched while plan mode is active.
     #[test]
-    fn subagent_capability_routes_sailor_async_explore_sync() {
+    fn subagent_capability_tags_write_bash_vs_read_only() {
         let mut registry = pi::ext_point_agent::AgentRegistry::new();
         pi_extensions::agents::register_defaults(&mut registry);
         let sailor = registry.get("Sailor").expect("Sailor registered");
@@ -5762,7 +5648,7 @@ mod tests {
         assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
         assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
         assert!(
-            prompt.contains("multiple `Agent(Sailor)` calls over forming a `Team`"),
+            prompt.contains("multiple `Steer` calls in one turn"),
             "prefers Sailors over Team: {prompt}"
         );
     }

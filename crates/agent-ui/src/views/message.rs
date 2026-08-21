@@ -2904,7 +2904,7 @@ fn render_background_task(
         TaskKind::MonitorCommand => i18n::t("background-task-kind-command"),
         TaskKind::MonitorWebSocket => i18n::t("background-task-kind-websocket"),
         TaskKind::BackgroundBash => i18n::t("background-task-kind-bash"),
-        TaskKind::Sailor => i18n::t("background-task-kind-sailor"),
+        TaskKind::Subagent => i18n::t("background-task-kind-subagent"),
     };
     let status_str = match bt.status {
         TaskStatus::Running => i18n::t("background-task-status-running"),

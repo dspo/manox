@@ -223,12 +223,12 @@ pub enum BackendNotice {
     /// should refresh so the conversation appears at send time, not at
     /// turn end.
     SessionListDirty,
-    /// A team tool's round trip: the tool (tokio) sends the op; the facade
-    /// (gpui, owns the `Entity<Team>` / member threads) executes it on the
-    /// main thread and replies with the model-facing string. Mirrors the
-    /// approval-gate round-trip architecture.
-    TeamRequest {
-        op: TeamOp,
+    /// A Steer bus request (tokio→gpui round-trip): the `AgentBus` sends a
+    /// `BusOp` the facade executes on the gpui main thread (spawn member
+    /// thread, inject peer message, abort member) and replies via the
+    /// responder. Generalizes the retired `TeamRequest` architecture.
+    BusRequest {
+        op: pi_extensions::steer_bus::BusOp,
         responder: async_channel::Sender<Result<String, String>>,
     },
     /// A browser tool's host round trip: the tool (tokio) sends the op with
@@ -239,56 +239,14 @@ pub enum BackendNotice {
         op: BrowserOp,
         responder: async_channel::Sender<Result<BrowserReply, String>>,
     },
-    /// A dispatched Sailor subagent (async `Agent` dispatch) finished. The
-    /// facade delivers the final text to the Captain as a peer message and
-    /// triggers a turn, mirroring the Team leader-inbox path so the Captain
-    /// reliably observes the result without polling.
-    SailorCompleted { sailor_id: String, content: String },
-}
-
-/// One team operation a team tool asks the facade to run.
-#[derive(Debug, Clone)]
-pub enum TeamOp {
-    Create {
-        name: String,
-        members: Vec<MemberSpec>,
+    /// A dispatched subagent finished. The facade delivers the final text to
+    /// the Captain as a peer message and triggers a turn (generalizes the
+    /// retired `SailorCompleted`).
+    SteerDelivered {
+        from: pi_extensions::steer_bus::AgentId,
+        reason: pi_extensions::steer_bus::SteerReason,
+        payload: pi_extensions::steer_bus::SteerPayload,
     },
-    Spawn {
-        spec: MemberSpec,
-    },
-    Send {
-        to: String,
-        content: String,
-    },
-    Disband,
-    /// Dismiss one worker member: cancel, archive, release its tasks.
-    Dismiss {
-        name: String,
-    },
-    /// Read-only roster status report (running/idle, stop reasons, reported).
-    Status,
-    TaskCreate {
-        subject: String,
-        description: Option<String>,
-    },
-    TaskList,
-    TaskUpdate {
-        id: String,
-        status: Option<crate::team::TaskStatus>,
-        owner: Option<Option<String>>,
-        subject: Option<String>,
-    },
-    TaskGet {
-        id: String,
-    },
-}
-
-/// A worker member to spawn (`TeamCreate` initial roster / `TeamSpawn`).
-#[derive(Debug, Clone)]
-pub struct MemberSpec {
-    pub name: String,
-    pub role: String,
-    pub prompt: String,
 }
 
 /// One browser operation a `web_explore_*` tool asks the host to run.
