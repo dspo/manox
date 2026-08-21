@@ -42,6 +42,16 @@ pub enum SessionKind {
     Terminal,
 }
 
+/// Where a freshly spawned external session surfaces.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionPlacement {
+    /// Full-window `ViewMode::ExternalSession` — the sidebar-row path.
+    FullWindow,
+    /// The right pane: the session's terminal mounts on the tab at
+    /// `replace_tab` while it still holds the Launcher, else on a fresh tab.
+    RightPane { replace_tab: usize },
+}
+
 impl SessionKind {
     /// The sidebar row label. Brand names stay untranslated; `Terminal` is
     /// UI chrome and localized.

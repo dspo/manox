@@ -117,6 +117,7 @@ mod tests {
             "icons/corner-right-up.svg",
             "icons/zodiac-scorpio.svg",
             "icons/blocks.svg",
+            "icons/panel-right-dashed.svg",
         ] {
             assert!(LocalAssets::get(path).is_some(), "missing {path}");
         }

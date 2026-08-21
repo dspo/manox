@@ -60,9 +60,9 @@ fn thread_event_of(child: &SubagentChildEvent) -> ThreadEvent {
 }
 
 pub(crate) struct SubagentPanel {
-    /// `{type} · {topic}` display title (call id last resort), also the tab
-    /// label.
-    title: String,
+    /// The sub-agent's task topic — the panel's second-level banner. The
+    /// right-pane tab label shows the subagent's address instead.
+    topic: String,
     status: ToolCallStatus,
     /// The child run rendered as a miniature conversation through the shared
     /// message pipeline.
@@ -79,7 +79,7 @@ pub(crate) struct SubagentPanel {
 impl SubagentPanel {
     #[allow(clippy::too_many_arguments)] // constructor inputs are distinct presentation values, not a bundleable config
     pub(crate) fn new(
-        title: String,
+        topic: String,
         role: String,
         status: ToolCallStatus,
         backfill: &[SubagentChildEvent],
@@ -131,7 +131,7 @@ impl SubagentPanel {
             conversation
         });
         cx.new(|_| Self {
-            title,
+            topic,
             status,
             conversation,
             final_note,
@@ -140,10 +140,6 @@ impl SubagentPanel {
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
         })
-    }
-
-    pub(crate) fn title(&self) -> &str {
-        &self.title
     }
 
     pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
@@ -194,7 +190,7 @@ impl Render for SubagentPanel {
                     .text_sm()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.foreground)
-                    .child(self.title.clone()),
+                    .child(self.topic.clone()),
             );
 
         let items: Vec<AnyElement> = self
