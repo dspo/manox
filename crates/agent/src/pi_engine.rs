@@ -1221,7 +1221,8 @@ fn build_tools(
             // subagent support for the session's lifetime.
             let late_bus = Arc::clone(&bus);
             let configure: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-                let Some(model) = model_slot.lock().unwrap().clone() else {
+                let Some(model) = model_slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                else {
                     return false;
                 };
                 late_bus.set_subagent_tool(build_subagent(&model));
