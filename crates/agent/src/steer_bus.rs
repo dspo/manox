@@ -57,6 +57,10 @@ pub struct AgentBus {
     weak_self: Mutex<Weak<AgentBus>>,
     subagent_tool: Mutex<Option<Arc<SubagentTool>>>,
     tool_ctx: Mutex<Option<Arc<dyn ToolContext>>>,
+    /// Wires `subagent_tool` on first dispatch for sessions assembled
+    /// before a model resolved (resume-at-launch race); returns whether a
+    /// live model was available to wire with.
+    late_configure: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl AgentBus {
@@ -79,6 +83,7 @@ impl AgentBus {
             weak_self: Mutex::new(Weak::new()),
             subagent_tool: Mutex::new(None),
             tool_ctx: Mutex::new(None),
+            late_configure: Mutex::new(None),
         });
         *bus.weak_self.lock().unwrap() = Arc::downgrade(&bus);
         bus
@@ -103,6 +108,10 @@ impl AgentBus {
 
     pub fn set_tool_ctx(&self, ctx: Arc<dyn ToolContext>) {
         *self.tool_ctx.lock().unwrap() = Some(ctx);
+    }
+
+    pub fn set_late_configure(&self, configure: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.late_configure.lock().unwrap() = Some(configure);
     }
 
     /// The main Steer routing entry point.
@@ -216,12 +225,25 @@ impl AgentBus {
         let spawn_type = spawn_type.to_string();
         let isolation = isolation.map(String::from);
         let prompt = prompt.to_string();
-        let subagent_tool = self
-            .subagent_tool
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| ToolError::ExecutionFailed("subagent tool not configured".into()))?;
+        let subagent_tool = match self.subagent_tool.lock().unwrap().clone() {
+            Some(tool) => tool,
+            None => {
+                let wired = self
+                    .late_configure
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .is_some_and(|configure| configure());
+                if !wired {
+                    return Err(ToolError::ExecutionFailed(
+                        "subagent tool not configured".into(),
+                    ));
+                }
+                self.subagent_tool.lock().unwrap().clone().ok_or_else(|| {
+                    ToolError::ExecutionFailed("subagent tool not configured".into())
+                })?
+            }
+        };
         let tool_ctx = self
             .tool_ctx
             .lock()
