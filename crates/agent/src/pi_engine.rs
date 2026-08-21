@@ -1233,9 +1233,10 @@ fn build_tools(
             // catalog resolves a model; the model slot fills in shortly via
             // `SetModel`, so wire on first dispatch instead of dropping
             // subagent support for the session's lifetime.
-            let late_bus = Arc::clone(&bus);
+            let late_bus = Arc::clone(bus);
             let configure: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
-                let Some(model) = model_slot.lock().unwrap().clone() else {
+                let Some(model) = model_slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+                else {
                     return false;
                 };
                 late_bus.set_subagent_tool(build_subagent(&model));

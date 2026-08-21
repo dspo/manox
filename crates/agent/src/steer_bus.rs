@@ -222,9 +222,16 @@ impl AgentBus {
     }
 
     /// Dispatch a subagent coroutine: spawn session, register bg task,
-    /// run in tokio, emit SteerDelivered on completion. Bounded: a stuck
-    /// spawn surfaces as a stage-named error instead of a silent
-    /// forever-await on the caller's tool channel.
+    /// run in tokio, emit SteerDelivered on completion.
+    ///
+    /// The dispatch body must never poll on the caller's executor: it takes
+    /// std-Mutex locks (bus slots, the engine's model slot via the late
+    /// configurator), and on a cooperative executor a contended lock starves
+    /// the whole executor — a silent forever-hang that even a timeout cannot
+    /// surface (the timeout polls on the same starved executor). Bridge to
+    /// the dedicated tokio runtime instead; the oneshot keeps the caller
+    /// executor-agnostic, and a stuck or panicked dispatch task surfaces as
+    /// a stage-named error (timeout fired / sender dropped).
     async fn dispatch_subagent(
         &self,
         addr: &str,
@@ -233,15 +240,42 @@ impl AgentBus {
         prompt: &str,
     ) -> Result<AgentToolResult, ToolError> {
         let stage = Arc::new(std::sync::Mutex::new("entry"));
-        let fut =
-            self.dispatch_subagent_inner(addr, spawn_type, isolation, prompt, Arc::clone(&stage));
-        match tokio::time::timeout(Duration::from_secs(90), fut).await {
-            Ok(result) => result,
-            Err(_) => Err(ToolError::ExecutionFailed(format!(
-                "subagent dispatch timed out at stage `{}` (addr={addr})",
+        let bus = locked(&self.weak_self)
+            .upgrade()
+            .ok_or_else(|| ToolError::ExecutionFailed("bus gone".into()))?;
+        let addr_s = addr.to_string();
+        let spawn_s = spawn_type.to_string();
+        let isolation_s = isolation.map(str::to_string);
+        let prompt_s = prompt.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stage2 = Arc::clone(&stage);
+        crate::runtime::handle().spawn(async move {
+            let stage_err = Arc::clone(&stage2);
+            let result = tokio::time::timeout(
+                Duration::from_secs(90),
+                bus.dispatch_subagent_inner(
+                    &addr_s,
+                    &spawn_s,
+                    isolation_s.as_deref(),
+                    &prompt_s,
+                    stage2,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ToolError::ExecutionFailed(format!(
+                    "subagent dispatch timed out at stage `{}` (addr={addr_s})",
+                    *locked(&stage_err)
+                )))
+            });
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| {
+            ToolError::ExecutionFailed(format!(
+                "subagent dispatch task died at stage `{}` (addr={addr}) — panic in dispatch",
                 *locked(&stage)
-            ))),
-        }
+            ))
+        })?
     }
 
     async fn dispatch_subagent_inner(
