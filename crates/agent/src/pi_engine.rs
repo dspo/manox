@@ -3608,7 +3608,6 @@ async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<
     }
 }
 
-
 /// The active worktree binding persisted in a session's sidecar (forked
 /// worktree sessions carry it; originals and plain sessions don't).
 async fn load_worktree_state(
@@ -5044,7 +5043,10 @@ mod tests {
                 "mid-run AppendUiNote must merge into the mirror immediately"
             );
             assert!(
-                matches!(state.history.lock().unwrap().last(), Some(HistoryEntry::Note(_))),
+                matches!(
+                    state.history.lock().unwrap().last(),
+                    Some(HistoryEntry::Note(_))
+                ),
                 "the mirrored tail is the note"
             );
             stream.release1.notify_waiters();
@@ -5074,7 +5076,10 @@ mod tests {
             "settlement drains the parked queue"
         );
         assert!(
-            matches!(state.history.lock().unwrap().last(), Some(HistoryEntry::Note(_))),
+            matches!(
+                state.history.lock().unwrap().last(),
+                Some(HistoryEntry::Note(_))
+            ),
             "the authoritative rebuild must retain the parked note"
         );
         assert_eq!(
