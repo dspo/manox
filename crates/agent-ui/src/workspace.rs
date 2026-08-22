@@ -3870,6 +3870,10 @@ impl Workspace {
             if !text.trim().is_empty() || self.pending_ask_has_selection() {
                 self.input_state
                     .update(cx, |state, cx| state.set_value("", window, cx));
+                // Submission empties the composer; the walk is derived state
+                // an empty value can never satisfy, so drop it explicitly
+                // (set_value emits no Change to trigger the divergence reset).
+                self.recall_index = -1;
                 self.close_completion(cx);
                 self.resolve_ask_with_response(Some(text), cx);
             }
@@ -3887,6 +3891,10 @@ impl Workspace {
         }
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
+        // Submission empties the composer; the walk is derived state an empty
+        // value can never satisfy, so drop it explicitly (set_value emits no
+        // Change to trigger the divergence reset).
+        self.recall_index = -1;
         self.close_completion(cx);
 
         // Slash commands (line-initial `/name [args]`) are intercepted before
@@ -6100,7 +6108,7 @@ impl Workspace {
                     wrap = wrap.key_context(composer_key_context(
                         self.completion.is_some(),
                         self.recall_index >= 0,
-                        self.input_state.read(cx).text().len() == 0,
+                        self.input_state.read(cx).value().is_empty(),
                     ));
                     wrap.child(
                         Input::new(&self.input_state)
@@ -9420,6 +9428,7 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         format!("{nanos}-{:?}", std::thread::current().id())
+    }
 
     #[gpui::test]
     fn composer_context_without_recall_moves_caret_natively(cx: &mut gpui::TestAppContext) {
