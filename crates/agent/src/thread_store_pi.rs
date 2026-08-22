@@ -365,6 +365,7 @@ impl ThreadStore {
             parent_id: parent.map(str::to_string),
             archived: false,
             pinned: false,
+            tag: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -464,6 +465,21 @@ impl ThreadStore {
             s.pinned = pinned;
         }
         self.write_meta(id, move |meta| meta.pinned = pinned, cx);
+    }
+
+    /// Set the user tag on a session (persisted in its sidecar); `None`
+    /// removes it. Re-asserting the current value is a no-op — no sidecar
+    /// write, no rescan.
+    pub fn set_thread_tag(&mut self, id: &str, tag: Option<String>, cx: &mut Context<Self>) {
+        if let Some(s) = self.summary_mut(id)
+            && s.tag == tag
+        {
+            return;
+        }
+        if let Some(s) = self.summary_mut(id) {
+            s.tag = tag.clone();
+        }
+        self.write_meta(id, move |meta| meta.tag = tag, cx);
     }
 
     /// Append a `model_change` event. The pi transcript records model changes
@@ -671,6 +687,7 @@ fn session_info_to_summary(
         parent_id: team_parent_id(info).or_else(|| info.parent_session_path.clone()),
         archived: meta.archived,
         pinned: meta.pinned,
+        tag: meta.tag.clone(),
         has_unread: meta.unread,
         errored: meta.errored,
         created_at: info.created_at.timestamp(),
@@ -924,6 +941,7 @@ mod tests {
             parent_id: None,
             archived,
             pinned: false,
+            tag: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -1115,6 +1133,56 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 
+    /// The user tag round-trips through the sidecar: the in-memory summary
+    /// flips immediately (the render source of truth) and the persisted
+    /// sidecar follows; clearing lands `None`.
+    #[test]
+    fn set_thread_tag_persists_to_sidecar() {
+        let (db, db_path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("t1.jsonl");
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                s.session_paths.insert("t1".to_string(), session.clone());
+                s.sessions_dir = dir.path().to_path_buf();
+                s.insert_summary_for_test("t1", None);
+            });
+        });
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.set_thread_tag("t1", Some("urgent".into()), cx));
+        });
+        // Drive the gpui executor so `write_meta`'s background task runs.
+        cx.executor().run_until_parked();
+        // In-memory flip is immediate.
+        cx.update(|cx| {
+            store.update(cx, |s, _| {
+                assert_eq!(s.summary_by_id("t1").and_then(|s| s.tag.clone()), Some("urgent".into()));
+            });
+        });
+        let wait_for = |expected: Option<&str>| {
+            for _ in 0..1500 {
+                if let Ok(meta) = crate::runtime::handle()
+                    .block_on(pi_extensions::session_meta::load(dir.path(), &session))
+                    && meta.tag.as_deref() == expected
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            false
+        };
+        assert!(wait_for(Some("urgent")), "tag never reached the sidecar");
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.set_thread_tag("t1", None, cx));
+        });
+        cx.executor().run_until_parked();
+        assert!(wait_for(None), "cleared tag never reached the sidecar");
+        std::fs::remove_file(db_path).ok();
+    }
+
     /// Minimal summary row for hierarchy tests; only id / parent / archived
     /// matter to the cascade.
     fn cascade_summary(id: &str, parent: Option<&str>) -> ThreadSummary {
@@ -1131,6 +1199,7 @@ mod tests {
             parent_id: parent.map(str::to_string),
             archived: false,
             pinned: false,
+            tag: None,
             has_unread: false,
             errored: false,
             created_at: 0,

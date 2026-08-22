@@ -25,6 +25,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::{Input, InputEvent, InputState},
     menu::{PopupMenu, PopupMenuItem},
     tag::{Tag, TagVariant},
     tooltip::Tooltip,
@@ -157,6 +158,9 @@ pub enum SidebarEvent {
     NewThreadWithProject(PathBuf),
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
+    /// User set or cleared a thread row's tag (overflow menu / chip clear
+    /// button). `None` removes the tag.
+    SetThreadTag(String, Option<String>),
     /// Launch an external agent CLI session with a user-picked provider +
     /// model (the cascade wizard's terminal action). The kind identifies the
     /// agent (`claude` / `codex` / `copilot`); the strings are provider name +
@@ -307,6 +311,14 @@ pub struct Sidebar {
     /// emit `NewThread` vs `NewThreadWithProject`, and to pass the project path
     /// as the CWD for external CLI sessions.
     new_session_project: Option<PathBuf>,
+    /// The single inline tag edit in flight (one row at a time); `None`
+    /// when no row is editing its tag.
+    tag_edit: Option<TagEdit>,
+    /// The thread row whose three-dot overflow menu is open (one at a
+    /// time); mirrors the new-session menu's open flag.
+    row_menu_open: Option<String>,
+    row_menu: Option<Entity<PopupMenu>>,
+    row_menu_sub: Option<Subscription>,
     /// Live width driven by dragging the divider on the right edge. Updated
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
@@ -341,6 +353,10 @@ impl Sidebar {
             new_session_menu: None,
             new_session_menu_sub: None,
             new_session_project: None,
+            tag_edit: None,
+            row_menu_open: None,
+            row_menu: None,
+            row_menu_sub: None,
             width,
             scroll_handle: ScrollHandle::new(),
             _sub: sub,
@@ -553,6 +569,194 @@ impl Sidebar {
         self.new_session_project = None;
     }
 
+    /// Open a thread row's three-dot overflow menu (Archive + Tag), anchored
+    /// below its trigger button. One row menu at a time — opening one closes
+    /// the previous.
+    fn open_row_menu(
+        &mut self,
+        id: String,
+        archived: bool,
+        has_tag: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_row_menu();
+        let theme = cx.theme().clone();
+        let sidebar = cx.entity().downgrade();
+        let open_id = id.clone();
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            let archive_label = if archived {
+                i18n::t("sidebar-unarchive")
+            } else {
+                i18n::t("sidebar-archive")
+            };
+            let sidebar_archive = sidebar.clone();
+            let id_archive = id.clone();
+            let menu = menu.item(
+                PopupMenuItem::new(archive_label)
+                    .icon(
+                        Icon::new(IconName::Inbox)
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .on_click(move |_, _, cx| {
+                        let _ = sidebar_archive.update(cx, |this, cx| {
+                            this.close_row_menu();
+                            cx.emit(SidebarEvent::ArchiveThread(id_archive.clone(), !archived));
+                            cx.notify();
+                        });
+                    }),
+            );
+            let tag_label = if has_tag {
+                i18n::t("sidebar-thread-tag-rename")
+            } else {
+                i18n::t("sidebar-thread-tag-add")
+            };
+            let mode = if has_tag {
+                TagEditMode::Renaming
+            } else {
+                TagEditMode::Adding
+            };
+            let sidebar_tag = sidebar.clone();
+            let id_tag = id.clone();
+            menu.item(
+                PopupMenuItem::new(tag_label)
+                    .icon(
+                        Icon::default()
+                            .path("icons/tag.svg")
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = sidebar_tag.update(cx, |this, cx| {
+                            this.close_row_menu();
+                            this.begin_tag_edit(id_tag.clone(), mode, window, cx);
+                        });
+                    }),
+            )
+        });
+        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+            this.close_row_menu();
+            cx.notify();
+        });
+        self.row_menu_open = Some(open_id);
+        self.row_menu = Some(menu);
+        self.row_menu_sub = Some(sub);
+    }
+
+    fn close_row_menu(&mut self) {
+        self.row_menu_open = None;
+        self.row_menu = None;
+        self.row_menu_sub = None;
+    }
+
+    /// Anchor the open row menu below its trigger button. Deferred so it
+    /// paints above sibling rows and escapes the row's `overflow_hidden`;
+    /// `top_full()` + `right_0()` hang it just under the button's wrapper.
+    fn render_row_menu_dropdown(&self, id: &str) -> Option<AnyElement> {
+        if self.row_menu_open.as_deref() != Some(id) {
+            return None;
+        }
+        let menu = self.row_menu.clone()?;
+        Some(
+            deferred(
+                gpui::div()
+                    .id(SharedString::from(format!("thread-menu-dropdown-{id}")))
+                    .absolute()
+                    .top_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Mount the inline tag input on a row — at most one edit in flight;
+    /// starting a new one replaces the previous. Rename mode prefills the
+    /// current tag. The input is focused immediately and clamped to
+    /// [`MAX_THREAD_TAG_CHARS`] on every edit.
+    fn begin_tag_edit(
+        &mut self,
+        id: String,
+        mode: TagEditMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefill = (mode == TagEditMode::Renaming)
+            .then(|| self.summary_tag(&id, cx))
+            .flatten();
+        let placeholder = i18n::t("sidebar-thread-tag-placeholder");
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder(placeholder);
+            if let Some(value) = prefill {
+                state.set_value(value, window, cx);
+            }
+            state
+        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                // The pinned gpui-component input has no max-length
+                // support; clamp every edit down to the tag ceiling.
+                InputEvent::Change => {
+                    input.update(cx, |state, cx| {
+                        let value = state.value();
+                        if value.chars().count() > MAX_THREAD_TAG_CHARS {
+                            let truncated: String =
+                                value.chars().take(MAX_THREAD_TAG_CHARS).collect();
+                            state.set_value(truncated, window, cx);
+                        }
+                    });
+                }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_tag_edit(cx);
+                }
+                _ => {}
+            },
+        );
+        self.tag_edit = Some(TagEdit {
+            id,
+            input: input.clone(),
+            _sub: sub,
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Commit the in-flight tag edit: a non-empty value emits
+    /// `SetThreadTag`, an empty one discards silently. Either way the input
+    /// unmounts. Idempotent — a blur may race in after an Enter commit.
+    fn commit_tag_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.tag_edit.take() else {
+            return;
+        };
+        let value = edit.input.read(cx).value().trim().to_string();
+        if !value.is_empty() {
+            cx.emit(SidebarEvent::SetThreadTag(edit.id, Some(value)));
+        }
+        cx.notify();
+    }
+
+    fn cancel_tag_edit(&mut self, cx: &mut Context<Self>) {
+        if self.tag_edit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The persisted tag for a row, reading both sidebar partitions.
+    fn summary_tag(&self, id: &str, cx: &App) -> Option<String> {
+        let store = self.store.read(cx);
+        store
+            .summaries()
+            .iter()
+            .chain(store.archived_summaries())
+            .find(|s| s.id == id)
+            .and_then(|s| s.tag.clone())
+    }
+
     /// Build the new-session dropdown anchored below the `+` button that
     /// opened it. Deferred so it paints above sibling rows; `top_full()` is
     /// 100% of the wrapping `.relative()` div, so the menu sits just under the
@@ -747,6 +951,7 @@ impl Sidebar {
                                     &theme,
                                 ),
                                 slide,
+                                self,
                                 &theme,
                                 cx,
                             )
@@ -754,6 +959,7 @@ impl Sidebar {
                         SidebarRow::External(s) => render_thread_item(
                             &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
                             slide,
+                            self,
                             &theme,
                             cx,
                         ),
@@ -986,6 +1192,7 @@ impl Render for Sidebar {
                                                         &theme,
                                                     ),
                                                     &slide,
+                                                    self,
                                                     &theme,
                                                     cx,
                                                 )
@@ -998,6 +1205,7 @@ impl Render for Sidebar {
                                                     &theme,
                                                 ),
                                                 &slide,
+                                                self,
                                                 &theme,
                                                 cx,
                                             ),
@@ -1070,12 +1278,36 @@ enum RowIcon {
     External(&'static str),
 }
 
-/// What the row's hover "Inbox" archive action emits — a thread toggles its
-/// archived flag, an external session tears itself down (kill + drop).
+/// What the row's trailing action emits — a thread row's overflow menu
+/// toggles its archived flag, an external session's hover button tears it
+/// down (kill + drop).
 #[derive(Clone)]
 enum RowKind {
     Thread { archived: bool },
     External,
+}
+
+/// Maximum length of a user thread tag (enforced on every input edit).
+const MAX_THREAD_TAG_CHARS: usize = 10;
+
+/// Which flavor of inline tag edit a row is running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagEditMode {
+    /// The row has no tag yet; committing stores the typed value.
+    Adding,
+    /// The row's existing tag is being replaced; the input is prefilled.
+    Renaming,
+}
+
+/// The one inline tag edit in flight (at most one row edits at a time).
+/// The add/rename mode is consumed at mount time (prefill decision) and
+/// never needed again.
+struct TagEdit {
+    id: String,
+    input: Entity<InputState>,
+    /// Input-event subscription (length clamp + commit); dropped with the
+    /// edit so a stale input can never fire into the sidebar.
+    _sub: Subscription,
 }
 
 /// Live per-thread state the store tracks for the row's icon: the spin /
@@ -1104,6 +1336,9 @@ struct SidebarThreadItem {
     title: String,
     updated: String,
     pinned: bool,
+    /// User-assigned tag rendered as a chip beside the id tag; `None` when
+    /// the thread carries no tag. Threads only — external rows never tag.
+    tag: Option<String>,
     has_unread: bool,
     errored: bool,
     selected: bool,
@@ -1160,6 +1395,7 @@ impl SidebarThreadItem {
             title,
             updated: format_relative(summary.interacted_at),
             pinned: summary.pinned,
+            tag: summary.tag.clone(),
             has_unread: summary.has_unread,
             errored: summary.errored,
             running: live.running,
@@ -1221,6 +1457,7 @@ impl SidebarThreadItem {
             updated: format_relative(summary.created_at),
             pinned: false,
             has_unread: false,
+            tag: None,
             errored: false,
             running: false,
             pending_auth: false,
@@ -1258,13 +1495,17 @@ fn member_role_for(store: &agent::ThreadStore, id: &str, cx: &App) -> Option<Str
         .map(|m| m.role().to_string())
 }
 
-/// Render one unified sidebar row — threads and external agent sessions share
-/// the layout (leading icon → title → id tag + updated time + hover archive),
-/// the selection-wash slide animation, and the hover "Inbox" archive action.
-/// Only the emitted event and the leading icon differ by `kind`.
+/// Render one unified sidebar row — threads and external agent sessions
+/// share the layout (leading icon → title → id tag + tag chip + updated
+/// time + trailing action), the selection-wash slide animation, and the
+/// hover-reveal affordance. Only the emitted event, the trailing action
+/// (overflow menu vs close button), and the leading icon differ by `kind`.
+/// `sidebar` carries the per-sidebar overlay state (tag edit, open row
+/// menu) — `Context<Sidebar>` derefs to `App`, not the entity.
 fn render_thread_item(
     item: &SidebarThreadItem,
     slide: &SlideCtx,
+    sidebar: &Sidebar,
     theme: &Theme,
     cx: &mut Context<Sidebar>,
 ) -> AnyElement {
@@ -1555,12 +1796,28 @@ fn render_thread_item(
                             )
                         }),
                 )
-                .child(
+                .child({
+                    // Tag slot: the inline input while an edit is in flight,
+                    // else the persisted chip; external rows render neither.
+                    let editing_input = sidebar
+                        .tag_edit
+                        .as_ref()
+                        .filter(|e| e.id == id)
+                        .map(|e| e.input.clone());
+                    let tag_slot: Option<AnyElement> = if let Some(input) = editing_input {
+                        Some(render_tag_edit(&id, &input, cx))
+                    } else {
+                        item.tag
+                            .as_ref()
+                            .map(|tag| render_tag_chip(&id, tag, &group, cx))
+                    };
+                    let menu_open = sidebar.row_menu_open.as_deref() == Some(id.as_str());
                     h_flex()
                         .w_full()
                         .gap_1()
                         .items_center()
                         .child(tag_element)
+                        .children(tag_slot)
                         .child(
                             h_flex()
                                 .flex_1()
@@ -1574,26 +1831,145 @@ fn render_thread_item(
                         .child(
                             h_flex()
                                 .gap_0p5()
-                                .invisible()
-                                .group_hover(group.clone(), |s| s.visible())
-                                .child(render_hover_action(
-                                    id_archive.clone(),
-                                    item.kind.clone(),
-                                    item.resumable,
-                                    cx,
-                                )),
-                        ),
-                ),
+                                // The trigger stays visible while its menu is
+                                // open so the anchor doesn't vanish
+                                // mid-interaction.
+                                .when(!menu_open, |this| {
+                                    this.invisible().group_hover(group.clone(), |s| s.visible())
+                                })
+                                .child(match &item.kind {
+                                    // Thread rows overflow into the three-dot
+                                    // menu (Archive + Tag); external sessions
+                                    // keep the single hover close button.
+                                    RowKind::Thread { .. } => {
+                                        render_thread_menu_trigger(item, sidebar, cx)
+                                    }
+                                    RowKind::External => render_hover_action(
+                                        id_archive.clone(),
+                                        item.kind.clone(),
+                                        item.resumable,
+                                        cx,
+                                    ),
+                                }),
+                        )
+                }),
         )
         .into_any_element()
 }
 
-/// The hover action on a row's right edge. Threads and live external sessions
-/// get the Inbox close/archive button; a resumable row gets a Play resume
-/// button (the row click already emits the same `OpenExternalSession` event,
-/// so the affordance is just a visible hint). Uses `cx.listener` so the click
-/// emits on the sidebar's own context (where `EventEmitter<SidebarEvent>`
-/// lives) rather than the bare `App` the standalone `on_click` receives.
+/// The inline tag input of the row currently editing its tag. The wrapper
+/// swallows clicks (the row's open-thread click must not fire while the
+/// user works the input) and catches the input's propagated `Escape` as a
+/// cancel; Enter/blur commits flow through the input's own events.
+fn render_tag_edit(id: &str, input: &Entity<InputState>, cx: &mut Context<Sidebar>) -> AnyElement {
+    let id = id.to_string();
+    gpui::div()
+        .id(SharedString::from(format!("thread-tag-edit-{id}")))
+        .w(px(90.))
+        .on_click(|_ev, _window, cx| cx.stop_propagation())
+        .on_action(cx.listener(
+            move |this, _: &gpui_component::input::Escape, _window, cx| {
+                cx.stop_propagation();
+                this.cancel_tag_edit(cx);
+            },
+        ))
+        .child(Input::new(input).appearance(false).xsmall())
+        .into_any_element()
+}
+
+/// The persisted user tag: a chip beside the id tag with an ✕ to clear it;
+/// double-clicking it renames inline. Clicks stop propagation so chip
+/// interaction never trips the row's open-thread click.
+fn render_tag_chip(
+    id: &str,
+    tag: &str,
+    row_group: &SharedString,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
+    let id = id.to_string();
+    let id_rename = id.clone();
+    let id_clear = id.clone();
+    let tag_text = tag.to_string();
+    let row_group = row_group.clone();
+    // Same visual language as the thread-id tag; the clear affordance rides
+    // the row hover like every other row action (space reserved, so the row
+    // never reflows mid-hover).
+    h_flex()
+        .items_center()
+        .id(SharedString::from(format!("thread-tag-chip-{id}")))
+        .cursor_pointer()
+        .tooltip(move |window, cx| Tooltip::new(i18n::t("sidebar-thread-tag")).build(window, cx))
+        .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+            cx.stop_propagation();
+            if ev.click_count() >= 2 {
+                this.begin_tag_edit(id_rename.clone(), TagEditMode::Renaming, window, cx);
+            }
+        }))
+        .child(
+            Tag::new()
+                .with_variant(TagVariant::Secondary)
+                .outline()
+                .small()
+                .child(tag_text),
+        )
+        .child(
+            Button::new(format!("thread-tag-clear-{id}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .tooltip(i18n::t("sidebar-thread-tag-clear"))
+                .invisible()
+                .group_hover(row_group, |s| s.visible())
+                .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                    cx.stop_propagation();
+                    cx.emit(SidebarEvent::SetThreadTag(id_clear.clone(), None));
+                })),
+        )
+        .into_any_element()
+}
+
+/// The thread row's overflow trigger: a three-dot button opening the
+/// Archive + Tag popup. Clicking it again toggles the menu closed; the
+/// dropdown anchors below the button (deferred, so it escapes the row's
+/// `overflow_hidden` and paints above sibling rows).
+fn render_thread_menu_trigger(
+    item: &SidebarThreadItem,
+    sidebar: &Sidebar,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
+    let id = item.id.clone();
+    let id_toggle = id.clone();
+    let archived = matches!(item.kind, RowKind::Thread { archived: true });
+    let has_tag = item.tag.is_some();
+    let button = Button::new(format!("thread-menu-{id}"))
+        .ghost()
+        .xsmall()
+        .icon(IconName::Ellipsis)
+        .tooltip(i18n::t("sidebar-thread-menu"))
+        .on_click(cx.listener(move |this, _ev, window, cx| {
+            cx.stop_propagation();
+            if this.row_menu_open.as_deref() == Some(id_toggle.as_str()) {
+                this.close_row_menu();
+            } else {
+                this.open_row_menu(id_toggle.clone(), archived, has_tag, window, cx);
+            }
+            cx.notify();
+        }));
+    let dropdown = sidebar.render_row_menu_dropdown(&id);
+    gpui::div()
+        .relative()
+        .child(button)
+        .children(dropdown)
+        .into_any_element()
+}
+
+/// The hover action on an external session row's right edge: the Inbox
+/// close button while live, a Play resume button when resumable (the row
+/// click already emits the same `OpenExternalSession` event, so the
+/// affordance is just a visible hint). Thread rows use the overflow menu
+/// instead. Uses `cx.listener` so the click emits on the sidebar's own
+/// context (where `EventEmitter<SidebarEvent>` lives) rather than the bare
+/// `App` the standalone `on_click` receives.
 fn render_hover_action(
     id: String,
     kind: RowKind,
@@ -1694,6 +2070,7 @@ mod tests {
             parent_id: None,
             archived: false,
             pinned: false,
+            tag: None,
             has_unread: false,
             errored: false,
             created_at: 0,
