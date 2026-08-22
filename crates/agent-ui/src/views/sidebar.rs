@@ -1807,7 +1807,9 @@ fn render_thread_item(
                     let tag_slot: Option<AnyElement> = if let Some(input) = editing_input {
                         Some(render_tag_edit(&id, &input, cx))
                     } else {
-                        item.tag.as_ref().map(|tag| render_tag_chip(&id, tag, cx))
+                        item.tag
+                            .as_ref()
+                            .map(|tag| render_tag_chip(&id, tag, &group, cx))
                     };
                     let menu_open = sidebar.row_menu_open.as_deref() == Some(id.as_str());
                     h_flex()
@@ -1878,12 +1880,22 @@ fn render_tag_edit(id: &str, input: &Entity<InputState>, cx: &mut Context<Sideba
 /// The persisted user tag: a chip beside the id tag with an ✕ to clear it;
 /// double-clicking it renames inline. Clicks stop propagation so chip
 /// interaction never trips the row's open-thread click.
-fn render_tag_chip(id: &str, tag: &str, cx: &mut Context<Sidebar>) -> AnyElement {
+fn render_tag_chip(
+    id: &str,
+    tag: &str,
+    row_group: &SharedString,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
     let id = id.to_string();
     let id_rename = id.clone();
     let id_clear = id.clone();
     let tag_text = tag.to_string();
-    gpui::div()
+    let row_group = row_group.clone();
+    // Same visual language as the thread-id tag; the clear affordance rides
+    // the row hover like every other row action (space reserved, so the row
+    // never reflows mid-hover).
+    h_flex()
+        .items_center()
         .id(SharedString::from(format!("thread-tag-chip-{id}")))
         .cursor_pointer()
         .tooltip(move |window, cx| Tooltip::new(i18n::t("sidebar-thread-tag")).build(window, cx))
@@ -1906,6 +1918,8 @@ fn render_tag_chip(id: &str, tag: &str, cx: &mut Context<Sidebar>) -> AnyElement
                 .xsmall()
                 .icon(IconName::Close)
                 .tooltip(i18n::t("sidebar-thread-tag-clear"))
+                .invisible()
+                .group_hover(row_group, |s| s.visible())
                 .on_click(cx.listener(move |_this, _ev, _window, cx| {
                     cx.stop_propagation();
                     cx.emit(SidebarEvent::SetThreadTag(id_clear.clone(), None));
