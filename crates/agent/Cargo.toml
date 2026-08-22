@@ -6,6 +6,10 @@ publish.workspace = true
 
 [features]
 default = []
+# ChromeUse: the in-process rustwright CDP engine + ChromeUse* tools. The
+# gpui app enables it; the VS Code host (manox-napi) builds without it so the
+# engine never links into the shipped extension.
+chrome-use = ["dep:rustwright_core"]
 # Exposes `thread_store::init_for_test` / `drop_for_test` (and the `TEST_OVERRIDE`
 # slot they mutate) to downstream crates' test suites. Production builds keep
 # these hidden so the global `ThreadStore` path is the only one reachable.
@@ -56,13 +60,14 @@ fluent.workspace = true
 unic-langid.workspace = true
 tera.workspace = true
 tokio-tungstenite = { workspace = true }
-rustwright_core.workspace = true
+rustwright_core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Self-reference with `test-support`: integration tests (`tests/`) compile the
 # lib without `cfg(test)`, so the test seams (`init_for_test` /
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
-agent = { path = ".", features = ["test-support"] }
+# `chrome-use` keeps the chrome_use module and its live tests in the suite.
+agent = { path = ".", features = ["test-support", "chrome-use"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 
