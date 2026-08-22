@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::views::launcher::LauncherPick;
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
@@ -49,12 +50,14 @@ use gpui_component::{
 use gpui_component::{WindowExt as _, notification::Notification, tooltip::Tooltip};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
+use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
 use crate::external_session::{
-    ExternalSession, ResumeSidecar, SessionKind, claude_cwd_from_file_head,
+    ExternalSession, ResumeSidecar, SessionKind, SessionPlacement, claude_cwd_from_file_head,
     claude_project_dir_for_cwd, claude_session_id_from_file_name, codex_session_id_from_rollout,
     codex_sessions_dir, list_nested_jsonl, list_sidecars, list_top_level_jsonl,
     merge_external_summaries, new_file_names, remove_sidecar, resume_args, write_sidecar,
@@ -85,16 +88,51 @@ use terminal_ui::TerminalView;
 pub(crate) type ThreadEntity = agent::Thread;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
-/// (Write/Preview); `Browser(id)` is an untrusted embedded webview (see
-/// [`BrowserView`]).
+/// (Write/Preview); `Launcher` is the empty-tab launcher offering the
+/// built-in browser / terminal / CLI-agent views; `Browser(id)` is an
+/// untrusted embedded webview (see [`BrowserView`]); `Session(id)` embeds an
+/// [`ExternalSession`]'s terminal (plain PTY or CLI agent TUI).
 #[derive(Clone, Debug)]
 enum RightTab {
     Editor,
+    Launcher,
     Browser(BrowserTabId),
     /// A team member's observation panel, keyed by member name.
     Member(String),
-    /// A pi sub-agent's observation panel, keyed by Agent tool-call id.
+    /// A pi sub-agent's observation panel, keyed by subagent address.
     Subagent(String),
+    /// An embedded terminal/CLI-agent session, keyed by `ExternalSession.id`.
+    Session(String),
+}
+
+/// Persisted shape of a thread's right-pane state — one row per thread in
+/// `threads.db` (`thread_right_pane`). The UI layer owns this shape; the db
+/// stores opaque TEXT. Subagent tabs are ephemeral by design and never
+/// serialized.
+#[derive(Serialize, Deserialize)]
+struct PersistedRightPane {
+    visible: bool,
+    active: usize,
+    tabs: Vec<PersistedRightTab>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedRightTab {
+    Editor,
+    Launcher,
+    Browser { url: String },
+    Member { name: String },
+    Session { id: String },
+}
+
+/// In-session per-thread right-pane stash: the live tabs (browser views and
+/// member panels keep their entities across switches), the active index, and
+/// visibility. The persistent copy lives in `threads.db`.
+struct RightPaneSnapshot {
+    tabs: Vec<RightTab>,
+    active: usize,
+    visible: bool,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -288,11 +326,30 @@ pub struct Workspace {
     /// `h_full`-percentage) scroll container reliably engages `overflow_y_scroll`
     /// instead of letting content overflow and clip.
     editor_preview_scroll: ScrollHandle,
-    /// Peer right-pane tabs for the editor, member/sub-agent observers,
-    /// browser, and plan preview. The pane renders while non-empty;
-    /// `editor_open` tracks whether the Editor tab specifically is active.
+    /// Peer right-pane tabs for the editor, launcher, browser, member/sub-agent
+    /// observers, and embedded terminal/CLI sessions. `editor_open` tracks
+    /// whether the Editor tab specifically is active.
     right_tabs: Vec<RightTab>,
     active_right_tab: usize,
+    /// Right-pane visibility gate, orthogonal to the tab list: hiding the pane
+    /// keeps every tab (and its state) alive for the next toggle. Closing the
+    /// last tab hides the pane; the TitleBar toggle restores the tabs.
+    right_pane_visible: bool,
+    /// Per-thread right-pane stash for in-session round trips; the persistent
+    /// copy lives in `threads.db` (`thread_right_pane`).
+    right_pane_by_thread: HashMap<String, RightPaneSnapshot>,
+    /// The tab currently under the mouse — the close `×` reveals on hover.
+    hovered_right_tab: Option<usize>,
+    /// Generation counter for the browser page-title ticker; bumped when the
+    /// last browser tab closes so the prior ticker self-terminates.
+    browser_title_ticker_gen: u64,
+    /// Provider→model cascade opened from the Launcher's CLI-agent rows.
+    /// Created on open, destroyed on close (the model-selector pattern).
+    launcher_menu: Option<Entity<PopupMenu>>,
+    launcher_menu_sub: Option<Subscription>,
+    /// The CLI agent kind the open launcher cascade belongs to — anchors the
+    /// popup under its launcher row.
+    launcher_menu_kind: Option<SessionKind>,
     /// Team chip popover open state (composer chip).
     team_chip_open: bool,
     /// Member observation panels keyed by member name; lifetime is the
@@ -508,6 +565,23 @@ enum ViewMode {
 const EDITOR_PANEL_WIDTH: f32 = 640.;
 const EDITOR_MIN_WIDTH: f32 = 320.;
 const EDITOR_MAX_WIDTH: f32 = 960.;
+/// Fixed width of every right-pane tab: long labels cap + ellipsis instead
+/// of stretching the bar.
+const RIGHT_TAB_WIDTH: f32 = 160.;
+/// Character cap for right-pane tab labels; longer labels end in `…` and the
+/// full text rides the tab's tooltip.
+const RIGHT_TAB_LABEL_CAP: usize = 16;
+
+/// Cap a right-pane tab label at [`RIGHT_TAB_LABEL_CAP`] chars + `…`.
+fn cap_tab_label(label: &str) -> String {
+    let mut chars = label.chars();
+    let head: String = chars.by_ref().take(RIGHT_TAB_LABEL_CAP).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
 /// Width of the drag handle between the message column and the right side
 /// view (the editor pane).
 const EDITOR_DIVIDER_WIDTH: f32 = 6.;
@@ -673,6 +747,13 @@ impl Workspace {
             editor_preview_scroll: ScrollHandle::new(),
             right_tabs: Vec::new(),
             active_right_tab: 0,
+            right_pane_visible: false,
+            right_pane_by_thread: HashMap::new(),
+            hovered_right_tab: None,
+            browser_title_ticker_gen: 0,
+            launcher_menu: None,
+            launcher_menu_sub: None,
+            launcher_menu_kind: None,
             team_chip_open: false,
             member_panels: HashMap::new(),
             subagent_panels: HashMap::new(),
@@ -1667,12 +1748,19 @@ impl Workspace {
                             wire_api: wire.clone(),
                             project_cwd: project.clone(),
                         },
+                        SessionPlacement::FullWindow,
                         window,
                         cx,
                     );
                 }
                 SidebarEvent::SpawnPlainSession(kind, project) => {
-                    this.spawn_plain_session(*kind, project.clone(), window, cx);
+                    this.spawn_plain_session(
+                        *kind,
+                        project.clone(),
+                        SessionPlacement::FullWindow,
+                        window,
+                        cx,
+                    );
                 }
                 SidebarEvent::LaunchVSCode(project) => {
                     // VS Code opens the project directory the menu was launched
@@ -1854,6 +1942,7 @@ impl Workspace {
     pub(crate) fn spawn_external_session(
         &mut self,
         spawn: ExternalSpawn,
+        placement: SessionPlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1983,7 +2072,7 @@ impl Workspace {
         });
         self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
         self.sync_sidebar_external(cx);
-        self.attach_external_session(&id, window, cx);
+        self.place_external_session(&id, placement, window, cx);
     }
 
     /// Launch a plain PTY session — the user's shell (`Terminal`) — with no
@@ -2000,6 +2089,7 @@ impl Workspace {
         &mut self,
         kind: SessionKind,
         project_cwd: Option<PathBuf>,
+        placement: SessionPlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2059,7 +2149,7 @@ impl Workspace {
             sidecar: None,
         });
         self.sync_sidebar_external(cx);
-        self.attach_external_session(&id, window, cx);
+        self.place_external_session(&id, placement, window, cx);
     }
 
     /// Observe a session terminal's lifecycle, shared by the agent and plain
@@ -2580,6 +2670,53 @@ impl Workspace {
         });
     }
 
+    /// Route a freshly spawned external session to its placement: full-window
+    /// attach (the sidebar-row path) or a right-pane Session tab.
+    fn place_external_session(
+        &mut self,
+        id: &str,
+        placement: SessionPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match placement {
+            SessionPlacement::FullWindow => self.attach_external_session(id, window, cx),
+            SessionPlacement::RightPane { replace_tab } => {
+                self.mount_session_tab(id, replace_tab, window, cx)
+            }
+        }
+    }
+
+    /// Mount an external session's terminal on the right pane: replace the
+    /// Launcher tab at `replace_tab` while it still holds one, else append a
+    /// fresh tab. The terminal gains focus on the next frame so the TUI
+    /// receives keystrokes immediately.
+    fn mount_session_tab(
+        &mut self,
+        id: &str,
+        replace_tab: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.right_tabs.get(replace_tab), Some(RightTab::Launcher)) {
+            self.right_tabs[replace_tab] = RightTab::Session(id.to_string());
+            self.set_active_right_tab(replace_tab, cx);
+        } else {
+            self.right_tabs.push(RightTab::Session(id.to_string()));
+            self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+        }
+        self.right_pane_visible = true;
+        if let Some(view) = self
+            .external_sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.terminal_view.clone())
+        {
+            self.focus_external_view(view, window, cx);
+        }
+        cx.notify();
+    }
+
     /// Mirror an external agent's OSC title (`TerminalEvent::Title`) into its
     /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
     /// the titlebar when the active session's title changed. No-op when the
@@ -2651,6 +2788,21 @@ impl Workspace {
     fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.active_external.as_deref() == Some(id);
         self.external_sessions.retain(|s| s.id != id);
+        // A Session tab embedding this terminal must not outlive the session
+        // (a natural `/exit` closes its tab instead of stranding a dead PTY).
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Session(sid) if *sid == id))
+        {
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix, cx);
+            self.hide_right_pane_if_empty(cx);
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+        }
         // The session is now explicitly closed (sidebar `×` or a natural CLI
         // exit): drop its sidecar — both the in-memory row and the disk record
         // — so it is no longer offered for resume.
@@ -2689,18 +2841,105 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> BrowserTabId {
-        let url = if url.is_empty() {
-            crate::views::browser_view::DEFAULT_URL
-        } else {
-            url
-        };
-        let tab_id = crate::views::browser_view::allocate_tab_id();
-        let view =
-            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
-        self.browser_views.insert(tab_id, view);
+        let tab_id = self.restore_browser_tab(url, window, cx);
+        self.right_pane_visible = true;
         self.right_tabs.push(RightTab::Browser(tab_id));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);
         tab_id
+    }
+
+    /// Poll every browser tab's `<title>` through the host so right-pane tab
+    /// labels track the loaded page. Mirrors the thinking-ticker pattern:
+    /// bumping `browser_title_ticker_gen` (last browser tab closed, or a new
+    /// ticker superseding this one) or an emptied `browser_views` map
+    /// self-terminates the loop.
+    fn spawn_browser_title_ticker(&mut self, cx: &mut Context<Self>) {
+        self.browser_title_ticker_gen = self.browser_title_ticker_gen.wrapping_add(1);
+        let entity = cx.entity().clone();
+        let ticker_gen = self.browser_title_ticker_gen;
+        cx.spawn(async move |_this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                let alive = entity.read_with(cx, |this, _| {
+                    this.browser_title_ticker_gen == ticker_gen && !this.browser_views.is_empty()
+                });
+                if !alive {
+                    break;
+                }
+                let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() else {
+                    break;
+                };
+                // Only tabs on screen need fresh titles: hidden panes and
+                // tabs stashed under other threads keep their (hidden)
+                // webviews idle instead of polling JS into them every tick.
+                let ids: Vec<BrowserTabId> = entity.read_with(cx, |this, _| {
+                    if this.right_pane_open() {
+                        this.right_tabs
+                            .iter()
+                            .filter_map(|t| match t {
+                                RightTab::Browser(id) => Some(*id),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                });
+                if ids.is_empty() {
+                    continue;
+                }
+                for id in ids {
+                    // A superseded / dead ticker must stop issuing evals.
+                    let still =
+                        entity.read_with(cx, |this, _| this.browser_title_ticker_gen == ticker_gen);
+                    if !still {
+                        break;
+                    }
+                    // `page_title` reads the Workspace inside `inject_script`,
+                    // so it must not run under a Workspace lease — plain
+                    // `AsyncApp::update`, not `entity.update`.
+                    let task = cx.update(|cx| host.page_title(id, cx));
+                    if let Ok(title) = task.await
+                        && !title.is_empty()
+                    {
+                        entity.update(cx, |this, cx| {
+                            if let Some(view) = this.browser_views.get(&id).cloned() {
+                                view.update(cx, |v, cx| v.set_title(title.clone(), cx));
+                            }
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Show only the active browser tab's native webview and hide the rest.
+    /// No webview may draw while the pane is hidden or another view mode is
+    /// up (the platform view is not a gpui element and ignores layout).
+    fn sync_browser_visibility(&mut self, cx: &mut Context<Self>) {
+        let active_browser =
+            if matches!(self.view_mode, ViewMode::Workspace) && self.right_pane_open() {
+                match self.right_tabs.get(self.active_right_tab) {
+                    Some(RightTab::Browser(id)) => Some(*id),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        for (id, view) in self.browser_views.iter() {
+            let should_show = active_browser == Some(*id);
+            view.update(cx, |v, cx| {
+                let wv = v.webview().clone();
+                match (should_show, wv.read(cx).visible()) {
+                    (true, false) => wv.update(cx, |w, _| w.show()),
+                    (false, true) => wv.update(cx, |w, _| w.hide()),
+                    _ => {}
+                }
+            });
+        }
     }
 
     /// Close and recycle a browser tab by id. Dropping the `BrowserView`
@@ -2717,13 +2956,18 @@ impl Workspace {
         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
             host.reclaim_routes(tab_id);
         }
+        if self.browser_views.is_empty() {
+            // Last browser tab gone — retire the title ticker.
+            self.browser_title_ticker_gen = self.browser_title_ticker_gen.wrapping_add(1);
+        }
         if let Some(ix) = self
             .right_tabs
             .iter()
             .position(|t| matches!(t, RightTab::Browser(id) if *id == tab_id))
         {
             self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
+            self.reseat_active_after_close(ix, cx);
+            self.hide_right_pane_if_empty(cx);
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
@@ -3105,7 +3349,12 @@ impl Workspace {
 
         // Sub-agent observation is per-thread ephemeral state; drop the
         // outgoing thread's panels and transcripts before rebinding.
-        self.clear_subagent_observation();
+        self.clear_subagent_observation(cx);
+        // The right pane belongs to a thread: stash the outgoing pane (live
+        // tabs, active index, visibility) to the in-session map + threads.db
+        // before the incoming thread rebinds. Subagent tabs were already
+        // stripped above, so the stash never carries ephemeral entries.
+        self.stash_right_pane(old_id.clone(), cx);
 
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
@@ -3230,6 +3479,10 @@ impl Workspace {
         let editor_saved = self.editor_drafts.remove(&new_id).unwrap_or_default();
         self.editor_state
             .update(cx, |s, cx| s.set_value(editor_saved, window, cx));
+        // Restore the incoming thread's right pane: the in-session stash,
+        // else the threads.db snapshot; a thread with neither gets the empty
+        // hidden pane.
+        self.restore_right_pane(&new_id, window, cx);
         // Reveal the latest turn for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. Both running and completed threads arm `FollowMode::Tail`:
@@ -4150,9 +4403,418 @@ impl Workspace {
         }
     }
 
-    /// Whether the right pane has any tab (Editor or Member) showing.
+    /// Whether the right pane is actually on screen: the visibility gate is
+    /// up AND at least one tab exists. Everything layout-related (main view
+    /// sub-columns, composer/rail suppression, width math) keys off this.
     fn right_pane_open(&self) -> bool {
-        !self.right_tabs.is_empty()
+        self.right_pane_visible && !self.right_tabs.is_empty()
+    }
+
+    /// Closing the last tab hides the pane; the TitleBar toggle restores the
+    /// surviving tabs on the next open.
+    fn hide_right_pane_if_empty(&mut self, cx: &mut Context<Self>) {
+        if self.right_tabs.is_empty() {
+            self.right_pane_visible = false;
+        }
+        if self
+            .hovered_right_tab
+            .is_some_and(|ix| ix >= self.right_tabs.len())
+        {
+            self.hovered_right_tab = None;
+        }
+        self.persist_right_pane(cx);
+    }
+
+    /// Snapshot the live pane into its persistable form: subagent tabs drop
+    /// out (ephemeral) and the active index remaps into the filtered list
+    /// (falling back to the head when the active tab was one).
+    fn persisted_right_pane(&self, cx: &App) -> PersistedRightPane {
+        let mut tabs: Vec<PersistedRightTab> = Vec::new();
+        let mut active = 0usize;
+        for (ix, tab) in self.right_tabs.iter().enumerate() {
+            let persisted = match tab {
+                RightTab::Editor => Some(PersistedRightTab::Editor),
+                RightTab::Launcher => Some(PersistedRightTab::Launcher),
+                RightTab::Browser(id) => {
+                    let url = self
+                        .browser_views
+                        .get(id)
+                        .map(|v| v.read(cx).url().to_string())
+                        .unwrap_or_default();
+                    Some(PersistedRightTab::Browser { url })
+                }
+                RightTab::Member(name) => Some(PersistedRightTab::Member { name: name.clone() }),
+                RightTab::Session(id) => Some(PersistedRightTab::Session { id: id.clone() }),
+                RightTab::Subagent(_) => None,
+            };
+            if let Some(p) = persisted {
+                if ix == self.active_right_tab {
+                    active = tabs.len();
+                }
+                tabs.push(p);
+            }
+        }
+        PersistedRightPane {
+            visible: self.right_pane_visible,
+            active,
+            tabs,
+        }
+    }
+
+    /// Write the foreground thread's live pane state to `threads.db`. The
+    /// mutation primitives (tab activate/close, visibility toggle) call this,
+    /// so the persisted row tracks the pane on every change.
+    fn persist_right_pane(&mut self, cx: &mut Context<Self>) {
+        let thread_id = self.thread.read(cx).id.0.clone();
+        let persisted = self.persisted_right_pane(cx);
+        let json = match serde_json::to_string(&persisted) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "serialize right pane failed");
+                return;
+            }
+        };
+        let db = agent::thread_store_global().read(cx).db().clone();
+        if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
+            tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
+        }
+    }
+
+    /// Per-thread isolation: move the outgoing thread's live pane (tabs,
+    /// active index, visibility) into the in-session stash and persist it to
+    /// `threads.db`, then reset the pane to the empty state for the incoming
+    /// thread.
+    fn stash_right_pane(&mut self, thread_id: String, cx: &mut Context<Self>) {
+        let persisted = self.persisted_right_pane(cx);
+        let json = serde_json::to_string(&persisted)
+            .inspect_err(|e| tracing::warn!(error = %e, "serialize right pane failed"))
+            .ok();
+        if let Some(json) = json {
+            let db = agent::thread_store_global().read(cx).db().clone();
+            if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
+                tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
+            }
+        }
+        // The cascade belongs to the outgoing thread's launcher row; a
+        // leftover popup would resurface stale (and with a stale tab index)
+        // when the pane restores.
+        self.close_launcher_menu();
+        self.right_pane_by_thread.insert(
+            thread_id,
+            RightPaneSnapshot {
+                tabs: std::mem::take(&mut self.right_tabs),
+                active: self.active_right_tab,
+                visible: self.right_pane_visible,
+            },
+        );
+        self.active_right_tab = 0;
+        self.right_pane_visible = false;
+        self.hovered_right_tab = None;
+        self.editor_open = false;
+    }
+
+    /// Restore the incoming thread's pane: the in-session stash first (live
+    /// tabs keep their webview/panel entities), else the `threads.db`
+    /// snapshot re-materialized; a thread with neither gets the empty hidden
+    /// pane.
+    fn restore_right_pane(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.right_pane_by_thread.remove(thread_id) {
+            Some(snapshot) => {
+                // A stashed tab may outlive its backing entity: browser
+                // views can be closed and external sessions can exit while
+                // another thread is foreground. Drop the orphaned tabs.
+                let mut tabs = snapshot.tabs;
+                tabs.retain(|t| match t {
+                    RightTab::Browser(id) => self.browser_views.contains_key(id),
+                    RightTab::Session(id) => self.external_sessions.iter().any(|s| s.id == *id),
+                    _ => true,
+                });
+                self.right_tabs = tabs;
+                self.right_pane_visible = snapshot.visible;
+                self.hovered_right_tab = None;
+                if self.right_tabs.is_empty() {
+                    self.active_right_tab = 0;
+                    self.right_pane_visible = false;
+                    self.editor_open = false;
+                } else {
+                    let active = snapshot.active.min(self.right_tabs.len() - 1);
+                    self.set_active_right_tab(active, cx);
+                }
+            }
+            None => {
+                let loaded = agent::thread_store_global()
+                    .read(cx)
+                    .db()
+                    .load_right_pane(thread_id);
+                let persisted = match loaded {
+                    Ok(Some(json)) => match serde_json::from_str::<PersistedRightPane>(&json) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(error = %e, thread_id = %thread_id, "decode right pane snapshot failed");
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, thread_id = %thread_id, "load right pane snapshot failed");
+                        None
+                    }
+                };
+                self.right_tabs.clear();
+                self.hovered_right_tab = None;
+                if let Some(persisted) = persisted {
+                    self.materialize_right_pane(persisted, window, cx);
+                } else {
+                    self.active_right_tab = 0;
+                    self.right_pane_visible = false;
+                    self.editor_open = false;
+                }
+            }
+        }
+    }
+
+    /// Rebuild a persisted pane into live tabs. Browser tabs recreate their
+    /// webview from the stored URL (the app-restart path); member tabs only
+    /// restore while the thread's team still has the member; session tabs
+    /// only while the external session is still alive — everything else
+    /// drops silently.
+    fn materialize_right_pane(
+        &mut self,
+        persisted: PersistedRightPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for tab in persisted.tabs {
+            match tab {
+                PersistedRightTab::Editor => self.right_tabs.push(RightTab::Editor),
+                PersistedRightTab::Launcher => self.right_tabs.push(RightTab::Launcher),
+                PersistedRightTab::Browser { url } => {
+                    let id = self.restore_browser_tab(&url, window, cx);
+                    self.right_tabs.push(RightTab::Browser(id));
+                }
+                // `open_member_tab` no-ops (pushes nothing) when the team or
+                // member is gone — exactly the drop semantics.
+                PersistedRightTab::Member { name } => self.open_member_tab(&name, cx),
+                PersistedRightTab::Session { id } => {
+                    if self.external_sessions.iter().any(|s| s.id == id) {
+                        self.right_tabs.push(RightTab::Session(id));
+                    }
+                }
+            }
+        }
+        self.right_pane_visible = persisted.visible && !self.right_tabs.is_empty();
+        if self.right_tabs.is_empty() {
+            self.active_right_tab = 0;
+            self.editor_open = false;
+        } else {
+            let active = persisted.active.min(self.right_tabs.len() - 1);
+            self.set_active_right_tab(active, cx);
+        }
+    }
+
+    /// Recreate a persisted browser tab's webview (app-restart path): build
+    /// the view, register it in the host routing table, arm the title poll —
+    /// tab-list placement is the caller's.
+    fn restore_browser_tab(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BrowserTabId {
+        let url = if url.is_empty() {
+            crate::views::browser_view::DEFAULT_URL
+        } else {
+            url
+        };
+        let tab_id = crate::views::browser_view::allocate_tab_id();
+        let view =
+            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
+        self.browser_views.insert(tab_id, view);
+        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+            host.register_ui_tab(tab_id, self.thread.downgrade());
+        }
+        self.spawn_browser_title_ticker(cx);
+        tab_id
+    }
+
+    /// Toggle the right pane's visibility from the TitleBar button. Hiding
+    /// keeps every tab alive; showing with an empty tab list lands on a fresh
+    /// Launcher tab so the button always opens something real.
+    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane_open() {
+            self.right_pane_visible = false;
+        } else {
+            self.right_pane_visible = true;
+            if self.right_tabs.is_empty() {
+                self.right_tabs.push(RightTab::Launcher);
+                self.active_right_tab = 0;
+                self.editor_open = false;
+            }
+        }
+        self.persist_right_pane(cx);
+        cx.notify();
+    }
+
+    /// Open (or focus) an empty Launcher tab.
+    fn open_launcher_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Launcher))
+        {
+            self.right_pane_visible = true;
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
+        self.right_pane_visible = true;
+        self.right_tabs.push(RightTab::Launcher);
+        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+    }
+
+    /// The Launcher tab's body: five centered integration shortcuts, with the
+    /// open provider→model cascade anchored under its CLI-agent row.
+    fn render_launcher_content(
+        &mut self,
+        launcher_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let weak = cx.weak_entity();
+        let on_pick = move |pick: LauncherPick, window: &mut Window, cx: &mut App| {
+            if let Some(ws) = weak.upgrade() {
+                ws.update(cx, |this, cx| {
+                    this.launcher_pick(pick, launcher_ix, window, cx)
+                });
+            }
+        };
+        let dropdown = self.launcher_menu_kind.zip(self.launcher_menu.clone());
+        crate::views::launcher::render_launcher_tab(&theme, Rc::new(on_pick), dropdown)
+    }
+
+    /// Route a launcher shortcut to its view, opening it on the launcher's own
+    /// tab. Terminal and the three CLI agents spawn at the active thread's
+    /// cwd; CLI agents pick their provider/model through the cascade first.
+    fn launcher_pick(
+        &mut self,
+        pick: LauncherPick,
+        launcher_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match pick {
+            LauncherPick::Browser => {
+                if matches!(self.right_tabs.get(launcher_ix), Some(RightTab::Launcher)) {
+                    self.right_tabs.remove(launcher_ix);
+                    self.reseat_active_after_close(launcher_ix, cx);
+                }
+                let tab_id =
+                    self.open_browser_tab(crate::views::browser_view::DEFAULT_URL, window, cx);
+                // Keep the browser view on the launcher's own tab slot.
+                if let Some(new_ix) = self
+                    .right_tabs
+                    .iter()
+                    .position(|t| matches!(t, RightTab::Browser(id) if *id == tab_id))
+                {
+                    let insert_at = launcher_ix.min(self.right_tabs.len() - 1);
+                    if new_ix != insert_at {
+                        let tab = self.right_tabs.remove(new_ix);
+                        self.right_tabs.insert(insert_at, tab);
+                    }
+                    self.set_active_right_tab(insert_at, cx);
+                }
+            }
+            LauncherPick::Terminal => {
+                let cwd = self.launcher_thread_cwd(cx);
+                self.spawn_plain_session(
+                    SessionKind::Terminal,
+                    cwd,
+                    SessionPlacement::RightPane {
+                        replace_tab: launcher_ix,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            LauncherPick::Agent(kind) => {
+                self.open_launcher_cascade(kind, launcher_ix, window, cx);
+            }
+        }
+    }
+
+    /// The active thread's cwd for launcher spawns (`None` when unset — the
+    /// spawn paths fall back to the workspace cwd, parity with the
+    /// Conversations-header spawns).
+    fn launcher_thread_cwd(&self, cx: &App) -> Option<PathBuf> {
+        let cwd = self.thread.read(cx).cwd();
+        if cwd.as_os_str().is_empty() {
+            None
+        } else {
+            Some(cwd.to_path_buf())
+        }
+    }
+
+    /// Open the provider→model cascade for a launcher CLI-agent row. Mirrors
+    /// the model-selector popup pattern: entity + dismiss subscription,
+    /// dropped on close.
+    fn open_launcher_cascade(
+        &mut self,
+        kind: SessionKind,
+        launcher_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.launcher_menu_kind == Some(kind) {
+            self.close_launcher_menu();
+            cx.notify();
+            return;
+        }
+        self.close_launcher_menu();
+        let cwd = self.launcher_thread_cwd(cx);
+        let ws = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+            crate::views::model_cascade::build_model_cascade(
+                menu,
+                kind.agent_id(),
+                window,
+                cx,
+                move |provider, model, wire, window, cx| {
+                    if let Some(ws) = ws.upgrade() {
+                        ws.update(cx, |this, cx| {
+                            this.close_launcher_menu();
+                            this.spawn_external_session(
+                                ExternalSpawn {
+                                    kind,
+                                    provider_name: provider,
+                                    model_id: model,
+                                    wire_api: wire,
+                                    project_cwd: cwd.clone(),
+                                },
+                                SessionPlacement::RightPane {
+                                    replace_tab: launcher_ix,
+                                },
+                                window,
+                                cx,
+                            );
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+        });
+        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+            this.close_launcher_menu();
+            cx.notify();
+        });
+        self.launcher_menu = Some(menu);
+        self.launcher_menu_sub = Some(sub);
+        self.launcher_menu_kind = Some(kind);
+        cx.notify();
+    }
+
+    fn close_launcher_menu(&mut self) {
+        self.launcher_menu = None;
+        self.launcher_menu_sub = None;
+        self.launcher_menu_kind = None;
     }
 
     /// Index of the Editor tab, if present.
@@ -4173,6 +4835,7 @@ impl Workspace {
             .right_tabs
             .get(self.active_right_tab)
             .is_some_and(|t| matches!(t, RightTab::Editor));
+        self.persist_right_pane(cx);
         cx.notify();
     }
 
@@ -4181,12 +4844,16 @@ impl Workspace {
     /// `removed_ix` shift left by one, so a still-live active tab to the right
     /// must decrement; the active tab itself being removed (and being the
     /// last) falls back to the new last tab.
-    fn reseat_active_after_close(&mut self, removed_ix: usize) {
+    fn reseat_active_after_close(&mut self, removed_ix: usize, cx: &mut Context<Self>) {
         if self.active_right_tab > removed_ix {
             self.active_right_tab -= 1;
         } else if self.active_right_tab >= self.right_tabs.len() {
             self.active_right_tab = self.right_tabs.len().saturating_sub(1);
         }
+        // Tab indices shifted — the cached hover index would name the wrong
+        // tab until the next mouse move recomputes it.
+        self.hovered_right_tab = None;
+        self.persist_right_pane(cx);
     }
 
     /// Open the markdown editor: hide the inline composer and transfer its draft
@@ -4197,6 +4864,7 @@ impl Workspace {
         // Close any open inline menus so they don't linger behind the hidden footer.
         self.close_completion(cx);
         self.close_plus_menu();
+        self.right_pane_visible = true;
         if let Some(ix) = self.editor_tab_ix() {
             self.set_active_right_tab(ix, cx);
             return;
@@ -4231,7 +4899,8 @@ impl Workspace {
         });
         self.editor_state
             .update(cx, |s, cx| s.set_value("", window, cx));
-        self.reseat_active_after_close(ix);
+        self.reseat_active_after_close(ix, cx);
+        self.hide_right_pane_if_empty(cx);
         self.editor_open = self
             .right_tabs
             .get(self.active_right_tab)
@@ -4240,26 +4909,37 @@ impl Workspace {
     }
 
     /// Close a right-pane tab by index. The Editor tab routes through
-    /// `close_editor` to preserve draft-transfer semantics.
+    /// `close_editor` (draft-transfer semantics); a Session tab routes
+    /// through `close_external_session` (kill + teardown, whose removal path
+    /// drops the tab); the rest remove in place.
     fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
-            self.close_editor(window, cx);
-            return;
-        }
-        if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
-            self.close_browser_tab(id, cx);
-        }
-        if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
-            self.member_panels.remove(&name);
-            self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
-            cx.notify();
-        }
-        if let Some(RightTab::Subagent(id)) = self.right_tabs.get(ix).cloned() {
-            self.subagent_panels.remove(&id);
-            self.right_tabs.remove(ix);
-            self.reseat_active_after_close(ix);
-            cx.notify();
+        match self.right_tabs.get(ix).cloned() {
+            Some(RightTab::Editor) => self.close_editor(window, cx),
+            Some(RightTab::Browser(id)) => self.close_browser_tab(id, cx),
+            Some(RightTab::Session(id)) => self.close_external_session(&id, cx),
+            Some(RightTab::Member(name)) => {
+                self.member_panels.remove(&name);
+                self.right_tabs.remove(ix);
+                self.reseat_active_after_close(ix, cx);
+                self.hide_right_pane_if_empty(cx);
+                cx.notify();
+            }
+            Some(RightTab::Subagent(id)) => {
+                self.subagent_panels.remove(&id);
+                self.right_tabs.remove(ix);
+                self.reseat_active_after_close(ix, cx);
+                self.hide_right_pane_if_empty(cx);
+                cx.notify();
+            }
+            Some(RightTab::Launcher) | None => {
+                if ix < self.right_tabs.len() {
+                    self.close_launcher_menu();
+                    self.right_tabs.remove(ix);
+                    self.reseat_active_after_close(ix, cx);
+                    self.hide_right_pane_if_empty(cx);
+                    cx.notify();
+                }
+            }
         }
     }
     /// Close the active right-pane tab if it is a browser tab. No-op
@@ -4302,14 +4982,16 @@ impl Workspace {
             weak,
             cx,
         );
+        self.right_pane_visible = true;
         self.member_panels.insert(name.to_string(), panel);
         self.right_tabs.push(RightTab::Member(name.to_string()));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);
         cx.notify();
     }
-    /// Open (or focus) a sub-agent observation panel in the right pane.
-    /// `topic` is the shared `subagent_topic` derivation so the tab title
-    /// matches the rail and conversation rows.
+    /// Open (or focus) a sub-agent observation panel in the right pane. The
+    /// tab label is the subagent's address (`id`); the panel's banner shows
+    /// `topic` — the shared `subagent_topic` derivation the rail and
+    /// conversation rows use.
     pub(crate) fn open_subagent_tab(
         &mut self,
         id: &str,
@@ -4337,8 +5019,11 @@ impl Workspace {
         } else {
             None
         };
-        let title = crate::views::subagents::task_display_title(subagent_type, topic)
-            .unwrap_or_else(|| id.to_string());
+        let banner = if topic.is_empty() {
+            id.to_string()
+        } else {
+            topic.to_string()
+        };
         let role = if subagent_type.is_empty() {
             "sub-agent".to_string()
         } else {
@@ -4346,7 +5031,7 @@ impl Workspace {
         };
         let prompt = self.subagent_prompts.get(id).cloned();
         let panel = crate::views::subagent_panel::SubagentPanel::new(
-            title,
+            banner,
             role,
             status,
             &backfill,
@@ -4356,6 +5041,7 @@ impl Workspace {
             cx,
         );
         self.subagent_panels.insert(id.to_string(), panel);
+        self.right_pane_visible = true;
         self.right_tabs.push(RightTab::Subagent(id.to_string()));
         self.set_active_right_tab(self.right_tabs.len() - 1, cx);
         cx.notify();
@@ -4377,7 +5063,7 @@ impl Workspace {
     }
 
     /// Drop per-thread sub-agent observation state and close its tabs.
-    fn clear_subagent_observation(&mut self) {
+    fn clear_subagent_observation(&mut self, cx: &mut Context<Self>) {
         self.subagent_panels.clear();
         self.subagent_transcripts.clear();
         let before = self.right_tabs.len();
@@ -4402,6 +5088,7 @@ impl Workspace {
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
         }
+        self.hide_right_pane_if_empty(cx);
     }
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
@@ -6959,6 +7646,11 @@ impl Workspace {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
         }
+        // The native webview keeps its last bounds until explicitly hidden,
+        // so every frame must pin which one may draw (the active browser tab
+        // of a visible right pane) — an inactive tab would otherwise paint
+        // over the pane's content.
+        self.sync_browser_visibility(cx);
         // Settings reuses the shared shell (`sidebar | divider | main`) — the
         // same layout container as the app page, only with the settings nav in
         // the sidebar slot and the settings panel as the main column. The
@@ -7094,7 +7786,7 @@ impl Workspace {
         }
 
         let editor_open = self.editor_open;
-        let right_pane_open = !self.right_tabs.is_empty();
+        let right_pane_open = self.right_pane_open();
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
         // Title text is the active thread's display title (user rename > LLM
@@ -7113,7 +7805,7 @@ impl Workspace {
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
         let loading = self.thread.read(cx).history_phase().is_loading();
-        let composer_placement = composer_placement(editor_open, first_screen);
+        let composer_placement = composer_placement(editor_open && right_pane_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
             - px(SIDEBAR_DIVIDER_WIDTH)
@@ -7123,7 +7815,7 @@ impl Workspace {
                 px(0.)
             };
         let show_rail = !first_screen
-            && !editor_open
+            && (!editor_open || !right_pane_open)
             && self.thread.read(cx).has_interacted()
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
         let overlay = self.render_blank_project_overlay(window, &theme, cx);
@@ -7270,63 +7962,100 @@ impl Workspace {
             );
         // The sidebar divider lives in `shell_root` — shared by every view
         // mode so the sidebar resizes identically everywhere.
-        // Right pane is a peer tab container for the editor, member/sub-agent
-        // observers, browser views, and plan preview. The top-level TabBar is
-        // built from `right_tabs`; the content below dispatches on the active
-        // tab.
+        // Right pane is a peer tab container for the editor, launcher,
+        // browser, member/sub-agent observers, and embedded sessions. The
+        // top-level TabBar is built from `right_tabs`; the content below
+        // dispatches on the active tab.
         let active_tab = self.right_tabs.get(self.active_right_tab).cloned();
+        let hovered_tab = self.hovered_right_tab;
         let right_tab_children: Vec<Tab> = self
             .right_tabs
             .iter()
             .enumerate()
             .map(|(ix, tab)| {
-                let base = match tab {
-                    RightTab::Editor => Tab::new().label(i18n::t("member-editor-tab")),
+                // Full label rides the tooltip; the fixed-width tab shows the
+                // capped form. Session tabs additionally carry their kind's
+                // brand glyph as a prefix.
+                let (full, icon_path): (SharedString, Option<&'static str>) = match tab {
+                    RightTab::Editor => (i18n::t("member-editor-tab"), None),
+                    RightTab::Launcher => (i18n::t("right-tab-launcher"), None),
                     RightTab::Member(name) => {
-                        Tab::new().label(i18n::t_str("member-tab", &[("name", name.as_str())]))
+                        (i18n::t_str("member-tab", &[("name", name.as_str())]), None)
                     }
                     RightTab::Browser(id) => {
-                        let url = self
+                        // The page's <title>, polled by the host; the URL is
+                        // the fallback before the first title lands.
+                        let label = self
                             .browser_views
                             .get(id)
-                            .map(|v| v.read(cx).url().to_string())
+                            .map(|v| {
+                                let view = v.read(cx);
+                                let title = view.title();
+                                if title.is_empty() {
+                                    view.url().to_string()
+                                } else {
+                                    title.to_string()
+                                }
+                            })
                             .unwrap_or_default();
-                        Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
+                        (i18n::t_str("browser-tab", &[("title", &label)]), None)
                     }
-                    RightTab::Subagent(id) => {
-                        let title = self
-                            .subagent_panels
-                            .get(id)
-                            .map(|p| p.read(cx).title().to_string())
-                            .unwrap_or_default();
-                        Tab::new().label(title)
+                    // The subagent's address (e.g. `Sailor_0`); the panel's
+                    // banner carries the topic.
+                    RightTab::Subagent(id) => (id.as_str().into(), None),
+                    RightTab::Session(id) => {
+                        let session = self.external_sessions.iter().find(|s| s.id == *id);
+                        let label = session.map(|s| s.display_title()).unwrap_or_default();
+                        (label, session.map(|s| s.kind.icon_asset()))
                     }
                 };
-                // Every observational/preview tab carries a close affordance;
-                // the Editor tab keeps its keyboard toggle (`ToggleEditor` /
-                // `CloseEditor`).
-                match tab {
-                    RightTab::Browser(_) | RightTab::Member(_) | RightTab::Subagent(_) => base
-                        .suffix(
-                            gpui::div()
-                                .id(("right-tab-close", ix))
-                                .cursor_pointer()
-                                .child(
-                                    Icon::new(IconName::Close)
-                                        .xsmall()
-                                        .text_color(theme.muted_foreground),
-                                )
-                                // Stop the click from also selecting the tab
-                                // underneath the ×.
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_right_tab(ix, window, cx);
-                                })),
-                        ),
-                    RightTab::Editor => base,
+                let mut base = Tab::new()
+                    .label(cap_tab_label(&full))
+                    .w(px(RIGHT_TAB_WIDTH))
+                    .tooltip({
+                        let full = full.clone();
+                        move |window, cx| Tooltip::new(full.clone()).build(window, cx)
+                    })
+                    .on_hover(cx.listener(move |this, hovering: &bool, _window, cx| {
+                        if *hovering {
+                            this.hovered_right_tab = Some(ix);
+                        } else if this.hovered_right_tab == Some(ix) {
+                            this.hovered_right_tab = None;
+                        }
+                        cx.notify();
+                    }));
+                if let Some(path) = icon_path {
+                    base = base.prefix(
+                        Icon::default()
+                            .path(path)
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    );
                 }
+                // The close × reveals on hover for every tab kind. Routing
+                // stays in `close_right_tab`: Editor keeps its draft-transfer
+                // semantics, Session kills + tears the session down.
+                if hovered_tab == Some(ix) {
+                    base = base.suffix(
+                        gpui::div()
+                            .id(("right-tab-close", ix))
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .xsmall()
+                                    .text_color(theme.muted_foreground),
+                            )
+                            // Stop the click from also selecting the tab
+                            // underneath the ×.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_right_tab(ix, window, cx);
+                            })),
+                    );
+                }
+                base
             })
             .collect();
         let editor_pane = v_flex()
@@ -7335,7 +8064,7 @@ impl Workspace {
             .flex_shrink_0()
             .bg(theme.background)
             .child(
-                h_flex().w_full().px_2().pt_1().child(
+                h_flex().w_full().px_2().pt_1().items_center().child(
                     TabBar::new("right-tabs")
                         .underline()
                         .small()
@@ -7343,7 +8072,17 @@ impl Workspace {
                         .on_click(cx.listener(|this, ix: &usize, _window, cx| {
                             this.set_active_right_tab(*ix, cx);
                         }))
-                        .children(right_tab_children),
+                        .children(right_tab_children)
+                        .suffix(
+                            Button::new("right-tab-new")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .tooltip(i18n::t("right-tab-new"))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.open_launcher_tab(cx);
+                                })),
+                        ),
                 ),
             )
             .child(
@@ -7446,6 +8185,15 @@ impl Workspace {
                             .get(&id)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Launcher) => {
+                            self.render_launcher_content(self.active_right_tab, cx)
+                        }
+                        Some(RightTab::Session(id)) => self
+                            .external_sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.terminal_view.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
                         None => gpui::div().into_any_element(),
                     }),
             );
@@ -7455,7 +8203,7 @@ impl Workspace {
         // actions and the turn-navigator overlay onto it. The shell's main
         // slot is the main view: a two-column container holding the message
         // column (conversation + rail) and, when any right-pane tab is open,
-        // the right side view (editor / browser tabs).
+        // the right side view (editor / launcher / browser / session tabs).
         // Bind the column to a local before the shell call: the column's
         // builder borrows `self` (title-menu trigger, context rail), which
         // would collide with `shell_root`'s `&mut self` receiver inside a
@@ -7631,7 +8379,22 @@ impl Workspace {
                                                 .child(title_text),
                                         ),
                                 )
-                                .child(h_flex()),
+                                .child(
+                                    h_flex().items_center().pr_2().child(
+                                        Button::new("right-pane-toggle")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(if right_pane_open {
+                                                Icon::new(IconName::PanelRight)
+                                            } else {
+                                                Icon::default().path("icons/panel-right-dashed.svg")
+                                            })
+                                            .tooltip(i18n::t("right-pane-toggle"))
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.toggle_right_pane(cx);
+                                            })),
+                                    ),
+                                ),
                         ),
                 )
                 // Floating context card: absolute top-right of the
@@ -7643,8 +8406,9 @@ impl Workspace {
                 .when(show_rail, |this| this.child(self.context_rail.clone()))
         };
         // The main view is the shell's main slot: the message column plus the
-        // right side view (editor / browser tabs) as its sub-columns. Nesting
-        // the right pane inside the main view keeps the shell uniformly
+        // right side view (editor / launcher / browser / session tabs) as its
+        // sub-columns. Nesting the right pane inside the main view keeps the
+        // shell uniformly
         // `sidebar | divider | main view` across every view mode (Terminal /
         // ExternalSession / Settings pass a single-column main).
         let main_view = h_flex()
@@ -8408,5 +9172,170 @@ mod tests {
             (range.start, range.end)
         });
         assert_ne!(start, end);
+    }
+    #[test]
+    fn cap_tab_label_caps_with_ellipsis() {
+        let long = "a very long tab label that must be capped";
+        let capped = super::cap_tab_label(long);
+        assert_eq!(capped.chars().count(), super::RIGHT_TAB_LABEL_CAP + 1);
+        assert!(capped.ends_with('\u{2026}'), "{capped}");
+        // Short labels pass through untouched; unicode caps on char bounds.
+        assert_eq!(super::cap_tab_label("short"), "short");
+        let unicode = "\u{4e2d}".repeat(super::RIGHT_TAB_LABEL_CAP + 4);
+        assert_eq!(
+            super::cap_tab_label(&unicode).chars().count(),
+            super::RIGHT_TAB_LABEL_CAP + 1
+        );
+    }
+    /// Right-pane state machine coverage: persisted-snapshot remap, the
+    /// stash/restore round trip, orphan-tab drops, and db re-materialization
+    /// across a simulated restart. Runs on an in-memory store so the real
+    /// `~/.manox/threads.db` is never touched.
+    #[gpui::test]
+    async fn right_pane_state_machine(cx: &mut gpui::TestAppContext) {
+        use super::{PersistedRightTab, RightTab};
+        use gpui::AppContext as _;
+
+        cx.update(gpui_component::init);
+        let db_path =
+            std::env::temp_dir().join(format!("manox-right-pane-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| {
+            agent::runtime::init(cx);
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone(), cx);
+        });
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // ── persisted_right_pane: subagent filter + active remap ──────────
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![
+                    RightTab::Editor,
+                    RightTab::Subagent("s1".into()),
+                    RightTab::Launcher,
+                ];
+                ws.active_right_tab = 2;
+                ws.right_pane_visible = true;
+                let p = ws.persisted_right_pane(cx);
+                assert_eq!(p.tabs.len(), 2, "subagent tab must drop out");
+                assert!(matches!(p.tabs[0], PersistedRightTab::Editor));
+                assert!(matches!(p.tabs[1], PersistedRightTab::Launcher));
+                assert_eq!(p.active, 1, "active remaps into the filtered list");
+                assert!(p.visible);
+
+                // An active subagent tab falls back to the head.
+                ws.active_right_tab = 1;
+                let p = ws.persisted_right_pane(cx);
+                assert_eq!(p.active, 0);
+            });
+        });
+
+        // ── stash → restore round trip (in-session) ────────────────────────
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![RightTab::Editor, RightTab::Launcher];
+                ws.active_right_tab = 1;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadA".into(), cx);
+                assert!(ws.right_tabs.is_empty());
+                assert!(!ws.right_pane_visible);
+                ws.restore_right_pane("threadA", window, cx);
+                assert_eq!(ws.right_tabs.len(), 2);
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert!(matches!(ws.right_tabs[1], RightTab::Launcher));
+                assert_eq!(ws.active_right_tab, 1);
+                assert!(ws.right_pane_visible);
+            });
+        });
+        // The stash wrote the db row keyed by thread.
+        assert!(
+            db.load_right_pane("threadA")
+                .expect("db readable")
+                .is_some()
+        );
+
+        // ── orphaned tabs drop on restore ──────────────────────────────────
+        // A browser view closed and a session exited while another thread was
+        // foreground: the stashed tabs referencing them must not come back.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![
+                    RightTab::Browser(987_654),
+                    RightTab::Session("external:claude:dead".into()),
+                    RightTab::Editor,
+                ];
+                ws.active_right_tab = 2;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadB".into(), cx);
+                ws.restore_right_pane("threadB", window, cx);
+                assert_eq!(ws.right_tabs.len(), 1, "orphans dropped");
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert_eq!(ws.active_right_tab, 0, "active remaps onto the survivor");
+            });
+        });
+
+        // ── db re-materialization across a simulated restart ───────────────
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![RightTab::Editor, RightTab::Launcher];
+                ws.active_right_tab = 0;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadC".into(), cx);
+                // Restart: the in-session stash is gone, only the db row
+                // survives.
+                ws.right_pane_by_thread.clear();
+                ws.restore_right_pane("threadC", window, cx);
+                assert_eq!(ws.right_tabs.len(), 2);
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert!(matches!(ws.right_tabs[1], RightTab::Launcher));
+                assert!(ws.right_pane_visible);
+            });
+        });
+
+        // ── toggle on an empty pane lands on a fresh Launcher ──────────────
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs.clear();
+                ws.right_pane_visible = false;
+                ws.editor_open = true; // stale on purpose
+                ws.toggle_right_pane(cx);
+                assert!(ws.right_pane_visible);
+                assert_eq!(ws.right_tabs.len(), 1);
+                assert!(matches!(ws.right_tabs[0], RightTab::Launcher));
+                assert!(!ws.editor_open, "a Launcher is never the editor");
+            });
+        });
+
+        // Release the process-global store override so the gpui leak
+        // detector doesn't trip on it at teardown.
+        agent::thread_store::drop_for_test();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Unique-ish id for temp files without pulling in a uuid dependency.
+    fn uuid_like_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{nanos}-{:?}", std::thread::current().id())
     }
 }

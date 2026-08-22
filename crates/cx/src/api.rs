@@ -22,8 +22,8 @@ use crate::relay::transfer::{WriteReq, writer_loop};
 use crate::session::{self, SessionRegistry};
 use crate::warp::WarpSession;
 use crate::{
-    LaunchSpec, Selection, WireApi, apply_probe_cache, build_all_models, build_launch_spec,
-    find_agent, load_config, providers_for_agent, resolve_launch_model,
+    LaunchSpec, Selection, WireApi, build_all_models, build_launch_spec, find_agent, load_config,
+    providers_for_agent, resolve_launch_model,
 };
 
 /// The agent binary to launch. ChatGPT.app is intentionally absent: it is a GUI
@@ -147,8 +147,11 @@ impl AgentBuilder {
     /// Resolve config + selection and spawn the agent behind a `SessionHandle`.
     pub fn spawn(self) -> Result<SessionHandle> {
         let config = load_config()?;
-        let mut all_models = build_all_models(&config);
-        apply_probe_cache(&mut all_models);
+        // No `apply_probe_cache` here: the caller's explicit
+        // (provider, model, wire) selection is authoritative — a stale or
+        // variant-collapsing probe entry must not veto it (the probe cache
+        // stays a heuristic for the interactive TUI flow only).
+        let all_models = build_all_models(&config);
 
         let agent_name = self
             .agent

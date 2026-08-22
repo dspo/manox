@@ -46,6 +46,10 @@ pub struct BrowserView {
     webview: Entity<manox_webview::webview::WebView>,
     address: Entity<InputState>,
     url: String,
+    /// The page's `<title>`, polled by the workspace's title ticker through
+    /// the host's `page_title` eval. Empty until the first poll lands; the
+    /// tab label falls back to the URL meanwhile.
+    title: String,
     // Set by the host while a `web_explore_yield` call is parked waiting for
     // the user to signal handback. Drives the yield banner.
     yielded: bool,
@@ -105,6 +109,7 @@ impl BrowserView {
             webview,
             address,
             url: url.to_string(),
+            title: String::new(),
             yielded: false,
             read_hint: false,
             _input_sub,
@@ -117,6 +122,19 @@ impl BrowserView {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Adopt a freshly polled page title. Idempotent — an unchanged title
+    /// does not repaint.
+    pub fn set_title(&mut self, title: String, cx: &mut Context<Self>) {
+        if self.title != title {
+            self.title = title;
+            cx.notify();
+        }
     }
 
     /// The underlying webview entity, for host-driven eval/navigation.

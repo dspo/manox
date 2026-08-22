@@ -232,11 +232,14 @@ impl WorkspaceBrowserHost {
     /// `__manox_notify__("eval_result", { request_id, payload })`), and return
     /// a `Task` awaiting the paired payload. A 60s timeout bounds a
     /// non-responding page so a hung eval never blocks the turn; the stale
-    /// sender is best-effort removed on the timeout/drop path.
+    /// sender is best-effort removed on the timeout/drop path. `mark_read`
+    /// raises the read-hint banner on authenticated origins — agent reads do,
+    /// the page-title poll does not.
     fn eval_awaiting(
         &self,
         id: BrowserTabId,
         make_script: impl FnOnce(u64) -> String,
+        mark_read: bool,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -278,7 +281,9 @@ impl WorkspaceBrowserHost {
         // The injected script will report the page's content back as the eval
         // result — flag the view so the user sees that logged-in content is
         // being exposed to the agent on this authenticated origin.
-        self.mark_read_if_https(id, cx);
+        if mark_read {
+            self.mark_read_if_https(id, cx);
+        }
         let routes = self.routes.clone();
         cx.background_spawn(async move {
             // Race the page's EvalResult notify against a 60s timeout. The
@@ -344,6 +349,55 @@ impl WorkspaceBrowserHost {
             .lock()
             .expect("routes lock poisoned")
             .remove(&label);
+    }
+
+    /// Register a UI-opened tab (the `+` launcher / `cmd-b` path) in the
+    /// routing table so host evals (`page_title`) can reach it. Tool-opened
+    /// tabs register inside `open_tab`; this mirrors that registration half
+    /// for the workspace-opened direction. Idempotent — a re-insert replaces.
+    pub(crate) fn register_ui_tab(&self, id: BrowserTabId, thread: WeakEntity<Thread>) {
+        let label = crate::views::browser_view::webview_label_for(id);
+        {
+            let mut labels = self
+                .routes
+                .label_to_tab
+                .lock()
+                .expect("routes lock poisoned");
+            labels.insert(label.clone(), id);
+        }
+        {
+            let mut tabs = self.routes.tabs.lock().expect("routes lock poisoned");
+            tabs.insert(
+                id,
+                TabState {
+                    thread,
+                    label,
+                    pending_evals: Mutex::new(HashMap::new()),
+                    pending_yield: Mutex::new(None),
+                },
+            );
+        }
+    }
+
+    /// Poll the page's `<title>` for the right-pane tab label. Unlike agent
+    /// reads this never raises the read-hint banner (`mark_read: false`) — a
+    /// title poll exposes nothing to the agent.
+    pub(crate) fn page_title(
+        &self,
+        id: BrowserTabId,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        self.eval_awaiting(
+            id,
+            |rid| {
+                format!(
+                    "(function(){{try{{window.__manox_notify__('eval_result',{{request_id:{rid},payload:document.title||''}});}}catch(e){{window.__manox_notify__('eval_result',{{request_id:{rid},payload:{{__error:String(e&&e.message||e)}}}});}}}})();",
+                    rid = rid,
+                )
+            },
+            false,
+            cx,
+        )
     }
 
     /// Flag the tab's view that a read exposed its content to the agent — a
@@ -561,6 +615,7 @@ impl BrowserHost for WorkspaceBrowserHost {
                     rid = rid,
                 )
             },
+            true,
             cx,
         )
     }
@@ -574,6 +629,7 @@ impl BrowserHost for WorkspaceBrowserHost {
                     rid = rid,
                 )
             },
+            true,
             cx,
         )
     }
@@ -602,6 +658,7 @@ impl BrowserHost for WorkspaceBrowserHost {
                     )
                 }
             },
+            true,
             cx,
         )
     }
@@ -652,6 +709,7 @@ impl BrowserHost for WorkspaceBrowserHost {
                     rid = rid,
                 )
             },
+            true,
             cx,
         )
     }

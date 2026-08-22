@@ -13,6 +13,8 @@
 //!   decompressing the message BLOB.
 //! - `terminal_sessions`: per-terminal metadata (cwd/env/title) for tab
 //!   restore; scrollback is not persisted.
+//! - `thread_right_pane`: one opaque JSON snapshot per thread backing the
+//!   right pane's tab list / active tab / visibility (UI-layer owned shape).
 //! - `projects`: registered project roots retained independently of threads.
 //!
 //! UI annotation cards (Error / Notice / PlanReview) are NOT stored here —
@@ -25,6 +27,7 @@
 mod events;
 mod goals;
 mod projects;
+mod right_pane;
 mod terminals;
 mod threads;
 mod token_usage;
@@ -82,6 +85,7 @@ impl ThreadsDatabase {
         token_usage::create_table(conn)?;
         terminals::create_table(conn)?;
         projects::create_table(conn)?;
+        right_pane::create_table(conn)?;
         Ok(())
     }
 

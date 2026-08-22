@@ -128,6 +128,12 @@ impl ThreadStore {
         &self.summaries
     }
 
+    /// The shared threads.db handle, for UI-layer per-thread state that
+    /// piggybacks on the store's single connection (right-pane snapshots).
+    pub fn db(&self) -> &std::sync::Arc<crate::db::ThreadsDatabase> {
+        &self.db
+    }
+
     /// Archived rows, partitioned out of `summaries` so the sidebar list
     /// stays clean while surfaces can still render them on demand.
     pub fn archived_summaries(&self) -> &[ThreadSummary] {

@@ -59,7 +59,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### MessageColumn
 
-- [MessageColumn](#messagecolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+- [MessageColumn](#messagecolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarMenuButton](#titlebarmenubutton) · [RightPaneToggleBtn](#rightpanetogglebtn) · [Body](#body)
 
 ### ContextRail
 
@@ -95,7 +95,7 @@ crates/pi-extensions；宿主（agent / agent-ui）只做装配与 UI。
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [SubagentPanel](#subagentpanel) · [BrowserView](#browserview)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [LauncherTab](#launchertab) · [SessionTab](#sessiontab) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [SubagentPanel](#subagentpanel) · [BrowserView](#browserview)
 
 ### ManagementShell
 
@@ -275,7 +275,7 @@ Vertical flex container, fills remaining width.
 
 #### TitleBar
 
-Absolute-positioned top bar at the message-column level (not the conversation body), height `TITLE_BAR_HEIGHT`, spans both [MessageColumn](#messagecolumn) and the [ContextRail](#contextrail) card so the pair reads as one message column under a single bar. Contains thread title and "..." menu.
+Absolute-positioned top bar at the message-column level (not the conversation body), height `TITLE_BAR_HEIGHT`, spans both [MessageColumn](#messagecolumn) and the [ContextRail](#contextrail) card so the pair reads as one message column under a single bar. Contains thread title, the "..." menu, and the [RightPaneToggleBtn](#rightpanetogglebtn) at its right edge.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -288,6 +288,12 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 #### TitleBarMenuButton
 
 "..." button → opens [TitleMenu](#titlemenu) popup.
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### RightPaneToggleBtn
+
+Ghost icon button at the TitleBar's right edge toggling the [RightPane](#rightpane)'s visibility (`Workspace::toggle_right_pane`). The icon is lucide `panel-right-dashed` (a manox-local asset through `ExtrasAssetSource`) while the pane is hidden and `IconName::PanelRight` while shown. Hiding never discards tabs — the visibility gate (`right_pane_visible`) is orthogonal to the tab list; showing with no tabs opens a fresh [LauncherTab](#launchertab). Composer/ContextRail suppression keyed off an active Editor tab applies only while the pane is actually visible.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -695,13 +701,25 @@ Right side view of the [MainView](#mainview), shown when any right-pane tab is o
 
 #### RightPane
 
-Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor, member/sub-agent observers, and browser tabs as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
+Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor, the [LauncherTab](#launchertab), browser views, member/sub-agent observers, and embedded [SessionTab](#sessiontab) terminals as peer tab types. Visibility is the `right_pane_visible` gate AND a non-empty `right_tabs` — the [RightPaneToggleBtn](#rightpanetogglebtn) hides/shows without discarding tabs, and closing the last tab hides the pane automatically. The active tab's content fills the body. The pane state (tab list, active tab, visibility) is **per-thread**: `attach_thread` stashes the outgoing pane into an in-session map (`right_pane_by_thread`, live tabs keep their webview/panel entities) and restores the incoming one, and every mutation persists the foreground thread's snapshot to `threads.db` (`thread_right_pane` — one opaque UI-layer-owned JSON row keyed by thread id). Subagent tabs are ephemeral — cleared on switch, never stashed or persisted. Browser tabs persist as their URL (rebuilt as fresh webviews after a restart, re-registered in the host routing table + title poll); Member tabs restore only while the thread's team still has the member; Session tabs only while the external session is still alive — after a restart they drop (the sidebar's resumable rows remain the external-session recovery surface).
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### RightTabBar
 
-Top-level underline tab bar over `right_tabs`: `[Editor] [browser:url] …`. Selecting a tab switches `active_right_tab`. Browser, member, and sub-agent tabs carry a `×` suffix that closes the tab via `close_right_tab` (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+Top-level underline tab bar over `right_tabs`. Every tab is fixed-width (`RIGHT_TAB_WIDTH`, 160px) with long labels capped at 16 chars + `…` (the full text rides the tab's tooltip); selecting a tab switches `active_right_tab`. Hovering a tab reveals a `×` suffix that closes the tab via `close_right_tab` (click stops propagation so it does not also select) — for every tab kind: the Editor keeps its draft-transfer semantics (`close_editor`), a Session kills the session (`close_external_session`). A `+` suffix button right of the last tab opens (or focuses) a [LauncherTab](#launchertab).
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### LauncherTab
+
+The right pane's "new tab" surface (`RightTab::Launcher`): five vertically centered shortcut rows — 打开集成浏览器 / 打开集成终端 / 打开 Claude Code / 打开 Codex / 打开 Github Copilot (i18n `launcher-open-*`). The picked view opens **on the tab itself**: the browser via `open_browser_tab(DEFAULT_URL)`; the terminal and the three CLI agents via `spawn_plain_session` / `spawn_external_session` with `SessionPlacement::RightPane` and the **active thread's cwd** as the spawn CWD (workspace-cwd fallback when unset). A CLI-agent row first opens the shared provider→model cascade (the popup anchored under the row; `views/model_cascade.rs`) and spawns on model pick.
+
+> Source: `agent-ui/src/views/launcher.rs`, `agent-ui/src/workspace.rs`
+
+#### SessionTab
+
+A right-pane tab embedding an external session's terminal (`RightTab::Session(id)` — a plain PTY or a CLI-agent TUI). Mounted by the [LauncherTab](#launchertab) pick (replacing the launcher tab in place); the tab label is the session's `display_title()` (OSC title → kind label) with the kind's brand glyph as prefix. `×` kills the session via `close_external_session`; a natural CLI exit (`ChildExit`) closes the tab through `remove_external_session`. Full-window attach (`ViewMode::ExternalSession`) and the tab mount are mutually exclusive by construction — only one mounts the terminal entity per frame.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -719,13 +737,13 @@ Rendered markdown view (`Markdown`).
 
 #### SubagentPanel
 
-A right-pane read-only observation tab for one Steer-bus sub-agent run (`RightTab::Subagent(address)`, equal citizen of the right tab bar). Header: status indicator + `{type} · {topic}` mono title (the shared `task_display_title` composition, address last resort, so the tab matches the rail row). Body: a miniature conversation rendered through the **same `ConversationState` + message pipeline as the main conversation** — it opens with the Captain's dispatch prompt as a user bubble (captured from the Steer tool call into `Workspace::subagent_prompts`), then the bridged child events translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`) — assistant bubbles, reasoning folds, tool cards, tail-follow scrolling. The live accumulation lives in `Workspace::subagent_transcripts` and is kept for the session lifetime (no longer trimmed at terminal status), so a tab opened after the run replays the full work; a panel opened after a reload falls back to `subagent_final_text` replayed as the assistant message plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
+A right-pane read-only observation tab for one Steer-bus sub-agent run (`RightTab::Subagent(address)`, equal citizen of the right tab bar). The tab label shows the subagent's **address** (`SubagentProgress.id`, e.g. `Sailor_0`); the panel's second-level header banner shows the **topic** — status indicator + mono topic text (the shared `subagent_topic` / dispatch-prompt first-line derivation, address fallback when empty). Body: a miniature conversation rendered through the **same `ConversationState` + message pipeline as the main conversation** — it opens with the Captain's dispatch prompt as a user bubble (captured from the Steer tool call into `Workspace::subagent_prompts`), then the bridged child events translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`) — assistant bubbles, reasoning folds, tool cards, tail-follow scrolling. The live accumulation lives in `Workspace::subagent_transcripts` and is kept for the session lifetime (no longer trimmed at terminal status), so a tab opened after the run replays the full work; a panel opened after a reload falls back to `subagent_final_text` replayed as the assistant message plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
 
 > Source: `agent-ui/src/views/subagent_panel.rs`, `agent-ui/src/workspace.rs`
 
 #### BrowserView
 
-A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. The process-wide bridges attach at build via `WorkspaceBrowserHost::attach_to_builder`; the host itself is installed once at startup in `main` (`WorkspaceBrowserHost::install`) and routes notifications back to their tab. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`) and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab. The inbound-write authorization overlay (manox's `InboundWriteOverlay`) was retired with the manox harness; `ThreadEvent::InboundAuthorization` still exists but has no UI consumer today.
+A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. The process-wide bridges attach at build via `WorkspaceBrowserHost::attach_to_builder`; the host itself is installed once at startup in `main` (`WorkspaceBrowserHost::install`) and routes notifications back to their tab. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`), the [LauncherTab](#launchertab), or the host's `open_tab`, and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). The tab label mirrors the page's `<title>` — polled as `document.title` by the workspace's 2s title ticker through the host's `page_title` eval (which never raises the read hint), with the URL as fallback until the first title lands. `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab. The inbound-write authorization overlay (manox's `InboundWriteOverlay`) was retired with the manox harness; `ThreadEvent::InboundAuthorization` still exists but has no UI consumer today.
 
 Two transient banners render between the chrome row and the content area, both driven by flags the `BrowserHost` sets on the view (cleared on navigation / resolution):
 
