@@ -214,6 +214,23 @@ fn editor_can_submit(
     !history_loading && !running && !has_pending_ask && !text.trim().is_empty()
 }
 
+/// Key context for the composer wrapper. `completion = open` shadows the
+/// input's keys for the popover; `composer = recall` is present exactly
+/// while a history recall can apply — mid-walk (`recall_index >= 0`) or on
+/// an empty input, where Up starts one. Anywhere else the recall bindings
+/// must not match: a matched action listener consumes the keystroke even
+/// when it does nothing, so the caret's native movement depends on the
+/// context gate, not on the handler deferring.
+fn composer_key_context(completion_open: bool, recalling: bool, value_empty: bool) -> &'static str {
+    if completion_open {
+        "completion = open"
+    } else if recalling || value_empty {
+        "composer = recall"
+    } else {
+        "composer"
+    }
+}
+
 struct DeferredUserTurn {
     text: String,
     images: Vec<agent::language_model::MessageContent>,
@@ -2989,7 +3006,10 @@ impl Workspace {
                 InputEvent::PressEnter { shift: false, .. } => this.submit_input(window, cx),
                 // Shift+Enter inserts a newline inside the input and does not submit.
                 InputEvent::PressEnter { shift: true, .. } => {}
-                InputEvent::Change => this.sync_completion(window, cx),
+                InputEvent::Change => {
+                    this.exit_diverged_recall(cx);
+                    this.sync_completion(window, cx);
+                }
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         )
@@ -5919,6 +5939,28 @@ impl Workspace {
         }
     }
 
+    /// Leave recall mode as soon as the input value diverges from the
+    /// recalled turn. Recall is derived state keyed on that match, and the
+    /// wrapper's `composer = recall` context must drop back to plain caret
+    /// movement the moment the walk no longer applies — otherwise the next
+    /// arrow key is consumed by a recall that can't act. `set_value` emits
+    /// no Change event, so applying a recall step never cancels itself;
+    /// user edits and completion inserts do fire Change and end the walk.
+    fn exit_diverged_recall(&mut self, cx: &mut Context<Self>) {
+        if self.recall_index < 0 {
+            return;
+        }
+        let turns = self.recall_turns(cx);
+        let value = self.input_state.read(cx).value().to_string();
+        let in_recall = usize::try_from(self.recall_index)
+            .ok()
+            .and_then(|ix| turns.get(ix))
+            .is_some_and(|text| value == *text);
+        if !in_recall {
+            self.recall_index = -1;
+        }
+    }
+
     /// Newest-first user-turn texts for recall, mirroring the navigator's
     /// `collect_user_turns` ordering minus image-only/empty turns.
     fn recall_turns(&self, cx: &App) -> Vec<String> {
@@ -6047,16 +6089,19 @@ impl Workspace {
                     // completion popover open, `completion = open` (so the
                     // `completion == open > Input` bindings shadow the Input's
                     // own up/down/enter/tab/escape and drive the popover);
-                    // otherwise `composer = recall`, so the recall bindings
-                    // shadow up/down while the composer input is focused and
-                    // defer to native caret movement unless a recall applies.
-                    // The contexts are mutually exclusive, so the two
-                    // same-depth binding sets never both match.
-                    if self.completion.is_some() {
-                        wrap = wrap.key_context("completion = open");
-                    } else {
-                        wrap = wrap.key_context("composer = recall");
-                    }
+                    // otherwise `composer = recall` exactly while a history
+                    // recall can apply, so the recall bindings shadow the
+                    // Input's up/down only then. A matched action listener
+                    // consumes the keystroke even when no recall results, so
+                    // outside recall the context stays plain `composer` and
+                    // the Input's native MoveUp/MoveDown move the caret. The
+                    // completion and recall contexts are mutually exclusive,
+                    // so the two same-depth binding sets never both match.
+                    wrap = wrap.key_context(composer_key_context(
+                        self.completion.is_some(),
+                        self.recall_index >= 0,
+                        self.input_state.read(cx).text().len() == 0,
+                    ));
                     wrap.child(
                         Input::new(&self.input_state)
                             .appearance(false)
@@ -8485,10 +8530,11 @@ impl Workspace {
                 }),
             )
             // Composer history recall: fires only via the `composer == recall
-            // > Input` bindings (the wrapper sets that context exactly when
-            // the completion context is absent). The handlers stop
-            // propagation only when they act, so a deferred key falls through
-            // to the Input's native MoveUp/MoveDown.
+            // > Input` bindings. The wrapper carries that context exactly
+            // while a recall can apply (see `composer_key_context`), so
+            // these listeners never see plain caret movement — a listener
+            // that fires consumes the keystroke whether or not a recall
+            // step results.
             .on_action(
                 cx.listener(|this, _: &crate::ComposerRecallUp, window, cx| {
                     this.composer_recall_up(window, cx);
@@ -8998,8 +9044,8 @@ fn truncate_follow_up(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerPlacement, RecallDirection, RecallStep, Workspace, composer_placement,
-        editor_can_submit,
+        ComposerPlacement, RecallDirection, RecallStep, Workspace, composer_key_context,
+        composer_placement, editor_can_submit,
     };
     use gpui::InteractiveElement as _;
     use gpui::prelude::*;
@@ -9110,10 +9156,35 @@ mod tests {
         assert!(!editor_can_submit(false, false, true, "draft"));
         assert!(!editor_can_submit(false, false, false, "   "));
     }
-    /// Minimal composer harness for the recall keybinding test: a wrapper
-    /// carrying the `composer = recall` context around a live input.
+
+    #[test]
+    fn composer_key_context_admits_recall_only_while_it_can_apply() {
+        // The popover context shadows everything.
+        assert_eq!(composer_key_context(true, false, true), "completion = open");
+        assert_eq!(composer_key_context(true, true, false), "completion = open");
+        // Mid-walk recall and the empty input (where Up starts a recall)
+        // keep the recall bindings matched...
+        assert_eq!(
+            composer_key_context(false, true, false),
+            "composer = recall"
+        );
+        assert_eq!(
+            composer_key_context(false, false, true),
+            "composer = recall"
+        );
+        // ...and any other state leaves the caret to the Input's own keys.
+        assert_eq!(composer_key_context(false, false, false), "composer");
+    }
+
+    /// Minimal composer harness for the recall keybinding tests: a wrapper
+    /// carrying a configurable key context around a live input. With
+    /// `consume_recall` set it also registers recall listeners like the
+    /// workspace does; a recall action that reaches them is consumed even
+    /// when it does nothing.
     struct RecallTestComposer {
         input: gpui::Entity<gpui_component::input::InputState>,
+        context: &'static str,
+        consume_recall: bool,
     }
 
     impl gpui::Render for RecallTestComposer {
@@ -9122,9 +9193,13 @@ mod tests {
             _window: &mut gpui::Window,
             _cx: &mut gpui::Context<Self>,
         ) -> impl gpui::IntoElement {
-            gpui::div()
-                .key_context("composer = recall")
-                .child(gpui_component::input::Input::new(&self.input))
+            let mut wrap = gpui::div().key_context(self.context);
+            if self.consume_recall {
+                wrap = wrap
+                    .on_action(|_: &crate::ComposerRecallUp, _window, _cx| {})
+                    .on_action(|_: &crate::ComposerRecallDown, _window, _cx| {});
+            }
+            wrap.child(gpui_component::input::Input::new(&self.input))
         }
     }
 
@@ -9139,6 +9214,8 @@ mod tests {
             let view = cx.new(|cx| RecallTestComposer {
                 input: cx
                     .new(|cx| gpui_component::input::InputState::new(window, cx).multi_line(true)),
+                context: "composer = recall",
+                consume_recall: false,
             });
             let input = view.read(cx).input.clone();
             *slot_for_window.borrow_mut() = Some(input);
@@ -9148,9 +9225,11 @@ mod tests {
         let input = slot.borrow().as_ref().expect("input initialized").clone();
         cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
 
-        // A multi-line draft: the recall binding matches every Up, but with
-        // no recall applicable the handler defers (no stop_propagation), so
-        // the Input's native MoveUp still runs — the caret moves up a line.
+        // A multi-line draft under the static `composer = recall` context:
+        // the recall binding wins every Up, but this harness registers no
+        // recall listener, so the dispatched action stays unhandled and
+        // GPUI falls back to the next matching binding — the Input's
+        // native MoveUp still runs and the caret moves up a line.
         cx.simulate_input("hello\nworld");
         assert_eq!(
             input.read_with(cx, |state, _| state.selected_range().end),
@@ -9341,5 +9420,58 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or_default();
         format!("{nanos}-{:?}", std::thread::current().id())
+
+    #[gpui::test]
+    fn composer_context_without_recall_moves_caret_natively(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.bind_keys(crate::composer_recall_key_bindings()));
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot_for_window = slot.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| RecallTestComposer {
+                input: cx
+                    .new(|cx| gpui_component::input::InputState::new(window, cx).multi_line(true)),
+                // The live composer outside recall: plain context, with the
+                // workspace's recall listeners present.
+                context: "composer",
+                consume_recall: true,
+            });
+            let input = view.read(cx).input.clone();
+            *slot_for_window.borrow_mut() = Some(input);
+            gpui_component::Root::new(view, window, cx)
+        });
+        cx.simulate_resize(gpui::size(gpui::px(640.), gpui::px(480.)));
+        let input = slot.borrow().as_ref().expect("input initialized").clone();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
+
+        // Without the `composer = recall` context the recall bindings never
+        // match, so Up/Down are the Input's native MoveUp/MoveDown even
+        // though recall listeners are registered and would consume the
+        // keystrokes if they fired.
+        cx.simulate_input("hello\nworld");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.selected_range().end),
+            11
+        );
+        cx.simulate_keystrokes("up");
+        let (row, end) = input.read_with(cx, |state, _| {
+            let end = state.selected_range().end;
+            (
+                gpui_component::input::RopeExt::offset_to_position(state.text(), end).line,
+                end,
+            )
+        });
+        assert_eq!(row, 0, "native MoveUp moved the caret to the first line");
+        assert!(end < 11);
+        cx.simulate_keystrokes("down");
+        let row = input.read_with(cx, |state, _| {
+            gpui_component::input::RopeExt::offset_to_position(
+                state.text(),
+                state.selected_range().end,
+            )
+            .line
+        });
+        assert_eq!(row, 1, "native MoveDown moved the caret back down");
     }
 }

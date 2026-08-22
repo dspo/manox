@@ -59,10 +59,12 @@ gpui::actions!(
     ]
 );
 
-/// Keybindings shadowing the composer Input's own up/down while it is
-/// focused; the handlers defer to native caret movement unless a history
-/// recall is eligible. Registered after `gpui_component::init`, so the
-/// same-depth `composer == recall > Input` predicate wins the tie.
+/// Keybindings shadowing the composer Input's own up/down while the
+/// composer wrapper carries the `composer = recall` context — exactly
+/// while a history recall can apply; outside that state the Input's
+/// native caret bindings handle the keys. Registered after
+/// `gpui_component::init`, so the same-depth `composer == recall >
+/// Input` predicate wins the tie when both match.
 pub fn composer_recall_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
         gpui::KeyBinding::new("up", ComposerRecallUp, Some("composer == recall > Input")),
