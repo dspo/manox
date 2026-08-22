@@ -2871,8 +2871,25 @@ impl Workspace {
                 let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() else {
                     break;
                 };
-                let ids: Vec<BrowserTabId> =
-                    entity.read_with(cx, |this, _| this.browser_views.keys().copied().collect());
+                // Only tabs on screen need fresh titles: hidden panes and
+                // tabs stashed under other threads keep their (hidden)
+                // webviews idle instead of polling JS into them every tick.
+                let ids: Vec<BrowserTabId> = entity.read_with(cx, |this, _| {
+                    if this.right_pane_open() {
+                        this.right_tabs
+                            .iter()
+                            .filter_map(|t| match t {
+                                RightTab::Browser(id) => Some(*id),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                });
+                if ids.is_empty() {
+                    continue;
+                }
                 for id in ids {
                     // A superseded / dead ticker must stop issuing evals.
                     let still =
@@ -4478,6 +4495,10 @@ impl Workspace {
                 tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
             }
         }
+        // The cascade belongs to the outgoing thread's launcher row; a
+        // leftover popup would resurface stale (and with a stale tab index)
+        // when the pane restores.
+        self.close_launcher_menu();
         self.right_pane_by_thread.insert(
             thread_id,
             RightPaneSnapshot {
@@ -4627,6 +4648,7 @@ impl Workspace {
             if self.right_tabs.is_empty() {
                 self.right_tabs.push(RightTab::Launcher);
                 self.active_right_tab = 0;
+                self.editor_open = false;
             }
         }
         self.persist_right_pane(cx);
@@ -9164,5 +9186,156 @@ mod tests {
             super::cap_tab_label(&unicode).chars().count(),
             super::RIGHT_TAB_LABEL_CAP + 1
         );
+    }
+    /// Right-pane state machine coverage: persisted-snapshot remap, the
+    /// stash/restore round trip, orphan-tab drops, and db re-materialization
+    /// across a simulated restart. Runs on an in-memory store so the real
+    /// `~/.manox/threads.db` is never touched.
+    #[gpui::test]
+    async fn right_pane_state_machine(cx: &mut gpui::TestAppContext) {
+        use super::{PersistedRightTab, RightTab};
+        use gpui::AppContext as _;
+
+        cx.update(gpui_component::init);
+        let db_path =
+            std::env::temp_dir().join(format!("manox-right-pane-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| {
+            agent::runtime::init(cx);
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone(), cx);
+        });
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // ── persisted_right_pane: subagent filter + active remap ──────────
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![
+                    RightTab::Editor,
+                    RightTab::Subagent("s1".into()),
+                    RightTab::Launcher,
+                ];
+                ws.active_right_tab = 2;
+                ws.right_pane_visible = true;
+                let p = ws.persisted_right_pane(cx);
+                assert_eq!(p.tabs.len(), 2, "subagent tab must drop out");
+                assert!(matches!(p.tabs[0], PersistedRightTab::Editor));
+                assert!(matches!(p.tabs[1], PersistedRightTab::Launcher));
+                assert_eq!(p.active, 1, "active remaps into the filtered list");
+                assert!(p.visible);
+
+                // An active subagent tab falls back to the head.
+                ws.active_right_tab = 1;
+                let p = ws.persisted_right_pane(cx);
+                assert_eq!(p.active, 0);
+            });
+        });
+
+        // ── stash → restore round trip (in-session) ────────────────────────
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![RightTab::Editor, RightTab::Launcher];
+                ws.active_right_tab = 1;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadA".into(), cx);
+                assert!(ws.right_tabs.is_empty());
+                assert!(!ws.right_pane_visible);
+                ws.restore_right_pane("threadA", window, cx);
+                assert_eq!(ws.right_tabs.len(), 2);
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert!(matches!(ws.right_tabs[1], RightTab::Launcher));
+                assert_eq!(ws.active_right_tab, 1);
+                assert!(ws.right_pane_visible);
+            });
+        });
+        // The stash wrote the db row keyed by thread.
+        assert!(
+            db.load_right_pane("threadA")
+                .expect("db readable")
+                .is_some()
+        );
+
+        // ── orphaned tabs drop on restore ──────────────────────────────────
+        // A browser view closed and a session exited while another thread was
+        // foreground: the stashed tabs referencing them must not come back.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![
+                    RightTab::Browser(987_654),
+                    RightTab::Session("external:claude:dead".into()),
+                    RightTab::Editor,
+                ];
+                ws.active_right_tab = 2;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadB".into(), cx);
+                ws.restore_right_pane("threadB", window, cx);
+                assert_eq!(ws.right_tabs.len(), 1, "orphans dropped");
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert_eq!(ws.active_right_tab, 0, "active remaps onto the survivor");
+            });
+        });
+
+        // ── db re-materialization across a simulated restart ───────────────
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs = vec![RightTab::Editor, RightTab::Launcher];
+                ws.active_right_tab = 0;
+                ws.right_pane_visible = true;
+                ws.stash_right_pane("threadC".into(), cx);
+                // Restart: the in-session stash is gone, only the db row
+                // survives.
+                ws.right_pane_by_thread.clear();
+                ws.restore_right_pane("threadC", window, cx);
+                assert_eq!(ws.right_tabs.len(), 2);
+                assert!(matches!(ws.right_tabs[0], RightTab::Editor));
+                assert!(matches!(ws.right_tabs[1], RightTab::Launcher));
+                assert!(ws.right_pane_visible);
+            });
+        });
+
+        // ── toggle on an empty pane lands on a fresh Launcher ──────────────
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.right_tabs.clear();
+                ws.right_pane_visible = false;
+                ws.editor_open = true; // stale on purpose
+                ws.toggle_right_pane(cx);
+                assert!(ws.right_pane_visible);
+                assert_eq!(ws.right_tabs.len(), 1);
+                assert!(matches!(ws.right_tabs[0], RightTab::Launcher));
+                assert!(!ws.editor_open, "a Launcher is never the editor");
+            });
+        });
+
+        // Release the process-global store override so the gpui leak
+        // detector doesn't trip on it at teardown.
+        agent::thread_store::drop_for_test();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Unique-ish id for temp files without pulling in a uuid dependency.
+    fn uuid_like_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{nanos}-{:?}", std::thread::current().id())
     }
 }
