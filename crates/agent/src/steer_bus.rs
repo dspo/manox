@@ -5,8 +5,10 @@
 //! has no cross-session agent bus — this is a manox host extension.
 
 use std::collections::{BTreeMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use pi::harness::HarnessHandle;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -57,6 +59,17 @@ pub struct AgentBus {
     weak_self: Mutex<Weak<AgentBus>>,
     subagent_tool: Mutex<Option<Arc<SubagentTool>>>,
     tool_ctx: Mutex<Option<Arc<dyn ToolContext>>>,
+    /// Wires `subagent_tool` on first dispatch for sessions assembled
+    /// before a model resolved (resume-at-launch race); returns whether a
+    /// live model was available to wire with.
+    late_configure: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+}
+
+/// Poison-tolerant lock: a holder that panicked must not take every later
+/// dispatch down with a secondary panic (which reads as a silent hang on
+/// the caller's tool channel).
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl AgentBus {
@@ -79,6 +92,7 @@ impl AgentBus {
             weak_self: Mutex::new(Weak::new()),
             subagent_tool: Mutex::new(None),
             tool_ctx: Mutex::new(None),
+            late_configure: Mutex::new(None),
         });
         *bus.weak_self.lock().unwrap() = Arc::downgrade(&bus);
         bus
@@ -103,6 +117,10 @@ impl AgentBus {
 
     pub fn set_tool_ctx(&self, ctx: Arc<dyn ToolContext>) {
         *self.tool_ctx.lock().unwrap() = Some(ctx);
+    }
+
+    pub fn set_late_configure(&self, configure: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.late_configure.lock().unwrap() = Some(configure);
     }
 
     /// The main Steer routing entry point.
@@ -205,6 +223,15 @@ impl AgentBus {
 
     /// Dispatch a subagent coroutine: spawn session, register bg task,
     /// run in tokio, emit SteerDelivered on completion.
+    ///
+    /// The dispatch body must never poll on the caller's executor: it takes
+    /// std-Mutex locks (bus slots, the engine's model slot via the late
+    /// configurator), and on a cooperative executor a contended lock starves
+    /// the whole executor — a silent forever-hang that even a timeout cannot
+    /// surface (the timeout polls on the same starved executor). Bridge to
+    /// the dedicated tokio runtime instead; the oneshot keeps the caller
+    /// executor-agnostic, and a stuck or panicked dispatch task surfaces as
+    /// a stage-named error (timeout fired / sender dropped).
     async fn dispatch_subagent(
         &self,
         addr: &str,
@@ -212,28 +239,92 @@ impl AgentBus {
         isolation: Option<&str>,
         prompt: &str,
     ) -> Result<AgentToolResult, ToolError> {
+        let stage = Arc::new(std::sync::Mutex::new("entry"));
+        let bus = locked(&self.weak_self)
+            .upgrade()
+            .ok_or_else(|| ToolError::ExecutionFailed("bus gone".into()))?;
+        let addr_s = addr.to_string();
+        let spawn_s = spawn_type.to_string();
+        let isolation_s = isolation.map(str::to_string);
+        let prompt_s = prompt.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stage2 = Arc::clone(&stage);
+        crate::runtime::handle().spawn(async move {
+            let stage_err = Arc::clone(&stage2);
+            let result = tokio::time::timeout(
+                Duration::from_secs(90),
+                bus.dispatch_subagent_inner(
+                    &addr_s,
+                    &spawn_s,
+                    isolation_s.as_deref(),
+                    &prompt_s,
+                    stage2,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ToolError::ExecutionFailed(format!(
+                    "subagent dispatch timed out at stage `{}` (addr={addr_s})",
+                    *locked(&stage_err)
+                )))
+            });
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| {
+            ToolError::ExecutionFailed(format!(
+                "subagent dispatch task died at stage `{}` (addr={addr}) — panic in dispatch",
+                *locked(&stage)
+            ))
+        })?
+    }
+
+    async fn dispatch_subagent_inner(
+        &self,
+        addr: &str,
+        spawn_type: &str,
+        isolation: Option<&str>,
+        prompt: &str,
+        stage: Arc<std::sync::Mutex<&'static str>>,
+    ) -> Result<AgentToolResult, ToolError> {
         let addr = addr.to_string();
         let spawn_type = spawn_type.to_string();
         let isolation = isolation.map(String::from);
         let prompt = prompt.to_string();
-        let subagent_tool = self
-            .subagent_tool
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| ToolError::ExecutionFailed("subagent tool not configured".into()))?;
-        let tool_ctx = self
-            .tool_ctx
-            .lock()
-            .unwrap()
+        *locked(&stage) = "subagent-tool";
+        let subagent_tool = match locked(&self.subagent_tool).clone() {
+            Some(tool) => tool,
+            None => {
+                *locked(&stage) = "late-configure";
+                let configure = locked(&self.late_configure).clone();
+                let wired = match configure {
+                    Some(configure) => match catch_unwind(AssertUnwindSafe(|| configure())) {
+                        Ok(wired) => wired,
+                        Err(_) => {
+                            tracing::error!("late subagent configure panicked (addr={addr})");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if !wired {
+                    return Err(ToolError::ExecutionFailed(
+                        "subagent tool not configured".into(),
+                    ));
+                }
+                locked(&self.subagent_tool).clone().ok_or_else(|| {
+                    ToolError::ExecutionFailed("subagent tool not configured".into())
+                })?
+            }
+        };
+        tracing::info!("steer dispatch: subagent tool resolved (addr={addr})");
+        *locked(&stage) = "tool-ctx";
+        let tool_ctx = locked(&self.tool_ctx)
             .clone()
             .ok_or_else(|| ToolError::ExecutionFailed("tool context not configured".into()))?;
 
         // Create child SteerTool (limited: from=Subagent, Inject-only).
-        let bus_arc = self
-            .weak_self
-            .lock()
-            .unwrap()
+        *locked(&stage) = "bus-upgrade";
+        let bus_arc = locked(&self.weak_self)
             .upgrade()
             .ok_or_else(|| ToolError::ExecutionFailed("bus gone".into()))?;
         let child_steer = Arc::new(SteerTool::new(bus_arc, AgentId::Subagent(addr.to_string())));
@@ -249,13 +340,17 @@ impl AgentBus {
         // Existence check: re-dispatching a live address would overwrite the
         // first run and orphan it (un-Abort/Inject-able). Matches the schema's
         // "Error if address exists" contract.
-        if self.live_subagents.lock().unwrap().contains_key(&addr) {
+        if locked(&self.live_subagents).contains_key(&addr) {
             return Err(ToolError::InvalidArguments(format!(
                 "agent {addr} already exists"
             )));
         }
         let run = self.run_seq.fetch_add(1, Ordering::SeqCst);
         // Spawn the session.
+        *locked(&stage) = "spawn-session";
+        tracing::info!(
+            "steer dispatch: spawning subagent session (addr={addr}, type={spawn_type})"
+        );
         let (mut session, session_dir, worktree) = subagent_tool
             .spawn_subagent_session(
                 &spawn_type,
@@ -295,7 +390,8 @@ impl AgentBus {
         )));
 
         // Track in live_subagents for Inject/Abort.
-        self.live_subagents.lock().unwrap().insert(
+        *locked(&stage) = "register-task";
+        locked(&self.live_subagents).insert(
             addr.to_string(),
             LiveSubagent {
                 handle: handle.clone(),
@@ -305,7 +401,8 @@ impl AgentBus {
         );
         // Spawn the run task.
         let notice_tx = self.notice_tx.clone();
-        let weak = self.weak_self.lock().unwrap().clone();
+        let weak = locked(&self.weak_self).clone();
+        *locked(&stage) = "spawn-run";
         let addr_clone = addr.clone();
         let label = addr.clone();
         let full_prompt = format!(
