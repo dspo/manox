@@ -3,14 +3,14 @@
 //!
 //! The browser host (`agent::webview_host::BrowserHost`) is a gpui
 //! main-thread surface; pi tools run on tokio. Each call therefore rides the
-//! same round-trip architecture as the approval gate: the tool sends a
+//! same round-trip architecture as the permission gate: the tool sends a
 //! `BackendNotice::BrowserRequest` with a responder channel, the facade
 //! (gpui drainer) executes the op against the host and replies through the
 //! channel, and the tool awaits the reply on its tokio thread.
 //!
-//! Read tools (`ReadText` / `ReadDom` / `Screenshot`) are approval-free and
+//! Read tools (`ReadText` / `ReadDom` / `Screenshot`) are ungated and
 //! `is_read_only` so plan mode exposes them. Write tools declare
-//! `requires_approval` and ride the owning thread's `ApprovalMode` (the
+//! `requires_approval` and ride the owning thread's `PermissionMode` (the
 //! engine wraps them in `ApprovalGatedTool`), so the outbound trust axis is
 //! governed by the same mode that gates `Bash` / `Write`.
 
@@ -223,8 +223,7 @@ impl AgentTool for WebExploreOpenTool {
     fn description(&self) -> &str {
         "Open a new browser tab in the manox sidebar navigated to `url` and return its \
          numeric `tab_id` (as JSON `{\"tab_id\": N}`). Pass that id to the other \
-         WebExplore* tools to drive the tab. Requires approval (subject to the \
-         thread's approval mode)."
+         WebExplore* tools to drive the tab. Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<OpenInput>()
@@ -265,7 +264,7 @@ impl AgentTool for WebExploreNavigateTool {
     }
     fn description(&self) -> &str {
         "Navigate an existing browser tab (identified by `tab_id`) to a new `url`. \
-         Requires approval (subject to the thread's approval mode)."
+         Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<NavigateInput>()
@@ -376,8 +375,8 @@ impl AgentTool for WebExploreClickTool {
         "WebExploreClick"
     }
     fn description(&self) -> &str {
-        "Click the first element matching `selector` in the tab. Requires approval \
-         (subject to the thread's approval mode)."
+        "Click the first element matching `selector` in the tab. Gated by the \
+         thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<ClickInput>()
@@ -417,8 +416,8 @@ impl AgentTool for WebExploreTypeTool {
     }
     fn description(&self) -> &str {
         "Focus the first element matching `selector` and type `text` into it (sets the \
-         value and dispatches input/change events). Requires approval (subject to the \
-         thread's approval mode)."
+         value and dispatches input/change events). Gated by the thread's \
+         permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TypeInput>()
@@ -459,8 +458,7 @@ impl AgentTool for WebExploreScrollTool {
     }
     fn description(&self) -> &str {
         "Scroll the tab's page by (dx, dy) device pixels (positive = right/down, \
-         negative = left/up). Requires approval (subject to the thread's approval \
-         mode)."
+         negative = left/up). Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<ScrollInput>()
@@ -540,8 +538,7 @@ impl AgentTool for WebExploreYieldTool {
         "Yield control of the tab to the user (e.g. for a login / captcha handshake). \
          Blocks until the user triggers the handback in the browser chrome, then \
          returns. Use this when the page needs human interaction before you can read \
-         the authenticated result. Requires approval (subject to the thread's \
-         approval mode)."
+         the authenticated result. Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TabIdInput>()
@@ -583,8 +580,8 @@ impl AgentTool for WebExploreCloseTool {
         "WebExploreClose"
     }
     fn description(&self) -> &str {
-        "Close and reclaim the browser tab identified by `tab_id`. Requires approval \
-         (subject to the thread's approval mode)."
+        "Close and reclaim the browser tab identified by `tab_id`. Gated by the \
+         thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TabIdInput>()

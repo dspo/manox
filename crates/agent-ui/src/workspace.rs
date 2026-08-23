@@ -1,7 +1,7 @@
 //! Top-level workspace view.
 //!
 //! Holds `Entity<agent::Thread>` + `Entity<Sidebar>`; `cx.subscribe` handles:
-//! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens an approval overlay;
+//! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens the question card;
 //!   the terminal `Stop` (non-ToolUse) triggers `refresh_thread_list`.
 //! - `SidebarEvent`: new conversation / open history / delete.
 //!
@@ -17,7 +17,7 @@ use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
 use agent::i18n;
 use agent::language_model::StopReason;
-use agent::thread::ApprovalMode;
+use agent::thread::PermissionMode;
 use agent::webview_host::BrowserTabId;
 use agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use gpui::DismissEvent;
@@ -424,7 +424,7 @@ pub struct Workspace {
     plus_open: bool,
     plus_menu: Option<Entity<PopupMenu>>,
     plus_menu_sub: Option<Subscription>,
-    /// Access-chip dropdown (Normal / Danger mode). Mirrors the model selector pattern.
+    /// Access-chip dropdown (permission modes). Mirrors the model selector pattern.
     access_open: bool,
     /// Project-chip dropdown (recent projects + new project submenu).
     project_chip_open: bool,
@@ -885,7 +885,7 @@ impl Workspace {
     }
 
     /// Seed a parsed `AskUserQuestion` as the pending ask. Diagnostic-only:
-    /// bypasses the approval gate so the synthesis path can be tested with a
+    /// bypasses the engine gate so the synthesis path can be tested with a
     /// fake engine (whose `pending_auth_entries` is empty).
     #[cfg(feature = "test-support")]
     pub fn diagnostic_seed_ask(
@@ -1026,10 +1026,9 @@ impl Workspace {
         cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
             match ev {
                 ThreadEvent::ToolCallAuthorization { id, input, .. } => {
-                    // Every authorization — interactive tools, bubbled
-                    // sub-agent auth, AutoPilot escalations — surfaces as the
-                    // AskUserQuestion card; the question payload carries the
-                    // decision options.
+                    // Every interaction — AskUserQuestion calls and bubbled
+                    // team-member questions — surfaces as the question card;
+                    // the payload carries the decision options.
                     this.pending_ask = parse_pending_ask(id.clone(), input.clone());
                     this.ask_step = 0;
                     this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
@@ -1085,8 +1084,8 @@ impl Workspace {
                     this.context_rail
                         .update(cx, |r, cx| r.set_plan(snapshot, cx));
                 }
-                ThreadEvent::ApprovalModeChanged { .. } => {
-                    // Refresh the access chip + Danger badge; no conversation item.
+                ThreadEvent::PermissionModeChanged { .. } => {
+                    // Refresh the access chip; no conversation item.
                     cx.notify();
                 }
                 // The pi actor restores session history asynchronously; the
@@ -1136,52 +1135,6 @@ impl Workspace {
                             });
                             this.history_rendered = messages.len();
                             this.apply_list_outcome(outcome, cx);
-                        }
-                    }
-                }
-                ThreadEvent::ApprovalDecision {
-                    tool_call_id,
-                    tool_title,
-                    verdict,
-                    ..
-                } => {
-                    match &verdict {
-                        // Auto-approved: no notice card. The badge rides the
-                        // tool-call row itself (check-check ahead of the
-                        // status icon); persist a marker note so a rebuild
-                        // reproduces it. The verdict may land before the
-                        // creating `ToolCall` event (documented ordering
-                        // race) — park it so the `ToolCall` arm stamps the
-                        // item once it exists, and persist the note either
-                        // way so live and rebuild agree.
-                        agent::approval::ReviewVerdict::Allow => {
-                            this.conversation.update(cx, |c, cx| {
-                                if !c.mark_auto_approved(tool_call_id, cx) {
-                                    c.buffer_auto_approval(tool_call_id);
-                                }
-                            });
-                            this.append_ui_note(
-                                agent::db::UiNoteKind::AutoApproval,
-                                String::new(),
-                                Some(tool_call_id.as_str()),
-                                cx,
-                            );
-                            cx.notify();
-                        }
-                        // Escalated for review: keep the anchored decision
-                        // record so the reason clusters at the tool call that
-                        // triggered it instead of piling at the tail.
-                        agent::approval::ReviewVerdict::Ask { reason } => {
-                            let msg = i18n::t_str(
-                                "workspace-approval-autopilot-escalated",
-                                &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
-                            )
-                            .to_string();
-                            let anchor = this
-                                .conversation
-                                .read(cx)
-                                .notice_anchor_for_tool(tool_call_id, cx);
-                            this.add_info_message(msg, anchor, Some(tool_call_id.as_str()), cx);
                         }
                     }
                 }
@@ -1557,7 +1510,7 @@ impl Workspace {
                     store.update(cx, |s, cx| s.mark_running(&id, cx));
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
-                    // A parked thread's approval card is not visible; the
+                    // A parked thread's question card is not visible; the
                     // sidebar badge is the only signal until the user
                     // switches back and the card re-surfaces.
                     let store = agent::thread_store_global();
@@ -3567,8 +3520,8 @@ impl Workspace {
             }
             cx.notify();
         });
-        // If the new thread has pending authorizations (e.g. it was parked
-        // while waiting for tool approval), re-surface them so the overlay
+        // If the new thread has pending interactions (e.g. it was parked
+        // waiting for a user answer), re-surface them so the question card
         // appears immediately upon switching back.
         self.resurface_pending_auths(cx);
         self.sidebar
@@ -3662,16 +3615,16 @@ impl Workspace {
         .detach();
     }
 
-    /// Re-surface any pending authorization on the current thread that was
+    /// Re-surface any pending interaction on the current thread that was
     /// emitted while the thread was in the background (no subscription). Called
     /// after switching threads so the question card appears without requiring
     /// the user to wait for the next event.
     fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
-        // Query the thread for any pending authorization metadata that was
+        // Query the thread for any pending interaction metadata that was
         // stored when the auth event was originally emitted. If the thread was
-        // parked waiting for user approval while in the background, re-surface
+        // parked waiting for a user answer while in the background, re-surface
         // the events so the question card appears immediately upon switching
-        // back. Every authorization surfaces as the AskUserQuestion card.
+        // back. Every interaction surfaces as the AskUserQuestion card.
         let entries: Vec<(String, String, serde_json::Value)> = self
             .thread
             .read(cx)
@@ -3684,11 +3637,10 @@ impl Workspace {
             self.ask_step = 0;
             self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
             // The card renders on a top-level `ToolCall` item. The rebuilt
-            // conversation carries one only for direct asks whose ToolUse the
-            // mirror synced; escalated tools fold into their activity segment
-            // and a stale mirror misses the ask entirely. Synthesize the card
-            // the gate would have created live so the interactive drawer
-            // renders.
+            // conversation may lack it (a parked thread never saw the live
+            // `ToolCall` event, or a stale mirror missed the ask). Synthesize
+            // the card the gate would have created live so the interactive
+            // drawer renders.
             if self.pending_ask.is_some() {
                 self.ensure_ask_tool_item(&id, &summary, input, cx);
             }
@@ -3701,10 +3653,8 @@ impl Workspace {
     /// Synthesize the top-level AskUserQuestion card when the rebuilt
     /// conversation lacks the matching `ToolCall` item. The live card is
     /// created by the gate's `ToolCall` event, which a parked thread never
-    /// sees; the rebuild only carries the underlying ToolUse (an escalated
-    /// tool folds into its activity segment, and a direct ask can miss the
-    /// mirror's sync window). Without the item the ask snapshot cannot
-    /// attach, so the interaction UI never renders.
+    /// sees; the rebuild can miss the mirror's sync window. Without the item
+    /// the ask snapshot cannot attach, so the interaction UI never renders.
     fn ensure_ask_tool_item(
         &mut self,
         id: &str,
@@ -3735,7 +3685,6 @@ impl Workspace {
                     streaming: false,
                     collapsed: false,
                     user_toggled: false,
-                    auto_approved: false,
                     panel: None,
                 },
                 role,
@@ -3789,7 +3738,7 @@ impl Workspace {
     }
 
     /// Archive the active thread and open a fresh one that inherits the
-    /// outgoing thread's project, model, approval mode, and reasoning effort —
+    /// outgoing thread's project, model, permission mode, and reasoning effort —
     /// `/new` starts a clean conversation without dropping the working
     /// context. No-op while a turn is running (see
     /// `archive_active_thread_if_idle`).
@@ -3806,7 +3755,7 @@ impl Workspace {
         let project = old.read(cx).project().cloned();
         let model = old.read(cx).model().cloned();
         let effort = old.read(cx).reasoning_effort();
-        let approval = old.read(cx).approval_mode();
+        let permission = old.read(cx).permission_mode();
         let new = match &project {
             Some(dir) => {
                 Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone(), cx)
@@ -3818,7 +3767,7 @@ impl Workspace {
                 t.set_model(model, cx);
             }
             t.set_reasoning_effort(effort, cx);
-            t.set_approval_mode(approval, cx);
+            t.set_permission_mode(permission, cx);
         });
         self.attach_thread(new, window, cx);
     }
@@ -5189,11 +5138,11 @@ impl Workspace {
     }
 
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
-        let approval_mode = self.thread.read(cx).approval_mode();
+        let permission_mode = self.thread.read(cx).permission_mode();
         UserTurnMeta::new(
             chrono::Utc::now().timestamp(),
             self.model_label(cx),
-            Some(approval_mode),
+            Some(permission_mode),
         )
     }
 
@@ -5265,9 +5214,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let mut data = serde_json::json!({ "text": text });
-        // A tool-anchored notice (an approval decision record) carries the
-        // tool call id so the rebuild can splice it next to the tool item,
-        // matching the live placement. `data` is raw JSON — no schema change.
+        // A tool-anchored notice carries the tool call id so the rebuild can
+        // splice it next to the tool item, matching the live placement.
+        // `data` is raw JSON — no schema change.
         if let Some(id) = tool_call_id {
             data["tool_call_id"] = serde_json::Value::String(id.to_owned());
         }
@@ -5557,7 +5506,7 @@ impl Workspace {
             let project = self.thread.read(cx).project().cloned();
             let model = self.thread.read(cx).model().cloned();
             let effort = self.thread.read(cx).reasoning_effort();
-            let approval = self.thread.read(cx).approval_mode();
+            let permission = self.thread.read(cx).permission_mode();
             let new = match &project {
                 Some(dir) => Thread::new_in_project(
                     ThreadId(uuid::Uuid::new_v4().to_string()),
@@ -5571,7 +5520,7 @@ impl Workspace {
                     t.set_model(model, cx);
                 }
                 t.set_reasoning_effort(effort, cx);
-                t.set_approval_mode(approval, cx);
+                t.set_permission_mode(permission, cx);
                 t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui), cx);
             });
             self.attach_thread(new, window, cx);
@@ -6125,7 +6074,7 @@ impl Workspace {
                     .child(
                         // `min_w_0` lets this group flex-shrink when the row is
                         // narrow; `overflow_hidden` is deliberately NOT set so
-                        // the chips' popovers (project picker, approval menu, `+`
+                        // the chips' popovers (project picker, permission menu, `+`
                         // menu) can overflow upward. `MIN_WINDOW_W` keeps the row
                         // wide enough that the chips themselves never overflow.
                         h_flex()
@@ -6832,23 +6781,20 @@ impl Workspace {
         )
     }
 
-    /// Access chip + 3-tier approval popover.
+    /// Access chip + permission-mode popover.
     ///
     /// The chip is a mode-aware pill rendered next to the composer send button.
-    /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
-    /// blue bot for AutoPilot, red triangle for Danger) so the
-    /// current permission posture is legible at a glance — a 1-line summary of
-    /// what the model is allowed to do without prompting.
+    /// Each `PermissionMode` gets its own icon + accent color (amber eye for
+    /// Read Only, green folder for Workspace Write, red triangle for Full
+    /// Access) so the current permission posture is legible at a glance — a
+    /// 1-line summary of what the model is allowed to do.
     ///
-    /// Clicking the chip opens a `PopupMenu` mirroring the header:
-    /// a question row with a "Learn more" link, three selectable rows (icon +
-    /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
-    /// row pointing at `config.toml` for users who want a fully custom policy.
-    /// The popover is `max_w(360)` to fit the longest bilingual subtitle
-    /// ("Unrestricted access to the internet and any file on your computer")
-    /// without wrapping.
+    /// Clicking the chip opens the popover: a question row with a "Learn
+    /// more" link and three selectable rows (icon + title + subtitle, check
+    /// on the right). The popover is `w(360)` to fit the longest bilingual
+    /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.thread.read(cx).approval_mode();
+        let mode = self.thread.read(cx).permission_mode();
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
         // capture `theme` (which only lives for the method body) — closures
@@ -6908,7 +6854,7 @@ impl Workspace {
         // so `max_w` alone leaves the popover at ~140px and the subtitles
         // wrap into single-word lines. A fixed 360px width gives the
         // subtitles room to wrap at word boundaries.
-        let content = build_approval_content(workspace.clone(), mode, cx);
+        let content = build_permission_content(workspace.clone(), mode, cx);
         gpui::div()
             .relative()
             .child(trigger)
@@ -7698,7 +7644,7 @@ impl Render for Workspace {
 }
 impl Workspace {
     /// The full workspace chrome: sidebar, conversation column, context rail,
-    /// right pane, approval overlays. Shared by both harness builds.
+    /// right pane, question-card overlays. Shared by both harness builds.
     fn render_manox(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !matches!(self.view_mode, ViewMode::Workspace) {
             self.drop_turn_navigator(cx);
@@ -7894,7 +7840,7 @@ impl Workspace {
         });
 
         // Hero occupies the message-list region on the first screen.
-        // Notice items on the first screen (e.g. Danger toggle acknowledgement).
+        // Notice items on the first screen (e.g. mode-switch acknowledgement).
         // They are stored in the conversation but hidden behind the hero layout;
         // show them as a temporary banner below the composer so the user sees
         // the feedback without leaving the first-screen view.
@@ -8398,7 +8344,7 @@ impl Workspace {
                             })
                         })
                         .children(footer)
-                        // Approval overlay (if any)
+                        // Question card overlay (if any)
                         .children(overlay)
                 })
                 // Title-bar overlay: absolute top of the conversation column,
@@ -8734,7 +8680,7 @@ impl Workspace {
 /// Parse an `AskUserQuestion` tool input into a `PendingAsk`. The per-question
 /// `InputState` entities are allocated lazily on first render (they need a
 /// `Window`, which the event handler lacks). Returns `None` when the input is
-/// malformed (the generic approval overlay then takes over as a fallback).
+/// malformed (the generic question overlay then takes over as a fallback).
 /// Snapshot a thread's working directory as a `SharedString` for the
 /// `TerminalPanel` prompt line. Reads the `Thread` entity (not the `Workspace`)
 /// so it stays safe inside a `Workspace::update` closure, where reading the
@@ -8846,40 +8792,33 @@ fn strip_recommended_suffix(label: String) -> (String, bool) {
     (label, false)
 }
 
-/// Map an `ApprovalMode` to the chip's (label, accent color, icon) triple.
+/// Map a `PermissionMode` to the chip's (label, accent color, icon) triple.
 ///
 /// Colors are theme tokens, not raw hsla values, so the chip follows the
 /// active theme (light/dark) without bespoke palettes per mode. The
-/// AutoPilot accent uses `info` (green) as a "this is the safe default"
-/// signal — staying gray would be visually identical to a disabled state.
-fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
+/// WorkspaceWrite accent uses `info` (green) as a "this is the safe
+/// default" signal — staying gray would be visually identical to a disabled
+/// state.
+fn mode_chip_visual(mode: PermissionMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
     match mode {
-        ApprovalMode::AutoPilot => (
-            i18n::t("workspace-chip-mode-autopilot"),
-            theme.info,
-            IconName::Bot,
+        PermissionMode::ReadOnly => (
+            i18n::t("workspace-chip-mode-readonly"),
+            theme.warning,
+            IconName::Eye,
         ),
-        ApprovalMode::Danger => (
-            i18n::t("workspace-chip-mode-danger"),
+        PermissionMode::WorkspaceWrite => (
+            i18n::t("workspace-chip-mode-workspacewrite"),
+            theme.info,
+            IconName::FolderOpen,
+        ),
+        PermissionMode::FullAccess => (
+            i18n::t("workspace-chip-mode-fullaccess"),
             theme.danger,
             IconName::TriangleAlert,
         ),
     }
 }
 
-/// Build the 3-tier approval `PopupMenu`:
-///   - title row: localized question + a "Learn more" link on the right
-///   - three selectable rows (icon + title + subtitle, check on the right)
-///   - hairline separator
-///   - non-clickable "Custom (config.toml)" info row
-///
-/// Width is `360px` to fit the longest bilingual subtitle. Each clickable row
-/// routes through `Workspace::apply_approval_mode` so the mode switch +
-/// notice + menu close stay in one place.
-///
-/// `theme` is consumed up front: every value used inside the `'static` row
-/// closures is pre-extracted into owned `SharedString`/`Hsla`/`IconName`,
-/// so the closures don't capture a short-lived theme reference.
 /// Build the popover content for the access chip: a header row (question +
 /// "Learn more" link) and three selectable mode rows (icon + title +
 /// subtitle, check on the right for the active one). The whole thing is a
@@ -8888,17 +8827,24 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
 /// for the opaque card chrome — that path doesn't go through `PopupMenu`
 /// at all, sidestepping the per-`ElementItem` `flex_1`/`min_h(26)` wrapper
 /// that was producing both the height-leak bug and the clip-to-26 bug.
-fn build_approval_content(
+///
+/// Every clickable row routes through `Workspace::apply_permission_mode` so
+/// the mode switch + notice + menu close stay in one place. `theme` is
+/// consumed up front: every value used inside the `'static` row closures is
+/// pre-extracted into owned `SharedString`/`Hsla`/`IconName`, so the
+/// closures don't capture a short-lived theme reference.
+fn build_permission_content(
     workspace: WeakEntity<Workspace>,
-    current: ApprovalMode,
+    current: PermissionMode,
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let fg: gpui::Hsla = cx.theme().foreground;
     let muted: gpui::Hsla = cx.theme().muted_foreground;
     let info: gpui::Hsla = cx.theme().info;
+    let warning: gpui::Hsla = cx.theme().warning;
     let danger: gpui::Hsla = cx.theme().danger;
 
-    let make_row = |mode: ApprovalMode,
+    let make_row = |mode: PermissionMode,
                     title: SharedString,
                     subtitle: SharedString,
                     icon: IconName,
@@ -8906,7 +8852,7 @@ fn build_approval_content(
                     selected: bool| {
         let ws = workspace.clone();
         h_flex()
-            .id(("approval-mode-row", mode as usize))
+            .id(("permission-mode-row", mode as usize))
             .w_full()
             .items_center()
             .gap_2()
@@ -8936,7 +8882,7 @@ fn build_approval_content(
                 el.child(Icon::new(IconName::Check).small().text_color(accent))
             })
             .on_click(move |_event, _window, cx| {
-                let _ = ws.update(cx, |this, cx| this.apply_approval_mode(mode, cx));
+                let _ = ws.update(cx, |this, cx| this.apply_permission_mode(mode, cx));
             })
     };
 
@@ -8973,57 +8919,70 @@ fn build_approval_content(
                 ),
         )
         .child(make_row(
-            ApprovalMode::AutoPilot,
-            i18n::t("workspace-mode-autopilot-title"),
-            i18n::t("workspace-mode-autopilot-desc"),
-            IconName::Bot,
-            info,
-            current == ApprovalMode::AutoPilot,
+            PermissionMode::ReadOnly,
+            i18n::t("workspace-mode-readonly-title"),
+            i18n::t("workspace-mode-readonly-desc"),
+            IconName::Eye,
+            warning,
+            current == PermissionMode::ReadOnly,
         ))
         .child(make_row(
-            ApprovalMode::Danger,
-            i18n::t("workspace-mode-danger-title"),
-            i18n::t("workspace-mode-danger-desc"),
+            PermissionMode::WorkspaceWrite,
+            i18n::t("workspace-mode-workspacewrite-title"),
+            i18n::t("workspace-mode-workspacewrite-desc"),
+            IconName::FolderOpen,
+            info,
+            current == PermissionMode::WorkspaceWrite,
+        ))
+        .child(make_row(
+            PermissionMode::FullAccess,
+            i18n::t("workspace-mode-fullaccess-title"),
+            i18n::t("workspace-mode-fullaccess-desc"),
             IconName::TriangleAlert,
             danger,
-            current == ApprovalMode::Danger,
+            current == PermissionMode::FullAccess,
         ))
 }
 
 impl Workspace {
-    /// Toggle Danger mode on the current thread (`/danger` no-args form):
-    /// Danger → AutoPilot, anything else → Danger. The mode change notice
-    /// rides `apply_approval_mode` so the conversation shows the switch.
-    pub(crate) fn toggle_danger(&mut self, cx: &mut Context<Self>) {
-        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Danger {
-            ApprovalMode::AutoPilot
-        } else {
-            ApprovalMode::Danger
+    /// Cycle the permission mode on the current thread (`/mode` no-args
+    /// form): ReadOnly → WorkspaceWrite → FullAccess → ReadOnly. The mode
+    /// change notice rides `apply_permission_mode` so the conversation shows
+    /// the switch.
+    pub(crate) fn cycle_mode(&mut self, cx: &mut Context<Self>) {
+        let next = match self.thread.read(cx).permission_mode() {
+            PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
+            PermissionMode::WorkspaceWrite => PermissionMode::FullAccess,
+            PermissionMode::FullAccess => PermissionMode::ReadOnly,
         };
-        self.apply_approval_mode(next, cx);
+        self.apply_permission_mode(next, cx);
     }
 
-    /// Enable Danger mode (if not already on) and immediately send `prompt`
-    /// as a user turn — the `/danger [prompt]` form. Slash dispatch only
-    /// fires while idle (the submit gate); `/danger Y` typed mid-turn parks
-    /// in the follow-up queue as raw text like any other message.
-    pub(crate) fn start_danger_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if self.thread.read(cx).approval_mode() != ApprovalMode::Danger {
-            self.apply_approval_mode(ApprovalMode::Danger, cx);
-        }
+    /// Apply `mode` and immediately send `prompt` as a user turn — the
+    /// `/mode <name> [prompt]` form. Slash dispatch only fires while idle
+    /// (the submit gate); `/mode` typed mid-turn parks in the follow-up
+    /// queue as raw text like any other message.
+    pub(crate) fn start_mode_turn(
+        &mut self,
+        mode: PermissionMode,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_permission_mode(mode, cx);
         self.send_user_turn(prompt, Vec::new(), cx);
     }
 
-    /// Switch the thread's `ApprovalMode`, post a localized notice, and close
-    /// the popover. Centralized so slash command, chip click, and the
-    /// future settings-panel wiring all funnel through one path.
-    pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+    /// Switch the thread's `PermissionMode`, post a localized notice, and
+    /// close the popover. Centralized so slash command, chip click, and the
+    /// settings panel wiring all funnel through one path.
+    pub(crate) fn apply_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
         let mode_key = match mode {
-            ApprovalMode::AutoPilot => "autopilot",
-            ApprovalMode::Danger => "danger",
+            PermissionMode::ReadOnly => "readonly",
+            PermissionMode::WorkspaceWrite => "workspacewrite",
+            PermissionMode::FullAccess => "fullaccess",
         };
         self.thread
-            .update(cx, |t, cx| t.set_approval_mode(mode, cx));
+            .update(cx, |t, cx| t.set_permission_mode(mode, cx));
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
             NoticeAnchor::TurnEnd,

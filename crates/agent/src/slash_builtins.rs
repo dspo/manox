@@ -25,9 +25,9 @@ pub struct BuiltinSlashMeta {
 /// The built-in command set, in popover listing order.
 pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashMeta] = &[
     BuiltinSlashMeta {
-        name: "danger",
+        name: "mode",
         aliases: &[],
-        description_key: "slash-danger-desc",
+        description_key: "slash-mode-desc",
     },
     BuiltinSlashMeta {
         name: "plan",

@@ -1,4 +1,4 @@
-//! UI annotation card types (Error / Notice / PlanReview / AutoApproval).
+//! UI annotation card types (Error / Notice / PlanReview).
 //!
 //! These cards are host-only UI state that never enters the model-facing
 //! canonical `Thread::messages` (so `build_completion_request` — and the
@@ -27,18 +27,12 @@ pub enum UiNoteKind {
     /// UI-only and never enters `Thread::messages`, so without this note it
     /// would vanish the moment the conversation entity is rebuilt.
     PlanReview,
-    /// An autopilot auto-approval marker: the safety reviewer allowed a gated
-    /// tool call without escalating to the user. `data` carries only
-    /// `tool_call_id`; the rebuild stamps the matching tool item's badge
-    /// (`ToolCallItem::auto_approved`) — this kind never renders as a
-    /// conversation item.
-    AutoApproval,
 }
 
 /// One UI annotation card. `data` carries the render payload — currently
-/// `{ "text": String }`, plus `tool_call_id` for approval decision records —
-/// and is left as raw JSON so future note shapes extend without a schema
-/// change. Entry append order in the session jsonl equals emit order.
+/// `{ "text": String }` — and is left as raw JSON so future note shapes
+/// extend without a schema change. Entry append order in the session jsonl
+/// equals emit order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiNoteRecord {
     pub kind: UiNoteKind,

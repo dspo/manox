@@ -28,12 +28,13 @@
 //!
 //! The `ws` half is pure read-only network observation and rides ungated.
 //! The `command` half executes an arbitrary shell command under `sh -c` —
-//! the same surface as `Bash` — so it opts into the host approval gate via
-//! the params-aware `requires_approval`. Deliberately NOT exempted like
-//! sandboxed Bash calls: a monitor is long-running background execution the
-//! user never sees output from until later, so its start stays gated even
-//! though the command is seatbelt-wrapped. Monitor output is always framed
-//! as untrusted external data either way.
+//! the same surface as `Bash` — so it rides the host permission gate via
+//! the params-aware `requires_approval`, with the same mode semantics as
+//! sandboxed Bash: a confined monitor start is auto-allowed under
+//! WorkspaceWrite (the OS sandbox bounds it), denied under ReadOnly, and
+//! ungated under FullAccess; an escalated (unsandboxed) monitor start is
+//! denied outside FullAccess. Monitor output is always framed as untrusted
+//! external data either way.
 //!
 //! ## Teardown semantics
 //!

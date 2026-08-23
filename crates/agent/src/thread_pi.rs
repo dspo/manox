@@ -58,32 +58,41 @@ pub struct SideCallMetric {
     pub latency_ms: u64,
 }
 
-/// User-facing approval policy. `AutoPilot` routes approval-required tool
-/// calls through the safety reviewer with user escalation; `Danger` runs
-/// everything without prompting. Enforced by the engine's approval gate
-/// (`pi_approval`); persisted in the session sidecar.
+/// Thread permission mode: pure mode-based allow/deny for mutating tool
+/// calls, enforced by the engine's permission gate (`pi_approval`). No
+/// reviewer, no interactive approval — out-of-scope calls return a tool
+/// error to the model. Persisted in the session sidecar (wire field
+/// `approval_mode`, kebab values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ApprovalMode {
-    #[serde(rename = "autopilot")]
+pub enum PermissionMode {
+    /// Mutating tools denied; reads ungated.
+    ReadOnly,
+    /// In-workspace writes and sandbox-confined bash ungated; out-of-
+    /// workspace targets denied.
     #[default]
-    AutoPilot,
-    #[serde(rename = "danger")]
-    Danger,
+    WorkspaceWrite,
+    /// Everything ungated; bash runs unsandboxed.
+    FullAccess,
 }
 
-impl ApprovalMode {
+impl PermissionMode {
+    /// Map the persisted i64; any unknown value lands on the single bounded
+    /// default.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            1 | 2 => Self::Danger,
-            _ => Self::AutoPilot,
+            0 => Self::ReadOnly,
+            1 => Self::WorkspaceWrite,
+            2 => Self::FullAccess,
+            _ => Self::default(),
         }
     }
 
     pub fn as_i64(self) -> i64 {
         match self {
-            Self::AutoPilot => 0,
-            Self::Danger => 1,
+            Self::ReadOnly => 0,
+            Self::WorkspaceWrite => 1,
+            Self::FullAccess => 2,
         }
     }
 }
@@ -197,26 +206,18 @@ pub enum ThreadEvent {
         id: String,
         child: SubagentChildEvent,
     },
-    /// Request user authorization for a tool call: approval-gated tools
-    /// escalate here, and `AskUserQuestion` rides the same channel. The
-    /// workspace renders the question card and answers through
-    /// [`Thread::respond_authorization`].
+    /// Interactive question round trip: `AskUserQuestion` (and bubbled team
+    /// member authorizations) parks here. The workspace renders the question
+    /// card and answers through [`Thread::respond_authorization`]. Permission
+    /// denials never ride this channel — they return a tool error directly.
     ToolCallAuthorization {
         id: String,
         tool_name: String,
         summary: String,
         input: serde_json::Value,
     },
-    /// An autopilot approval decision. `tool_call_id` lets the host anchor
-    /// the decision record next to the tool call that triggered it.
-    ApprovalDecision {
-        tool_call_id: String,
-        tool_name: String,
-        tool_title: String,
-        verdict: crate::approval::ReviewVerdict,
-    },
-    /// Approval mode changed.
-    ApprovalModeChanged { mode: ApprovalMode },
+    /// Permission mode changed.
+    PermissionModeChanged { mode: PermissionMode },
     /// A completion turn started.
     TurnStarted,
     /// A completion turn ended.
@@ -315,7 +316,7 @@ pub struct Thread {
     cwd: PathBuf,
     project: Option<PathBuf>,
     model: Option<PiModel>,
-    approval_mode: ApprovalMode,
+    permission_mode: PermissionMode,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
@@ -340,10 +341,10 @@ pub struct Thread {
     engine: Option<Arc<dyn ThreadEngine>>,
     /// History-loading state (see `HistoryPhase`).
     history_phase: HistoryPhase,
-    /// Whether the user explicitly set the approval mode on a landing
+    /// Whether the user explicitly set the permission mode on a landing
     /// thread; the mode is then not overwritten by the session sidecar's
     /// default when the engine materializes.
-    approval_mode_explicitly_set: bool,
+    permission_mode_explicitly_set: bool,
     /// Whether the user explicitly set the reasoning effort on a landing
     /// thread; the effort is then not overwritten by the session sidecar's
     /// default when the engine materializes.
@@ -380,7 +381,7 @@ impl Thread {
             cwd,
             project: None,
             model: crate::pi_providers::default_model(),
-            approval_mode: ApprovalMode::default(),
+            permission_mode: PermissionMode::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
@@ -395,7 +396,7 @@ impl Thread {
             last_user_ui: None,
             engine: None,
             history_phase: HistoryPhase::Ready,
-            approval_mode_explicitly_set: false,
+            permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
             plan_mode: false,
             persisted_plan: None,
@@ -462,7 +463,7 @@ impl Thread {
                 cwd,
                 project,
                 model,
-                approval_mode: ApprovalMode::default(),
+                permission_mode: PermissionMode::default(),
                 messages: Vec::new(),
                 reasoning_effort: ReasoningEffort::default(),
                 pinned: false,
@@ -481,7 +482,7 @@ impl Thread {
                 } else {
                     HistoryPhase::Ready
                 },
-                approval_mode_explicitly_set: false,
+                permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
@@ -496,7 +497,7 @@ impl Thread {
     /// the user acts: a sidebar open swaps the whole thread via
     /// `open_existing` instead; a first prompt or project bind calls this).
     /// Spawns a fresh session (never restores) bound to `project`, wires the
-    /// notice drainer, and replays the stored approval mode / reasoning
+    /// notice drainer, and replays the stored permission mode / reasoning
     /// effort. `spawn_engine` is infallible (it only queues the actor), so
     /// the engine is always available after this returns.
     fn ensure_engine(&mut self, project: Option<PathBuf>, cx: &mut Context<Self>) {
@@ -522,8 +523,8 @@ impl Thread {
             self.goal_bridge.clone(),
             None,
         );
-        if self.approval_mode != ApprovalMode::default() {
-            engine.set_approval_mode(self.approval_mode);
+        if self.permission_mode != PermissionMode::default() {
+            engine.set_permission_mode(self.permission_mode);
         }
         if self.reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(self.reasoning_effort.wire_value().to_string()));
@@ -539,8 +540,8 @@ impl Thread {
             BackendNotice::Event(event) => {
                 // Mirror the gate policy before the chip hears about the
                 // change.
-                if let ThreadEvent::ApprovalModeChanged { mode } = *event {
-                    self.approval_mode = mode;
+                if let ThreadEvent::PermissionModeChanged { mode } = *event {
+                    self.permission_mode = mode;
                 }
                 if let ThreadEvent::PlanModeChanged { enabled } = *event {
                     self.plan_mode = enabled;
@@ -695,7 +696,7 @@ impl Thread {
             BackendNotice::Ready {
                 restored,
                 model,
-                approval_mode,
+                permission_mode,
                 reasoning_effort,
                 plan_mode,
                 plan_file,
@@ -710,8 +711,8 @@ impl Thread {
                 if let Some(m) = model {
                     self.model = Some(m);
                 }
-                if !self.approval_mode_explicitly_set {
-                    self.approval_mode = approval_mode;
+                if !self.permission_mode_explicitly_set {
+                    self.permission_mode = permission_mode;
                 }
                 if !self.reasoning_effort_explicitly_set {
                     self.reasoning_effort = reasoning_effort;
@@ -1067,8 +1068,8 @@ impl Thread {
             .unwrap_or_else(|| "Manox Pi".to_string())
     }
 
-    pub fn approval_mode(&self) -> ApprovalMode {
-        self.approval_mode
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -1373,7 +1374,7 @@ impl Thread {
     }
 
     /// Construct a team worker thread: a fresh pi session inheriting this
-    /// (leader) thread's cwd / model / approval mode / reasoning effort,
+    /// (leader) thread's cwd / model / permission mode / reasoning effort,
     /// labeled with the member name. Engine spawned eagerly (members always
     /// run). Members carry no goal bridge: the goal contract belongs to the
     /// leader's user-facing conversation. The member session header records
@@ -1383,7 +1384,7 @@ impl Thread {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
         let model = self.model.clone();
-        let approval_mode = self.approval_mode;
+        let permission_mode = self.permission_mode;
         let reasoning_effort = self.reasoning_effort;
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -1399,8 +1400,8 @@ impl Thread {
             None,
             Some(self.id.0.clone()),
         );
-        if approval_mode != ApprovalMode::default() {
-            engine.set_approval_mode(approval_mode);
+        if permission_mode != PermissionMode::default() {
+            engine.set_permission_mode(permission_mode);
         }
         if reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(reasoning_effort.wire_value().to_string()));
@@ -1412,7 +1413,7 @@ impl Thread {
                 cwd,
                 project: None,
                 model,
-                approval_mode,
+                permission_mode,
                 messages: Vec::new(),
                 reasoning_effort,
                 pinned: false,
@@ -1427,7 +1428,7 @@ impl Thread {
                 last_user_ui: None,
                 engine: Some(engine),
                 history_phase: HistoryPhase::Ready,
-                approval_mode_explicitly_set: true,
+                permission_mode_explicitly_set: true,
                 reasoning_effort_explicitly_set: true,
                 plan_mode: false,
                 persisted_plan: None,
@@ -1600,25 +1601,25 @@ impl Thread {
         }
     }
 
-    pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
-        if self.approval_mode == mode {
+    pub fn set_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+        if self.permission_mode == mode {
             return;
         }
-        self.approval_mode = mode;
+        self.permission_mode = mode;
         // An explicit user choice must survive engine materialization: the
         // session sidecar's default would otherwise overwrite it at `Ready`.
-        self.approval_mode_explicitly_set = true;
+        self.permission_mode_explicitly_set = true;
         if let Some(engine) = &self.engine {
             // The engine applies the mode to its gate and persists it in the
             // session sidecar; the chip reflects the change immediately.
-            engine.set_approval_mode(mode);
+            engine.set_permission_mode(mode);
         }
-        cx.emit(ThreadEvent::ApprovalModeChanged { mode });
+        cx.emit(ThreadEvent::PermissionModeChanged { mode });
         cx.notify();
     }
 
-    /// Deliver the user's verdict for a pending tool-call authorization
-    /// (approval card or `AskUserQuestion`). Unknown ids are ignored.
+    /// Deliver the user's answer for a pending interaction card
+    /// (`AskUserQuestion`). Unknown ids are ignored.
     pub fn respond_authorization(
         &mut self,
         id: &str,
@@ -1796,7 +1797,7 @@ impl Thread {
         true
     }
 
-    /// Run a built-in slash command (`/danger`, `/plan`, `/compact`,
+    /// Run a built-in slash command (`/mode`, `/plan`, `/compact`,
     /// `/goal`) at the thread level — the headless twin of the gpui host's
     /// built-in command impls, sharing the name/alias set via
     /// [`crate::slash_builtins`]. Returns `false` for names this layer does
@@ -1811,18 +1812,36 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> bool {
         match crate::slash_builtins::canonical_builtin(name).map(|meta| meta.name) {
-            Some("danger") => {
-                if args.trim().is_empty() {
-                    let next = match self.approval_mode() {
-                        ApprovalMode::Danger => ApprovalMode::AutoPilot,
-                        _ => ApprovalMode::Danger,
+            Some("mode") => {
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    let next = match self.permission_mode() {
+                        PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
+                        PermissionMode::WorkspaceWrite => PermissionMode::FullAccess,
+                        PermissionMode::FullAccess => PermissionMode::ReadOnly,
                     };
-                    self.set_approval_mode(next, cx);
+                    self.set_permission_mode(next, cx);
                 } else {
-                    if self.approval_mode() != ApprovalMode::Danger {
-                        self.set_approval_mode(ApprovalMode::Danger, cx);
+                    let (name, rest) = match trimmed.split_once(char::is_whitespace) {
+                        Some((head, tail)) => (head, tail.trim()),
+                        None => (trimmed, ""),
+                    };
+                    let parsed: Result<PermissionMode, _> =
+                        serde_json::from_value(serde_json::Value::String(name.to_string()));
+                    match parsed {
+                        Ok(mode) => {
+                            self.set_permission_mode(mode, cx);
+                            if !rest.is_empty() {
+                                self.insert_slash_turn(rest.to_string(), ui, cx);
+                            }
+                        }
+                        Err(_) => {
+                            cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                                "unknown permission mode `{name}` (expected read-only, \
+                                 workspace-write, or full-access)"
+                            )));
+                        }
                     }
-                    self.insert_slash_turn(args.to_string(), ui, cx);
                 }
                 true
             }
@@ -2125,7 +2144,7 @@ pub(crate) mod tests {
         history: Vec<Message>,
         shutdown_calls: AtomicUsize,
         abort_calls: AtomicUsize,
-        approval_mode: Mutex<Option<ApprovalMode>>,
+        permission_mode: Mutex<Option<PermissionMode>>,
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
         runs: Mutex<Vec<(String, Vec<pi::types::ContentBlock>)>>,
@@ -2140,7 +2159,7 @@ pub(crate) mod tests {
                 history: Vec::new(),
                 shutdown_calls: AtomicUsize::new(0),
                 abort_calls: AtomicUsize::new(0),
-                approval_mode: Mutex::new(None),
+                permission_mode: Mutex::new(None),
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
@@ -2206,8 +2225,8 @@ pub(crate) mod tests {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn set_approval_mode(&self, mode: ApprovalMode) {
-            *self.approval_mode.lock().unwrap() = Some(mode);
+        fn set_permission_mode(&self, mode: PermissionMode) {
+            *self.permission_mode.lock().unwrap() = Some(mode);
         }
     }
 
@@ -2225,7 +2244,7 @@ pub(crate) mod tests {
                 cwd: PathBuf::from("/tmp"),
                 project: None,
                 model: None,
-                approval_mode: ApprovalMode::default(),
+                permission_mode: PermissionMode::default(),
                 messages: Vec::new(),
                 reasoning_effort: ReasoningEffort::default(),
                 pinned: false,
@@ -2240,7 +2259,7 @@ pub(crate) mod tests {
                 last_user_ui: None,
                 engine: Some(engine),
                 history_phase: phase,
-                approval_mode_explicitly_set: false,
+                permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
@@ -2252,12 +2271,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn approval_mode_maps_i64_roundtrip() {
-        assert_eq!(ApprovalMode::from_i64(0), ApprovalMode::AutoPilot);
-        assert_eq!(ApprovalMode::from_i64(1), ApprovalMode::Danger);
-        assert_eq!(ApprovalMode::from_i64(2), ApprovalMode::Danger);
-        assert_eq!(ApprovalMode::AutoPilot.as_i64(), 0);
-        assert_eq!(ApprovalMode::Danger.as_i64(), 1);
+    fn permission_mode_maps_i64_roundtrip() {
+        assert_eq!(PermissionMode::from_i64(0), PermissionMode::ReadOnly);
+        assert_eq!(PermissionMode::from_i64(1), PermissionMode::WorkspaceWrite);
+        assert_eq!(PermissionMode::from_i64(2), PermissionMode::FullAccess);
+        assert_eq!(PermissionMode::ReadOnly.as_i64(), 0);
+        assert_eq!(PermissionMode::WorkspaceWrite.as_i64(), 1);
+        assert_eq!(PermissionMode::FullAccess.as_i64(), 2);
+        // Unknown persisted values land on the bounded default.
+        assert_eq!(PermissionMode::from_i64(-1), PermissionMode::default());
+        assert_eq!(PermissionMode::from_i64(3), PermissionMode::default());
+        // Wire names are the kebab sidecar values.
+        assert_eq!(
+            serde_json::to_value(PermissionMode::FullAccess).unwrap(),
+            serde_json::json!("full-access")
+        );
+        assert_eq!(
+            serde_json::from_value::<PermissionMode>(serde_json::json!("read-only")).unwrap(),
+            PermissionMode::ReadOnly
+        );
     }
 
     /// Registry turns originate on the GPUI main thread, outside Tokio's
@@ -2310,7 +2342,7 @@ pub(crate) mod tests {
             )])],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2345,14 +2377,14 @@ pub(crate) mod tests {
     }
 
     /// The headless slash router drives the same thread state the gpui host
-    /// toggles: plan mode, approval mode, compact, and goal lifecycle.
+    /// toggles: plan mode, permission mode, compact, and goal lifecycle.
     #[gpui::test]
-    fn run_slash_builtin_plan_danger_compact_and_unowned(cx: &mut gpui::TestAppContext) {
+    fn run_slash_builtin_plan_mode_compact_and_unowned(cx: &mut gpui::TestAppContext) {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2382,9 +2414,11 @@ pub(crate) mod tests {
             assert!(!t.plan_mode(), "/plan bare exits plan mode");
             assert_eq!(engine.runs.lock().unwrap().len(), 1);
 
-            assert!(t.run_slash_builtin("danger", "", None, cx));
-            assert_eq!(t.approval_mode(), ApprovalMode::Danger);
-
+            assert!(t.run_slash_builtin("mode", "", None, cx));
+            assert_eq!(t.permission_mode(), PermissionMode::FullAccess);
+            // Named form sets the mode directly.
+            assert!(t.run_slash_builtin("mode", "read-only", None, cx));
+            assert_eq!(t.permission_mode(), PermissionMode::ReadOnly);
             assert!(t.run_slash_builtin("compact", "focus", None, cx));
             assert!(t.run_slash_builtin("goal", "clear", None, cx));
 
@@ -2414,7 +2448,7 @@ pub(crate) mod tests {
             ],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2461,7 +2495,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2529,7 +2563,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2557,7 +2591,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2579,7 +2613,7 @@ pub(crate) mod tests {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2592,7 +2626,7 @@ pub(crate) mod tests {
                 BackendNotice::Ready {
                     restored: true,
                     model: None,
-                    approval_mode: ApprovalMode::default(),
+                    permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
@@ -2632,7 +2666,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2650,31 +2684,32 @@ pub(crate) mod tests {
         assert_eq!(count, 0, "stale preview is dropped");
     }
 
-    /// I3: an explicit user approval-mode choice on a landing thread survives
-    /// the sidecar default arriving at `Ready` (`approval_mode_explicitly_set`).
+    /// I3: an explicit user permission-mode choice on a landing thread
+    /// survives the sidecar default arriving at `Ready`
+    /// (`permission_mode_explicitly_set`).
     #[gpui::test]
-    fn explicit_approval_mode_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+    fn explicit_permission_mode_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
         thread.update(cx, |t, _cx| {
-            t.set_approval_mode(ApprovalMode::Danger, _cx);
+            t.set_permission_mode(PermissionMode::ReadOnly, _cx);
         });
-        // The fresh session's sidecar reports AutoPilot at Ready; the user's
-        // Danger choice must not be overwritten.
+        // The fresh session's sidecar reports the default at Ready; the
+        // user's ReadOnly choice must not be overwritten.
         thread.update(cx, |t, cx| {
             t.handle_notice(
                 BackendNotice::Ready {
                     restored: false,
                     model: None,
-                    approval_mode: ApprovalMode::AutoPilot,
+                    permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
@@ -2684,7 +2719,10 @@ pub(crate) mod tests {
                 cx,
             );
         });
-        assert_eq!(cx.read(|cx| thread.read(cx).approval_mode()), ApprovalMode::Danger);
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).permission_mode()),
+            PermissionMode::ReadOnly
+        );
     }
 
     /// P1: `PlanUpdated` mirrors onto the facade and persists through the
@@ -2695,7 +2733,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2756,7 +2794,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2775,7 +2813,7 @@ pub(crate) mod tests {
                 BackendNotice::Ready {
                     restored: true,
                     model: None,
-                    approval_mode: ApprovalMode::default(),
+                    permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
@@ -2798,7 +2836,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2814,7 +2852,7 @@ pub(crate) mod tests {
                 BackendNotice::Ready {
                     restored: false,
                     model: None,
-                    approval_mode: ApprovalMode::default(),
+                    permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
                     plan_mode: false,
                     plan_file: None,
@@ -2838,7 +2876,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
@@ -2849,7 +2887,7 @@ pub(crate) mod tests {
                 BackendNotice::Ready {
                     restored: true,
                     model: None,
-                    approval_mode: ApprovalMode::default(),
+                    permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::Max,
                     plan_mode: false,
                     plan_file: None,
@@ -2873,7 +2911,7 @@ pub(crate) mod tests {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
             abort_calls: AtomicUsize::new(0),
-            approval_mode: Mutex::new(None),
+            permission_mode: Mutex::new(None),
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use agent::language_model::MessageContent;
 use agent::permission::{PermissionDecision, ToolAuthorizationResponse};
-use agent::thread::ApprovalMode;
+use agent::thread::PermissionMode;
 use agent::{
     Message, MessageUiMetadata, Thread, ThreadEvent, ThreadId, ThreadStore, ThreadStoreEvent,
 };
@@ -314,7 +314,7 @@ fn handle_command(
                     thread.update(app, |t, cx| t.set_model(model, cx));
                 });
             }
-            let persisted_mode = cx.update(|app| thread.read(app).approval_mode());
+            let persisted_mode = cx.update(|app| thread.read(app).permission_mode());
             state.sessions.insert(
                 id.clone(),
                 SessionState {
@@ -327,7 +327,7 @@ fn handle_command(
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
-            emit_persisted_approval_mode(persisted_mode, &id, sink);
+            emit_persisted_permission_mode(persisted_mode, &id, sink);
         }
         "open_thread" => {
             let Some(id) = session_id.clone() else {
@@ -340,8 +340,8 @@ fn handle_command(
             if let Some(session) = state.sessions.get(&id) {
                 sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
                 let (thread, subagents) = (session.thread.clone(), session.subagents.clone());
-                let persisted_mode = cx.update(|app| thread.read(app).approval_mode());
-                emit_persisted_approval_mode(persisted_mode, &id, sink);
+                let persisted_mode = cx.update(|app| thread.read(app).permission_mode());
+                emit_persisted_permission_mode(persisted_mode, &id, sink);
                 cx.update(|app| {
                     emit_history_and_info(
                         app,
@@ -383,7 +383,7 @@ fn handle_command(
                     sink.clone(),
                 )
             });
-            let persisted_mode = cx.update(|app| thread.read(app).approval_mode());
+            let persisted_mode = cx.update(|app| thread.read(app).permission_mode());
             state.sessions.insert(
                 id.clone(),
                 SessionState {
@@ -396,7 +396,7 @@ fn handle_command(
                 },
             );
             sink.emit(json!({"type": "session_created", "sessionId": id}).to_string());
-            emit_persisted_approval_mode(persisted_mode, &id, sink);
+            emit_persisted_permission_mode(persisted_mode, &id, sink);
         }
         "focus_thread" => {
             *state.focused.lock().unwrap() = session_id.clone();
@@ -586,7 +586,7 @@ fn handle_command(
                         let t = session.thread.read(app);
                         MessageUiMetadata {
                             model_id: t.model().map(|m| m.id.clone()),
-                            approval_mode: Some(t.approval_mode().as_i64()),
+                            approval_mode: Some(t.permission_mode().as_i64()),
                             ..Default::default()
                         }
                     });
@@ -602,7 +602,7 @@ fn handle_command(
                     session.thread.update(app, |t, cx| {
                         let ui = MessageUiMetadata {
                             model_id: t.model().map(|m| m.id.clone()),
-                            approval_mode: Some(t.approval_mode().as_i64()),
+                            approval_mode: Some(t.permission_mode().as_i64()),
                             ..Default::default()
                         };
                         // Slash turns ride the registry (built-ins first,
@@ -672,7 +672,7 @@ fn handle_command(
                 session.thread.update(app, |t, cx| {
                     let ui = MessageUiMetadata {
                         model_id: t.model().map(|m| m.id.clone()),
-                        approval_mode: Some(t.approval_mode().as_i64()),
+                        approval_mode: Some(t.permission_mode().as_i64()),
                         ..Default::default()
                     };
                     let mut content = Vec::new();
@@ -757,15 +757,23 @@ fn handle_command(
                 });
             });
         }),
+        // Wire command name kept as `set_approval_mode` (host contract);
+        // the mode value is the PermissionMode kebab wire name, unknown
+        // values land on the bounded default.
         "set_approval_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
-            let mode = match cmd["mode"].as_str() {
-                Some("danger") => ApprovalMode::Danger,
-                _ => ApprovalMode::AutoPilot,
-            };
+            let mode = cmd["mode"]
+                .as_str()
+                .and_then(|raw| {
+                    serde_json::from_value::<PermissionMode>(serde_json::Value::String(
+                        raw.to_string(),
+                    ))
+                    .ok()
+                })
+                .unwrap_or_default();
             cx.update(|app| {
                 session
                     .thread
-                    .update(app, |t, cx| t.set_approval_mode(mode, cx));
+                    .update(app, |t, cx| t.set_permission_mode(mode, cx));
             });
         }),
         "set_plan_mode" => with_session(state, session_id.as_deref(), sink, |session, _| {
@@ -812,7 +820,7 @@ fn handle_command(
                     });
                     let ui = MessageUiMetadata {
                         model_id: t.model().map(|m| m.id.clone()),
-                        approval_mode: Some(t.approval_mode().as_i64()),
+                        approval_mode: Some(t.permission_mode().as_i64()),
                         author: Some(t.self_author()),
                         ..Default::default()
                     };
@@ -829,7 +837,7 @@ fn handle_command(
                 session.thread.update(app, |t, cx| {
                     let ui = MessageUiMetadata {
                         model_id: t.model().map(|m| m.id.clone()),
-                        approval_mode: Some(t.approval_mode().as_i64()),
+                        approval_mode: Some(t.permission_mode().as_i64()),
                         author: Some(t.self_author()),
                         ..Default::default()
                     };
@@ -1028,9 +1036,10 @@ fn error_json(session_id: Option<&str>, message: &str) -> String {
     .to_string()
 }
 
-/// Restored threads keep their persisted policy; replay it on open so the
-/// surface renders the right approval toggle without a round trip.
-fn emit_persisted_approval_mode(mode: ApprovalMode, session_id: &str, sink: &EventSink) {
+/// Restored threads keep their persisted mode; replay it on open so the
+/// surface renders the right permission toggle without a round trip. Wire
+/// type kept as `approval_mode_changed` (host contract).
+fn emit_persisted_permission_mode(mode: PermissionMode, session_id: &str, sink: &EventSink) {
     sink.emit(
         serde_json::json!({
             "type": "approval_mode_changed",
@@ -1268,26 +1277,6 @@ fn subscribe_thread(
                         );
                     });
                 }
-                ThreadEvent::ApprovalDecision {
-                    tool_call_id,
-                    verdict,
-                    ..
-                } => {
-                    // The actor-only host has no workspace `record_ui_note`;
-                    // persist the auto-approval marker here so a VS Code
-                    // session's `thread_history.auto_approved_tools` rebuild
-                    // reproduces the badge exactly like the gpui host's.
-                    if matches!(verdict, agent::approval::ReviewVerdict::Allow) {
-                        let note = agent::db::UiNoteRecord {
-                            kind: agent::db::UiNoteKind::AutoApproval,
-                            data: serde_json::json!({
-                                "text": "",
-                                "tool_call_id": tool_call_id,
-                            }),
-                        };
-                        entity.update(app, |t, _| t.append_ui_note(note));
-                    }
-                }
                 _ => {}
             }
             if let Some(json) = crate::events::thread_event_to_json(ev, Some(&session_id)) {
@@ -1308,44 +1297,21 @@ fn emit_history_and_info(
     sink: &EventSink,
 ) {
     let messages = strip_messages_for_wire(thread.read(app).messages());
-    // Auto-approval badges ride the ui_notes sidecar, which the webview's
-    // `wireMessagesToTranscriptItems` rebuild never sees; project just the
-    // marked tool ids so the restored transcript stamps the same badges.
-    let auto_approved_tools: Vec<String> = thread
-        .read(app)
-        .display_history()
-        .iter()
-        .filter_map(|entry| match entry {
-            agent::db::HistoryEntry::Note(note) => Some(note),
-            _ => None,
-        })
-        .filter(|n| n.kind == agent::db::UiNoteKind::AutoApproval)
-        .filter_map(|n| {
-            n.data
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect();
     sink.emit(
         json!({
             "type": "thread_history",
             "sessionId": session_id,
             "messages": messages,
-            "auto_approved_tools": auto_approved_tools,
         })
         .to_string(),
     );
     emit_thread_info(app, thread, session_id, subagents, sink);
     // Re-emit in-flight interaction cards a reloaded webview lost: pending
-    // authorizations re-fold as the ask card and a submitted plan re-folds as
-    // the review card. The webview store folds these as upserts, so a session
-    // that never lost state stays single-card. Every authorization surfaces as
-    // `AskUserQuestion` live (the gate emits the escalation payload as the ask
-    // input, even for an escalated tool whose `PendingAuthMeta.tool_name` is the
-    // original tool) — replay the same so an escalated approval re-renders the
-    // three-option ask card, not the two-button approval card that would drop
-    // the always-allow verdict.
+    // questions re-fold as the ask card and a submitted plan re-folds as
+    // the review card. The webview store folds these as upserts, so a
+    // session that never lost state stays single-card. Every interaction
+    // surfaces as `AskUserQuestion` live — replay the same shape so the
+    // card renders identically after a reload.
     for (id, meta) in thread.read(app).pending_auth_entries() {
         sink.emit(
             json!({
@@ -1851,7 +1817,7 @@ mod tests {
         assert!(state.sessions.contains_key("s1"));
         assert!(types(&out).contains(&"session_created".to_string()));
 
-        // A fresh session opens focused and replays its approval policy, so
+        // A fresh session opens focused and replays its permission mode, so
         // the surface's toggle starts on the thread's actual mode and the
         // first finished turn does not badge the thread unread.
         assert_eq!(state.focused.lock().unwrap().as_deref(), Some("s1"));
@@ -1863,15 +1829,15 @@ mod tests {
             .filter(|v| v["type"] == "approval_mode_changed")
             .map(|v| v["mode"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(modes, vec!["autopilot".to_string()]);
+        assert_eq!(modes, vec!["workspace-write".to_string()]);
 
-        // Switching the approval policy surfaces as an approval_mode_changed
-        // event for the session.
+        // Switching the permission mode surfaces as an approval_mode_changed
+        // event for the session (wire type kept for the host contract).
         handle_command(
             &mut cx,
             &mut state,
             &sink,
-            r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"danger"}"#,
+            r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"full-access"}"#,
         );
         cx.run_until_parked();
         let modes: Vec<String> = out
@@ -1882,7 +1848,10 @@ mod tests {
             .filter(|v| v["type"] == "approval_mode_changed")
             .map(|v| v["mode"].as_str().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(modes, vec!["autopilot".to_string(), "danger".to_string()]);
+        assert_eq!(
+            modes,
+            vec!["workspace-write".to_string(), "full-access".to_string()]
+        );
 
         // A command for an unknown session surfaces as an error event.
         handle_command(
@@ -3137,7 +3106,7 @@ mod tests {
         let messages = cx.update(|app| state.sessions["s1"].thread.read(app).messages().to_vec());
         assert_eq!(messages.len(), 1);
         let ui = messages[0].ui.as_ref().expect("ui metadata attached");
-        assert_eq!(ui.approval_mode, Some(ApprovalMode::AutoPilot.as_i64()));
+        assert_eq!(ui.approval_mode, Some(PermissionMode::default().as_i64()));
         assert!(
             messages[0]
                 .content
@@ -3206,7 +3175,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_routes_builtin_plan_and_danger() {
+    fn submit_routes_builtin_plan_and_mode() {
         let _guard = GLOBALS_LOCK.lock().unwrap();
         hermetic_home();
         let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
@@ -3260,17 +3229,18 @@ mod tests {
             1
         );
 
-        // Bare `/danger` toggles the approval mode and pushes the change.
+        // Bare `/mode` cycles the permission mode (default WorkspaceWrite
+        // → FullAccess) and pushes the change.
         handle_command(
             &mut cx,
             &mut state,
             &sink,
-            r#"{"cmd":"submit","sessionId":"s1","text":"/danger"}"#,
+            r#"{"cmd":"submit","sessionId":"s1","text":"/mode"}"#,
         );
         cx.run_until_parked();
         assert_eq!(
-            cx.update(|app| state.sessions["s1"].thread.read(app).approval_mode()),
-            ApprovalMode::Danger
+            cx.update(|app| state.sessions["s1"].thread.read(app).permission_mode()),
+            PermissionMode::FullAccess
         );
         assert!(types(&out).contains(&"approval_mode_changed".to_string()));
 
@@ -4125,11 +4095,11 @@ mod tests {
         agent::thread_store::drop_global_for_test();
     }
 
-    /// A webview reload re-emits a pending authorization as the ask surface:
-    /// an escalated approval's `PendingAuthMeta.tool_name` is the original
-    /// tool (e.g. `Bash`), but the live gate always emits
-    /// `AskUserQuestion`; the replay must match the live shape so the
-    /// three-option ask card renders instead of the two-button approval card.
+    /// A webview reload re-emits a pending interaction as the ask surface:
+    /// a parked entry's `PendingAuthMeta.tool_name` may differ (bubbled
+    /// team-member auth), but the replay always surfaces
+    /// `AskUserQuestion` — matching the live shape so the ask card renders
+    /// identically after a reload.
     #[test]
     fn open_thread_replay_reemits_pending_auth_as_ask_surface() {
         let _guard = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4139,23 +4109,22 @@ mod tests {
         let mut state = state_with(PathBuf::from("/"));
         let out = with_session_for_submit(&mut cx, &mut state);
 
-        // Swap in a fake engine carrying an escalated Bash authorization
-        // (tool_name `Bash`, escalation three-option payload). The live gate
-        // would have emitted `AskUserQuestion` for this same id.
+        // Swap in a fake engine carrying a parked interaction whose stored
+        // tool_name is not `AskUserQuestion` (bubbled member auth shape).
+        // The replay must still surface `AskUserQuestion` for this id.
         let (engine, events) = FakeEngine::new();
         engine.set_pending_auth(
-            "bash-1",
+            "ask-1",
             "Bash",
-            "rm -rf /tmp/scratch",
+            "Clarify the next step",
             json!({
                 "questions": [{
-                    "question": "Allow this command?",
-                    "header": "Approval",
+                    "question": "Which approach should I take?",
+                    "header": "Clarify",
                     "multiSelect": false,
                     "options": [
-                        {"label": "Allow once"},
-                        {"label": "Always allow"},
-                        {"label": "Deny"}
+                        {"label": "Option A"},
+                        {"label": "Option B"}
                     ]
                 }]
             }),
@@ -4172,7 +4141,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
-                .filter(|v| v["type"] == "tool_call_authorization" && v["id"] == "bash-1")
+                .filter(|v| v["type"] == "tool_call_authorization" && v["id"] == "ask-1")
                 .filter(|v| v["tool_name"].as_str() == Some(tool_name))
                 .count()
         };
@@ -4182,8 +4151,8 @@ mod tests {
             "the replay must not surface the original tool name"
         );
 
-        // Reopen the live session: the replayed authorization must arrive as
-        // the ask surface (`AskUserQuestion`), matching the live gate.
+        // Reopen the live session: the replayed interaction must arrive as
+        // the ask surface (`AskUserQuestion`), matching the live shape.
         handle_command(
             &mut cx,
             &mut state,
@@ -4241,10 +4210,10 @@ mod tests {
             )
         }
 
-        /// Seed a pending authorization the workspace re-surfaces on
-        /// switch-back / replay. `tool_name` is the *original* tool name an
-        /// escalated approval stores, so the replay can prove it re-emits as
-        /// the ask surface regardless.
+        /// Seed a pending interaction the workspace re-surfaces on
+        /// switch-back / replay. `tool_name` is a non-`AskUserQuestion`
+        /// name here so the replay proves it re-emits as the ask surface
+        /// regardless.
         fn set_pending_auth(&self, id: &str, tool_name: &str, summary: &str, input: Value) {
             *self.pending_auth.lock().unwrap() = vec![(
                 id.to_string(),

@@ -14,10 +14,10 @@
 //! compaction, optional focus instructions, see [`CompactCommand`]), `/exit`
 //! (alias `/quit`; archive the current thread and start a fresh one, see
 //! [`ExitCommand`]), and `/new` (aliases `/clear`, `/archive`; archive the
-//! current thread and start a fresh one that keeps the project, approval
-//! mode, and model, see [`NewCommand`]), and `/danger` (toggle the thread's
-//! approval mode, optionally with a prompt that starts working immediately,
-//! see [`DangerCommand`]); markdown prompt-macros and skills are
+//! current thread and start a fresh one that keeps the project, permission
+//! mode, and model, see [`NewCommand`]), and `/mode` (cycle or set the
+//! thread's permission mode, optionally with a prompt that starts working
+//! immediately, see [`ModeCommand`]); markdown prompt-macros and skills are
 //! mirrored into the registry at startup from the shared `agent::command` /
 //! `agent::skill` registries ([`MarkdownSlashCommand`] /
 //! [`SkillSlashCommand`]).
@@ -63,7 +63,7 @@ pub struct ParsedSlash {
 /// typed `Context<Workspace>` so they can toggle thread state, push messages,
 /// etc., exactly like inline workspace methods.
 pub trait SlashCommand: Send + Sync {
-    /// Canonical name without the leading `/` (e.g. `danger`).
+    /// Canonical name without the leading `/` (e.g. `mode`).
     fn name(&self) -> &str;
     /// One-line description shown in the `⁄` popover. Localized via `i18n` for
     /// built-in commands; markdown-defined commands return their frontmatter
@@ -127,7 +127,7 @@ impl SlashCommandRegistry {
 /// any workspace is created. Idempotent via `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
-        Box::new(DangerCommand),
+        Box::new(ModeCommand),
         Box::new(PlanCommand),
         Box::new(CompactCommand),
         Box::new(ExitCommand),
@@ -156,7 +156,7 @@ pub fn init(_cx: &mut App) {
         .map(|r| r.entries())
         .unwrap_or_default()
     {
-        // A macro sharing a built-in name (e.g. `commands/danger.md`) is skipped —
+        // A macro sharing a built-in name (e.g. `commands/mode.md`) is skipped —
         // the built-in wins, mirroring the skill-skip rule below, so the popover
         // never shows two rows for the same name.
         if command_keys.contains(key.as_str()) {
@@ -324,19 +324,20 @@ fn builtin_meta(name: &str) -> &'static agent::slash_builtins::BuiltinSlashMeta 
 /// the prompt immediately. Running `/plan` again exits plan mode (full
 /// write access restored). Plans are submitted for approval through the
 /// `ProposePlan` tool, never as prose.
-/// `/danger` — toggle Danger mode on the current thread.
+/// `/mode` — cycle or set the permission mode on the current thread.
 ///
-/// `/danger` (no args) toggles Danger on/off and pushes a notice.
-/// `/danger [prompt]` enables Danger (if not already on) and immediately sends
-/// `prompt` as a user turn so the agent starts working with full autonomy.
-struct DangerCommand;
+/// `/mode` (no args) cycles ReadOnly → WorkspaceWrite → FullAccess and
+/// pushes a notice. `/mode <name>` sets the named mode (`read-only`,
+/// `workspace-write`, `full-access`); an optional prompt after the mode
+/// name immediately starts a turn under the new mode.
+struct ModeCommand;
 
-impl SlashCommand for DangerCommand {
+impl SlashCommand for ModeCommand {
     fn name(&self) -> &str {
-        builtin_meta("danger").name
+        builtin_meta("mode").name
     }
     fn description(&self) -> SharedString {
-        i18n::t(builtin_meta("danger").description_key)
+        i18n::t(builtin_meta("mode").description_key)
     }
     fn execute(
         &self,
@@ -345,10 +346,33 @@ impl SlashCommand for DangerCommand {
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
-        if args.is_empty() {
-            workspace.toggle_danger(cx);
-        } else {
-            workspace.start_danger_turn(args.to_string(), cx);
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            workspace.cycle_mode(cx);
+            return SlashResult::Handled;
+        }
+        let (name, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((head, tail)) => (head, tail.trim()),
+            None => (trimmed, ""),
+        };
+        let parsed: Result<agent::thread::PermissionMode, _> =
+            serde_json::from_value(serde_json::Value::String(name.to_string()));
+        match parsed {
+            Ok(mode) => {
+                if rest.is_empty() {
+                    workspace.apply_permission_mode(mode, cx);
+                } else {
+                    workspace.start_mode_turn(mode, rest.to_string(), cx);
+                }
+            }
+            Err(_) => {
+                workspace.add_info_message(
+                    i18n::t_str("slash-mode-unknown", &[("mode", name)]).to_string(),
+                    NoticeAnchor::TurnEnd,
+                    None,
+                    cx,
+                );
+            }
         }
         SlashResult::Handled
     }
@@ -657,7 +681,7 @@ impl SlashCommand for ExitCommand {
 }
 
 /// `/new` — archive the current thread and open a fresh one that inherits
-/// the outgoing thread's project, approval mode, and model: the conversation
+/// the outgoing thread's project, permission mode, and model: the conversation
 /// starts empty but keeps the working context.
 struct NewCommand;
 impl SlashCommand for NewCommand {
@@ -741,7 +765,7 @@ mod tests {
         assert!(r.get("nope").is_none());
         {
             // The pi registry only carries the commands its engine supports.
-            assert!(r.get("danger").is_none());
+            assert!(r.get("mode").is_none());
             assert!(r.get("plan").is_none());
             assert!(r.get("goal").is_none());
         }

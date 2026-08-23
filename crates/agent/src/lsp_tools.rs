@@ -2,8 +2,8 @@
 //! manox harness). Three lifecycle tools surface the harness-driven
 //! spawn/readiness model; six code-intel tools route a file path to the
 //! right server client by extension and return `path:line:col` or text
-//! summaries. All nine are read-only and ride ungated (approval gates
-//! mutating tools only).
+//! summaries. All nine are read-only and ride ungated (the permission gate
+//! applies to mutating tools only).
 //!
 //! Position input is `(path, line, symbol, column?)`: the model normally
 //! picks the symbol text off a line and the client resolves the exact

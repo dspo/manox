@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn detect_none_after_space() {
         // Caret right after a space: the token is empty.
-        assert!(detect("/danger ", 8).is_none());
+        assert!(detect("/mode ", 6).is_none());
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn filter_sort_empty_query_keeps_all() {
         let items = vec![CompletionItem {
-            name: "danger".into(),
+            name: "mode".into(),
             description: "".into(),
             kind: CompletionKind::Command,
         }];

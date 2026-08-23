@@ -70,10 +70,6 @@ const TPL_WRAPPER_ASK_USER_QUESTIONS_ZH_CN: &str =
 const TPL_WRAPPER_TOOL_DENIED_EN: &str = include_str!("templates/en/wrapper/tool_denied.tera.md");
 const TPL_WRAPPER_TOOL_DENIED_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/tool_denied.tera.md");
-const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN: &str =
-    include_str!("templates/en/wrapper/escalated_approval_question.tera.md");
-const TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/escalated_approval_question.tera.md");
 const TPL_TITLE_FIRST_EN: &str = include_str!("templates/en/title/first.tera.md");
 const TPL_TITLE_FIRST_ZH_CN: &str = include_str!("templates/zh-CN/title/first.tera.md");
 const TPL_TITLE_TOPIC_SHIFT_EN: &str = include_str!("templates/en/title/topic_shift.tera.md");
@@ -150,11 +146,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperToolDenied,
         TPL_WRAPPER_TOOL_DENIED_EN,
         TPL_WRAPPER_TOOL_DENIED_ZH_CN,
-    ),
-    (
-        PromptTemplate::WrapperEscalatedApprovalQuestion,
-        TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_EN,
-        TPL_WRAPPER_ESCALATED_APPROVAL_QUESTION_ZH_CN,
     ),
     (
         PromptTemplate::TitleFirstInstruction,
@@ -417,8 +408,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 19);
-        assert_eq!(REGISTRATIONS.len(), 19);
+        assert_eq!(template::ALL.len(), 18);
+        assert_eq!(REGISTRATIONS.len(), 18);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -493,7 +484,7 @@ mod tests {
                     python3: "3.12".to_string(),
                     node: "20".to_string(),
                     today: "2026-07-14".to_string(),
-                    approval_mode: Some("Danger"),
+                    permission_mode: "full-access",
                 },
             };
             assert_clean(
@@ -589,19 +580,6 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperAskUserQuestions,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperEscalatedApprovalQuestion,
-                    lang,
-                    &crate::prompt::EscalatedApprovalQuestionData {
-                        tool_title: "Bash".to_string(),
-                        reason: "network access".to_string(),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperEscalatedApprovalQuestion,
                 lang,
             );
             // Title topic-shift (uses a sentinel literal in data).
