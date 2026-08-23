@@ -605,7 +605,10 @@ impl Thread {
                     BusOp::InjectMember { thread_id, payload } => {
                         let store = crate::thread_store::global();
                         let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            let _ = responder.try_send(Err(format!("member {thread_id} not found")));
+                            if let Some(r) = &responder {
+                                let _ =
+                                    r.try_send(Err(format!("member {thread_id} not found")));
+                            }
                             return;
                         };
                         thread.update(cx, |t, cx| {
@@ -622,14 +625,19 @@ impl Thread {
                     BusOp::AbortMember { thread_id } => {
                         let store = crate::thread_store::global();
                         let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            let _ = responder.try_send(Err(format!("member {thread_id} not found")));
+                            if let Some(r) = &responder {
+                                let _ =
+                                    r.try_send(Err(format!("member {thread_id} not found")));
+                            }
                             return;
                         };
                         thread.update(cx, |t, cx| t.cancel(cx));
                         Ok("aborted".into())
                     }
                 };
-                let _ = responder.try_send(result);
+                if let Some(r) = responder {
+                    let _ = r.try_send(result);
+                }
             }
             BackendNotice::BrowserRequest { op, responder } => {
                 // The browser host is a gpui main-thread surface; the tool

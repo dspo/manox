@@ -472,7 +472,10 @@ impl AgentBus {
     async fn bus_request(&self, op: BusOp) -> Result<String, ToolError> {
         let (tx, rx) = async_channel::bounded(1);
         self.notice_tx
-            .send(BackendNotice::BusRequest { op, responder: tx })
+            .send(BackendNotice::BusRequest {
+                op,
+                responder: Some(tx),
+            })
             .map_err(|_| ToolError::ExecutionFailed("engine actor gone".into()))?;
         rx.recv()
             .await
@@ -493,10 +496,9 @@ impl AgentBus {
             .cloned()
             .collect();
         for thread_id in members {
-            let (responder, _reply) = async_channel::bounded(1);
             let _ = self.notice_tx.send(BackendNotice::BusRequest {
                 op: BusOp::AbortMember { thread_id },
-                responder,
+                responder: None,
             });
         }
     }
