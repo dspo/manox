@@ -5,8 +5,8 @@
 //! `ask_user.rs`, `monitor.rs`, `self_info.rs`, `skill.rs`). This module holds
 //! the path/truncation helpers they share, plus the default registry assembly.
 //!
-//! `requires_approval` gates the approval overlay: write_file / edit_file /
-//! ask_user always require it; `bash` requires it on `unsandboxed: true`
+//! `requires_approval` marks the tools the permission gate applies to:
+//! mutating/remote calls are gated; reads stay open (see `pi_approval`).
 
 // ─── tool name constants ────────────────────────────────────────────────────
 //

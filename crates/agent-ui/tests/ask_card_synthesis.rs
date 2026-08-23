@@ -1,8 +1,8 @@
 //! Regression: the AskUserQuestion card synthesized when the rebuilt
 //! conversation lacks the top-level `ToolCall` item the interactive drawer
-//! renders on. An escalated approval's real ToolUse folds into an activity
-//! segment, so a switch-back rebuild has no card for the pending
-//! authorization; the workspace must synthesize the gate-created card.
+//! renders on. A parked interaction whose underlying ToolUse folded into an
+//! activity segment leaves no card on a switch-back rebuild; the workspace
+//! must synthesize the gate-created card.
 #![cfg(feature = "test-support")]
 
 mod common;

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, WeakEntity};
 
 use crate::db::ThreadSummary;
-use crate::thread::{Thread, ThreadId};
+use crate::thread::{PermissionMode, Thread, ThreadId};
 
 /// Events emitted by `ThreadStore` to the sidebar.
 #[derive(Debug, Clone)]
@@ -36,8 +36,8 @@ pub struct ThreadStore {
     /// `projects` table only — thread rows remain the manox store's domain).
     db: std::sync::Arc<crate::db::ThreadsDatabase>,
     running: HashSet<String>,
-    /// Threads with a tool authorization pending a user verdict (a parked
-    /// thread's approval card is not visible, so the sidebar badge is the
+    /// Threads with an interaction pending a user answer (a parked
+    /// thread's question card is not visible, so the sidebar badge is the
     /// only signal until the user switches back). In-memory only: cleared on
     /// attach, on terminal events, and when the run resumes past the call.
     pending_auth: HashSet<String>,
@@ -359,7 +359,7 @@ impl ThreadStore {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: 0,
+            approval_mode: PermissionMode::default().as_i64(),
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),
@@ -676,7 +676,7 @@ fn session_info_to_summary(
         title_override: None,
         model_id: String::new(),
         provider_id: None,
-        approval_mode: 0,
+        approval_mode: PermissionMode::default().as_i64(),
         project: info.cwd.clone(),
         depth: 0,
         // Team affiliation wins over a fork lineage when both are present:
@@ -935,7 +935,7 @@ mod tests {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: 0,
+            approval_mode: PermissionMode::default().as_i64(),
             project: String::new(),
             depth: 0,
             parent_id: None,
@@ -1193,7 +1193,7 @@ mod tests {
             title_override: None,
             model_id: String::new(),
             provider_id: None,
-            approval_mode: 0,
+            approval_mode: PermissionMode::default().as_i64(),
             project: String::new(),
             depth: parent.is_some() as i32,
             parent_id: parent.map(str::to_string),

@@ -5,12 +5,11 @@
 //!
 //! ## Scope and honest gaps
 //!
-//! - **bash stays approval-gated only.** The retired manox sandbox wrapped
-//!   bash in macOS seatbelt; the pi bash tool is a persistent shell confined
-//!   by the approval gate alone. A seatbelt (or bwrap) backend for pi bash
-//!   is a separate, larger task. FS tools are the primary model-driven
-//!   exfiltration vector and are what this policy covers; `bash cat ~/.ssh/…`
-//!   still routes through user approval, not this policy.
+//! - **bash rides the permission gate, not this policy.** Sandboxed bash is
+//!   confined by the OS seatbelt; unsandboxed calls need Full Access mode.
+//!   FS tools are the primary model-driven exfiltration vector and are what
+//!   this policy covers; `bash cat ~/.ssh/…` routes through the permission
+//!   mode, not this policy.
 //! - **Root-level checks only.** The hook sees each tool call's `path`
 //!   argument (`Edit`: the section paths extracted from its hashline patch),
 //!   not the entries a walk descends through, so a `grep`/`find`
@@ -118,12 +117,12 @@ impl ReadPolicy {
     }
 
     /// Check `path`; an `Err` carries the English block reason surfaced to
-    /// the model, pointing it at the approval-gated escape hatch (bash).
+    /// the model.
     pub fn check(&self, path: &Path) -> Result<(), String> {
         if self.is_denied(path) {
             return Err(format!(
                 "Read blocked by path policy (sensitive path or secret file): {}. \
-                 If you genuinely need it, use the bash tool and pass user approval.",
+                 If you genuinely need it, use the bash tool (allowed in full-access mode).",
                 path.display()
             ));
         }
@@ -252,7 +251,7 @@ impl WritePolicy {
         }
         Err(format!(
             "Write blocked by path policy (outside the project root, temp scratch, and plans dir): {}. \
-             Write inside the project, or use bash with user approval.",
+             Write inside the project, or run under full-access permission mode.",
             path.display()
         ))
     }

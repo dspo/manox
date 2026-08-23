@@ -33,7 +33,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// The bash tool with the manox product surface: optional `cwd`, background
 /// execution via the registry, head/tail line filters, and an escalation
 /// slot — a per-call `unsandboxed` flag plus a host-injected force resolver
-/// (e.g. Danger mode) that overrides the flag regardless of what the model
+/// (e.g. Full Access mode) that overrides the flag regardless of what the model
 /// passed. Escalated calls run through `unsandboxed_operations` (no
 /// confinement); all other calls ride the default backend.
 pub struct BashTool {
@@ -91,7 +91,7 @@ impl BashTool {
 
     /// Bind the force-escalation resolver. It runs per call; a `true` return
     /// escalates regardless of the model's `unsandboxed` argument. Hosts
-    /// wire this to their authorization state (e.g. Danger mode).
+    /// wire this to their authorization state (e.g. Full Access mode).
     pub fn with_force_unsandboxed(mut self, resolver: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.force_unsandboxed = Some(resolver);
         self
@@ -130,8 +130,8 @@ impl AgentTool for BashTool {
          `TaskStop`. Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
          piping through `head`/`tail` — they shape the foreground result and the background \
          completion summary. Set `unsandboxed: true` to run without the sandbox (no write/network \
-         confinement; requires user approval in non-Danger modes). In Danger mode the host \
-         escalates every call regardless of this flag."
+         confinement). Unsandboxed calls are denied in workspace-write mode; in full-access mode \
+         the host runs every call unsandboxed regardless of this flag."
     }
 
     fn is_read_only(&self) -> bool {
@@ -179,7 +179,7 @@ impl AgentTool for BashTool {
                 },
                 "unsandboxed": {
                     "type": "boolean",
-                    "description": "Run without the sandbox (no write/network confinement). Requires user approval in non-Danger modes; Danger mode escalates every call regardless."
+                    "description": "Run without the sandbox (no write/network confinement). Denied in workspace-write mode; full-access mode runs every call unsandboxed regardless."
                 },
                 "head_lines": {
                     "type": "integer",
@@ -239,7 +239,7 @@ impl BashTool {
         let run_cwd = cwd_override.as_deref().unwrap_or_else(|| ctx.cwd());
         let run_in_background = params["run_in_background"].as_bool().unwrap_or(false);
         // Escalation: the model's explicit flag OR the host's force resolver
-        // (Danger mode). Authorization is host policy — the model cannot
+        // (Full Access mode). Authorization is host policy — the model cannot
         // downgrade a forced escalation by passing `unsandboxed: false`.
         let escalate = params["unsandboxed"].as_bool().unwrap_or(false)
             || self.force_unsandboxed.as_ref().is_some_and(|f| f());
@@ -665,7 +665,7 @@ mod tests {
             .with_unsandboxed_operations(unsandboxed.clone())
             .with_force_unsandboxed(Arc::new(|| true));
         // The model explicitly passed `unsandboxed: false`; the host's force
-        // resolver (Danger mode) still escalates.
+        // resolver (Full Access mode) still escalates.
         let result = tool
             .execute(
                 "c1",
@@ -741,7 +741,7 @@ mod tests {
                 &serde_json::json!({"command": "git push", "unsandboxed": true})
             )
         );
-        // The host force resolver (Danger) escalates regardless of the flag.
+        // The host force resolver (Full Access) escalates regardless of the flag.
         let ops = Arc::new(TaggedOps {
             tag: "t",
             calls: Mutex::new(Vec::new()),

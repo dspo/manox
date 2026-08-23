@@ -188,7 +188,7 @@ pub type InvokeHandler =
 /// notify bridge (`window.__manox_notify__`) and an inbound-write request
 /// bridge (`window.__manox_request_write__`) are injected. The page can tell
 /// manox "something happened" but cannot name a command to execute; inbound
-/// writes always go through a mandatory confirmation that ignores ApprovalMode.
+/// writes always go through a mandatory confirmation that ignores PermissionMode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrustMode {
     #[default]
@@ -221,7 +221,7 @@ pub enum BrowserNotification {
 /// An inbound write request from an untrusted page via
 /// `window.__manox_request_write__(intent, payload)`. This is NOT executed
 /// directly — it is routed through a mandatory confirmation overlay that does
-/// not read ApprovalMode (the inbound axis is orthogonal to outbound approval).
+/// not read PermissionMode (the inbound axis is orthogonal to outbound permission).
 /// No `intent` is registered yet; the architecture is in place for future
 /// write surfaces.
 #[derive(Clone, Debug)]
@@ -318,7 +318,7 @@ impl<'a> Builder<'a> {
     /// Register a handler invoked on the gpui main thread when an untrusted
     /// page calls `window.__manox_request_write__(intent, payload)`. The
     /// handler must NOT execute the write directly — it routes through a
-    /// mandatory confirmation that ignores ApprovalMode. Only meaningful under
+    /// mandatory confirmation that ignores PermissionMode. Only meaningful under
     /// `TrustMode::Untrusted`; ignored otherwise.
     pub fn on_inbound_write<F>(mut self, handler: F) -> Self
     where

@@ -36,7 +36,6 @@ pub enum PromptTemplate {
     WrapperPeerMessage,
     WrapperAskUserQuestions,
     WrapperToolDenied,
-    WrapperEscalatedApprovalQuestion,
 
     // --- side-call system + user prompts ---
 
@@ -83,7 +82,6 @@ impl PromptTemplate {
             Self::WrapperPeerMessage => "wrapper/peer_message.tera.md",
             Self::WrapperAskUserQuestions => "wrapper/ask_user_questions.tera.md",
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
-            Self::WrapperEscalatedApprovalQuestion => "wrapper/escalated_approval_question.tera.md",
             Self::TitleFirstInstruction => "title/first.tera.md",
             Self::TitleTopicShiftInstruction => "title/topic_shift.tera.md",
             Self::SkillBody => "wrapper/skill_body.tera.md",
@@ -99,7 +97,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 19] = [
+pub const ALL: [PromptTemplate; 18] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -111,7 +109,6 @@ pub const ALL: [PromptTemplate; 19] = [
     PromptTemplate::WrapperPeerMessage,
     PromptTemplate::WrapperAskUserQuestions,
     PromptTemplate::WrapperToolDenied,
-    PromptTemplate::WrapperEscalatedApprovalQuestion,
     PromptTemplate::TitleFirstInstruction,
     PromptTemplate::TitleTopicShiftInstruction,
     PromptTemplate::SkillBody,

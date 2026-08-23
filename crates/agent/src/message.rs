@@ -60,7 +60,7 @@ impl MessageAuthor {
 pub struct MessageUiMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// `ApprovalMode::as_i64`, stored as an integer to avoid coupling the
+    /// `PermissionMode::as_i64`, stored as an integer to avoid coupling the
     /// message schema to enum names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<i64>,

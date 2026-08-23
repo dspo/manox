@@ -30,9 +30,8 @@ pub struct LanguagePromptData {
 
 /// Runtime identity block. Session-stable rows first (cwd / project / os /
 /// shell / python3 / node), then daily-volatile `today`, then
-/// toggle-volatile approval mode last — so the cacheable prefix extends as far
-/// as possible. `None` approval mode stays silent (the default `AutoPilot`
-/// case), keeping the identity block byte-stable for the common path.
+/// toggle-volatile permission mode last — so the cacheable prefix extends as
+/// far as possible.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeIdentityPromptData {
     pub cwd: String,
@@ -43,9 +42,10 @@ pub struct RuntimeIdentityPromptData {
     pub python3: String,
     pub node: String,
     pub today: String,
-    /// `None` = `AutoPilot` (silent). `Some("Danger")` advertises the mode
-    /// the model can act differently on.
-    pub approval_mode: Option<&'static str>,
+    /// The active permission mode's wire label (`read-only` /
+    /// `workspace-write` / `full-access`) — the template states the mode's
+    /// deny semantics so the model knows what will be refused.
+    pub permission_mode: &'static str,
 }
 
 /// A git worktree row in the runtime identity block.
@@ -141,15 +141,6 @@ pub struct AskUserQa {
 pub struct AskUserQuestionsData {
     pub answers: Vec<AskUserQa>,
     pub response: Option<String>,
-}
-
-/// The reviewer's refusal surfaced to the user for a manual verdict. Rendered
-/// as the question text of the AskUserQuestion-style escalation card; the
-/// chosen option label rides back as the answer.
-#[derive(Debug, Clone, Serialize)]
-pub struct EscalatedApprovalQuestionData {
-    pub tool_title: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

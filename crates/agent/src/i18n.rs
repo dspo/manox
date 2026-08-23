@@ -305,24 +305,26 @@ mod tests {
         assert_eq!(current(), Language::ZhCn);
     }
 
-    /// The escalation card's decision vocabulary must exist in both locales:
-    /// the verdict parser matches the card's own payload labels, and a missing
-    /// key renders as the key itself, which would still match — but only
-    /// because both sides degrade identically. Pin the real strings so a
-    /// rename or a dropped translation fails loudly here.
+    /// The permission-mode notice must resolve all three variants in both
+    /// locales: the workspace posts it on every mode switch, and a missing
+    /// variant renders the raw fluent term. Pin the shapes so a rename or a
+    /// dropped translation fails loudly here.
     #[test]
-    fn escalation_labels_localized() {
+    fn permission_mode_notice_localized() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
-        assert_eq!(t("workspace-escalation-allow-once").as_ref(), "Allow once");
-        assert_eq!(
-            t("workspace-escalation-always-allow").as_ref(),
-            "Always allow"
-        );
-        assert_eq!(t("workspace-escalation-deny").as_ref(), "Deny");
+        let readonly = t_str("workspace-mode-notice", &[("mode", "readonly")]);
+        assert!(readonly.contains("Read Only"), "got: {readonly}");
+        let workspace = t_str("workspace-mode-notice", &[("mode", "workspacewrite")]);
+        assert!(workspace.contains("Workspace Write"), "got: {workspace}");
+        let full = t_str("workspace-mode-notice", &[("mode", "fullaccess")]);
+        assert!(full.contains("Full Access"), "got: {full}");
         set_lang(Language::ZhCn);
-        assert_eq!(t("workspace-escalation-allow-once").as_ref(), "允许一次");
-        assert_eq!(t("workspace-escalation-always-allow").as_ref(), "始终允许");
-        assert_eq!(t("workspace-escalation-deny").as_ref(), "拒绝");
+        let readonly = t_str("workspace-mode-notice", &[("mode", "readonly")]);
+        assert!(readonly.contains("只读"), "got: {readonly}");
+        let workspace = t_str("workspace-mode-notice", &[("mode", "workspacewrite")]);
+        assert!(workspace.contains("工作区写入"), "got: {workspace}");
+        let full = t_str("workspace-mode-notice", &[("mode", "fullaccess")]);
+        assert!(full.contains("完全访问"), "got: {full}");
     }
 }

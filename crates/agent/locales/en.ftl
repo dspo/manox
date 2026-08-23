@@ -143,10 +143,12 @@ settings-row-work-mode-workday = For daily work
 settings-desc-work-mode-workday = Just as capable, with less technical detail
 
 settings-section-permissions = Permissions
-settings-row-permission-autopilot = AutoPilot
-settings-desc-permission-autopilot = manox can read and edit files in its workspace. A safety reviewer automatically approves additional access requests. It can make mistakes.
-settings-row-permission-danger = Danger
-settings-desc-permission-danger = When manox runs in Danger, it can edit any file on your computer and run internet commands without your approval. This significantly increases the risk of data loss, leaks, or unintended actions.
+settings-row-permission-readonly = Read Only
+settings-desc-permission-readonly = manox can read files in its workspace, but every mutating tool call is denied. Choose this for review and research sessions.
+settings-row-permission-workspaceread = Workspace Write
+settings-desc-permission-workspaceread = manox can write files inside its workspace and run sandboxed shell commands there. Writes outside the workspace are denied.
+settings-row-permission-fullaccess = Full Access
+settings-desc-permission-fullaccess = manox can edit any file on your computer and run commands outside the sandbox without restriction. This significantly increases the risk of data loss, leaks, or unintended actions.
 settings-link-learn-more = Learn more
 
 settings-section-general-misc = General
@@ -369,32 +371,27 @@ workspace-no-model = No model configured
 workspace-reasoning-effort = Reasoning effort
 workspace-reasoning-high = High
 workspace-reasoning-max = Max
-workspace-approval-title = Tool call approval
-workspace-escalation-allow-once = Allow once
-workspace-escalation-allow-once-desc = Run this call once.
-workspace-escalation-always-allow = Always allow
-workspace-escalation-always-allow-desc = Allow this tool for the rest of the session.
-workspace-escalation-deny = Deny
-workspace-escalation-deny-desc = Refuse; the reason is returned to the model.
-workspace-escalation-no-verdict-reason = The safety reviewer did not run for this call.
 workspace-clarify-title = Clarifying question
 workspace-ask-supplement-label = Supplemental note
 workspace-ask-supplement-placeholder = Add optional context
 workspace-ask-recommended = Recommended
 workspace-cancel = Cancel
-workspace-mode-autopilot-title = AutoPilot
-workspace-mode-autopilot-desc = A safety reviewer automatically approves safe tool calls; risky ones are denied
-workspace-mode-danger-title = Danger
-workspace-mode-danger-desc = Tool calls need no approval, bash runs outside the sandbox
-workspace-chip-mode-autopilot = AutoPilot
-workspace-chip-mode-danger = Danger
-workspace-mode-title = How should manox actions be approved?
+workspace-mode-readonly-title = Read Only
+workspace-mode-readonly-desc = Mutating tools are denied; reads stay open
+workspace-mode-workspacewrite-title = Workspace Write
+workspace-mode-workspacewrite-desc = Writes and sandboxed bash inside the workspace; out-of-workspace targets are denied
+workspace-mode-fullaccess-title = Full Access
+workspace-mode-fullaccess-desc = Everything is allowed; bash runs outside the sandbox
+workspace-chip-mode-readonly = Read Only
+workspace-chip-mode-workspacewrite = Workspace Write
+workspace-chip-mode-fullaccess = Full Access
+workspace-mode-title = What should manox be allowed to do?
 workspace-mode-learn-more = Learn more
 workspace-mode-notice = { $mode ->
-    [autopilot] AutoPilot mode: safe tool calls run without prompting, risky ones are denied.
-   *[danger] Danger: tool calls need no approval, bash runs outside the sandbox.
+    [readonly] Read Only: mutating tool calls are denied; reads stay open.
+    [workspacewrite] Workspace Write: in-workspace writes and sandboxed bash run; out-of-workspace targets are denied.
+   *[fullaccess] Full Access: everything runs ungated; bash runs outside the sandbox.
 }
-workspace-approval-autopilot-escalated = ✗ Escalated for your review: {$tool} — {$reason}
 workspace-project-choose = Choose project
 workspace-project-new = New project
 workspace-project-blank = Create blank project
@@ -426,9 +423,10 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
-slash-danger-desc = Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
+slash-mode-desc = Cycle the permission mode (Read Only → Workspace Write → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately
+slash-mode-unknown = Unknown permission mode "{ $mode }" — expected read-only, workspace-write, or full-access
 slash-exit-desc = Archive the current thread and start a fresh one
-slash-new-desc = Archive the current thread and start a fresh one that keeps the project, approval mode, and model
+slash-new-desc = Archive the current thread and start a fresh one that keeps the project, permission mode, and model
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
 ### main.rs (system menus)
 menu-settings = Settings…

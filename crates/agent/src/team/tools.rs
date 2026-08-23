@@ -3,11 +3,10 @@
 //! Operate on `Arc<Mutex<PlainTaskList>>` (bus-owned, tokio-safe) directly
 //! — no `BackendNotice` round-trip, no gpui `Entity`.
 
-use std::sync::{Arc, Mutex};
-
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

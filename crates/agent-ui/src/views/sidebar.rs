@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::i18n;
-use agent::thread::ApprovalMode;
+use agent::thread::PermissionMode;
 use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
@@ -1473,7 +1473,7 @@ impl SidebarThreadItem {
             nested: false,
             member_role: None,
             icon: RowIcon::External(summary.kind.icon_asset()),
-            // Same wash as AutoPilot threads: `theme.accent` resolves to
+            // Same wash as Workspace Write threads: `theme.accent` resolves to
             // `neutral-100` (near-white) in the forced Light theme, which made
             // the external row's hover/active/selected wash invisible on the
             // white sidebar. `theme.info` (cyan) is the visible default tint.
@@ -2013,9 +2013,10 @@ fn render_hover_action(
 }
 
 fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
-    match ApprovalMode::from_i64(mode) {
-        ApprovalMode::AutoPilot => theme.info,
-        ApprovalMode::Danger => theme.danger,
+    match PermissionMode::from_i64(mode) {
+        PermissionMode::ReadOnly => theme.warning,
+        PermissionMode::WorkspaceWrite => theme.info,
+        PermissionMode::FullAccess => theme.danger,
     }
 }
 
@@ -2064,7 +2065,7 @@ mod tests {
             title_override: None,
             model_id: "claude".into(),
             provider_id: None,
-            approval_mode: 0,
+            approval_mode: PermissionMode::default().as_i64(),
             project: String::new(),
             depth: 0,
             parent_id: None,
@@ -2179,7 +2180,10 @@ mod tests {
         );
         assert!(thread.selected);
         assert_eq!(thread.id, "thread-abcdef12");
-        assert_eq!(thread.wash, approval_mode_color(0, &theme));
+        assert_eq!(
+            thread.wash,
+            approval_mode_color(PermissionMode::default().as_i64(), &theme)
+        );
         assert!(thread.wash.a > 0.0);
         assert!(matches!(thread.kind, RowKind::Thread { archived: false }));
 
@@ -2190,7 +2194,7 @@ mod tests {
         // this row's `is_selected` check.
         assert_eq!(external.id, "external:claude:deadbeef");
         // Fully unified: the external row's wash is the same visible tint a
-        // default (AutoPilot) manox thread carries — never the near-white
+        // default (Workspace Write) manox thread carries — never the near-white
         // `theme.accent`, which disappears against the light sidebar.
         assert_eq!(external.wash, thread.wash);
         assert_eq!(external.wash, theme.info);

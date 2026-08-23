@@ -30,6 +30,7 @@ use gpui_component::{
 };
 
 use agent::i18n;
+use agent::thread::PermissionMode;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
 
@@ -482,32 +483,62 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                 )
                 .into_any_element()
         };
-        let desc_auto = build_desc(
-            i18n::t("settings-desc-permission-autopilot"),
+        let desc_readonly = build_desc(
+            i18n::t("settings-desc-permission-readonly"),
             learn_more.clone(),
         );
-        let desc_danger = build_desc(i18n::t("settings-desc-permission-danger"), learn_more);
+        let desc_workspace = build_desc(
+            i18n::t("settings-desc-permission-workspaceread"),
+            learn_more.clone(),
+        );
+        let desc_full = build_desc(i18n::t("settings-desc-permission-fullaccess"), learn_more);
+        // Radio semantics across three switches: enabling one row selects
+        // its mode; switching a row off keeps the current selection.
+        let mode = view.permission_mode;
         let children = vec![
             section_header("settings-section-permissions"),
             row_with_control(
-                i18n::t("settings-row-permission-autopilot"),
-                Some(desc_auto),
+                i18n::t("settings-row-permission-readonly"),
+                Some(desc_readonly),
                 mock_switch(
-                    "perm-autopilot",
-                    view.permission_autopilot,
+                    "perm-readonly",
+                    mode == PermissionMode::ReadOnly,
                     entity.clone(),
-                    Arc::new(|this, v| this.permission_autopilot = v),
+                    Arc::new(|this, on| {
+                        if on {
+                            this.permission_mode = PermissionMode::ReadOnly;
+                        }
+                    }),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(
-                i18n::t("settings-row-permission-danger"),
-                Some(desc_danger),
+                i18n::t("settings-row-permission-workspaceread"),
+                Some(desc_workspace),
                 mock_switch(
-                    "perm-danger",
-                    view.permission_danger,
+                    "perm-workspace-write",
+                    mode == PermissionMode::WorkspaceWrite,
+                    entity.clone(),
+                    Arc::new(|this, on| {
+                        if on {
+                            this.permission_mode = PermissionMode::WorkspaceWrite;
+                        }
+                    }),
+                ),
+            ),
+            hairline(theme.border.opacity(0.6)),
+            row_with_control(
+                i18n::t("settings-row-permission-fullaccess"),
+                Some(desc_full),
+                mock_switch(
+                    "perm-full-access",
+                    mode == PermissionMode::FullAccess,
                     entity,
-                    Arc::new(|this, v| this.permission_danger = v),
+                    Arc::new(|this, on| {
+                        if on {
+                            this.permission_mode = PermissionMode::FullAccess;
+                        }
+                    }),
                 ),
             ),
         ];

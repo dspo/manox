@@ -5,8 +5,6 @@
 //! `~/.manox/cx.providers.config.yaml`.
 
 pub mod agent_defs;
-pub mod approval;
-pub mod approval_review;
 pub mod background_task;
 #[cfg(feature = "chrome-use")]
 pub mod chrome_use;
@@ -66,9 +64,7 @@ use gpui::App;
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use message::{Message, MessageAuthor, MessageProvenance, MessageUiMetadata};
-pub use permission::{
-    PendingAuthMeta, PermissionCache, PermissionDecision, ToolAuthorizationResponse,
-};
+pub use permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{
     SideCallMetric, SubagentChildEvent, Thread, ThreadEvent, ThreadId, ToolCallStatus,

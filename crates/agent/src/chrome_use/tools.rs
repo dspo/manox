@@ -5,7 +5,7 @@
 //! with a fresh snapshot so the loop continues without an extra round trip;
 //! refs are valid only for the snapshot that issued them. Reads (`Snapshot`
 //! / `WaitFor` / `Screenshot`) are approval-free and `is_read_only`; writes
-//! declare `requires_approval` and ride the owning thread's `ApprovalMode`
+//! declare `requires_approval` and ride the owning thread's `PermissionMode`
 //! (the engine wraps them in `ApprovalGatedTool`), the same trust axes as
 //! the built-in browser tools. Chrome's network egress bypasses the bash
 //! sandbox proxy — treat it as an unsandboxed outbound surface.
@@ -261,7 +261,7 @@ impl AgentTool for ChromeUseOpenTool {
          and open a tab, optionally navigated to `url`. Session options only apply when the \
          session starts; an already-running session is reused. Returns `{\"tab_id\": N}` plus \
          a snapshot when a url was given. Chrome's network egress bypasses the bash sandbox. \
-         Requires approval (subject to the thread's approval mode)."
+         Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<OpenInput>()
@@ -308,8 +308,8 @@ impl AgentTool for ChromeUseNavigateTool {
         "ChromeUseNavigate"
     }
     fn description(&self) -> &str {
-        "Navigate a ChromeUse tab to a new `url` and return the fresh snapshot. Requires \
-         approval (subject to the thread's approval mode)."
+        "Navigate a ChromeUse tab to a new `url` and return the fresh snapshot. Gated by \
+         the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<NavigateInput>()
@@ -376,7 +376,7 @@ impl AgentTool for ChromeUseClickTool {
     }
     fn description(&self) -> &str {
         "Click the element `[ref]` from the tab's latest snapshot and return the fresh \
-         snapshot. Requires approval (subject to the thread's approval mode)."
+         snapshot. Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<RefInput>()
@@ -463,8 +463,8 @@ impl AgentTool for ChromeUseTypeTool {
     }
     fn description(&self) -> &str {
         "Set the element `[ref]`'s value to `text` (replacing existing content); set \
-         `submit` to press Enter afterwards. Returns the fresh snapshot. Requires approval \
-         (subject to the thread's approval mode)."
+         `submit` to press Enter afterwards. Returns the fresh snapshot. Gated by the \
+         thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TypeInput>()
@@ -526,8 +526,8 @@ impl AgentTool for ChromeUsePressKeyTool {
     }
     fn description(&self) -> &str {
         "Press a native key (`Enter`, `Tab`, `ArrowDown`, `Control+A`, …) on the focused \
-         element, optionally focusing `[ref]` first. Returns the fresh snapshot. Requires \
-         approval (subject to the thread's approval mode)."
+         element, optionally focusing `[ref]` first. Returns the fresh snapshot. Gated by \
+         the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<PressKeyInput>()
@@ -580,8 +580,8 @@ impl AgentTool for ChromeUseSelectOptionTool {
     }
     fn description(&self) -> &str {
         "Select option `values` in the `<select>` element `[ref]`; exact option values or \
-         visible labels both match. Returns the fresh snapshot. Requires approval (subject to \
-         the thread's approval mode)."
+         visible labels both match. Returns the fresh snapshot. Gated by the thread's \
+         permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<SelectOptionInput>()
@@ -630,8 +630,8 @@ impl AgentTool for ChromeUseScrollTool {
     }
     fn description(&self) -> &str {
         "Scroll the tab's page `direction` by `pixels` (default 600), or reveal the element \
-         `[ref]` when given. Returns the fresh snapshot. Requires approval (subject to the \
-         thread's approval mode)."
+         `[ref]` when given. Returns the fresh snapshot. Gated by the thread's \
+         permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<ScrollInput>()
@@ -818,8 +818,8 @@ impl AgentTool for ChromeUseTabsTool {
     fn description(&self) -> &str {
         "Manage the Chrome session's tabs: `list` (also adopts tabs opened outside \
          ChromeUse), `new` (optionally navigated via `url`), `select` (report a tab — \
-         ChromeUse tools address tabs by explicit tab_id), or `close`. All actions require \
-         approval (subject to the thread's approval mode)."
+         ChromeUse tools address tabs by explicit tab_id), or `close`. All actions are \
+         gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<TabsInput>()
@@ -894,8 +894,7 @@ impl AgentTool for ChromeUseEvaluateTool {
     fn description(&self) -> &str {
         "Evaluate JavaScript in the tab's page with Playwright semantics: a function literal \
          like `() => document.title` is invoked; any other expression returns its completion \
-         value. Returns the JSON-encoded result. Requires approval (subject to the thread's \
-         approval mode)."
+         value. Returns the JSON-encoded result. Gated by the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<EvaluateInput>()
@@ -926,8 +925,8 @@ impl AgentTool for ChromeUseCloseTool {
     }
     fn description(&self) -> &str {
         "Close one tab (`tab_id`) or the whole Chrome session when `tab_id` is omitted — a \
-         launched Chrome process is terminated, an attached one is left running. Requires \
-         approval (subject to the thread's approval mode)."
+         launched Chrome process is terminated, an attached one is left running. Gated by \
+         the thread's permission mode."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<CloseInput>()
