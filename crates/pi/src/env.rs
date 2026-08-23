@@ -271,7 +271,10 @@ impl ExecutionEnv for TokioExecutionEnv {
             return Err(ExecutionError::Aborted);
         }
         // Own process group: the whole tree the command spawns dies together
-        // on timeout or cancellation.
+        // on timeout or cancellation. `kill_on_drop` alone would not do: it
+        // reaches only the direct child, while the tree kill must cover
+        // grandchildren too — the armed guard below performs the group kill
+        // even when this future is dropped from outside at an await point.
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -281,6 +284,7 @@ impl ExecutionEnv for TokioExecutionEnv {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| ExecutionError::Spawn(format!("{e}")))?;
+        let mut kill_guard = TreeKillGuard::arm(child.id());
 
         let mut stdout = child.stdout.take().expect("stdout piped");
         let mut stderr = child.stderr.take().expect("stderr piped");
@@ -301,6 +305,8 @@ impl ExecutionEnv for TokioExecutionEnv {
             status = child.wait() => status.map_err(|e| ExecutionError::Spawn(format!("{e}")))?,
             () = tokio::time::sleep(timeout_dur) => {
                 kill_process_tree(&mut child).await;
+                // The explicit tree kill already did the guard's job.
+                kill_guard.defuse();
                 let _ = child.wait().await;
                 let _ = out_task.await;
                 let _ = err_task.await;
@@ -308,12 +314,16 @@ impl ExecutionEnv for TokioExecutionEnv {
             }
             () = signal.cancelled() => {
                 kill_process_tree(&mut child).await;
+                kill_guard.defuse();
                 let _ = child.wait().await;
                 let _ = out_task.await;
                 let _ = err_task.await;
                 return Err(ExecutionError::Aborted);
             }
         };
+        // The command exited on its own; deliberately backgrounded
+        // descendants keep their usual shell survival semantics.
+        kill_guard.defuse();
 
         let stdout = out_task
             .await
@@ -326,6 +336,40 @@ impl ExecutionEnv for TokioExecutionEnv {
             stderr: String::from_utf8_lossy(&stderr).to_string(),
             exit_code: status.code().unwrap_or(-1),
         })
+    }
+}
+
+/// SIGKILL the child's whole process group when dropped while armed.
+///
+/// The kernel's cancel race drops a cancelled tool's execution future from
+/// outside, at any await point — code after the await never runs, so the
+/// tree kill must live in a Drop guard. `process_group(0)` makes the child
+/// its group leader, so `kill(-pgid)` reaches the whole tree.
+struct TreeKillGuard {
+    pgid: Option<i32>,
+}
+
+impl TreeKillGuard {
+    fn arm(pid: Option<u32>) -> Self {
+        TreeKillGuard {
+            pgid: pid.map(|p| p as i32),
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for TreeKillGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            // Best-effort: the group may already be gone by the time the
+            // guard drops.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -409,6 +453,40 @@ mod tests {
         assert!(
             !marker.exists(),
             "the detached grandchild dies with the process group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External-drop variant of the tree kill: the kernel's enforcement race
+    /// abandons a cancelled tool by dropping its future, so the exec future
+    /// can be dropped from outside at any await point — before its internal
+    /// signal arm ever runs. The drop guard must still reap the whole tree.
+    #[tokio::test]
+    async fn exec_future_drop_at_cancel_kills_the_whole_process_tree() {
+        let env = test_env();
+        let token = CancellationToken::new();
+        let signal = token.clone();
+        // The grandchild writes a marker after the shell and its direct
+        // child should have been killed; a tree kill prevents the write.
+        let dir = std::env::temp_dir().join(format!("pi-exec-drop-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-survived");
+        let cmd = format!("sh -c 'sleep 2; touch {}' & sleep 30", marker.display());
+        let exec =
+            tokio::spawn(async move { env.exec(&cmd, Duration::from_secs(60), signal).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Cancel and drop the future in the same instant: the task abort
+        // drops the exec future from outside, exactly like the enforcement
+        // race dropping a cancelled tool's execution.
+        token.cancel();
+        exec.abort();
+        let _ = exec.await;
+        // Wait past the grandchild's scheduled write; the tree kill must have
+        // taken it down with the rest.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the detached grandchild dies even when the exec future is dropped from outside"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

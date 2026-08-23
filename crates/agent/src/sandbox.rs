@@ -615,7 +615,8 @@ impl BashOperations for SandboxedBashOperations {
 /// Drain a spawned child to completion with streaming output, wall-clock
 /// timeout, and cancellation. Shared by the sandboxed and unsandboxed
 /// backends: both build a `tokio::process::Command`, spawn, then converge
-/// on the same semantics (drop kills the tree via `kill_on_drop`).
+/// on the same semantics (drop kills the direct child via `kill_on_drop`,
+/// even when the enclosing exec future is dropped from outside).
 async fn run_to_completion(
     child: tokio::process::Child,
     on_data: Option<pi::tools::bash::BashDataCallback<'_>>,
@@ -664,7 +665,10 @@ async fn run_to_completion(
     let (out_buf, err_buf, status) = tokio::select! {
         r = drain => r,
         _ = signal.cancelled() => {
-            // Dropping the child (kill_on_drop) kills the process tree.
+            // Dropping the child (kill_on_drop) kills the direct child. A
+            // compound command's grandchildren can outlive it; `bash -c`
+            // execs the single-command common case, so the direct child IS
+            // the command there.
             return Err(ExecutionError::Aborted);
         }
         _ = tokio::time::sleep(timeout) => {
