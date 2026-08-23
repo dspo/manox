@@ -305,6 +305,8 @@ impl ExecutionEnv for TokioExecutionEnv {
             status = child.wait() => status.map_err(|e| ExecutionError::Spawn(format!("{e}")))?,
             () = tokio::time::sleep(timeout_dur) => {
                 kill_process_tree(&mut child).await;
+                // The explicit tree kill already did the guard's job.
+                kill_guard.defuse();
                 let _ = child.wait().await;
                 let _ = out_task.await;
                 let _ = err_task.await;
@@ -312,6 +314,7 @@ impl ExecutionEnv for TokioExecutionEnv {
             }
             () = signal.cancelled() => {
                 kill_process_tree(&mut child).await;
+                kill_guard.defuse();
                 let _ = child.wait().await;
                 let _ = out_task.await;
                 let _ = err_task.await;
