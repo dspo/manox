@@ -85,6 +85,12 @@ pub trait ThreadEngine: Send + Sync {
     /// Abort the running turn.
     fn abort(&self);
 
+    /// Fan an explicit user cancel out to every TeamMember thread this
+    /// engine's agent bus spawned: each member aborts its active turn (the
+    /// member survives) and its own facade cancel recurses into its
+    /// derivatives. Fire-and-forget; engines without a member bus no-op.
+    fn abort_spawned_members(&self) {}
+
     /// Hot-swap the model for the next provider request.
     fn set_model(&self, model: PiModel);
 
@@ -226,10 +232,11 @@ pub enum BackendNotice {
     /// A Steer bus request (tokio→gpui round-trip): the `AgentBus` sends a
     /// `BusOp` the facade executes on the gpui main thread (spawn member
     /// thread, inject peer message, abort member) and replies via the
-    /// responder. Generalizes the retired `TeamRequest` architecture.
+    /// responder when one is attached; fire-and-forget ops (cancel fan-out)
+    /// send `None`. Generalizes the retired `TeamRequest` architecture.
     BusRequest {
         op: pi_extensions::steer_bus::BusOp,
-        responder: async_channel::Sender<Result<String, String>>,
+        responder: Option<async_channel::Sender<Result<String, String>>>,
     },
     /// A browser tool's host round trip: the tool (tokio) sends the op with
     /// a responder; the facade (gpui, owns the `BrowserHost`) executes it on

@@ -1152,6 +1152,26 @@ pub async fn cancel_all_for_thread(thread_id: &str) {
     .await;
 }
 
+/// Stop every non-terminal task owned by a thread with TaskStop semantics
+/// (terminal status `Stopped`). This is the explicit user-cancel counterpart
+/// of `cancel_all_for_thread` (thread-teardown: `SessionEnded`); a natural
+/// turn settle never calls it — background tasks survive across turns.
+pub async fn stop_all_for_thread(thread_id: &str) {
+    let ids: Vec<String> = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.tasks
+            .iter()
+            .filter(|(_, task)| task.owner_thread_id() == thread_id && !task.status().is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    futures::future::join_all(
+        ids.iter()
+            .map(|id| stop_with_status(id, TaskStatus::Stopped)),
+    )
+    .await;
+}
+
 /// Whether a thread has any running (non-terminal) tasks.
 pub fn thread_has_running_tasks(thread_id: &str) -> bool {
     let reg = registry().lock().expect("registry poisoned");
@@ -1673,5 +1693,55 @@ mod tests {
         );
         cancel_all_for_thread("t-x1").await; // already terminal — no-op
         assert!(!other.is_cancelled(), "other thread's task untouched");
+    }
+
+    /// `stop_all_for_thread` is the explicit user-cancel fan-out: owned
+    /// tasks settle as `Stopped` (TaskStop semantics) with their token
+    /// cancelled and card updates published, while another thread's tasks
+    /// stay untouched.
+    #[tokio::test]
+    async fn stop_all_for_thread_stops_owned_tasks() {
+        use tokio_util::sync::CancellationToken;
+        let thread_id = "t-stop-1";
+        let cancel = CancellationToken::new();
+        let (id, task) = register(
+            TaskKind::Subagent,
+            thread_id.into(),
+            "test".into(),
+            cancel.clone(),
+        );
+        assert!(!cancel.is_cancelled(), "pre: token not yet cancelled");
+        stop_all_for_thread(thread_id).await;
+        assert!(cancel.is_cancelled(), "owned task's token was cancelled");
+        assert_eq!(task.status(), TaskStatus::Stopped);
+        // The stop publishes card updates like the other cancel paths.
+        let events = drain_thread_events(thread_id);
+        assert!(events.iter().any(|e| {
+            e.task_id == id
+                && matches!(
+                    e.event,
+                    TaskEventKind::Terminal {
+                        status: TaskStatus::Stopped,
+                        ..
+                    }
+                )
+        }));
+
+        // A different thread's task is not affected.
+        let other = CancellationToken::new();
+        let (id2, task2) = register(
+            TaskKind::Subagent,
+            "t-stop-other".into(),
+            "other".into(),
+            other.clone(),
+        );
+        stop_all_for_thread(thread_id).await; // already terminal — no-op
+        assert!(!other.is_cancelled(), "other thread's task untouched");
+        assert_eq!(task2.status(), TaskStatus::Running);
+
+        remove(&id);
+        remove(&id2);
+        remove_thread_mailbox(thread_id);
+        remove_thread_mailbox("t-stop-other");
     }
 }
