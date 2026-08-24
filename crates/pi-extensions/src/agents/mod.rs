@@ -90,6 +90,10 @@ pub struct SubagentTool {
     /// the static default — so the model sees the available
     /// `subagent_type` values without probing the filesystem.
     description_override: Option<String>,
+    /// Persistent directory for subagent session transcripts. When set,
+    /// subagent sessions persist there and survive their run (usage
+    /// accounting); unset keeps the throwaway tempdir lifecycle.
+    session_dir: Option<PathBuf>,
 }
 
 impl SubagentTool {
@@ -102,6 +106,7 @@ impl SubagentTool {
             model_slot: None,
             provider_registry: None,
             description_override: None,
+            session_dir: None,
         }
     }
 
@@ -147,6 +152,13 @@ impl SubagentTool {
         self.description_override = Some(description);
         self
     }
+
+    /// Persistent directory for subagent session transcripts. Without one the
+    /// session lives in a throwaway tempdir removed on exit (examples/tests).
+    pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.session_dir = Some(dir.into());
+        self
+    }
 }
 
 impl SubagentTool {
@@ -161,7 +173,8 @@ impl SubagentTool {
         isolation: Option<&str>,
         ctx: &dyn ToolContext,
         extra_tools: Vec<Arc<dyn AgentTool>>,
-    ) -> Result<(AgentSession, tempfile::TempDir, Option<Worktree>), ToolError> {
+        parent_session: Option<&str>,
+    ) -> Result<(AgentSession, Option<tempfile::TempDir>, Option<Worktree>), ToolError> {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
@@ -178,16 +191,30 @@ impl SubagentTool {
             .as_ref()
             .map(|w| w.path.as_path())
             .unwrap_or(ctx.cwd());
-        let session_dir =
-            tempfile::tempdir().map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+        let (session_dir, temp_guard): (PathBuf, Option<tempfile::TempDir>) =
+            match &self.session_dir {
+                Some(dir) => (dir.clone(), None),
+                None => {
+                    let guard = tempfile::tempdir()
+                        .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+                    (guard.path().to_path_buf(), Some(guard))
+                }
+            };
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.to_path_buf())
-            .with_session_dir(session_dir.path())
+            .with_session_dir(session_dir)
             .with_system_prompt(def.system_prompt.clone())
             .with_tools(selected);
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
         }
+        // Subagent transcripts carry their dispatch lineage in the session
+        // header; `parent` stays absent when the caller has no session id.
+        let mut subagent_meta = serde_json::json!({ "type": subagent_type });
+        if let Some(parent) = parent_session {
+            subagent_meta["parent"] = serde_json::json!(parent);
+        }
+        builder = builder.with_metadata(serde_json::json!({ "subagent": subagent_meta }));
         let inherited = self
             .model_slot
             .as_ref()
@@ -199,7 +226,7 @@ impl SubagentTool {
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
-        Ok((session, session_dir, worktree))
+        Ok((session, temp_guard, worktree))
     }
 }
 

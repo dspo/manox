@@ -351,12 +351,13 @@ impl AgentBus {
         tracing::info!(
             "steer dispatch: spawning subagent session (addr={addr}, type={spawn_type})"
         );
-        let (mut session, session_dir, worktree) = subagent_tool
+        let (mut session, session_guard, worktree) = subagent_tool
             .spawn_subagent_session(
                 &spawn_type,
                 isolation.as_deref(),
                 &*tool_ctx,
                 vec![child_steer],
+                Some(self.owner_thread_id.as_str()),
             )
             .await?;
         let handle = session.handle();
@@ -412,12 +413,13 @@ impl AgentBus {
         );
         let tool_ctx2 = tool_ctx.clone();
 
-        // session_dir (TempDir) must outlive the spawned task — the session
-        // JSONL file lives inside it; dropping it mid-run deletes the dir.
+        // The tempdir guard (present only when no host session dir is
+        // injected) must outlive the spawned task: the session JSONL lives
+        // inside it, and dropping it mid-run deletes the transcript.
         let run_cancel = task_cancel.clone();
         let run_handle = handle.clone();
         crate::runtime::handle().spawn(async move {
-            let _session_dir = session_dir; // hold TempDir alive for session lifetime
+            let _session_guard = session_guard; // hold the tempdir alive for the session lifetime
             // Bridge the child session's streamed events to the workspace so
             // the sub-agent panel + rail show live dynamics (the retired
             // JSON bridge's successor). The subscription must outlive the loop.

@@ -559,6 +559,11 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
         if !crate::host::belongs_to_current_host(info.metadata.as_ref()) {
             continue;
         }
+        // Subagent transcripts persist for usage accounting but never
+        // surface as threads.
+        if info.metadata.as_ref().is_some_and(|m| m.get("subagent").is_some()) {
+            continue;
+        }
         let meta = match pi_extensions::session_meta::load(dir, &info.path).await {
             Ok(meta) => meta,
             Err(error) => {
