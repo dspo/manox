@@ -1609,6 +1609,10 @@ impl ConversationState {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::Unchanged
             }
+            ThreadEvent::BrowserSuitesChanged { .. } => {
+                // Composer chips handled by `Workspace`; not a conversation item.
+                ApplyOutcome::Unchanged
+            }
             ThreadEvent::PrefixStability { .. } => {
                 // Cache discipline signal: no conversation item, the drift
                 // flags are only consumed by debug telemetry views (if at all).

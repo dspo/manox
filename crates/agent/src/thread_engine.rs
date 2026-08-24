@@ -168,38 +168,47 @@ pub trait ThreadEngine: Send + Sync {
     }
 }
 
+/// Restore-time state the actor projects onto the facade at `Ready`; boxed
+/// in [`BackendNotice::Ready`] so the notice enum stays pointer-sized (same
+/// idiom as `Event`).
+pub struct ReadyInfo {
+    pub restored: bool,
+    /// The model the actor resolved for this thread (registration may
+    /// have landed after construction); the facade mirrors it so the
+    /// selector shows the default instead of "no model".
+    pub model: Option<pi::types::Model>,
+    /// The permission mode persisted in the session sidecar (fresh
+    /// sessions take the bounded default); the facade mirrors it for the
+    /// access chip.
+    pub permission_mode: crate::thread::PermissionMode,
+    /// The reasoning effort restored from the session sidecar (fresh
+    /// sessions default to High); the facade mirrors it so the model
+    /// dropdown shows the restored selection.
+    pub reasoning_effort: crate::language_model::ReasoningEffort,
+    /// Opt-in browser tool suites active in the session (projected from
+    /// the authoritative active-tool set); the facade mirrors it so the
+    /// composer chips derive from the thread's state.
+    pub browser_suites: Vec<crate::pi_engine::BrowserSuite>,
+    /// Plan mode restored from the session sidecar (fresh sessions
+    /// default to off); the facade re-syncs rendered instructions.
+    pub plan_mode: bool,
+    /// Last plan file recorded in the sidecar, if any.
+    pub plan_file: Option<String>,
+    /// A plan review card was pending when the session last settled;
+    /// the facade re-emits `PlanReady` so the card re-surfaces.
+    pub plan_review_pending: bool,
+    /// Last `UpdatePlan` snapshot persisted in the sidecar; the facade
+    /// mirrors it as the rebuild fallback after compaction summarized
+    /// the transcript's plan tool calls away.
+    pub plan_snapshot: Option<serde_json::Value>,
+}
+
 /// Notices the backend sends back to the facade's gpui drainer.
 pub enum BackendNotice {
     /// A run event already adapted into a `ThreadEvent`.
     Event(Box<crate::thread::ThreadEvent>),
     /// The session finished building/restoring.
-    Ready {
-        restored: bool,
-        /// The model the actor resolved for this thread (registration may
-        /// have landed after construction); the facade mirrors it so the
-        /// selector shows the default instead of "no model".
-        model: Option<pi::types::Model>,
-        /// The permission mode persisted in the session sidecar (fresh
-        /// sessions take the bounded default); the facade mirrors it for the
-        /// access chip.
-        permission_mode: crate::thread::PermissionMode,
-        /// The reasoning effort restored from the session sidecar (fresh
-        /// sessions default to High); the facade mirrors it so the model
-        /// dropdown shows the restored selection.
-        reasoning_effort: crate::language_model::ReasoningEffort,
-        /// Plan mode restored from the session sidecar (fresh sessions
-        /// default to off); the facade re-syncs rendered instructions.
-        plan_mode: bool,
-        /// Last plan file recorded in the sidecar, if any.
-        plan_file: Option<String>,
-        /// A plan review card was pending when the session last settled;
-        /// the facade re-emits `PlanReady` so the card re-surfaces.
-        plan_review_pending: bool,
-        /// Last `UpdatePlan` snapshot persisted in the sidecar; the facade
-        /// mirrors it as the rebuild fallback after compaction summarized
-        /// the transcript's plan tool calls away.
-        plan_snapshot: Option<serde_json::Value>,
-    },
+    Ready(Box<ReadyInfo>),
     /// The turn loop unwound and released the running slot.
     Settled {
         cancelled: bool,

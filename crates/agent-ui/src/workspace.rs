@@ -1088,6 +1088,12 @@ impl Workspace {
                     // Refresh the access chip; no conversation item.
                     cx.notify();
                 }
+                ThreadEvent::BrowserSuitesChanged { suites } => {
+                    // The composer chips are derived state of the thread's
+                    // suite mirror (survives thread switches and restores).
+                    this.active_browser_suites = suites.clone();
+                    cx.notify();
+                }
                 // The pi actor restores session history asynchronously; the
                 // attach-time conversation rebuild saw an empty transcript,
                 // so rebuild once the authoritative history lands (sidebar
@@ -3440,6 +3446,9 @@ impl Workspace {
         // turn actually finishes, capturing the final assistant messages.
 
         self.thread = new_thread;
+        // The chips derive from the bound thread's authoritative mirror; the
+        // previous thread's suites never bleed across the switch.
+        self.active_browser_suites = self.thread.read(cx).browser_suites().to_vec();
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
@@ -7004,38 +7013,29 @@ impl Workspace {
         self.plus_menu_sub = Some(sub);
     }
 
-    /// Activate a browser tool suite: record the chip and tell the engine to
-    /// widen the thread's active tool set. Idempotent — activating an
-    /// already-present suite is a no-op. The engine merges the suite names
-    /// atomically against the session's authoritative active-tool set.
+    /// Activate a browser tool suite on the bound thread. The chip is
+    /// derived state: it rides the `BrowserSuitesChanged` echo of the
+    /// facade mirror, so a landing thread's pre-engine toggle survives until
+    /// the engine materializes. The engine merges the suite names atomically
+    /// against the session's authoritative active-tool set.
     fn activate_browser_tool_suite(
         &mut self,
         suite: agent::pi_engine::BrowserSuite,
         cx: &mut Context<Self>,
     ) {
-        if self.active_browser_suites.contains(&suite) {
-            return;
-        }
-        self.active_browser_suites.push(suite);
         self.thread
             .update(cx, |t, cx| t.set_browser_suite(suite, true, cx));
-        cx.notify();
     }
 
-    /// Deactivate a browser tool suite: drop the chip and tell the engine to
-    /// narrow the thread's active tool set.
+    /// Deactivate a browser tool suite on the bound thread; the chip follows
+    /// the mirror echo (see `activate_browser_tool_suite`).
     fn deactivate_browser_tool_suite(
         &mut self,
         suite: agent::pi_engine::BrowserSuite,
         cx: &mut Context<Self>,
     ) {
-        let before = self.active_browser_suites.len();
-        self.active_browser_suites.retain(|s| *s != suite);
-        if self.active_browser_suites.len() != before {
-            self.thread
-                .update(cx, |t, cx| t.set_browser_suite(suite, false, cx));
-        }
-        cx.notify();
+        self.thread
+            .update(cx, |t, cx| t.set_browser_suite(suite, false, cx));
     }
 
     /// Open the native file picker and add chosen paths as pending
