@@ -2363,6 +2363,7 @@ mod tests {
                 ("mimo", "Mimo"),
                 ("pi", "Pi"),
                 ("manox", "Manox"),
+                ("dsh", "DeepSeek Harness"),
             ]
         );
     }

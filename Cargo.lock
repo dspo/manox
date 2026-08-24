@@ -2147,6 +2147,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "url",
  "which 7.0.3",
+ "zstd",
 ]
 
 [[package]]

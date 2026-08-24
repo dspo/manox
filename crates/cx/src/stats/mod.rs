@@ -126,6 +126,7 @@ pub(crate) const AGENT_OMP: &str = "omp";
 pub(crate) const AGENT_MIMO: &str = "mimo";
 pub(crate) const AGENT_PI: &str = "pi";
 pub(crate) const AGENT_MANOX: &str = "manox";
+pub(crate) const AGENT_DSH: &str = "dsh";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -136,6 +137,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_MIMO, "Mimo"),
     (AGENT_PI, "Pi"),
     (AGENT_MANOX, "Manox"),
+    (AGENT_DSH, "DeepSeek Harness"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -173,7 +175,7 @@ fn log_sources() -> Vec<LogSource> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .filter(|p| p.is_file());
-    vec![
+    let mut sources = vec![
         LogSource {
             root: home.join(".claude/projects"),
             extra_file: None,
@@ -220,7 +222,29 @@ fn log_sources() -> Vec<LogSource> {
             extra_file: None,
             kind: SourceKind::PiSession(AGENT_MANOX),
         },
-    ]
+    ];
+    // deepseek-harness home resolves through $DSH_HOME, else ~/.dsh; a
+    // deployment without either has no source to scan.
+    if let Some(root) = dsh_sessions_root() {
+        sources.push(LogSource {
+            root,
+            extra_file: None,
+            kind: SourceKind::DshSession,
+        });
+    }
+    sources
+}
+
+/// deepseek-harness session root: `$DSH_HOME/sessions` when set, otherwise
+/// `~/.dsh/sessions`.
+fn dsh_sessions_root() -> Option<PathBuf> {
+    let home = std::env::var("DSH_HOME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".dsh")))?;
+    Some(home.join("sessions"))
 }
 
 /// 递归收集 `*.jsonl` 文件。
@@ -246,6 +270,35 @@ fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             out.push(path);
+        }
+    }
+    out
+}
+
+/// 递归收集 deepseek-harness 的 session transcript：每个会话目录内固定名字的
+/// `session.jsonl.zstd`（默认压缩）或 `session.jsonl`（compression: none）。
+fn collect_dsh_session_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if meta.is_file() && (name == "session.jsonl.zstd" || name == "session.jsonl") {
+                out.push(path);
+            }
         }
     }
     out
@@ -466,6 +519,9 @@ pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
                 } else {
                     Vec::new()
                 }
+            }
+            SourceKind::DshSession if source.root.exists() => {
+                collect_dsh_session_files(&source.root)
             }
             _ if source.root.exists() => collect_jsonl_files(&source.root),
             _ => Vec::new(),
@@ -935,5 +991,40 @@ mod tests {
         assert_eq!(StatsPeriod::parse("7days"), None);
         assert_eq!(StatsPeriod::parse("today"), None);
         assert_eq!(StatsPeriod::parse("all"), None);
+    }
+
+    /// The dsh collector picks exactly the fixed transcript names out of the
+    /// nested project/session layout and ignores everything else.
+    #[test]
+    fn collect_dsh_session_files_matches_fixed_transcript_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let names = [
+            "--p--/session-a/session.jsonl.zstd",
+            "--p--/session-b/session.jsonl",
+            "--p--/session-c/other.jsonl",
+            "--p--/session-d/session.jsonl.zstd.tmp",
+            "session.jsonl",
+        ];
+        for name in names {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+        }
+        std::fs::create_dir_all(root.join("--p--/empty-session")).unwrap();
+
+        let mut found: Vec<String> = collect_dsh_session_files(root)
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "--p--/session-a/session.jsonl.zstd",
+                "--p--/session-b/session.jsonl",
+                "session.jsonl",
+            ]
+        );
     }
 }

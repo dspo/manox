@@ -8,6 +8,7 @@
 pub(super) mod claude;
 pub(super) mod codex;
 pub(super) mod copilot;
+pub(super) mod dsh;
 pub(super) mod manox;
 pub(super) mod mimo;
 pub(super) mod omp_session;
@@ -32,7 +33,7 @@ pub(super) struct RawEntry {
     pub(super) output_tokens: u64,
     pub(super) cache_read_input_tokens: u64,
     pub(super) cache_creation_input_tokens: u64,
-    /// reasoning_output_tokens 已包含在 `output_tokens` 中（codex/copilot），
+    /// reasoning_output_tokens 已包含在 `output_tokens` 中（codex/copilot/dsh），
     /// 这里冗余保存只供未来展示，不参与汇总。
     #[serde(default)]
     pub(super) reasoning_output_tokens: u64,
@@ -77,6 +78,9 @@ pub(super) enum SourceKind {
     /// pi 原生 session（~/.pi/agent/sessions/）标记为 `pi`；
     /// manox pi 化后的 session（~/.manox/pi-sessions/）标记为 `manox`。
     PiSession(&'static str),
+    /// deepseek-harness session jsonl（$DSH_HOME/sessions，默认 ~/.dsh），
+    /// 默认 zstd 压缩（session.jsonl.zstd，多 frame 拼接）。
+    DshSession,
 }
 
 pub(super) struct ParseResult {
@@ -108,6 +112,12 @@ pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Result<ParseResult> {
                 consumed_bytes: 0,
             })
             .with_context(|| format!("Manox 解析失败 ({})", path.display())),
+        SourceKind::DshSession => dsh::parse(path)
+            .map(|entries| ParseResult {
+                entries,
+                consumed_bytes: 0,
+            })
+            .with_context(|| format!("DSH 解析失败 ({})", path.display())),
         _ => {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("读取日志失败 ({})", path.display()))?;
@@ -122,7 +132,9 @@ pub(super) fn parse_file_from_offset(
     offset: u64,
 ) -> Result<ParseResult> {
     match kind {
-        SourceKind::MimoSession | SourceKind::ManoxSession => parse_file(path, kind),
+        SourceKind::MimoSession | SourceKind::ManoxSession | SourceKind::DshSession => {
+            parse_file(path, kind)
+        }
         _ => {
             let mut file =
                 File::open(path).with_context(|| format!("打开日志失败 ({})", path.display()))?;
@@ -154,7 +166,9 @@ fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawE
         SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
         SourceKind::OmpSession => omp_session::parse(content),
         SourceKind::PiSession(agent) => pi::parse_with_agent(content, agent),
-        SourceKind::MimoSession | SourceKind::ManoxSession => unreachable!(),
+        SourceKind::MimoSession | SourceKind::ManoxSession | SourceKind::DshSession => {
+            unreachable!()
+        }
     }
 }
 
