@@ -50,7 +50,7 @@ fn text_of(result: &AgentToolResult) -> &str {
     text
 }
 
-/// The 4-hex tag from a `[path#TAG]` header line.
+/// The 6-hex tag from a `[path#TAG]` header line.
 fn tag_of(output: &str) -> &str {
     let first = output.lines().next().expect("non-empty output");
     let start = first.rfind('#').expect("header has `#`") + 1;

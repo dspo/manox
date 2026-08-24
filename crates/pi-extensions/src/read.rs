@@ -51,7 +51,7 @@ impl AgentTool for SelectorReadTool {
 
     fn description(&self) -> &str {
         "Read a file with optional line-range paging or a path selector. Output \
-         format: first line `[<path>#<TAG>]` (4-hex snapshot tag for follow-up \
+         format: first line `[<path>#<TAG>]` (6-hex snapshot tag for follow-up \
          edits), followed by `N:TEXT` numbered rows (1-indexed). Without \
          offset/limit the first 2000 lines are returned; use offset/limit to \
          page through longer files. The path may carry a selector after the \
@@ -115,12 +115,32 @@ impl AgentTool for SelectorReadTool {
         let path_display = path.display().to_string();
 
         // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = ctx
-            .tool_state()
-            .snapshots
-            .lock()
-            .expect("hashline snapshot store poisoned")
-            .record(&path, &text);
+        let snap = {
+            let mut store = ctx.tool_state().snapshots.lock().expect("hashline snapshot store poisoned");
+            let snap = store.record(&path, &text);
+            // Record which lines were displayed.
+            let displayed: std::collections::HashSet<usize> = match &selector {
+                Selector::Lines(ranges) => {
+                    let total = text.lines().count();
+                    ranges.iter().flat_map(|r| {
+                        let start = r.start;
+                        let end = r.end.unwrap_or(total).min(total);
+                        start..=end
+                    }).collect()
+                }
+                Selector::Raw => (1..=text.lines().count()).collect(),
+                Selector::RawLines(ranges) => {
+                    let total = text.lines().count();
+                    ranges.iter().flat_map(|r| {
+                        let start = r.start;
+                        let end = r.end.unwrap_or(total).min(total);
+                        start..=end
+                    }).collect()
+                }
+            };
+            store.record_seen_lines(&path, &snap.tag, &displayed);
+            snap
+        };
 
         let raw_selector = matches!(selector, Selector::Raw | Selector::RawLines(_));
         let formatted = match selector {
@@ -130,7 +150,6 @@ impl AgentTool for SelectorReadTool {
             Selector::Raw => hashline::format_raw(&text, None),
             Selector::RawLines(ranges) => hashline::format_raw(&text, Some(&ranges)),
         };
-
         let config = TruncateConfig {
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_lines: Self::DEFAULT_MAX_LINES,

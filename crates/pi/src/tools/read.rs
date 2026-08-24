@@ -28,14 +28,12 @@ impl AgentTool for ReadTool {
     fn name(&self) -> &str {
         "Read"
     }
-
     fn description(&self) -> &str {
         "Read a file with optional line-range paging. Output format: first line \
-         `[<path>#<TAG>]` (4-hex snapshot tag for follow-up edits), followed by \
+         `[<path>#<TAG>]` (6-hex snapshot tag for follow-up edits), followed by \
          `N:TEXT` numbered rows (1-indexed). Without offset/limit the first \
          2000 lines are returned; use offset/limit to page through longer files."
     }
-
     fn is_read_only(&self) -> bool {
         true
     }
@@ -85,12 +83,28 @@ impl AgentTool for ReadTool {
         let path_display = path.display().to_string();
 
         // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = ctx
-            .tool_state()
-            .snapshots
-            .lock()
-            .expect("hashline snapshot store poisoned")
-            .record(&path, &text);
+        let snap = {
+            let mut store = ctx.tool_state().snapshots.lock().expect("hashline snapshot store poisoned");
+            let snap = store.record(&path, &text);
+            // Record which lines were displayed.
+            let displayed: std::collections::HashSet<usize> = match (offset, limit) {
+                (None, None) => {
+                    let count = text.lines().count();
+                    if count <= ReadTool::MAX_READ_LINES {
+                        (1..=count).collect()
+                    } else {
+                        (1..=ReadTool::MAX_READ_LINES).collect()
+                    }
+                }
+                _ => {
+                    let start = offset.unwrap_or(1);
+                    let end = limit.map(|l| (start + l - 1).min(text.lines().count())).unwrap_or(text.lines().count());
+                    (start..=end).collect()
+                }
+            };
+            store.record_seen_lines(&path, &snap.tag, &displayed);
+            snap
+        };
 
         let formatted = match (offset, limit) {
             (None, None) => format_full_read(&path_display, &text, &snap.tag),
@@ -101,8 +115,6 @@ impl AgentTool for ReadTool {
                 hashline::format_numbered_range(&path_display, &text, &snap.tag, &ranges)
             }
         };
-
-        // Truncate if too large.
         let config = TruncateConfig {
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_lines: Self::DEFAULT_MAX_LINES,

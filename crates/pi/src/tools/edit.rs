@@ -21,8 +21,8 @@ pub struct EditTool;
 /// The `patch` field description doubles as the hashline grammar reference
 /// the model sees; keep it in sync with `hashline::parser`.
 const PATCH_DOC: &str = "Hashline patch text. Each file section starts with a header \
-`[<abs-path>#<tag>]` — paste the exact path and 4-hex tag returned by your latest `read` \
-for that file; do NOT write the literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A557]`. \
+`[<abs-path>#<tag>]` — paste the exact path and 6-hex tag returned by your latest `read` \
+for that file; do NOT write the literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A55789]`. \
 Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows; \
 `DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / \
 `INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` operate on the \
@@ -35,14 +35,13 @@ Format gotchas (common miswrites): the range separator is `.=` not `:` — write
 not `SWAP 37:=48:`. The body starts on the NEXT line as `+`-prefixed rows, never on the same \
 line as the directive. Complete example:\n\
 ```text\n\
-[/Users/me/proj/main.py#A557]\n\
+[/Users/me/proj/main.py#A55789]\n\
 SWAP 37.=48:\n\
 +    if args.command == \"add\":\n\
 +        handler.add(args.title)\n\
 +    else:\n\
 +        parser.print_help()\n\
 ```";
-
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
@@ -128,13 +127,14 @@ impl AgentTool for EditTool {
                 ToolError::ExecutionFailed(format!("edit write failed {path_display}: {e}"))
             })?;
 
+            // Record snapshot of LF-normalized text, consistent with Read tool.
+            let snap_text = hashline::normalize_to_lf(&new_text);
             let new_snap = ctx
                 .tool_state()
                 .snapshots
                 .lock()
                 .expect("hashline snapshot store poisoned")
-                .record(&path, &new_text);
-
+                .record(&path, &snap_text);
             let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
             let diff = if edit_diff::is_diff_empty(&diff) {
                 "(no changes)".to_string()

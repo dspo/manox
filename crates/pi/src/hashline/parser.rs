@@ -325,7 +325,7 @@ fn parse_section_header(line: &str) -> Option<FilePatch> {
 }
 
 fn is_valid_tag(tag: &str) -> bool {
-    tag.len() == 4 && tag.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F'))
+    tag.len() == 6 && tag.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F'))
 }
 
 fn unquote_path(s: &str) -> &str {
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn parses_swap_range() {
-        let p = parse_patch("[a.rs#1A2B]\nSWAP 2.=3:\n+x\n+y").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nSWAP 2.=3:\n+x\n+y").unwrap();
         assert_eq!(
             op_at(&p, 0),
             &Op::Swap {
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn parses_swap_single_as_range() {
-        let p = parse_patch("[a.rs#1A2B]\nSWAP 5:\n+z").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nSWAP 5:\n+z").unwrap();
         assert_eq!(
             op_at(&p, 0),
             &Op::Swap {
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn parses_del_range_and_single() {
-        let p = parse_patch("[a.rs#1A2B]\nDEL 2.=4\nDEL 7").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nDEL 2.=4\nDEL 7").unwrap();
         assert_eq!(op_at(&p, 0), &Op::Del { start: 2, end: 4 });
         assert_eq!(op_at(&p, 1), &Op::Del { start: 7, end: 7 });
     }
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn parses_ins_variants() {
         let p = parse_patch(
-            "[a.rs#1A2B]\nINS.PRE 2:\n+x\nINS.POST 3:\n+y\nINS.HEAD:\n+h\nINS.TAIL:\n+t",
+            "[a.rs#1A2B3C]\nINS.PRE 2:\n+x\nINS.POST 3:\n+y\nINS.HEAD:\n+h\nINS.TAIL:\n+t",
         )
         .unwrap();
         assert!(matches!(
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn parses_block_ops() {
         let p =
-            parse_patch("[a.rs#1A2B]\nSWAP.BLK 1:\n+x\nDEL.BLK 2\nINS.BLK.POST 3:\n+y").unwrap();
+            parse_patch("[a.rs#1A2B3C]\nSWAP.BLK 1:\n+x\nDEL.BLK 2\nINS.BLK.POST 3:\n+y").unwrap();
         assert!(matches!(op_at(&p, 0), Op::SwapBlk { start: 1, .. }));
         assert!(matches!(op_at(&p, 1), Op::DelBlk { start: 2 }));
         assert!(matches!(op_at(&p, 2), Op::InsBlkPost { anchor: 3, .. }));
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn body_blank_and_escape() {
-        let p = parse_patch("[a.rs#1A2B]\nSWAP 1.=1:\n+\n+-x\n++y").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nSWAP 1.=1:\n+\n+-x\n++y").unwrap();
         assert_eq!(
             op_at(&p, 0),
             &Op::Swap {
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn body_preserves_leading_whitespace() {
-        let p = parse_patch("[a.rs#1A2B]\nSWAP 1.=1:\n+    code").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nSWAP 1.=1:\n+    code").unwrap();
         assert_eq!(
             op_at(&p, 0),
             &Op::Swap {
@@ -509,14 +509,14 @@ mod tests {
 
     #[test]
     fn envelope_optional() {
-        let with = parse_patch("*** Begin Patch\n[a.rs#1A2B]\nDEL 1\n*** End Patch").unwrap();
-        let without = parse_patch("[a.rs#1A2B]\nDEL 1").unwrap();
+        let with = parse_patch("*** Begin Patch\n[a.rs#1A2B3C]\nDEL 1\n*** End Patch").unwrap();
+        let without = parse_patch("[a.rs#1A2B3C]\nDEL 1").unwrap();
         assert_eq!(with, without);
     }
 
     #[test]
     fn multiple_sections() {
-        let p = parse_patch("[a.rs#1A2B]\nDEL 1\n[b.rs#3C4D]\nSWAP 1.=1:\n+x").unwrap();
+        let p = parse_patch("[a.rs#1A2B3C]\nDEL 1\n[b.rs#3C4D5E]\nSWAP 1.=1:\n+x").unwrap();
         assert_eq!(p.len(), 2);
         assert_eq!(p[0].path, PathBuf::from("a.rs"));
         assert_eq!(p[1].path, PathBuf::from("b.rs"));
@@ -529,12 +529,12 @@ mod tests {
 
     #[test]
     fn error_on_zero_line() {
-        assert!(parse_patch("[a.rs#1A2B]\nDEL 0").is_err());
+        assert!(parse_patch("[a.rs#1A2B3C]\nDEL 0").is_err());
     }
 
     #[test]
     fn error_on_unrecognized_header() {
-        let e = parse_patch("[a.rs#1A2B]\nFROB 1").unwrap_err();
+        let e = parse_patch("[a.rs#1A2B3C]\nFROB 1").unwrap_err();
         assert!(e.message.contains("unrecognized"));
     }
 
@@ -542,7 +542,7 @@ mod tests {
     fn unrecognized_header_suggests_plus_body_prefix() {
         // A `-`-prefixed markdown list item is not a body row; the parse error
         // must steer the model toward the `+` body-row prefix.
-        let e = parse_patch("[a.rs#1A2B]\n- `hashline/` — 行锚定补丁系统").unwrap_err();
+        let e = parse_patch("[a.rs#1A2B3C]\n- `hashline/` — 行锚定补丁系统").unwrap_err();
         assert!(e.message.contains("unrecognized"), "got: {}", e.message);
         assert!(
             e.message.contains("`+`"),

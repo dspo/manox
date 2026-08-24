@@ -138,7 +138,23 @@ impl AgentTool for GrepTool {
             for path in matched_paths.iter().take(20) {
                 if let Ok(raw) = std::fs::read_to_string(path) {
                     let normalized = hashline::normalize_to_lf(&raw);
-                    let _ = store.record(path, &normalized);
+                    let tag = store.record(path, &normalized);
+                    // Extract line numbers from matches for this file.
+                    let path_str = path.display().to_string();
+                    let lines: std::collections::HashSet<usize> = matches
+                        .iter()
+                        .filter_map(|m| {
+                            let prefix = format!("{path_str}:");
+                            if let Some(rest) = m.strip_prefix(&prefix) {
+                                rest.split(':').next()?.parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !lines.is_empty() {
+                        store.record_seen_lines(path, &tag.tag, &lines);
+                    }
                 }
             }
         }
