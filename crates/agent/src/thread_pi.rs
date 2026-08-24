@@ -58,44 +58,11 @@ pub struct SideCallMetric {
     pub latency_ms: u64,
 }
 
-/// Thread permission mode: pure mode-based allow/deny for mutating tool
-/// calls, enforced by the engine's permission gate (`pi_approval`). No
-/// reviewer, no interactive approval — out-of-scope calls return a tool
-/// error to the model. Persisted in the session sidecar (wire field
-/// `approval_mode`, kebab values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    /// Mutating tools denied; reads ungated.
-    ReadOnly,
-    /// In-workspace writes and sandbox-confined bash ungated; out-of-
-    /// workspace targets denied.
-    #[default]
-    WorkspaceWrite,
-    /// Everything ungated; bash runs unsandboxed.
-    FullAccess,
-}
-
-impl PermissionMode {
-    /// Map the persisted i64; any unknown value lands on the single bounded
-    /// default.
-    pub fn from_i64(v: i64) -> Self {
-        match v {
-            0 => Self::ReadOnly,
-            1 => Self::WorkspaceWrite,
-            2 => Self::FullAccess,
-            _ => Self::default(),
-        }
-    }
-
-    pub fn as_i64(self) -> i64 {
-        match self {
-            Self::ReadOnly => 0,
-            Self::WorkspaceWrite => 1,
-            Self::FullAccess => 2,
-        }
-    }
-}
+/// File-effect policy for confined bash and the fs write fence (the per-call
+/// sandbox mode). Defined in the extension layer (`pi_extensions::sandbox`) so
+/// the bash tool and the host fence share one vocabulary; re-exported here for
+/// the host's session/persistence (wire field `approval_mode`, kebab values).
+pub use pi_extensions::sandbox::PermissionMode;
 
 /// Session-scoped state for a thread inside a git worktree. The pi backend
 /// never enters worktrees in this stage, so the type exists only to keep the
@@ -1817,8 +1784,8 @@ impl Thread {
                 if trimmed.is_empty() {
                     let next = match self.permission_mode() {
                         PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
-                        PermissionMode::WorkspaceWrite => PermissionMode::FullAccess,
-                        PermissionMode::FullAccess => PermissionMode::ReadOnly,
+                        PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
+                        PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
                     };
                     self.set_permission_mode(next, cx);
                 } else {
@@ -1838,7 +1805,7 @@ impl Thread {
                         Err(_) => {
                             cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                                 "unknown permission mode `{name}` (expected read-only, \
-                                 workspace-write, or full-access)"
+                                 workspace-write, or danger-full-access)"
                             )));
                         }
                     }
@@ -2274,17 +2241,17 @@ pub(crate) mod tests {
     fn permission_mode_maps_i64_roundtrip() {
         assert_eq!(PermissionMode::from_i64(0), PermissionMode::ReadOnly);
         assert_eq!(PermissionMode::from_i64(1), PermissionMode::WorkspaceWrite);
-        assert_eq!(PermissionMode::from_i64(2), PermissionMode::FullAccess);
+        assert_eq!(PermissionMode::from_i64(2), PermissionMode::DangerFullAccess);
         assert_eq!(PermissionMode::ReadOnly.as_i64(), 0);
         assert_eq!(PermissionMode::WorkspaceWrite.as_i64(), 1);
-        assert_eq!(PermissionMode::FullAccess.as_i64(), 2);
+        assert_eq!(PermissionMode::DangerFullAccess.as_i64(), 2);
         // Unknown persisted values land on the bounded default.
         assert_eq!(PermissionMode::from_i64(-1), PermissionMode::default());
         assert_eq!(PermissionMode::from_i64(3), PermissionMode::default());
         // Wire names are the kebab sidecar values.
         assert_eq!(
-            serde_json::to_value(PermissionMode::FullAccess).unwrap(),
-            serde_json::json!("full-access")
+            serde_json::to_value(PermissionMode::DangerFullAccess).unwrap(),
+            serde_json::json!("danger-full-access")
         );
         assert_eq!(
             serde_json::from_value::<PermissionMode>(serde_json::json!("read-only")).unwrap(),
@@ -2415,7 +2382,7 @@ pub(crate) mod tests {
             assert_eq!(engine.runs.lock().unwrap().len(), 1);
 
             assert!(t.run_slash_builtin("mode", "", None, cx));
-            assert_eq!(t.permission_mode(), PermissionMode::FullAccess);
+            assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess);
             // Named form sets the mode directly.
             assert!(t.run_slash_builtin("mode", "read-only", None, cx));
             assert_eq!(t.permission_mode(), PermissionMode::ReadOnly);

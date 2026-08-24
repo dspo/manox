@@ -2019,7 +2019,7 @@ fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
     match PermissionMode::from_i64(mode) {
         PermissionMode::ReadOnly => theme.warning,
         PermissionMode::WorkspaceWrite => theme.info,
-        PermissionMode::FullAccess => theme.danger,
+        PermissionMode::DangerFullAccess => theme.danger,
     }
 }
 

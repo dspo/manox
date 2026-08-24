@@ -12,6 +12,7 @@ pub mod monitor;
 pub mod path_selector;
 pub mod provider;
 pub mod read;
+pub mod sandbox;
 pub mod session_meta;
 pub mod session_stream;
 pub mod steer_bus;

@@ -1019,7 +1019,7 @@ fn approval_mode_color(mode: PermissionMode, theme: &Theme) -> gpui::Hsla {
     match mode {
         PermissionMode::ReadOnly => theme.warning,
         PermissionMode::WorkspaceWrite => theme.info,
-        PermissionMode::FullAccess => theme.danger,
+        PermissionMode::DangerFullAccess => theme.danger,
     }
 }
 

@@ -43,7 +43,7 @@ pub struct RuntimeIdentityPromptData {
     pub node: String,
     pub today: String,
     /// The active permission mode's wire label (`read-only` /
-    /// `workspace-write` / `full-access`) — the template states the mode's
+    /// `workspace-write` / `danger-full-access`) — the template states the mode's
     /// deny semantics so the model knows what will be refused.
     pub permission_mode: &'static str,
 }

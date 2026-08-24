@@ -47,7 +47,6 @@ similar.workspace = true
 base64.workspace = true
 image.workspace = true
 rquickjs.workspace = true
-http_proxy.workspace = true
 
 gpui.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }

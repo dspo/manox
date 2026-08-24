@@ -32,8 +32,8 @@
 //! the params-aware `requires_approval`, with the same mode semantics as
 //! sandboxed Bash: a confined monitor start is auto-allowed under
 //! WorkspaceWrite (the OS sandbox bounds it), denied under ReadOnly, and
-//! ungated under FullAccess; an escalated (unsandboxed) monitor start is
-//! denied outside FullAccess. Monitor output is always framed as untrusted
+//! ungated under DangerFullAccess; an escalated (unsandboxed) monitor start is
+//! denied outside DangerFullAccess. Monitor output is always framed as untrusted
 //! external data either way.
 //!
 //! ## Teardown semantics

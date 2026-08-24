@@ -317,14 +317,14 @@ mod tests {
         assert!(readonly.contains("Read Only"), "got: {readonly}");
         let workspace = t_str("workspace-mode-notice", &[("mode", "workspacewrite")]);
         assert!(workspace.contains("Workspace Write"), "got: {workspace}");
-        let full = t_str("workspace-mode-notice", &[("mode", "fullaccess")]);
+        let full = t_str("workspace-mode-notice", &[("mode", "dangerfullaccess")]);
         assert!(full.contains("Full Access"), "got: {full}");
         set_lang(Language::ZhCn);
         let readonly = t_str("workspace-mode-notice", &[("mode", "readonly")]);
         assert!(readonly.contains("只读"), "got: {readonly}");
         let workspace = t_str("workspace-mode-notice", &[("mode", "workspacewrite")]);
         assert!(workspace.contains("工作区写入"), "got: {workspace}");
-        let full = t_str("workspace-mode-notice", &[("mode", "fullaccess")]);
+        let full = t_str("workspace-mode-notice", &[("mode", "dangerfullaccess")]);
         assert!(full.contains("完全访问"), "got: {full}");
     }
 }

@@ -22,7 +22,7 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     /// The permission gate policy the session runs under (`"read-only"`,
-    /// `"workspace-write"`, or `"full-access"`), as chosen in the access
+    /// `"workspace-write"`, or `"danger-full-access"`), as chosen in the access
     /// chip. Absent = the harness default. Stored as the mode's wire string
     /// (field name kept as `approval_mode`); the harness parses it leniently
     /// and falls back to its bounded default on unknown values.

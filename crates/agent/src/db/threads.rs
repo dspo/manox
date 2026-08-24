@@ -81,7 +81,7 @@ pub struct ThreadRecord {
     /// post-creation; a global settings change only affects threads created
     /// afterwards, so an existing thread's prompt-cache prefix stays byte-stable.
     pub agent_language: String,
-    /// Permission mode (0 = ReadOnly, 1 = WorkspaceWrite, 2 = FullAccess).
+    /// Permission mode (0 = ReadOnly, 1 = WorkspaceWrite, 2 = DangerFullAccess).
     /// Persisted as INTEGER; `PermissionMode::from_i64` folds any unknown
     /// value into the bounded default.
     pub approval_mode: i64,

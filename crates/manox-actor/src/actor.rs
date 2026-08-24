@@ -1837,7 +1837,7 @@ mod tests {
             &mut cx,
             &mut state,
             &sink,
-            r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"full-access"}"#,
+            r#"{"cmd":"set_approval_mode","sessionId":"s1","mode":"danger-full-access"}"#,
         );
         cx.run_until_parked();
         let modes: Vec<String> = out
@@ -1850,7 +1850,7 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec!["workspace-write".to_string(), "full-access".to_string()]
+            vec!["workspace-write".to_string(), "danger-full-access".to_string()]
         );
 
         // A command for an unknown session surfaces as an error event.
@@ -3230,7 +3230,7 @@ mod tests {
         );
 
         // Bare `/mode` cycles the permission mode (default WorkspaceWrite
-        // → FullAccess) and pushes the change.
+        // → DangerFullAccess) and pushes the change.
         handle_command(
             &mut cx,
             &mut state,
@@ -3240,7 +3240,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             cx.update(|app| state.sessions["s1"].thread.read(app).permission_mode()),
-            PermissionMode::FullAccess
+            PermissionMode::DangerFullAccess
         );
         assert!(types(&out).contains(&"approval_mode_changed".to_string()));
 

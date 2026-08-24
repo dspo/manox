@@ -159,6 +159,12 @@ struct EngineState {
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
     /// session, so the toggle parks here and lands right after settle.
     pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
+    /// Session cmds that arrived mid-run but are not serviceable until the
+    /// turn settles (e.g. `EnterWorktree`/`ExitWorktree`/`NewSession`/`Open` —
+    /// they rebuild the session, which the running turn owns). drive_run
+    /// parks them here instead of dropping; the idle loop drains and
+    /// re-queues them so the post-settle cmd dispatch runs the handler.
+    pending_session_cmds: Mutex<Vec<SessionCmd>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -248,6 +254,7 @@ pub fn spawn_engine(
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
         pending_browser_suite: Mutex::new(None),
+        pending_session_cmds: Mutex::new(Vec::new()),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
@@ -628,13 +635,15 @@ impl pi::tool::AgentTool for SubagentBashTool {
         self.inner.execution_mode()
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        // Strip `run_in_background` (refused by this wrapper — N1) and
-        // `unsandboxed` (no escalation path in the ungated subagent session)
-        // so the model never proposes them.
+        // Strip `run_in_background` (refused by this wrapper — N1) and the
+        // `sandbox_permissions`/`justification` escalation fields (no
+        // escalation path in the ungated subagent session) so the model
+        // never proposes them.
         let mut schema = self.inner.parameters_schema();
         if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
             props.remove("run_in_background");
-            props.remove("unsandboxed");
+            props.remove("sandbox_permissions");
+            props.remove("justification");
         }
         schema
     }
@@ -841,22 +850,39 @@ fn build_tools(
     crate::plan_mode::ReadOnlySubagentResolver,
 ) {
     // Bash execution backend: seatbelt-wrapped one-shot commands when the
-    // OS backend is available (writes + network confined; shell state does
-    // not persist — the tool's `cwd` parameter pins each call), otherwise
-    // the unsandboxed persistent brush shell (permission-gated as always).
-    // Background tasks ride the same policy: the registry's sandbox wrapper
-    // reuses this backend's `wrap_command`, so a non-escalated background
-    // task is confined exactly like a foreground call. Inside a worktree
-    // session the policy is worktree-scoped: writable set narrowed to the
-    // worktree, the bound repo's shared `.git` re-opened, network
-    // unrestricted (a worktree is an approved isolation context).
+    // OS backend is available (the per-call file-effect profile is rendered
+    // from the effective `PermissionMode`; shell state does not persist —
+    // the tool's `cwd` parameter pins each call), otherwise the unsandboxed
+    // persistent brush shell (permission-gated as always). Background tasks
+    // reuse this backend's `wrap_command`, so a non-escalated background
+    // task is confined exactly like a foreground call. The per-call effective
+    // mode reaches the seatbelt via the `mode_resolver`; a worktree session
+    // scopes the workspace root to the worktree.
     let sandbox_available = crate::sandbox::is_available();
     let mut background = Arc::new(BackgroundRegistry::new());
+    // Shared per-call grant cell: an approved sandbox-escalation stamps the
+    // wider mode here for exactly one call; the sandboxed backend's mode
+    // resolver reads it before the standing session mode.
+    let grant_cell: Arc<std::sync::atomic::AtomicI64> =
+        Arc::new(std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT));
     let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if sandbox_available {
         let policy = worktree_policy(cwd, worktree);
-        let ops = Arc::new(crate::sandbox::SandboxedBashOperations::new(cwd, policy));
-        // Background tasks: wrap through the same policy/seatbelt as
-        // foreground calls (the wrapper owns the allowlist proxy too).
+        let sandbox_mode_gate = Arc::clone(gate);
+        let cell_for_resolver = Arc::clone(&grant_cell);
+        let sandbox_mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+            Arc::new(move || {
+                let g = cell_for_resolver.load(std::sync::atomic::Ordering::SeqCst);
+                if g != pi_extensions::sandbox::NO_GRANT {
+                    PermissionMode::from_i64(g)
+                } else {
+                    sandbox_mode_gate.mode()
+                }
+            });
+        let ops = Arc::new(crate::sandbox::SandboxedBashOperations::new(
+            cwd,
+            policy,
+            sandbox_mode_resolver,
+        ));
         let wrap_ops = Arc::clone(&ops);
         let wrap: pi_extensions::bash::background::SandboxCommandBuilder =
             Arc::new(move |command, cwd| wrap_ops.wrap_background(command, cwd));
@@ -871,28 +897,33 @@ fn build_tools(
     let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
-    // Escalation backend: no confinement at all. Selected per call when the
-    // model passes `unsandboxed: true` or the host's force resolver
-    // (Full Access mode) says so — authorization is host policy, never the
-    // model's word. Installed only where a seatbelt exists to escape from:
-    // on other platforms the default backend is already unsandboxed, and
-    // swapping it for a stateless one-shot would only discard shell state.
+    // Unsandboxed backend (no confinement): selected per call when the
+    // effective mode is `danger-full-access` (the standing session mode, or
+    // an approved `sandbox_permissions` grant). Installed only where a
+    // seatbelt exists to escape from; on other platforms the default backend
+    // is already unsandboxed.
     let unsandboxed_ops: Option<Arc<dyn pi::tools::bash::BashOperations>> =
         sandbox_available.then(|| {
             let ops: Arc<dyn pi::tools::bash::BashOperations> =
                 Arc::new(crate::sandbox::UnsandboxedBashOperations::new(cwd));
             ops
         });
-    let force_gate = Arc::clone(gate);
-    let force_unsandboxed = Arc::new(move || force_gate.mode() == PermissionMode::FullAccess);
+    // Standing-mode resolver (the session mode, NOT the grant — the grant is
+    // what an escalation requests, so it cannot be its own baseline).
+    let standing_gate = Arc::clone(gate);
+    let standing_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+        Arc::new(move || standing_gate.mode());
+    let escalation_approver: Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync> =
+        Arc::new(crate::pi_approval::GateEscalationApprover::new(Arc::clone(gate)));
     let mut bash = BashTool::new(bash_ops, background.clone())
         .with_manager(Arc::clone(&manager))
-        .with_sandbox_available(sandbox_available);
+        .with_sandbox_available(sandbox_available)
+        .with_mode_resolver(Arc::clone(&standing_resolver))
+        .with_grant_cell(grant_cell)
+        .with_escalation_approver(Arc::clone(&escalation_approver));
     if let Some(ops) = unsandboxed_ops {
         bash = bash.with_unsandboxed_operations(ops);
     }
-    let bash = bash.with_force_unsandboxed(force_unsandboxed);
-
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         // Read with oh-my-pi path selectors (`path:N-M` / `:raw` / multi-range);
         // selector-less reads delegate to the kernel ReadTool unchanged.
@@ -927,27 +958,30 @@ fn build_tools(
         plans_dir: crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans")),
         cwd: cwd.to_path_buf(),
     });
-    // Sandbox-confined bash rides the OS confinement instead of the gate in
-    // WorkspaceWrite: `Bash` without `unsandboxed` and the `Monitor` command
-    // half (its commands spawn through the same sandbox-wrapped background
-    // registry). Escalated calls stay gated in every mode.
+    // Bash rides the OS confinement (the per-call file-effect profile) instead
+    // of the host gate whenever a seatbelt is mounted: the mode drives the
+    // seatbelt directly, and a `sandbox_permissions` escalation is resolved
+    // inside the tool through the host-injected approver (never the gate).
+    // `Monitor`'s command half spawns through the same sandbox-wrapped
+    // background registry under workspace-write.
     let confined_bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> = sandbox_available
         .then(|| {
-            let gate = Arc::clone(gate);
             let allow: crate::pi_approval::AutoAllowResolver =
-                Arc::new(move |name: &str, params: &serde_json::Value| {
-                    gate.mode() == PermissionMode::WorkspaceWrite
-                        && match name {
-                            "Bash" => !params["unsandboxed"].as_bool().unwrap_or(false),
-                            "Monitor" => params
-                                .get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| !c.trim().is_empty()),
-                            _ => false,
-                        }
+                Arc::new(move |name: &str, params: &serde_json::Value| match name {
+                    "Bash" => true,
+                    "Monitor" => params
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| !c.trim().is_empty()),
+                    _ => false,
                 });
             allow
         });
+    // Per-call grant cell for the fs write fence (Write/Edit); distinct from
+    // bash's cell (separate tools, separate stamps). The shared approver +
+    // standing-mode resolver are reused.
+    let fs_grant_cell: Arc<std::sync::atomic::AtomicI64> =
+        Arc::new(std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT));
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
@@ -958,6 +992,13 @@ fn build_tools(
                 && matches!(name.as_str(), "Bash" | "Monitor")
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
+            }
+            if matches!(name.as_str(), "Write" | "Edit") {
+                wrapper = wrapper.with_escalation(
+                    Arc::clone(&escalation_approver),
+                    Arc::clone(&fs_grant_cell),
+                    Arc::clone(&standing_resolver),
+                );
             }
             Arc::new(wrapper) as Arc<dyn PiAgentTool>
         })
@@ -980,7 +1021,7 @@ fn build_tools(
     // Steer-based team architecture; the task list persists per thread and
     // every session registers the four tools. Gated like any other mutating
     // tool: ReadOnly denies, WorkspaceWrite admits (session-scoped, no
-    // out-of-workspace target — see `workspace_write_verdict`), FullAccess
+    // out-of-workspace target — see `workspace_write_verdict`), DangerFullAccess
     // runs ungated.
     let task_list = Arc::new(std::sync::Mutex::new(
         crate::team::tools::PlainTaskList::new(),
@@ -1089,7 +1130,7 @@ fn build_tools(
     // Git worktree management: the tools run the git phase and queue the
     // session swap (actor-side, between turns). Gated like other mutating
     // tools: repo-scoped, so WorkspaceWrite admits (see
-    // `workspace_write_verdict`), ReadOnly denies, FullAccess ungated.
+    // `workspace_write_verdict`), ReadOnly denies, DangerFullAccess ungated.
     for tool in [
         Arc::new(crate::worktree::EnterWorktreeTool::new(
             cmd_tx.clone(),
@@ -1286,8 +1327,7 @@ fn build_tools(
 }
 
 /// The sandbox policy for a session cwd: worktree-scoped when the session
-/// runs inside the active worktree (writable set narrowed to the worktree,
-/// the bound repo's shared `.git` re-opened, network unrestricted), else
+/// runs inside the active worktree (workspace root = the worktree), else
 /// project-scoped. The cwd comparison canonicalizes both sides so the
 /// policy follows the session's actual directory — a stale pre-swap state
 /// or an Exit back to the original repo both classify correctly.
@@ -1301,9 +1341,7 @@ fn worktree_policy(
     let wt = crate::sandbox::canonicalize_best_effort(Path::new(&meta.worktree_path));
     let current = crate::sandbox::canonicalize_best_effort(cwd);
     if current == wt {
-        let main_git_dir =
-            crate::sandbox::canonicalize_best_effort(&Path::new(&meta.original_cwd).join(".git"));
-        crate::sandbox::SandboxPolicy::for_worktree(&wt, &main_git_dir)
+        crate::sandbox::SandboxPolicy::for_worktree(&wt)
     } else {
         crate::sandbox::SandboxPolicy::for_project(cwd)
     }
@@ -1521,7 +1559,9 @@ where
                     // must not be silently dropped).
                     *state.pending_browser_suite.lock().unwrap() = Some((suite, enable));
                 }
-                Some(_) => {} // not serviceable mid-run; dropped (facade re-syncs after settle)
+                Some(cmd) => { // not serviceable mid-run; park for post-settle
+                    state.pending_session_cmds.lock().unwrap().push(cmd);
+                }
                 None => {
                     // Facade dropped mid-run: abort, settle, exit.
                     channel_open = false;
@@ -2018,131 +2058,6 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
     }
 }
 
-/// Register the FS path-policy hook: read tools (`Read`/`Grep`/`Glob`/`Ls`)
-/// are checked against the sensitive-path deny-list in every mode; write
-/// tools (`Write`/`Edit`) keep only the Full Access `.git` guard here —
-/// outside Full Access the permission gate owns write scope (its mode-named
-/// denials are the model-facing contract). Block reasons surface to the
-/// model as tool errors.
-///
-/// Reads keep the sensitive-path deny-list in every mode: a secret read is
-/// an irreversible exfiltration even under full trust.
-fn attach_path_policy_hooks(session: &mut AgentSession, cwd: &Path, gate: &Arc<ApprovalGate>) {
-    let cwd = cwd.to_path_buf();
-    let read_policy = Arc::new(crate::path_policy::ReadPolicy::new());
-    let gate = Arc::clone(gate);
-    session.on(
-        pi::harness::HookPoint::ToolCall,
-        Arc::new(move |mut ctx| {
-            let full_access = gate.mode() == PermissionMode::FullAccess;
-            let tool_name = ctx
-                .data
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let args = ctx
-                .data
-                .get("args")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-            let verdict = path_policy_verdict(tool_name, &args, &cwd, &read_policy, full_access);
-            if let Some(reason) = verdict {
-                ctx.block_reason = Some(reason);
-            }
-            ctx
-        }),
-    );
-}
-
-/// Pure verdict for the path-policy hook: `Some(reason)` blocks the call.
-/// Extracted from the hook closure so the mode/read/write matrix is
-/// unit-testable without a live session.
-fn path_policy_verdict(
-    tool_name: &str,
-    args: &serde_json::Map<String, serde_json::Value>,
-    cwd: &Path,
-    read_policy: &crate::path_policy::ReadPolicy,
-    full_access: bool,
-) -> Option<String> {
-    match tool_name {
-        "Read" | "Ls" | "Grep" | "Glob" => args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .and_then(|raw| read_policy.check(&resolve_tool_path(raw, cwd)).err()),
-        "Write" => {
-            let target = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(|raw| resolve_tool_path(raw, cwd));
-            match target {
-                // Full Access lifts write confinement but repo internals stay
-                // protected: `.git` is repository structure, not a file the
-                // "edit any file" promise covers (the c5aefe4d escape
-                // class — a direct write into `.git` bypasses git itself).
-                Some(p) if full_access && has_git_component(&p) => Some(format!(
-                    "Write blocked by path policy (`.git` is protected even in Full Access): {}. \
-                     Use git commands through bash (unsandboxed in Full Access) for git state.",
-                    p.display()
-                )),
-                _ => None,
-            }
-        }
-        // Full Access: same `.git`-only guard across every patch target.
-        "Edit" if full_access => args
-            .get("patch")
-            .and_then(|v| v.as_str())
-            .and_then(|patch| {
-                // Fail closed on unparseable patches, mirroring the
-                // confined arm — an unverifiable patch must not ride the
-                // Full Access release.
-                let targets = match pi::hashline::parse_patch(patch) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        return Some(format!(
-                            "Edit blocked by path policy (patch targets unverifiable even in Full Access): {e}. \
-                             Fix the hashline patch grammar and retry."
-                        ));
-                    }
-                };
-                let hit = targets.iter().find(|fp| {
-                    let t = if fp.path.is_absolute() {
-                        fp.path.clone()
-                    } else {
-                        cwd.join(&fp.path)
-                    };
-                    has_git_component(&t)
-                });
-                hit.map(|fp| {
-                    format!(
-                        "Edit blocked by path policy (`.git` is protected even in Full Access): {}. \
-                     Use git commands through bash (unsandboxed in Full Access) for git state.",
-                        fp.path.display()
-                    )
-                })
-            }),
-        _ => None,
-    }
-}
-
-/// Whether a canonicalized path contains a `.git` component anywhere.
-fn has_git_component(path: &Path) -> bool {
-    crate::path_policy::canonicalize_best_effort(path)
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
-}
-
-/// Resolve a tool `path` argument against the session cwd (relative paths),
-/// leaving absolute paths untouched.
-fn resolve_tool_path(raw: &str, cwd: &Path) -> PathBuf {
-    let candidate = Path::new(raw);
-    if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        cwd.join(candidate)
-    }
-}
-
 /// Register the plugin-lifecycle hook bridges (PreToolUse / PostToolUse
 /// fire-and-forget shell-outs). Notification-only; never blocks a call.
 fn attach_plugin_hooks(session: &mut AgentSession, cwd: &Path) {
@@ -2270,9 +2185,7 @@ async fn run_actor(
                     notice_tx.clone(),
                     thread_id.clone(),
                 );
-                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
-                attach_path_policy_hooks(&mut s, &tool_cwd, &state.gate);
-                attach_plugin_hooks(&mut s, &tool_cwd);
+                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);                attach_plugin_hooks(&mut s, &tool_cwd);
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 session = Some(s);
@@ -2315,9 +2228,7 @@ async fn run_actor(
                         notice_tx.clone(),
                         thread_id.clone(),
                     );
-                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
-                    attach_path_policy_hooks(&mut s, &cwd, &state.gate);
-                    attach_plugin_hooks(&mut s, &cwd);
+                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);                    attach_plugin_hooks(&mut s, &cwd);
                     s
                 }
                 Err(err) => {
@@ -2463,6 +2374,13 @@ async fn run_actor(
         let parked_suite = state.pending_browser_suite.lock().unwrap().take();
         if let Some((suite, enable)) = parked_suite {
             apply_browser_suite(&mut session, suite, enable).await;
+        }
+        // Mid-run non-serviceable cmds (EnterWorktree/ExitWorktree/...) parked
+        // themselves for the same reason; re-queue so the post-settle dispatch
+        // runs their handler.
+        let parked_cmds = std::mem::take(&mut *state.pending_session_cmds.lock().unwrap());
+        for cmd in parked_cmds {
+            let _ = cmd_tx.send(cmd);
         }
         // Between runs the actor wakes on either a facade command or a
         // monitor idle-wakeup (steered events queued while the session was
@@ -3120,9 +3038,7 @@ async fn run_actor(
                             notice_tx.clone(),
                             thread_id.clone(),
                         );
-                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
-                        attach_path_policy_hooks(&mut s, &cwd, &state.gate);
-                        attach_plugin_hooks(&mut s, &cwd);
+                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);                        attach_plugin_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
                         state.plan.set(false, None);
@@ -3272,9 +3188,7 @@ async fn rebuild_session(
             attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
             // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
             // the same path policy as fresh builds — without it the
-            // replaced session loses write confinement entirely.
-            attach_path_policy_hooks(&mut s, &cwd, gate);
-            attach_plugin_hooks(&mut s, &cwd);
+            // replaced session loses write confinement entirely.            attach_plugin_hooks(&mut s, &cwd);
             adopt_session_model(&s, pi_model, state);
             *session = s;
         }
@@ -4348,12 +4262,12 @@ mod tests {
             PermissionMode::WorkspaceWrite
         );
 
-        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::FullAccess)
+        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::DangerFullAccess)
             .await
             .unwrap();
         assert_eq!(
             load_approval_mode(dir.path(), &session).await,
-            PermissionMode::FullAccess
+            PermissionMode::DangerFullAccess
         );
 
         write_approval_mode_sidecar(dir.path(), &session, PermissionMode::ReadOnly)
@@ -4564,7 +4478,7 @@ mod tests {
             .await
             .unwrap();
 
-        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::FullAccess)
+        write_approval_mode_sidecar(dir.path(), &session, PermissionMode::DangerFullAccess)
             .await
             .unwrap();
 
@@ -4573,7 +4487,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
-        assert_eq!(loaded.approval_mode.as_deref(), Some("full-access"));
+        assert_eq!(loaded.approval_mode.as_deref(), Some("danger-full-access"));
     }
 
     #[test]
@@ -4808,6 +4722,7 @@ mod tests {
             sessions: Mutex::new(Vec::new()),
             active_path: Mutex::new(None),
             pending_browser_suite: Mutex::new(None),
+            pending_session_cmds: Mutex::new(Vec::new()),
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
@@ -5378,76 +5293,6 @@ mod tests {
     }
 
     #[test]
-    fn path_policy_verdict_defers_write_scope_to_the_gate_outside_full_access() {
-        let cwd = Path::new("/tmp/manox-policy-hook-proj");
-        let read = crate::path_policy::ReadPolicy::new();
-        let args = serde_json::json!({ "path": "/etc/manox-hook-x" })
-            .as_object()
-            .unwrap()
-            .clone();
-        // Outside Full Access the permission gate owns write scope; the hook
-        // adds no write confinement of its own.
-        assert!(path_policy_verdict("Write", &args, cwd, &read, false).is_none());
-        let edit_args = serde_json::json!({ "patch": "*** Begin Patch\n[/etc/manox-hook-x#1A2B]\nDEL 1\n*** End Patch" })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(path_policy_verdict("Edit", &edit_args, cwd, &read, false).is_none());
-    }
-
-    #[test]
-    fn path_policy_verdict_full_access_lifts_write_confinement_but_keeps_read_denylist() {
-        let cwd = Path::new("/tmp/manox-policy-hook-proj");
-        let read = crate::path_policy::ReadPolicy::new();
-        // Full Access: an out-of-project Write and an out-of-project Edit both pass.
-        let write_args = serde_json::json!({ "path": "/etc/manox-hook-x" })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(
-            path_policy_verdict("Write", &write_args, cwd, &read, true).is_none(),
-            "full-access Write passes"
-        );
-        let edit_args = serde_json::json!({ "patch": "*** Begin Patch\n[/etc/manox-hook-x#1A2B]\nDEL 1\n*** End Patch" })
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(
-            path_policy_verdict("Edit", &edit_args, cwd, &read, true).is_none(),
-            "full-access Edit passes"
-        );
-        // Repo internals stay protected even under Full Access: `.git` is
-        // repository structure, not a file the "edit any file" promise
-        // covers (a direct write bypasses git itself).
-        let git_write_args = serde_json::json!({ "path": cwd.join(".git/config") })
-            .as_object()
-            .unwrap()
-            .clone();
-        let reason = path_policy_verdict("Write", &git_write_args, cwd, &read, true).unwrap();
-        assert!(reason.contains(".git"), "{reason}");
-        let git_edit_args = serde_json::json!({
-            "patch": format!(
-                "*** Begin Patch\n[{}/.git/config#1A2B]\nDEL 1\n*** End Patch",
-                cwd.display()
-            )
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        let reason = path_policy_verdict("Edit", &git_edit_args, cwd, &read, true).unwrap();
-        assert!(reason.contains(".git"), "{reason}");
-        // Reads keep the sensitive-path deny-list even under Full Access: a
-        // secret read is an irreversible exfiltration.
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-        let read_args = serde_json::json!({ "path": home.join(".ssh/id_rsa") })
-            .as_object()
-            .unwrap()
-            .clone();
-        let reason = path_policy_verdict("Read", &read_args, cwd, &read, true).unwrap();
-        assert!(reason.contains("sensitive"), "{reason}");
-    }
-
-    #[test]
     fn worktree_policy_scopes_to_the_active_worktree_and_falls_back() {
         let base = crate::sandbox::canonicalize_best_effort(&std::env::temp_dir())
             .join("manox-wt-policy-proj");
@@ -5456,9 +5301,8 @@ mod tests {
         // No active worktree → project policy (anchor None).
         let p = worktree_policy(&wt, &state);
         assert!(p.worktree_anchor().is_none());
-        // Active worktree matching the session cwd → worktree-scoped:
-        // writable in the worktree, the bound repo's shared `.git`
-        // re-opened, network unrestricted.
+        // Active worktree matching the session cwd → worktree-scoped: the
+        // workspace root is the worktree, so workspace-write admits it.
         *state.lock().unwrap() = Some(pi_extensions::session_meta::WorktreeMeta {
             worktree_path: wt.display().to_string(),
             branch: "b".into(),
@@ -5467,33 +5311,18 @@ mod tests {
         });
         let p = worktree_policy(&wt, &state);
         assert_eq!(p.worktree_anchor(), Some(wt.as_path()));
-        assert!(p.is_write_allowed(&wt.join("file")), "worktree writable");
+        let sb = p.render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
         assert!(
-            p.is_write_allowed(&base.join(".git/refs/head")),
-            "bound repo .git re-opened"
+            sb.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                wt.display()
+            )),
+            "worktree root admitted: {sb}"
         );
-        assert!(matches!(
-            p.network(),
-            crate::sandbox::NetworkPolicy::Unrestricted
-        ));
         // Session cwd back at the original repo (Exit) → project policy
         // again, not the stale worktree scope.
         let p2 = worktree_policy(&base, &state);
         assert!(p2.worktree_anchor().is_none());
-    }
-
-    #[test]
-    fn full_access_edit_fails_closed_on_unparseable_patch() {
-        let cwd = Path::new("/tmp/manox-policy-hook-proj");
-        let read = crate::path_policy::ReadPolicy::new();
-        // An unparseable hashline patch must not ride the Full Access release —
-        // the confined arm already fails closed on it.
-        let bad_args = serde_json::json!({ "patch": "[src/lib.rs#1A2B\nDEL 1" })
-            .as_object()
-            .unwrap()
-            .clone();
-        let reason = path_policy_verdict("Edit", &bad_args, cwd, &read, true).unwrap();
-        assert!(reason.contains("unverifiable"), "{reason}");
     }
 
     #[tokio::test]
@@ -5830,7 +5659,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_bash_schema_strips_background_and_unsandboxed() {
+    fn subagent_bash_schema_strips_background_and_escalation_fields() {
         let tool = SubagentBashTool {
             inner: Arc::new(MarkerBash),
         };
@@ -5843,8 +5672,12 @@ mod tests {
             "run_in_background stripped from the subagent schema"
         );
         assert!(
-            !props.contains_key("unsandboxed"),
-            "unsandboxed stripped from the subagent schema"
+            !props.contains_key("sandbox_permissions"),
+            "sandbox_permissions stripped from the subagent schema"
+        );
+        assert!(
+            !props.contains_key("justification"),
+            "justification stripped from the subagent schema"
         );
         assert!(props.contains_key("command"), "command still advertised");
     }
