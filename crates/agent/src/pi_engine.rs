@@ -863,8 +863,9 @@ fn build_tools(
     // Shared per-call grant cell: an approved sandbox-escalation stamps the
     // wider mode here for exactly one call; the sandboxed backend's mode
     // resolver reads it before the standing session mode.
-    let grant_cell: Arc<std::sync::atomic::AtomicI64> =
-        Arc::new(std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT));
+    let grant_cell: Arc<std::sync::atomic::AtomicI64> = Arc::new(
+        std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT),
+    );
     let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if sandbox_available {
         let policy = worktree_policy(cwd, worktree);
         let sandbox_mode_gate = Arc::clone(gate);
@@ -914,7 +915,9 @@ fn build_tools(
     let standing_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
         Arc::new(move || standing_gate.mode());
     let escalation_approver: Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync> =
-        Arc::new(crate::pi_approval::GateEscalationApprover::new(Arc::clone(gate)));
+        Arc::new(crate::pi_approval::GateEscalationApprover::new(Arc::clone(
+            gate,
+        )));
     let mut bash = BashTool::new(bash_ops, background.clone())
         .with_manager(Arc::clone(&manager))
         .with_sandbox_available(sandbox_available)
@@ -980,8 +983,9 @@ fn build_tools(
     // Per-call grant cell for the fs write fence (Write/Edit); distinct from
     // bash's cell (separate tools, separate stamps). The shared approver +
     // standing-mode resolver are reused.
-    let fs_grant_cell: Arc<std::sync::atomic::AtomicI64> =
-        Arc::new(std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT));
+    let fs_grant_cell: Arc<std::sync::atomic::AtomicI64> = Arc::new(
+        std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT),
+    );
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
@@ -2185,7 +2189,8 @@ async fn run_actor(
                     notice_tx.clone(),
                     thread_id.clone(),
                 );
-                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);                attach_plugin_hooks(&mut s, &tool_cwd);
+                attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
+                attach_plugin_hooks(&mut s, &tool_cwd);
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 session = Some(s);
@@ -2228,7 +2233,8 @@ async fn run_actor(
                         notice_tx.clone(),
                         thread_id.clone(),
                     );
-                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);                    attach_plugin_hooks(&mut s, &cwd);
+                    attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
+                    attach_plugin_hooks(&mut s, &cwd);
                     s
                 }
                 Err(err) => {
@@ -3038,7 +3044,8 @@ async fn run_actor(
                             notice_tx.clone(),
                             thread_id.clone(),
                         );
-                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);                        attach_plugin_hooks(&mut s, &cwd);
+                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
+                        attach_plugin_hooks(&mut s, &cwd);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
                         state.plan.set(false, None);

@@ -491,7 +491,10 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             i18n::t("settings-desc-permission-workspaceread"),
             learn_more.clone(),
         );
-        let desc_full = build_desc(i18n::t("settings-desc-permission-dangerfullaccess"), learn_more);
+        let desc_full = build_desc(
+            i18n::t("settings-desc-permission-dangerfullaccess"),
+            learn_more,
+        );
         // Radio semantics across three switches: enabling one row selects
         // its mode; switching a row off keeps the current selection.
         let mode = view.permission_mode;

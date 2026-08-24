@@ -11,15 +11,15 @@ pub mod persistent;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
-use pi::BackgroundTaskRegistry;
-use pi::env::CommandResult;
 use crate::sandbox::{
-    EscalationApprover, EscalationRequest, ESCALATION_TARGETS, NO_GRANT, PermissionMode,
+    ESCALATION_TARGETS, EscalationApprover, EscalationRequest, NO_GRANT, PermissionMode,
     approve_escalation, validate_escalation_args,
 };
+use pi::BackgroundTaskRegistry;
+use pi::env::CommandResult;
 
 use orchestration::{BackgroundManager, OutputShape};
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
@@ -309,16 +309,15 @@ impl BashTool {
         // cell, which the sandboxed backend's mode resolver reads). The
         // guard clears the stamp on drop so the next call reverts.
         let standing = self.standing_mode();
-        let _grant = EscalationGrant::resolve(self, tool_call_id, &signal, &params, standing)
-            .await?;
+        let _grant =
+            EscalationGrant::resolve(self, tool_call_id, &signal, &params, standing).await?;
         let effective = self.effective_mode();
 
         if run_in_background {
             // Background tasks route through the same confinement decision
             // as foreground calls: danger-full-access → bare spawn, else
             // sandboxed. Without a seatbelt there is no wrapper either way.
-            let sandboxed =
-                self.sandbox_available && effective != PermissionMode::DangerFullAccess;
+            let sandboxed = self.sandbox_available && effective != PermissionMode::DangerFullAccess;
             let shape = OutputShape {
                 head_lines,
                 tail_lines,
@@ -426,6 +425,7 @@ impl<'a> EscalationGrant<'a> {
                     justification: just.unwrap().to_string(),
                     effective_mode: standing,
                     subject: "command".into(),
+                    tool_name: "Bash".into(),
                     call_id: tool_call_id.to_string(),
                     signal: Some(signal.clone()),
                 },
@@ -784,8 +784,7 @@ mod tests {
             &self,
             _req: crate::sandbox::EscalationRequest,
         ) -> crate::sandbox::EscalationOutcome {
-            self.asked
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.outcome
         }
     }
@@ -840,7 +839,11 @@ mod tests {
             .await
             .unwrap();
         assert!(output_text(&result).contains("ran=unsandboxed"));
-        assert_eq!(asked.load(Ordering::SeqCst), 1, "the approver was asked once");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the approver was asked once"
+        );
     }
 
     #[tokio::test]
@@ -863,7 +866,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not strictly wider"), "{}", err);
-        assert_eq!(asked.load(Ordering::SeqCst), 0, "non-widening never prompts");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "non-widening never prompts"
+        );
     }
 
     #[tokio::test]

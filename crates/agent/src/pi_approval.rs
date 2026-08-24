@@ -37,8 +37,7 @@ use crate::thread_engine::BackendNotice;
 const DENY_READ_ONLY: &str = "[sandbox: file access denied under read-only mode]";
 /// Model-facing denial marker: workspace-write refuses a mutation whose
 /// target the policy cannot prove inside the writable roots.
-const DENY_OUT_OF_WORKSPACE: &str =
-    "[sandbox: file access denied under workspace-write mode]";
+const DENY_OUT_OF_WORKSPACE: &str = "[sandbox: file access denied under workspace-write mode]";
 
 /// The same-turn escalation hint appended to a fs-mutation refusal.
 fn fs_escalation_hint() -> String {
@@ -161,6 +160,7 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
         req: pi_extensions::sandbox::EscalationRequest,
     ) -> pi_extensions::sandbox::EscalationOutcome {
         let mode = req.requested_mode;
+        let tool_name = req.tool_name.clone();
         let reason = format!("escalate sandbox to {}: {}", mode.wire(), req.justification);
         let input = serde_json::json!({
             "sandbox_permissions": mode.wire(),
@@ -169,14 +169,14 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
         let rx = self.gate.register(
             &req.call_id,
             PendingAuthMeta {
-                tool_name: "Bash".into(),
+                tool_name: tool_name.clone(),
                 summary: reason.clone(),
                 input: input.clone(),
             },
         );
         self.gate.emit(ThreadEvent::ToolCallAuthorization {
             id: req.call_id.clone(),
-            tool_name: "Bash".into(),
+            tool_name,
             summary: reason,
             input,
         });
@@ -188,9 +188,9 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
                     return pi_extensions::sandbox::EscalationOutcome::Cancelled;
                 }
             },
-            None => rx
-                .await
-                .unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+            None => rx.await.unwrap_or(ToolAuthorizationResponse::Decision(
+                PermissionDecision::Deny,
+            )),
         };
         self.gate.discard(&req.call_id);
         match response {
@@ -203,6 +203,26 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
 }
 
 // ── The gating wrapper ──────────────────────────────────────────────────────
+
+/// Clears the per-call grant cell on drop so an approved one-shot escalation
+/// never leaks to the next call — including the verdict `?` rejection path
+/// (where a stale grant would let a later Write/Edit bypass read-only). Held
+/// across the gated execution; created only after `resolve_escalation`
+/// succeeds (so the resolve-error path, which stamps nothing, skips it).
+struct GrantGuard<'a> {
+    cell: Option<&'a Arc<std::sync::atomic::AtomicI64>>,
+}
+
+impl Drop for GrantGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cell) = self.cell {
+            cell.store(
+                pi_extensions::sandbox::NO_GRANT,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
+}
 
 /// Wraps a pi tool with the host's permission policy. Tools that neither
 /// declare `requires_approval` nor mutate anything pass straight through.
@@ -217,8 +237,7 @@ pub struct ApprovalGatedTool {
     /// `sandbox_permissions` grant through the host approver before the
     /// mode check, so an approved wider mode widens the verdict for one
     /// call. Bash resolves its own escalation inside the tool.
-    escalation_approver:
-        Option<Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>>,
+    escalation_approver: Option<Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>>,
     grant_cell: Option<Arc<std::sync::atomic::AtomicI64>>,
     mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
 }
@@ -325,8 +344,15 @@ impl ApprovalGatedTool {
         let standing = self.standing_mode();
         self.resolve_escalation(tool_call_id, &signal, &params, standing)
             .await?;
+        // From here the grant cell may carry a one-shot stamp; clear it on
+        // every path (incl. a verdict `?` rejection or a read-only refusal)
+        // via drop. Nothing was stamped on the resolve-escalation error path
+        // (`?` above returns before the guard exists).
+        let _grant = GrantGuard {
+            cell: self.grant_cell.as_ref(),
+        };
         let mode = self.effective_mode();
-        let result = match mode {
+        match mode {
             PermissionMode::DangerFullAccess => {
                 self.delegate(tool_call_id, params, signal, ctx, progress)
                     .await
@@ -337,13 +363,7 @@ impl ApprovalGatedTool {
                     .await
             }
             PermissionMode::ReadOnly => Err(fs_denial(DENY_READ_ONLY)),
-        };
-        // Clear the per-call grant so the next call reverts to the standing
-        // session mode (nothing stamped on the error path — `?` returns early).
-        if let Some(cell) = &self.grant_cell {
-            cell.store(pi_extensions::sandbox::NO_GRANT, std::sync::atomic::Ordering::SeqCst);
         }
-        result
     }
 
     /// The standing session mode (absent any per-call grant).
@@ -405,6 +425,7 @@ impl ApprovalGatedTool {
                     justification: just.unwrap().to_string(),
                     effective_mode: standing,
                     subject: "operation".into(),
+                    tool_name: self.inner.name().to_string(),
                     call_id: tool_call_id.to_string(),
                     signal: Some(signal.clone()),
                 },
@@ -503,7 +524,33 @@ impl PiAgentTool for ApprovalGatedTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
+        let mut schema = self.inner.parameters_schema();
+        // Advertise the escalation fields on the wrapping tool (Write/Edit)
+        // when a sandbox backend is mounted, so the model knows the denied
+        // call can be retried with `sandbox_permissions`+`justification`.
+        if self.escalation_approver.is_some()
+            && let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut())
+        {
+            props.insert(
+                "sandbox_permissions".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": pi_extensions::sandbox::ESCALATION_TARGETS
+                        .iter()
+                        .map(|m| m.wire())
+                        .collect::<Vec<_>>(),
+                    "description": "The wider sandbox mode this file operation needs. Only valid as a one-shot retry of an operation the sandbox just denied; requires justification and user approval."
+                }),
+            );
+            props.insert(
+                "justification".into(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Required with sandbox_permissions: one sentence for the user explaining why this exact file operation needs the wider access."
+                }),
+            );
+        }
+        schema
     }
 
     fn requires_approval(&self, params: &serde_json::Value) -> bool {
@@ -1082,7 +1129,10 @@ mod tests {
                 .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains(DENY_READ_ONLY), "{name} denied in ReadOnly");
+            assert!(
+                err.to_string().contains(DENY_READ_ONLY),
+                "{name} denied in ReadOnly"
+            );
             assert_eq!(ro_ran.load(Ordering::SeqCst), 0);
         }
     }
@@ -1111,5 +1161,144 @@ mod tests {
         }));
         assert!(!tool.needs_gate(&serde_json::json!({"unsandboxed": false})));
         assert!(tool.needs_gate(&serde_json::json!({"unsandboxed": true})));
+    }
+
+    struct CannedEscalationApprover(pi_extensions::sandbox::EscalationOutcome);
+
+    #[async_trait::async_trait]
+    impl pi_extensions::sandbox::EscalationApprover for CannedEscalationApprover {
+        async fn request(
+            &self,
+            _req: pi_extensions::sandbox::EscalationRequest,
+        ) -> pi_extensions::sandbox::EscalationOutcome {
+            self.0
+        }
+    }
+
+    /// Regression: an approved escalation whose verdict then rejects (the
+    /// typical case — the model asked for an out-of-workspace target) must
+    /// clear the per-call grant so the NEXT call (no escalation) falls back
+    /// to the standing read-only mode, not the stale workspace-write grant.
+    #[tokio::test]
+    async fn read_only_escalation_rejected_by_verdict_does_not_leak_grant() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::ReadOnly);
+        let (tool, _ran) = gated_named("Write", false, false, Arc::clone(&gate));
+        let grant_cell = Arc::new(std::sync::atomic::AtomicI64::new(
+            pi_extensions::sandbox::NO_GRANT,
+        ));
+        let standing = Arc::clone(&gate);
+        let mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+            Arc::new(move || standing.mode());
+        let tool = tool.with_escalation(
+            Arc::new(CannedEscalationApprover(
+                pi_extensions::sandbox::EscalationOutcome::AllowedOnce,
+            )),
+            grant_cell,
+            mode_resolver,
+        );
+        let ctx = tool_ctx();
+        // Call 1: escalate to workspace-write for an out-of-workspace target.
+        let args = serde_json::json!({
+            "path": "/etc/manox-grant-leak-test/x.txt",
+            "content": "x",
+            "sandbox_permissions": "workspace-write",
+            "justification": "need it"
+        });
+        let err = tool
+            .execute("c1", args, CancellationToken::new(), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(DENY_OUT_OF_WORKSPACE),
+            "call 1 rejected by the verdict: {err}"
+        );
+        // Call 2: no escalation, same out-of-workspace target — must fall
+        // back to read-only, NOT the stale workspace-write grant.
+        let args2 = serde_json::json!({
+            "path": "/etc/manox-grant-leak-test/x.txt",
+            "content": "x"
+        });
+        let err2 = tool
+            .execute("c2", args2, CancellationToken::new(), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err2.to_string().contains(DENY_READ_ONLY),
+            "call 2 fell back to read-only: {err2}"
+        );
+        assert!(
+            !err2.to_string().contains(DENY_OUT_OF_WORKSPACE),
+            "stale grant leaked to call 2: {err2}"
+        );
+    }
+    /// A mock tool whose schema carries a `properties` object (so the gate's
+    /// escalation-field merge has somewhere to land).
+    struct PropMock;
+    #[async_trait::async_trait]
+    impl PiAgentTool for PropMock {
+        fn name(&self) -> &str {
+            "Write"
+        }
+        fn description(&self) -> &str {
+            "mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})
+        }
+        fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+            false
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            Ok(AgentToolResult::text("ran"))
+        }
+    }
+
+    #[test]
+    fn escalation_fields_advertised_on_wrapped_write_edit_schema() {
+        let bare_gate = gate();
+        let gate = gate();
+        let grant_cell = Arc::new(std::sync::atomic::AtomicI64::new(
+            pi_extensions::sandbox::NO_GRANT,
+        ));
+        let standing = Arc::clone(&gate);
+        let mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
+            Arc::new(move || standing.mode());
+        let tool = ApprovalGatedTool::new(Arc::new(PropMock), gate).with_escalation(
+            Arc::new(CannedEscalationApprover(
+                pi_extensions::sandbox::EscalationOutcome::AllowedOnce,
+            )),
+            grant_cell,
+            mode_resolver,
+        );
+        let schema = tool.parameters_schema();
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema has properties");
+        assert!(props.contains_key("path"), "inner field preserved");
+        assert!(
+            props.contains_key("sandbox_permissions"),
+            "escalation field advertised"
+        );
+        assert!(
+            props.contains_key("justification"),
+            "escalation field advertised"
+        );
+        // Without escalation configured, the inner schema passes through bare.
+        let bare = ApprovalGatedTool::new(Arc::new(PropMock), bare_gate);
+        let bare_schema = bare.parameters_schema();
+        let bare_props = bare_schema["properties"]
+            .as_object()
+            .expect("bare schema has properties");
+        assert!(!bare_props.contains_key("sandbox_permissions"));
     }
 }

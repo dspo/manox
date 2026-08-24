@@ -84,15 +84,23 @@ impl PermissionMode {
 pub const WIDER_MODES: &[(PermissionMode, &[PermissionMode])] = &[
     (
         PermissionMode::ReadOnly,
-        &[PermissionMode::WorkspaceWrite, PermissionMode::DangerFullAccess],
+        &[
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ],
     ),
-    (PermissionMode::WorkspaceWrite, &[PermissionMode::DangerFullAccess]),
+    (
+        PermissionMode::WorkspaceWrite,
+        &[PermissionMode::DangerFullAccess],
+    ),
 ];
 
 /// The closed escalation-target vocabulary — every mode a call could ever
 /// escalate TO (`read-only` is the floor; nothing escalates to it).
-pub const ESCALATION_TARGETS: &[PermissionMode] =
-    &[PermissionMode::WorkspaceWrite, PermissionMode::DangerFullAccess];
+pub const ESCALATION_TARGETS: &[PermissionMode] = &[
+    PermissionMode::WorkspaceWrite,
+    PermissionMode::DangerFullAccess,
+];
 
 /// Validate the escalation argument pairing a tool schema cannot express:
 /// `sandbox_permissions` and `justification` travel together — an approval
@@ -106,7 +114,10 @@ pub fn validate_escalation_args(
         return Err("invalid escalation: sandbox_permissions requires a justification".into());
     }
     if justification.is_some() && sandbox_permissions.is_none() {
-        return Err("invalid escalation: justification is only valid together with sandbox_permissions".into());
+        return Err(
+            "invalid escalation: justification is only valid together with sandbox_permissions"
+                .into(),
+        );
     }
     if let Some(j) = justification
         && j.trim().is_empty()
@@ -260,6 +271,9 @@ pub struct EscalationRequest {
     /// The family's noun for the escalated action in user-facing texts
     /// (`"command"` for bash, `"operation"` for fs).
     pub subject: String,
+    /// The originating tool name (e.g. `"Bash"`, `"Write"`, `"Edit"`) recorded
+    /// on the approval audit trail + card.
+    pub tool_name: String,
     /// The tool-call id the approval prompt attaches to (the host's approval
     /// gate keys its pending round-trip off this).
     pub call_id: String,
@@ -336,9 +350,11 @@ mod tests {
         let root = Path::new("/tmp/pi-ext-sandbox-roots-test");
         let roots = writable_roots(root);
         // The workspace root is always present (canonicalized).
-        assert!(roots
-            .iter()
-            .any(|r| r.ends_with("pi-ext-sandbox-roots-test")));
+        assert!(
+            roots
+                .iter()
+                .any(|r| r.ends_with("pi-ext-sandbox-roots-test"))
+        );
         // Canonical + deduplicated: a second resolution adds no new entries.
         let before = roots.len();
         let mut seen: Vec<PathBuf> = Vec::new();
@@ -376,7 +392,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             ro.1,
-            &[PermissionMode::WorkspaceWrite, PermissionMode::DangerFullAccess]
+            &[
+                PermissionMode::WorkspaceWrite,
+                PermissionMode::DangerFullAccess
+            ]
         );
         let ww = WIDER_MODES
             .iter()
@@ -402,6 +421,7 @@ mod tests {
             justification: "need it".into(),
             effective_mode: effective,
             subject: "command".into(),
+            tool_name: "Bash".into(),
             call_id: "test".into(),
             signal: None,
         }
@@ -411,7 +431,10 @@ mod tests {
     async fn approve_escalation_non_widening_never_prompts() {
         // workspace-write -> workspace-write is not strictly wider.
         let err = approve_escalation(
-            req(PermissionMode::WorkspaceWrite, PermissionMode::WorkspaceWrite),
+            req(
+                PermissionMode::WorkspaceWrite,
+                PermissionMode::WorkspaceWrite,
+            ),
             None,
         )
         .await

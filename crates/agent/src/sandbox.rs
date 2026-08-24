@@ -102,9 +102,7 @@ impl SandboxPolicy {
                 ));
             }
         }
-        for dev in ["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"] {
-            s.push_str(&format!("(allow file-write* (literal \"{dev}\"))\n"));
-        }
+        s.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         s
     }
 
@@ -281,7 +279,26 @@ impl BashOperations for SandboxedBashOperations {
                 .spawn()
                 .map_err(|e| ExecutionError::Spawn(e.to_string()))?;
             let timeout = request.timeout.unwrap_or(DEFAULT_TIMEOUT);
-            run_to_completion(child, request.on_data, timeout, &request.signal).await
+            let mut result =
+                run_to_completion(child, request.on_data, timeout, &request.signal).await?;
+            // Classify a seatbelt file-write denial (EPERM) and surface the
+            // deepseek marker + escalation hint so the model recognizes a
+            // policy refusal (not a command bug) and can retry with
+            // `sandbox_permissions`. macOS seatbelt emits "Operation not
+            // permitted" on a denied write.
+            if result.exit_code != 0
+                && result
+                    .stderr
+                    .to_ascii_lowercase()
+                    .contains("operation not permitted")
+            {
+                result.stderr.push_str(&format!(
+                    "\n{}\n{}",
+                    pi_extensions::sandbox::sandbox_denial_marker(mode),
+                    pi_extensions::sandbox::escalation_hint_marker("command"),
+                ));
+            }
+            Ok(result)
         }
     }
 }
@@ -425,7 +442,10 @@ mod tests {
             root.display()
         )));
         // `/tmp` is admitted (canonicalized to /private/tmp on macOS).
-        assert!(sb.contains("(allow file-write* (subpath \"/tmp\"))") || sb.contains("(allow file-write* (subpath \"/private/tmp\"))"));
+        assert!(
+            sb.contains("(allow file-write* (subpath \"/tmp\"))")
+                || sb.contains("(allow file-write* (subpath \"/private/tmp\"))")
+        );
     }
 
     #[test]
@@ -495,7 +515,8 @@ mod tests {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
         let policy = SandboxPolicy::for_project(&root);
-        let ops = SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::WorkspaceWrite));
+        let ops =
+            SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::WorkspaceWrite));
 
         // A confined write inside the project succeeds.
         let inside = root.join("sandbox-ok.txt");
@@ -557,6 +578,14 @@ mod tests {
             return;
         }
         assert_ne!(res.exit_code, 0, "read-only denies the write");
+        // The seatbelt denial carries the deepseek marker + escalation hint
+        // so the model recognizes a policy refusal (not a command bug).
+        assert!(
+            res.stderr
+                .contains("[sandbox: file access denied under read-only mode]"),
+            "denial marker in stderr: {}",
+            res.stderr
+        );
         assert!(!inside.exists());
 
         // A read succeeds (reads are unrestricted in every mode).
@@ -568,7 +597,11 @@ mod tests {
             on_data: None,
         };
         let res = ops.exec(req).await.expect("read runs");
-        assert_eq!(res.exit_code, 0, "read succeeds under read-only: {}", res.stderr);
+        assert_eq!(
+            res.exit_code, 0,
+            "read succeeds under read-only: {}",
+            res.stderr
+        );
     }
 
     #[tokio::test]

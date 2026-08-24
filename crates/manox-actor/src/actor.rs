@@ -1850,7 +1850,10 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec!["workspace-write".to_string(), "danger-full-access".to_string()]
+            vec![
+                "workspace-write".to_string(),
+                "danger-full-access".to_string()
+            ]
         );
 
         // A command for an unknown session surfaces as an error event.
