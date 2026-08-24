@@ -2027,6 +2027,7 @@ impl Thread {
         let record = pi_extensions::session_meta::UserAttributionMeta {
             author: author.routing().to_string(),
             peer: ui.peer,
+            display_text: ui.display_text.clone(),
         };
         persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
     }

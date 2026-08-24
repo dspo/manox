@@ -92,6 +92,11 @@ pub struct UserAttributionMeta {
     /// rebuilds it as a team bubble.
     #[serde(default)]
     pub peer: bool,
+    /// The send-time display form of the message (e.g. the unwrapped body of
+    /// a peer delivery whose model-facing text is a wrapped `[from …]` form).
+    /// The reload path re-attaches it so restored bubbles match the live view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_text: Option<String>,
 }
 
 /// Active git-worktree binding persisted in the session sidecar (see

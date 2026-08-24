@@ -1009,6 +1009,10 @@ impl Workspace {
         // `Tail` natively pins to the end and keeps following; an upward user
         // scroll disengages it and landing back at the bottom re-arms it.
         self.list_state.set_follow_mode(FollowMode::Tail);
+        // Recover the settled sub-agent observation rows alongside the
+        // conversation: a restored transcript is the only record of runs that
+        // finished (or were killed) before the restart / switch.
+        self.rebuild_subagent_observation(&messages, cx);
         cx.notify();
     }
 
@@ -3541,6 +3545,10 @@ impl Workspace {
             }
             cx.notify();
         });
+        // Recover the settled sub-agent observation rows for the incoming
+        // thread after the rail reset above (a restoring thread has no
+        // messages yet — its rows land with the `HistoryRestored` rebuild).
+        self.rebuild_subagent_observation(&messages, cx);
         // If the new thread has pending interactions (e.g. it was parked
         // waiting for a user answer), re-surface them so the question card
         // appears immediately upon switching back.
@@ -5026,6 +5034,41 @@ impl Workspace {
                 .is_some_and(|t| matches!(t, RightTab::Editor));
         }
         self.hide_right_pane_if_empty(cx);
+    }
+
+    /// Rebuild the per-thread sub-agent observation state (rail rows + panel
+    /// prompt/final-text) from the restored transcript. Live rows are fed by
+    /// `SubagentProgress` events, which die with the process; this recovers
+    /// the settled rows after a restart or a thread switch-back so the rail
+    /// and panels are not left empty. Idempotent: rows upsert by address.
+    fn rebuild_subagent_observation(
+        &mut self,
+        messages: &[agent::Message],
+        cx: &mut Context<Self>,
+    ) {
+        for row in agent::subagent_restore::rebuild_from_messages(messages) {
+            let first_line = row
+                .prompt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_string);
+            self.subagent_prompts
+                .insert(row.address.clone(), row.prompt.clone());
+            if let Some(text) = &row.final_text {
+                self.subagent_final_text
+                    .insert(row.address.clone(), text.clone());
+            }
+            self.context_rail.update(cx, |r, cx| {
+                r.apply_subagent_progress(
+                    &row.address,
+                    &row.subagent_type,
+                    first_line.as_deref(),
+                    row.status,
+                    cx,
+                );
+            });
+        }
     }
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
