@@ -144,7 +144,7 @@ settings-desc-work-mode-workday = Just as capable, with less technical detail
 
 settings-section-permissions = Permissions
 settings-row-permission-readonly = Read Only
-settings-desc-permission-readonly = manox can read files in its workspace, but every mutating tool call is denied. Choose this for review and research sessions.
+settings-desc-permission-readonly = Bash runs but cannot write files (network is unrestricted); reads stay open across the filesystem. Choose this for review and research sessions.
 settings-row-permission-workspaceread = Workspace Write
 settings-desc-permission-workspaceread = manox can write files inside its workspace and run sandboxed shell commands there. Writes outside the workspace are denied.
 settings-row-permission-dangerfullaccess = Danger Full Access
@@ -423,7 +423,7 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
-slash-mode-desc = Cycle the permission mode (Read Only → Workspace Write → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately
+slash-mode-desc = Cycle the permission mode (Read Only → Workspace Write → Danger Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately
 slash-mode-unknown = Unknown permission mode "{ $mode }" — expected read-only, workspace-write, or danger-full-access
 slash-exit-desc = Archive the current thread and start a fresh one
 slash-new-desc = Archive the current thread and start a fresh one that keeps the project, permission mode, and model

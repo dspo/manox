@@ -131,7 +131,7 @@ settings-desc-work-mode-workday = 同样强大，技术细节更少
 
 settings-section-permissions = 权限
 settings-row-permission-readonly = 只读
-settings-desc-permission-readonly = manox 可以读取工作区内的文件，但所有变更类工具调用都会被拒绝。适合审查与调研场景。
+settings-desc-permission-readonly = bash 可运行但不可写文件（网络不受限）；读取对整个文件系统保持开放。适合审查与调研场景。
 settings-row-permission-workspaceread = 工作区写入
 settings-desc-permission-workspaceread = manox 可以在工作区内写入文件并运行沙箱内的 shell 命令；工作区之外的写入会被拒绝。
 settings-row-permission-dangerfullaccess = 危险完全访问
@@ -410,7 +410,7 @@ turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
-slash-mode-desc = 循环切换权限模式（只读 → 工作区写入 → 完全访问）；`/mode <名称>` 指定模式，带提示词则切换后直接开工
+slash-mode-desc = 循环切换权限模式（只读 → 工作区写入 → 危险完全访问）；`/mode <名称>` 指定模式，带提示词则切换后直接开工
 slash-mode-unknown = 未知权限模式“{ $mode }”— 应为 read-only、workspace-write 或 danger-full-access
 slash-exit-desc = 归档当前会话并开始一个新会话
 slash-new-desc = 归档当前会话并开始新会话，保留项目、权限模式与模型

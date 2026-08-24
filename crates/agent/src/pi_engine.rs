@@ -980,12 +980,9 @@ fn build_tools(
                 });
             allow
         });
-    // Per-call grant cell for the fs write fence (Write/Edit); distinct from
-    // bash's cell (separate tools, separate stamps). The shared approver +
-    // standing-mode resolver are reused.
-    let fs_grant_cell: Arc<std::sync::atomic::AtomicI64> = Arc::new(
-        std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT),
-    );
+    // Write/Edit carry the host escalation config (shared approver + standing
+    // resolver); the per-call grant is a local return value in the gate (no
+    // shared cell — Write/Edit run `Parallel`).
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
@@ -1000,7 +997,6 @@ fn build_tools(
             if matches!(name.as_str(), "Write" | "Edit") {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
-                    Arc::clone(&fs_grant_cell),
                     Arc::clone(&standing_resolver),
                 );
             }
@@ -3193,9 +3189,11 @@ async fn rebuild_session(
                 thread_id.to_string(),
             );
             attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
-            // Session swaps (Open/EnterWorktree/ExitWorktree) must carry
-            // the same path policy as fresh builds — without it the
-            // replaced session loses write confinement entirely.            attach_plugin_hooks(&mut s, &cwd);
+            // Session swaps (Open/EnterWorktree/ExitWorktree) must carry the
+            // same plugin lifecycle hooks as fresh builds, or the swapped
+            // session's PreToolUse/PostToolUse fire-and-forget shell-outs
+            // never attach (write confinement is now in ApprovalGatedTool).
+            attach_plugin_hooks(&mut s, &cwd);
             adopt_session_model(&s, pi_model, state);
             *session = s;
         }
