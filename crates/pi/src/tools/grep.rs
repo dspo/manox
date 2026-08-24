@@ -120,43 +120,12 @@ impl AgentTool for GrepTool {
         // Build the file glob filter.
         let glob_set = build_glob_filter(glob_pattern)?;
 
-        // Walk the directory tree and collect matches.
-        let (matches, matched_paths) =
+        // Walk the directory tree and collect matches plus, per matched file,
+        // the 1-indexed lines the output will display (match + context).
+        let (matches, matched_paths, displayed) =
             search_files(&search_path, &matcher, &glob_set, context_lines, limit);
         if matches.is_empty() {
             return Ok(AgentToolResult::text("No matches found"));
-        }
-
-        // Record hashline snapshots for matched files so the model can edit
-        // directly without re-reading. Limited to 20 files to bound I/O.
-        {
-            let mut store = ctx
-                .tool_state()
-                .snapshots
-                .lock()
-                .expect("hashline snapshot store poisoned");
-            for path in matched_paths.iter().take(20) {
-                if let Ok(raw) = std::fs::read_to_string(path) {
-                    let normalized = hashline::normalize_to_lf(&raw);
-                    let tag = store.record(path, &normalized);
-                    // Extract line numbers from matches for this file.
-                    let path_str = path.display().to_string();
-                    let lines: std::collections::HashSet<usize> = matches
-                        .iter()
-                        .filter_map(|m| {
-                            let prefix = format!("{path_str}:");
-                            if let Some(rest) = m.strip_prefix(&prefix) {
-                                rest.split(':').next()?.parse::<usize>().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !lines.is_empty() {
-                        store.record_seen_lines(path, &tag.tag, &lines);
-                    }
-                }
-            }
         }
 
         let joined = matches.join("\n");
@@ -168,6 +137,32 @@ impl AgentTool for GrepTool {
         };
         let result = truncate::truncate(&joined, &config);
 
+        // Record hashline snapshots for matched files so the model can edit
+        // directly without re-reading. Limited to 20 files to bound I/O.
+        // Seen-line provenance is attached only when the output was NOT
+        // truncated — a clipped transcript may have dropped rows the
+        // provenance claims were shown, and over-claiming would let the gate
+        // accept edits on lines the model never received. No provenance means
+        // the gate does not fire (applies as before), the safe fallback.
+        {
+            let mut store = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned");
+            for path in matched_paths.iter().take(20) {
+                if let Ok(raw) = std::fs::read_to_string(path) {
+                    let normalized = hashline::normalize_to_lf(&raw);
+                    let tag = store.record(path, &normalized);
+                    if !result.was_truncated
+                        && let Some(lines) = displayed.get(path)
+                        && !lines.is_empty()
+                    {
+                        store.record_seen_lines(path, &tag.tag, lines);
+                    }
+                }
+            }
+        }
         let mut output = result.content;
         if result.was_truncated {
             output.push_str(&format!(
@@ -208,18 +203,25 @@ fn build_glob_filter(pattern: Option<&str>) -> Result<Option<globset::GlobSet>, 
 }
 
 /// Search files for a pattern with the ripgrep engine. Returns the formatted
-/// matches plus the paths of files that produced at least one match, in
-/// first-match order (deduplicated), so the caller can record hashline
-/// snapshots for them.
+/// matches, the paths of files that produced at least one match (in
+/// first-match order, deduplicated), and the 1-indexed lines each matched
+/// file's output displays (match lines plus context), so the caller can
+/// record hashline snapshots with accurate seen-line provenance.
 fn search_files(
     search_path: &Path,
     matcher: &RegexMatcher,
     glob_set: &Option<globset::GlobSet>,
     context_lines: usize,
     limit: usize,
-) -> (Vec<String>, Vec<PathBuf>) {
+) -> (
+    Vec<String>,
+    Vec<PathBuf>,
+    std::collections::HashMap<PathBuf, std::collections::HashSet<usize>>,
+) {
     let mut results: Vec<String> = Vec::new();
     let mut matched_paths: Vec<PathBuf> = Vec::new();
+    let mut displayed: std::collections::HashMap<PathBuf, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
     let mut searcher = SearcherBuilder::new()
         // Ripgrep semantics: a NUL byte marks the file binary, and the search
         // stops there instead of reporting garbage matches.
@@ -283,6 +285,7 @@ fn search_files(
                 continue;
             };
             let lines: Vec<&str> = content.lines().collect();
+            let shown = displayed.entry(path.to_path_buf()).or_default();
             for (line_no, _) in &sink.matches {
                 results.push(format_with_context(
                     &lines,
@@ -290,10 +293,19 @@ fn search_files(
                     context_lines,
                     &display_path,
                 ));
+                // Mirror format_with_context's window: match line ± context,
+                // clamped to the file.
+                let start = line_no.saturating_sub(context_lines as u64);
+                let end = (*line_no + context_lines as u64).min(lines.len() as u64);
+                for l in start..=end {
+                    shown.insert(l as usize);
+                }
             }
         } else {
+            let shown = displayed.entry(path.to_path_buf()).or_default();
             for (line_no, line) in &sink.matches {
                 results.push(format!("{display_path}:{line_no}:{line}"));
+                shown.insert(*line_no as usize);
             }
         }
 
@@ -304,7 +316,7 @@ fn search_files(
         }
     }
 
-    (results, matched_paths)
+    (results, matched_paths, displayed)
 }
 
 /// Collects matched lines for one file while the searcher runs. The searcher
@@ -385,7 +397,7 @@ mod tests {
         std::fs::write(nested.join("hit.rs"), "fn needle() {}\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _) = search_files(dir.path(), &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10);
         let output = matches.join("\n");
         assert!(
             output.contains("src/deep/hit.rs:1:"),
@@ -406,7 +418,7 @@ mod tests {
         std::fs::write(&file, "fn needle() {}\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _) = search_files(&file, &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(&file, &matcher, &None, 0, 10);
         let output = matches.join("\n");
         assert!(
             output.starts_with("target.rs:1:"),
@@ -421,7 +433,7 @@ mod tests {
         std::fs::write(&file, "fn a() {\r\nneedle()\r\n}\r\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _) = search_files(dir.path(), &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10);
         let output = matches.join("\n");
         assert!(
             output.contains("win.rs:2:needle()"),

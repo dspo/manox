@@ -279,3 +279,219 @@ async fn edit_restores_crlf_and_trailing_newline() {
         "fn a() {\r\n    y();\r\n}\r\n"
     );
 }
+
+#[tokio::test]
+async fn partial_read_gates_unseen_lines_then_reveal_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.rs");
+    let content: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&file, content).unwrap();
+    let ctx = TestCtx::new(dir.path());
+
+    // Read lines 1..=3; the numbered body displays those plus trailing
+    // context. Line 20 is never shown.
+    let read_out = ReadTool
+        .execute(
+            "1",
+            json!({"path": "p.rs", "offset": 1, "limit": 3}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let tag = tag_of(text_of(&read_out)).to_string();
+
+    // Edit line 20 — never displayed — the gate rejects with a reveal.
+    let patch = format!("[{}#{}]\nSWAP 20.=20:\n+edited", file.display(), tag);
+    let err = EditTool
+        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .await
+        .expect_err("unseen line must be gated")
+        .to_string();
+    assert!(err.contains("never displayed"), "{err}");
+    assert!(err.contains("20:line 20"), "reveal inlines content: {err}");
+    // File untouched by the rejected edit.
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("edited"));
+    // The full-width reveal merged line 20 into seen_lines: the same patch
+    // retries straight through without a re-read.
+    let retried = EditTool
+        .execute("3", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        !retried.is_error,
+        "straight retry after reveal must succeed: {}",
+        text_of(&retried)
+    );
+    assert!(std::fs::read_to_string(&file).unwrap().contains("edited"));
+}
+
+#[tokio::test]
+async fn displayed_context_lines_pass_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("c.rs");
+    let content: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&file, content).unwrap();
+    let ctx = TestCtx::new(dir.path());
+
+    // Read lines 1..=3; format_numbered_range appends 3 trailing context
+    // lines, so line 5 (context) was displayed even though it was outside
+    // the requested range.
+    let read_out = ReadTool
+        .execute(
+            "1",
+            json!({"path": "c.rs", "offset": 1, "limit": 3}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let tag = tag_of(text_of(&read_out)).to_string();
+
+    let patch = format!("[{}#{}]\nSWAP 5.=5:\n+edited 5", file.display(), tag);
+    let out = EditTool
+        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        !out.is_error,
+        "displayed context line must pass the gate: {}",
+        text_of(&out)
+    );
+}
+
+#[tokio::test]
+async fn grep_provenance_gates_non_matched_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("s.rs");
+    let content: String = (1..=10).map(|i| format!("row {i}\n")).collect();
+    std::fs::write(&file, content).unwrap();
+    let ctx = TestCtx::new(dir.path());
+
+    // Grep displays only the matched line (no context): line 5.
+    let out = GrepTool
+        .execute(
+            "1",
+            json!({"pattern": "row 5", "path": dir.path().to_str().unwrap()}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "grep failed: {}", text_of(&out));
+
+    let tag = ctx
+        .state
+        .snapshots
+        .lock()
+        .unwrap()
+        .head(&file)
+        .expect("grep recorded a snapshot")
+        .tag
+        .clone();
+
+    // Editing a never-displayed line is gated; the reveal merges the line
+    // into seen_lines so the same patch retries clean (no write on reject).
+    let gate_patch = format!("[{}#{}]\nSWAP 9.=9:\n+other", file.display(), tag);
+    let gated = EditTool
+        .execute(
+            "3",
+            json!({"patch": gate_patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect_err("non-matched line must be gated")
+        .to_string();
+    assert!(gated.contains("never displayed"), "{gated}");
+    assert!(
+        !std::fs::read_to_string(&file).unwrap().contains("other"),
+        "rejected edit must not touch the file"
+    );
+    let retried = EditTool
+        .execute(
+            "4",
+            json!({"patch": gate_patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !retried.is_error,
+        "straight retry after reveal must succeed: {}",
+        text_of(&retried)
+    );
+
+    // Fresh context: grep again and edit the matched line — passes the gate.
+    let ctx2 = TestCtx::new(dir.path());
+    let out2 = GrepTool
+        .execute(
+            "5",
+            json!({"pattern": "row 5", "path": dir.path().to_str().unwrap()}),
+            CancellationToken::new(),
+            &ctx2,
+        )
+        .await
+        .unwrap();
+    assert!(!out2.is_error, "grep failed: {}", text_of(&out2));
+    let tag2 = ctx2
+        .state
+        .snapshots
+        .lock()
+        .unwrap()
+        .head(&file)
+        .expect("grep recorded a snapshot")
+        .tag
+        .clone();
+    let ok_patch = format!("[{}#{}]\nSWAP 5.=5:\n+hit", file.display(), tag2);
+    let ok = EditTool
+        .execute(
+            "6",
+            json!({"patch": ok_patch}),
+            CancellationToken::new(),
+            &ctx2,
+        )
+        .await
+        .unwrap();
+    assert!(!ok.is_error, "matched line must pass: {}", text_of(&ok));
+}
+
+#[tokio::test]
+async fn edit_chain_after_full_seen_recording_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("w.rs");
+    let ctx = TestCtx::new(dir.path());
+
+    // Write mints a snapshot with every line seen.
+    WriteTool
+        .execute(
+            "1",
+            json!({"path": "w.rs", "content": "a\nb\nc\n"}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let tag = ctx
+        .state
+        .snapshots
+        .lock()
+        .unwrap()
+        .head(&file)
+        .expect("write recorded a snapshot")
+        .tag
+        .clone();
+
+    // A follow-up edit on any line passes the gate.
+    let patch = format!("[{}#{}]\nSWAP 2.=2:\n+B", file.display(), tag);
+    let out = EditTool
+        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        !out.is_error,
+        "edit after write-authored seen must pass: {}",
+        text_of(&out)
+    );
+}

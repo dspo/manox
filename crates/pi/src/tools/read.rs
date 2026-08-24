@@ -83,28 +83,12 @@ impl AgentTool for ReadTool {
         let path_display = path.display().to_string();
 
         // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = {
-            let mut store = ctx.tool_state().snapshots.lock().expect("hashline snapshot store poisoned");
-            let snap = store.record(&path, &text);
-            // Record which lines were displayed.
-            let displayed: std::collections::HashSet<usize> = match (offset, limit) {
-                (None, None) => {
-                    let count = text.lines().count();
-                    if count <= ReadTool::MAX_READ_LINES {
-                        (1..=count).collect()
-                    } else {
-                        (1..=ReadTool::MAX_READ_LINES).collect()
-                    }
-                }
-                _ => {
-                    let start = offset.unwrap_or(1);
-                    let end = limit.map(|l| (start + l - 1).min(text.lines().count())).unwrap_or(text.lines().count());
-                    (start..=end).collect()
-                }
-            };
-            store.record_seen_lines(&path, &snap.tag, &displayed);
-            snap
-        };
+        let snap = ctx
+            .tool_state()
+            .snapshots
+            .lock()
+            .expect("hashline snapshot store poisoned")
+            .record(&path, &text);
 
         let formatted = match (offset, limit) {
             (None, None) => format_full_read(&path_display, &text, &snap.tag),
@@ -120,6 +104,18 @@ impl AgentTool for ReadTool {
             max_lines: Self::DEFAULT_MAX_LINES,
         };
         let result = truncate::truncate(&formatted, &config);
+
+        // Record the lines the OUTPUT actually shows, parsed from the possibly
+        // truncated body — intent ranges would over-claim when the byte/line
+        // guard clipped rows the model never received.
+        let displayed = hashline::parse_seen_lines_from_body(&result.content);
+        if !displayed.is_empty() {
+            ctx.tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned")
+                .record_seen_lines(&path, &snap.tag, &displayed);
+        }
 
         let mut output = result.content;
         if result.was_truncated {

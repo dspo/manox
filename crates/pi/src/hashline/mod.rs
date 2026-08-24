@@ -28,6 +28,202 @@ pub use parser::{FilePatch, InsPos, Op, ParseError, parse_patch};
 pub use recovery::{RecoverError, try_recover, try_recover_with_snapshot};
 pub use snapshot::{Snapshot, SnapshotStore};
 
+use std::collections::HashSet;
+
+/// Parse the 1-indexed line numbers a numbered hashline body actually
+/// displayed. Only rows whose `digits:`-prefixed prefix parse contribute —
+/// headers, `...` gap markers, footers, and free text never match, and
+/// optional leading marker characters (`>` match / ` ` context, as grep
+/// emits) are tolerated. Parse the OUTPUT after truncation so the
+/// provenance reflects exactly what reached the model.
+pub fn parse_seen_lines_from_body(body: &str) -> HashSet<usize> {
+    let mut seen = HashSet::new();
+    for line in body.lines() {
+        // Tolerate leading marker characters (grep's `>` / ` ` prefix).
+        let stripped = line.trim_start_matches(['>', ' ']);
+        let Some(colon) = stripped.find(':') else {
+            continue;
+        };
+        let prefix = &stripped[..colon];
+        if prefix.is_empty()
+            || prefix.starts_with('0')
+            || !prefix.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        if let Ok(n) = prefix.parse::<usize>() {
+            seen.insert(n);
+        }
+    }
+    seen
+}
+
+/// Compress a line list into a sorted `1-4, 7, 10-12` range string.
+pub fn format_line_ranges(lines: &[usize]) -> String {
+    let mut sorted: Vec<usize> = lines.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = sorted[0];
+    let mut prev = sorted[0];
+    for &cur in sorted.iter().skip(1) {
+        if cur == prev + 1 {
+            prev = cur;
+            continue;
+        }
+        parts.push(if start == prev {
+            start.to_string()
+        } else {
+            format!("{start}-{prev}")
+        });
+        start = cur;
+        prev = cur;
+    }
+    parts.push(if start == prev {
+        start.to_string()
+    } else {
+        format!("{start}-{prev}")
+    });
+    parts.join(", ")
+}
+
+/// Upper bound on unseen anchor lines whose content is inlined into a
+/// seen-line rejection. Big enough for the common "edit a whole function
+/// body" retry, small enough to keep the error human-readable.
+pub const SEEN_LINE_REVEAL_CAP: usize = 40;
+/// Per-revealed-line character cap so a minified megabyte line can never
+/// dump into the error message. Lines over the cap are trimmed and the
+/// whole reveal is flagged truncated.
+pub const SEEN_LINE_REVEAL_MAX_COLUMNS: usize = 512;
+
+/// The seen-line gate: reject anchored edits on lines the read that minted
+/// the cited tag never displayed. When the reveal covers every unseen
+/// anchor in full width, those lines merge into the snapshot's `seen_lines`
+/// and the message invites a straight retry with the same `[path#tag]`
+/// header; when truncated, the range re-read guidance stays intact. Only
+/// runs on the no-drift path — on recovery the line numbers shift, so
+/// provenance does not index the live content 1:1. Returns `Ok(())` when
+/// no snapshot carries provenance or every anchor was displayed.
+pub fn assert_seen_lines(
+    store: &mut snapshot::SnapshotStore,
+    path: &std::path::Path,
+    tag: &str,
+    ops: &[parser::Op],
+    current: &str,
+) -> Result<(), String> {
+    let seen_count = store
+        .get(path, tag)
+        .and_then(|s| s.seen_lines.as_ref())
+        .map(|seen| if seen.is_empty() { 0 } else { seen.len() })
+        .unwrap_or(0);
+    if seen_count == 0 {
+        // Absent or empty provenance: the tag was externally minted or the
+        // snapshot aged out. Apply as before.
+        return Ok(());
+    }
+
+    let mut unseen: Vec<usize> = Vec::new();
+    for op in ops {
+        match op {
+            parser::Op::Swap { start, end, .. } | parser::Op::Del { start, end } => {
+                for line in *start..=*end {
+                    unseen.push(line);
+                }
+            }
+            parser::Op::Ins {
+                anchor: Some(a), ..
+            } => unseen.push(*a),
+            parser::Op::SwapBlk { start, .. }
+            | parser::Op::DelBlk { start }
+            | parser::Op::InsBlkPost { anchor: start, .. } => unseen.push(*start),
+            parser::Op::Ins { anchor: None, .. } => {}
+        }
+    }
+    let seen_ref = &store
+        .get(path, tag)
+        .and_then(|s| s.seen_lines.clone())
+        .unwrap_or_default();
+    unseen.retain(|line| !seen_ref.contains(line));
+    if unseen.is_empty() {
+        return Ok(());
+    }
+    unseen.sort_unstable();
+    unseen.dedup();
+
+    let path_display = path.display().to_string();
+    let ranges = format_line_ranges(&unseen);
+    let source_lines: Vec<&str> = current.lines().collect();
+
+    let reveal_count = unseen.len().min(SEEN_LINE_REVEAL_CAP);
+    let mut revealed: Vec<(usize, String)> = Vec::new();
+    let mut column_truncated = false;
+    for &line in &unseen[..reveal_count] {
+        // Out-of-range anchors are caught by apply with a better message;
+        // skip them so they never join the revealed set.
+        if line < 1 || line > source_lines.len() {
+            continue;
+        }
+        let source = source_lines[line - 1];
+        if source.len() > SEEN_LINE_REVEAL_MAX_COLUMNS {
+            let end = source
+                .char_indices()
+                .nth(SEEN_LINE_REVEAL_MAX_COLUMNS)
+                .map(|(i, _)| i)
+                .unwrap_or(source.len());
+            revealed.push((line, format!("{}…", &source[..end])));
+            column_truncated = true;
+        } else {
+            revealed.push((line, source.to_string()));
+        }
+    }
+    let truncated = unseen.len() > reveal_count || column_truncated;
+    // Only merge when the reveal covered every unseen anchor in full width:
+    // a truncated reveal would let the model split a blind edit into
+    // <=cap-line retries and land it without the required range re-read.
+    if !truncated
+        && let Some(snap) = store.get_mut(path, tag)
+        && let Some(seen) = &mut snap.seen_lines
+    {
+        let revealed_lines: HashSet<usize> = revealed.iter().map(|(l, _)| *l).collect();
+        seen.extend(&revealed_lines);
+    }
+
+    let header = format!(
+        "This edit anchors to lines {ranges} of {path_display} that \
+         [{path_display}#{tag}] never displayed (it showed a partial range, \
+         a search hit, or a folded summary)."
+    );
+    let selector = ranges.replace(", ", ",");
+    let preview: String = revealed
+        .iter()
+        .map(|(line, text)| format!("  {line}:{text}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if revealed.is_empty() {
+        return Err(format!(
+            "{header} Re-read them in full first with a ranged read like \
+             `{path_display}:{selector}`, then re-issue the edit."
+        ));
+    }
+    if truncated {
+        return Err(format!(
+            "{header} Preview of the actual file content at the first {} unseen line(s):\n{preview}\n\
+             The range exceeds the inline preview cap — re-read the remainder with \
+             `{path_display}:{selector}` before re-issuing the edit.",
+            revealed.len()
+        ));
+    }
+    Err(format!(
+        "{header} Actual file content at those lines:\n{preview}\n\
+         Verify the content matches what you intend to touch, then re-issue the edit with the \
+         same [{path_display}#{tag}] header — a straight retry now succeeds without a re-read. \
+         If the content does NOT match, fix your line numbers."
+    ))
+}
+
 /// A 1-indexed inclusive line range for partial display. `end: None` extends
 /// to the end of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

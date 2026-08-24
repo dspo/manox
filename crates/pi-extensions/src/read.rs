@@ -115,46 +115,62 @@ impl AgentTool for SelectorReadTool {
         let path_display = path.display().to_string();
 
         // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = {
-            let mut store = ctx.tool_state().snapshots.lock().expect("hashline snapshot store poisoned");
-            let snap = store.record(&path, &text);
-            // Record which lines were displayed.
-            let displayed: std::collections::HashSet<usize> = match &selector {
-                Selector::Lines(ranges) => {
-                    let total = text.lines().count();
-                    ranges.iter().flat_map(|r| {
-                        let start = r.start;
-                        let end = r.end.unwrap_or(total).min(total);
-                        start..=end
-                    }).collect()
-                }
-                Selector::Raw => (1..=text.lines().count()).collect(),
-                Selector::RawLines(ranges) => {
-                    let total = text.lines().count();
-                    ranges.iter().flat_map(|r| {
-                        let start = r.start;
-                        let end = r.end.unwrap_or(total).min(total);
-                        start..=end
-                    }).collect()
-                }
-            };
-            store.record_seen_lines(&path, &snap.tag, &displayed);
-            snap
-        };
+        let snap = ctx
+            .tool_state()
+            .snapshots
+            .lock()
+            .expect("hashline snapshot store poisoned")
+            .record(&path, &text);
 
         let raw_selector = matches!(selector, Selector::Raw | Selector::RawLines(_));
-        let formatted = match selector {
+        let formatted = match &selector {
             Selector::Lines(ranges) => {
-                hashline::format_numbered_range(&path_display, &text, &snap.tag, &ranges)
+                hashline::format_numbered_range(&path_display, &text, &snap.tag, ranges)
             }
             Selector::Raw => hashline::format_raw(&text, None),
-            Selector::RawLines(ranges) => hashline::format_raw(&text, Some(&ranges)),
+            Selector::RawLines(ranges) => hashline::format_raw(&text, Some(ranges)),
         };
         let config = TruncateConfig {
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_lines: Self::DEFAULT_MAX_LINES,
         };
         let result = truncate::truncate(&formatted, &config);
+
+        // Record the lines the OUTPUT actually shows. Numbered bodies carry
+        // their line numbers, so the (possibly truncated) body parses
+        // directly; raw bodies carry no numbers, so the requested ranges are
+        // trusted only when the output was not clipped. Over-claiming would
+        // let the gate accept edits on lines the model never received.
+        let displayed: std::collections::HashSet<usize> = if raw_selector {
+            if result.was_truncated {
+                std::collections::HashSet::new()
+            } else {
+                match &selector {
+                    Selector::Raw => (1..=text.lines().count()).collect(),
+                    Selector::RawLines(ranges) => {
+                        let total = text.lines().count();
+                        ranges
+                            .iter()
+                            .flat_map(|r| {
+                                let start = r.start;
+                                let end = r.end.unwrap_or(total).min(total);
+                                start..=end
+                            })
+                            .collect()
+                    }
+                    Selector::Lines(_) => std::collections::HashSet::new(),
+                }
+            }
+        } else {
+            hashline::parse_seen_lines_from_body(&result.content)
+        };
+        if !displayed.is_empty() {
+            ctx.tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned")
+                .record_seen_lines(&path, &snap.tag, &displayed);
+        }
         let mut output = result.content;
         if result.was_truncated {
             output.push_str(&format!(

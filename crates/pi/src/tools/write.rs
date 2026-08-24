@@ -75,14 +75,22 @@ impl AgentTool for WriteTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
 
-        // Record a snapshot so subsequent edit calls have a valid tag.
+        // Record a snapshot so subsequent edit calls have a valid tag. The
+        // model authored the whole file, so every line counts as seen — a
+        // follow-up edit on the returned tag must not trip the seen-line gate.
         let normalized = hashline::normalize_to_lf(&content);
-        let snap = ctx
-            .tool_state()
-            .snapshots
-            .lock()
-            .expect("hashline snapshot store poisoned")
-            .record(&path, &normalized);
+        let snap = {
+            let mut store = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned");
+            let snap = store.record(&path, &normalized);
+            let all_lines: std::collections::HashSet<usize> =
+                (1..=normalized.lines().count()).collect();
+            store.record_seen_lines(&path, &snap.tag, &all_lines);
+            snap
+        };
 
         let mut output = format!("Wrote file: {path}", path = path.display());
 

@@ -8,13 +8,12 @@
 // newline are restored so the edit is a minimal content delta.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::path::PathBuf;
+
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
-use crate::hashline::parser::Op;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
@@ -106,22 +105,23 @@ impl AgentTool for EditTool {
             let current = hashline::normalize_to_lf(&raw);
             let current_tag = hashline::compute_tag(&current);
 
-            // Seen-line gating: reject edits targeting lines the read tool
-            // never displayed. Only applies when the snapshot has provenance.
-            {
-                let store = ctx
-                    .tool_state()
-                    .snapshots
-                    .lock()
-                    .expect("hashline snapshot store poisoned");
-                if let Some(snapshot) = store.get(&path, &fp.tag)
-                    && let Some(ref seen) = snapshot.seen_lines
-                {
-                    check_seen_lines(&fp.ops, seen, &current, &path_display)?;
-                }
-            }
-
             let new_text = if current_tag == fp.tag {
+                // Seen-line gate — only on the no-drift path, where anchor line
+                // numbers index the tagged content 1:1. On recovery the numbers
+                // shift, so provenance does not apply.
+                hashline::assert_seen_lines(
+                    &mut ctx
+                        .tool_state()
+                        .snapshots
+                        .lock()
+                        .expect("hashline snapshot store poisoned"),
+                    &path,
+                    &fp.tag,
+                    &fp.ops,
+                    &current,
+                )
+                .map_err(ToolError::ExecutionFailed)?;
+
                 hashline::apply(&current, &fp.ops)
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
@@ -146,13 +146,21 @@ impl AgentTool for EditTool {
             })?;
 
             // Record snapshot of LF-normalized text, consistent with Read tool.
+            // The model authored the whole file through this patch (or the diff
+            // it produced), so every line counts as seen — a follow-up edit on
+            // the returned tag must not trip the gate.
             let snap_text = hashline::normalize_to_lf(&new_text);
-            let new_snap = ctx
-                .tool_state()
-                .snapshots
-                .lock()
-                .expect("hashline snapshot store poisoned")
-                .record(&path, &snap_text);
+            let new_snap = {
+                let mut store = ctx
+                    .tool_state()
+                    .snapshots
+                    .lock()
+                    .expect("hashline snapshot store poisoned");
+                let snap = store.record(&path, &snap_text);
+                let all_lines: HashSet<usize> = (1..=snap_text.lines().count()).collect();
+                store.record_seen_lines(&path, &snap.tag, &all_lines);
+                snap
+            };
             let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
             let diff = if edit_diff::is_diff_empty(&diff) {
                 "(no changes)".to_string()
@@ -205,64 +213,6 @@ fn persist(text: &str, crlf: bool, bom: bool, trailing_nl: bool) -> String {
         }
     }
     out
-}
-
-/// Check that every anchor line referenced by the ops was displayed by the
-/// read tool. Returns an error with context when any line is unseen.
-fn check_seen_lines(
-    ops: &[Op],
-    seen: &HashSet<usize>,
-    current: &str,
-    path_display: &str,
-) -> Result<(), ToolError> {
-    let mut unseen: Vec<usize> = Vec::new();
-    for op in ops {
-        let anchor_lines = op_anchor_lines(op);
-        for &line in &anchor_lines {
-            if !seen.contains(&line) {
-                unseen.push(line);
-            }
-        }
-    }
-    if unseen.is_empty() {
-        return Ok(());
-    }
-
-    unseen.sort();
-    unseen.dedup();
-
-    // Build context: show the current content of each unseen line.
-    let lines: Vec<&str> = current.lines().collect();
-    let mut context = String::new();
-    for &line in &unseen {
-        if line <= lines.len() {
-            use std::fmt::Write as _;
-            let _ = write!(context, "\n  line {line}: {}", lines[line - 1]);
-        } else {
-            let _ = write!(context, "\n  line {line}: <out of bounds>");
-        }
-    }
-
-    Err(ToolError::ExecutionFailed(format!(
-        "Edit rejected for {path_display}: the following lines were not displayed by `read` \
-         or `search` and cannot be edited without a current view. \
-         Re-read the file with `read` to refresh the tag and line numbers, \
-         then retry the edit.{}",
-        context
-    )))
-}
-
-/// Collect all 1-indexed anchor lines referenced by a single op.
-fn op_anchor_lines(op: &Op) -> Vec<usize> {
-    match op {
-        Op::Swap { start, end, .. } => (*start..=*end).collect(),
-        Op::Del { start, end } => (*start..=*end).collect(),
-        Op::Ins { anchor: Some(a), .. } => vec![*a],
-        Op::Ins { anchor: None, .. } => vec![],
-        Op::SwapBlk { start, .. } => vec![*start],
-        Op::DelBlk { start } => vec![*start],
-        Op::InsBlkPost { anchor, .. } => vec![*anchor],
-    }
 }
 
 #[cfg(test)]

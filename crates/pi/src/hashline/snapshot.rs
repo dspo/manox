@@ -113,6 +113,14 @@ impl SnapshotStore {
         self.by_path.get(path).and_then(|v| v.last())
     }
 
+    /// Mutable lookup of a historical snapshot by `(path, tag)`. Used to merge
+    /// revealed lines into `seen_lines` after a gate rejection surfaced them.
+    pub fn get_mut(&mut self, path: &Path, tag: &str) -> Option<&mut Snapshot> {
+        self.by_path
+            .get_mut(path)
+            .and_then(|versions| versions.iter_mut().find(|s| s.tag == tag))
+    }
+
     /// Look up a snapshot by `(path, full_text)` — exact text match. Does not
     /// refresh recency. Returns `None` when no version matches.
     pub fn by_content(&self, path: &Path, full_text: &str) -> Option<&Snapshot> {
@@ -185,7 +193,9 @@ impl SnapshotStore {
         // Keep only the newest MAX_VERSIONS_PER_PATH.
         if merged.len() > MAX_VERSIONS_PER_PATH {
             merged.sort_by_key(|a| a.recorded_at);
-            let removed: Vec<_> = merged.drain(..merged.len() - MAX_VERSIONS_PER_PATH).collect();
+            let removed: Vec<_> = merged
+                .drain(..merged.len() - MAX_VERSIONS_PER_PATH)
+                .collect();
             for r in &removed {
                 self.total_bytes = self.total_bytes.saturating_sub(r.text.len());
             }
