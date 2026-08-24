@@ -2051,7 +2051,13 @@ impl Workspace {
             thread_bound,
             sidecar,
         });
-        self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
+        // The watcher's only job is capturing the CLI session id into the
+        // sidecar; thread-bound sessions carry none, and starting it would
+        // only claim ledger files a top-level watcher in the same cwd needs
+        // to record its own sidecar's resume target.
+        if !thread_bound {
+            self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
+        }
         self.sync_sidebar_external(cx);
         self.place_external_session(&id, placement, window, cx);
     }
@@ -2703,9 +2709,10 @@ impl Workspace {
     }
 
     /// Mirror an external agent's OSC title (`TerminalEvent::Title`) into its
-    /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
-    /// the titlebar when the active session's title changed. No-op when the
-    /// session was already removed (a spurious title after close).
+    /// `ExternalSession`, keep the durable sidecar's title in sync, and
+    /// refresh the sidebar projection + titlebar when a visible title
+    /// changed. No-op when the session was already removed (a spurious title
+    /// after close) or the title sanitizes to the stored value.
     fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
         let active = self.active_external.as_deref() == Some(id);
         // TUI-set titles arrive verbatim; sanitize so the stored form is a
@@ -2714,35 +2721,30 @@ impl Workspace {
         let new = title
             .as_deref()
             .and_then(crate::external_session::sanitize_osc_title);
-        let changed = self.external_sessions.iter_mut().any(|s| {
-            if s.id != id {
-                return false;
+        let Some(session) = self.external_sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        if session.title == new {
+            return;
+        }
+        let thread_bound = session.thread_bound;
+        session.title = new.clone();
+        // Keep the durable sidecar's title in sync so a later exit offers
+        // the resumable row under the latest OSC title rather than the one
+        // captured at spawn / last resume.
+        if let Some(sidecar) = session.sidecar.as_mut() {
+            sidecar.title = new.clone();
+            if let Err(e) = write_sidecar(sidecar) {
+                tracing::warn!(error = %e, id, "external session sidecar title update failed");
             }
-            if s.title == new {
-                return false;
-            }
-            s.title = new.clone();
-            true
-        });
-        if changed {
-            // Keep the durable sidecar's title in sync so a later exit offers
-            // the resumable row under the latest OSC title rather than the one
-            // captured at spawn / last resume.
-            if let Some(sidecar) = self
-                .external_sessions
-                .iter_mut()
-                .find(|s| s.id == id)
-                .and_then(|s| s.sidecar.as_mut())
-            {
-                sidecar.title = new.clone();
-                if let Err(e) = write_sidecar(sidecar) {
-                    tracing::warn!(error = %e, id, "external session sidecar title update failed");
-                }
-            }
+        }
+        // Thread-bound sessions never project into the sidebar; rebuilding
+        // the projection on their title churn would be pure waste.
+        if !thread_bound {
             self.sync_sidebar_external(cx);
-            if active {
-                cx.notify();
-            }
+        }
+        if active {
+            cx.notify();
         }
     }
 

@@ -350,7 +350,10 @@ impl ResumeSidecar {
                 .expect("sidecar agent_id is always an agent kind"),
             created_at: self.created_at,
             project: self.project.clone(),
-            title: self.title.clone(),
+            // Pre-sanitize sidecars (written before title sanitization
+            // existed) may carry line breaks; fold so the resumable row
+            // stays single-line like every live row.
+            title: self.title.as_deref().and_then(sanitize_osc_title),
             cx_session_id: String::new(),
             socket_path: None,
             resumable: true,
@@ -1009,6 +1012,13 @@ mod tests {
         );
         assert_eq!(super::sanitize_osc_title(" \n\t "), None);
         assert_eq!(super::sanitize_osc_title(""), None);
+        // Control bytes drop without injecting spaces; surrounding
+        // whitespace trims away.
+        assert_eq!(super::sanitize_osc_title("a\x07\x07b"), Some("ab".into()));
+        assert_eq!(
+            super::sanitize_osc_title("  \x1b lead\ntrail \t "),
+            Some("lead trail".into())
+        );
         assert_eq!(
             super::sanitize_osc_title(&"a".repeat(200)).map(|t| t.len()),
             Some(120)

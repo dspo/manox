@@ -252,6 +252,10 @@ Only top-level external sessions list here: a session mounted as a right-pane
 [SessionTab](#sessiontab) is thread-bound (`ExternalSession.thread_bound`) — a
 resource of its thread — and never projects into this list, live or resumable
 (thread-bound spawns write no [`ResumeSidecar`](#resumesidecar)).
+Row titles render single-line with ellipsis (`.truncate()` replaces the old
+wrap-and-clip `overflow_hidden`), so no title — sanitized OSC titles and
+pre-sanitize sidecar titles folded at projection alike — can stretch a row at
+any sidebar width.
 
 #### SidebarThreadRowMenu
 
