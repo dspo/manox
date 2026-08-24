@@ -40,13 +40,17 @@ pub(crate) fn spawn_pty(spec: &LaunchSpec, extra_env: &[(&str, String)]) -> Resu
         cmd.arg(arg);
     }
     // manox is the host terminal for every embedded agent PTY, regardless of how
-    // manox itself was launched. A GUI launch (Finder/Dock/Spotlight) carries no
+    // manox itself was launched. TERM_PROGRAM claims iTerm.app: capability-gating
+    // TUIs (Claude Code's kitty keyboard, synchronized output) whitelist known
+    // terminal identities and degrade on unknown ones, and the emulator backs
+    // iTerm.app's progressive features (kitty keyboard via alacritty, sync
+    // updates via vte). A GUI launch (Finder/Dock/Spotlight) carries no
     // TERM/COLORTERM in its environment, and CommandBuilder snapshots the parent
     // env — so without these fallbacks the agent inherits a terminal-less
     // environment and TUIs (Claude Code) render monochrome and skip mouse capture.
     // `env_remove`, `env`, and `extra_env` apply after these and win, so explicit
     // spec values keep their precedence.
-    cmd.env("TERM_PROGRAM", "manox");
+    cmd.env("TERM_PROGRAM", "iTerm.app");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     if std::env::var_os("TERM").is_none() {
         cmd.env("TERM", "xterm-256color");
@@ -171,15 +175,15 @@ mod tests {
         (lines, pty)
     }
 
-    /// The child always sees manox as its terminal host: `TERM_PROGRAM` is
-    /// manox, and `TERM`/`COLORTERM` are non-empty whether inherited from a
-    /// terminal-bearing parent env or supplied by the spawn_pty fallbacks.
+    /// The child always sees the claimed terminal host identity: `TERM_PROGRAM`
+    /// is iTerm.app, and `TERM`/`COLORTERM` are non-empty whether inherited from
+    /// a terminal-bearing parent env or supplied by the spawn_pty fallbacks.
     #[test]
     fn spawn_pty_always_reports_terminal_env() {
         let (lines, mut pty) = spawn_env_and_collect(BTreeMap::new(), vec![]);
         assert!(
-            lines.iter().any(|l| l == "TERM_PROGRAM=manox"),
-            "expected TERM_PROGRAM=manox in child env, got: {lines:?}"
+            lines.iter().any(|l| l == "TERM_PROGRAM=iTerm.app"),
+            "expected TERM_PROGRAM=iTerm.app in child env, got: {lines:?}"
         );
         for key in ["TERM", "COLORTERM"] {
             let prefix = format!("{key}=");

@@ -3,9 +3,9 @@
 //!
 //! Coverage: enter/backspace/tab/escape/space, arrows + home/end with
 //! xterm modifier suffixes, page up/down/insert/delete, F1–F12, and the
-//! printable ASCII range (ctrl-a..z, alt-prefix, shift-uppercase). The
-//! kitty keyboard protocol flags are intentionally not honored (rare in
-//! TUI agents).
+//! printable ASCII range (ctrl-a..z, alt-prefix, shift-uppercase). Modified
+//! enters encode as kitty CSI-u when the program pushed the disambiguate
+//! flag (`CSI > 1 u`); every other key keeps the legacy encoding.
 
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
@@ -40,9 +40,18 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
     let mod_code = modifier_code(k);
     let has_mod = has_modifier(k);
 
-    // Single-char control keys — modifiers on these are not standard.
+    // Single-char control keys — modifiers on these are not standard, except
+    // enter under the kitty keyboard protocol.
     match k.key.as_ref() {
-        "enter" | "return" => return Some("\r".into()),
+        "enter" | "return" => {
+            // Kitty disambiguation: a modified enter is CSI 13;<mod>u
+            // (shift+enter reads as newline in TUI agents); a plain enter
+            // stays CR per the protocol.
+            if has_mod && mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+                return Some(format!("\x1b[13;{}u", mod_code));
+            }
+            return Some("\r".into());
+        }
         "backspace" => return Some(if k.modifiers.control { "\x08" } else { "\x7f" }.into()),
         "tab" => {
             return Some(if k.modifiers.shift {
@@ -234,5 +243,46 @@ mod tests {
         };
         let s = to_esc_str(&ks("tab", mods), TermMode::NONE);
         assert_eq!(s.as_deref(), Some("\x1b[Z"));
+    }
+
+    #[test]
+    fn shift_enter_kitty_disambiguate_is_csi_u() {
+        let mods = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let s = to_esc_str(&ks("enter", mods), TermMode::DISAMBIGUATE_ESC_CODES);
+        assert_eq!(s.as_deref(), Some("\x1b[13;2u"));
+    }
+
+    #[test]
+    fn ctrl_alt_enter_kitty_disambiguate_modifier_code() {
+        let mods = Modifiers {
+            alt: true,
+            control: true,
+            ..Default::default()
+        };
+        let s = to_esc_str(&ks("enter", mods), TermMode::DISAMBIGUATE_ESC_CODES);
+        // 1 + 2*alt + 4*ctrl = 7.
+        assert_eq!(s.as_deref(), Some("\x1b[13;7u"));
+    }
+
+    #[test]
+    fn plain_enter_stays_cr_under_kitty_disambiguate() {
+        let s = to_esc_str(
+            &ks("enter", Modifiers::default()),
+            TermMode::DISAMBIGUATE_ESC_CODES,
+        );
+        assert_eq!(s.as_deref(), Some("\r"));
+    }
+
+    #[test]
+    fn shift_enter_without_disambiguate_stays_cr() {
+        let mods = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let s = to_esc_str(&ks("enter", mods), TermMode::NONE);
+        assert_eq!(s.as_deref(), Some("\r"));
     }
 }

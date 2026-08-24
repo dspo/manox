@@ -76,11 +76,15 @@ impl Dimensions for TermSize {
 /// Build the alacritty `Config` from `[terminal]` settings: scrollback size,
 /// cursor glyph, and OSC 52 policy. Alacritty gates OSC 52 internally per
 /// `Config.osc52`, so the gpui task only sees allowed clipboard requests.
+/// Kitty keyboard mode is honored so programs can disambiguate modified keys
+/// (shift+enter); with the config flag off the Term ignores the mode and the
+/// key encoder never sees it activate.
 fn build_config(settings: &TerminalSettings) -> Config {
     Config {
         scrolling_history: settings.scrolling_history,
         default_cursor_style: map_cursor(settings.cursor_shape, settings.cursor_blink),
         osc52: map_osc52(settings.osc52_access),
+        kitty_keyboard: true,
         // Drop `:` from the default separator set so URLs and `host:port`
         // text stay one semantic word (double-click select, hover target).
         semantic_escape_chars: ",│`\"' ()[]{}<>\t".into(),
@@ -776,7 +780,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        // The wrapper exec'd the real shell; env injection identifies manox.
+        // The wrapper exec'd the real shell; env injection carries the
+        // claimed terminal identity.
         pty.write(b"echo TERM_IS=$TERM_PROGRAM\r")
             .expect("write input");
         let start = Instant::now();
@@ -795,7 +800,7 @@ mod tests {
                     }
                 }
             }
-            if grid_text(&term.lock(), 24, 80).contains("TERM_IS=manox") {
+            if grid_text(&term.lock(), 24, 80).contains("TERM_IS=iTerm.app") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
