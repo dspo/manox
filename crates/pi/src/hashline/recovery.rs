@@ -110,7 +110,7 @@ fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
     let mut lines = Vec::new();
     for op in ops {
         match op {
-            Op::Swap { start, end, .. } => {
+            Op::Swap { start, end, .. } | Op::Cut { start, end } => {
                 for l in *start..=*end {
                     lines.push(l);
                 }
@@ -122,10 +122,13 @@ fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
             }
             Op::Ins {
                 anchor: Some(a), ..
+            }
+            | Op::Paste {
+                anchor: Some(a), ..
             } => {
                 lines.push(*a);
             }
-            Op::SwapBlk { start, .. } => {
+            Op::SwapBlk { start, .. } | Op::CutBlk { start } => {
                 lines.push(*start);
             }
             Op::DelBlk { start } => {
@@ -134,7 +137,7 @@ fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
             Op::InsBlkPost { anchor, .. } => {
                 lines.push(*anchor);
             }
-            Op::Ins { anchor: None, .. } => {}
+            Op::Ins { anchor: None, .. } | Op::Paste { anchor: None, .. } => {}
         }
     }
     lines
@@ -336,6 +339,22 @@ fn remap_ops(ops: &[Op], line_map: &HashMap<usize, usize>) -> Option<Vec<Op>> {
                     body: body.clone(),
                 });
             }
+            Op::Cut { start, end } => {
+                let s = map_line(*start)?;
+                let e = map_line(*end)?;
+                remapped.push(Op::Cut { start: s, end: e });
+            }
+            Op::CutBlk { start } => {
+                let s = map_line(*start)?;
+                remapped.push(Op::CutBlk { start: s });
+            }
+            Op::Paste { pos, anchor } => {
+                let new_anchor = anchor.and_then(&mut map_line);
+                remapped.push(Op::Paste {
+                    pos: *pos,
+                    anchor: new_anchor,
+                });
+            }
         }
     }
 
@@ -352,8 +371,14 @@ fn remap_ops(ops: &[Op], line_map: &HashMap<usize, usize>) -> Option<Vec<Op>> {
                     | Op::Del { .. }
                     | Op::SwapBlk { .. }
                     | Op::DelBlk { .. }
+                    | Op::Cut { .. }
+                    | Op::CutBlk { .. }
                     | Op::InsBlkPost { .. }
                     | Op::Ins {
+                        anchor: Some(_),
+                        ..
+                    }
+                    | Op::Paste {
                         anchor: Some(_),
                         ..
                     }

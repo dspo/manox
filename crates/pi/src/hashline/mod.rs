@@ -24,7 +24,7 @@ mod integration_tests;
 pub use apply::{ApplyError, ApplyResult, apply};
 pub use block::BlockError;
 pub use hash::compute_tag;
-pub use parser::{FilePatch, InsPos, Op, ParseError, parse_patch};
+pub use parser::{FileOp, FilePatch, InsPos, Op, ParseError, parse_patch};
 pub use recovery::{RecoverError, try_recover, try_recover_with_snapshot};
 pub use snapshot::{Snapshot, SnapshotStore};
 
@@ -128,18 +128,24 @@ pub fn assert_seen_lines(
     let mut unseen: Vec<usize> = Vec::new();
     for op in ops {
         match op {
-            parser::Op::Swap { start, end, .. } | parser::Op::Del { start, end } => {
+            parser::Op::Swap { start, end, .. }
+            | parser::Op::Del { start, end }
+            | parser::Op::Cut { start, end } => {
                 for line in *start..=*end {
                     unseen.push(line);
                 }
             }
             parser::Op::Ins {
                 anchor: Some(a), ..
+            }
+            | parser::Op::Paste {
+                anchor: Some(a), ..
             } => unseen.push(*a),
             parser::Op::SwapBlk { start, .. }
             | parser::Op::DelBlk { start }
-            | parser::Op::InsBlkPost { anchor: start, .. } => unseen.push(*start),
-            parser::Op::Ins { anchor: None, .. } => {}
+            | parser::Op::InsBlkPost { anchor: start, .. }
+            | parser::Op::CutBlk { start } => unseen.push(*start),
+            parser::Op::Ins { anchor: None, .. } | parser::Op::Paste { anchor: None, .. } => {}
         }
     }
     let seen_ref = &store
