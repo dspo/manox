@@ -29,7 +29,7 @@ use crate::language::Language;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
-use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
+use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 use crate::team::Team;
 
 /// Stable `Thread` id used for persistence.
@@ -280,6 +280,11 @@ pub enum ThreadEvent {
     /// Plan mode toggled (persisted in the session sidecar); the workspace
     /// mirrors it for the plan chip.
     PlanModeChanged { enabled: bool },
+    /// The thread's active opt-in browser tool suites changed; the composer
+    /// chips are derived state of this mirror.
+    BrowserSuitesChanged {
+        suites: Vec<crate::pi_engine::BrowserSuite>,
+    },
     /// A peer message was delivered from another team member.
     PeerMessage { from: String, content: String },
     /// A queued steer follow-up was drained into `messages`.
@@ -349,6 +354,14 @@ pub struct Thread {
     /// thread; the effort is then not overwritten by the session sidecar's
     /// default when the engine materializes.
     reasoning_effort_explicitly_set: bool,
+    /// Opt-in browser tool suites the user activated; the composer chips
+    /// derive from this mirror. Replayed to the engine when a landing thread
+    /// materializes it, so a pre-engine toggle is never dropped.
+    browser_suites: Vec<crate::pi_engine::BrowserSuite>,
+    /// Whether a suite was toggled since construction; until then the
+    /// `Ready` projection seeds the mirror (same pattern as
+    /// `permission_mode_explicitly_set`).
+    browser_suites_explicitly_set: bool,
     /// Plan mode active: read-only research + plan-file writes, proposals
     /// ride the `ProposePlan` tool. Mirrored from the engine on
     /// `PlanModeChanged`/`Ready`.
@@ -398,6 +411,8 @@ impl Thread {
             history_phase: HistoryPhase::Ready,
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
+            browser_suites: Vec::new(),
+            browser_suites_explicitly_set: false,
             plan_mode: false,
             persisted_plan: None,
             label: "lead".into(),
@@ -484,6 +499,8 @@ impl Thread {
                 },
                 permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
+                browser_suites: Vec::new(),
+                browser_suites_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
@@ -528,6 +545,11 @@ impl Thread {
         }
         if self.reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(self.reasoning_effort.wire_value().to_string()));
+        }
+        // Toggles that landed while the thread was engine-less parked in the
+        // mirror; the fresh engine replays them before the first prompt.
+        for suite in self.browser_suites.clone() {
+            engine.set_browser_suite(suite, true);
         }
         self.engine = Some(engine.clone());
         drain_engine_notices(cx, events);
@@ -693,16 +715,18 @@ impl Thread {
                 })
                 .detach();
             }
-            BackendNotice::Ready {
-                restored,
-                model,
-                permission_mode,
-                reasoning_effort,
-                plan_mode,
-                plan_file,
-                plan_review_pending,
-                plan_snapshot,
-            } => {
+            BackendNotice::Ready(notice) => {
+                let ReadyInfo {
+                    restored,
+                    model,
+                    permission_mode,
+                    reasoning_effort,
+                    browser_suites,
+                    plan_mode,
+                    plan_file,
+                    plan_review_pending,
+                    plan_snapshot,
+                } = *notice;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot
@@ -716,6 +740,15 @@ impl Thread {
                 }
                 if !self.reasoning_effort_explicitly_set {
                     self.reasoning_effort = reasoning_effort;
+                }
+                // A toggle since construction outranks the projection (the
+                // queued `SetBrowserSuite` has not reached the actor yet when
+                // this lands, so the projection cannot know about it).
+                if !self.browser_suites_explicitly_set && self.browser_suites != browser_suites {
+                    self.browser_suites = browser_suites.clone();
+                    cx.emit(ThreadEvent::BrowserSuitesChanged {
+                        suites: browser_suites,
+                    });
                 }
                 if plan_mode {
                     self.plan_mode = true;
@@ -1430,6 +1463,8 @@ impl Thread {
                 history_phase: HistoryPhase::Ready,
                 permission_mode_explicitly_set: true,
                 reasoning_effort_explicitly_set: true,
+                browser_suites: Vec::new(),
+                browser_suites_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
                 goal_bridge: None,
@@ -1545,10 +1580,36 @@ impl Thread {
         enable: bool,
         cx: &mut Context<Self>,
     ) {
+        self.browser_suites_explicitly_set = true;
+        let changed = if enable {
+            if self.browser_suites.contains(&suite) {
+                false
+            } else {
+                self.browser_suites.push(suite);
+                true
+            }
+        } else {
+            let before = self.browser_suites.len();
+            self.browser_suites.retain(|s| *s != suite);
+            self.browser_suites.len() != before
+        };
+        // A landing thread parks the toggle in the mirror; `ensure_engine`
+        // replays it when the engine materializes.
         if let Some(engine) = &self.engine {
             engine.set_browser_suite(suite, enable);
         }
+        if changed {
+            cx.emit(ThreadEvent::BrowserSuitesChanged {
+                suites: self.browser_suites.clone(),
+            });
+        }
         cx.notify();
+    }
+
+    /// The opt-in browser tool suites active on this thread; the workspace
+    /// derives the composer chips from this mirror.
+    pub fn browser_suites(&self) -> &[crate::pi_engine::BrowserSuite] {
+        &self.browser_suites
     }
 
     /// Execute an approved plan on this thread: optionally compact the
@@ -2261,6 +2322,8 @@ pub(crate) mod tests {
                 history_phase: phase,
                 permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
+                browser_suites: Vec::new(),
+                browser_suites_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
@@ -2623,16 +2686,17 @@ pub(crate) mod tests {
         thread.update(cx, |t, cx| {
             t.messages = vec![Message::user("preview-only".to_string())];
             t.handle_notice(
-                BackendNotice::Ready {
+                BackendNotice::Ready(Box::new(ReadyInfo {
                     restored: true,
                     model: None,
                     permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: Vec::new(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                },
+                })),
                 cx,
             );
         });
@@ -2706,16 +2770,17 @@ pub(crate) mod tests {
         // user's ReadOnly choice must not be overwritten.
         thread.update(cx, |t, cx| {
             t.handle_notice(
-                BackendNotice::Ready {
+                BackendNotice::Ready(Box::new(ReadyInfo {
                     restored: false,
                     model: None,
                     permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: Vec::new(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                },
+                })),
                 cx,
             );
         });
@@ -2810,16 +2875,17 @@ pub(crate) mod tests {
         let value = serde_json::to_value(&snapshot).unwrap();
         thread.update(cx, |t, cx| {
             t.handle_notice(
-                BackendNotice::Ready {
+                BackendNotice::Ready(Box::new(ReadyInfo {
                     restored: true,
                     model: None,
                     permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: Vec::new(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: Some(value),
-                },
+                })),
                 cx,
             );
         });
@@ -2849,16 +2915,17 @@ pub(crate) mod tests {
         // choice must not be overwritten.
         thread.update(cx, |t, cx| {
             t.handle_notice(
-                BackendNotice::Ready {
+                BackendNotice::Ready(Box::new(ReadyInfo {
                     restored: false,
                     model: None,
                     permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: Vec::new(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                },
+                })),
                 cx,
             );
         });
@@ -2884,16 +2951,17 @@ pub(crate) mod tests {
         let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
         thread.update(cx, |t, cx| {
             t.handle_notice(
-                BackendNotice::Ready {
+                BackendNotice::Ready(Box::new(ReadyInfo {
                     restored: true,
                     model: None,
                     permission_mode: PermissionMode::default(),
                     reasoning_effort: ReasoningEffort::Max,
+                    browser_suites: Vec::new(),
                     plan_mode: false,
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
-                },
+                })),
                 cx,
             );
         });
@@ -2901,6 +2969,86 @@ pub(crate) mod tests {
             cx.read(|cx| thread.read(cx).reasoning_effort()),
             ReasoningEffort::Max
         );
+    }
+
+    /// P0 regression: a browser-suite toggle on an engine-less landing
+    /// thread parks in the facade mirror (replayed at `ensure_engine`)
+    /// instead of being dropped.
+    #[gpui::test]
+    fn landing_browser_suite_toggle_parks_in_mirror(cx: &mut gpui::TestAppContext) {
+        crate::pi_providers::init_for_test();
+        let thread = cx.update(|cx| Thread::landing(PathBuf::from("/tmp"), cx));
+        thread.update(cx, |t, cx| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true, cx);
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                thread.read(cx).browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::ChromeUse]
+            );
+        });
+    }
+
+    /// The `Ready` projection seeds the suite mirror so restored sessions
+    /// surface their active suites (the composer chips derive from it).
+    #[gpui::test]
+    fn ready_seeds_browser_suites_from_projection(cx: &mut gpui::TestAppContext) {
+        let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()), cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(
+                BackendNotice::Ready(Box::new(ReadyInfo {
+                    restored: true,
+                    model: None,
+                    permission_mode: PermissionMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                })),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                thread.read(cx).browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::ChromeUse]
+            );
+        });
+    }
+
+    /// A toggle since construction outranks the `Ready` projection: the
+    /// queued engine command has not settled when Ready lands, so the
+    /// projection cannot know about it and must not clobber the mirror.
+    #[gpui::test]
+    fn explicit_browser_suite_toggle_outranks_ready_projection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()), cx);
+        thread.update(cx, |t, cx| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true, cx);
+            t.handle_notice(
+                BackendNotice::Ready(Box::new(ReadyInfo {
+                    restored: true,
+                    model: None,
+                    permission_mode: PermissionMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                })),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                thread.read(cx).browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::WebExplore]
+            );
+        });
     }
 
     /// `Thread::cancel` aborts the engine; the actor relies on this when

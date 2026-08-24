@@ -53,6 +53,14 @@ pub fn init() {
     });
 }
 
+/// Seed an empty registry for tests that construct threads without a full
+/// `agent::init`; no background build, so tests never pay the keychain /
+/// shell cost of provider registration. Idempotent: the first setter wins.
+#[cfg(test)]
+pub fn init_for_test() {
+    let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
+}
+
 /// Wait for the one-shot initial registration to finish. Returns at once
 /// when it already completed, or when [`init`] was never called (nothing
 /// to wait for). Pi actors await this once at startup instead of

@@ -30,7 +30,7 @@ use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
 use crate::thread::{PermissionMode, ThreadEvent};
-use crate::thread_engine::{BackendNotice, SpawnedEngine, ThreadEngine};
+use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
 /// How often the engine refreshes its history mirror while a run is in
 /// flight. Bounds the mid-run staleness a thread switch-back can observe;
@@ -1414,6 +1414,20 @@ async fn apply_browser_suite(session: &mut AgentSession, suite: BrowserSuite, en
     }
 }
 
+/// The opt-in suites whose tool names are all present in a resolved
+/// active-tool set; a suite is active only when fully selected.
+fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
+    [BrowserSuite::ChromeUse, BrowserSuite::WebExplore]
+        .into_iter()
+        .filter(|suite| {
+            suite
+                .tool_names()
+                .iter()
+                .all(|name| active.iter().any(|n| n == name))
+        })
+        .collect()
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
@@ -2421,16 +2435,24 @@ async fn run_actor(
     if restored {
         sync_usage(&session, &state).await;
     }
-    let _ = notice_tx.send(BackendNotice::Ready {
+    // The active-tool set is authoritative for the composer chips; `None`
+    // (never narrowed) reads as the full mounted set.
+    let browser_suites = project_browser_suites(
+        &session
+            .active_tool_names()
+            .unwrap_or_else(|| session.tools()),
+    );
+    let _ = notice_tx.send(BackendNotice::Ready(Box::new(ReadyInfo {
         restored,
         model: Some(pi_model.clone()),
         permission_mode,
         reasoning_effort,
+        browser_suites,
         plan_mode: plan_mode_restored,
         plan_file: plan_file_restored,
         plan_review_pending,
         plan_snapshot,
-    });
+    })));
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
     if restored {
@@ -4324,6 +4346,40 @@ mod tests {
         for name in BrowserSuite::WebExplore.tool_names() {
             assert!(stripped.iter().any(|n| n == name), "{name} should survive");
         }
+    }
+
+    #[test]
+    fn project_browser_suites_requires_the_full_suite_active() {
+        // A suite projects as active only when every one of its tool names is
+        // selected; the browser-free default set projects nothing.
+        let defaults = vec!["Read".to_string(), "Bash".to_string()];
+        assert!(project_browser_suites(&defaults).is_empty());
+
+        let partial: Vec<String> = BrowserSuite::ChromeUse.tool_names()[..3]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(project_browser_suites(&partial).is_empty());
+
+        let mut full = defaults.clone();
+        full.extend(
+            BrowserSuite::ChromeUse
+                .tool_names()
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert_eq!(project_browser_suites(&full), vec![BrowserSuite::ChromeUse]);
+
+        full.extend(
+            BrowserSuite::WebExplore
+                .tool_names()
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        assert_eq!(
+            project_browser_suites(&full),
+            vec![BrowserSuite::ChromeUse, BrowserSuite::WebExplore]
+        );
     }
 
     #[test]
