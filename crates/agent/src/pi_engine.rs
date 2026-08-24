@@ -1245,7 +1245,11 @@ fn build_tools(
             .with_model_slot(Arc::clone(&model_slot))
             // Resolve agent-definition `model` overrides against the live
             // registry (registration has landed before session assembly).
-            .with_provider_registry(provider_registry.clone());
+            .with_provider_registry(provider_registry.clone())
+            // Subagent transcripts persist under the host session root (a
+            // subdirectory the sidebar's non-recursive listing never
+            // surfaces) so their usage stays accountable.
+            .with_session_dir(crate::thread_store::sessions_dir().join("subagents"));
             let subagent = match subagent_description.clone() {
                 Some(desc) => subagent.with_description(desc),
                 None => subagent,
@@ -4183,9 +4187,17 @@ async fn refresh_session_list(
     if let Ok(list) = repo.list().await {
         for info in list {
             // The mirrored list stays host-scoped like the sidebar's own.
-            if crate::host::belongs_to_current_host(info.metadata.as_ref()) {
-                out.push(session_info_to_summary(&info));
+            // Subagent transcripts persist for usage accounting but never
+            // surface as threads.
+            if !crate::host::belongs_to_current_host(info.metadata.as_ref())
+                || info
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.get("subagent").is_some())
+            {
+                continue;
             }
+            out.push(session_info_to_summary(&info));
         }
     }
     *state.sessions.lock().unwrap() = out;
@@ -5847,5 +5859,78 @@ mod tests {
             "unsandboxed stripped from the subagent schema"
         );
         assert!(props.contains_key("command"), "command still advertised");
+    }
+
+    /// A dispatched subagent session persists under the host-injected session
+    /// directory with its dispatch lineage in the header metadata; without an
+    /// injected directory the transcript stays in a tempdir whose guard the
+    /// caller must hold (examples/tests lifecycle).
+    #[tokio::test]
+    async fn subagent_session_persists_under_host_dir_with_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let resolver: pi::agent_loop::StreamResolver =
+            Arc::new(
+                |_m: &PiModel| Ok(Arc::new(StaticStream) as Arc<dyn pi::agent_loop::StreamFn>),
+            );
+        let runtime = ModelRuntime::new(resolver);
+
+        let mut registry = AgentRegistry::new();
+        register_defaults(&mut registry);
+        let registry = Arc::new(registry);
+        let tools: Vec<Arc<dyn pi::tool::AgentTool>> = vec![
+            Arc::new(pi::tools::read::ReadTool),
+            Arc::new(pi::tools::grep::GrepTool),
+            Arc::new(pi::tools::glob::GlobTool),
+            Arc::new(pi::tools::ls::LsTool),
+        ];
+        let ctx = pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(cwd.clone())),
+            cwd.clone(),
+            Arc::new(pi::tool::ToolState::new()),
+        );
+
+        // Host-injected directory: the transcript persists there and the
+        // header carries the dispatch lineage.
+        let subagents = dir.path().join("subagents");
+        let tool = SubagentTool::new(Arc::clone(&registry), tools.clone())
+            .with_model_runtime(runtime.clone())
+            .with_model(test_model())
+            .with_session_dir(subagents.clone());
+        let (mut session, guard, worktree) = tool
+            .spawn_subagent_session("Explore", None, &ctx, vec![], Some("thread-parent"))
+            .await
+            .unwrap();
+        assert!(guard.is_none(), "persistent dir spawns no tempdir guard");
+        assert!(worktree.is_none());
+        let _ = session.prompt("hi").await.unwrap();
+        let path = session.path().clone();
+        assert_eq!(path.parent().unwrap(), subagents);
+        let header = tokio::fs::read_to_string(&path)
+            .await
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.contains("\"metadata\":{\"subagent\":{")
+                && header.contains("\"type\":\"Explore\"")
+                && header.contains("\"parent\":\"thread-parent\""),
+            "header must carry the subagent lineage: {header}"
+        );
+
+        // No injected directory: the throwaway tempdir lifecycle stays, and
+        // the guard is the caller's only handle to the transcript.
+        let tool = SubagentTool::new(Arc::clone(&registry), tools)
+            .with_model_runtime(runtime)
+            .with_model(test_model());
+        let (_session, guard, _worktree) = tool
+            .spawn_subagent_session("Explore", None, &ctx, vec![], None)
+            .await
+            .unwrap();
+        assert!(guard.is_some(), "uninjected spawn keeps the tempdir guard");
     }
 }
