@@ -1689,6 +1689,10 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.session
             .append_active_tools_change(&active_tool_names)
             .await?;
+        // The shared runtime snapshot follows the idle change, so the next
+        // run's `apply_turn_runtime` never reverts the selection.
+        self.control.turn_runtime.lock().unwrap().active_tool_names =
+            Some(active_tool_names.clone());
         self.active_tool_names = Some(active_tool_names);
         self.apply_active_tools();
         Ok(())
@@ -7983,6 +7987,40 @@ pub(crate) mod tests {
         // Scramble the in-memory tool list; restore replays the selection.
         harness.agent_mut().set_tools(two_tools());
         harness.restore().await.unwrap();
+        assert_eq!(mounted_names(&harness), ["echo"]);
+    }
+
+    /// An idle `set_active_tools` updates the shared runtime snapshot, so the
+    /// next run's pre-prompt `apply_turn_runtime` keeps the selection instead
+    /// of reverting to the stale pre-toggle set. Regression: the idle setter
+    /// once synced only the harness field, and the following turn silently
+    /// re-mounted the old tools.
+    #[tokio::test]
+    async fn test_idle_set_active_tools_survives_next_turn_runtime_sync() {
+        let session = Session::new(MemStorage::new());
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        )
+        .with_tools(two_tools());
+
+        // A restore seeds the shared runtime snapshot with the default set —
+        // the stale state a later idle toggle must overwrite.
+        harness.set_restore_active_tool_default(vec!["echo".to_string(), "other".to_string()]);
+        harness.restore().await.unwrap();
+        assert_eq!(mounted_names(&harness), ["echo", "other"]);
+
+        // Toggle to the narrowed set while idle.
+        harness
+            .set_active_tools(vec!["echo".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(mounted_names(&harness), ["echo"]);
+
+        // The next run's pre-prompt runtime sync must not revert the toggle.
+        harness.apply_turn_runtime();
         assert_eq!(mounted_names(&harness), ["echo"]);
     }
 
