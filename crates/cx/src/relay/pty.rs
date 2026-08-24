@@ -42,14 +42,16 @@ pub(crate) fn spawn_pty(spec: &LaunchSpec, extra_env: &[(&str, String)]) -> Resu
     // manox is the host terminal for every embedded agent PTY, regardless of how
     // manox itself was launched. TERM_PROGRAM claims iTerm.app: capability-gating
     // TUIs (Claude Code's kitty keyboard, synchronized output) whitelist known
-    // terminal identities and degrade on unknown ones, and the emulator backs
-    // iTerm.app's progressive features (kitty keyboard via alacritty, sync
-    // updates via vte). A GUI launch (Finder/Dock/Spotlight) carries no
-    // TERM/COLORTERM in its environment, and CommandBuilder snapshots the parent
-    // env — so without these fallbacks the agent inherits a terminal-less
-    // environment and TUIs (Claude Code) render monochrome and skip mouse capture.
-    // `env_remove`, `env`, and `extra_env` apply after these and win, so explicit
-    // spec values keep their precedence.
+    // terminal identities and degrade on unknown ones. Among the whitelisted
+    // identities, iTerm.app is chosen because the emulator fully backs both of
+    // its progressive features (kitty keyboard via alacritty, sync updates via
+    // vte) — kitty/WezTerm would unlock the keyboard too, but only the iTerm.app
+    // pairing is verified end-to-end here. A GUI launch (Finder/Dock/Spotlight)
+    // carries no TERM/COLORTERM in its environment, and CommandBuilder snapshots
+    // the parent env — so without these fallbacks the agent inherits a
+    // terminal-less environment and TUIs (Claude Code) render monochrome and
+    // skip mouse capture. `env_remove`, `env`, and `extra_env` apply after these
+    // and win, so explicit spec values keep their precedence.
     cmd.env("TERM_PROGRAM", "iTerm.app");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     if std::env::var_os("TERM").is_none() {
