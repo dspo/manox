@@ -7,12 +7,14 @@
 // single critical section. On write, the file's original CRLF/BOM/trailing
 // newline are restored so the edit is a minimal content delta.
 
+use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
-
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
+use crate::hashline::parser::Op;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
@@ -42,6 +44,7 @@ SWAP 37.=48:\n\
 +    else:\n\
 +        parser.print_help()\n\
 ```";
+
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
@@ -102,6 +105,21 @@ impl AgentTool for EditTool {
             let had_trailing_nl = raw.ends_with('\n');
             let current = hashline::normalize_to_lf(&raw);
             let current_tag = hashline::compute_tag(&current);
+
+            // Seen-line gating: reject edits targeting lines the read tool
+            // never displayed. Only applies when the snapshot has provenance.
+            {
+                let store = ctx
+                    .tool_state()
+                    .snapshots
+                    .lock()
+                    .expect("hashline snapshot store poisoned");
+                if let Some(snapshot) = store.get(&path, &fp.tag)
+                    && let Some(ref seen) = snapshot.seen_lines
+                {
+                    check_seen_lines(&fp.ops, seen, &current, &path_display)?;
+                }
+            }
 
             let new_text = if current_tag == fp.tag {
                 hashline::apply(&current, &fp.ops)
@@ -187,6 +205,64 @@ fn persist(text: &str, crlf: bool, bom: bool, trailing_nl: bool) -> String {
         }
     }
     out
+}
+
+/// Check that every anchor line referenced by the ops was displayed by the
+/// read tool. Returns an error with context when any line is unseen.
+fn check_seen_lines(
+    ops: &[Op],
+    seen: &HashSet<usize>,
+    current: &str,
+    path_display: &str,
+) -> Result<(), ToolError> {
+    let mut unseen: Vec<usize> = Vec::new();
+    for op in ops {
+        let anchor_lines = op_anchor_lines(op);
+        for &line in &anchor_lines {
+            if !seen.contains(&line) {
+                unseen.push(line);
+            }
+        }
+    }
+    if unseen.is_empty() {
+        return Ok(());
+    }
+
+    unseen.sort();
+    unseen.dedup();
+
+    // Build context: show the current content of each unseen line.
+    let lines: Vec<&str> = current.lines().collect();
+    let mut context = String::new();
+    for &line in &unseen {
+        if line <= lines.len() {
+            use std::fmt::Write as _;
+            let _ = write!(context, "\n  line {line}: {}", lines[line - 1]);
+        } else {
+            let _ = write!(context, "\n  line {line}: <out of bounds>");
+        }
+    }
+
+    Err(ToolError::ExecutionFailed(format!(
+        "Edit rejected for {path_display}: the following lines were not displayed by `read` \
+         or `search` and cannot be edited without a current view. \
+         Re-read the file with `read` to refresh the tag and line numbers, \
+         then retry the edit.{}",
+        context
+    )))
+}
+
+/// Collect all 1-indexed anchor lines referenced by a single op.
+fn op_anchor_lines(op: &Op) -> Vec<usize> {
+    match op {
+        Op::Swap { start, end, .. } => (*start..=*end).collect(),
+        Op::Del { start, end } => (*start..=*end).collect(),
+        Op::Ins { anchor: Some(a), .. } => vec![*a],
+        Op::Ins { anchor: None, .. } => vec![],
+        Op::SwapBlk { start, .. } => vec![*start],
+        Op::DelBlk { start } => vec![*start],
+        Op::InsBlkPost { anchor, .. } => vec![*anchor],
+    }
 }
 
 #[cfg(test)]
