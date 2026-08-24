@@ -39,6 +39,21 @@ pub(crate) fn spawn_pty(spec: &LaunchSpec, extra_env: &[(&str, String)]) -> Resu
     for arg in &spec.args {
         cmd.arg(arg);
     }
+    // manox is the host terminal for every embedded agent PTY, regardless of how
+    // manox itself was launched. A GUI launch (Finder/Dock/Spotlight) carries no
+    // TERM/COLORTERM in its environment, and CommandBuilder snapshots the parent
+    // env — so without these fallbacks the agent inherits a terminal-less
+    // environment and TUIs (Claude Code) render monochrome and skip mouse capture.
+    // `env_remove`, `env`, and `extra_env` apply after these and win, so explicit
+    // spec values keep their precedence.
+    cmd.env("TERM_PROGRAM", "manox");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    if std::env::var_os("TERM").is_none() {
+        cmd.env("TERM", "xterm-256color");
+    }
+    if std::env::var_os("COLORTERM").is_none() {
+        cmd.env("COLORTERM", "truecolor");
+    }
     for key in &spec.env_remove {
         cmd.env_remove(key);
     }
@@ -122,5 +137,96 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Run `/usr/bin/env` inside the PTY and collect its `KEY=VALUE` output.
+    /// The child exits immediately, so the master reader reaches EOF once the
+    /// output is drained. PTY output cooking turns `\n` into `\r\n`, so callers
+    /// must strip `\r` before comparing lines.
+    fn spawn_env_and_collect(
+        spec_env: BTreeMap<String, String>,
+        env_remove: Vec<String>,
+    ) -> (Vec<String>, PtySession) {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/env"),
+            args: vec![],
+            env: spec_env,
+            summary: String::new(),
+            detach: false,
+            env_remove,
+            agent_id: "test".into(),
+            provider_name: "test".into(),
+            model_id: None,
+            pty: true,
+            socket: None,
+            cwd: None,
+        };
+        let mut pty = spawn_pty(&spec, &[]).expect("spawn_pty");
+        let mut out = String::new();
+        pty.reader.read_to_string(&mut out).expect("read env");
+        let lines = out
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect();
+        (lines, pty)
+    }
+
+    /// The child always sees manox as its terminal host: `TERM_PROGRAM` is
+    /// manox, and `TERM`/`COLORTERM` are non-empty whether inherited from a
+    /// terminal-bearing parent env or supplied by the spawn_pty fallbacks.
+    #[test]
+    fn spawn_pty_always_reports_terminal_env() {
+        let (lines, mut pty) = spawn_env_and_collect(BTreeMap::new(), vec![]);
+        assert!(
+            lines.iter().any(|l| l == "TERM_PROGRAM=manox"),
+            "expected TERM_PROGRAM=manox in child env, got: {lines:?}"
+        );
+        for key in ["TERM", "COLORTERM"] {
+            let prefix = format!("{key}=");
+            let present = lines
+                .iter()
+                .any(|l| l.strip_prefix(&prefix).is_some_and(|v| !v.is_empty()));
+            assert!(
+                present,
+                "expected a non-empty {key} in child env, got: {lines:?}"
+            );
+        }
+        let _ = pty.child.kill();
+        let _ = pty.child.wait();
+    }
+
+    /// Explicit `spec.env` wins over the fallbacks: a spec-supplied TERM reaches
+    /// the child unchanged instead of being replaced by the xterm-256color
+    /// fallback.
+    #[test]
+    fn spawn_pty_spec_env_overrides_terminal_fallbacks() {
+        let mut env = BTreeMap::new();
+        env.insert("TERM".to_string(), "dumb".to_string());
+        let (lines, mut pty) = spawn_env_and_collect(env, vec![]);
+        assert!(
+            lines.iter().any(|l| l == "TERM=dumb"),
+            "expected spec.env TERM=dumb to win, got: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l == "TERM=xterm-256color"),
+            "fallback TERM leaked past the spec.env override: {lines:?}"
+        );
+        let _ = pty.child.kill();
+        let _ = pty.child.wait();
+    }
+
+    /// `spec.env_remove` wins over the fallbacks too: removing TERM leaves the
+    /// child with no TERM at all, whether the value would have been inherited
+    /// from the parent env or supplied by the xterm-256color fallback. The
+    /// assertion is robust to both test environments for that reason.
+    #[test]
+    fn spawn_pty_env_remove_strips_term() {
+        let (lines, mut pty) = spawn_env_and_collect(BTreeMap::new(), vec!["TERM".to_string()]);
+        assert!(
+            !lines.iter().any(|l| l.starts_with("TERM=")),
+            "env_remove should strip TERM from the child env, got: {lines:?}"
+        );
+        let _ = pty.child.kill();
+        let _ = pty.child.wait();
     }
 }
