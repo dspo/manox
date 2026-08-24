@@ -73,7 +73,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
 | 5 | **Write** | Write `<tmpdir>/writable.txt` with content `healthz write test` | Success, no error |
-| 6 | **Edit** | Edit `<tmpdir>/writable.txt` — use the hashline patch format: write `[<absolute_path>#<tag>]` header on line 1, then `INS.TAIL:` on line 2, then `+appended by edit` as the new content line. The `#<tag>` is any 4-hex-digit placeholder (e.g. `#A000`). | Success, no error |
+| 6 | **Edit** | Edit `<tmpdir>/writable.txt` — use the hashline patch format: write `[<absolute_path>#<tag>]` header on line 1, then `INS.TAIL:` on line 2, then `+appended by edit` as the new content line. The `#<tag>` is any 6-hex-digit placeholder (e.g. `#A0000B`). | Success, no error |
 | — | (verify) | Read `<tmpdir>/writable.txt` back | Content contains both `healthz write test` and `appended by edit` |
 | — | (cleanup) | Delete `<tmpdir>/writable.txt` | — |
 

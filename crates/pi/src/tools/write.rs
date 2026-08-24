@@ -134,7 +134,7 @@ fn strip_hashline_prefixes(content: &str) -> String {
     let is_header = header.starts_with('[')
         && header.ends_with(']')
         && header.contains('#')
-        && header.len() >= 7; // Minimal: `[#xxxx]`
+        && header.len() >= 9; // Minimal: `[#xxxxxx]`
     if !is_header {
         return content.to_string();
     }

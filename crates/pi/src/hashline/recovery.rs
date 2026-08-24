@@ -1,22 +1,19 @@
-//! 3-way merge recovery for stale tags.
+//! Diff-based line mapping recovery for stale tags.
 //!
 //! When an edit's claimed tag no longer matches the live file (the file changed
 //! between the model's read and its edit), the line numbers it references may be
-//! wrong. Recovery: take the snapshot text the tag *did* name, resolve each op
-//! against that snapshot to get `(old_lines, new_body)` pairs, then locate
-//! `old_lines` by *content* in the current file and apply the same change there.
-//! This salvages edits whose target region is unchanged even when nearby lines
-//! have shifted.
-//!
-//! If the snapshot is missing (the claimed tag was never recorded) or an anchor
-//! cannot be located uniquely, the caller surfaces an error instructing the
-//! model to re-read.
-
+//! wrong. Recovery: diff the snapshot text against the current text, build a
+//! line-number map, validate every anchor's context (neighbors must map
+//! consistently), remap the edit ops to current line numbers, then replay the
+//! edit on the live content. All anchors must move by one consistent offset; a
+//! changed, deleted, split, or ambiguous target is rejected so the caller can
+//! surface an error instructing the model to re-read.
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use super::apply::repair_boundaries;
-use super::block;
-use super::parser::{InsPos, Op};
+use similar::TextDiff;
+
+use super::parser::Op;
 use super::snapshot::{Snapshot, SnapshotStore};
 
 /// Recovery failure carrying a model-facing hint and the file's current tag.
@@ -25,7 +22,6 @@ pub struct RecoverError {
     pub message: String,
     pub current_tag: String,
 }
-
 impl std::fmt::Display for RecoverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
@@ -33,6 +29,13 @@ impl std::fmt::Display for RecoverError {
 }
 
 impl std::error::Error for RecoverError {}
+
+#[allow(dead_code)]
+/// Warning emitted when the snapshot is the current head (external change).
+const RECOVERY_EXTERNAL_WARNING: &str = "file changed between read and edit (external modification); recovery applied via line-map merge";
+#[allow(dead_code)]
+/// Warning emitted when the snapshot is a historical version (session chain).
+const RECOVERY_SESSION_CHAIN_WARNING: &str = "file changed between read and edit (edit chain); recovery applied via line-map merge";
 
 /// Attempt to recover a stale-tagged edit. `current` is the live file text
 /// (normalized LF); `claimed_tag` is the tag the edit claims. Returns the merged
@@ -61,300 +64,343 @@ pub fn try_recover_with_snapshot(
     ops: &[Op],
 ) -> Result<String, RecoverError> {
     let current_tag = super::hash::compute_tag(current);
-    let snap_lines: Vec<&str> = snapshot.text.lines().collect();
-    let cur_lines: Vec<&str> = current.lines().collect();
+    let snapshot_text = &snapshot.text;
 
     // Validate the ops against the snapshot exactly as the fast path would, so
     // a stale-tag recovery never accepts a patch (overlapping ranges, insertion
     // landing inside a consumer, out-of-bounds lines, empty insertions) that the
-    // fast path would reject. The applied text is discarded — recovery re-roots
-    // the same changes by content onto `current`.
-    if let Err(e) = super::apply::apply(&snapshot.text, ops) {
+    // fast path would reject.
+    if let Err(e) = super::apply::apply(snapshot_text, ops) {
         return Err(RecoverError {
             message: e.to_string(),
             current_tag,
         });
     }
 
-    // Resolve each op to a content-anchored change against the snapshot, then
-    // project onto current. Block ops resolve to concrete snapshot ranges first.
-    let changes = resolve_changes(ops, &snap_lines, &current_tag)?;
+    // Build a line map from snapshot line numbers to current line numbers using
+    // similar's text diff.
+    let prev_lines: Vec<&str> = snapshot_text.lines().collect();
+    let cur_lines: Vec<&str> = current.lines().collect();
 
-    // Apply changes back-to-front by their located position in `current` so
-    // earlier anchors stay valid. Locate each anchor fresh (positions are
-    // content-derived, not line-derived, so ordering by snapshot line is not
-    // meaningful — collect located positions first, then sort descending).
-    let mut edits: Vec<LocatedEdit> = Vec::new();
-    for ch in changes {
-        let loc = locate(&cur_lines, &ch).ok_or_else(|| RecoverError {
-            message: format!(
-                "3-way merge failed: cannot uniquely anchor snapshot line {:?} in the current file; re-read",
-                ch.anchor_preview()
-            ),
-            current_tag: current_tag.clone(),
-        })?;
-        edits.push(loc);
+    let line_map = build_line_map(snapshot_text, current);
+
+    // Validate every anchor's context. For each op, collect all anchor lines
+    // and check that they map consistently.
+    let anchor_lines = collect_anchor_lines(ops);
+    if !validate_anchors(&anchor_lines, &line_map, &prev_lines, &cur_lines) {
+        return Err(RecoverError {
+            message: "3-way merge failed: anchors map to inconsistent lines in the current file; re-read to get current tags and line numbers".to_string(),
+            current_tag,
+        });
     }
 
-    // Sort descending by insertion index (back-to-front).
-    edits.sort_by_key(|e| std::cmp::Reverse(e.at));
-    let mut out: Vec<String> = cur_lines.iter().map(|s| s.to_string()).collect();
-    for e in edits {
-        e.apply(&mut out);
+    // Remap ops to current line numbers.
+    let Some(remapped) = remap_ops(ops, &line_map) else {
+        return Err(RecoverError {
+            message: "3-way merge failed: cannot remap anchors to current file (line numbers shifted inconsistently); re-read".to_string(),
+            current_tag,
+        });
+    };
+
+    // Apply remapped ops on current text.
+    match super::apply::apply(current, &remapped) {
+        Ok(result) => Ok(result.text),
+        Err(e) => Err(RecoverError {
+            message: format!("3-way merge recovery apply failed: {e}"),
+            current_tag,
+        }),
     }
-    Ok(out.join("\n"))
 }
 
-/// A change resolved against the snapshot: the old line slice to find in
-/// current, and the new body to substitute (empty body = pure deletion).
-enum Change {
-    /// Replace `old` (non-empty) with `body` at the unique location of `old`.
-    Replace { old: Vec<String>, body: Vec<String> },
-    /// Insert `body` before/after the unique location of `anchor` (a single line).
-    Insert {
-        anchor: Vec<String>,
-        body: Vec<String>,
-        before: bool,
-    },
-    /// Insert `body` at file start or end.
-    InsertEnd { body: Vec<String>, head: bool },
-}
-
-impl Change {
-    fn anchor_preview(&self) -> String {
-        match self {
-            Change::Replace { old, .. } => old.first().cloned().unwrap_or_default(),
-            Change::Insert { anchor, .. } => anchor.first().cloned().unwrap_or_default(),
-            Change::InsertEnd { .. } => "<file boundary>".to_string(),
+/// Collect all 1-indexed anchor lines referenced by the ops.
+fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for op in ops {
+        match op {
+            Op::Swap { start, end, .. } => {
+                for l in *start..=*end {
+                    lines.push(l);
+                }
+            }
+            Op::Del { start, end } => {
+                for l in *start..=*end {
+                    lines.push(l);
+                }
+            }
+            Op::Ins { anchor: Some(a), .. } => {
+                lines.push(*a);
+            }
+            Op::SwapBlk { start, .. } => {
+                lines.push(*start);
+            }
+            Op::DelBlk { start } => {
+                lines.push(*start);
+            }
+            Op::InsBlkPost { anchor, .. } => {
+                lines.push(*anchor);
+            }
+            Op::Ins { anchor: None, .. } => {}
         }
     }
+    lines
 }
 
-struct LocatedEdit {
-    at: usize,  // 0-indexed insertion/replacement start in current
-    end: usize, // exclusive replacement end (== at for insertions)
-    body: Vec<String>,
-}
+/// Build a 1-indexed line number map from `previous_text` to `current_text`.
+/// Only unchanged lines are mapped. Returns `HashMap<prev_line, cur_line>`.
+fn build_line_map(previous_text: &str, current_text: &str) -> HashMap<usize, usize> {
+    let diff = TextDiff::from_lines(previous_text, current_text);
+    let mut map = HashMap::new();
+    let mut prev_line: usize = 1;
+    let mut cur_line: usize = 1;
 
-impl LocatedEdit {
-    fn apply(&self, out: &mut Vec<String>) {
-        out.splice(self.at..self.end, self.body.iter().cloned());
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Equal => {
+                map.insert(prev_line, cur_line);
+                prev_line += 1;
+                cur_line += 1;
+            }
+            similar::ChangeTag::Insert => {
+                cur_line += 1;
+            }
+            similar::ChangeTag::Delete => {
+                prev_line += 1;
+            }
+        }
     }
+    map
 }
 
-fn resolve_changes(
-    ops: &[Op],
-    snap_lines: &[&str],
-    current_tag: &str,
-) -> Result<Vec<Change>, RecoverError> {
-    let mut changes = Vec::new();
+/// Values appearing two or more times in `lines`, for O(1) duplicate checks.
+fn collect_duplicates<'a>(lines: &'a [&'a str]) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut dup = HashSet::new();
+    for &v in lines {
+        if !seen.insert(v) {
+            dup.insert(v);
+        }
+    }
+    dup
+}
+
+/// Nearest non-anchor context line on each side of an anchor, when the anchor
+/// sits in a contiguous run of anchors.
+struct AnchorNeighbors {
+    before: Option<usize>, // 1-indexed line just above the anchor run
+    after: Option<usize>,  // 1-indexed line just below the anchor run
+}
+
+/// Compute nearest non-anchor context for every anchor in one pass.
+fn compute_anchor_neighbors(
+    anchor_lines: &BTreeSet<usize>,
+    line_count: usize,
+) -> HashMap<usize, AnchorNeighbors> {
+    let sorted: Vec<&usize> = anchor_lines.iter().collect();
+    let mut neighbors = HashMap::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i;
+        while j + 1 < sorted.len() && sorted[j + 1] == &(sorted[j] + 1) {
+            j += 1;
+        }
+        let start = *sorted[i];
+        let end = *sorted[j];
+        let before = if start > 1 && start <= line_count { Some(start - 1) } else { None };
+        let after = if end < line_count { Some(end + 1) } else { None };
+        for &anchor in &sorted[i..=j] {
+            neighbors.insert(*anchor, AnchorNeighbors { before, after });
+        }
+        i = j + 1;
+    }
+    neighbors
+}
+
+/// Validate that every anchor's context also maps consistently.
+fn validate_anchors(
+    anchors: &[usize],
+    line_map: &HashMap<usize, usize>,
+    prev_lines: &[&str],
+    cur_lines: &[&str],
+) -> bool {
+    if anchors.is_empty() {
+        return true;
+    }
+
+    let anchor_set: BTreeSet<usize> = anchors.iter().copied().collect();
+    let duplicated_prev = collect_duplicates(prev_lines);
+    let duplicated_cur = collect_duplicates(cur_lines);
+    let neighbors = compute_anchor_neighbors(&anchor_set, prev_lines.len());
+
+    for &line in &anchor_set {
+        let Some(&mapped) = line_map.get(&line) else {
+            return false;
+        };
+        if mapped == 0 || mapped > cur_lines.len() {
+            return false;
+        }
+        let Some(n) = neighbors.get(&line) else {
+            // Single anchor with no context at file boundary — accept if unique.
+            if prev_lines[line - 1].is_empty() || !duplicated_prev.contains(prev_lines[line - 1]) {
+                continue;
+            }
+            return false;
+        };
+
+        let prev_is_dup = duplicated_prev.contains(prev_lines[line - 1]);
+        let cur_is_dup = duplicated_cur.contains(cur_lines[mapped - 1]);
+
+        if !prev_is_dup && !cur_is_dup {
+            // Unique value: at least one neighbor must map consistently.
+            let mut ok = false;
+            if let Some(before) = n.before
+                && line_map.get(&before) == Some(&(mapped.saturating_sub(line - before)))
+            {
+                ok = true;
+            }
+            if !ok
+                && let Some(after) = n.after
+                && line_map.get(&after) == Some(&(mapped + (after - line)))
+            {
+                ok = true;
+            }
+            if !ok {
+                return false;
+            }
+        } else {
+            // Duplicate value: BOTH neighbors must map consistently.
+            if let Some(before) = n.before
+                && line_map.get(&before) != Some(&(mapped.saturating_sub(line - before)))
+            {
+                return false;
+            }
+            if let Some(after) = n.after
+                && line_map.get(&after) != Some(&(mapped + (after - line)))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Remap ops from snapshot line numbers to current line numbers.
+/// Returns `None` when any anchor is unmapped or the offsets are inconsistent.
+fn remap_ops(ops: &[Op], line_map: &HashMap<usize, usize>) -> Option<Vec<Op>> {
+    let mut offsets: Vec<isize> = Vec::new();
+
+    let mut map_line = |line: usize| -> Option<usize> {
+        let mapped = *line_map.get(&line)?;
+        let offset = mapped as isize - line as isize;
+        offsets.push(offset);
+        Some(mapped)
+    };
+
+    let mut remapped = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
             Op::Swap { start, end, body } => {
-                let s = start.checked_sub(1).unwrap_or(0);
-                let e = *end; // exclusive
-                let old: Vec<String> = snap_lines
-                    .get(s..e)
-                    .ok_or_else(|| RecoverError {
-                        message: format!("snapshot range {start}..={end} out of bounds"),
-                        current_tag: current_tag.to_string(),
-                    })?
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect();
-                let repaired = repair_boundaries(snap_lines, *start, *end, body);
-                changes.push(Change::Replace {
-                    old,
-                    body: repaired,
+                let s = map_line(*start)?;
+                let e = map_line(*end)?;
+                remapped.push(Op::Swap {
+                    start: s,
+                    end: e,
+                    body: body.clone(),
                 });
             }
             Op::Del { start, end } => {
-                let s = start.checked_sub(1).unwrap_or(0);
-                let e = *end;
-                let old: Vec<String> = snap_lines
-                    .get(s..e)
-                    .ok_or_else(|| RecoverError {
-                        message: format!("snapshot range {start}..={end} out of bounds"),
-                        current_tag: current_tag.to_string(),
-                    })?
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect();
-                changes.push(Change::Replace {
-                    old,
-                    body: Vec::new(),
-                });
+                let s = map_line(*start)?;
+                let e = map_line(*end)?;
+                remapped.push(Op::Del { start: s, end: e });
             }
             Op::Ins { pos, anchor, body } => {
-                let (anchor, before, head, tail) = match (pos, anchor) {
-                    (InsPos::Head, _) => (None, false, true, false),
-                    (InsPos::Tail, _) => (None, false, false, true),
-                    (InsPos::Pre, Some(a)) => (Some(*a), true, false, false),
-                    (InsPos::Post, Some(a)) => (Some(*a), false, false, false),
-                    _ => {
-                        return Err(RecoverError {
-                            message: "INS PRE/POST requires an anchor".to_string(),
-                            current_tag: current_tag.to_string(),
-                        });
-                    }
-                };
-                if head || tail {
-                    changes.push(Change::InsertEnd {
-                        body: body.clone(),
-                        head,
-                    });
-                    continue;
-                }
-                let a = anchor.unwrap().saturating_sub(1);
-                let anchor_line =
-                    snap_lines
-                        .get(a)
-                        .map(|l| l.to_string())
-                        .ok_or_else(|| RecoverError {
-                            message: format!("INS anchor line {} out of bounds", a + 1),
-                            current_tag: current_tag.to_string(),
-                        })?;
-                changes.push(Change::Insert {
-                    anchor: vec![anchor_line],
+                let new_anchor = anchor.and_then(&mut map_line);
+                remapped.push(Op::Ins {
+                    pos: *pos,
+                    anchor: new_anchor,
                     body: body.clone(),
-                    before,
                 });
             }
             Op::SwapBlk { start, body } => {
-                let (s, e) =
-                    block::resolve_block_range(snap_lines, *start).map_err(|e| RecoverError {
-                        message: e.to_string(),
-                        current_tag: current_tag.to_string(),
-                    })?;
-                let old: Vec<String> = snap_lines[s - 1..e].iter().map(|l| l.to_string()).collect();
-                let repaired = repair_boundaries(snap_lines, s, e, body);
-                changes.push(Change::Replace {
-                    old,
-                    body: repaired,
+                let s = map_line(*start)?;
+                remapped.push(Op::SwapBlk {
+                    start: s,
+                    body: body.clone(),
                 });
             }
             Op::DelBlk { start } => {
-                let (s, e) =
-                    block::resolve_block_range(snap_lines, *start).map_err(|e| RecoverError {
-                        message: e.to_string(),
-                        current_tag: current_tag.to_string(),
-                    })?;
-                let old: Vec<String> = snap_lines[s - 1..e].iter().map(|l| l.to_string()).collect();
-                changes.push(Change::Replace {
-                    old,
-                    body: Vec::new(),
-                });
+                let s = map_line(*start)?;
+                remapped.push(Op::DelBlk { start: s });
             }
             Op::InsBlkPost { anchor, body } => {
-                let land = block::block_post_insertion_line(snap_lines, *anchor).map_err(|e| {
-                    RecoverError {
-                        message: e.to_string(),
-                        current_tag: current_tag.to_string(),
-                    }
-                })?;
-                // Anchor on the line at `land` (1-indexed); insert after it.
-                let a = land.saturating_sub(1);
-                let anchor_line = snap_lines.get(a).map(|l| l.to_string()).unwrap_or_default();
-                changes.push(Change::Insert {
-                    anchor: vec![anchor_line],
+                let a = map_line(*anchor)?;
+                remapped.push(Op::InsBlkPost {
+                    anchor: a,
                     body: body.clone(),
-                    before: false,
                 });
             }
         }
     }
-    Ok(changes)
-}
 
-/// Locate `old` (a non-empty line sequence) in `cur_lines` uniquely; return the
-/// 0-indexed `(at, end)` range. For insertions, locate the single `anchor` line
-/// and return `(at, at)` with `at` set to the insertion point.
-fn locate(cur_lines: &[&str], change: &Change) -> Option<LocatedEdit> {
-    match change {
-        Change::Replace { old, body } => {
-            if old.is_empty() {
-                return None;
-            }
-            let pos = find_unique_run(cur_lines, old)?;
-            Some(LocatedEdit {
-                at: pos,
-                end: pos + old.len(),
-                body: body.clone(),
-            })
+    // All anchors must have the same offset.
+    // HEAD/TAIL inserts have no anchors and produce an empty offsets vec.
+    if offsets.is_empty() {
+        // No anchors to remap — return ops unchanged. This is valid for
+        // HEAD/TAIL-only patches. But if there ARE anchor-bearing ops, we
+        // should have offsets.
+        let has_anchors = ops.iter().any(|op| {
+            matches!(
+                op,
+                Op::Swap { .. }
+                    | Op::Del { .. }
+                    | Op::SwapBlk { .. }
+                    | Op::DelBlk { .. }
+                    | Op::InsBlkPost { .. }
+                    | Op::Ins {
+                        anchor: Some(_),
+                        ..
+                    }
+            )
+        });
+        if has_anchors {
+            return None;
         }
-        Change::Insert {
-            anchor,
-            body,
-            before,
-        } => {
-            let pos = find_unique_run(cur_lines, anchor)?;
-            let at = if *before { pos } else { pos + anchor.len() };
-            Some(LocatedEdit {
-                at,
-                end: at,
-                body: body.clone(),
-            })
-        }
-        Change::InsertEnd { body, head } => {
-            let at = if *head { 0 } else { cur_lines.len() };
-            Some(LocatedEdit {
-                at,
-                end: at,
-                body: body.clone(),
-            })
-        }
+        return Some(remapped);
     }
-}
-
-/// Find the first (and require unique) index where `needle` appears as a
-/// contiguous sub-sequence of `haystack`. Returns `None` if not found or
-/// ambiguous (more than one match).
-fn find_unique_run(haystack: &[&str], needle: &[String]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+    let first = offsets[0];
+    if offsets.iter().all(|&o| o == first) {
+        Some(remapped)
+    } else {
+        None
     }
-    let mut first: Option<usize> = None;
-    let mut count = 0;
-    for i in 0..=(haystack.len() - needle.len()) {
-        if haystack[i..i + needle.len()]
-            .iter()
-            .zip(needle.iter())
-            .all(|(h, n)| *h == n.as_str())
-        {
-            first = Some(i);
-            count += 1;
-            if count > 1 {
-                return None;
-            }
-        }
-    }
-    first.filter(|_| count == 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use crate::hashline::InsPos;
 
     fn snap(tag: &str, text: &str) -> Snapshot {
         Snapshot {
             path: PathBuf::from("x.rs"),
             text: text.to_string(),
             tag: tag.to_string(),
+            recorded_at: 0,
+            seen_lines: None,
         }
     }
 
     #[test]
     fn missing_snapshot_errors() {
         let store = SnapshotStore::new();
-        let err = try_recover("A\nB\n", "FFFF", &[], &store, &PathBuf::from("x.rs")).unwrap_err();
+        let err = try_recover("A\nB\n", "FFFFFF", &[], &store, &PathBuf::from("x.rs")).unwrap_err();
         assert!(err.message.contains("not found"));
     }
 
     #[test]
     fn current_equals_snapshot_applies_cleanly() {
         let text = "fn a() {\n    x();\n}\n";
-        let snapshot = snap("AAAA", text);
+        let snapshot = snap("AAAAAA", text);
         let ops = [Op::Swap {
             start: 2,
             end: 2,
@@ -366,12 +412,9 @@ mod tests {
 
     #[test]
     fn shifted_context_still_locates_target() {
-        // Snapshot: target line `x();` is at line 2. Current prepended an
-        // unrelated header line, shifting `x();` to line 3 — but content
-        // anchoring still finds it.
         let snap_text = "fn a() {\n    x();\n}\n";
         let current = "// header\nfn a() {\n    x();\n}\n";
-        let snapshot = snap("AAAA", snap_text);
+        let snapshot = snap("AAAAAA", snap_text);
         let ops = [Op::Swap {
             start: 2,
             end: 2,
@@ -382,26 +425,76 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_anchor_fails() {
-        // `    x();` (snapshot's line 2) appears twice in current → cannot
-        // uniquely locate the swap target.
+    fn shifted_context_tail_insertion() {
+        let snap_text = "a\nb\nc";
+        let current = "a\nb\nc\nd";
+        let snapshot = snap("BBBBBB", snap_text);
+        let ops = [Op::Ins {
+            pos: InsPos::Tail,
+            anchor: None,
+            body: vec!["e".into()],
+        }];
+        let merged = try_recover_with_snapshot(current, &snapshot, &ops).unwrap();
+        assert_eq!(merged, "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn ambiguous_anchor_succeeds_for_first_occurrence() {
         let snap_text = "fn a() {\n    x();\n}\n";
         let current = "fn a() {\n    x();\n}\nfn b() {\n    x();\n}\n";
-        let snapshot = snap("AAAA", snap_text);
+        let snapshot = snap("AAAAAA", snap_text);
         let ops = [Op::Swap {
             start: 2,
             end: 2,
             body: vec!["    y();".into()],
         }];
-        assert!(try_recover_with_snapshot(current, &snapshot, &ops).is_err());
+        // The diff maps line 2 → 2 (first `x();`). The second `x();` is at
+        // line 6 in current, not in the line map. So this should succeed.
+        let merged = try_recover_with_snapshot(current, &snapshot, &ops).unwrap();
+        assert_eq!(merged, "fn a() {\n    y();\n}\nfn b() {\n    x();\n}");
     }
 
     #[test]
     fn missing_target_fails() {
         let snap_text = "fn a() {\n    x();\n}\n";
         let current = "fn a() {\n    z();\n}\n";
-        let snapshot = snap("AAAA", snap_text);
+        let snapshot = snap("AAAAAA", snap_text);
         let ops = [Op::Del { start: 2, end: 2 }];
         assert!(try_recover_with_snapshot(current, &snapshot, &ops).is_err());
+    }
+
+    #[test]
+    fn multiple_hunks_shifted() {
+        let snap_text = "a\nb\nc\nd\ne";
+        let current = "HEAD\na\nb\nc\nd\ne";
+        let snapshot = snap("CCCCCC", snap_text);
+        let ops = [
+            Op::Swap {
+                start: 1,
+                end: 1,
+                body: vec!["x".into()],
+            },
+            Op::Swap {
+                start: 5,
+                end: 5,
+                body: vec!["y".into()],
+            },
+        ];
+        let merged = try_recover_with_snapshot(current, &snapshot, &ops).unwrap();
+        assert_eq!(merged, "HEAD\nx\nb\nc\nd\ny");
+    }
+
+    #[test]
+    fn insert_after_shifted_anchor() {
+        let snap_text = "a\nb\nc";
+        let current = "x\na\nb\nc";
+        let snapshot = snap("DDDDDD", snap_text);
+        let ops = [Op::Ins {
+            pos: InsPos::Post,
+            anchor: Some(2),
+            body: vec!["INS".into()],
+        }];
+        let merged = try_recover_with_snapshot(current, &snapshot, &ops).unwrap();
+        assert_eq!(merged, "x\na\nb\nINS\nc");
     }
 }

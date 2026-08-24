@@ -339,14 +339,22 @@ pub(super) fn repair_boundaries(
     repaired
 }
 
-/// Net `()`/`[]`/`{}` balance of a line, skipping `//` comments and string
-/// literals (simplified scan — sufficient for boundary-repair heuristics).
+/// Net `()`/`[]`/`{}` balance of a line, skipping `//` and `/* */` comments,
+/// string literals (`"`/`'`), and backtick template literals.
 pub(super) fn net_balance(line: &str) -> i32 {
     let mut balance: i32 = 0;
     let mut in_string = false;
     let mut string_quote = '\0';
+    let mut in_block_comment = false;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_block_comment {
+            if c == '*' && matches!(chars.peek(), Some('/')) {
+                in_block_comment = false;
+                chars.next();
+            }
+            continue;
+        }
         if in_string {
             if c == '\\' {
                 chars.next();
@@ -359,7 +367,11 @@ pub(super) fn net_balance(line: &str) -> i32 {
         }
         match c {
             '/' if matches!(chars.peek(), Some('/')) => break,
-            '"' | '\'' => {
+            '/' if matches!(chars.peek(), Some('*')) => {
+                in_block_comment = true;
+                chars.next();
+            }
+            '"' | '\'' | '`' => {
                 in_string = true;
                 string_quote = c;
             }

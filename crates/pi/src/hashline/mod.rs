@@ -1,6 +1,6 @@
 //! Hashline editing: line-anchored patches validated by content-hash tags.
 //!
-//! `read` mints a 4-hex tag from the file's normalized text and records a
+//! `read` mints a 6-hex tag from the file's normalized text and records a
 //! snapshot; `edit` parses a patch of `SWAP`/`DEL`/`INS` ops anchored on
 //! the ORIGINAL line numbers, validates the tag still matches the live file,
 //! and applies the ops back-to-front. On a stale tag, a 3-way merge replays the
@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn format_numbered_shapes_header_and_lines() {
-        let out = format_numbered("a.rs", "fn main() {\n}", "1A2B");
-        assert_eq!(out, "[a.rs#1A2B]\n1:fn main() {\n2:}");
+        let out = format_numbered("a.rs", "fn main() {\n}", "1A2B3C");
+        assert_eq!(out, "[a.rs#1A2B3C]\n1:fn main() {\n2:}");
     }
 
     fn ten_line_file() -> String {

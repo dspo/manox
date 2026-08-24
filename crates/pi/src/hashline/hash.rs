@@ -1,15 +1,14 @@
 //! Content hash for snapshot tags.
 //!
-//! The tag is a 4-hex fingerprint of the whole file's normalized text: any read
+//! The tag is a 6-hex fingerprint of the whole file's normalized text: any read
 //! of byte-identical content mints the same tag, and a follow-up edit anchored
 //! at any line validates whenever the live file still hashes to it. Trailing
 //! whitespace and CRLF endings are normalized away before hashing so display
 //! trimming and line-ending differences never invalidate a tag.
 
 use xxhash_rust::xxh32::xxh32;
-
 /// Tag length in hex characters.
-pub const TAG_LEN: usize = 4;
+pub const TAG_LEN: usize = 6;
 
 /// Normalize text before hashing: trim trailing `[ \t\r]` from every line
 /// (including the final line) so CRLF endings and display-trimmed lines do not
@@ -30,11 +29,11 @@ pub fn normalize(text: &str) -> String {
     out
 }
 
-/// Compute the 4-uppercase-hex content tag from raw file text.
+/// Compute the 6-uppercase-hex content tag from raw file text.
 pub fn compute_tag(text: &str) -> String {
     let normalized = normalize(text);
-    let low16 = xxh32(normalized.as_bytes(), 0) & 0xffff;
-    format!("{:0>4X}", low16)
+    let low24 = xxh32(normalized.as_bytes(), 0) & 0xffffff;
+    format!("{:0>6X}", low24)
 }
 
 #[cfg(test)]
@@ -63,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn tag_is_four_upper_hex() {
+    fn tag_is_six_upper_hex() {
         let tag = compute_tag("anything");
         assert_eq!(tag.len(), TAG_LEN);
         assert!(tag.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')));
