@@ -491,7 +491,10 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             i18n::t("settings-desc-permission-workspaceread"),
             learn_more.clone(),
         );
-        let desc_full = build_desc(i18n::t("settings-desc-permission-fullaccess"), learn_more);
+        let desc_full = build_desc(
+            i18n::t("settings-desc-permission-dangerfullaccess"),
+            learn_more,
+        );
         // Radio semantics across three switches: enabling one row selects
         // its mode; switching a row off keeps the current selection.
         let mode = view.permission_mode;
@@ -528,15 +531,15 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(
-                i18n::t("settings-row-permission-fullaccess"),
+                i18n::t("settings-row-permission-dangerfullaccess"),
                 Some(desc_full),
                 mock_switch(
-                    "perm-full-access",
-                    mode == PermissionMode::FullAccess,
+                    "perm-danger-full-access",
+                    mode == PermissionMode::DangerFullAccess,
                     entity,
                     Arc::new(|this, on| {
                         if on {
-                            this.permission_mode = PermissionMode::FullAccess;
+                            this.permission_mode = PermissionMode::DangerFullAccess;
                         }
                     }),
                 ),

@@ -19,7 +19,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 会话主路径（流式文本 / thinking / 工具卡片 / cancel / steer） | ✅ | `pi_backend::session` + `adapt`；空闲 `prompt()`，运行中 `steer()` |
 | 会话持久化与重启恢复 | ✅ | pi jsonl + `session_meta` sidecar |
 | 转录渲染（MessageList / ToolCallCard / RetryBadge / ErrorMessage） | ✅ | 共享渲染管线 |
-| 权限门控（PermissionMode / ToolCallAuthorization / AskUserQuestion） | ✅ | 宿主 `ApprovalGatedTool` wrapper（纯模式 allow/deny，无 reviewer/overlay）；AccessChip 切 ReadOnly/WorkspaceWrite/FullAccess |
+| 权限门控（PermissionMode / ToolCallAuthorization / AskUserQuestion） | ✅ | 文件效果策略：bash 三模式都运行（seatbelt 按模式渲染 read-only/workspace-write profile），fs 写经 `writable_roots` containment + `[sandbox: …]` marker；`sandbox_permissions`+`justification` 升级往返经 `ToolCallAuthorization`；AccessChip 切 ReadOnly/WorkspaceWrite/DangerFullAccess |
 | Slash commands | ✅ 部分 | `/compact`、`/exit`(`/quit`)、`/new`(`/clear` `/archive`)、`/plan`、`/goal`、`/mode`；markdown/skill 适配器经共享 registry |
 | 模型选择器 | ✅ | pi `ProviderRegistry`，按 provider 显示名分组 |
 | 项目（composer chip / 侧栏文件夹 / 绑定新会话） | ✅ | 共享 threads.db `projects` 表 |
@@ -595,7 +595,7 @@ Trigger: [ModelChip](#modelchip). Model selector dropdown: provider submenus for
 
 #### AccessMenu
 
-Trigger: [AccessChip](#accesschip). [PermissionMode](#permission-modes) selector: Read Only / Workspace Write / Full Access.
+Trigger: [AccessChip](#accesschip). [PermissionMode](#permission-modes) selector: Read Only / Workspace Write / Danger Full Access.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -983,21 +983,19 @@ Hover tooltip.
 
 ## 8. Permission Modes
 
-Visual states of the [AccessChip](#accesschip). Pure mode-based allow/deny —
-no reviewer, no per-call approval overlay; out-of-scope tool calls return a
-tool error to the model.
+Three file-effect modes drive the seatbelt profile (bash) and the fs write fence; a denied call carries a `[sandbox: …]` marker and a `sandbox_permissions`+`justification` escalation path through the `ToolCallAuthorization` card.
 
 #### Read Only
 
-Amber — mutating tools denied; reads ungated.
+Amber — bash runs but writes are denied by the seatbelt; fs mutations refused.
 
 #### Workspace Write
 
-Green — in-workspace writes and sandbox-confined bash ungated; out-of-workspace targets denied (default).
+Green — writes under the workspace + temp areas; bash confined to the workspace-write profile (default).
 
-#### Full Access
+#### Danger Full Access
 
-Red — everything ungated, bash runs outside the sandbox.
+Red — no sandbox; bash unsandboxed, fs mutations unfenced.
 ---
 
 ## 9. Tool Call Statuses

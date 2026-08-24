@@ -8836,8 +8836,8 @@ fn mode_chip_visual(mode: PermissionMode, theme: &Theme) -> (SharedString, gpui:
             theme.info,
             IconName::FolderOpen,
         ),
-        PermissionMode::FullAccess => (
-            i18n::t("workspace-chip-mode-fullaccess"),
+        PermissionMode::DangerFullAccess => (
+            i18n::t("workspace-chip-mode-dangerfullaccess"),
             theme.danger,
             IconName::TriangleAlert,
         ),
@@ -8960,25 +8960,25 @@ fn build_permission_content(
             current == PermissionMode::WorkspaceWrite,
         ))
         .child(make_row(
-            PermissionMode::FullAccess,
-            i18n::t("workspace-mode-fullaccess-title"),
-            i18n::t("workspace-mode-fullaccess-desc"),
+            PermissionMode::DangerFullAccess,
+            i18n::t("workspace-mode-dangerfullaccess-title"),
+            i18n::t("workspace-mode-dangerfullaccess-desc"),
             IconName::TriangleAlert,
             danger,
-            current == PermissionMode::FullAccess,
+            current == PermissionMode::DangerFullAccess,
         ))
 }
 
 impl Workspace {
     /// Cycle the permission mode on the current thread (`/mode` no-args
-    /// form): ReadOnly → WorkspaceWrite → FullAccess → ReadOnly. The mode
+    /// form): ReadOnly → WorkspaceWrite → DangerFullAccess → ReadOnly. The mode
     /// change notice rides `apply_permission_mode` so the conversation shows
     /// the switch.
     pub(crate) fn cycle_mode(&mut self, cx: &mut Context<Self>) {
         let next = match self.thread.read(cx).permission_mode() {
             PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
-            PermissionMode::WorkspaceWrite => PermissionMode::FullAccess,
-            PermissionMode::FullAccess => PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
+            PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
         };
         self.apply_permission_mode(next, cx);
     }
@@ -9004,7 +9004,7 @@ impl Workspace {
         let mode_key = match mode {
             PermissionMode::ReadOnly => "readonly",
             PermissionMode::WorkspaceWrite => "workspacewrite",
-            PermissionMode::FullAccess => "fullaccess",
+            PermissionMode::DangerFullAccess => "dangerfullaccess",
         };
         self.thread
             .update(cx, |t, cx| t.set_permission_mode(mode, cx));

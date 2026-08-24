@@ -484,7 +484,7 @@ mod tests {
                     python3: "3.12".to_string(),
                     node: "20".to_string(),
                     today: "2026-07-14".to_string(),
-                    permission_mode: "full-access",
+                    permission_mode: "danger-full-access",
                 },
             };
             assert_clean(

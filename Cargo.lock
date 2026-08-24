@@ -148,7 +148,6 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "http",
- "http_proxy",
  "ignore",
  "image",
  "libc",

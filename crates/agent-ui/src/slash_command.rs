@@ -326,9 +326,9 @@ fn builtin_meta(name: &str) -> &'static agent::slash_builtins::BuiltinSlashMeta 
 /// `ProposePlan` tool, never as prose.
 /// `/mode` — cycle or set the permission mode on the current thread.
 ///
-/// `/mode` (no args) cycles ReadOnly → WorkspaceWrite → FullAccess and
+/// `/mode` (no args) cycles ReadOnly → WorkspaceWrite → DangerFullAccess and
 /// pushes a notice. `/mode <name>` sets the named mode (`read-only`,
-/// `workspace-write`, `full-access`); an optional prompt after the mode
+/// `workspace-write`, `danger-full-access`); an optional prompt after the mode
 /// name immediately starts a turn under the new mode.
 struct ModeCommand;
 
