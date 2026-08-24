@@ -30,8 +30,6 @@ impl std::fmt::Display for RecoverError {
 
 impl std::error::Error for RecoverError {}
 
-
-
 /// Attempt to recover a stale-tagged edit. `current` is the live file text
 /// (normalized LF); `claimed_tag` is the tag the edit claims. Returns the merged
 /// new text on success.
@@ -122,7 +120,9 @@ fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
                     lines.push(l);
                 }
             }
-            Op::Ins { anchor: Some(a), .. } => {
+            Op::Ins {
+                anchor: Some(a), ..
+            } => {
                 lines.push(*a);
             }
             Op::SwapBlk { start, .. } => {
@@ -200,8 +200,16 @@ fn compute_anchor_neighbors(
         }
         let start = *sorted[i];
         let end = *sorted[j];
-        let before = if start > 1 && start <= line_count { Some(start - 1) } else { None };
-        let after = if end < line_count { Some(end + 1) } else { None };
+        let before = if start > 1 && start <= line_count {
+            Some(start - 1)
+        } else {
+            None
+        };
+        let after = if end < line_count {
+            Some(end + 1)
+        } else {
+            None
+        };
         for &anchor in &sorted[i..=j] {
             neighbors.insert(*anchor, AnchorNeighbors { before, after });
         }
@@ -367,8 +375,8 @@ fn remap_ops(ops: &[Op], line_map: &HashMap<usize, usize>) -> Option<Vec<Op>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::hashline::InsPos;
+    use std::path::PathBuf;
 
     fn snap(tag: &str, text: &str) -> Snapshot {
         Snapshot {

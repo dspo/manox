@@ -7,6 +7,7 @@
 // single critical section. On write, the file's original CRLF/BOM/trailing
 // newline are restored so the edit is a minimal content delta.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
@@ -42,6 +43,7 @@ SWAP 37.=48:\n\
 +    else:\n\
 +        parser.print_help()\n\
 ```";
+
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
@@ -104,6 +106,22 @@ impl AgentTool for EditTool {
             let current_tag = hashline::compute_tag(&current);
 
             let new_text = if current_tag == fp.tag {
+                // Seen-line gate — only on the no-drift path, where anchor line
+                // numbers index the tagged content 1:1. On recovery the numbers
+                // shift, so provenance does not apply.
+                hashline::assert_seen_lines(
+                    &mut ctx
+                        .tool_state()
+                        .snapshots
+                        .lock()
+                        .expect("hashline snapshot store poisoned"),
+                    &path,
+                    &fp.tag,
+                    &fp.ops,
+                    &current,
+                )
+                .map_err(ToolError::ExecutionFailed)?;
+
                 hashline::apply(&current, &fp.ops)
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
@@ -128,13 +146,21 @@ impl AgentTool for EditTool {
             })?;
 
             // Record snapshot of LF-normalized text, consistent with Read tool.
+            // The model authored the whole file through this patch (or the diff
+            // it produced), so every line counts as seen — a follow-up edit on
+            // the returned tag must not trip the gate.
             let snap_text = hashline::normalize_to_lf(&new_text);
-            let new_snap = ctx
-                .tool_state()
-                .snapshots
-                .lock()
-                .expect("hashline snapshot store poisoned")
-                .record(&path, &snap_text);
+            let new_snap = {
+                let mut store = ctx
+                    .tool_state()
+                    .snapshots
+                    .lock()
+                    .expect("hashline snapshot store poisoned");
+                let snap = store.record(&path, &snap_text);
+                let all_lines: HashSet<usize> = (1..=snap_text.lines().count()).collect();
+                store.record_seen_lines(&path, &snap.tag, &all_lines);
+                snap
+            };
             let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
             let diff = if edit_diff::is_diff_empty(&diff) {
                 "(no changes)".to_string()
