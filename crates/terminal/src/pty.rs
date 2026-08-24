@@ -128,10 +128,12 @@ pub fn open(
     };
     cmd.cwd(cwd);
 
-    // manox is the host terminal regardless of what launched it; TERM and
-    // COLORTERM only fill gaps in sparse GUI-launch environments. User
-    // `[terminal].env` applies last and wins.
-    cmd.env("TERM_PROGRAM", "manox");
+    // manox is the host terminal regardless of what launched it; TERM_PROGRAM
+    // claims iTerm.app because capability-gating TUIs (Claude Code's kitty
+    // keyboard, synchronized output) whitelist known terminal identities and
+    // degrade on unknown ones. TERM and COLORTERM only fill gaps in sparse
+    // GUI-launch environments. User `[terminal].env` applies last and wins.
+    cmd.env("TERM_PROGRAM", "iTerm.app");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     if std::env::var_os("TERM").is_none() {
         cmd.env("TERM", "xterm-256color");
