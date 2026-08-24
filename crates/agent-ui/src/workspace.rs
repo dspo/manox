@@ -2011,40 +2011,53 @@ impl Workspace {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        // Thread-bound (right-pane tab) sessions are resources of their
+        // thread: no sidebar row and no sidecar, so a restart drops them with
+        // the tab instead of resurfacing them as top-level resumable rows.
+        let thread_bound = matches!(placement, SessionPlacement::RightPane { .. });
         // Persist the session as unclosed from the first frame: the sidecar
         // survives this process (crash or quit), is kept in sync while live,
         // and is deleted only on an explicit close — so the next launch offers
         // exactly the sessions the user never closed.
-        let sidecar = ResumeSidecar {
+        let sidecar = (!thread_bound).then(|| ResumeSidecar {
             id: id.clone(),
             agent_id: agent_id.into(),
             cwd: cwd.to_string_lossy().into_owned(),
-            project: project_cwd,
+            project: project_cwd.clone(),
             created_at,
             provider: provider_name,
             model: model_id,
             wire_api: wire_api.clone(),
             title: None,
             cli_session_id: spawn_cli_session_id,
-        };
-        let watch_cli_session_id = sidecar.cli_session_id.clone();
-        if let Err(e) = write_sidecar(&sidecar) {
+        });
+        let watch_cli_session_id = sidecar.as_ref().and_then(|s| s.cli_session_id.clone());
+        if let Some(sidecar) = &sidecar
+            && let Err(e) = write_sidecar(sidecar)
+        {
             tracing::warn!(error = %e, id, "external session sidecar write failed");
         }
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
             kind,
             created_at,
-            project: sidecar.project.clone(),
+            project: project_cwd,
             title: None,
             cx_session_id,
             socket_path,
             terminal_view: view,
             handle: Some(handle),
             _exit_sub: exit_sub,
-            sidecar: Some(sidecar),
+            thread_bound,
+            sidecar,
         });
-        self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
+        // The watcher's only job is capturing the CLI session id into the
+        // sidecar; thread-bound sessions carry none, and starting it would
+        // only claim ledger files a top-level watcher in the same cwd needs
+        // to record its own sidecar's resume target.
+        if !thread_bound {
+            self.start_cli_session_watch(&id, kind, &cwd, watch_cli_session_id, cx);
+        }
         self.sync_sidebar_external(cx);
         self.place_external_session(&id, placement, window, cx);
     }
@@ -2120,6 +2133,7 @@ impl Workspace {
             terminal_view: view,
             handle: None,
             _exit_sub: exit_sub,
+            thread_bound: matches!(placement, SessionPlacement::RightPane { .. }),
             sidecar: None,
         });
         self.sync_sidebar_external(cx);
@@ -2370,7 +2384,10 @@ impl Workspace {
                     _exit_sub: exit_sub,
                     // The resumed session keeps its sidecar (same identity):
                     // the disk record already represents it, and title sync
-                    // keeps the row fresh for a possible later exit.
+                    // keeps the row fresh for a possible later exit. Resumes
+                    // are always top-level (sidebar row path), never
+                    // thread-bound.
+                    thread_bound: false,
                     sidecar: Some(sidecar),
                 });
                 this.start_cli_session_watch(&id, kind, &watch_cwd, watch_initial, cx);
@@ -2692,41 +2709,42 @@ impl Workspace {
     }
 
     /// Mirror an external agent's OSC title (`TerminalEvent::Title`) into its
-    /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
-    /// the titlebar when the active session's title changed. No-op when the
-    /// session was already removed (a spurious title after close).
+    /// `ExternalSession`, keep the durable sidecar's title in sync, and
+    /// refresh the sidebar projection + titlebar when a visible title
+    /// changed. No-op when the session was already removed (a spurious title
+    /// after close) or the title sanitizes to the stored value.
     fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
         let active = self.active_external.as_deref() == Some(id);
-        let new = title.as_deref().filter(|t| !t.trim().is_empty());
-        let changed = self.external_sessions.iter_mut().any(|s| {
-            if s.id != id {
-                return false;
+        // TUI-set titles arrive verbatim; sanitize so the stored form is a
+        // single printable line (control bytes / line breaks would stretch
+        // the sidebar row).
+        let new = title
+            .as_deref()
+            .and_then(crate::external_session::sanitize_osc_title);
+        let Some(session) = self.external_sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        if session.title == new {
+            return;
+        }
+        let thread_bound = session.thread_bound;
+        session.title = new.clone();
+        // Keep the durable sidecar's title in sync so a later exit offers
+        // the resumable row under the latest OSC title rather than the one
+        // captured at spawn / last resume.
+        if let Some(sidecar) = session.sidecar.as_mut() {
+            sidecar.title = new.clone();
+            if let Err(e) = write_sidecar(sidecar) {
+                tracing::warn!(error = %e, id, "external session sidecar title update failed");
             }
-            if s.title.as_deref() == new {
-                return false;
-            }
-            s.title = new.map(str::to_string);
-            true
-        });
-        if changed {
-            // Keep the durable sidecar's title in sync so a later exit offers
-            // the resumable row under the latest OSC title rather than the one
-            // captured at spawn / last resume.
-            if let Some(sidecar) = self
-                .external_sessions
-                .iter_mut()
-                .find(|s| s.id == id)
-                .and_then(|s| s.sidecar.as_mut())
-            {
-                sidecar.title = new.map(str::to_string);
-                if let Err(e) = write_sidecar(sidecar) {
-                    tracing::warn!(error = %e, id, "external session sidecar title update failed");
-                }
-            }
+        }
+        // Thread-bound sessions never project into the sidebar; rebuilding
+        // the projection on their title churn would be pure waste.
+        if !thread_bound {
             self.sync_sidebar_external(cx);
-            if active {
-                cx.notify();
-            }
+        }
+        if active {
+            cx.notify();
         }
     }
 
@@ -2794,7 +2812,14 @@ impl Workspace {
     /// PTY-bearing structs. Live sessions render first, then the resumable
     /// rows restored from sidecars.
     fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
-        let live: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
+        // Thread-bound (right-pane) sessions are resources of their thread
+        // and never surface in the top-level list.
+        let live: Vec<_> = self
+            .external_sessions
+            .iter()
+            .filter(|s| !s.thread_bound)
+            .map(|s| s.summary())
+            .collect();
         let mut summaries = merge_external_summaries(live, self.resumable_external.clone());
         let resuming = self.resuming_external.clone();
         for s in &mut summaries {
