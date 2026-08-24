@@ -1,11 +1,12 @@
 // Edit tool — apply a hashline patch (line-anchored + TAG validation) to
 // existing files, with 3-way merge recovery on a stale TAG.
 //
-// A patch holds one or more `[path#TAG]` sections of `SWAP`/`DEL`/`INS` ops
-// anchored on the ORIGINAL line numbers from `read`. The per-file mutation
-// lock is held across read→patch→write so the TAG check and the write form a
-// single critical section. On write, the file's original CRLF/BOM/trailing
-// newline are restored so the edit is a minimal content delta.
+// A patch holds one or more `[path#TAG]` sections of `SWAP`/`DEL`/`INS`/
+// `CUT`/`PASTE` ops anchored on the ORIGINAL line numbers from `read`, plus
+// optional file-level ops (`REM`/`MV`). The per-file mutation lock is held
+// across read→patch→write so the TAG check and the write form a single
+// critical section. On write, the file's original CRLF/BOM/trailing newline
+// are restored so the edit is a minimal content delta.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::hashline;
+use crate::hashline::parser::Op;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
@@ -25,9 +27,12 @@ const PATCH_DOC: &str = "Hashline patch text. Each file section starts with a he
 `[<abs-path>#<tag>]` — paste the exact path and 6-hex tag returned by your latest `read` \
 for that file; do NOT write the literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A55789]`. \
 Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows; \
-`DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / \
-`INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` operate on the \
-bracket-block beginning at line N. Body rows are `+TEXT` (`+` alone = blank line; \
+`DEL N.=M` delete lines N..=M (no body); `CUT N.=M` delete and capture to clipboard; \
+`PASTE.PRE N:` / `PASTE.POST N:` / `PASTE.HEAD:` / `PASTE.TAIL:` paste clipboard content; \
+`INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` insert body rows; \
+`SWAP.BLK N:` / `DEL.BLK N` / `CUT.BLK N` / `INS.BLK.POST N:` operate on the \
+bracket-block beginning at line N; `REM` deletes the file; `MV DEST` renames it. \
+Body rows are `+TEXT` (`+` alone = blank line; \
 `+-x`/`++x` escapes a literal leading `-`/`+`); a `-`-prefixed markdown list item is NOT a \
 body row — rewrite it with a `+` prefix. Line numbers reference the ORIGINAL file from read \
 and do not shift across hunks. Ranges cover only changed lines; pure additions use `INS`, \
@@ -86,21 +91,44 @@ impl AgentTool for EditTool {
         let patches =
             hashline::parse_patch(patch).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
+        // Clear the clipboard at the start of each edit call — the anonymous
+        // register is batch-local, matching oh-my-pi's startClipboardBatch.
+        ctx.tool_state()
+            .clipboard
+            .lock()
+            .expect("hashline clipboard poisoned")
+            .clear();
+
         let mut results: Vec<String> = Vec::new();
         for fp in patches {
             let path = resolve_path(ctx, &fp.path);
             let path_display = path.display().to_string();
 
-            // Handle file-level operations (REM/MV).
+            // Hold the mutation lock across all operations so concurrent
+            // edits to the same file are serialized.
+            let _guard = ctx.tool_state().mutation_queue.lock(&path).await;
+
+            // File-level operations (REM/MV) still validate the tag — the
+            // model must have a current view of the file it's deleting or
+            // moving.
             if let Some(file_op) = &fp.file_op {
+                let raw = ctx.env().read_file(&path, None, None).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("edit read failed {path_display}: {e}"))
+                })?;
+                let current = hashline::normalize_to_lf(&raw);
+                let current_tag = hashline::compute_tag(&current);
+                if current_tag != fp.tag {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "edit {path_display}: file changed between read and edit (tag mismatch)"
+                    )));
+                }
                 match file_op {
                     hashline::FileOp::Rem => {
-                        ctx.env().write_file(&path, "").await.map_err(|e| {
+                        ctx.env().remove(&path).await.map_err(|e| {
                             ToolError::ExecutionFailed(format!(
                                 "edit REM failed {path_display}: {e}"
                             ))
                         })?;
-                        // Invalidate the snapshot for the deleted file.
                         ctx.tool_state()
                             .snapshots
                             .lock()
@@ -111,32 +139,32 @@ impl AgentTool for EditTool {
                     }
                     hashline::FileOp::Move { dest } => {
                         let dest_path = resolve_path(ctx, std::path::Path::new(dest));
-                        let raw = ctx.env().read_file(&path, None, None).await.map_err(|e| {
+                        ctx.env()
+                            .write_file(&dest_path, &raw)
+                            .await
+                            .map_err(|e| {
+                                ToolError::ExecutionFailed(format!(
+                                    "edit MV write failed {path_display}: {e}"
+                                ))
+                            })?;
+                        ctx.env().remove(&path).await.map_err(|e| {
                             ToolError::ExecutionFailed(format!(
-                                "edit MV read failed {path_display}: {e}"
+                                "edit MV source removal failed {path_display}: {e}"
                             ))
                         })?;
-                        ctx.env().write_file(&dest_path, &raw).await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "edit MV write failed {path_display}: {e}"
-                            ))
-                        })?;
-                        // Relocate snapshot history from old path to new path.
                         ctx.tool_state()
                             .snapshots
                             .lock()
                             .expect("hashline snapshot store poisoned")
                             .relocate(&path, &dest_path);
-                        results.push(format!("[{path_display}] moved to {}", dest_path.display()));
+                        results.push(format!(
+                            "[{path_display}] moved to {}",
+                            dest_path.display()
+                        ));
                         continue;
                     }
                 }
             }
-
-            // Hold the mutation lock across read+patch+write so the TAG check
-            // and the write are a single critical section — a concurrent
-            // writer between read and write would stale the TAG and clobber.
-            let _guard = ctx.tool_state().mutation_queue.lock(&path).await;
 
             let raw = ctx.env().read_file(&path, None, None).await.map_err(|e| {
                 ToolError::ExecutionFailed(format!("edit read failed {path_display}: {e}"))
@@ -231,13 +259,16 @@ fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
 
 /// Expand Cut/Paste ops before apply. Cut captures the deleted lines to the
 /// clipboard and converts to Del; Paste expands to Ins with clipboard content.
+/// CutBlk resolves the block range and captures those lines before converting
+/// to DelBlk.
 fn expand_clipboard_ops(
-    ops: &[hashline::Op],
+    ops: &[Op],
     current: &str,
     ctx: &dyn ToolContext,
-) -> Result<Vec<hashline::Op>, ToolError> {
+) -> Result<Vec<Op>, ToolError> {
     let lines: Vec<&str> = current.lines().collect();
-    let mut expanded: Vec<hashline::Op> = Vec::new();
+    let line_refs: Vec<&str> = lines.to_vec();
+    let mut expanded: Vec<Op> = Vec::new();
     let mut clipboard = ctx
         .tool_state()
         .clipboard
@@ -246,28 +277,34 @@ fn expand_clipboard_ops(
 
     for op in ops {
         match op {
-            hashline::Op::Cut { start, end } => {
-                // Capture the lines being cut to the clipboard.
+            Op::Cut { start, end } => {
                 let s = start.saturating_sub(1);
                 let e = (*end).min(lines.len());
                 if s < e {
-                    let captured: Vec<String> = lines[s..e].iter().map(|s| s.to_string()).collect();
+                    let captured: Vec<String> =
+                        lines[s..e].iter().map(|s| s.to_string()).collect();
                     clipboard.clear();
                     clipboard.extend(captured);
                 }
-                // Convert Cut to Del.
-                expanded.push(hashline::Op::Del {
+                expanded.push(Op::Del {
                     start: *start,
                     end: *end,
                 });
             }
-            hashline::Op::CutBlk { start } => {
-                // CutBlk needs block resolution to capture lines; for now,
-                // convert to DelBlk (clipboard capture happens at block level).
-                expanded.push(hashline::Op::DelBlk { start: *start });
+            Op::CutBlk { start } => {
+                let (s, e) = crate::hashline::block::resolve_block_range(&line_refs, *start)
+                    .map_err(|err| {
+                        ToolError::ExecutionFailed(format!("CUT.BLK resolve failed: {err}"))
+                    })?;
+                let captured: Vec<String> = lines[s - 1..e]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                clipboard.clear();
+                clipboard.extend(captured);
+                expanded.push(Op::DelBlk { start: *start });
             }
-            hashline::Op::Paste { pos, anchor } => {
-                // Expand Paste to Ins with clipboard content.
+            Op::Paste { pos, anchor } => {
                 let body = clipboard.clone();
                 if body.is_empty() {
                     return Err(ToolError::ExecutionFailed(
@@ -275,7 +312,7 @@ fn expand_clipboard_ops(
                             .to_string(),
                     ));
                 }
-                expanded.push(hashline::Op::Ins {
+                expanded.push(Op::Ins {
                     pos: *pos,
                     anchor: *anchor,
                     body,
@@ -307,8 +344,6 @@ fn persist(text: &str, crlf: bool, bom: bool, trailing_nl: bool) -> String {
     } else {
         out.push_str(text);
     }
-    // Re-attach a trailing terminator if the original file had one and the
-    // edited content is non-empty (an emptied file stays empty).
     if trailing_nl && !text.is_empty() {
         if crlf {
             out.push_str("\r\n");
@@ -325,15 +360,10 @@ mod tests {
 
     #[test]
     fn persist_restores_trailing_newline_and_crlf() {
-        // apply yields content without a terminator; persist re-attaches the
-        // file's original trailing newline (LF or CRLF) and BOM.
         assert_eq!(persist("a\nb", false, false, true), "a\nb\n");
         assert_eq!(persist("a\nb", true, false, true), "a\r\nb\r\n");
-        // No trailing newline originally → none added.
         assert_eq!(persist("a\nb", false, false, false), "a\nb");
-        // Emptied content stays empty even if the original had a newline.
         assert_eq!(persist("", false, false, true), "");
-        // BOM is re-prepended.
         assert_eq!(persist("x", false, true, false), "\u{feff}x");
     }
 }
