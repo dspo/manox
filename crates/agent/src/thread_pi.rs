@@ -1464,7 +1464,9 @@ impl Thread {
                 permission_mode_explicitly_set: true,
                 reasoning_effort_explicitly_set: true,
                 browser_suites: Vec::new(),
-                browser_suites_explicitly_set: false,
+                // Members never mount browser suites; the explicit flag keeps
+                // even an empty-mirror seed from the Ready projection out.
+                browser_suites_explicitly_set: true,
                 plan_mode: false,
                 persisted_plan: None,
                 goal_bridge: None,
