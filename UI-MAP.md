@@ -1030,5 +1030,3 @@ Thread-level reasoning effort, chosen in [ModelMenu](#modelmenu) (High / Max, cu
 
 #### High
 #### Max
-
-

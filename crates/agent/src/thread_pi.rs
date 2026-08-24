@@ -1299,8 +1299,10 @@ impl Thread {
     }
 
     /// Deliver peer messages from teammates: render each through the peer
-    /// wrapper template, emit `PeerMessage`, then run a turn over the batch
-    /// (no-op when the engine is mid-turn — the team queues instead).
+    /// wrapper template, append it as a user message to the conversation,
+    /// and emit [`ThreadEvent::PeerMessage`]. A delivery landing mid-turn
+    /// stays in the history until the running turn settles; the model sees
+    /// it on the next prompt assembly.
     pub fn deliver_peer_messages(
         &mut self,
         msgs: Vec<crate::team::PeerMessage>,
@@ -2985,4 +2987,5 @@ pub(crate) mod tests {
         assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
 }
+
 

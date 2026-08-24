@@ -1,5 +1,5 @@
 ---
-description: Run a full built-in tool regression check. The LLM exercises every built-in tool group (FS, shell, user interaction, metadata, monitor, web, subagent, goal, plan, worktree, team, browser), collects PASS/FAIL/SKIP results, and reports a summary table.
+description: Run a full built-in tool regression check. The LLM exercises every built-in tool group (FS, shell, user interaction, metadata, monitor, web, subagent, goal, plan, worktree, task, browser), collects PASS/FAIL/SKIP results, and reports a summary table.
 ---
 You are running a **health check** (`/healthz`) on the manox built-in toolset. Your job is to systematically exercise every built-in tool group, record PASS/FAIL/SKIP for each tool, and produce a final summary table. This is a regression test — run every group even if an earlier one fails.
 
@@ -24,7 +24,7 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 | Goal | GetGoal, CreateGoal, UpdateGoal |
 | Plan | UpdatePlan |
 | Worktree | EnterWorktree, ExitWorktree |
-| Team | TeamCreate, TeamSpawn, TaskCreate, TaskList, TaskGet, TaskUpdate, SendMessage, TeamDisband |
+| Task | TaskCreate, TaskList, TaskGet, TaskUpdate |
 | Browser | WebExploreOpen, WebExploreNavigate, WebExploreReadText, WebExploreReadDom, WebExploreClick, WebExploreType, WebExploreScroll, WebExploreScreenshot, WebExploreYield, WebExploreClose |
 
 **Out of scope** — do NOT test (skip silently, do not report):
@@ -41,7 +41,6 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 3. **Clean up side effects.** Tools with persistent state must be cleaned up after verification:
    - Write/Edit: write to the temp dir, verify, then delete.
    - EnterWorktree/ExitWorktree: enter a worktree, verify cwd changed, then exit with `remove` to clean it up.
-   - TeamCreate/TeamDisband: create a team, exercise team tools (including member tool execution), then disband.
    - CreateGoal: create a goal, verify, then clear it via UpdateGoal(complete) and verify.
    - Browser: open a tab, exercise read-only tools, then close it with WebExploreClose.
 4. **Parallel calls.** When tools in the same group are independent (e.g. Read + List + Grep + Glob), call them in parallel in one turn.
@@ -137,36 +136,31 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 | 20 | **EnterWorktree** | Enter a new worktree named `healthz-smoke` | cwd changes to a path under `.claude/worktrees/` |
 | 21 | **ExitWorktree** | Exit with `action: remove` | Success, cwd returns to original, worktree cleaned up |
 
-### Group: Team (sequential, clean up after)
+### Group: Task (sequential)
 
-This group tests both the team coordination tools AND that a spawned member can execute tool calls within its sub-agent context.
+The per-thread shared task list — the retired team-coordination layer's
+remaining tools.
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 22 | **TeamCreate** | Create a team named "healthz-test" | Success, no error |
-| 23 | **TeamSpawn** | Spawn one member with subagent_type `Explore`, role "tester", name "tester-1" | Success, no error |
-| 24 | **TaskCreate** | Create a task: "Read the file at `<tmpdir>/hello.txt` and report its contents." | Returns a task id (e.g. T1) |
-| 25 | **TaskList** | List tasks on the team board | The task appears in the list |
-| 26 | **TaskGet** | Read the task by id | Returns the task with correct subject |
-| 27 | **TaskUpdate** | Update the task status to `in_progress` | Success, no error |
-| 28 | **SendMessage** | Send a message to the member "tester-1": "Please use the Read tool to read `<tmpdir>/hello.txt` and reply with the contents." | Success, no error |
-| — | (verify) | Wait for the member to process the message and reply. Poll by calling SendMessage to yourself or by sending another message asking for status. In practice, the member's reply arrives as a user-role message in your conversation — continue your turn and check if the reply containing `healthz line 1` arrives. If no reply after 2-3 attempts, record FAIL for SendMessage with "no member reply" in Notes. | Member's reply contains `healthz line 1` — proving the team member could execute tool calls and report results back |
-| 29 | **TeamDisband** | Disband the team | Success, no error |
-
+| 22 | **TaskCreate** | Create a task: "Read the file at `<tmpdir>/hello.txt` and report its contents." | Returns a task id (e.g. T1) |
+| 23 | **TaskList** | List tasks on the task list | The task appears in the list |
+| 24 | **TaskGet** | Read the task by id | Returns the task with correct subject |
+| 25 | **TaskUpdate** | Update the task status to `in_progress` | Success, no error |
 ### Group: Browser (sequential, clean up after)
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 30 | **WebExploreOpen** | Open a tab to `https://example.com` | Returns a tab id |
-| 31 | **WebExploreNavigate** | Navigate the tab to `https://example.com` | Success, no error |
-| 32 | **WebExploreReadText** | Read the page text | Content is non-empty and contains `Example Domain` |
-| 33 | **WebExploreReadDom** | Read the DOM HTML | HTML is non-empty and contains `<html` |
-| 34 | **WebExploreScreenshot** | Take a viewport snapshot | Success, returns DOM structure |
-| 35 | **WebExploreScroll** | Scroll down by 100px | Success, no error |
-| 36 | **WebExploreType** | Type `healthz` into any focusable element (e.g. search input if available) | PASS or SKIP if no focusable element |
-| 37 | **WebExploreClick** | Click on a link or element | PASS or SKIP if no clickable element |
-| 38 | **WebExploreYield** | Yield control to the user, then continue after they resume | PASS or SKIP if not applicable |
-| 39 | **WebExploreClose** | Close the tab | Success, no error |
+| 26 | **WebExploreOpen** | Open a tab to `https://example.com` | Returns a tab id |
+| 27 | **WebExploreNavigate** | Navigate the tab to `https://example.com` | Success, no error |
+| 28 | **WebExploreReadText** | Read the page text | Content is non-empty and contains `Example Domain` |
+| 29 | **WebExploreReadDom** | Read the DOM HTML | HTML is non-empty and contains `<html` |
+| 30 | **WebExploreScreenshot** | Take a viewport snapshot | Success, returns DOM structure |
+| 31 | **WebExploreScroll** | Scroll down by 100px | Success, no error |
+| 32 | **WebExploreType** | Type `healthz` into any focusable element (e.g. search input if available) | PASS or SKIP if no focusable element |
+| 33 | **WebExploreClick** | Click on a link or element | PASS or SKIP if no clickable element |
+| 34 | **WebExploreYield** | Yield control to the user, then continue after they resume | PASS or SKIP if not applicable |
+| 35 | **WebExploreClose** | Close the tab | Success, no error |
 
 ### Group: Fixture cleanup
 
@@ -191,3 +185,4 @@ End with a summary line:
 ```
 **Summary: X passed, Y failed, Z skipped.**
 ```
+
