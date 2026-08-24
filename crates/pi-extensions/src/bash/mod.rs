@@ -172,6 +172,10 @@ impl AgentTool for BashTool {
          speculatively — ground the request in a real denial."
     }
 
+    /// `false`: bash mutates (it is not a read-only tool). Note this is the
+    /// *tool* classification, not the *mode* effect — under read-only the
+    /// seatbelt still lets bash run, it just denies every file write; the
+    /// two notions are distinct.
     fn is_read_only(&self) -> bool {
         false
     }
@@ -182,6 +186,11 @@ impl AgentTool for BashTool {
         // calls ride the OS confinement (no approval); only a
         // `sandbox_permissions` escalation needs the approval round-trip —
         // the escalation itself is the sensitive act.
+        //
+        // On macOS+seatbelt this returning `true` for an escalation is only a
+        // signal that `EscalationGrant::resolve` will run the round-trip
+        // *inside* the tool — the host gate's `auto_allow` still delegates
+        // bash ungated, so there is no double-prompt (no host gate round-trip).
         if !self.sandbox_available {
             return true;
         }
@@ -384,6 +393,12 @@ impl BashTool {
 /// resolves the wider mode through the host approval channel, stamps it on
 /// the shared grant cell for exactly this call, and clears the stamp on drop
 /// so the next call reverts to the standing mode.
+///
+/// The grant is per-call, not per-execution — if `resolve` succeeds but a
+/// later step panics before the backend runs, the `Drop` clears the stamp and
+/// the user-approved grant never executes. This matches deepseek (a grant is
+/// a same-turn retry signal, not a durable promise): the model re-issues the
+/// call and re-escalates. Acceptable for the same-turn retry contract.
 struct EscalationGrant<'a> {
     cell: Option<&'a Arc<AtomicI64>>,
 }

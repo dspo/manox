@@ -415,7 +415,7 @@ impl ApprovalGatedTool {
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
         // Containment against the shared writable-root set (workspace + /tmp
         // + tmpdir); deepseek parity — no `.git` or plans-dir special-casing.
-        let roots = pi_extensions::sandbox::writable_roots(cwd);
+        let roots = pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, cwd);
         let contained = |target: &Path| {
             let canon = pi_extensions::sandbox::canonicalize_best_effort(target);
             roots.iter().any(|r| canon.starts_with(r))

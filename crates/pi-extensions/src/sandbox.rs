@@ -203,13 +203,17 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 /// The roots one confined execution may WRITE under — the mode's meaning as a
-/// canonical, deduplicated allow-list. `read-only` allows nothing (the caller
-/// handles that before consulting roots); `workspace-write` allows the policy's
-/// workspace root, the host `/tmp`, and the per-user platform temp dir
+/// canonical, deduplicated allow-list. `read-only` returns an empty list
+/// (no caller guard needed — mirrors deepseek's `writableRoots(policy)` which
+/// checks the mode itself); `workspace-write` allows the policy's workspace
+/// root, the host `/tmp`, and the per-user platform temp dir
 /// (`std::env::temp_dir()` — the real temp area; omitting it would deny what
 /// the mode promises). Shared by the bash seatbelt and the fs fence so the
 /// "the write tool cannot write `/tmp` but bash can" asymmetry cannot arise.
-pub fn writable_roots(workspace_root: &Path) -> Vec<PathBuf> {
+pub fn writable_roots(mode: PermissionMode, workspace_root: &Path) -> Vec<PathBuf> {
+    if mode != PermissionMode::WorkspaceWrite {
+        return Vec::new();
+    }
     let candidates = [
         workspace_root.to_path_buf(),
         PathBuf::from("/tmp"),
@@ -254,7 +258,12 @@ pub enum EscalationOutcome {
     Rejected,
     /// The approval was cancelled (e.g. the turn was aborted).
     Cancelled,
-    /// No approval channel is available (fail-closed).
+    /// No approval channel is available (the approver exists but its channel
+    /// is down — a rare composition/runtime failure). The host
+    /// `GateEscalationApprover` always has a channel, so this is not produced
+    /// in manox today; it maps to the deepseek `unavailable` outcome (which,
+    /// like here, is only returned when an existing approver reports its
+    /// channel unavailable — a missing approver is a fatal `Err` in both).
     Unavailable,
 }
 
@@ -348,7 +357,7 @@ mod tests {
     #[test]
     fn writable_roots_canonical_dedup() {
         let root = Path::new("/tmp/pi-ext-sandbox-roots-test");
-        let roots = writable_roots(root);
+        let roots = writable_roots(PermissionMode::WorkspaceWrite, root);
         // The workspace root is always present (canonicalized).
         assert!(
             roots
@@ -358,7 +367,7 @@ mod tests {
         // Canonical + deduplicated: a second resolution adds no new entries.
         let before = roots.len();
         let mut seen: Vec<PathBuf> = Vec::new();
-        for r in writable_roots(root) {
+        for r in writable_roots(PermissionMode::WorkspaceWrite, root) {
             if !seen.iter().any(|s| s == &r) {
                 seen.push(r);
             }

@@ -36,6 +36,14 @@ pub use pi_extensions::sandbox::canonicalize_best_effort;
 /// own default).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Case-insensitive stderr substrings the macOS seatbelt emits when it denies
+/// a file-write effect — the deepseek `DENIAL_SIGNATURES.seatbelt` list
+/// (`packages/sandbox/sandbox-local/src/helpers.ts`). A non-zero exit whose
+/// stderr matches one of these is a policy refusal (marker + hint appended),
+/// not a command failure. Lifted to a const so a future runner (landlock /
+/// windows-acl) adds its own list without touching the consumer.
+const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
+
 /// Confinement policy for one sandboxed invocation: the workspace root whose
 /// `writable_roots()` the `workspace-write` profile allows, plus the worktree
 /// anchor (when the policy is worktree-scoped) for callers that key off it.
@@ -87,20 +95,19 @@ impl SandboxPolicy {
         s.push_str("(version 1)\n");
         s.push_str("(allow default)\n");
         s.push_str("(deny file-write*)\n");
-        // The writable allow-list is non-empty only under `workspace-write`.
-        // Filter out the filesystem root: admitting `/` would make the entire
-        // disk writable, turning the sandbox into a no-op (a session launched
-        // from `/` is confined to the temp areas only).
-        if mode == PermissionMode::WorkspaceWrite {
-            for root in writable_roots(&self.workspace_root)
-                .into_iter()
-                .filter(|r| r.parent().is_some())
-            {
-                s.push_str(&format!(
-                    "(allow file-write* (subpath \"{}\"))\n",
-                    escape_seatbelt_path(&root)
-                ));
-            }
+        // The writable allow-list is empty unless the mode is `workspace-write`
+        // (`writable_roots` checks the mode itself — no caller guard). Filter
+        // out the filesystem root: admitting `/` would make the entire disk
+        // writable, turning the sandbox into a no-op (a session launched from
+        // `/` is confined to the temp areas only).
+        for root in writable_roots(mode, &self.workspace_root)
+            .into_iter()
+            .filter(|r| r.parent().is_some())
+        {
+            s.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                escape_seatbelt_path(&root)
+            ));
         }
         s.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         s
@@ -284,14 +291,14 @@ impl BashOperations for SandboxedBashOperations {
             // Classify a seatbelt file-write denial (EPERM) and surface the
             // deepseek marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
-            // `sandbox_permissions`. macOS seatbelt emits "Operation not
-            // permitted" on a denied write.
-            if result.exit_code != 0
-                && result
-                    .stderr
-                    .to_ascii_lowercase()
-                    .contains("operation not permitted")
-            {
+            // `sandbox_permissions` (the signatures mirror deepseek's
+            // `DENIAL_SIGNATURES.seatbelt`).
+            if result.exit_code != 0 && {
+                let stderr = result.stderr.to_ascii_lowercase();
+                SEATBELT_DENIAL_SIGNATURES
+                    .iter()
+                    .any(|sig| stderr.contains(sig))
+            } {
                 result.stderr.push_str(&format!(
                     "\n{}\n{}",
                     pi_extensions::sandbox::sandbox_denial_marker(mode),
