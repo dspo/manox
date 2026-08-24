@@ -247,8 +247,8 @@ fn dsh_sessions_root() -> Option<PathBuf> {
     Some(home.join("sessions"))
 }
 
-/// 递归收集 `*.jsonl` 文件。
-fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
+/// 递归收集满足 `filter` 的普通文件（不可读的目录/条目静默跳过）。
+fn collect_files(root: &Path, mut filter: impl FnMut(&Path) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -266,42 +266,30 @@ fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            out.push(path);
-        }
-    }
-    out
-}
-
-/// 递归收集 deepseek-harness 的 session transcript：每个会话目录内固定名字的
-/// `session.jsonl.zstd`（默认压缩）或 `session.jsonl`（compression: none）。
-fn collect_dsh_session_files(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if meta.is_file() && (name == "session.jsonl.zstd" || name == "session.jsonl") {
+            if meta.is_file() && filter(&path) {
                 out.push(path);
             }
         }
     }
     out
+}
+
+/// 递归收集 `*.jsonl` 文件。
+fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
+    collect_files(root, |path| {
+        path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+    })
+}
+
+/// 递归收集 deepseek-harness 的 session transcript：每个会话目录内固定名字的
+/// `session.jsonl.zstd`（默认压缩）或 `session.jsonl`（compression: none）。
+fn collect_dsh_session_files(root: &Path) -> Vec<PathBuf> {
+    collect_files(root, |path| {
+        matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("session.jsonl.zstd" | "session.jsonl")
+        )
+    })
 }
 
 fn current_file_state(meta: &Metadata) -> CurrentFileState {
