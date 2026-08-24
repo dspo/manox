@@ -3,14 +3,50 @@
 //! Operate on `Arc<Mutex<PlainTaskList>>` (bus-owned, tokio-safe) directly
 //! — no `BackendNotice` round-trip, no gpui `Entity`.
 
+/// Lifecycle of a task. Three states only: each is wired into the `TaskUpdate`
+/// tool and rendered on the board; adding a state without that wiring would be
+/// a half-built field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A single coordination task on the shared list.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub subject: String,
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    /// Owning member name; `None` is the unassigned pool.
+    pub owner: Option<String>,
+}
+
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-use crate::team::task_list::{Task, TaskStatus};
 
 /// A plain (non-gpui) task list — tokio-safe, no Entity/EventEmitter.
 /// Owned by `AgentBus` as `Arc<Mutex<PlainTaskList>>`; Task* tools call

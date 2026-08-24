@@ -1015,7 +1015,7 @@ mod tests {
         gate.set_mode(PermissionMode::WorkspaceWrite);
         let (tool, ran) = gated_named("Edit", false, false, Arc::clone(&gate));
         let ctx = tool_ctx();
-        let ok_patch = "*** Begin Patch\n[src/ok.rs#1A2B]\nDEL 1\n*** End Patch";
+        let ok_patch = "*** Begin Patch\n[src/ok.rs#1A2B3C]\nDEL 1\n*** End Patch";
         let result = tool
             .execute(
                 "c1",
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
 
         let escape_patch =
-            "*** Begin Patch\n[/etc/manox-gate-test/bad.rs#1A2B]\nDEL 1\n*** End Patch";
+            "*** Begin Patch\n[/etc/manox-gate-test/bad.rs#1A2B3C]\nDEL 1\n*** End Patch";
         let err = tool
             .execute(
                 "c2",

@@ -335,21 +335,18 @@ impl ThreadStore {
     }
 
     /// The live (in-memory) thread for `id`, if its entity is still alive.
-    /// Unlike [`ThreadStore::load_thread`], never restores from disk — the
-    /// archive path only needs threads that could still hold a live team.
+    /// Unlike [`ThreadStore::load_thread`], never restores from disk.
     pub fn live_thread(&self, id: &str) -> Option<Entity<Thread>> {
         self.live_threads.get(id).and_then(WeakEntity::upgrade)
     }
 
-    /// Track a live thread (team leader/member at `set_team`) so the
-    /// centralized archive-teardown can reach its team from the id alone.
+    /// Track a live thread so the facade can address it by id alone.
     pub fn register_live_thread(&mut self, id: &str, t: WeakEntity<Thread>) {
         self.live_threads.insert(id.to_string(), t);
     }
 
     /// Seed an active summary row without touching disk — lets foreign test
-    /// modules (team lifecycle) exercise the archive cascade against real
-    /// thread ids.
+    /// modules exercise the archive cascade against real thread ids.
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert_summary_for_test(&mut self, id: &str, parent: Option<&str>) {
         self.summaries.push(crate::db::ThreadSummary {
@@ -391,26 +388,6 @@ impl ThreadStore {
         } else {
             vec![id.to_string()]
         };
-        if archived {
-            // Archive-leader invariant, centralized: any live thread in the
-            // cascade that still leads a team is torn down here (running
-            // members cancelled, roster released) so no orphan keeps working
-            // after its row is archived — covers every current and future
-            // archive entry point. `teardown` is store-free, keeping this
-            // method re-entrancy-safe; the cascade below archives the rows.
-            for tid in &ids {
-                if let Some(thread) = self.live_thread(tid) {
-                    if let Some(team) = thread.read(cx).team().cloned() {
-                        // Only a leader's archive tears the team down; a
-                        // dismissed member must not cancel its siblings.
-                        if team.read_with(cx, |t, _| t.is_leader(&thread)) {
-                            team.update(cx, |t, cx| t.teardown(cx));
-                        }
-                    }
-                    thread.update(cx, |t, cx| t.clear_team(cx));
-                }
-            }
-        }
         for tid in ids {
             // A row already at the target state (e.g. archived by the
             // caller's disband earlier) skips move + meta + hook: one
@@ -1275,3 +1252,4 @@ mod tests {
         std::fs::remove_file(db_path).ok();
     }
 }
+

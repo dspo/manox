@@ -7,7 +7,6 @@ pub mod composer_menu;
 pub mod context_rail;
 pub mod launcher;
 pub mod management_shell;
-pub mod member_panel;
 pub mod message;
 pub mod model_cascade;
 pub mod plugin_manager;

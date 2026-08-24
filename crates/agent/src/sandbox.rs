@@ -42,6 +42,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// stderr matches one of these is a policy refusal (marker + hint appended),
 /// not a command failure. Lifted to a const so a future runner (landlock /
 /// windows-acl) adds its own list without touching the consumer.
+// The signatures are only classified in the macOS `exec` body; on other
+// platforms the seatbelt backend is a compiled stub (`is_available()` false),
+// so the const would otherwise read as dead code there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
 
 /// Confinement policy for one sandboxed invocation: the workspace root whose
@@ -222,6 +226,10 @@ fn login_shell_path() -> String {
 /// session mode, or an approved `sandbox_permissions` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels
 /// through a closure, not a kernel field.
+// The seatbelt fields are macOS-only: on other platforms `is_available()`
+// is false so the backend is never constructed at runtime, and the compiled
+// stub's fields stay unread.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct SandboxedBashOperations {
     policy: SandboxPolicy,
     base_cwd: PathBuf,
@@ -432,6 +440,7 @@ mod tests {
         canonicalize_best_effort(&std::env::temp_dir()).join("manox-sandbox-test-proj")
     }
 
+    #[cfg(target_os = "macos")]
     fn resolver(mode: PermissionMode) -> Arc<dyn Fn() -> PermissionMode + Send + Sync> {
         Arc::new(move || mode)
     }

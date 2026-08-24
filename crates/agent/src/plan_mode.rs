@@ -704,7 +704,7 @@ mod tests {
 
     /// Minimal valid hashline patch touching one section.
     fn edit_patch(path: &str) -> String {
-        format!("*** Begin Patch\n[{path}#1A2B]\nDEL 1\n*** End Patch")
+        format!("*** Begin Patch\n[{path}#1A2B3C]\nDEL 1\n*** End Patch")
     }
 
     #[test]
@@ -853,7 +853,7 @@ mod tests {
         assert!(
             run(
                 "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[/home/u/.manox/plans/x-plan.md#1A2B]\nDEL 1\n*** End Patch"})
+                serde_json::json!({"patch": "*** Begin Patch\n[/home/u/.manox/plans/x-plan.md#1A2B3C]\nDEL 1\n*** End Patch"})
             )
             .block_reason
             .is_none()
@@ -867,7 +867,7 @@ mod tests {
         assert!(
             run(
                 "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[/tmp/scratch.md#1A2B]\nDEL 1\n*** End Patch"})
+                serde_json::json!({"patch": "*** Begin Patch\n[/tmp/scratch.md#1A2B3C]\nDEL 1\n*** End Patch"})
             )
             .block_reason
             .is_none()
@@ -875,7 +875,7 @@ mod tests {
         assert!(
             run(
                 "Edit",
-                serde_json::json!({"patch": "*** Begin Patch\n[src/main.rs#1A2B]\nDEL 1\n*** End Patch"})
+                serde_json::json!({"patch": "*** Begin Patch\n[src/main.rs#1A2B3C]\nDEL 1\n*** End Patch"})
             )
             .block_reason
             .is_some()
@@ -886,7 +886,7 @@ mod tests {
                 "Edit",
                 serde_json::json!({
                     "path": "/tmp/decoy.md",
-                    "patch": "*** Begin Patch\n[src/main.rs#1A2B]\nDEL 1\n*** End Patch"
+                    "patch": "*** Begin Patch\n[src/main.rs#1A2B3C]\nDEL 1\n*** End Patch"
                 })
             )
             .block_reason

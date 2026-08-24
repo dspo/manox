@@ -36,26 +36,14 @@ pub struct LiveSubagent {
     pub run: u64,
 }
 
-/// Parent routing info injected into a member thread's bus so the member
-/// can address its parent Captain by thread id.
-#[derive(Clone)]
-pub struct ParentRoute {
-    pub parent_thread_id: String,
-    pub parent_notice_tx: mpsc::UnboundedSender<BackendNotice>,
-}
-
 /// The host-side agent bus. One per thread (Captain or member). The
-/// Captain's bus tracks live subagents + spawned member thread-ids; a
-/// member's bus carries a `parent_route` to address its parent.
+/// Captain's bus tracks live subagents + spawned member thread-ids.
 pub struct AgentBus {
     owner_thread_id: String,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     live_subagents: Mutex<BTreeMap<String, LiveSubagent>>,
     spawned_members: Mutex<HashSet<String>>,
     run_seq: AtomicU64,
-    parent_route: Mutex<Option<ParentRoute>>,
-    task_list: Mutex<Option<Arc<Mutex<crate::team::TaskList>>>>,
-    captain_handle: Mutex<Option<HarnessHandle>>,
     weak_self: Mutex<Weak<AgentBus>>,
     subagent_tool: Mutex<Option<Arc<SubagentTool>>>,
     tool_ctx: Mutex<Option<Arc<dyn ToolContext>>>,
@@ -85,9 +73,6 @@ impl AgentBus {
             notice_tx,
             live_subagents: Mutex::new(BTreeMap::new()),
             spawned_members: Mutex::new(HashSet::new()),
-            parent_route: Mutex::new(None),
-            task_list: Mutex::new(None),
-            captain_handle: Mutex::new(None),
             run_seq: AtomicU64::new(0),
             weak_self: Mutex::new(Weak::new()),
             subagent_tool: Mutex::new(None),
@@ -96,19 +81,6 @@ impl AgentBus {
         });
         *bus.weak_self.lock().unwrap() = Arc::downgrade(&bus);
         bus
-    }
-
-    /// Late-bind the Captain's session handle.
-    pub fn bind_captain(&self, handle: HarnessHandle) {
-        *self.captain_handle.lock().unwrap() = Some(handle);
-    }
-
-    pub fn set_parent_route(&self, route: ParentRoute) {
-        *self.parent_route.lock().unwrap() = Some(route);
-    }
-
-    pub fn set_task_list(&self, list: Arc<Mutex<crate::team::TaskList>>) {
-        *self.task_list.lock().unwrap() = Some(list);
     }
 
     pub fn set_subagent_tool(&self, tool: Arc<SubagentTool>) {

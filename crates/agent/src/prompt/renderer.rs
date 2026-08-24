@@ -85,8 +85,6 @@ const TPL_PLAN_MODE_APPROVED_ZH_CN: &str =
     include_str!("templates/zh-CN/mode/plan_mode_approved.tera.md");
 const TPL_AGENT_TOOL_EN: &str = include_str!("templates/en/tools/agent_tool.tera.md");
 const TPL_AGENT_TOOL_ZH_CN: &str = include_str!("templates/zh-CN/tools/agent_tool.tera.md");
-const TPL_SYSTEM_TEAM_EN: &str = include_str!("templates/en/system/team.tera.md");
-const TPL_SYSTEM_TEAM_ZH_CN: &str = include_str!("templates/zh-CN/system/team.tera.md");
 
 /// `(PromptTemplate, English source, 简体中文 source)` for every built-in
 /// template. The single source of truth for what gets parsed into each
@@ -171,11 +169,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::ModePlanApproved,
         TPL_PLAN_MODE_APPROVED_EN,
         TPL_PLAN_MODE_APPROVED_ZH_CN,
-    ),
-    (
-        PromptTemplate::SystemTeam,
-        TPL_SYSTEM_TEAM_EN,
-        TPL_SYSTEM_TEAM_ZH_CN,
     ),
     (
         PromptTemplate::AgentToolDescription,
@@ -408,8 +401,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 18);
-        assert_eq!(REGISTRATIONS.len(), 18);
+        assert_eq!(template::ALL.len(), 17);
+        assert_eq!(REGISTRATIONS.len(), 17);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
