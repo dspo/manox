@@ -30,12 +30,7 @@ impl std::fmt::Display for RecoverError {
 
 impl std::error::Error for RecoverError {}
 
-#[allow(dead_code)]
-/// Warning emitted when the snapshot is the current head (external change).
-const RECOVERY_EXTERNAL_WARNING: &str = "file changed between read and edit (external modification); recovery applied via line-map merge";
-#[allow(dead_code)]
-/// Warning emitted when the snapshot is a historical version (session chain).
-const RECOVERY_SESSION_CHAIN_WARNING: &str = "file changed between read and edit (edit chain); recovery applied via line-map merge";
+
 
 /// Attempt to recover a stale-tagged edit. `current` is the live file text
 /// (normalized LF); `claimed_tag` is the tag the edit claims. Returns the merged
@@ -235,16 +230,11 @@ fn validate_anchors(
         let Some(&mapped) = line_map.get(&line) else {
             return false;
         };
-        if mapped == 0 || mapped > cur_lines.len() {
+        if mapped > cur_lines.len() {
             return false;
         }
-        let Some(n) = neighbors.get(&line) else {
-            // Single anchor with no context at file boundary — accept if unique.
-            if prev_lines[line - 1].is_empty() || !duplicated_prev.contains(prev_lines[line - 1]) {
-                continue;
-            }
-            return false;
-        };
+        // Every anchor in `anchor_set` has an entry in `neighbors` by construction.
+        let n = &neighbors[&line];
 
         let prev_is_dup = duplicated_prev.contains(prev_lines[line - 1]);
         let cur_is_dup = duplicated_cur.contains(cur_lines[mapped - 1]);

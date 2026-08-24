@@ -130,7 +130,7 @@ fn strip_hashline_prefixes(content: &str) -> String {
     };
     let header = lines[header_idx];
 
-    // Check if it matches hashline header pattern: `[path#tag]` where tag is 4 hex chars.
+    // Check if it matches hashline header pattern: `[path#tag]` where tag is 6 hex chars.
     let is_header = header.starts_with('[')
         && header.ends_with(']')
         && header.contains('#')
