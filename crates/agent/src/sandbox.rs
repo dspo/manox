@@ -440,6 +440,7 @@ mod tests {
         canonicalize_best_effort(&std::env::temp_dir()).join("manox-sandbox-test-proj")
     }
 
+    #[cfg(target_os = "macos")]
     fn resolver(mode: PermissionMode) -> Arc<dyn Fn() -> PermissionMode + Send + Sync> {
         Arc::new(move || mode)
     }
@@ -673,3 +674,4 @@ mod tests {
         assert!(matches!(err, ExecutionError::Aborted), "{err:?}");
     }
 }
+
