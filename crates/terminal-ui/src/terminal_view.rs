@@ -582,11 +582,12 @@ impl TerminalView {
             });
             return;
         }
-        if mode.intersects(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        if terminal::term::alternate_scroll_active(mode) {
             // Alt screen without mouse capture (less, git log): the wheel
-            // becomes arrow-key presses (xterm alternateScroll). With the
-            // mode off the wheel stays dead here — local scrollback is a
-            // no-op on the alt screen anyway.
+            // becomes arrow-key presses (xterm alternateScroll). On the
+            // normal screen the wheel falls through to the local scrollback
+            // — ALTERNATE_SCROLL defaults on, so the alt-screen check is
+            // what keeps inline TUIs off the arrow-key path.
             self.terminal.update(cx, |t, _| t.alternate_scroll(lines));
             return;
         }

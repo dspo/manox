@@ -405,17 +405,15 @@ impl Terminal {
 
     /// xterm alternateScroll: with the alt screen active but no mouse capture
     /// (less, git log), wheel deltas become arrow-key presses so the program
-    /// scrolls its own content. No-op when the program disabled the mode via
-    /// DECRST 1007. `delta_lines` shares the wheel sign convention (negative
+    /// scrolls its own content. No-op unless [`alternate_scroll_active`]
+    /// holds. `delta_lines` shares the wheel sign convention (negative
     /// = up); capped per event like mouse reports.
     pub fn alternate_scroll(&self, delta_lines: i32) {
         if delta_lines == 0 {
             return;
         }
         let mode = self.mode();
-        if !mode.intersects(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-            || mode.intersects(TermMode::MOUSE_MODE)
-        {
+        if !alternate_scroll_active(mode) {
             return;
         }
         let _ = self.pty.write(&alternate_scroll_bytes(mode, delta_lines));
@@ -591,6 +589,17 @@ fn mouse_report_bytes(mode: TermMode, button: u8, row: usize, col: usize) -> Vec
         let cy = (32u32 + row as u32 + 1).min(255) as u8;
         vec![0x1b, b'[', b'M', cb, cx, cy]
     }
+}
+
+/// Whether the wheel degenerates into arrow-key presses (xterm
+/// alternateScroll): the alt screen is active, DECSET 1007 has not turned
+/// the mode off, and the program has not captured the mouse. alacritty
+/// enables ALTERNATE_SCROLL by default, so the alt-screen half of the
+/// condition is the real gate — on the normal screen the wheel must stay
+/// on the local scrollback.
+pub fn alternate_scroll_active(mode: TermMode) -> bool {
+    mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+        && !mode.intersects(TermMode::MOUSE_MODE)
 }
 
 /// One alternateScroll wheel event as arrow-key bytes: up for negative
@@ -831,6 +840,24 @@ mod tests {
     fn alternate_scroll_caps_at_six() {
         assert_eq!(alternate_scroll_bytes(TermMode::empty(), 100).len(), 6 * 3);
         assert!(alternate_scroll_bytes(TermMode::empty(), 0).is_empty());
+    }
+
+    /// alacritty turns ALTERNATE_SCROLL on by default, so a normal-screen
+    /// program (inline TUI, shell) satisfies neither half of the gate by
+    /// itself: no arrows without the alt screen, no arrows under mouse
+    /// capture, arrows only on the alt screen with the mode left on.
+    #[test]
+    fn alternate_scroll_active_requires_alt_screen() {
+        let base = TermMode::default();
+        assert!(base.contains(TermMode::ALTERNATE_SCROLL));
+        assert!(!alternate_scroll_active(base));
+        assert!(alternate_scroll_active(base | TermMode::ALT_SCREEN));
+        assert!(!alternate_scroll_active(
+            base | TermMode::ALT_SCREEN | TermMode::MOUSE_REPORT_CLICK
+        ));
+        assert!(!alternate_scroll_active(
+            (base | TermMode::ALT_SCREEN) - TermMode::ALTERNATE_SCROLL
+        ));
     }
 
     /// OSC 10;? makes the Term raise a ColorRequest for the default
