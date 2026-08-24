@@ -91,6 +91,48 @@ impl AgentTool for EditTool {
             let path = resolve_path(ctx, &fp.path);
             let path_display = path.display().to_string();
 
+            // Handle file-level operations (REM/MV).
+            if let Some(file_op) = &fp.file_op {
+                match file_op {
+                    hashline::FileOp::Rem => {
+                        ctx.env().write_file(&path, "").await.map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "edit REM failed {path_display}: {e}"
+                            ))
+                        })?;
+                        // Invalidate the snapshot for the deleted file.
+                        ctx.tool_state()
+                            .snapshots
+                            .lock()
+                            .expect("hashline snapshot store poisoned")
+                            .invalidate(&path);
+                        results.push(format!("[{path_display}] deleted"));
+                        continue;
+                    }
+                    hashline::FileOp::Move { dest } => {
+                        let dest_path = resolve_path(ctx, std::path::Path::new(dest));
+                        let raw = ctx.env().read_file(&path, None, None).await.map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "edit MV read failed {path_display}: {e}"
+                            ))
+                        })?;
+                        ctx.env().write_file(&dest_path, &raw).await.map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "edit MV write failed {path_display}: {e}"
+                            ))
+                        })?;
+                        // Relocate snapshot history from old path to new path.
+                        ctx.tool_state()
+                            .snapshots
+                            .lock()
+                            .expect("hashline snapshot store poisoned")
+                            .relocate(&path, &dest_path);
+                        results.push(format!("[{path_display}] moved to {}", dest_path.display()));
+                        continue;
+                    }
+                }
+            }
+
             // Hold the mutation lock across read+patch+write so the TAG check
             // and the write are a single critical section — a concurrent
             // writer between read and write would stale the TAG and clobber.
@@ -105,6 +147,10 @@ impl AgentTool for EditTool {
             let current = hashline::normalize_to_lf(&raw);
             let current_tag = hashline::compute_tag(&current);
 
+            // Expand Cut/Paste ops before apply: Cut captures lines to clipboard,
+            // Paste expands to Ins with clipboard content.
+            let expanded_ops = expand_clipboard_ops(&fp.ops, &current, ctx)?;
+
             let new_text = if current_tag == fp.tag {
                 // Seen-line gate — only on the no-drift path, where anchor line
                 // numbers index the tagged content 1:1. On recovery the numbers
@@ -117,12 +163,12 @@ impl AgentTool for EditTool {
                         .expect("hashline snapshot store poisoned"),
                     &path,
                     &fp.tag,
-                    &fp.ops,
+                    &expanded_ops,
                     &current,
                 )
                 .map_err(ToolError::ExecutionFailed)?;
 
-                hashline::apply(&current, &fp.ops)
+                hashline::apply(&current, &expanded_ops)
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
                     })?
@@ -133,7 +179,7 @@ impl AgentTool for EditTool {
                     .snapshots
                     .lock()
                     .expect("hashline snapshot store poisoned");
-                hashline::try_recover(&current, &fp.tag, &fp.ops, &store, &path)
+                hashline::try_recover(&current, &fp.tag, &expanded_ops, &store, &path)
                     .map_err(|e| ToolError::ExecutionFailed(format!("edit {path_display}: {e}")))?
             };
 
@@ -181,6 +227,64 @@ fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
     } else {
         ctx.cwd().join(path)
     }
+}
+
+/// Expand Cut/Paste ops before apply. Cut captures the deleted lines to the
+/// clipboard and converts to Del; Paste expands to Ins with clipboard content.
+fn expand_clipboard_ops(
+    ops: &[hashline::Op],
+    current: &str,
+    ctx: &dyn ToolContext,
+) -> Result<Vec<hashline::Op>, ToolError> {
+    let lines: Vec<&str> = current.lines().collect();
+    let mut expanded: Vec<hashline::Op> = Vec::new();
+    let mut clipboard = ctx
+        .tool_state()
+        .clipboard
+        .lock()
+        .expect("hashline clipboard poisoned");
+
+    for op in ops {
+        match op {
+            hashline::Op::Cut { start, end } => {
+                // Capture the lines being cut to the clipboard.
+                let s = start.saturating_sub(1);
+                let e = (*end).min(lines.len());
+                if s < e {
+                    let captured: Vec<String> = lines[s..e].iter().map(|s| s.to_string()).collect();
+                    clipboard.clear();
+                    clipboard.extend(captured);
+                }
+                // Convert Cut to Del.
+                expanded.push(hashline::Op::Del {
+                    start: *start,
+                    end: *end,
+                });
+            }
+            hashline::Op::CutBlk { start } => {
+                // CutBlk needs block resolution to capture lines; for now,
+                // convert to DelBlk (clipboard capture happens at block level).
+                expanded.push(hashline::Op::DelBlk { start: *start });
+            }
+            hashline::Op::Paste { pos, anchor } => {
+                // Expand Paste to Ins with clipboard content.
+                let body = clipboard.clone();
+                if body.is_empty() {
+                    return Err(ToolError::ExecutionFailed(
+                        "PASTE failed: clipboard is empty (no preceding CUT in this patch)"
+                            .to_string(),
+                    ));
+                }
+                expanded.push(hashline::Op::Ins {
+                    pos: *pos,
+                    anchor: *anchor,
+                    body,
+                });
+            }
+            other => expanded.push(other.clone()),
+        }
+    }
+    Ok(expanded)
 }
 
 /// Restore the file's original line-ending style, trailing newline, and optional

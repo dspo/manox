@@ -228,6 +228,23 @@ fn resolve_op(op: &Op, lines: &[String]) -> Result<ResolvedOp, ApplyError> {
                 body: body.clone(),
             })
         }
+        Op::Cut { start, end } => {
+            validate_range(*start, *end, lines.len())?;
+            Ok(ResolvedOp::Del {
+                start: *start,
+                end: *end,
+            })
+        }
+        Op::CutBlk { start } => {
+            let (s, e) =
+                block::resolve_block_range(&line_refs, *start).map_err(|e| ApplyError {
+                    message: e.to_string(),
+                })?;
+            Ok(ResolvedOp::Del { start: s, end: e })
+        }
+        Op::Paste { .. } => Err(ApplyError {
+            message: "PASTE ops must be expanded before apply (clipboard content not available at apply level)".to_string(),
+        }),
     }
 }
 
@@ -391,12 +408,17 @@ fn first_changed_line(new_lines: &[String], _original_len: usize, _old: &str, op
             Op::Swap { start, .. }
             | Op::Del { start, .. }
             | Op::SwapBlk { start, .. }
-            | Op::DelBlk { start, .. } => *start,
+            | Op::DelBlk { start, .. }
+            | Op::Cut { start, .. }
+            | Op::CutBlk { start, .. } => *start,
             Op::Ins {
                 anchor: Some(a), ..
             }
-            | Op::InsBlkPost { anchor: a, .. } => *a,
-            Op::Ins { anchor: None, .. } => 1,
+            | Op::InsBlkPost { anchor: a, .. }
+            | Op::Paste {
+                anchor: Some(a), ..
+            } => *a,
+            Op::Ins { anchor: None, .. } | Op::Paste { anchor: None, .. } => 1,
         })
         .min()
         .unwrap_or(1)

@@ -15,17 +15,23 @@ use crate::types::{AgentEvent, AgentLoopConfig, ContentBlock, EventSink};
 
 // ── Tool state ─────────────────────────────────────────────────────────────
 
-/// Session-scoped tool state: hashline snapshots and the file mutation queue.
+/// Session-scoped tool state: hashline snapshots, the file mutation queue,
+/// and the hashline clipboard.
 ///
 /// Carried by the harness's `ToolContext` implementation and shared by all
 /// tools in a run. The snapshot store backs hashline tag validation and 3-way
-/// recovery; the mutation queue serializes concurrent edits to the same file.
+/// recovery; the mutation queue serializes concurrent edits to the same file;
+/// the clipboard holds lines captured by `CUT` ops for `PASTE` ops.
 pub struct ToolState {
     /// Hashline snapshots keyed by path. Interior mutability is a plain
     /// `Mutex`: snapshot record/lookup never spans an `.await`.
     pub snapshots: std::sync::Mutex<SnapshotStore>,
     /// Per-file mutation locks serializing concurrent edits to the same path.
     pub mutation_queue: FileMutationQueue,
+    /// Hashline clipboard: lines captured by `CUT` ops, available to `PASTE`.
+    /// The anonymous register is batch-local; named registers persist across
+    /// batches. For now, only the anonymous register is supported.
+    pub clipboard: std::sync::Mutex<Vec<String>>,
 }
 
 impl ToolState {
@@ -33,6 +39,7 @@ impl ToolState {
         ToolState {
             snapshots: std::sync::Mutex::new(SnapshotStore::new()),
             mutation_queue: FileMutationQueue::new(),
+            clipboard: std::sync::Mutex::new(Vec::new()),
         }
     }
 }

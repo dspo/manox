@@ -10,6 +10,12 @@
 //! SWAP.BLK N:                (replace bracket-block, body follows)
 //! DEL N.=M / DEL N           (delete range, no body)
 //! DEL.BLK N                  (delete bracket-block, no body)
+//! CUT N.=M / CUT N           (delete range + capture to clipboard, no body)
+//! CUT.BLK N                  (delete bracket-block + capture, no body)
+//! PASTE.PRE N: / PASTE.POST N: / PASTE.HEAD: / PASTE.TAIL:
+//!                            (paste clipboard at position, no body)
+//! REM                        (delete the file named by the section header)
+//! MV DEST                    (rename/move the section file to DEST)
 //! INS.PRE N: / INS.POST N:   (insert before/after anchor, body follows)
 //! INS.HEAD: / INS.TAIL:      (insert at start/end, body follows)
 //! INS.BLK.POST N:            (insert after bracket-block, body follows)
@@ -19,11 +25,11 @@
 //! ```
 //!
 //! Line numbers are 1-indexed, non-zero, no leading zeros. Ranges are inclusive
-//! on both ends. Only body-bearing headers end in `:`; `DEL` has no body.
-
+//! on both ends. Only body-bearing headers end in `:`; `DEL`, `CUT`, `REM`,
+//! `MV`, and `PASTE` have no body.
 use std::path::PathBuf;
 
-/// Insertion position for `INS` ops.
+/// Insertion position for `INS` / `PASTE` ops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsPos {
     Pre,
@@ -55,14 +61,32 @@ pub enum Op {
     DelBlk { start: usize },
     /// `INS.BLK.POST N:` — insert after the bracket-block at `anchor`.
     InsBlkPost { anchor: usize, body: Vec<String> },
+    /// `CUT N.=M` / `CUT N` — delete range and capture lines to clipboard.
+    Cut { start: usize, end: usize },
+    /// `CUT.BLK N` — delete bracket-block and capture to clipboard.
+    CutBlk { start: usize },
+    /// `PASTE.PRE N:` / `PASTE.POST N:` / `PASTE.HEAD:` / `PASTE.TAIL:` —
+    /// paste clipboard at position (no body; clipboard supplies content).
+    Paste { pos: InsPos, anchor: Option<usize> },
 }
 
-/// One file section: a path, the snapshot tag it claims, and its operations.
+/// A file-level operation for the section (mutually exclusive with line ops).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOp {
+    /// `REM` — delete the file named by the section header.
+    Rem,
+    /// `MV DEST` — rename/move the section file to `DEST`.
+    Move { dest: String },
+}
+
+/// One file section: a path, the snapshot tag it claims, its operations, and
+/// an optional file-level operation (mutually exclusive with line ops).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePatch {
     pub path: PathBuf,
     pub tag: String,
     pub ops: Vec<Op>,
+    pub file_op: Option<FileOp>,
 }
 
 /// Parse failure carrying the 1-indexed line and a reason.
@@ -129,6 +153,18 @@ pub fn parse_patch(text: &str) -> Result<Vec<FilePatch>, ParseError> {
                 flush_body(&mut sections, &mut body, &mut pending_body)?;
                 push_op(&mut sections, op);
             }
+            Ok(ParsedOp::File(file_op)) => {
+                flush_body(&mut sections, &mut body, &mut pending_body)?;
+                if let Some(sec) = sections.last_mut() {
+                    if sec.file_op.is_some() {
+                        return Err(ParseError {
+                            line: line_no,
+                            message: "only one file-level op (REM or MV) per section".to_string(),
+                        });
+                    }
+                    sec.file_op = Some(file_op);
+                }
+            }
             Err(msg) => {
                 return Err(ParseError {
                     line: line_no,
@@ -183,7 +219,11 @@ fn flush_body(
             | Op::InsBlkPost { body: b, .. } => {
                 b.append(body);
             }
-            Op::Del { .. } | Op::DelBlk { .. } => {}
+            Op::Del { .. }
+            | Op::DelBlk { .. }
+            | Op::Cut { .. }
+            | Op::CutBlk { .. }
+            | Op::Paste { .. } => {}
         }
     }
     body.clear();
@@ -210,11 +250,13 @@ fn strip_body_prefix(line: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
-/// A parsed op header: either body-bearing (needs `+` rows) or bodyless.
+/// A parsed op header: either body-bearing (needs `+` rows), bodyless, or a
+/// file-level operation.
 #[derive(Debug)]
 enum ParsedOp {
     BodyBearer(Op),
     Bodyless(Op),
+    File(FileOp),
 }
 
 fn parse_op_header(line: &str) -> Result<ParsedOp, String> {
@@ -258,7 +300,66 @@ fn parse_op_header(line: &str) -> Result<ParsedOp, String> {
         expect_eol(tail)?;
         return Ok(ParsedOp::Bodyless(Op::Del { start, end }));
     }
-    // INS.PRE N: / INS.POST N: / INS.HEAD: / INS.TAIL:
+    // CUT.BLK N
+    if let Some(rest) = line.strip_prefix("CUT.BLK ") {
+        let (n, tail) = parse_lid(rest)?;
+        expect_eol(tail)?;
+        return Ok(ParsedOp::Bodyless(Op::CutBlk { start: n }));
+    }
+    // CUT N.=M / CUT N
+    if let Some(rest) = line.strip_prefix("CUT ") {
+        let (start, end, tail) = parse_range(rest)?;
+        expect_eol(tail)?;
+        return Ok(ParsedOp::Bodyless(Op::Cut { start, end }));
+    }
+    // PASTE.PRE N: / PASTE.POST N: / PASTE.HEAD: / PASTE.TAIL:
+    if let Some(rest) = line.strip_prefix("PASTE.") {
+        if let Some(rest) = rest.strip_prefix("PRE ") {
+            let (n, tail) = parse_lid(rest)?;
+            expect_colon(tail)?;
+            return Ok(ParsedOp::Bodyless(Op::Paste {
+                pos: InsPos::Pre,
+                anchor: Some(n),
+            }));
+        }
+        if let Some(rest) = rest.strip_prefix("POST ") {
+            let (n, tail) = parse_lid(rest)?;
+            expect_colon(tail)?;
+            return Ok(ParsedOp::Bodyless(Op::Paste {
+                pos: InsPos::Post,
+                anchor: Some(n),
+            }));
+        }
+        if let Some(rest) = rest.strip_prefix("HEAD") {
+            expect_colon(rest)?;
+            return Ok(ParsedOp::Bodyless(Op::Paste {
+                pos: InsPos::Head,
+                anchor: None,
+            }));
+        }
+        if let Some(rest) = rest.strip_prefix("TAIL") {
+            expect_colon(rest)?;
+            return Ok(ParsedOp::Bodyless(Op::Paste {
+                pos: InsPos::Tail,
+                anchor: None,
+            }));
+        }
+        return Err("unknown PASTE position (expected PRE/POST/HEAD/TAIL)".to_string());
+    }
+    // REM — delete the file
+    if line.trim() == "REM" {
+        return Ok(ParsedOp::File(FileOp::Rem));
+    }
+    // MV DEST — move the file
+    if let Some(rest) = line.strip_prefix("MV ") {
+        let dest = rest.trim();
+        if dest.is_empty() {
+            return Err("MV requires a destination path".to_string());
+        }
+        return Ok(ParsedOp::File(FileOp::Move {
+            dest: dest.to_string(),
+        }));
+    }
     if let Some(rest) = line.strip_prefix("INS.") {
         if let Some(rest) = rest.strip_prefix("PRE ") {
             let (n, tail) = parse_lid(rest)?;
@@ -301,8 +402,10 @@ fn parse_op_header(line: &str) -> Result<ParsedOp, String> {
          Hint: body rows (the content to insert/replace) must start with `+` (e.g. `+new content`); \
          a lone `+` on a line denotes an empty line, and `+-x`/`++x` escape literal `-`/`+`. \
          A `-`-prefixed markdown list item is not a body row — rewrite it with a `+` prefix. \
-         If you did mean to write an op header, valid directives are: `SWAP N.=M:` / `DEL N.=M` / `INS.PRE N:` / \
-         `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:`."
+         If you did mean to write an op header, valid directives are: `SWAP N.=M:` / `DEL N.=M` / \
+         `CUT N.=M` / `PASTE.PRE N:` / `PASTE.POST N:` / `PASTE.HEAD:` / `PASTE.TAIL:` / \
+         `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `SWAP.BLK N:` / `DEL.BLK N` / \
+         `CUT.BLK N` / `INS.BLK.POST N:` / `REM` / `MV DEST`."
     ))
 }
 
@@ -321,6 +424,7 @@ fn parse_section_header(line: &str) -> Option<FilePatch> {
         path: PathBuf::from(path),
         tag: tag.to_string(),
         ops: Vec::new(),
+        file_op: None,
     })
 }
 
