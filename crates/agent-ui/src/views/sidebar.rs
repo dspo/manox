@@ -1781,7 +1781,10 @@ fn render_thread_item(
                             gpui::div()
                                 .flex_1()
                                 .min_w_0()
-                                .overflow_hidden()
+                                // Single-line invariant: the row height must
+                                // stay bounded for any title (LLM-generated
+                                // thread titles included) at any width.
+                                .truncate()
                                 .text_sm()
                                 .text_color(title_color)
                                 .child(title),

@@ -171,6 +171,11 @@ pub struct ExternalSession {
     /// sync (title) while live, deleted on close. `None` for plain PTY
     /// sessions, which are never persisted.
     pub sidecar: Option<ResumeSidecar>,
+    /// Thread-bound sessions mount as a right-pane Session tab of their
+    /// thread: they never project into the sidebar's top-level list and carry
+    /// no sidecar, so a restart cannot surface a thread resource as a
+    /// top-level (resumable) row.
+    pub thread_bound: bool,
 }
 
 impl ExternalSession {
@@ -256,6 +261,34 @@ impl ExternalSessionSummary {
         }
     }
 }
+
+/// OSC titles arrive verbatim from the TUI; control bytes and line breaks in
+/// the stored title would wrap the sidebar row's title div into an unbounded
+/// height. The stored form is always a single printable line, or `None`.
+pub(crate) fn sanitize_osc_title(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut spaced = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            if !spaced {
+                out.push(' ');
+            }
+            spaced = true;
+        } else if !c.is_control() {
+            out.push(c);
+            spaced = false;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(OSC_TITLE_MAX_CHARS).collect())
+}
+
+/// Sidebar rows stay single-line; the cap bounds the stored title well beyond
+/// any plausible TUI-set value.
+const OSC_TITLE_MAX_CHARS: usize = 120;
 
 /// Recover the cx session id from a `<id>.sock` socket path (stripping the
 /// `.sock` extension + parent dir). Returns `None` for paths that do not end in
@@ -956,5 +989,29 @@ mod tests {
         let listed = list_sidecars_in(dir.path());
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].wire_api, None);
+    }
+
+    /// Control bytes drop, whitespace runs (incl. line breaks) fold to one
+    /// space, blank input yields `None`, and overlong titles cap out.
+    #[test]
+    fn sanitize_osc_title_strips_controls_and_folds_whitespace() {
+        assert_eq!(
+            super::sanitize_osc_title("✳ 审查 PR 631 和 632"),
+            Some("✳ 审查 PR 631 和 632".into())
+        );
+        assert_eq!(
+            super::sanitize_osc_title("\x1b]2;claude\x07"),
+            Some("]2;claude".into())
+        );
+        assert_eq!(
+            super::sanitize_osc_title("line1\n\nline2\tend"),
+            Some("line1 line2 end".into())
+        );
+        assert_eq!(super::sanitize_osc_title(" \n\t "), None);
+        assert_eq!(super::sanitize_osc_title(""), None);
+        assert_eq!(
+            super::sanitize_osc_title(&"a".repeat(200)).map(|t| t.len()),
+            Some(120)
+        );
     }
 }
