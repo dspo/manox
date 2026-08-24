@@ -54,12 +54,6 @@ pub enum PromptTemplate {
     /// implement it top to bottom.
     ModePlanApproved,
 
-    // --- team lifecycle ---
-    /// Leader playbook (stop-notification reactions, dismiss/nudge/replace,
-    /// cleanup etiquette) injected at `TeamCreate`; member obligations
-    /// (final report before stopping) injected at spawn. One template, two
-    /// roles gated by `is_leader`.
-    SystemTeam,
     // --- tool descriptions ---
     AgentToolDescription,
 }
@@ -87,7 +81,6 @@ impl PromptTemplate {
             Self::SkillBody => "wrapper/skill_body.tera.md",
             Self::ModePlanActive => "mode/plan_mode_active.tera.md",
             Self::ModePlanApproved => "mode/plan_mode_approved.tera.md",
-            Self::SystemTeam => "system/team.tera.md",
             Self::AgentToolDescription => "tools/agent_tool.tera.md",
         }
     }
@@ -97,7 +90,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 18] = [
+pub const ALL: [PromptTemplate; 17] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -114,6 +107,5 @@ pub const ALL: [PromptTemplate; 18] = [
     PromptTemplate::SkillBody,
     PromptTemplate::ModePlanActive,
     PromptTemplate::ModePlanApproved,
-    PromptTemplate::SystemTeam,
     PromptTemplate::AgentToolDescription,
 ];

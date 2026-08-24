@@ -97,8 +97,7 @@ enum RightTab {
     Editor,
     Launcher,
     Browser(BrowserTabId),
-    /// A team member's observation panel, keyed by member name.
-    Member(String),
+
     /// A pi sub-agent's observation panel, keyed by subagent address.
     Subagent(String),
     /// An embedded terminal/CLI-agent session, keyed by `ExternalSession.id`.
@@ -122,13 +121,13 @@ enum PersistedRightTab {
     Editor,
     Launcher,
     Browser { url: String },
-    Member { name: String },
+
     Session { id: String },
 }
 
-/// In-session per-thread right-pane stash: the live tabs (browser views and
-/// member panels keep their entities across switches), the active index, and
-/// visibility. The persistent copy lives in `threads.db`.
+/// In-session per-thread right-pane stash: the live tabs (browser views
+/// keep their entities across switches), the active index, and visibility.
+/// The persistent copy lives in `threads.db`.
 struct RightPaneSnapshot {
     tabs: Vec<RightTab>,
     active: usize,
@@ -330,8 +329,7 @@ pub struct Workspace {
     editor_state: Entity<InputState>,
     /// Whether the Editor tab is the active right-pane tab. Drives the inline
     /// composer hide (writing happens in the side panel) and the env/hero
-    /// gates. A member tab being active leaves this `false` so the inline
-    /// composer stays usable for talking to the leader.
+    /// gates.
     editor_open: bool,
     editor_preview: bool,
     /// Stable markdown preview entity kept across renders so the source is
@@ -343,7 +341,7 @@ pub struct Workspace {
     /// `h_full`-percentage) scroll container reliably engages `overflow_y_scroll`
     /// instead of letting content overflow and clip.
     editor_preview_scroll: ScrollHandle,
-    /// Peer right-pane tabs for the editor, launcher, browser, member/sub-agent
+    /// Peer right-pane tabs for the editor, launcher, browser, sub-agent
     /// observers, and embedded terminal/CLI sessions. `editor_open` tracks
     /// whether the Editor tab specifically is active.
     right_tabs: Vec<RightTab>,
@@ -367,11 +365,6 @@ pub struct Workspace {
     /// The CLI agent kind the open launcher cascade belongs to — anchors the
     /// popup under its launcher row.
     launcher_menu_kind: Option<SessionKind>,
-    /// Team chip popover open state (composer chip).
-    team_chip_open: bool,
-    /// Member observation panels keyed by member name; lifetime is the
-    /// tab's (dropped when the tab closes).
-    member_panels: HashMap<String, Entity<crate::views::member_panel::MemberPanel>>,
     /// Live sub-agent observation panels keyed by Agent tool-call id.
     subagent_panels: HashMap<String, Entity<crate::views::subagent_panel::SubagentPanel>>,
     /// Accumulated child-session events per Agent tool-call id, so a panel
@@ -771,8 +764,6 @@ impl Workspace {
             launcher_menu: None,
             launcher_menu_sub: None,
             launcher_menu_kind: None,
-            team_chip_open: false,
-            member_panels: HashMap::new(),
             subagent_panels: HashMap::new(),
             subagent_transcripts: HashMap::new(),
             subagent_final_text: HashMap::new(),
@@ -1756,10 +1747,6 @@ impl Workspace {
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let is_current = this.thread.read(cx).id.0 == *id;
                     let store = agent::thread_store_global();
-                    // Team teardown is the store's centralized invariant
-                    // (leader-gated); an explicit disband here would destroy
-                    // a whole team when a member row is archived and strand
-                    // the leader with a dangling team ref.
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
@@ -3755,22 +3742,6 @@ impl Workspace {
         true
     }
 
-    // Phase E stub — retained until Entity<Team> retirement removes the call sites.
-    #[allow(dead_code)]
-    /// UI entry for the member panel's dismiss button: the `TeamDismiss`
-    /// op on the leader thread (cancel, archive session, release tasks,
-    /// drop from roster).
-    pub(crate) fn dismiss_member(
-        &mut self,
-        team: gpui::WeakEntity<agent::team::Team>,
-        name: String,
-        cx: &mut Context<Self>,
-    ) {
-        // Phase E: dismiss_member retired with Entity<Team> — use
-        // Steer(Abort, to=member_thread_id) instead. Stubbed for now.
-        let _ = (team, name, cx);
-    }
-
     /// Archive the active thread and open a fresh one that inherits the
     /// outgoing thread's project, model, permission mode, and reasoning effort —
     /// `/new` starts a clean conversation without dropping the working
@@ -4458,7 +4429,6 @@ impl Workspace {
                         .unwrap_or_default();
                     Some(PersistedRightTab::Browser { url })
                 }
-                RightTab::Member(name) => Some(PersistedRightTab::Member { name: name.clone() }),
                 RightTab::Session(id) => Some(PersistedRightTab::Session { id: id.clone() }),
                 RightTab::Subagent(_) => None,
             };
@@ -4589,10 +4559,9 @@ impl Workspace {
     }
 
     /// Rebuild a persisted pane into live tabs. Browser tabs recreate their
-    /// webview from the stored URL (the app-restart path); member tabs only
-    /// restore while the thread's team still has the member; session tabs
-    /// only while the external session is still alive — everything else
-    /// drops silently.
+    /// webview from the stored URL (the app-restart path); session tabs
+    /// restore only while the external session is still alive — everything
+    /// else drops silently.
     fn materialize_right_pane(
         &mut self,
         persisted: PersistedRightPane,
@@ -4607,9 +4576,6 @@ impl Workspace {
                     let id = self.restore_browser_tab(&url, window, cx);
                     self.right_tabs.push(RightTab::Browser(id));
                 }
-                // `open_member_tab` no-ops (pushes nothing) when the team or
-                // member is gone — exactly the drop semantics.
-                PersistedRightTab::Member { name } => self.open_member_tab(&name, cx),
                 PersistedRightTab::Session { id } => {
                     if self.external_sessions.iter().any(|s| s.id == id) {
                         self.right_tabs.push(RightTab::Session(id));
@@ -4932,13 +4898,6 @@ impl Workspace {
             Some(RightTab::Editor) => self.close_editor(window, cx),
             Some(RightTab::Browser(id)) => self.close_browser_tab(id, cx),
             Some(RightTab::Session(id)) => self.close_external_session(&id, cx),
-            Some(RightTab::Member(name)) => {
-                self.member_panels.remove(&name);
-                self.right_tabs.remove(ix);
-                self.reseat_active_after_close(ix, cx);
-                self.hide_right_pane_if_empty(cx);
-                cx.notify();
-            }
             Some(RightTab::Subagent(id)) => {
                 self.subagent_panels.remove(&id);
                 self.right_tabs.remove(ix);
@@ -4966,43 +4925,6 @@ impl Workspace {
         }
     }
 
-    /// Open (or focus) a team member's observation panel in the right pane.
-    fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
-        if let Some(ix) = self
-            .right_tabs
-            .iter()
-            .position(|t| matches!(t, RightTab::Member(n) if n == name))
-        {
-            self.set_active_right_tab(ix, cx);
-            return;
-        }
-        let Some(team) = self.thread.read(cx).team().cloned() else {
-            return;
-        };
-        let Some(member_thread) = team.read(cx).thread_for(name).cloned() else {
-            return;
-        };
-        let role = team
-            .read(cx)
-            .members()
-            .get(name)
-            .map(|m| m.role().to_string())
-            .unwrap_or_else(|| name.to_string());
-        let weak = cx.weak_entity();
-        let panel = crate::views::member_panel::MemberPanel::new(
-            member_thread,
-            name.to_string(),
-            role,
-            team.downgrade(),
-            weak,
-            cx,
-        );
-        self.right_pane_visible = true;
-        self.member_panels.insert(name.to_string(), panel);
-        self.right_tabs.push(RightTab::Member(name.to_string()));
-        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
-        cx.notify();
-    }
     /// Open (or focus) a sub-agent observation panel in the right pane. The
     /// tab label is the subagent's address (`id`); the panel's banner shows
     /// `topic` — the shared `subagent_topic` derivation the rail and
@@ -6006,7 +5928,6 @@ impl Workspace {
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip_pi(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
-        let team_chip = self.render_team_chip(theme, cx);
         let plan_chip = self.render_plan_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector_pi(theme, cx);
@@ -6118,7 +6039,6 @@ impl Workspace {
                             .child(plus)
                             .child(project_chip)
                             .when_some(goal_chip, |el, chip| el.child(chip))
-                            .when_some(team_chip, |el, chip| el.child(chip))
                             .when_some(plan_chip, |el, chip| el.child(chip))
                             .child(access),
                     )
@@ -6603,163 +6523,6 @@ impl Workspace {
                             .child(popover)
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                 this.goal_popover_open = false;
-                                cx.notify();
-                            })),
-                    )
-                    .with_priority(1),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_team_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let team = self.thread.read(cx).team().cloned()?;
-        // Collect member roster metadata in one pass so we never hold a
-        // borrow on the `Team` entity across the render closures below.
-        let (count, rows): (usize, Vec<(String, String, bool, usize)>) = {
-            let t = team.read(cx);
-            let members = t.members();
-            let tasks = t.tasks().read(cx).tasks();
-            let rows = members
-                .iter()
-                .map(|(name, m)| {
-                    let running = m.thread().read(cx).is_running();
-                    let owned = tasks
-                        .iter()
-                        .filter(|tk| tk.owner.as_deref() == Some(name.as_str()))
-                        .count();
-                    (name.clone(), m.role().to_string(), running, owned)
-                })
-                .collect();
-            (members.len(), rows)
-        };
-        let accent = theme.accent;
-        let muted = theme.muted_foreground;
-        let fg = theme.foreground;
-        let open = self.team_chip_open;
-        let label: SharedString = i18n::t_str("team-chip", &[("count", &count.to_string())]);
-
-        let trigger = h_flex()
-            .id("team-chip")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(accent)
-            .cursor_pointer()
-            .child(
-                Icon::new(IconName::User)
-                    .xsmall()
-                    .text_color(theme.accent_foreground),
-            )
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.accent_foreground)
-                    .child(label),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(muted),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.team_chip_open = !this.team_chip_open;
-                cx.notify();
-            }));
-
-        if !open {
-            return Some(trigger.into_any_element());
-        }
-
-        let title = i18n::t("team-drawer-title");
-        let empty = i18n::t("team-drawer-empty");
-
-        let roster = if rows.is_empty() {
-            v_flex()
-                .w_full()
-                .p_3()
-                .child(gpui::div().text_xs().text_color(muted).child(empty))
-        } else {
-            v_flex().w_full().gap_1().p_2().children(
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(ix, (name, role, running, owned))| {
-                        let dot_color = if running {
-                            theme.accent_foreground
-                        } else {
-                            theme.muted_foreground
-                        };
-                        let tasks_label = i18n::t_str_count("team-drawer-tasks", &[], owned as i64);
-                        let name_for_click = name.clone();
-                        h_flex()
-                            .id(("team-member-row", ix))
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                            .child(gpui::div().w(px(8.)).h(px(8.)).rounded_full().bg(dot_color))
-                            .child(
-                                gpui::div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(fg)
-                                    .child(name),
-                            )
-                            .child(gpui::div().text_xs().text_color(muted).child(role))
-                            .child(gpui::div().flex_1())
-                            .child(gpui::div().text_xs().text_color(muted).child(tasks_label))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                this.open_member_tab(&name_for_click, cx);
-                                this.team_chip_open = false;
-                                cx.notify();
-                            }))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        let popover = v_flex()
-            .w_full()
-            .gap_1()
-            .p_2()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(accent)
-                    .child(title),
-            )
-            .child(roster);
-
-        Some(
-            gpui::div()
-                .relative()
-                .child(trigger)
-                .child(
-                    deferred(
-                        gpui::div()
-                            .id("team-dropdown")
-                            .absolute()
-                            .bottom_full()
-                            .left_0()
-                            .occlude()
-                            .w(px(320.))
-                            .popover_style(cx)
-                            .child(popover)
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.team_chip_open = false;
                                 cx.notify();
                             })),
                     )
@@ -7991,7 +7754,7 @@ impl Workspace {
         // The sidebar divider lives in `shell_root` — shared by every view
         // mode so the sidebar resizes identically everywhere.
         // Right pane is a peer tab container for the editor, launcher,
-        // browser, member/sub-agent observers, and embedded sessions. The
+        // browser, sub-agent observers, and embedded sessions. The
         // top-level TabBar is built from `right_tabs`; the content below
         // dispatches on the active tab.
         let active_tab = self.right_tabs.get(self.active_right_tab).cloned();
@@ -8007,9 +7770,6 @@ impl Workspace {
                 let (full, icon_path): (SharedString, Option<&'static str>) = match tab {
                     RightTab::Editor => (i18n::t("member-editor-tab"), None),
                     RightTab::Launcher => (i18n::t("right-tab-launcher"), None),
-                    RightTab::Member(name) => {
-                        (i18n::t_str("member-tab", &[("name", name.as_str())]), None)
-                    }
                     RightTab::Browser(id) => {
                         // The page's <title>, polled by the host; the URL is
                         // the fallback before the first title lands.
@@ -8202,11 +7962,6 @@ impl Workspace {
                             .browser_views
                             .get(&id)
                             .map(|v| v.clone().into_any_element())
-                            .unwrap_or_else(|| gpui::div().into_any_element()),
-                        Some(RightTab::Member(name)) => self
-                            .member_panels
-                            .get(&name)
-                            .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
                         Some(RightTab::Subagent(id)) => self
                             .subagent_panels

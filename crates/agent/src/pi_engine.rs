@@ -1324,7 +1324,6 @@ fn build_tools(
         SessionOrchestrators {
             monitor,
             background: manager,
-            bus: Arc::clone(bus),
         },
         read_only_subagent,
     )
@@ -1353,18 +1352,15 @@ fn worktree_policy(
 struct SessionOrchestrators {
     monitor: Arc<MonitorManager>,
     background: Arc<BackgroundManager>,
-    bus: Arc<crate::steer_bus::AgentBus>,
 }
 
 /// Bind the orchestrators to a freshly built session: the monitor steerer
-/// lands events in the session's steering queue, the background manager
-/// subscribes to the session's lifecycle, and the Steer bus gets the
-/// Captain's session handle for late-bind routing.
+/// lands events in the session's steering queue and the background manager
+/// subscribes to the session's lifecycle.
 fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators) {
     let handle = session.handle();
     orch.monitor.attach(&handle);
     orch.background.attach(session);
-    orch.bus.bind_captain(handle);
 }
 fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
     let mut content = vec![ContentBlock::Text {

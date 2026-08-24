@@ -30,7 +30,6 @@ use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, T
 use pi::types::Model as PiModel;
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
-use crate::team::Team;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone)]
@@ -340,9 +339,7 @@ pub struct Thread {
     /// Member label for team routing: `lead` for the main thread, the
     /// member name for team workers.
     label: String,
-    /// The team this thread belongs to. The leader owns the `Entity<Team>`;
-    /// members hold the same entity (set at spawn, cleared on disband).
-    team: Option<Entity<Team>>,
+
     /// Shared goal state with the engine's goal tools; `None` only when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<GoalBridge>>,    worktree_path: Option<String>,
@@ -383,7 +380,6 @@ impl Thread {
             plan_mode: false,
             persisted_plan: None,
             label: "lead".into(),
-            team: None,
             goal_bridge: None,            worktree_path: None,
         })
     }
@@ -471,7 +467,6 @@ impl Thread {
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
-                team: None,
                 goal_bridge,            worktree_path: None,
             }
         })
@@ -1019,18 +1014,6 @@ impl Thread {
         self.running = running;
     }
 
-    /// Test-only: set the member label.
-    #[cfg(test)]
-    pub(crate) fn set_label_for_test(&mut self, label: String) {
-        self.label = label;
-    }
-
-    /// Override the thread id for tests that exercise `parent_id` cascades
-    /// (the default `test-thread` id would self-collide across threads).
-    #[cfg(test)]
-    pub(crate) fn set_id_for_test(&mut self, id: String) {
-        self.id = ThreadId(id);
-    }
     // ── Thread duck-type: read accessors ───────────────────────────────────
 
     pub fn messages(&self) -> &[Message] {
@@ -1315,28 +1298,6 @@ impl Thread {
         crate::team::author_for(&self.label)
     }
 
-    /// The team this thread belongs to (leader owns; member holds).
-    pub fn team(&self) -> Option<&Entity<Team>> {
-        self.team.as_ref()
-    }
-
-    /// Attach this thread to a team (leader at `TeamCreate`, member at
-    /// spawn). Registers the thread as live so the store's centralized
-    /// archive-teardown can reach a leader's team from its id alone.
-    pub fn set_team(&mut self, team: Entity<Team>, cx: &mut Context<Self>) {
-        self.team = Some(team);
-        if let Some(store) = crate::thread_store::try_global() {
-            let id = self.id.0.clone();
-            let weak = cx.weak_entity();
-            store.update(cx, |s, _| s.register_live_thread(&id, weak));
-        }
-    }
-
-    /// Detach from the team (disband path).
-    pub fn clear_team(&mut self, _cx: &mut Context<Self>) {
-        self.team = None;
-    }
-
     /// Deliver peer messages from teammates: render each through the peer
     /// wrapper template, emit `PeerMessage`, then run a turn over the batch
     /// (no-op when the engine is mid-turn — the team queues instead).
@@ -1438,7 +1399,6 @@ impl Thread {
                 persisted_plan: None,
                 goal_bridge: None,
                 label: name,
-                team: None,
                 worktree_path: None,
             }
         })
@@ -1654,20 +1614,8 @@ impl Thread {
         &mut self,
         id: &str,
         response: crate::permission::ToolAuthorizationResponse,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        // Composite ids (`<member>::<child_id>`) route the leader's verdict
-        // to the member thread that owns the actual authorization.
-        if id.contains("::")
-            && let Some(team) = self.team.clone()
-        {
-            let resolved = team.read_with(cx, |t, _| t.resolve_child_auth(id));
-            if let Some((member, child_id)) = resolved {
-                member.update(cx, |m, cx| m.respond_authorization(&child_id, response, cx));
-                team.update(cx, |t, _| t.clear_child_auth(id));
-                return;
-            }
-        }
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
         }
@@ -2296,7 +2244,6 @@ pub(crate) mod tests {
                 plan_mode: false,
                 persisted_plan: None,
                 label: "lead".into(),
-                team: None,
                 goal_bridge: None,            worktree_path: None,
             })
         })
@@ -3038,3 +2985,4 @@ pub(crate) mod tests {
         assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
 }
+

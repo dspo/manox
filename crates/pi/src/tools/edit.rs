@@ -139,14 +139,11 @@ impl AgentTool for EditTool {
                     }
                     hashline::FileOp::Move { dest } => {
                         let dest_path = resolve_path(ctx, std::path::Path::new(dest));
-                        ctx.env()
-                            .write_file(&dest_path, &raw)
-                            .await
-                            .map_err(|e| {
-                                ToolError::ExecutionFailed(format!(
-                                    "edit MV write failed {path_display}: {e}"
-                                ))
-                            })?;
+                        ctx.env().write_file(&dest_path, &raw).await.map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "edit MV write failed {path_display}: {e}"
+                            ))
+                        })?;
                         ctx.env().remove(&path).await.map_err(|e| {
                             ToolError::ExecutionFailed(format!(
                                 "edit MV source removal failed {path_display}: {e}"
@@ -157,10 +154,7 @@ impl AgentTool for EditTool {
                             .lock()
                             .expect("hashline snapshot store poisoned")
                             .relocate(&path, &dest_path);
-                        results.push(format!(
-                            "[{path_display}] moved to {}",
-                            dest_path.display()
-                        ));
+                        results.push(format!("[{path_display}] moved to {}", dest_path.display()));
                         continue;
                     }
                 }
@@ -281,8 +275,7 @@ fn expand_clipboard_ops(
                 let s = start.saturating_sub(1);
                 let e = (*end).min(lines.len());
                 if s < e {
-                    let captured: Vec<String> =
-                        lines[s..e].iter().map(|s| s.to_string()).collect();
+                    let captured: Vec<String> = lines[s..e].iter().map(|s| s.to_string()).collect();
                     clipboard.clear();
                     clipboard.extend(captured);
                 }
@@ -296,10 +289,7 @@ fn expand_clipboard_ops(
                     .map_err(|err| {
                         ToolError::ExecutionFailed(format!("CUT.BLK resolve failed: {err}"))
                     })?;
-                let captured: Vec<String> = lines[s - 1..e]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let captured: Vec<String> = lines[s - 1..e].iter().map(|s| s.to_string()).collect();
                 clipboard.clear();
                 clipboard.extend(captured);
                 expanded.push(Op::DelBlk { start: *start });
