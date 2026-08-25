@@ -11,30 +11,16 @@ import type {
   ReasoningEffort,
 } from '../../../protocol';
 import type { HostToWebview, WebviewToHost } from '../../messages';
+import type { Bridge } from './bridge';
+import { createVscodeBridge, isVscodeHost } from './vscode-bridge';
+import { createWebBridge } from './web-bridge';
 
-interface HostApi {
-  postMessage(msg: WebviewToHost): void;
-}
-
-declare function acquireVsCodeApi(): HostApi;
-
-const host = acquireVsCodeApi();
-
-const listeners = new Set<(message: HostToWebview) => void>();
-
-window.addEventListener('message', (raw: MessageEvent) => {
-  const message = raw.data as HostToWebview;
-  for (const listener of listeners) listener(message);
-});
-
-/** Subscribe to host messages; returns an unsubscribe function. */
-export function onHostMessage(listener: (message: HostToWebview) => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
+// Pick the host transport at runtime: VS Code injects acquireVsCodeApi as a
+// global, the browser host has only a WebSocket.
+const bridge: Bridge = isVscodeHost() ? createVscodeBridge() : createWebBridge();
 
 const navigatorListeners = new Set<() => void>();
-onHostMessage((message) => {
+bridge.onMessage((message) => {
   if (message.type === 'open_turn_navigator') {
     for (const listener of navigatorListeners) listener();
   }
@@ -47,8 +33,13 @@ export function onOpenTurnNavigator(listener: () => void): () => void {
   return () => navigatorListeners.delete(listener);
 }
 
+/** Subscribe to host messages; returns an unsubscribe function. */
+export function onHostMessage(listener: (message: HostToWebview) => void): () => void {
+  return bridge.onMessage(listener);
+}
+
 function post(message: WebviewToHost): void {
-  host.postMessage(message);
+  bridge.post(message);
 }
 
 /** Per-thread command surface; one instance per live thread id. */

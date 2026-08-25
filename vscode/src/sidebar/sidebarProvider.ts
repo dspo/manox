@@ -6,9 +6,9 @@
 
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ImageAttachment } from '../protocol';
+import type { ActorEvent, ImageAttachment } from '../../dist/protocol';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
-import type { HostToWebview, WebviewToHost } from './messages';
+import type { HostToWebview, WebviewToHost } from '../../dist/sidebar/messages';
 
 /** Frame interval for draining the session-event buffer. One postMessage
  * per interval carries every buffered event, so a streaming turn (one wire

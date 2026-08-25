@@ -81,10 +81,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: vscode/package-lock.json
+          cache-dependency-path: |
+            vscode/package-lock.json
+            webui/package-lock.json
 
       - name: Build napi binding
         run: cargo build -p manox-napi
+
+      - name: Install webui dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Build webui (bundle + contract staging)
+        working-directory: webui
+        run: npm run build
 
       - name: Install extension dependencies
         working-directory: vscode
@@ -97,10 +107,6 @@ jobs:
       - name: Unit tests
         working-directory: vscode
         run: npm test
-
-      - name: Bundle webview
-        working-directory: vscode
-        run: npm run build:webview
 
       - name: Stage napi binding
         working-directory: vscode

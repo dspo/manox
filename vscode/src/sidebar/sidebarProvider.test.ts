@@ -5,8 +5,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
 
-import type { ThreadInfoSnapshot } from '../protocol';
-import type { HostToWebview, WebviewToHost } from './messages';
+import type { ThreadInfoSnapshot } from '../../dist/protocol';
+import type { HostToWebview, WebviewToHost } from '../../dist/sidebar/messages';
 import { registerManoxSidebar } from './sidebarProvider';
 
 const { managerMock } = vi.hoisted(() => {

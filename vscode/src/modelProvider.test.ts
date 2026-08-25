@@ -68,7 +68,7 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
-import type { ActorEvent } from './protocol';
+import type { ActorEvent } from '../dist/protocol';
 import { ManoxModelProvider, partToText, toWireMessages } from './modelProvider';
 import { SessionManager } from './sessionManager';
 import type { Transport } from './transport/transport';

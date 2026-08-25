@@ -1,7 +1,7 @@
-// Bundle the sidebar webview frontend into dist/webview/bundle.js, loaded
-// by sidebarProvider behind a CSP nonce. The companion bundle.css is
-// produced by the Tailwind CLI from styles/tokens.css. The host extension
-// is compiled separately by tsc; this bundle is webview-only code.
+// Bundle the webview frontend into dist/webview/bundle.js. The companion
+// bundle.css is produced by the Tailwind CLI from styles/tokens.css. This
+// bundle is shared verbatim by both hosts: VS Code loads it behind a CSP
+// nonce, the browser host embeds it in the served index.html.
 import * as esbuild from 'esbuild';
 import { fileURLToPath } from 'node:url';
 import * as path from 'node:path';
@@ -16,8 +16,8 @@ const options = {
   outfile: path.join(root, 'dist', 'webview', 'bundle.js'),
   format: 'iife',
   target: 'es2022',
-  // Match tsconfig.webview.json's react-jsx; the classic transform would need
-  // a React import in every module.
+  // Match tsconfig.json's react-jsx; the classic transform would need a
+  // React import in every module.
   jsx: 'automatic',
   minify: !watch,
   sourcemap: watch ? 'inline' : false,

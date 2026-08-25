@@ -3,7 +3,7 @@
 // strings, one event per delivery. The napi binding is the current
 // implementation; a stdio child process can implement the same interface.
 
-import type { ActorEvent } from '../protocol';
+import type { ActorEvent } from '../../dist/protocol';
 
 export interface Transport {
   /** Resolves once the actor is up and commands may be sent. */

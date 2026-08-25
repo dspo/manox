@@ -11,5 +11,5 @@
     "esModuleInterop": true,
     "types": []
   },
-  "include": ["src/sidebar/webview"]
+  "include": ["src"]
 }

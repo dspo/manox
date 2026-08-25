@@ -10,7 +10,7 @@ vi.mock('vscode', () => ({
   },
 }));
 
-import type { ActorEvent } from './protocol';
+import type { ActorEvent } from '../dist/protocol';
 import { SessionManager } from './sessionManager';
 import type { Transport } from './transport/transport';
 
