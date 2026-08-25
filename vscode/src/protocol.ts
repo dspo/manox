@@ -124,9 +124,11 @@ export type ToolCallStatus =
 	| 'cancelled'
 	| (string & {});
 
-/** Tool-authorization policy: autopilot gates on the safety reviewer with
- * user escalation, danger runs every tool call without prompting. */
-export type ApprovalMode = 'autopilot' | 'danger';
+/** Tool-authorization policy: mirrors the actor's `agent::PermissionMode`
+ * kebab wire values. `read-only` refuses fs mutations, `workspace-write`
+ * confines writes to the workspace and state home, `danger-full-access`
+ * runs every tool call without confinement. */
+export type ApprovalMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 
 /** User-facing reasoning-effort knob for the model dropdown (`high`/`max`). */
 export type ReasoningEffort = 'high' | 'max';

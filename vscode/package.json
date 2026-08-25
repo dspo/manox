@@ -55,15 +55,17 @@
         "manox.approvalMode": {
           "type": "string",
           "enum": [
-            "danger",
-            "autopilot"
+            "read-only",
+            "workspace-write",
+            "danger-full-access"
           ],
           "enumDescriptions": [
-            "Run every tool call without authorization prompts",
-            "Gate authorization-required tool calls on the safety reviewer, escalating to an approval card when unsure"
+            "Tools may read but not modify files",
+            "Writes confined to the workspace and the manox state home",
+            "No confinement; every tool call runs unrestricted"
           ],
-          "default": "danger",
-          "markdownDescription": "Tool-authorization policy for manox sessions. `danger` runs everything without prompting; `autopilot` routes authorization-required tool calls through the safety reviewer with user escalation."
+          "default": "workspace-write",
+          "markdownDescription": "Tool-authorization policy for manox sessions, mirroring the native `PermissionMode`. `read-only` refuses file mutations; `workspace-write` confines writes to the workspace and state home; `danger-full-access` runs every tool call without confinement."
         }
       }
     },

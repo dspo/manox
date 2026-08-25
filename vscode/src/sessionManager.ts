@@ -34,7 +34,7 @@ export function resolveWorkspaceCwd(): string {
 /** Configured tool-authorization policy; unset falls back to danger. */
 export function configuredApprovalMode(): ApprovalMode {
   const value = vscode.workspace.getConfiguration('manox').get<string>('approvalMode');
-  return value === 'autopilot' ? 'autopilot' : 'danger';
+  return value === 'read-only' || value === 'danger-full-access' ? value : 'workspace-write';
 }
 
 export class SessionManager {

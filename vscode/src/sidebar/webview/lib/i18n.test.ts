@@ -23,8 +23,8 @@ describe('i18n', () => {
     setLanguageForTest('zh-cn');
     expect(t('conversation_info')).toBe('对话信息');
     expect(t('no_sources')).toBe('暂无来源');
-    expect(t('autopilot')).toBe('自动驾驶');
-    expect(t('danger')).toBe('危险驾驶');
+    expect(t('workspace_write')).toBe('工作区可写');
+    expect(t('danger_full_access')).toBe('完全访问');
   });
 
   it('falls back to English otherwise', () => {

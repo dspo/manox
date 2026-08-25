@@ -77,7 +77,7 @@ describe('thread routing', () => {
       loading: false,
       // Matches the thread-side default; restored threads get their
       // persisted mode replayed by the actor.
-      approvalMode: 'autopilot',
+      approvalMode: 'workspace-write',
     });
   });
 
@@ -505,8 +505,8 @@ describe('transcript folding', () => {
     expect(thread(store)?.currentModelId).toBe('m1');
     store.dispatch(event({ type: 'current_model', sessionId: 's', id: 'm2' }));
     expect(thread(store)?.currentModelId).toBe('m2');
-    store.dispatch(event({ type: 'approval_mode_changed', sessionId: 's', mode: 'autopilot' }));
-    expect(thread(store)?.approvalMode).toBe('autopilot');
+    store.dispatch(event({ type: 'approval_mode_changed', sessionId: 's', mode: 'danger-full-access' }));
+    expect(thread(store)?.approvalMode).toBe('danger-full-access');
     store.dispatch(event({ type: 'reasoning_effort_changed', sessionId: 's', effort: 'max' }));
     expect(thread(store)?.reasoningEffort).toBe('max');
     store.dispatch(

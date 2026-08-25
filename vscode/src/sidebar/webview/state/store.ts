@@ -97,7 +97,7 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
   // Matches the thread-side default; the actor replays the persisted effort
   // (and approval mode) on open, correcting these values for restored threads.
   reasoningEffort: 'high',
-  approvalMode: 'autopilot',
+  approvalMode: 'workspace-write',
   usage: null,
   cost: 0,
   info: null,

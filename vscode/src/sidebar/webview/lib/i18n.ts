@@ -16,14 +16,21 @@ const DICT = {
   spend: { en: 'Spend', zh: '消费' },
   sources: { en: 'Sources', zh: '来源' },
   no_sources: { en: 'No sources yet', zh: '暂无来源' },
-  autopilot: { en: 'AutoPilot', zh: '自动驾驶' },
-  danger: { en: 'Danger', zh: '危险驾驶' },
-  autopilot_desc: {
-    en: 'Tools run after an automatic safety review',
-    zh: '工具经自动安全审查后执行',
+  read_only: { en: 'Read Only', zh: '只读' },
+  workspace_write: { en: 'Workspace Write', zh: '工作区可写' },
+  danger_full_access: { en: 'Full Access', zh: '完全访问' },
+  read_only_desc: { en: 'Tools may read but not modify files', zh: '工具只读，禁止修改文件' },
+  workspace_write_desc: {
+    en: 'Writes confined to the workspace and state home',
+    zh: '写入限定在工作区与状态目录',
   },
-  danger_desc: { en: 'Every tool call runs without prompting', zh: '所有工具调用直接执行' },
+  danger_full_access_desc: {
+    en: 'No confinement; every tool runs unrestricted',
+    zh: '无沙箱限制，工具自由运行',
+  },
   approval_mode: { en: 'Approval mode', zh: '审批模式' },
+  crashed_title: { en: 'Something went wrong', zh: '出现错误' },
+  crashed_reload: { en: 'Reload', zh: '重新加载' },
   composer_placeholder: {
     en: 'Type a message, then send to begin',
     zh: '输入消息，点击发送以开始使用',
