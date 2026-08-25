@@ -69,7 +69,8 @@ impl SandboxPolicy {
 
     /// Policy for a worktree-isolated session: the workspace root is the
     /// worktree itself, so `workspace-write` allows the worktree (plus the
-    /// shared temp areas). A worktree is an approved isolation context.
+    /// shared writable roots — manox home and temp areas). A worktree is an
+    /// approved isolation context.
     pub fn for_worktree(worktree_path: &Path) -> Self {
         let worktree = canonicalize_best_effort(worktree_path);
         Self {
@@ -453,6 +454,14 @@ mod tests {
             sb.contains("(allow file-write* (subpath \"/tmp\"))")
                 || sb.contains("(allow file-write* (subpath \"/private/tmp\"))")
         );
+        // The manox state home is admitted (plan files write without
+        // escalation).
+        if let Some(home) = pi_extensions::sandbox::manox_home() {
+            assert!(sb.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                canonicalize_best_effort(&home).display()
+            )));
+        }
     }
 
     #[test]
@@ -559,6 +568,47 @@ mod tests {
         let res = ops.exec(req).await.expect("exec itself succeeds");
         assert_ne!(res.exit_code, 0, "seatbelt denies the write");
         assert!(!denied_target.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandboxed_exec_admits_manox_home_writes() {
+        let Some(home) = pi_extensions::sandbox::manox_home() else {
+            return; // no home dir to admit
+        };
+        std::fs::create_dir_all(&home).ok();
+        let root = project_root();
+        std::fs::create_dir_all(&root).ok();
+        let policy = SandboxPolicy::for_project(&root);
+        let ops =
+            SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::WorkspaceWrite));
+
+        // The manox state home is writable under workspace-write (plan files
+        // and scratch state need no escalation).
+        let probe = home.join("manox-sandbox-home-probe.txt");
+        let _ = std::fs::remove_file(&probe);
+        let req = BashExecRequest {
+            command: &format!("echo hi > {}", probe.display()),
+            cwd: Some(&root),
+            timeout: Some(Duration::from_secs(30)),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_data: None,
+        };
+        let res = ops.exec(req).await.expect("exec runs");
+        if res.exit_code == 71 && res.stderr.contains("Operation not permitted") {
+            // Nested sandbox-exec is refused when the PARENT process is
+            // itself sandboxed. Environment-specific — CI and the GUI app
+            // are unsandboxed and exercise the real confinement.
+            eprintln!("skipping seatbelt assertions: parent process sandboxed");
+            return;
+        }
+        assert_eq!(
+            res.exit_code, 0,
+            "manox home write admitted: {}",
+            res.stderr
+        );
+        assert!(probe.exists(), "probe written under the manox home");
+        let _ = std::fs::remove_file(&probe);
     }
 
     #[cfg(target_os = "macos")]

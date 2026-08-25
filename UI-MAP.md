@@ -991,7 +991,7 @@ Amber — bash runs but writes are denied by the seatbelt; fs mutations refused.
 
 #### Workspace Write
 
-Green — writes under the workspace + temp areas; bash confined to the workspace-write profile (default).
+Green — writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the workspace-write profile (default).
 
 #### Danger Full Access
 

@@ -379,7 +379,7 @@ workspace-cancel = Cancel
 workspace-mode-readonly-title = Read Only
 workspace-mode-readonly-desc = Bash runs but may not write files; fs mutations are refused
 workspace-mode-workspacewrite-title = Workspace Write
-workspace-mode-workspacewrite-desc = Writes under the workspace + temp areas; bash confined to the workspace-write seatbelt profile
+workspace-mode-workspacewrite-desc = Writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the workspace-write seatbelt profile
 workspace-mode-dangerfullaccess-title = Danger Full Access
 workspace-mode-dangerfullaccess-desc = No sandbox: bash runs unsandboxed, fs mutations are unfenced
 workspace-chip-mode-readonly = Read Only
@@ -389,7 +389,7 @@ workspace-mode-title = What should manox be allowed to do?
 workspace-mode-learn-more = Learn more
 workspace-mode-notice = { $mode ->
     [readonly] Read Only: bash runs but writes are denied by the seatbelt; fs mutations are refused.
-    [workspacewrite] Workspace Write: writes under the workspace + temp areas run; out-of-workspace targets are refused. Escalate a denied call with sandbox_permissions + justification.
+    [workspacewrite] Workspace Write: writes under the workspace, the manox home (~/.manox), and temp areas run; out-of-workspace targets are refused. Escalate a denied call with sandbox_permissions + justification.
    *[dangerfullaccess] Danger Full Access: no sandbox; bash runs unsandboxed, fs mutations are unfenced.
 }
 workspace-project-choose = Choose project
