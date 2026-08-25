@@ -23,7 +23,7 @@ use pi::types::{
     StreamOptions,
 };
 
-use crate::actor::EventSink;
+use crate::session::EventSink;
 
 /// Default system prompt used when the request carries no system-role text.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are manox, a coding assistant running inside VS Code. Use the provided tools when they help answer the request.";
