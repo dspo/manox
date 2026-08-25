@@ -55,9 +55,13 @@ pub async fn load() -> HashMap<String, ThreadRegistryEntry> {
     }
 }
 
-/// Move a thread's active-session pointer. Read-modify-write under a
-/// process-wide lock, atomic on disk (temp file + rename); failures warn
-/// without propagating — the sidebar falls back to the newest session.
+/// Move a thread's active-session pointer. `session_id` is the session's
+/// file stem (`<id>.jsonl`): a fresh session is created with its owning
+/// thread's id (`with_session_id`), so for non-forked sessions the thread
+/// id IS a valid session id and the pointer always resolves within the
+/// thread's group. Read-modify-write under a process-wide lock, atomic on
+/// disk (temp file + rename); failures warn without propagating — the
+/// sidebar falls back to the newest session.
 pub async fn set_active(thread_id: &str, session_id: &str) {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let _guard = LOCK.get_or_init(tokio::sync::Mutex::default).lock().await;
@@ -80,12 +84,10 @@ async fn save(map: &HashMap<String, ThreadRegistryEntry>) -> Result<(), anyhow::
         tokio::fs::create_dir_all(parent).await?;
     }
     let bytes = serde_json::to_vec_pretty(map)?;
-    let tmp = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_default()
-    ));
+    // Suffix the full path (not `with_extension`, which would drop the
+    // `.json`; not `file_name` re-derivation, which degrades on an empty
+    // file name) — the tmp file lands beside the registry and renames over it.
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(())

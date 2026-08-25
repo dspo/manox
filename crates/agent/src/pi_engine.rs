@@ -3667,8 +3667,9 @@ async fn write_worktree_sidecar(
 /// Seed a worktree fork's sidecar: the worktree binding plus the source
 /// session's title and project, which the fork wears as the thread's
 /// identity while it is the active session (thread view title, sidebar
-/// grouping). A missing/unreadable source sidecar degrades to the binding
-/// alone.
+/// grouping). The fork's sidecar is fresh — it carries no identity of its
+/// own, so the source's is adopted unconditionally. A missing/unreadable
+/// source sidecar degrades to the binding alone.
 async fn fork_sidecar_inherit(
     sessions_dir: &Path,
     source_path: &Path,
@@ -3680,12 +3681,8 @@ async fn fork_sidecar_inherit(
         .ok();
     pi_extensions::session_meta::update(sessions_dir, fork_path, |meta| {
         if let Some(src) = &source {
-            if meta.title.is_none() {
-                meta.title = src.title.clone();
-            }
-            if meta.project.is_none() {
-                meta.project = src.project.clone();
-            }
+            meta.title = src.title.clone();
+            meta.project = src.project.clone();
         }
         meta.worktree = Some(worktree);
     })

@@ -185,8 +185,21 @@ impl AgentTool for EnterWorktreeTool {
         };
 
         // Git phase: create the worktree (when new) or resolve the branch
-        // (when re-entering an existing one).
+        // (when re-entering an existing one). A NEW worktree is created
+        // under the session's project root, so that root must itself be a
+        // git working tree — validated up front for the same clear-error
+        // reason the `path` branch validates its target.
         if !is_existing {
+            let inside = run_git(&project_root, &["rev-parse", "--is-inside-work-tree"]).await;
+            match inside {
+                Ok(out) if out.trim() == "true" => {}
+                _ => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "enter_worktree: {} is not a git working tree; cannot create a worktree under it",
+                        project_root.display()
+                    )));
+                }
+            }
             ensure_parent(&worktree_path)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("{e:#}")))?;
@@ -522,6 +535,30 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("does not exist or is not a directory"),
+            "{err}"
+        );
+    }
+
+    /// Creating a new worktree requires the session's project root to be a
+    /// git working tree — a non-git cwd gets the same clear error as a
+    /// non-git `path` target.
+    #[tokio::test]
+    async fn enter_name_rejects_non_git_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _rx) = enter_tool();
+        let ctx = local_ctx(dir.path().to_path_buf());
+        let err = tool
+            .execute(
+                "call",
+                serde_json::json!({ "name": "wt-x" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot create a worktree under it"),
             "{err}"
         );
     }

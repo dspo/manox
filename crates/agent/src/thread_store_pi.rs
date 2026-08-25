@@ -528,14 +528,14 @@ pub fn refresh_thread_list(cx: &mut App) {
     global().update(cx, |s, cx| s.refresh(cx));
 }
 
-/// One loaded session row: the sidebar summary plus the grouping inputs —
-/// the sidecar's worktree binding and the header's owning-thread stamp.
-type SessionRow = (
-    ThreadSummary,
-    PathBuf,
-    Option<pi_extensions::session_meta::WorktreeMeta>,
-    Option<String>,
-);
+/// One loaded session: the sidebar summary plus the grouping input — the
+/// header's owning-thread stamp.
+#[derive(Clone)]
+struct SessionRow {
+    summary: ThreadSummary,
+    path: PathBuf,
+    thread_key: Option<String>,
+}
 
 /// Read every session plus its sidecar into raw rows; grouping into
 /// thread-level rows happens in [`group_by_thread`] and team depths in
@@ -573,13 +573,11 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
             .and_then(|t| t.as_str())
             .filter(|t| !t.is_empty())
             .map(str::to_string);
-        let path = info.path.clone();
-        out.push((
-            session_info_to_summary(&info, &meta),
-            path,
-            meta.worktree.clone(),
+        out.push(SessionRow {
+            summary: session_info_to_summary(&info, &meta),
+            path: info.path.clone(),
             thread_key,
-        ));
+        });
     }
     out
 }
@@ -652,15 +650,16 @@ fn group_by_thread(
     let mut by_session: HashMap<String, usize> = HashMap::new();
     let mut session_to_thread: HashMap<String, String> = HashMap::new();
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, (sum, path, _, thread_key)) in rows.iter().enumerate() {
-        let session_id = path
+    for (i, row) in rows.iter().enumerate() {
+        let session_id = row
+            .path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
         by_session.insert(session_id, i);
-        if let Some(key) = thread_key {
-            session_to_thread.insert(sum.id.clone(), key.clone());
+        if let Some(key) = &row.thread_key {
+            session_to_thread.insert(row.summary.id.clone(), key.clone());
             groups.entry(key.clone()).or_default().push(i);
         }
     }
@@ -677,11 +676,13 @@ fn group_by_thread(
         let chosen = pointed.unwrap_or_else(|| {
             members
                 .iter()
-                .max_by_key(|i| rows[**i].0.interacted_at)
+                .max_by_key(|i| rows[**i].summary.interacted_at)
                 .copied()
                 .expect("a group is never empty")
         });
-        let (mut sum, path, _, _) = rows[chosen].clone();
+        let chosen_row = &rows[chosen];
+        let mut sum = chosen_row.summary.clone();
+        let path = chosen_row.path.clone();
         consumed.extend(members.iter().copied());
         // The row IS the thread: stable id across session swaps, team edge
         // remapped from the leader's SESSION id to the leader's THREAD key
@@ -692,6 +693,8 @@ fn group_by_thread(
         {
             sum.parent_id = Some(leader_thread.clone());
         }
+        // Grouping re-keys the row by thread id, so any prior depth is
+        // stale; `resolve_depths` re-derives it from the remapped edges.
         sum.depth = 0;
         session_paths.insert(thread_key, path.clone());
         if sum.archived {
@@ -700,15 +703,15 @@ fn group_by_thread(
             active.push(sum);
         }
     }
-    for (i, (sum, path, _, _)) in rows.into_iter().enumerate() {
+    for (i, row) in rows.into_iter().enumerate() {
         if consumed.contains(&i) {
             continue;
         }
-        session_paths.insert(sum.id.clone(), path);
-        if sum.archived {
-            archived.push(sum);
+        session_paths.insert(row.summary.id.clone(), row.path);
+        if row.summary.archived {
+            archived.push(row.summary);
         } else {
-            active.push(sum);
+            active.push(row.summary);
         }
     }
     (session_paths, active, archived)
@@ -1031,14 +1034,13 @@ mod tests {
         interacted_at: i64,
         archived: bool,
     ) -> SessionRow {
-        let mut sum = sample_summary(id, archived);
-        sum.interacted_at = interacted_at;
-        (
-            sum,
-            PathBuf::from(format!("{id}.jsonl")),
-            None,
-            thread_key.map(str::to_string),
-        )
+        let mut summary = sample_summary(id, archived);
+        summary.interacted_at = interacted_at;
+        SessionRow {
+            summary,
+            path: PathBuf::from(format!("{id}.jsonl")),
+            thread_key: thread_key.map(str::to_string),
+        }
     }
 
     fn pointer(active_session: &str) -> crate::thread_registry::ThreadRegistryEntry {
@@ -1081,10 +1083,9 @@ mod tests {
 
     #[test]
     fn group_remaps_team_edge_to_thread_id() {
-        let mut leader = sample_row("leader-sess", Some("TL"), 10, false);
-        leader.0.id = "leader-sess".to_string();
+        let leader = sample_row("leader-sess", Some("TL"), 10, false);
         let mut member = sample_row("member-sess", Some("TM"), 10, false);
-        member.0.parent_id = Some("leader-sess".to_string());
+        member.summary.parent_id = Some("leader-sess".to_string());
         let (paths, active, _) = group_by_thread(vec![leader, member], &HashMap::new());
         assert_eq!(active.len(), 2);
         let member_row = active.iter().find(|s| s.id == "TM").expect("member row");
