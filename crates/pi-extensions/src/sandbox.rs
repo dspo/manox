@@ -208,7 +208,10 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// definitions), part of the `workspace-write` writable scope so session
 /// state such as plan files needs no escalation. `None` when the home dir
 /// does not resolve — the host then places its state under the process cwd,
-/// which the workspace root already admits.
+/// which the workspace root already admits. The host resolves its home from
+/// `$HOME` (cwd fallback), this uses `dirs::home_dir()` (passwd fallback) —
+/// the only divergence is with `$HOME` unset, where this admits the
+/// passwd-home `.manox`, a lexical root matching nothing unless it exists.
 pub fn manox_home() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".manox"))
 }
