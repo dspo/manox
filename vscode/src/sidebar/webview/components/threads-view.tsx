@@ -65,7 +65,7 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
 
   const composer = (
     <Composer
-      approvalMode="autopilot"
+      approvalMode="workspace-write"
       commands={commands}
       currentModelId={draftModelId}
       models={models}

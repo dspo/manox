@@ -2,7 +2,7 @@
 // slash-command typeahead, and a bottom row carrying the approval-mode
 // dropdown on the left and the model picker plus send button on the right.
 
-import { ArrowUp, Bot, Check, ChevronDown, Pause, TriangleAlert, X } from 'lucide-react';
+import { ArrowUp, Check, ChevronDown, Lock, Pause, ShieldCheck, TriangleAlert, X } from 'lucide-react';
 import type { ClipboardEvent, KeyboardEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -70,12 +70,23 @@ async function fileToImage(file: File): Promise<PastedImage | null> {
 }
 
 const APPROVAL_META = {
-  autopilot: { icon: Bot, tint: 'text-info', labelKey: 'autopilot', descKey: 'autopilot_desc' },
-  danger: {
+  'read-only': {
+    icon: Lock,
+    tint: 'text-warning',
+    labelKey: 'read_only',
+    descKey: 'read_only_desc',
+  },
+  'workspace-write': {
+    icon: ShieldCheck,
+    tint: 'text-info',
+    labelKey: 'workspace_write',
+    descKey: 'workspace_write_desc',
+  },
+  'danger-full-access': {
     icon: TriangleAlert,
     tint: 'text-danger',
-    labelKey: 'danger',
-    descKey: 'danger_desc',
+    labelKey: 'danger_full_access',
+    descKey: 'danger_full_access_desc',
   },
 } as const;
 
@@ -108,7 +119,7 @@ const ApprovalChip = ({
       <DropdownMenuContent align="start" className="w-[360px]">
         <div className="px-2 py-1.5 text-sm font-medium">{t('approval_mode')}</div>
         <DropdownMenuSeparator />
-        {(['autopilot', 'danger'] as const).map((m) => {
+        {(['read-only', 'workspace-write', 'danger-full-access'] as const).map((m) => {
           const option = APPROVAL_META[m];
           const OptionIcon = option.icon;
           return (

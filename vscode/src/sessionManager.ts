@@ -31,10 +31,10 @@ export function resolveWorkspaceCwd(): string {
   return folder ?? process.env.HOME ?? process.cwd();
 }
 
-/** Configured tool-authorization policy; unset falls back to danger. */
+/** Configured tool-authorization policy; unset falls back to workspace-write. */
 export function configuredApprovalMode(): ApprovalMode {
   const value = vscode.workspace.getConfiguration('manox').get<string>('approvalMode');
-  return value === 'autopilot' ? 'autopilot' : 'danger';
+  return value === 'read-only' || value === 'danger-full-access' ? value : 'workspace-write';
 }
 
 export class SessionManager {

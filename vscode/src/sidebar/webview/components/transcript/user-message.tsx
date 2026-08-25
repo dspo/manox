@@ -96,7 +96,7 @@ export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageP
     <div
       className={cn(
         'group relative rounded-xl border-2 px-4 pt-2 pb-3',
-        approvalMode === 'danger' ? 'border-danger' : 'border-info',
+        approvalMode === 'danger-full-access' ? 'border-danger' : 'border-info',
       )}
     >
       <div className="bg-background pointer-events-none absolute bottom-[-2px] left-1/2 h-[2px] w-2/5 -translate-x-1/2" />

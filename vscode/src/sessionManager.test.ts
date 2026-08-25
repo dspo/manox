@@ -99,11 +99,11 @@ describe('createSession', () => {
 
     const sessionId = await pending;
     expect(sessionId).toBe(createCmd.sessionId);
-    // Unset config falls back to danger; the host enforces it right away.
+    // Unset config falls back to workspace-write; the host enforces it right away.
     expect(transport.lastCommand()).toEqual({
       cmd: 'set_approval_mode',
       sessionId,
-      mode: 'danger',
+      mode: 'workspace-write',
     });
   });
 
@@ -315,11 +315,11 @@ describe('setApprovalMode', () => {
     transport.emit({ type: 'session_created', sessionId });
     await pending;
 
-    manager.setApprovalMode('autopilot');
+    manager.setApprovalMode('danger-full-access');
     expect(transport.lastCommand()).toEqual({
       cmd: 'set_approval_mode',
       sessionId,
-      mode: 'autopilot',
+      mode: 'danger-full-access',
     });
   });
 });
