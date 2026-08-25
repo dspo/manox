@@ -3922,6 +3922,7 @@ fn attach_user_attributions(
                 let ui = message.ui.get_or_insert_with(Default::default);
                 ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
                 ui.peer = record.peer;
+                ui.display_text = record.display_text.clone();
             }
             ordinal += 1;
         }
@@ -4414,13 +4415,24 @@ mod tests {
                     pi_extensions::session_meta::UserAttributionMeta {
                         author: "lead".into(),
                         peer: false,
+                        display_text: None,
                     },
                 ),
                 (
-                    2usize,
+                    1usize,
                     pi_extensions::session_meta::UserAttributionMeta {
                         author: "Sailor".into(),
                         peer: true,
+                        display_text: Some("unwrapped body".into()),
+                    },
+                ),
+                // Beyond the transcript's ordinals: tolerated, attaches nowhere.
+                (
+                    5usize,
+                    pi_extensions::session_meta::UserAttributionMeta {
+                        author: "lead".into(),
+                        peer: false,
+                        display_text: None,
                     },
                 ),
             ]
@@ -4446,7 +4458,7 @@ mod tests {
                     content: "ok".into(),
                 },
             )]),
-            Message::user("peer body".to_string()), // ordinal 1...
+            Message::user("[from Sailor]: wrapped".to_string()), // ordinal 1
         ]
         .into_iter()
         .map(HistoryEntry::Message)
@@ -4461,10 +4473,20 @@ mod tests {
         assert_eq!(seed.author, Some(crate::message::MessageAuthor::Lead));
         assert!(!seed.peer);
         assert!(ui_at(1).is_none(), "assistant turns stay unattributed");
-        // Ordinal 2 skips the three-prompt history: only ordinals 0/1 exist.
+        let peer = ui_at(3).expect("peer delivery carries attribution");
+        assert_eq!(
+            peer.author,
+            Some(crate::message::MessageAuthor::Agent("Sailor".into()))
+        );
+        assert!(peer.peer);
+        assert_eq!(
+            peer.display_text.as_deref(),
+            Some("unwrapped body"),
+            "the send-time display form survives the sidecar round-trip"
+        );
         assert!(
-            ui_at(3).is_none(),
-            "an ordinal beyond the transcript attaches nowhere"
+            ui_at(2).is_none(),
+            "tool results never consume an ordinal nor carry attribution"
         );
     }
 
@@ -4481,6 +4503,7 @@ mod tests {
                 pi_extensions::session_meta::UserAttributionMeta {
                     author: "lead".into(),
                     peer: false,
+                    display_text: None,
                 },
             )]
             .into_iter()

@@ -22,6 +22,12 @@ use crate::background_task::{self, TaskKind, TaskStatus};
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
 
+/// Prefix of the peer delivery a failed subagent run emits to the parent.
+/// Shared with `subagent_restore`, which keys the restored row's status off
+/// it: a failed run delivers (unlike an abort), and its row must read as
+/// `Error`, not the `Success` a plain delivery implies.
+pub const SUBAGENT_FAILED_DELIVERY_PREFIX: &str = "subagent failed: ";
+
 // ── AgentBus ─────────────────────────────────────────────────────────────
 
 /// A live in-thread subagent coroutine (transient, not a manox Thread).
@@ -503,7 +509,7 @@ impl AgentBus {
                             from: AgentId::Subagent(label),
                             reason: SteerReason::Complete,
                             payload: SteerPayload {
-                                text: format!("subagent failed: {e}{kept_note}"),
+                                text: format!("{SUBAGENT_FAILED_DELIVERY_PREFIX}{e}{kept_note}"),
                             },
                         });
                     }
@@ -598,8 +604,9 @@ fn ack(addr: &str, spawned: bool, thread_id: Option<String>) -> AgentToolResult 
     )
 }
 
-/// The first non-empty line of a prompt, for the background-task card title.
-fn first_line(prompt: &str) -> Option<String> {
+/// The first non-empty line of a prompt, for the background-task card title
+/// and the restored sub-agent rail rows.
+pub fn first_line(prompt: &str) -> Option<String> {
     prompt
         .lines()
         .map(|l| l.trim())
