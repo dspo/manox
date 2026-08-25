@@ -203,7 +203,10 @@ impl SubagentTool {
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.to_path_buf())
             .with_session_dir(session_dir)
-            .with_system_prompt(def.system_prompt.clone())
+            .with_system_prompt_builder(crate::prompt::base_prompt_builder(
+                def.system_prompt.clone(),
+                child_cwd.to_path_buf(),
+            ))
             .with_tools(selected);
         if let Some(runtime) = &self.model_runtime {
             builder = builder.with_model_runtime(runtime.clone());
