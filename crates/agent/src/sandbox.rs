@@ -49,14 +49,15 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
 
 /// Confinement policy for one sandboxed invocation: the workspace root whose
-/// `writable_roots()` the `workspace-write` profile allows, plus the worktree
-/// anchor (when the policy is worktree-scoped) for callers that key off it.
-/// The effective mode is supplied per call by the `mode_resolver` on
-/// [`SandboxedBashOperations`], not held here.
+/// `writable_roots()` the `workspace-write` profile allows, plus extra
+/// granted roots (an approved `EnterWorktree` admits the worktree, its git
+/// common dir, and the pre-enter project root — additive on top of the
+/// workspace, never a replacement). The effective mode is supplied per call
+/// by the `mode_resolver` on [`SandboxedBashOperations`], not held here.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy {
     workspace_root: PathBuf,
-    worktree_anchor: Option<PathBuf>,
+    extra_roots: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -67,34 +68,30 @@ impl SandboxPolicy {
     pub fn for_project(project_root: &Path) -> Self {
         Self {
             workspace_root: canonicalize_best_effort(project_root),
-            worktree_anchor: None,
+            extra_roots: Vec::new(),
         }
     }
 
-    /// Policy for a worktree-isolated session: the workspace root is the
-    /// worktree itself, so `workspace-write` allows the worktree (plus the
-    /// shared writable roots — manox home and temp areas). A worktree is an
-    /// approved isolation context.
-    pub fn for_worktree(worktree_path: &Path) -> Self {
-        let worktree = canonicalize_best_effort(worktree_path);
-        Self {
-            workspace_root: worktree.clone(),
-            worktree_anchor: Some(worktree),
+    /// Add roots the `workspace-write` profile admits on top of the workspace
+    /// (canonicalized, deduplicated). Read-only rendering still admits
+    /// nothing; `danger-full-access` never renders.
+    pub fn with_extra_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        for root in roots {
+            let canon = canonicalize_best_effort(&root);
+            if !self.extra_roots.iter().any(|r| r == &canon) {
+                self.extra_roots.push(canon);
+            }
         }
-    }
-
-    /// The active worktree root when this policy is worktree-scoped.
-    pub fn worktree_anchor(&self) -> Option<&Path> {
-        self.worktree_anchor.as_deref()
+        self
     }
 
     /// Render a seatbelt (`.sbpl`) policy string for the effective `mode`.
     /// Denylist base (`(allow default)`) with an allowlist over writes;
     /// network is unrestricted (the mode vocabulary governs file effects only,
     /// not network or process visibility). `read-only` admits no writable
-    /// roots; `workspace-write` admits the shared `writable_roots()`.
-    /// `danger-full-access` is never rendered — backend selection skips the
-    /// seatbelt for it.
+    /// roots; `workspace-write` admits the shared `writable_roots()` plus the
+    /// extra granted roots. `danger-full-access` is never rendered — backend
+    /// selection skips the seatbelt for it.
     pub fn render_seatbelt(&self, mode: PermissionMode) -> String {
         let mut s = String::new();
         s.push_str("(version 1)\n");
@@ -113,6 +110,15 @@ impl SandboxPolicy {
                 "(allow file-write* (subpath \"{}\"))\n",
                 escape_seatbelt_path(&root)
             ));
+        }
+        // The extra granted roots ride the same mode gate as the workspace.
+        if mode == PermissionMode::WorkspaceWrite {
+            for root in self.extra_roots.iter().filter(|r| r.parent().is_some()) {
+                s.push_str(&format!(
+                    "(allow file-write* (subpath \"{}\"))\n",
+                    escape_seatbelt_path(root)
+                ));
+            }
         }
         s.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         s
@@ -507,18 +513,33 @@ mod tests {
     }
 
     #[test]
-    fn worktree_policy_scopes_to_worktree() {
+    fn extra_roots_render_under_workspace_write_only() {
         let wt = project_root().join("wt");
-        let policy = SandboxPolicy::for_worktree(&wt);
+        let git = project_root().join(".git");
+        let policy = SandboxPolicy::for_project(&project_root()).with_extra_roots(vec![
+            wt.clone(),
+            git.clone(),
+            wt.clone(),
+        ]);
         let sb = policy.render_seatbelt(PermissionMode::WorkspaceWrite);
-        assert!(sb.contains(&format!(
+        for root in [&wt, &git] {
+            assert!(
+                sb.contains(&format!(
+                    "(allow file-write* (subpath \"{}\"))",
+                    canonicalize_best_effort(root).display()
+                )),
+                "extra root admitted: {sb}"
+            );
+        }
+        // Deduplicated: the duplicated `wt` renders once.
+        let pattern = format!(
             "(allow file-write* (subpath \"{}\"))",
             canonicalize_best_effort(&wt).display()
-        )));
-        assert_eq!(
-            policy.worktree_anchor(),
-            Some(canonicalize_best_effort(&wt).as_path())
         );
+        assert_eq!(sb.matches(&pattern).count(), 1, "{sb}");
+        // Read-only admits none of the extra roots.
+        let sb_ro = policy.render_seatbelt(PermissionMode::ReadOnly);
+        assert!(!sb_ro.contains("(allow file-write* (subpath"));
     }
 
     #[cfg(target_os = "macos")]

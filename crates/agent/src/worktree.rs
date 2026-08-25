@@ -86,8 +86,9 @@ const ENTER_DESCRIPTION: &str = "Enter a git worktree on an isolated branch and 
      The context switch takes effect from the next turn (the current turn finishes in the original directory). \
      Use this when branching off for isolated work, or when explicitly told to work in a worktree. \
      Exit with `ExitWorktree` (keep or remove). Pass `name` to create a new worktree+branch under \
-     `<project>/.claude/worktrees/`, or `path` to re-enter any existing git worktree. The base ref is \
-     `origin/<default-branch>` (fallback `HEAD` when no remote tracking branch exists).";
+     `<project>/.claude/worktrees/`, or `path` to re-enter any existing git worktree, including one \
+     belonging to a different (sibling) repository. The base ref is `origin/<default-branch>` \
+     (fallback `HEAD` when no remote tracking branch exists).";
 
 const EXIT_DESCRIPTION: &str = "Leave the active git worktree. `action=keep` (default) returns the session to the prior \
      directory but leaves the worktree and branch on disk — you can re-enter it later with `EnterWorktree` \
@@ -145,6 +146,31 @@ impl AgentTool for EnterWorktreeTool {
             ));
         }
         let project_root = ctx.cwd().to_path_buf();
+        // An existing-path enter must land on a real git working tree: the
+        // explicit check keeps a non-git directory from failing deep in the
+        // branch resolution, and admits worktrees of OTHER repositories
+        // (multi-repo orchestration enters sibling checkouts).
+        if let Some(path_str) = &input.path {
+            let is_dir = tokio::fs::metadata(path_str)
+                .await
+                .ok()
+                .is_some_and(|m| m.is_dir());
+            if !is_dir {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "enter_worktree: path does not exist or is not a directory: {path_str}"
+                )));
+            }
+            let inside =
+                run_git(Path::new(path_str), &["rev-parse", "--is-inside-work-tree"]).await;
+            match inside {
+                Ok(out) if out.trim() == "true" => {}
+                _ => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "enter_worktree: {path_str} is not a git worktree (not inside a git working tree)"
+                    )));
+                }
+            }
+        }
         let (worktree_path, known_branch, is_existing) = match (&input.name, &input.path) {
             (Some(name), None) => {
                 validate_worktree_name(name)?;
@@ -159,8 +185,21 @@ impl AgentTool for EnterWorktreeTool {
         };
 
         // Git phase: create the worktree (when new) or resolve the branch
-        // (when re-entering an existing one).
+        // (when re-entering an existing one). A NEW worktree is created
+        // under the session's project root, so that root must itself be a
+        // git working tree — validated up front for the same clear-error
+        // reason the `path` branch validates its target.
         if !is_existing {
+            let inside = run_git(&project_root, &["rev-parse", "--is-inside-work-tree"]).await;
+            match inside {
+                Ok(out) if out.trim() == "true" => {}
+                _ => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "enter_worktree: {} is not a git working tree; cannot create a worktree under it",
+                        project_root.display()
+                    )));
+                }
+            }
             ensure_parent(&worktree_path)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("{e:#}")))?;
@@ -188,12 +227,27 @@ impl AgentTool for EnterWorktreeTool {
                 .trim()
                 .to_string(),
         };
+        // The owning repo's git common dir: linked-worktree commits write
+        // there and exit-time removal runs against it. Resolved from the
+        // worktree itself so a worktree of ANOTHER repository carries its
+        // own repo binding (relative output joins against the worktree).
+        let common = run_git(&worktree_path, &["rev-parse", "--git-common-dir"])
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("{e:#}")))?;
+        let common_path = PathBuf::from(common.trim());
+        let git_common_dir =
+            crate::sandbox::canonicalize_best_effort(&if common_path.is_relative() {
+                worktree_path.join(&common_path)
+            } else {
+                common_path
+            });
 
         self.cmd_tx
             .send(SessionCmd::EnterWorktree {
                 worktree_path: worktree_path.clone(),
                 branch: branch.clone(),
                 original_cwd: project_root.clone(),
+                git_common_dir,
             })
             .map_err(|_| ToolError::ExecutionFailed("engine actor gone".into()))?;
 
@@ -256,8 +310,16 @@ impl AgentTool for ExitWorktreeTool {
             return Err(ToolError::ExecutionFailed("Not in a worktree.".into()));
         };
         let worktree_path = PathBuf::from(&meta.worktree_path);
-        // The repo root for `git worktree remove` is the original cwd's repo.
-        let project_root = PathBuf::from(&meta.original_cwd);
+        // The owning repo root derives from the worktree's git common dir —
+        // the worktree may belong to another repository than the session cwd.
+        let repo_root = Path::new(&meta.git_common_dir)
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(
+                    "exit_worktree: cannot derive the owning repo root from git_common_dir".into(),
+                )
+            })?;
 
         if action == "remove" {
             let status = run_git(&worktree_path, &["status", "--porcelain"])
@@ -278,10 +340,10 @@ impl AgentTool for ExitWorktreeTool {
             };
             // On git failure the worktree stays active — the error surfaces
             // so the model can recover (commit, then retry) without exiting.
-            run_git(&project_root, &remove_args)
+            run_git(&repo_root, &remove_args)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("{e:#}")))?;
-            let _ = run_git(&project_root, &["branch", "-D", &meta.branch]).await;
+            let _ = run_git(&repo_root, &["branch", "-D", &meta.branch]).await;
         }
 
         self.cmd_tx
@@ -428,5 +490,147 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("git rev-parse"), "{err}");
+    }
+
+    fn enter_tool() -> (EnterWorktreeTool, mpsc::UnboundedReceiver<SessionCmd>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (EnterWorktreeTool::new(tx, new_state()), rx)
+    }
+
+    fn local_ctx(cwd: PathBuf) -> pi::tool::LocalToolContext {
+        pi::tool::LocalToolContext::new(
+            std::sync::Arc::new(pi::env::TokioExecutionEnv::new(std::env::temp_dir())),
+            cwd,
+            std::sync::Arc::new(pi::tool::ToolState::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn enter_rejects_non_git_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _rx) = enter_tool();
+        let ctx = local_ctx(dir.path().to_path_buf());
+        // Existing non-git directory → explicit worktree validation error.
+        let err = tool
+            .execute(
+                "call",
+                serde_json::json!({ "path": dir.path().display().to_string() }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a git worktree"), "{err}");
+        // Missing path → existence error before git is ever consulted.
+        let missing = dir.path().join("no-such-dir");
+        let err = tool
+            .execute(
+                "call",
+                serde_json::json!({ "path": missing.display().to_string() }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not exist or is not a directory"),
+            "{err}"
+        );
+    }
+
+    /// Creating a new worktree requires the session's project root to be a
+    /// git working tree — a non-git cwd gets the same clear error as a
+    /// non-git `path` target.
+    #[tokio::test]
+    async fn enter_name_rejects_non_git_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _rx) = enter_tool();
+        let ctx = local_ctx(dir.path().to_path_buf());
+        let err = tool
+            .execute(
+                "call",
+                serde_json::json!({ "name": "wt-x" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot create a worktree under it"),
+            "{err}"
+        );
+    }
+
+    /// A linked worktree of ANY repository enters and carries its owning
+    /// repo's git common dir (the multi-repo group scenario).
+    #[tokio::test]
+    async fn enter_resolves_git_common_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        let wt = dir.path().join("wt");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat",
+            &wt.display().to_string(),
+        ]);
+
+        let (tool, mut rx) = enter_tool();
+        let ctx = local_ctx(repo.clone());
+        tool.execute(
+            "call",
+            serde_json::json!({ "path": wt.display().to_string() }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .expect("linked worktree enters");
+        let SessionCmd::EnterWorktree {
+            worktree_path,
+            branch,
+            git_common_dir,
+            ..
+        } = rx.try_recv().expect("enter cmd queued")
+        else {
+            panic!("expected EnterWorktree");
+        };
+        // The command carries the path as spelled; only the common dir is
+        // canonicalized by the tool.
+        assert_eq!(worktree_path, wt);
+        assert_eq!(branch, "feat");
+        assert_eq!(
+            git_common_dir,
+            crate::sandbox::canonicalize_best_effort(&repo.join(".git"))
+        );
     }
 }

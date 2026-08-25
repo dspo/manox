@@ -246,6 +246,32 @@ pub fn writable_roots(mode: PermissionMode, workspace_root: &Path) -> Vec<PathBu
     roots
 }
 
+/// Writable roots an approved `EnterWorktree` grants ON TOP of the session
+/// workspace: the worktree itself, the owning repo's git common dir
+/// (linked-worktree commits write there), and the pre-enter project root
+/// (orchestration keeps writing the main checkout). Canonical and
+/// deduplicated like [`writable_roots`]; empty entries are skipped so a
+/// partially-populated binding degrades instead of admitting the fs root.
+/// Shared by the bash seatbelt and the fs fence — one derivation, no
+/// asymmetry between the two enforcing families.
+pub fn worktree_granted_roots(meta: &crate::session_meta::WorktreeMeta) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for candidate in [
+        &meta.worktree_path,
+        &meta.git_common_dir,
+        &meta.original_cwd,
+    ] {
+        if candidate.is_empty() {
+            continue;
+        }
+        let canon = canonicalize_best_effort(Path::new(candidate));
+        if !roots.iter().any(|r| r == &canon) {
+            roots.push(canon);
+        }
+    }
+    roots
+}
+
 /// The conventional scratch locations distinct from `$TMPDIR` (the per-user
 /// temp dir is already in [`writable_roots`]; these are the shared `/tmp`
 /// spools plan mode admits alongside the plans dir).
@@ -401,6 +427,38 @@ mod tests {
         assert!(roots.contains(&canonicalize_best_effort(&home)));
         // read-only admits nothing, manox home included.
         assert!(writable_roots(PermissionMode::ReadOnly, Path::new("/tmp/ws")).is_empty());
+    }
+
+    #[test]
+    fn worktree_granted_roots_dedup_canonicalize_skip_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let meta = crate::session_meta::WorktreeMeta {
+            worktree_path: wt.display().to_string(),
+            branch: "b".into(),
+            original_session_path: "x".into(),
+            original_cwd: dir.path().display().to_string(),
+            git_common_dir: dir.path().join(".git").display().to_string(),
+        };
+        let roots = worktree_granted_roots(&meta);
+        assert_eq!(roots.len(), 3, "{roots:?}");
+        assert!(roots.contains(&canonicalize_best_effort(&wt)));
+        assert!(roots.contains(&canonicalize_best_effort(dir.path())));
+        assert!(roots.contains(&canonicalize_best_effort(&dir.path().join(".git"))));
+        // An empty entry degrades away instead of admitting the fs root.
+        let meta_empty = crate::session_meta::WorktreeMeta {
+            git_common_dir: String::new(),
+            ..meta.clone()
+        };
+        let roots = worktree_granted_roots(&meta_empty);
+        assert_eq!(roots.len(), 2, "{roots:?}");
+        // Duplicate spellings of one path dedup to one root.
+        let meta_dup = crate::session_meta::WorktreeMeta {
+            original_cwd: wt.display().to_string(),
+            ..meta
+        };
+        assert_eq!(worktree_granted_roots(&meta_dup).len(), 2);
     }
 
     #[test]

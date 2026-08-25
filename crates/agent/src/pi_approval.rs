@@ -19,7 +19,7 @@
 
 use pi::types::Model as PiModel;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pi::tool::{
@@ -221,6 +221,11 @@ pub struct ApprovalGatedTool {
     /// its own escalation inside the tool.
     escalation_approver: Option<Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>>,
     mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
+    /// Live extra writable roots granted by an approved `EnterWorktree`
+    /// (the worktree, its git common dir, the pre-enter project root) —
+    /// resolved per call so a swap between calls is picked up. Absent when
+    /// the session never entered a worktree.
+    worktree_roots: Option<Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>>,
 }
 
 pub type AutoAllowResolver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
@@ -234,6 +239,7 @@ impl ApprovalGatedTool {
             auto_allow: None,
             escalation_approver: None,
             mode_resolver: None,
+            worktree_roots: None,
         }
     }
 
@@ -261,6 +267,17 @@ impl ApprovalGatedTool {
     ) -> Self {
         self.escalation_approver = Some(approver);
         self.mode_resolver = Some(mode_resolver);
+        self
+    }
+
+    /// Attach the live worktree-granted-roots resolver (Write/Edit): the
+    /// verdict admits targets under the roots an approved `EnterWorktree`
+    /// granted, mirroring the seatbelt's additive roots.
+    pub fn with_worktree_roots(
+        mut self,
+        resolver: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>,
+    ) -> Self {
+        self.worktree_roots = Some(resolver);
         self
     }
 
@@ -414,9 +431,13 @@ impl ApprovalGatedTool {
         let cwd = ctx.cwd();
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
         // Containment against the shared writable-root set (workspace + manox
-        // home + /tmp + tmpdir) — no `.git` or plans-dir special-casing: the
+        // home + /tmp + tmpdir) plus the worktree-granted roots an approved
+        // `EnterWorktree` added — no `.git` or plans-dir special-casing: the
         // plans dir is admitted transitively under the manox home.
-        let roots = pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, cwd);
+        let mut roots = pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, cwd);
+        if let Some(resolver) = &self.worktree_roots {
+            roots.extend(resolver());
+        }
         let contained = |target: &Path| {
             let canon = pi_extensions::sandbox::canonicalize_best_effort(target);
             roots.iter().any(|r| canon.starts_with(r))
@@ -988,6 +1009,69 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// An approved `EnterWorktree` widens the fs fence with the granted
+    /// roots: while the session cwd is the worktree, a Write to the
+    /// pre-enter project root passes the verdict (orchestration keeps
+    /// writing the main checkout). The target sits outside every default
+    /// writable root so only the resolver can admit it.
+    #[tokio::test]
+    async fn workspace_write_allows_entered_worktree_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let granted = PathBuf::from("/usr/local/manox-wt-fence-proj");
+        let target = granted.join("probe.txt");
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::WorkspaceWrite);
+
+        // With the worktree resolver: the granted root admits the target.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let tool = ApprovalGatedTool::new(
+            Arc::new(MockTool {
+                name: "Write",
+                approval: false,
+                read_only: false,
+                ran: Arc::clone(&ran),
+            }),
+            Arc::clone(&gate),
+        )
+        .with_worktree_roots({
+            let granted = granted.clone();
+            Arc::new(move || vec![granted.clone()])
+        });
+        let ctx = LocalToolContext::new(
+            Arc::new(TokioExecutionEnv::new(std::env::temp_dir())),
+            wt.clone(),
+            Arc::new(ToolState::new()),
+        );
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"path": target, "content": "x"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        // Control: the same call without the resolver is denied (the
+        // worktree cwd's default roots never cover the granted path).
+        let (tool2, ran2) = gated_named("Write", false, false, Arc::clone(&gate));
+        let err = tool2
+            .execute(
+                "c2",
+                serde_json::json!({"path": target, "content": "x"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert_eq!(ran2.load(Ordering::SeqCst), 0);
     }
 
     /// The manox state home is part of the workspace-write writable scope:
