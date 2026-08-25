@@ -106,6 +106,7 @@ pub(crate) enum SessionCmd {
         worktree_path: PathBuf,
         branch: String,
         original_cwd: PathBuf,
+        git_common_dir: PathBuf,
     },
     /// Return to the pre-worktree session (`ExitWorktree` tool's git
     /// cleanup already ran).
@@ -921,13 +922,25 @@ fn build_tools(
         });
     // Write/Edit carry the host escalation config (shared approver + standing
     // resolver); the per-call grant is a local return value in the gate (no
-    // shared cell — Write/Edit run `Parallel`).
+    // shared cell — Write/Edit run `Parallel`). Every gated wrapper also
+    // sees the live worktree-granted roots so an approved `EnterWorktree`
+    // widens the fs fence exactly like the seatbelt.
+    let wt_for_roots = Arc::clone(worktree);
+    let worktree_roots: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync> = Arc::new(move || {
+        wt_for_roots
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(pi_extensions::sandbox::worktree_granted_roots)
+            .unwrap_or_default()
+    });
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
             let name = tool.name().to_string();
             let mut wrapper = ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy));
+                .with_plan_policy(Arc::clone(&plan_policy))
+                .with_worktree_roots(Arc::clone(&worktree_roots));
             if let Some(allow) = &confined_bash_auto_allow
                 && matches!(name.as_str(), "Bash" | "Monitor")
             {
@@ -1268,11 +1281,13 @@ fn build_tools(
     )
 }
 
-/// The sandbox policy for a session cwd: worktree-scoped when the session
-/// runs inside the active worktree (workspace root = the worktree), else
-/// project-scoped. The cwd comparison canonicalizes both sides so the
-/// policy follows the session's actual directory — a stale pre-swap state
-/// or an Exit back to the original repo both classify correctly.
+/// The sandbox policy for a session cwd: when the session runs inside the
+/// active worktree, the worktree's granted roots (the worktree, its git
+/// common dir, and the pre-enter project root) are admitted ON TOP of the
+/// workspace — additive, so orchestration keeps writing the original repo.
+/// The cwd comparison canonicalizes both sides so the policy follows the
+/// session's actual directory — a stale pre-swap state or an Exit back to
+/// the original repo both classify correctly.
 fn worktree_policy(
     cwd: &Path,
     worktree: &crate::worktree::WorktreeState,
@@ -1283,7 +1298,8 @@ fn worktree_policy(
     let wt = crate::sandbox::canonicalize_best_effort(Path::new(&meta.worktree_path));
     let current = crate::sandbox::canonicalize_best_effort(cwd);
     if current == wt {
-        crate::sandbox::SandboxPolicy::for_worktree(&wt)
+        crate::sandbox::SandboxPolicy::for_project(cwd)
+            .with_extra_roots(pi_extensions::sandbox::worktree_granted_roots(&meta))
     } else {
         crate::sandbox::SandboxPolicy::for_project(cwd)
     }
@@ -1883,11 +1899,16 @@ fn subscribe_harness_events(
     }))
 }
 
-/// Session header metadata: the creating host's identity, plus (for a team
-/// worker) the leader's session id. The team link persists with the jsonl
-/// file, so the affiliation survives restarts and outlives the team.
-fn session_metadata(parent_session: Option<&str>) -> serde_json::Value {
-    let mut metadata = serde_json::json!({ "host": crate::host::current().slug() });
+/// Session header metadata: the creating host's identity, the owning thread
+/// id (forks inherit it — `fork_from` copies the header metadata verbatim —
+/// so a thread's sessions stay grouped across worktree swaps), plus (for a
+/// team worker) the leader's session id. The links persist with the jsonl
+/// file, so they survive restarts and outlive the in-memory team.
+fn session_metadata(thread_id: &str, parent_session: Option<&str>) -> serde_json::Value {
+    let mut metadata = serde_json::json!({
+        "host": crate::host::current().slug(),
+        "thread": thread_id,
+    });
     if let Some(parent) = parent_session {
         metadata["team"] = serde_json::json!({ "parent": parent });
     }
@@ -1908,6 +1929,7 @@ fn session_builder(
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
     cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
     worktree: &crate::worktree::WorktreeState,
+    thread_id: &str,
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
@@ -1949,10 +1971,12 @@ fn session_builder(
         .with_tools(tools)
         .with_initial_active_tools(default_active);
     // Every session a host creates is tagged with its identity so each
-    // host's session list stays disjoint. A team worker additionally carries
-    // its leader's session id: the link persists with the jsonl file, so the
-    // affiliation survives restarts and outlives the in-memory team.
-    builder = builder.with_metadata(session_metadata(parent_session));
+    // host's session list stays disjoint, and with its owning thread id so
+    // the sidebar groups one thread's sessions (base + worktree forks) into
+    // a single row. A team worker additionally carries its leader's session
+    // id: the link persists with the jsonl file, so the affiliation survives
+    // restarts and outlives the in-memory team.
+    builder = builder.with_metadata(session_metadata(thread_id, parent_session));
 
     if let Some(model) = model {
         builder = builder.with_model(model.clone());
@@ -2138,6 +2162,7 @@ async fn run_actor(
             state.goal_bridge.as_ref(),
             &cmd_tx,
             &state.worktree,
+            &thread_id,
             None,
             &bus,
         );
@@ -2154,6 +2179,8 @@ async fn run_actor(
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
+                // The restored file is the thread's active session.
+                crate::thread_registry::set_active(&thread_id, &info.id).await;
                 session = Some(s);
             }
             Err(err) => {
@@ -2179,6 +2206,7 @@ async fn run_actor(
                 state.goal_bridge.as_ref(),
                 &cmd_tx,
                 &state.worktree,
+                &thread_id,
                 parent_session.as_deref(),
                 &bus,
             );
@@ -2196,6 +2224,8 @@ async fn run_actor(
                     );
                     attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_plugin_hooks(&mut s, &cwd);
+                    // A fresh session is pinned to the facade thread's id.
+                    crate::thread_registry::set_active(&thread_id, &thread_id).await;
                     s
                 }
                 Err(err) => {
@@ -2828,6 +2858,12 @@ async fn run_actor(
                 );
                 resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
                 resync_worktree_state(&sessions_dir, &path, &state.worktree, &notice_tx).await;
+                // The opened file becomes the thread's active session.
+                let opened_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                crate::thread_registry::set_active(&thread_id, opened_id).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 // Opened sessions are resumed conversations: SessionStart
@@ -2841,6 +2877,7 @@ async fn run_actor(
                 worktree_path,
                 branch,
                 original_cwd,
+                git_common_dir,
             } => {
                 let Some(current_path) = state.active_path.lock().unwrap().clone() else {
                     let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
@@ -2862,22 +2899,32 @@ async fn run_actor(
                         continue;
                     }
                 };
+                // The fork becomes the thread's active session; the thread
+                // id stamp rides the forked header metadata, so the sidebar
+                // keeps both sessions under one row.
+                let fork_id = fork_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                crate::thread_registry::set_active(&thread_id, fork_id).await;
                 // The worktree sidecar + shared state must be in place
                 // BEFORE the session rebuild: `build_tools` derives the
                 // sandbox policy from the active-worktree state
-                // (worktree-scoped confinement with the bound repo's `.git`
-                // re-opened). The WorktreeChanged notice fires early here;
-                // the final refresh_session_list repaints everything.
+                // (worktree-scoped confinement plus the owning repo's git
+                // common dir admitted). The WorktreeChanged notice fires
+                // early here; the final refresh_session_list repaints
+                // everything.
                 let meta = pi_extensions::session_meta::WorktreeMeta {
                     worktree_path: worktree_path.display().to_string(),
                     branch,
                     original_session_path: current_path.display().to_string(),
                     original_cwd: original_cwd.display().to_string(),
+                    git_common_dir: git_common_dir.display().to_string(),
                 };
                 if let Err(err) =
-                    write_worktree_sidecar(&sessions_dir, &fork_path, Some(meta)).await
+                    fork_sidecar_inherit(&sessions_dir, &current_path, &fork_path, meta).await
                 {
-                    tracing::warn!(error = %err, "failed to persist worktree sidecar");
+                    tracing::warn!(error = %err, "failed to persist the worktree fork sidecar");
                 }
                 resync_worktree_state(&sessions_dir, &fork_path, &state.worktree, &notice_tx).await;
                 rebuild_session(
@@ -2979,6 +3026,13 @@ async fn run_actor(
                     tracing::warn!(error = %err, "failed to clear worktree sidecar");
                 }
                 resync_worktree_state(&sessions_dir, &original, &state.worktree, &notice_tx).await;
+                // The pointer returns to the pre-worktree session.
+                let original_id = original
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                crate::thread_registry::set_active(&thread_id, &original_id).await;
                 *state.active_path.lock().unwrap() = Some(original);
                 resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 sync_history(&session, &sessions_dir, &state).await;
@@ -2997,6 +3051,7 @@ async fn run_actor(
                     state.goal_bridge.as_ref(),
                     &cmd_tx,
                     &state.worktree,
+                    &thread_id,
                     parent_session.as_deref(),
                     &bus,
                 );
@@ -3030,6 +3085,8 @@ async fn run_actor(
                             },
                         )));
                         session = s;
+                        // The fresh session is pinned to the facade thread's id.
+                        crate::thread_registry::set_active(&thread_id, &thread_id).await;
                         let new_path = session.path().to_path_buf();
                         title_scheduler.retarget(
                             new_path.clone(),
@@ -3149,6 +3206,7 @@ async fn rebuild_session(
         goal_bridge,
         cmd_tx,
         worktree,
+        thread_id,
         None,
         bus,
     );
@@ -3602,6 +3660,34 @@ async fn write_worktree_sidecar(
 ) -> Result<(), anyhow::Error> {
     pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
         meta.worktree = worktree;
+    })
+    .await
+}
+
+/// Seed a worktree fork's sidecar: the worktree binding plus the source
+/// session's title and project, which the fork wears as the thread's
+/// identity while it is the active session (thread view title, sidebar
+/// grouping). A missing/unreadable source sidecar degrades to the binding
+/// alone.
+async fn fork_sidecar_inherit(
+    sessions_dir: &Path,
+    source_path: &Path,
+    fork_path: &Path,
+    worktree: pi_extensions::session_meta::WorktreeMeta,
+) -> Result<(), anyhow::Error> {
+    let source = pi_extensions::session_meta::load(sessions_dir, source_path)
+        .await
+        .ok();
+    pi_extensions::session_meta::update(sessions_dir, fork_path, |meta| {
+        if let Some(src) = &source {
+            if meta.title.is_none() {
+                meta.title = src.title.clone();
+            }
+            if meta.project.is_none() {
+                meta.project = src.project.clone();
+            }
+        }
+        meta.worktree = Some(worktree);
     })
     .await
 }
@@ -4262,13 +4348,15 @@ mod tests {
     }
 
     #[test]
-    fn session_metadata_tags_host_and_optional_team_parent() {
-        let tagged = session_metadata(Some("leader-1"));
+    fn session_metadata_tags_host_thread_and_optional_team_parent() {
+        let tagged = session_metadata("thread-1", Some("leader-1"));
         assert_eq!(tagged["host"], crate::host::current().slug());
+        assert_eq!(tagged["thread"], "thread-1");
         assert_eq!(tagged["team"]["parent"], "leader-1");
 
-        let plain = session_metadata(None);
+        let plain = session_metadata("thread-1", None);
         assert_eq!(plain["host"], crate::host::current().slug());
+        assert_eq!(plain["thread"], "thread-1");
         assert!(plain.get("team").is_none(), "no team key without a parent");
     }
 
@@ -5340,32 +5428,51 @@ mod tests {
         let base = crate::sandbox::canonicalize_best_effort(&std::env::temp_dir())
             .join("manox-wt-policy-proj");
         let wt = base.join("wt");
+        let git = base.join(".git");
         let state = crate::worktree::new_state();
-        // No active worktree → project policy (anchor None).
+        // No active worktree → plain project policy, no granted extras: the
+        // worktree/common-dir roots are absent from the seatbelt profile.
         let p = worktree_policy(&wt, &state);
-        assert!(p.worktree_anchor().is_none());
-        // Active worktree matching the session cwd → worktree-scoped: the
-        // workspace root is the worktree, so workspace-write admits it.
+        let sb_none = p.render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
+        assert!(
+            !sb_none.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                crate::sandbox::canonicalize_best_effort(&git).display()
+            )),
+            "no worktree roots without a binding: {sb_none}"
+        );
+        // Active worktree matching the session cwd → additive roots: the
+        // workspace-write profile admits the worktree, its git common dir,
+        // and the pre-enter project root.
         *state.lock().unwrap() = Some(pi_extensions::session_meta::WorktreeMeta {
             worktree_path: wt.display().to_string(),
             branch: "b".into(),
             original_session_path: "x".into(),
             original_cwd: base.display().to_string(),
+            git_common_dir: git.display().to_string(),
         });
-        let p = worktree_policy(&wt, &state);
-        assert_eq!(p.worktree_anchor(), Some(wt.as_path()));
-        let sb = p.render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
+        let sb = worktree_policy(&wt, &state)
+            .render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
+        for root in [&wt, &base, &git] {
+            assert!(
+                sb.contains(&format!(
+                    "(allow file-write* (subpath \"{}\"))",
+                    crate::sandbox::canonicalize_best_effort(root).display()
+                )),
+                "worktree root admitted: {sb}"
+            );
+        }
+        // Session cwd back at the original repo (Exit) → no worktree extras
+        // again, not the stale granted roots.
+        let sb_back = worktree_policy(&base, &state)
+            .render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
         assert!(
-            sb.contains(&format!(
+            !sb_back.contains(&format!(
                 "(allow file-write* (subpath \"{}\"))",
-                wt.display()
+                crate::sandbox::canonicalize_best_effort(&git).display()
             )),
-            "worktree root admitted: {sb}"
+            "no stale worktree roots after exit: {sb_back}"
         );
-        // Session cwd back at the original repo (Exit) → project policy
-        // again, not the stale worktree scope.
-        let p2 = worktree_policy(&base, &state);
-        assert!(p2.worktree_anchor().is_none());
     }
 
     #[tokio::test]
@@ -5784,5 +5891,54 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.is_some(), "uninjected spawn keeps the tempdir guard");
+    }
+
+    fn worktree_fixture() -> pi_extensions::session_meta::WorktreeMeta {
+        pi_extensions::session_meta::WorktreeMeta {
+            worktree_path: "/tmp/wt".into(),
+            branch: "b".into(),
+            original_session_path: "/sessions/source.jsonl".into(),
+            original_cwd: "/proj/a".into(),
+            git_common_dir: "/proj/a/.git".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_sidecar_inherit_seeds_source_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jsonl");
+        let fork = dir.path().join("fork.jsonl");
+        pi_extensions::session_meta::update(dir.path(), &source, |m| {
+            m.title = Some("the title".into());
+            m.project = Some("/proj/a".into());
+        })
+        .await
+        .unwrap();
+        fork_sidecar_inherit(dir.path(), &source, &fork, worktree_fixture())
+            .await
+            .unwrap();
+        let meta = pi_extensions::session_meta::load(dir.path(), &fork)
+            .await
+            .unwrap();
+        assert_eq!(meta.title.as_deref(), Some("the title"));
+        assert_eq!(meta.project.as_deref(), Some("/proj/a"));
+        assert_eq!(meta.worktree, Some(worktree_fixture()));
+    }
+
+    #[tokio::test]
+    async fn fork_sidecar_inherit_degrades_without_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing.jsonl");
+        let fork = dir.path().join("fork.jsonl");
+        // No source sidecar on disk: the binding lands alone, no error.
+        fork_sidecar_inherit(dir.path(), &source, &fork, worktree_fixture())
+            .await
+            .unwrap();
+        let meta = pi_extensions::session_meta::load(dir.path(), &fork)
+            .await
+            .unwrap();
+        assert!(meta.title.is_none());
+        assert!(meta.project.is_none());
+        assert_eq!(meta.worktree, Some(worktree_fixture()));
     }
 }

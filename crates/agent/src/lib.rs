@@ -55,6 +55,7 @@ pub mod worktree;
 
 pub mod thread;
 pub mod thread_engine;
+pub mod thread_registry;
 pub mod thread_store;
 
 pub mod monitor_bridge;

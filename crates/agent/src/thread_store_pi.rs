@@ -295,12 +295,17 @@ impl ThreadStore {
             // The session directory scan uses tokio::fs, which needs a tokio
             // runtime context; the gpui executor is not one, so hop onto the
             // agent runtime and await the result back here.
-            let list = crate::runtime::handle()
-                .spawn(async move { load_summaries(&dir).await })
+            let (list, registry) = crate::runtime::handle()
+                .spawn(async move {
+                    let rows = load_summaries(&dir).await;
+                    let registry = crate::thread_registry::load().await;
+                    (rows, registry)
+                })
                 .await
                 .unwrap_or_default();
             this.update(cx, |s, cx| {
-                let (session_paths, summaries, archived) = project_session_lists(list);
+                let (session_paths, mut summaries, archived) = group_by_thread(list, &registry);
+                resolve_depths(&mut summaries);
                 s.session_paths = session_paths;
                 s.summaries = summaries;
                 s.archived_summaries = archived;
@@ -523,8 +528,19 @@ pub fn refresh_thread_list(cx: &mut App) {
     global().update(cx, |s, cx| s.refresh(cx));
 }
 
-/// Read every session plus its sidecar into the sidebar summary shape.
-async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> {
+/// One loaded session row: the sidebar summary plus the grouping inputs —
+/// the sidecar's worktree binding and the header's owning-thread stamp.
+type SessionRow = (
+    ThreadSummary,
+    PathBuf,
+    Option<pi_extensions::session_meta::WorktreeMeta>,
+    Option<String>,
+);
+
+/// Read every session plus its sidecar into raw rows; grouping into
+/// thread-level rows happens in [`group_by_thread`] and team depths in
+/// [`resolve_depths`] afterwards.
+async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
     let repo = pi::session::repository::SessionRepository::new(dir);
     let Ok(list) = repo.list().await else {
         return Vec::new();
@@ -548,10 +564,23 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<(ThreadSummary, PathBuf)> 
                 pi_extensions::session_meta::SessionMeta::default()
             }
         };
+        // The owning thread's id rides the header metadata (stamped at
+        // creation, inherited by forks); absent on legacy files.
+        let thread_key = info
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("thread"))
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
         let path = info.path.clone();
-        out.push((session_info_to_summary(&info, &meta), path));
+        out.push((
+            session_info_to_summary(&info, &meta),
+            path,
+            meta.worktree.clone(),
+            thread_key,
+        ));
     }
-    resolve_depths(&mut out);
     out
 }
 
@@ -566,12 +595,12 @@ const MAX_TEAM_DEPTH: usize = 8;
 /// loaded list. A parent missing from the list (deleted leader, foreign
 /// host) leaves the row top-level; a cycle or an over-long chain likewise
 /// degrades to 0 instead of looping or nesting wildly.
-fn resolve_depths(list: &mut [(ThreadSummary, PathBuf)]) {
+fn resolve_depths(list: &mut [ThreadSummary]) {
     let parents: HashMap<String, Option<String>> = list
         .iter()
-        .map(|(s, _)| (s.id.clone(), s.parent_id.clone()))
+        .map(|s| (s.id.clone(), s.parent_id.clone()))
         .collect();
-    for (sum, _) in list.iter_mut() {
+    for sum in list.iter_mut() {
         let mut depth = 0usize;
         let mut cur = sum.parent_id.as_deref();
         while let Some(parent) = cur {
@@ -601,32 +630,88 @@ fn resolve_depths(list: &mut [(ThreadSummary, PathBuf)]) {
     }
 }
 
-/// Split a loaded session list into the id→path map (every session — an
-/// archived session must stay addressable so archive/unarchive and the
-/// unread/error flags can still reach its sidecar), the active list the
-/// sidebar renders, and the archived list kept separately so surfaces that
-/// offer an archive view can still reach it.
-fn project_session_lists(
-    list: Vec<(ThreadSummary, PathBuf)>,
+/// Collapse each thread's sessions into the single row the user sees: a
+/// thread IS the sidebar unit, its sessions (base + worktree forks) internal
+/// storage. The surfaced session is the registry's active pointer when it
+/// hits, else the newest; the row carries the THREAD's id (stable across
+/// swaps and restarts) and the active session's fields. Sessions without a
+/// thread stamp (legacy files) pass through as singleton rows keyed by
+/// their own id. Returns the id→active-session-path map (every surfaced row
+/// stays addressable for `load_thread` and sidecar flag writes), the active
+/// rows, and the archived rows.
+fn group_by_thread(
+    rows: Vec<SessionRow>,
+    registry: &HashMap<String, crate::thread_registry::ThreadRegistryEntry>,
 ) -> (
     HashMap<String, PathBuf>,
     Vec<ThreadSummary>,
     Vec<ThreadSummary>,
 ) {
-    let paths = list
-        .iter()
-        .map(|(sum, path)| (sum.id.clone(), path.clone()))
-        .collect();
+    // Session id (the `<id>.jsonl` stem) → row index, and the session→thread
+    // map used to remap team edges from session ids to thread keys.
+    let mut by_session: HashMap<String, usize> = HashMap::new();
+    let mut session_to_thread: HashMap<String, String> = HashMap::new();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (sum, path, _, thread_key)) in rows.iter().enumerate() {
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        by_session.insert(session_id, i);
+        if let Some(key) = thread_key {
+            session_to_thread.insert(sum.id.clone(), key.clone());
+            groups.entry(key.clone()).or_default().push(i);
+        }
+    }
+    let mut session_paths: HashMap<String, PathBuf> = HashMap::new();
     let mut active = Vec::new();
     let mut archived = Vec::new();
-    for (sum, _) in list {
+    let mut consumed: HashSet<usize> = HashSet::new();
+    for (thread_key, members) in groups {
+        let pointed = registry
+            .get(&thread_key)
+            .and_then(|entry| by_session.get(&entry.active_session))
+            .copied()
+            .filter(|i| members.contains(i));
+        let chosen = pointed.unwrap_or_else(|| {
+            members
+                .iter()
+                .max_by_key(|i| rows[**i].0.interacted_at)
+                .copied()
+                .expect("a group is never empty")
+        });
+        let (mut sum, path, _, _) = rows[chosen].clone();
+        consumed.extend(members.iter().copied());
+        // The row IS the thread: stable id across session swaps, team edge
+        // remapped from the leader's SESSION id to the leader's THREAD key
+        // (unresolvable legacy edges keep their raw value).
+        sum.id = thread_key.clone();
+        if let Some(parent_session) = sum.parent_id.clone()
+            && let Some(leader_thread) = session_to_thread.get(&parent_session)
+        {
+            sum.parent_id = Some(leader_thread.clone());
+        }
+        sum.depth = 0;
+        session_paths.insert(thread_key, path.clone());
         if sum.archived {
             archived.push(sum);
         } else {
             active.push(sum);
         }
     }
-    (paths, active, archived)
+    for (i, (sum, path, _, _)) in rows.into_iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        session_paths.insert(sum.id.clone(), path);
+        if sum.archived {
+            archived.push(sum);
+        } else {
+            active.push(sum);
+        }
+    }
+    (session_paths, active, archived)
 }
 
 
@@ -659,13 +744,20 @@ fn session_info_to_summary(
         model_id: String::new(),
         provider_id: None,
         approval_mode: PermissionMode::default().as_i64(),
-        project: info.cwd.clone(),
+        // The bound project (sidecar) wins over the header cwd: a worktree
+        // fork's header cwd is the worktree dir, but the thread stays under
+        // its source project; a `/` header cwd (GUI-launched bound session)
+        // classifies the same way.
+        project: meta
+            .project
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| info.cwd.clone()),
         depth: 0,
-        // Team affiliation wins over a fork lineage when both are present:
-        // the fork link is history, the team link is the live hierarchy.
-        // A fork lineage alone also nests under its fork source when both
-        // rows share a list (the tree renderer treats any parent_id as a
-        // hierarchy edge).
+        // Team affiliation is the only rendered hierarchy edge: worktree
+        // forks are a thread's internal sessions (`group_by_thread`
+        // collapses them), so their `parentSession` lineage stays raw
+        // metadata and never nests.
         parent_id: team_parent_id(info).or_else(|| info.parent_session_path.clone()),
         archived: meta.archived,
         pinned: meta.pinned,
@@ -933,29 +1025,177 @@ mod tests {
         }
     }
 
+    fn sample_row(
+        id: &str,
+        thread_key: Option<&str>,
+        interacted_at: i64,
+        archived: bool,
+    ) -> SessionRow {
+        let mut sum = sample_summary(id, archived);
+        sum.interacted_at = interacted_at;
+        (
+            sum,
+            PathBuf::from(format!("{id}.jsonl")),
+            None,
+            thread_key.map(str::to_string),
+        )
+    }
+
+    fn pointer(active_session: &str) -> crate::thread_registry::ThreadRegistryEntry {
+        crate::thread_registry::ThreadRegistryEntry {
+            active_session: active_session.to_string(),
+        }
+    }
+
     #[test]
-    fn project_session_lists_partitions_archived_keeps_paths() {
-        let (paths, active, archived) = project_session_lists(vec![
-            (
-                sample_summary("active", false),
-                PathBuf::from("active.jsonl"),
-            ),
-            (
-                sample_summary("archived", true),
-                PathBuf::from("archived.jsonl"),
-            ),
-        ]);
-        let ids: Vec<&str> = active.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["active"]);
-        let archived_ids: Vec<&str> = archived.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(archived_ids, vec!["archived"]);
-        // Both partitions stay addressable (unarchive / unread / pin still
-        // reach their sidecars); only the active one feeds the sidebar list.
-        assert_eq!(paths.len(), 2);
-        assert!(paths.contains_key("archived"));
+    fn group_collapses_to_registry_active() {
+        let rows = vec![
+            sample_row("base", Some("t"), 10, false),
+            sample_row("fork", Some("t"), 20, false),
+        ];
+        let registry = HashMap::from([("t".to_string(), pointer("base"))]);
+        let (paths, active, archived) = group_by_thread(rows, &registry);
+        assert!(archived.is_empty());
+        assert_eq!(active.len(), 1, "one thread = one row");
+        assert_eq!(active[0].id, "t", "row keyed by thread id");
+        assert_eq!(active[0].interacted_at, 10, "fields from the ACTIVE session");
+        assert_eq!(paths.get("t").cloned(), Some(PathBuf::from("base.jsonl")));
+    }
+
+    #[test]
+    fn group_falls_back_to_newest_without_pointer() {
+        let rows = vec![
+            sample_row("base", Some("t"), 10, false),
+            sample_row("fork", Some("t"), 20, false),
+        ];
+        // No registry entry → the newest session surfaces.
+        let (paths, active, _) = group_by_thread(rows.clone(), &HashMap::new());
+        assert_eq!(active.len(), 1);
+        assert_eq!(paths.get("t").cloned(), Some(PathBuf::from("fork.jsonl")));
+        // A stale pointer to a foreign session id degrades the same way.
+        let stale = HashMap::from([("t".to_string(), pointer("gone"))]);
+        let (_, active, _) = group_by_thread(rows, &stale);
+        assert_eq!(active.len(), 1);
+    }
+
+
+    #[test]
+    fn group_remaps_team_edge_to_thread_id() {
+        let mut leader = sample_row("leader-sess", Some("TL"), 10, false);
+        leader.0.id = "leader-sess".to_string();
+        let mut member = sample_row("member-sess", Some("TM"), 10, false);
+        member.0.parent_id = Some("leader-sess".to_string());
+        let (paths, active, _) = group_by_thread(vec![leader, member], &HashMap::new());
+        assert_eq!(active.len(), 2);
+        let member_row = active.iter().find(|s| s.id == "TM").expect("member row");
         assert_eq!(
-            paths.get("active").unwrap().file_name().unwrap(),
-            "active.jsonl"
+            member_row.parent_id.as_deref(),
+            Some("TL"),
+            "team edge remapped session id → thread key"
+        );
+        assert!(paths.contains_key("TL") && paths.contains_key("TM"));
+    }
+
+    #[test]
+    fn group_passes_through_unstamped_rows() {
+        let rows = vec![
+            sample_row("legacy", None, 10, false),
+            sample_row("threaded", Some("t"), 20, false),
+        ];
+        let (paths, active, _) = group_by_thread(rows, &HashMap::new());
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|s| s.id == "legacy"));
+        assert!(active.iter().any(|s| s.id == "t"));
+        assert_eq!(
+            paths.get("legacy").cloned(),
+            Some(PathBuf::from("legacy.jsonl"))
+        );
+    }
+
+    #[test]
+    fn group_partitions_by_active_session_archived_flag() {
+        let rows = vec![
+            sample_row("base", Some("t"), 10, false),
+            sample_row("fork", Some("t"), 20, true),
+        ];
+        // Pointer on the archived fork → the thread row retires with it.
+        let registry = HashMap::from([("t".to_string(), pointer("fork"))]);
+        let (_, active, archived) = group_by_thread(rows, &registry);
+        assert!(active.is_empty());
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "t");
+    }
+
+    /// A thread's real session files (base + worktree fork, both stamped
+    /// with the same header `thread` key as `fork_from` leaves them)
+    /// collapse to ONE sidebar row keyed by the thread id, following the
+    /// registry's active pointer in both directions.
+    #[tokio::test]
+    async fn grouping_end_to_end_over_real_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path();
+        let (base_id, fork_id, thread_key) = ("base-session", "fork-session", "thread-1");
+        let header = |id: &str, cwd: &str| {
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{cwd}\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{thread_key}\"}}}}\n"
+            )
+        };
+        tokio::fs::write(sessions.join(format!("{base_id}.jsonl")), header(base_id, "/proj/a"))
+            .await
+            .unwrap();
+        tokio::fs::write(sessions.join(format!("{fork_id}.jsonl")), header(fork_id, "/tmp/wt"))
+            .await
+            .unwrap();
+        // Sidecars: the fork wears the source's title/project (seeded by
+        // `fork_sidecar_inherit` at enter time) plus its worktree binding.
+        let base_path = sessions.join(format!("{base_id}.jsonl"));
+        let fork_path = sessions.join(format!("{fork_id}.jsonl"));
+        pi_extensions::session_meta::update(sessions, &base_path, |m| {
+            m.title = Some("the title".into());
+            m.project = Some("/proj/a".into());
+        })
+        .await
+        .unwrap();
+        pi_extensions::session_meta::update(sessions, &fork_path, |m| {
+            m.title = Some("the title".into());
+            m.project = Some("/proj/a".into());
+            m.worktree = Some(pi_extensions::session_meta::WorktreeMeta {
+                worktree_path: "/tmp/wt".into(),
+                branch: "b".into(),
+                original_session_path: base_path.display().to_string(),
+                original_cwd: "/proj/a".into(),
+                git_common_dir: "/proj/a/.git".into(),
+            });
+        })
+        .await
+        .unwrap();
+
+        let rows = load_summaries(sessions).await;
+        assert_eq!(rows.len(), 2);
+
+        // Pointer on the fork (inside the worktree): one row, thread-keyed,
+        // project stays the source's.
+        let registry = HashMap::from([(thread_key.to_string(), pointer(fork_id))]);
+        let (paths, active, archived) = group_by_thread(rows.clone(), &registry);
+        assert!(archived.is_empty());
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, thread_key);
+        assert_eq!(active[0].title.as_deref(), Some("the title"));
+        assert_eq!(active[0].project, "/proj/a");
+        assert_eq!(
+            paths.get(thread_key).cloned(),
+            Some(fork_path.clone())
+        );
+
+        // Pointer back on the base (after ExitWorktree): same single row,
+        // now addressable at the base session.
+        let registry = HashMap::from([(thread_key.to_string(), pointer(base_id))]);
+        let (paths, active, _) = group_by_thread(rows, &registry);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, thread_key);
+        assert_eq!(
+            paths.get(thread_key).cloned(),
+            Some(base_path)
         );
     }
 
@@ -1001,20 +1241,35 @@ mod tests {
     }
 
     #[test]
+    fn summary_project_prefers_sidecar_over_cwd() {
+        let info = sample_info("s", None);
+        let meta = pi_extensions::session_meta::SessionMeta {
+            project: Some("/proj/a".into()),
+            ..Default::default()
+        };
+        let summary = session_info_to_summary(&info, &meta);
+        assert_eq!(summary.project, "/proj/a");
+        // Without a bound project the header cwd classifies the row.
+        let default = pi_extensions::session_meta::SessionMeta::default();
+        let summary = session_info_to_summary(&info, &default);
+        assert_eq!(summary.project, "/p");
+    }
+
+    #[test]
     fn resolve_depths_nests_chains_and_degrades_orphans() {
         let mut list = vec![
-            (sample_summary("a", false), PathBuf::from("a")),
-            (sample_summary("b", false), PathBuf::from("b")),
-            (sample_summary("c", false), PathBuf::from("c")),
-            (sample_summary("orphan", false), PathBuf::from("orphan")),
+            sample_summary("a", false),
+            sample_summary("b", false),
+            sample_summary("c", false),
+            sample_summary("orphan", false),
         ];
-        list[1].0.parent_id = Some("a".into());
-        list[2].0.parent_id = Some("b".into());
-        list[3].0.parent_id = Some("gone".into());
+        list[1].parent_id = Some("a".into());
+        list[2].parent_id = Some("b".into());
+        list[3].parent_id = Some("gone".into());
         resolve_depths(&mut list);
         let depths: Vec<(String, i32)> = list
             .iter()
-            .map(|(s, _)| (s.id.clone(), s.depth))
+            .map(|s| (s.id.clone(), s.depth))
             .collect();
         assert_eq!(
             depths,
@@ -1030,21 +1285,18 @@ mod tests {
     #[test]
     fn resolve_depths_breaks_cycles_and_overlong_chains() {
         // a <-> b cycle: neither can resolve a stable depth.
-        let mut cycle = vec![
-            (sample_summary("a", false), PathBuf::from("a")),
-            (sample_summary("b", false), PathBuf::from("b")),
-        ];
-        cycle[0].0.parent_id = Some("b".into());
-        cycle[1].0.parent_id = Some("a".into());
+        let mut cycle = vec![sample_summary("a", false), sample_summary("b", false)];
+        cycle[0].parent_id = Some("b".into());
+        cycle[1].parent_id = Some("a".into());
         resolve_depths(&mut cycle);
-        assert_eq!(cycle[0].0.depth, 0);
-        assert_eq!(cycle[1].0.depth, 0);
+        assert_eq!(cycle[0].depth, 0);
+        assert_eq!(cycle[1].depth, 0);
 
         // A chain longer than the cap is malformed: rows whose own depth
         // would exceed the cap degrade to top-level, while rows at or under
         // the cap keep their valid nesting.
-        let mut chain: Vec<(ThreadSummary, PathBuf)> = (0..=MAX_TEAM_DEPTH + 1)
-            .map(|i| (sample_summary(&format!("n{i}"), false), PathBuf::new()))
+        let mut chain: Vec<ThreadSummary> = (0..=MAX_TEAM_DEPTH + 1)
+            .map(|i| sample_summary(&format!("n{i}"), false))
             .collect();
         for (i, item) in chain
             .iter_mut()
@@ -1052,20 +1304,20 @@ mod tests {
             .skip(1)
             .take(MAX_TEAM_DEPTH + 1)
         {
-            item.0.parent_id = Some(format!("n{}", i - 1));
+            item.parent_id = Some(format!("n{}", i - 1));
         }
         resolve_depths(&mut chain);
         assert_eq!(
-            chain[MAX_TEAM_DEPTH + 1].0.depth,
+            chain[MAX_TEAM_DEPTH + 1].depth,
             0,
             "over-cap row degrades"
         );
         assert_eq!(
-            chain[MAX_TEAM_DEPTH].0.depth,
+            chain[MAX_TEAM_DEPTH].depth,
             MAX_TEAM_DEPTH as i32,
             "at-cap row keeps depth"
         );
-        assert_eq!(chain[0].0.depth, 0);
+        assert_eq!(chain[0].depth, 0);
     }
 
     /// The `/exit` flow archives a session and, in the same instant, a
