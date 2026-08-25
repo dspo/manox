@@ -365,7 +365,7 @@ workspace-cancel = 取消
 workspace-mode-readonly-title = 只读
 workspace-mode-readonly-desc = bash 可运行但不可写文件；文件变更被拒绝
 workspace-mode-workspacewrite-title = 工作区写入
-workspace-mode-workspacewrite-desc = 工作区与临时目录下的写入放行；bash 受工作区写入 seatbelt 约束
+workspace-mode-workspacewrite-desc = 工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；bash 受工作区写入 seatbelt 约束
 workspace-mode-dangerfullaccess-title = 危险完全访问
 workspace-mode-dangerfullaccess-desc = 无沙箱：bash 不受限运行，文件变更不受约束
 workspace-chip-mode-readonly = 只读
@@ -375,7 +375,7 @@ workspace-mode-title = 允许 manox 做什么？
 workspace-mode-learn-more = 了解更多
 workspace-mode-notice = { $mode ->
     [readonly] 只读模式：bash 可运行但写入被 seatbelt 拒绝；文件变更被拒绝。
-    [workspacewrite] 工作区写入：工作区与临时目录下的写入放行；工作区之外的目标被拒绝。被拒绝时可用 sandbox_permissions + justification 申请升级。
+    [workspacewrite] 工作区写入：工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；工作区之外的目标被拒绝。被拒绝时可用 sandbox_permissions + justification 申请升级。
    *[dangerfullaccess] 危险完全访问：无沙箱；bash 不受限运行，文件变更不受约束。
 }
 workspace-project-choose = 选择项目

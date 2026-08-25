@@ -742,7 +742,7 @@ mod tests {
         ));
         // Multi-section patches require every target to be writable.
         let mixed = format!(
-            "{}\n[/home/u/proj/src/bad.rs#3C4D]\nDEL 1",
+            "{}\n[/home/u/proj/src/bad.rs#3C4D5E]\nDEL 1",
             edit_patch("/home/u/.manox/plans/ok-plan.md")
         );
         assert!(!is_plan_mode_writable_param(
@@ -754,7 +754,7 @@ mod tests {
         // Unparseable and empty patches fail closed.
         assert!(!is_plan_mode_writable_param(
             "Edit",
-            &params("[src/lib.rs#1A2B\nDEL 1"),
+            &params("[src/lib.rs#1A2B3C\nDEL 1"),
             plans,
             cwd
         ));

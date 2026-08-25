@@ -17,15 +17,17 @@ use serde::{Deserialize, Serialize};
 
 /// File-effect policy for confined bash and the fs write fence: the mode a
 /// call runs under. `read-only` permits only required sinks (`/dev/null`);
-/// `workspace-write` also permits the workspace root and platform temp areas;
-/// `danger-full-access` bypasses confinement. Persisted in the session sidecar
-/// (wire field `approval_mode`, kebab values).
+/// `workspace-write` also permits the workspace root, the manox state home
+/// (`~/.manox`), and platform temp areas; `danger-full-access` bypasses
+/// confinement. Persisted in the session sidecar (wire field `approval_mode`,
+/// kebab values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     /// Confined bash runs but may not write files; fs mutations are refused.
     ReadOnly,
-    /// Writes under the workspace root and platform temp areas are allowed.
+    /// Writes under the workspace root, the manox state home (`~/.manox`),
+    /// and platform temp areas are allowed.
     #[default]
     WorkspaceWrite,
     /// No confinement; bash runs unsandboxed, fs mutations are unfenced.
@@ -202,23 +204,38 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
+/// `$HOME/.manox` — the manox state home (plans, settings, sessions, agent
+/// definitions), part of the `workspace-write` writable scope so session
+/// state such as plan files needs no escalation. `None` when the home dir
+/// does not resolve — the host then places its state under the process cwd,
+/// which the workspace root already admits. The host resolves its home from
+/// `$HOME` (cwd fallback), this uses `dirs::home_dir()` (passwd fallback) —
+/// the only divergence is with `$HOME` unset, where this admits the
+/// passwd-home `.manox`, a lexical root matching nothing unless it exists.
+pub fn manox_home() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".manox"))
+}
+
 /// The roots one confined execution may WRITE under — the mode's meaning as a
 /// canonical, deduplicated allow-list. `read-only` returns an empty list
 /// (no caller guard needed — mirrors deepseek's `writableRoots(policy)` which
 /// checks the mode itself); `workspace-write` allows the policy's workspace
-/// root, the host `/tmp`, and the per-user platform temp dir
-/// (`std::env::temp_dir()` — the real temp area; omitting it would deny what
-/// the mode promises). Shared by the bash seatbelt and the fs fence so the
-/// "the write tool cannot write `/tmp` but bash can" asymmetry cannot arise.
+/// root, the manox state home ([`manox_home`] — plan files and other session
+/// state write without escalation), the host `/tmp`, and the per-user
+/// platform temp dir (`std::env::temp_dir()` — the real temp area; omitting
+/// it would deny what the mode promises). Shared by the bash seatbelt and
+/// the fs fence so the "the write tool cannot write `/tmp` but bash can"
+/// asymmetry cannot arise.
 pub fn writable_roots(mode: PermissionMode, workspace_root: &Path) -> Vec<PathBuf> {
     if mode != PermissionMode::WorkspaceWrite {
         return Vec::new();
     }
-    let candidates = [
+    let mut candidates = vec![
         workspace_root.to_path_buf(),
         PathBuf::from("/tmp"),
         std::env::temp_dir(),
     ];
+    candidates.extend(manox_home());
     let mut roots: Vec<PathBuf> = Vec::new();
     for candidate in candidates {
         let canon = canonicalize_best_effort(&candidate);
@@ -373,6 +390,17 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), before);
+    }
+
+    #[test]
+    fn writable_roots_include_manox_home() {
+        let Some(home) = manox_home() else {
+            return; // no home dir to admit
+        };
+        let roots = writable_roots(PermissionMode::WorkspaceWrite, Path::new("/tmp/ws"));
+        assert!(roots.contains(&canonicalize_best_effort(&home)));
+        // read-only admits nothing, manox home included.
+        assert!(writable_roots(PermissionMode::ReadOnly, Path::new("/tmp/ws")).is_empty());
     }
 
     #[test]

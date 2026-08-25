@@ -413,8 +413,9 @@ impl ApprovalGatedTool {
     ) -> Result<(), ToolError> {
         let cwd = ctx.cwd();
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
-        // Containment against the shared writable-root set (workspace + /tmp
-        // + tmpdir); deepseek parity — no `.git` or plans-dir special-casing.
+        // Containment against the shared writable-root set (workspace + manox
+        // home + /tmp + tmpdir) — no `.git` or plans-dir special-casing: the
+        // plans dir is admitted transitively under the manox home.
         let roots = pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, cwd);
         let contained = |target: &Path| {
             let canon = pi_extensions::sandbox::canonicalize_best_effort(target);
@@ -980,6 +981,52 @@ mod tests {
             .execute(
                 "c1",
                 serde_json::json!({"path": target, "content": "x"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// The manox state home is part of the workspace-write writable scope:
+    /// plan files (and other session state) write without escalation. The
+    /// target resolves through the HOST home resolver while the writable
+    /// roots resolve through the extension layer's — this test pins that the
+    /// two agree.
+    #[tokio::test]
+    async fn workspace_write_allows_manox_home_write() {
+        let Ok(home) = crate::paths::manox_home() else {
+            return; // no home dir to admit
+        };
+        let target = home.join("plans/gate-probe-plan.md");
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::WorkspaceWrite);
+        let ctx = tool_ctx();
+
+        let (tool, ran) = gated_named("Write", false, false, Arc::clone(&gate));
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({"path": target, "content": "x"}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+        let (tool, ran) = gated_named("Edit", false, false, Arc::clone(&gate));
+        let patch = format!(
+            "*** Begin Patch\n[{}#1A2B3C]\nDEL 1\n*** End Patch",
+            target.display()
+        );
+        let result = tool
+            .execute(
+                "c2",
+                serde_json::json!({"patch": patch}),
                 CancellationToken::new(),
                 &ctx,
             )

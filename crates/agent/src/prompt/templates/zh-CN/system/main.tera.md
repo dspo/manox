@@ -23,4 +23,4 @@
 - python3：{{ runtime.python3 }}
 - node：{{ runtime.node }}
 - 今天：{{ runtime.today }}
-- Permission mode: {{ runtime.permission_mode }}. Modes: read-only（bash 可运行但写入被 seatbelt 拒绝；文件变更被拒绝）、workspace-write（工作区与临时目录下的写入放行；bash 受工作区写入 profile 约束）、danger-full-access（无沙箱；bash 不受限，文件变更不受约束）。被拒绝的 bash 或文件写入以 `[sandbox: file access denied under <mode> mode]` 标记上报；当更宽模式能让其成功时，用 `sandbox_permissions`（最窄的够用的更宽模式）+ 一句 `justification` 原样重试一次——审批提示会询问用户。切勿投机性升级。
+- Permission mode: {{ runtime.permission_mode }}. Modes: read-only（bash 可运行但写入被 seatbelt 拒绝；文件变更被拒绝）、workspace-write（工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；bash 受工作区写入 profile 约束）、danger-full-access（无沙箱；bash 不受限，文件变更不受约束）。被拒绝的 bash 或文件写入以 `[sandbox: file access denied under <mode> mode]` 标记上报；当更宽模式能让其成功时，用 `sandbox_permissions`（最窄的够用的更宽模式）+ 一句 `justification` 原样重试一次——审批提示会询问用户。切勿投机性升级。
