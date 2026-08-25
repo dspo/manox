@@ -5047,12 +5047,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         for row in agent::subagent_restore::rebuild_from_messages(messages) {
-            let first_line = row
-                .prompt
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(str::to_string);
+            let first_line = agent::steer_bus::first_line(&row.prompt);
             self.subagent_prompts
                 .insert(row.address.clone(), row.prompt.clone());
             if let Some(text) = &row.final_text {
@@ -5070,6 +5065,7 @@ impl Workspace {
             });
         }
     }
+
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
     fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {

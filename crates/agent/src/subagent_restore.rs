@@ -26,9 +26,10 @@ pub struct RestoredSubagent {
     pub subagent_type: String,
     /// The Captain's dispatch prompt.
     pub prompt: String,
-    /// `Success` when a completion was delivered; `Cancelled` when the run
-    /// ended without one (quit-time kill and explicit abort are
-    /// indistinguishable after the fact). Never `Running` on return.
+    /// `Error` for a failure delivery; `Success` for a completion delivery;
+    /// `Cancelled` when the run ended without any delivery (quit-time kill
+    /// and explicit abort are indistinguishable after the fact). Never
+    /// `Running` on return.
     pub status: ToolCallStatus,
     /// The delivered final answer, when one reached the parent.
     pub final_text: Option<String>,
@@ -64,9 +65,9 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 }
             }
         }
-        // A peer delivery authored by a dispatched address is that
-        // subagent's completion. Deliveries from senders with no dispatch
-        // row (team members) are ignored.
+        // A peer delivery authored by a dispatched address settles that
+        // subagent's row. Deliveries from senders with no dispatch row
+        // (team members) are ignored.
         if let Some(ui) = &m.ui
             && ui.peer
             && let Some(MessageAuthor::Agent(from)) = &ui.author
@@ -76,7 +77,14 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| unwrap_peer_text(from, &text_of(m)));
-            row.status = ToolCallStatus::Success;
+            // A failed run also delivers (unlike an abort): the bus prefixes
+            // the failure text, and the live rail showed an Error row for it.
+            row.status =
+                if final_text.starts_with(crate::steer_bus::SUBAGENT_FAILED_DELIVERY_PREFIX) {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                };
             row.final_text = Some(final_text);
         }
     }
@@ -210,6 +218,23 @@ mod tests {
         assert_eq!(row.prompt, "fix the bug");
         assert_eq!(row.status, ToolCallStatus::Success);
         assert_eq!(row.final_text.as_deref(), Some("all done"));
+    }
+
+    #[test]
+    fn failed_run_delivery_restores_error_not_success() {
+        let failure = format!(
+            "{}model exploded",
+            crate::steer_bus::SUBAGENT_FAILED_DELIVERY_PREFIX
+        );
+        let messages = vec![
+            steer_use("tu_1", "worker", "Sailor", "Dispatch", "do it"),
+            tool_result("tu_1", false, "dispatched"),
+            delivery("worker", &failure, Some(&failure)),
+        ];
+        let rows = rebuild_from_messages(&messages);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ToolCallStatus::Error);
+        assert_eq!(rows[0].final_text.as_deref(), Some(failure.as_str()));
     }
 
     #[test]
