@@ -10,6 +10,7 @@ pub mod bash;
 pub mod model_ref;
 pub mod monitor;
 pub mod path_selector;
+pub mod prompt;
 pub mod provider;
 pub mod read;
 pub mod sandbox;

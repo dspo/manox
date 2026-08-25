@@ -100,7 +100,7 @@ pub fn build_harness_prompt(
 }
 
 /// Escape XML-special characters in prompt-embedded strings.
-fn xml_escape(value: &str) -> String {
+pub fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

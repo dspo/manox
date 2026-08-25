@@ -26,6 +26,7 @@ libc.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 tempfile = "3"
+tera.workspace = true
 
 
 [lints.clippy]

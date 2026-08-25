@@ -7039,6 +7039,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "tera",
  "thiserror 1.0.69",
  "tokio",
  "tokio-native-tls",

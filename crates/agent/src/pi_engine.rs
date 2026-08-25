@@ -533,67 +533,6 @@ fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
     }
 }
 
-/// Minimal builtin coding-agent prompt. Deliberately not the manox
-/// `system_prompt` assembly — that belongs to the manox harness.
-fn system_prompt(cwd: &Path) -> String {
-    let date = chrono::Local::now().format("%Y-%m-%d");
-    let mut prompt = format!(
-        "You are the Captain, the main agent running inside the manox app on the pi harness.\n\
-         Working directory: {cwd}\n\
-         Date: {date}\n\n\
-         Use your tools to inspect, edit, and create files and to run shell commands.\n\
-         Make changes directly, keep replies concise, and verify your work when practical.\n\
-         When several tool calls or subagent spawns are independent, emit them together in one turn so they run in parallel.",
-        cwd = cwd.display(),
-    );
-    // Skill summaries let the model know which skills are installed (users
-    // invoke them via `/name` slash commands). Parity with the retired manox
-    // system prompt, which rendered `skill::summaries_or_empty()` into its
-    // template; the pi path has no skill tool, so the wording only promises
-    // what exists.
-    prompt.push_str("\n\n## Subagents & parallel work\n");
-    prompt.push_str(
-        "You can dispatch subagents via the `Steer` tool — each runs in its \
-         own fresh context (no parent history). Set `to.spawn` to a capability \
-         def name (e.g. 'Sailor','Explore') to create an in-thread subagent \
-         coroutine, or 'TeamMember' to create a real manox Thread (a process: \
-         persisted, sidebar-visible, resumable, with its own Captain session). \
-         Only the Captain may spawn. `reason` is Dispatch (start a task), \
-         Inject (mid-run message), or Abort (cancel). Complete is harness-\
-         emitted on subagent termination — not callable; when a subagent \
-         finishes, its final summary arrives as a peer message and triggers \
-         your next turn. Continue with other work while subagents run; do \
-         not poll.\n\n\
-         Built-in subagent types: `Explore` (read-only: locates code by \
-         file, symbol, or keyword) and `Sailor` (write+bash: reads, writes, \
-         edits files, runs shell commands including cargo/clippy/test). \
-         TeamMembers are real threads — they persist, appear in the sidebar, \
-         and can be resumed; members do not report back autonomously — observe \
-         their progress by opening their tab and Inject guidance as needed \
-         (they cannot reply through the bus yet). A subagent (coroutine) is \
-         transient; it ends with a concise summary as its final assistant \
-         text (the harness emits Complete with that summary).\n\n\
-         Prefer parallel subagents over serial self-work. For splittable \
-         tasks — reviewing multiple PRs, modifying independent files, \
-         exploring alternatives — emit multiple `Steer` calls in one turn \
-         so they run concurrently. Pass `isolation: \"worktree\"` when a \
-         subagent needs its own working tree (builds won't collide, edits \
-         won't clash).\n\n\
-         Each subagent starts from a blank context, so pin any contract it \
-         must honor (exact paths, signatures, gate requirements) directly in \
-         the prompt.",
-    );
-    let summaries = crate::skill::summaries_or_empty();
-    if !summaries.is_empty() {
-        prompt.push_str("\n\n## Available skills\n");
-        prompt.push_str("Installed skills, invocable by the user as `/name` slash commands:\n");
-        for s in &summaries {
-            prompt.push_str(&format!("- {}: {}\n", s.name, s.description));
-        }
-    }
-    prompt
-}
-
 /// Host wrapper around `pi_extensions::bash::BashTool` for the subagent
 /// snapshot. A Sailor is already an async primitive, so a background bash
 /// inside a subagent session is pointless AND dangerous — the subagent's
@@ -1993,7 +1932,19 @@ fn session_builder(
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_system_prompt(system_prompt(cwd))
+        .with_system_prompt_builder(pi_extensions::prompt::captain_prompt_builder(
+            pi_extensions::prompt::CaptainConfig {
+                cwd: cwd.to_path_buf(),
+                today: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                skills: crate::skill::summaries_or_empty()
+                    .into_iter()
+                    .map(|s| pi_extensions::prompt::SkillSummary {
+                        name: s.name,
+                        description: s.description,
+                    })
+                    .collect(),
+            },
+        ))
         .with_resources(instruction_resources(cwd))
         .with_tools(tools)
         .with_initial_active_tools(default_active);
@@ -5625,18 +5576,6 @@ mod tests {
             subagent_capability(explore),
             "read-only",
             "Explore stays synchronous"
-        );
-    }
-
-    #[test]
-    fn system_prompt_mentions_captain_and_sailors() {
-        let prompt = system_prompt(std::path::Path::new("/tmp"));
-        assert!(prompt.contains("Captain"), "names the Captain: {prompt}");
-        assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
-        assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
-        assert!(
-            prompt.contains("multiple `Steer` calls in one turn"),
-            "prefers Sailors over Team: {prompt}"
         );
     }
 
