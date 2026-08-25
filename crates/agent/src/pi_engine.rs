@@ -535,12 +535,15 @@ fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
 
 /// Minimal builtin coding-agent prompt. Deliberately not the manox
 /// `system_prompt` assembly — that belongs to the manox harness.
-fn system_prompt(cwd: &Path) -> String {
-    let date = chrono::Local::now().format("%Y-%m-%d");
+fn system_prompt(
+    cwd: &Path,
+    today: &str,
+    skills: &[crate::prompt::SkillSummaryPromptData],
+) -> String {
     let mut prompt = format!(
         "You are the Captain, the main agent running inside the manox app on the pi harness.\n\
          Working directory: {cwd}\n\
-         Date: {date}\n\n\
+         Date: {today}\n\n\
          Use your tools to inspect, edit, and create files and to run shell commands.\n\
          Make changes directly, keep replies concise, and verify your work when practical.\n\
          When several tool calls or subagent spawns are independent, emit them together in one turn so they run in parallel.",
@@ -583,11 +586,10 @@ fn system_prompt(cwd: &Path) -> String {
          must honor (exact paths, signatures, gate requirements) directly in \
          the prompt.",
     );
-    let summaries = crate::skill::summaries_or_empty();
-    if !summaries.is_empty() {
+    if !skills.is_empty() {
         prompt.push_str("\n\n## Available skills\n");
         prompt.push_str("Installed skills, invocable by the user as `/name` slash commands:\n");
-        for s in &summaries {
+        for s in skills {
             prompt.push_str(&format!("- {}: {}\n", s.name, s.description));
         }
     }
@@ -1993,7 +1995,11 @@ fn session_builder(
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_system_prompt(system_prompt(cwd))
+        .with_system_prompt(system_prompt(
+            cwd,
+            &chrono::Local::now().format("%Y-%m-%d").to_string(),
+            &crate::skill::summaries_or_empty(),
+        ))
         .with_resources(instruction_resources(cwd))
         .with_tools(tools)
         .with_initial_active_tools(default_active);
@@ -5630,7 +5636,7 @@ mod tests {
 
     #[test]
     fn system_prompt_mentions_captain_and_sailors() {
-        let prompt = system_prompt(std::path::Path::new("/tmp"));
+        let prompt = system_prompt(std::path::Path::new("/tmp"), "2026-08-25", &[]);
         assert!(prompt.contains("Captain"), "names the Captain: {prompt}");
         assert!(prompt.contains("Sailor"), "introduces Sailor: {prompt}");
         assert!(prompt.contains("Explore"), "introduces Explore: {prompt}");
@@ -5638,6 +5644,170 @@ mod tests {
             prompt.contains("multiple `Steer` calls in one turn"),
             "prefers Sailors over Team: {prompt}"
         );
+    }
+
+    // Byte-equivalence gate between the legacy hardcoded assembly and the
+    // pi-extensions template render. The system prompt leads the provider
+    // request's cached prefix, so any drift between the two paths would
+    // break prompt caching for every session; these tests pin the bytes
+    // before the legacy path is deleted.
+
+    fn golden_captain_skills() -> Vec<(String, String)> {
+        vec![
+            ("gitwork:deliver".into(), "deliver a PR".into()),
+            ("remora:task".into(), "delegate a stuck problem".into()),
+        ]
+    }
+
+    fn golden_context_files() -> Vec<pi::harness::ContextFile> {
+        vec![
+            pi::harness::ContextFile {
+                name: "CLAUDE.md".into(),
+                location: "/private/tmp/golden-proj/CLAUDE.md".into(),
+                content: "Keep changes minimal.\nLine two.".into(),
+            },
+            pi::harness::ContextFile {
+                name: "RULES.md".into(),
+                location: "/tmp/a&b<R>/rules.md".into(),
+                content: "r1".into(),
+            },
+        ]
+    }
+
+    fn golden_harness_skills() -> Vec<pi::harness::Skill> {
+        vec![pi::harness::Skill {
+            name: "s&1".into(),
+            description: "d<2>".into(),
+            location: "/p/s.md".into(),
+            content: String::new(),
+        }]
+    }
+
+    #[test]
+    fn legacy_vs_template_prompt_is_byte_identical() {
+        let cwd = std::path::Path::new("/private/tmp/golden-proj");
+        let today = "2026-08-25";
+        let captain_skill_variants: Vec<Vec<(String, String)>> =
+            vec![vec![], golden_captain_skills()];
+        let ctx_variants: Vec<Vec<pi::harness::ContextFile>> = vec![vec![], golden_context_files()];
+        let res_skill_variants: Vec<Vec<pi::harness::Skill>> =
+            vec![vec![], golden_harness_skills()];
+        let tool_variants: Vec<Vec<String>> = vec![
+            vec!["Read".into(), "Bash".into(), "Edit".into(), "Write".into()],
+            vec!["Bash".into(), "Edit".into(), "Write".into()],
+        ];
+        for captain_skills in &captain_skill_variants {
+            for ctx_files in &ctx_variants {
+                for res_skills in &res_skill_variants {
+                    for active_tools in &tool_variants {
+                        let legacy = pi::system_prompt::build_harness_prompt(
+                            &system_prompt(
+                                cwd,
+                                today,
+                                &captain_skills
+                                    .iter()
+                                    .map(|(name, description)| {
+                                        crate::prompt::SkillSummaryPromptData {
+                                            name: name.clone(),
+                                            description: description.clone(),
+                                        }
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                            cwd,
+                            active_tools,
+                            ctx_files,
+                            res_skills,
+                            true,
+                        );
+                        let builder = pi_extensions::prompt::captain_prompt_builder(
+                            pi_extensions::prompt::CaptainConfig {
+                                cwd: cwd.to_path_buf(),
+                                today: today.to_string(),
+                                skills: captain_skills
+                                    .iter()
+                                    .map(|(name, description)| {
+                                        pi_extensions::prompt::SkillSummary {
+                                            name: name.clone(),
+                                            description: description.clone(),
+                                        }
+                                    })
+                                    .collect(),
+                            },
+                        );
+                        let resources = pi::harness::HarnessResources {
+                            skills: res_skills.clone(),
+                            prompt_templates: vec![],
+                            context_files: ctx_files.clone(),
+                        };
+                        assert_eq!(
+                            builder(active_tools, &resources),
+                            legacy,
+                            "byte drift: captain_skills={captain_skills:?} \
+                             ctx_files={} res_skills={} tools={active_tools:?}",
+                            ctx_files.len(),
+                            res_skills.len(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_vs_template_subagent_fold_is_byte_identical() {
+        let cwd = std::path::Path::new("/private/tmp/golden-proj");
+        let base = "You are the Explore agent.\n\nSearch carefully.";
+        let active_tools = vec!["Read".into(), "Grep".into(), "Glob".into(), "Ls".into()];
+        let legacy =
+            pi::system_prompt::build_harness_prompt(base, cwd, &active_tools, &[], &[], true);
+        let builder =
+            pi_extensions::prompt::base_prompt_builder(base.to_string(), cwd.to_path_buf());
+        let resources = pi::harness::HarnessResources::default();
+        assert_eq!(builder(&active_tools, &resources), legacy);
+    }
+
+    /// Regenerate the golden byte fixtures from the CURRENT (legacy) path.
+    /// Run once before the legacy assembly is deleted:
+    /// `cargo test -p agent dump_prompt_golden -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_prompt_golden() {
+        let cwd = std::path::Path::new("/private/tmp/golden-proj");
+        let today = "2026-08-25";
+        let captain = pi::system_prompt::build_harness_prompt(
+            &system_prompt(
+                cwd,
+                today,
+                &golden_captain_skills()
+                    .into_iter()
+                    .map(
+                        |(name, description)| crate::prompt::SkillSummaryPromptData {
+                            name,
+                            description,
+                        },
+                    )
+                    .collect::<Vec<_>>(),
+            ),
+            cwd,
+            &["Read".into(), "Bash".into(), "Edit".into(), "Write".into()],
+            &golden_context_files(),
+            &[],
+            true,
+        );
+        let out = concat!(env!("CARGO_MANIFEST_DIR"), "/../pi-extensions/testdata");
+        std::fs::create_dir_all(out).unwrap();
+        std::fs::write(format!("{out}/captain_prompt.golden.txt"), captain).unwrap();
+        let fold = pi::system_prompt::build_harness_prompt(
+            "You are the Explore agent.\n\nSearch carefully.",
+            cwd,
+            &["Read".into(), "Grep".into(), "Glob".into(), "Ls".into()],
+            &[],
+            &[],
+            true,
+        );
+        std::fs::write(format!("{out}/fold_prompt.golden.txt"), fold).unwrap();
+        println!("golden files written to {out}");
     }
 
     #[test]

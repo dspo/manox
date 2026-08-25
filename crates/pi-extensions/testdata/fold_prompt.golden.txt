@@ -1,0 +1,4 @@
+You are the Explore agent.
+
+Search carefully.
+Current working directory: /private/tmp/golden-proj

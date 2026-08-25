@@ -145,6 +145,10 @@ pub struct AgentSession {
     /// The base prompt the system-prompt builder starts from; kept so a
     /// fork re-installs the builder rather than freezing a rendered prompt.
     base_prompt: String,
+    /// Consumer-installed system-prompt builder overriding the default
+    /// `build_harness_prompt` fold; kept so a fork re-installs it rather
+    /// than falling back to the kernel default.
+    prompt_builder: Option<crate::harness::SystemPromptBuilder>,
     tools: Vec<Arc<dyn AgentTool>>,
     /// The facade's pending next-turn messages (TS coding-agent
     /// `_pendingNextTurnMessages`): delivered AFTER the prompt's own user
@@ -978,6 +982,7 @@ impl AgentSession {
                 runtime: self.runtime,
                 system_prompt: self.system_prompt,
                 base_prompt: self.base_prompt,
+                prompt_builder: self.prompt_builder.clone(),
                 tools: self.tools,
                 pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
                 model_fallback_notice: None,
@@ -1015,21 +1020,29 @@ impl AgentSession {
         // Re-install the system-prompt builder (not just the rendered
         // prompt), so a fork keeps rebuilding on active-tool/resource
         // changes.
-        let base_prompt = self.base_prompt.clone();
-        let cwd = self.cwd.clone();
-        let custom_for_builder = self.custom_prompt;
-        harness.set_system_prompt_builder(
-            move |active_tools: &[String], resources: &HarnessResources| {
-                crate::system_prompt::build_harness_prompt(
-                    &base_prompt,
-                    &cwd,
-                    active_tools,
-                    &resources.context_files,
-                    &resources.skills,
-                    custom_for_builder,
-                )
-            },
-        );
+        if let Some(builder) = self.prompt_builder.clone() {
+            harness.set_system_prompt_builder(
+                move |active_tools: &[String], resources: &HarnessResources| {
+                    builder(active_tools, resources)
+                },
+            );
+        } else {
+            let base_prompt = self.base_prompt.clone();
+            let cwd = self.cwd.clone();
+            let custom_for_builder = self.custom_prompt;
+            harness.set_system_prompt_builder(
+                move |active_tools: &[String], resources: &HarnessResources| {
+                    crate::system_prompt::build_harness_prompt(
+                        &base_prompt,
+                        &cwd,
+                        active_tools,
+                        &resources.context_files,
+                        &resources.skills,
+                        custom_for_builder,
+                    )
+                },
+            );
+        }
         // Restore projects the session's own model onto the harness.
         harness = harness.with_model_resolver(model_resolver(&self.runtime));
         let observer = harness.request_observer();
@@ -1154,6 +1167,9 @@ pub struct AgentSessionBuilder {
     initial_active_tools: Option<Vec<String>>,
     model: Option<Model>,
     system_prompt: Option<String>,
+    /// Consumer system-prompt builder; when set, it renders the initial
+    /// system prompt and every rebuild, replacing the default fold.
+    system_prompt_builder: Option<crate::harness::SystemPromptBuilder>,
     settings: Option<crate::settings::Settings>,
     trust: Option<TrustManager>,
     /// Session id pinned by the caller for a fresh `build()`; `None` draws a
@@ -1197,6 +1213,19 @@ impl AgentSessionBuilder {
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Install a consumer system-prompt builder. The builder renders the
+    /// initial system prompt over the active tools and resources, and the
+    /// harness re-invokes it on every active-tool/resource change. When set,
+    /// it fully owns the system prompt; a `with_system_prompt` value given
+    /// alongside is ignored.
+    pub fn with_system_prompt_builder(
+        mut self,
+        builder: crate::harness::SystemPromptBuilder,
+    ) -> Self {
+        self.system_prompt_builder = Some(builder);
         self
     }
 
@@ -1354,14 +1383,17 @@ impl AgentSessionBuilder {
             .clone()
             .unwrap_or_else(|| crate::system_prompt::DEFAULT_BASE_PROMPT.into());
         let custom_prompt = self.system_prompt.is_some();
-        let system_prompt = crate::system_prompt::build_harness_prompt(
-            &base_prompt,
-            &cwd,
-            &active_tools,
-            &resources.context_files,
-            &resources.skills,
-            self.system_prompt.is_some(),
-        );
+        let system_prompt = match &self.system_prompt_builder {
+            Some(builder) => builder(&active_tools, &resources),
+            None => crate::system_prompt::build_harness_prompt(
+                &base_prompt,
+                &cwd,
+                &active_tools,
+                &resources.context_files,
+                &resources.skills,
+                custom_prompt,
+            ),
+        };
 
         // The session's own model when reopening (restore), the builder
         // override or settings default otherwise.
@@ -1464,21 +1496,33 @@ impl AgentSessionBuilder {
         // Install the prompt builder: the harness rebuilds the system prompt
         // whenever the effective tool selection or resources change, so the
         // model never sees tools/skills that are not actually available.
-        let base_prompt_for_builder = base_prompt.clone();
-        let cwd_for_builder = cwd.clone();
-        let custom_for_builder = custom_prompt;
-        harness.set_system_prompt_builder(
-            move |active_tools: &[String], resources: &HarnessResources| {
-                crate::system_prompt::build_harness_prompt(
-                    &base_prompt_for_builder,
-                    &cwd_for_builder,
-                    active_tools,
-                    &resources.context_files,
-                    &resources.skills,
-                    custom_for_builder,
-                )
-            },
-        );
+        match &self.system_prompt_builder {
+            Some(builder) => {
+                let builder = builder.clone();
+                harness.set_system_prompt_builder(
+                    move |active_tools: &[String], resources: &HarnessResources| {
+                        builder(active_tools, resources)
+                    },
+                );
+            }
+            None => {
+                let base_prompt_for_builder = base_prompt.clone();
+                let cwd_for_builder = cwd.clone();
+                let custom_for_builder = custom_prompt;
+                harness.set_system_prompt_builder(
+                    move |active_tools: &[String], resources: &HarnessResources| {
+                        crate::system_prompt::build_harness_prompt(
+                            &base_prompt_for_builder,
+                            &cwd_for_builder,
+                            active_tools,
+                            &resources.context_files,
+                            &resources.skills,
+                            custom_for_builder,
+                        )
+                    },
+                );
+            }
+        }
         // Attach the request observer so the harness's before-payload /
         // after-response hooks fire on the real provider requests.
         let observer = harness.request_observer();
@@ -1550,6 +1594,7 @@ impl AgentSessionBuilder {
             runtime,
             system_prompt,
             base_prompt,
+            prompt_builder: self.system_prompt_builder.clone(),
             tools,
             pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
             model_fallback_notice: fallback_notice,
@@ -2683,6 +2728,88 @@ mod tests {
         let prompt = forked.harness.agent().state().system_prompt.clone();
         assert!(prompt.contains("- Read: Read a file"));
         assert!(!prompt.contains("- Grep:"), "{prompt}");
+    }
+
+    /// A consumer-installed builder owns the initial prompt and every
+    /// rebuild, replacing the kernel default fold.
+    #[tokio::test]
+    async fn custom_system_prompt_builder_drives_initial_and_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let builder: crate::harness::SystemPromptBuilder =
+            Arc::new(|tools: &[String], _resources: &HarnessResources| {
+                format!("CUSTOM[{}]", tools.join(","))
+            });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .with_system_prompt_builder(builder)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            session.harness.agent().state().system_prompt,
+            "CUSTOM[Read,Bash,Edit,Write]"
+        );
+        session.set_active_tools(vec!["Read".into()]).await.unwrap();
+        assert_eq!(
+            session.harness.agent().state().system_prompt,
+            "CUSTOM[Read]"
+        );
+    }
+
+    /// A fork of a session with a consumer-installed builder re-installs
+    /// THAT builder on the forked harness, not the kernel default fold.
+    #[tokio::test]
+    async fn fork_keeps_custom_prompt_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let builder: crate::harness::SystemPromptBuilder =
+            Arc::new(|tools: &[String], _resources: &HarnessResources| {
+                format!("CUSTOM[{}]", tools.join(","))
+            });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .with_system_prompt_builder(builder)
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let entries = session
+            .harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap();
+        let first_user = entries
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .next()
+            .unwrap();
+        let ForkResult {
+            session: mut forked,
+            ..
+        } = session
+            .fork(&first_user, ForkPosition::AtEntry)
+            .await
+            .unwrap();
+        forked.set_active_tools(vec!["Read".into()]).await.unwrap();
+        assert_eq!(forked.harness.agent().state().system_prompt, "CUSTOM[Read]");
     }
 
     /// Facade shutdown clears its pending next-turn queue and refuses more.
