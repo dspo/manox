@@ -44,6 +44,14 @@ fn canonical(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Public canonical store key (see [`canonical`]) for callers that need the
+/// same path identity the snapshot store uses — e.g. the edit tool's noop
+/// loop guard, which must not be bypassed by `/tmp` vs `/private/tmp`
+/// spellings of one file.
+pub fn canonical_path(path: &Path) -> PathBuf {
+    canonical(path)
+}
+
 /// A recorded file snapshot: its normalized text, the tag derived from it,
 /// and optional set of lines the read tool displayed.
 #[derive(Debug, Clone)]

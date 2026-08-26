@@ -26,7 +26,7 @@ pub use block::BlockError;
 pub use hash::compute_tag;
 pub use parser::{FileOp, FilePatch, InsPos, Op, ParseError, ParsedPatch, parse_patch};
 pub use recovery::{RecoverError, try_recover, try_recover_with_snapshot};
-pub use snapshot::{Snapshot, SnapshotStore};
+pub use snapshot::{Snapshot, SnapshotStore, canonical_path};
 
 use std::collections::HashSet;
 
@@ -303,9 +303,11 @@ pub fn anchored_context(ops: &[parser::Op], current: &str) -> String {
     let mut anchors = anchors;
     anchors.sort_unstable();
     anchors.dedup();
-    // Merge each anchor's ±2 window into contiguous 1-indexed ranges.
+    // Merge each anchor's ±2 window into contiguous 1-indexed ranges. Anchors
+    // past EOF clamp into the file so no window is empty.
     let mut windows: Vec<(usize, usize)> = Vec::new();
     for a in anchors {
+        let a = a.min(total);
         let start = a.saturating_sub(ANCHOR_CONTEXT_LINES).max(1);
         let end = (a + ANCHOR_CONTEXT_LINES).min(total);
         if let Some(last) = windows.last_mut()

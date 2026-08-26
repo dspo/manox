@@ -347,6 +347,18 @@ pub fn parse_patch(text: &str) -> Result<ParsedPatch, ParseError> {
                                 ),
                             });
                         }
+                        // A bare `N:` with no content is almost certainly a
+                        // stray fragment, not an intent to blank line N.
+                        if content.trim().is_empty() {
+                            return Err(ParseError {
+                                line: line_no,
+                                message: format!(
+                                    "recovered snapshot row {n}: has no content — if you meant to \
+                                     replace line {n} with an empty line, use `SWAP {n}.={n}:` \
+                                     with an explicit body"
+                                ),
+                            });
+                        }
                         flush_body(
                             &mut files,
                             &mut pending,
@@ -1320,6 +1332,13 @@ mod tests {
     #[test]
     fn repeated_snapshot_row_rejected() {
         assert!(parse_patch("[a.rs#1A2B3C]\n5:a\n5:b").is_err());
+    }
+
+    #[test]
+    fn empty_snapshot_row_rejected() {
+        // A bare `N:` with no content fails closed rather than blanking line N.
+        let e = parse_patch("[a.rs#1A2B3C]\n5:").unwrap_err();
+        assert!(e.message.contains("no content"), "{}", e.message);
     }
 
     #[test]

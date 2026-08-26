@@ -279,12 +279,15 @@ impl AgentTool for EditTool {
 
             // No-op loop guard: the same payload producing no change repeatedly
             // means the model is spinning; escalate after a few identical no-ops.
+            // Keyed by canonical path so `/tmp` vs `/private/tmp` spellings of
+            // one file cannot dodge the escalation.
+            let noop_key = hashline::canonical_path(&path);
             if changed {
                 ctx.tool_state()
                     .noop_edits
                     .lock()
                     .expect("noop guard poisoned")
-                    .remove(&path);
+                    .remove(&noop_key);
                 results.push(match new_snap {
                     Some(s) => format!("[{path_display}#{}]\n{diff}", s.tag),
                     None => format!("[{path_display}]\n{diff}\n(no snapshot: file exceeds 4MB)"),
@@ -296,7 +299,7 @@ impl AgentTool for EditTool {
                     .noop_edits
                     .lock()
                     .expect("noop guard poisoned");
-                let entry = guard.entry(path.clone()).or_insert((payload_hash, 0));
+                let entry = guard.entry(noop_key.clone()).or_insert((payload_hash, 0));
                 if entry.0 == payload_hash {
                     entry.1 += 1;
                 } else {
