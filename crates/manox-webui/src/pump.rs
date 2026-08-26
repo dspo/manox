@@ -175,6 +175,20 @@ mod tests {
         frames
     }
 
+    /// Whether a session event reached the wire, unwrapping batched `events`
+    /// frames (session events coalesce into one frame per flush).
+    fn has_event(frames: &[Value], ty: &str, sid: &str) -> bool {
+        frames.iter().any(|f| {
+            if f["type"] == ty && f["sessionId"] == sid {
+                return true;
+            }
+            f["type"] == "events"
+                && f["events"]
+                    .as_array()
+                    .is_some_and(|evs| evs.iter().any(|e| e["type"] == ty && e["sessionId"] == sid))
+        })
+    }
+
     /// A `new_session` message drives the full loop end to end: the webview
     /// message is translated, the actor creates a live thread, and the
     /// `session_created` event is consumed into a `session_ready(fresh)` on
@@ -188,18 +202,23 @@ mod tests {
         init_globals(&mut cx);
         cx.update(agent::thread_store::init);
 
-        let (mut conn, _outbound, mut frame_rx) = make_connection();
+        let (mut conn, outbound, mut frame_rx) = make_connection();
         let msg = json!({"type": "new_session", "sessionId": "s1"});
         cx.update(|app| bridge::process_webui_msg(app, &mut conn, &msg));
         cx.run_until_parked();
 
         assert!(conn.state.sessions.contains_key("s1"));
+        outbound.flush();
         let frames = drain(&mut frame_rx);
         assert!(
             frames.iter().any(|f| f["type"] == "session_ready"
                 && f["sessionId"] == "s1"
                 && f["kind"] == "fresh"),
             "frames: {frames:?}",
+        );
+        assert!(
+            has_event(&frames, "current_model", "s1"),
+            "picker model seed missing; frames: {frames:?}",
         );
 
         // Release every thread handle before the context drops so the gpui
@@ -226,7 +245,7 @@ mod tests {
         init_globals(&mut cx);
         cx.update(agent::thread_store::init);
 
-        let (mut conn, _outbound, mut frame_rx) = make_connection();
+        let (mut conn, outbound, mut frame_rx) = make_connection();
         cx.update(|app| {
             bridge::process_webui_msg(
                 app,
@@ -235,6 +254,7 @@ mod tests {
             );
         });
         cx.run_until_parked();
+        outbound.flush();
         drain(&mut frame_rx);
 
         cx.update(|app| {
@@ -245,12 +265,17 @@ mod tests {
             );
         });
         cx.run_until_parked();
+        outbound.flush();
         let frames = drain(&mut frame_rx);
         assert!(
             frames.iter().any(|f| f["type"] == "session_ready"
                 && f["sessionId"] == "s1"
                 && f["kind"] == "restored"),
             "frames: {frames:?}",
+        );
+        assert!(
+            has_event(&frames, "current_model", "s1"),
+            "picker model seed missing on restore; frames: {frames:?}",
         );
 
         let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();

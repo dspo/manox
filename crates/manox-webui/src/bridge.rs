@@ -202,6 +202,10 @@ fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, 
             if let Some(model) = msg["modelId"].as_str() {
                 cmds.push(json!({"cmd": "set_model", "sessionId": id, "id": model}));
             }
+            // The picker's currentModelId is seeded by the authoritative
+            // `current_model` response; `set_model` alone emits no wire
+            // event, so the query must follow any model override.
+            cmds.push(json!({"cmd": "get_current_model", "sessionId": id}));
             if msg["text"].as_str().is_some()
                 || msg["images"].as_array().is_some_and(|a| !a.is_empty())
             {
@@ -218,7 +222,12 @@ fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, 
                 return (vec![], None);
             };
             (
-                vec![json!({"cmd": "open_thread", "sessionId": id})],
+                vec![
+                    json!({"cmd": "open_thread", "sessionId": id}),
+                    // Seed the picker's currentModelId from the restored
+                    // thread's persisted model.
+                    json!({"cmd": "get_current_model", "sessionId": id}),
+                ],
                 Some((id, ReadyKind::Restored, cwd.to_string())),
             )
         }
@@ -533,23 +542,30 @@ mod tests {
             &json!({"type": "new_session", "text": "hi", "modelId": "m1"}),
             cwd,
         );
-        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds.len(), 4);
         assert_eq!(cmds[0]["cmd"], "create_session");
         assert_eq!(
             cmds[1],
             json!({"cmd": "set_model", "sessionId": cmds[0]["sessionId"], "id": "m1"})
         );
-        assert_eq!(cmds[2]["cmd"], "submit");
+        assert_eq!(
+            cmds[2],
+            json!({"cmd": "get_current_model", "sessionId": cmds[0]["sessionId"]})
+        );
+        assert_eq!(cmds[3]["cmd"], "submit");
         let (id, kind, cwd_out) = ready.expect("fresh announce");
         assert_eq!(kind, ReadyKind::Fresh);
         assert_eq!(cwd_out, cwd);
         assert_eq!(id, cmds[0]["sessionId"].as_str().unwrap());
 
-        // Empty composer: create only, still announces fresh.
+        // Empty composer: create + model seed, still announces fresh.
         let (cmds, ready) = translate(&json!({"type": "new_session", "sessionId": "s1"}), cwd);
         assert_eq!(
             Value::Array(cmds),
-            json!([{"cmd": "create_session", "sessionId": "s1", "cwd": cwd}]),
+            json!([
+                {"cmd": "create_session", "sessionId": "s1", "cwd": cwd},
+                {"cmd": "get_current_model", "sessionId": "s1"},
+            ]),
         );
         assert_eq!(
             ready,
@@ -562,7 +578,10 @@ mod tests {
         let (cmds, ready) = translate(&json!({"type": "open_thread", "sessionId": "s1"}), "/proj");
         assert_eq!(
             Value::Array(cmds),
-            json!([{"cmd": "open_thread", "sessionId": "s1"}]),
+            json!([
+                {"cmd": "open_thread", "sessionId": "s1"},
+                {"cmd": "get_current_model", "sessionId": "s1"},
+            ]),
         );
         assert_eq!(
             ready,
