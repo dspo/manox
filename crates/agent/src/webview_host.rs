@@ -126,9 +126,114 @@ pub fn host() -> Option<&'static Arc<dyn BrowserHost>> {
     HOST.get()
 }
 
+/// A browser op parked on the capability channel with its reply slot.
+struct BrowserCapabilityMsg {
+    op: crate::thread_engine::BrowserOp,
+    reply: futures::channel::oneshot::Sender<Result<crate::thread_engine::BrowserReply, String>>,
+}
+
+/// The gpui-backed capability provider. It is `Send + Sync` (it holds only a
+/// channel sender); the browser work itself runs on a main-thread service loop
+/// that owns the [`gpui::AsyncApp`], bridged by the channel. The kernel
+/// invokes [`crate::capability::CapabilityClient`] without holding an
+/// `&mut App`.
+pub struct GpuiCapability {
+    tx: async_channel::Sender<BrowserCapabilityMsg>,
+}
+
+impl GpuiCapability {
+    /// Create the provider and spawn its main-thread service loop on `cx`.
+    pub fn start(cx: &gpui::AsyncApp) -> Arc<Self> {
+        let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while let Ok(msg) = rx.recv().await {
+                // One task per op so a suspending op (e.g. `YieldToUser`,
+                // parked until the user hands the tab back) does not serialize
+                // later ops — parity with the prior per-request `cx.spawn`.
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    let result = execute_browser_op(msg.op, cx).await;
+                    let _ = msg.reply.send(result);
+                })
+                .detach();
+            }
+        })
+        .detach();
+        Arc::new(Self { tx })
+    }
+}
+
+impl crate::capability::CapabilityClient for GpuiCapability {
+    fn browser_op(
+        &self,
+        op: crate::thread_engine::BrowserOp,
+    ) -> futures::future::BoxFuture<'static, Result<crate::thread_engine::BrowserReply, String>>
+    {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = futures::channel::oneshot::channel();
+            if tx.send(BrowserCapabilityMsg { op, reply }).await.is_err() {
+                return Err("browser capability channel closed".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("browser capability dropped".to_string()))
+        })
+    }
+}
+
+/// Execute one browser op on the main thread through the registered host.
+async fn execute_browser_op(
+    op: crate::thread_engine::BrowserOp,
+    app: &gpui::AsyncApp,
+) -> Result<crate::thread_engine::BrowserReply, String> {
+    let Some(host) = host().cloned() else {
+        return Err("browser host not available".to_string());
+    };
+    use crate::thread_engine::{BrowserOp, BrowserReply};
+    match op {
+        BrowserOp::Open { url } => {
+            app.update(|cx| host.open_tab(&url, cx).map(BrowserReply::TabId))
+        }
+        BrowserOp::Navigate { id, url } => {
+            app.update(|cx| host.navigate(id, &url, cx).map(|_| BrowserReply::Unit))
+        }
+        BrowserOp::Close { id } => {
+            app.update(|cx| host.close_tab(id, cx).map(|_| BrowserReply::Unit))
+        }
+        BrowserOp::ReadText { id } => app
+            .update(|cx| host.read_text(id, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::ReadDom { id, selector } => app
+            .update(|cx| host.read_dom(id, selector, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::Click { id, selector } => app
+            .update(|cx| host.click(id, &selector, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::TypeText { id, selector, text } => app
+            .update(|cx| host.type_text(id, &selector, &text, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::Scroll { id, dx, dy } => app
+            .update(|cx| host.scroll(id, dx, dy, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::Screenshot { id } => app
+            .update(|cx| host.screenshot(id, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::YieldToUser { id } => app
+            .update(|cx| host.yield_to_user(id, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::CapabilityClient as _;
 
     // The internally-tagged `BrowserNotification` must round-trip every variant
     // — a newtype-of-String variant would fail serde's tag-merge at runtime, so
@@ -179,5 +284,36 @@ mod tests {
         let back: BrowserInboundWrite = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back.intent, "save_file");
         assert_eq!(back.payload["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn capability_fails_closed_when_service_channel_closed() {
+        let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
+        drop(rx); // no service loop
+        let caps = GpuiCapability { tx };
+        let err =
+            futures::executor::block_on(caps.browser_op(crate::thread_engine::BrowserOp::Open {
+                url: "https://example.com".into(),
+            }))
+            .unwrap_err();
+        assert!(err.contains("channel closed"));
+    }
+
+    #[test]
+    fn capability_fails_closed_when_reply_dropped() {
+        let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
+        let caps = GpuiCapability { tx };
+        // A "service" that receives the op but drops the reply without
+        // answering; the caller must surface a fail-closed error, not hang.
+        let service = async move {
+            if let Ok(msg) = rx.recv().await {
+                drop(msg.reply);
+            }
+        };
+        let call = caps.browser_op(crate::thread_engine::BrowserOp::Open {
+            url: "https://example.com".into(),
+        });
+        let (_, result) = futures::executor::block_on(async move { futures::join!(service, call) });
+        assert!(result.unwrap_err().contains("dropped"));
     }
 }

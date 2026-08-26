@@ -629,54 +629,16 @@ impl Thread {
                 }
             }
             BackendNotice::BrowserRequest { op, responder } => {
-                // The browser host is a gpui main-thread surface; the tool
-                // (tokio) parked its request here. Execute on the main
-                // thread and reply through the responder channel.
-                let Some(host) = crate::webview_host::host().cloned() else {
-                    let _ = responder.try_send(Err("browser host not available".to_string()));
+                // The browser is a frontend capability: hand the op to the
+                // registered capability provider (today the gpui host, later the
+                // protocol's `ServerCall::BrowserOp` owner) and relay its reply.
+                // Fail closed when no provider is registered (headless contexts).
+                let Some(caps) = crate::capability::provider().cloned() else {
+                    let _ = responder.try_send(Err("browser capability not available".to_string()));
                     return;
                 };
-                use crate::thread_engine::{BrowserOp, BrowserReply};
-                cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
-                    let result: Result<BrowserReply, String> = match op {
-                        BrowserOp::Open { url } => {
-                            cx.update(|cx| host.open_tab(&url, cx).map(BrowserReply::TabId))
-                        }
-                        BrowserOp::Navigate { id, url } => {
-                            cx.update(|cx| host.navigate(id, &url, cx).map(|_| BrowserReply::Unit))
-                        }
-                        BrowserOp::Close { id } => {
-                            cx.update(|cx| host.close_tab(id, cx).map(|_| BrowserReply::Unit))
-                        }
-                        BrowserOp::ReadText { id } => {
-                            let task = cx.update(|cx| host.read_text(id, cx));
-                            task.await.map(BrowserReply::Text)
-                        }
-                        BrowserOp::ReadDom { id, selector } => {
-                            let task = cx.update(|cx| host.read_dom(id, selector, cx));
-                            task.await.map(BrowserReply::Text)
-                        }
-                        BrowserOp::Click { id, selector } => {
-                            let task = cx.update(|cx| host.click(id, &selector, cx));
-                            task.await.map(|_| BrowserReply::Unit)
-                        }
-                        BrowserOp::TypeText { id, selector, text } => {
-                            let task = cx.update(|cx| host.type_text(id, &selector, &text, cx));
-                            task.await.map(|_| BrowserReply::Unit)
-                        }
-                        BrowserOp::Scroll { id, dx, dy } => {
-                            let task = cx.update(|cx| host.scroll(id, dx, dy, cx));
-                            task.await.map(|_| BrowserReply::Unit)
-                        }
-                        BrowserOp::Screenshot { id } => {
-                            let task = cx.update(|cx| host.screenshot(id, cx));
-                            task.await.map(BrowserReply::Text)
-                        }
-                        BrowserOp::YieldToUser { id } => {
-                            let task = cx.update(|cx| host.yield_to_user(id, cx));
-                            task.await.map(|_| BrowserReply::Unit)
-                        }
-                    };
+                cx.spawn(async move |_this, _cx| {
+                    let result = caps.browser_op(op).await;
                     let _ = responder.send(result).await;
                 })
                 .detach();
