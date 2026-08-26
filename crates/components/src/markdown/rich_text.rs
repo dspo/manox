@@ -658,11 +658,11 @@ impl Element for RichText {
 }
 
 /// The link span whose virtual-doc range contains `hovered`, if any.
-fn hovered_link<'a>(
-    link_spans: &'a [LinkSpan],
+fn hovered_link(
+    link_spans: &[LinkSpan],
     doc_start: usize,
     hovered: Option<usize>,
-) -> Option<&'a LinkSpan> {
+) -> Option<&LinkSpan> {
     let hovered = hovered?;
     link_spans.iter().find(|link| {
         let abs = (doc_start + link.range.start)..(doc_start + link.range.end);
@@ -1035,4 +1035,5 @@ mod tests {
         assert!(selection.hovered().is_some());
     }
 }
+
 
