@@ -139,6 +139,11 @@ impl WorkspaceBrowserHost {
         let routes = host.routes().clone();
         Self::set_concrete(host.clone());
         agent::webview_host::set_host(host);
+        // Register the capability provider on the same seam: the kernel drives
+        // the browser through `capability::provider()` without holding an
+        // `&mut App` (capability inversion; protocol `ServerCall::BrowserOp`
+        // later).
+        agent::capability::set_provider(agent::webview_host::GpuiCapability::start(cx));
         cx.update(|cx| {
             workspace.update(cx, |_, cx| {
                 cx.spawn(async move |_, cx: &mut AsyncApp| {
