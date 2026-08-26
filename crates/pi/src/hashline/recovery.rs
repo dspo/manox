@@ -41,12 +41,25 @@ pub fn try_recover(
     path: &Path,
 ) -> Result<String, RecoverError> {
     let current_tag = super::hash::compute_tag(current);
-    let snapshot = store.get(path, claimed_tag).ok_or_else(|| RecoverError {
-        message: format!(
-            "snapshot tag {claimed_tag} not found (file changed and no history version available); re-read to get the current tag {current_tag}"
-        ),
-        current_tag,
-    })?;
+    let Some(snapshot) = store.get(path, claimed_tag) else {
+        // The claimed tag names a file state this session never recorded:
+        // fabricated, or carried over from a prior session / app restart.
+        let mut message = format!(
+            "snapshot tag {claimed_tag} is not from this session (fabricated, or carried over \
+             from a prior session or app restart). The current file hashes to {current_tag}. \
+             Re-read the file with `Read` and copy the fresh [path#tag] header — never invent a \
+             tag or reuse one from a prior session."
+        );
+        let context = super::anchored_context(ops, current);
+        if !context.is_empty() {
+            message.push_str("\nCurrent file content near your anchors:\n");
+            message.push_str(&context);
+        }
+        return Err(RecoverError {
+            message,
+            current_tag,
+        });
+    };
     try_recover_with_snapshot(current, snapshot, ops)
 }
 
@@ -79,10 +92,16 @@ pub fn try_recover_with_snapshot(
 
     // Validate every anchor's context. For each op, collect all anchor lines
     // and check that they map consistently.
-    let anchor_lines = collect_anchor_lines(ops);
+    let anchor_lines = super::collect_anchor_lines(ops);
     if !validate_anchors(&anchor_lines, &line_map, &prev_lines, &cur_lines) {
         return Err(RecoverError {
-            message: "3-way merge failed: anchors map to inconsistent lines in the current file; re-read to get current tags and line numbers".to_string(),
+            message: drift_message(
+                ops,
+                current,
+                "3-way merge failed: the tagged read drifted and its anchors no longer map to \
+                 unchanged lines. If a prior edit this session changed this file, copy the \
+                 latest [path#newtag] header from that edit's response; otherwise re-read.",
+            ),
             current_tag,
         });
     }
@@ -90,7 +109,13 @@ pub fn try_recover_with_snapshot(
     // Remap ops to current line numbers.
     let Some(remapped) = remap_ops(ops, &line_map) else {
         return Err(RecoverError {
-            message: "3-way merge failed: cannot remap anchors to current file (line numbers shifted inconsistently); re-read".to_string(),
+            message: drift_message(
+                ops,
+                current,
+                "3-way merge failed: line anchors shifted inconsistently and cannot be remapped. If \
+                 a prior edit this session changed this file, copy the latest [path#newtag] \
+                 header from that edit's response; otherwise re-read.",
+            ),
             current_tag,
         });
     };
@@ -105,42 +130,14 @@ pub fn try_recover_with_snapshot(
     }
 }
 
-/// Collect all 1-indexed anchor lines referenced by the ops.
-fn collect_anchor_lines(ops: &[Op]) -> Vec<usize> {
-    let mut lines = Vec::new();
-    for op in ops {
-        match op {
-            Op::Swap { start, end, .. } | Op::Cut { start, end } => {
-                for l in *start..=*end {
-                    lines.push(l);
-                }
-            }
-            Op::Del { start, end } => {
-                for l in *start..=*end {
-                    lines.push(l);
-                }
-            }
-            Op::Ins {
-                anchor: Some(a), ..
-            }
-            | Op::Paste {
-                anchor: Some(a), ..
-            } => {
-                lines.push(*a);
-            }
-            Op::SwapBlk { start, .. } | Op::CutBlk { start } => {
-                lines.push(*start);
-            }
-            Op::DelBlk { start } => {
-                lines.push(*start);
-            }
-            Op::InsBlkPost { anchor, .. } => {
-                lines.push(*anchor);
-            }
-            Op::Ins { anchor: None, .. } | Op::Paste { anchor: None, .. } => {}
-        }
+/// Compose a drift-rejection message: the reason plus the live content around
+/// the edit's anchors so the model can verify its line numbers directly.
+fn drift_message(ops: &[Op], current: &str, reason: &str) -> String {
+    let context = super::anchored_context(ops, current);
+    if context.is_empty() {
+        return reason.to_string();
     }
-    lines
+    format!("{reason}\nCurrent file content near your anchors:\n{context}")
 }
 
 /// Build a 1-indexed line number map from `previous_text` to `current_text`.
@@ -417,7 +414,11 @@ mod tests {
     fn missing_snapshot_errors() {
         let store = SnapshotStore::new();
         let err = try_recover("A\nB\n", "FFFFFF", &[], &store, &PathBuf::from("x.rs")).unwrap_err();
-        assert!(err.message.contains("not found"));
+        assert!(
+            err.message.contains("not from this session"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

@@ -114,18 +114,22 @@ impl AgentTool for SelectorReadTool {
         let text = hashline::normalize_to_lf(&raw);
         let path_display = path.display().to_string();
 
-        // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = ctx
-            .tool_state()
-            .snapshots
-            .lock()
-            .expect("hashline snapshot store poisoned")
-            .record(&path, &text);
+        // The snapshot always fingerprints the full file — only display is
+        // sliced. Files over the snapshot cap carry no tag and no header.
+        let snap = {
+            let mut store = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned");
+            hashline::record_read_snapshot(&mut store, &path, &text)
+        };
+        let tag = snap.as_ref().map(|s| s.tag.as_str());
 
         let raw_selector = matches!(selector, Selector::Raw | Selector::RawLines(_));
         let formatted = match &selector {
             Selector::Lines(ranges) => {
-                hashline::format_numbered_range(&path_display, &text, &snap.tag, ranges)
+                hashline::format_numbered_range(&path_display, &text, tag, ranges)
             }
             Selector::Raw => hashline::format_raw(&text, None),
             Selector::RawLines(ranges) => hashline::format_raw(&text, Some(ranges)),
@@ -164,7 +168,9 @@ impl AgentTool for SelectorReadTool {
         } else {
             hashline::parse_seen_lines_from_body(&result.content)
         };
-        if !displayed.is_empty() {
+        if !displayed.is_empty()
+            && let Some(snap) = snap.as_ref()
+        {
             ctx.tool_state()
                 .snapshots
                 .lock()
@@ -185,6 +191,9 @@ impl AgentTool for SelectorReadTool {
                 "continue with a narrower range selector, e.g. `<path>:FROM-TO`"
             };
             output.push_str(&format!("\n[{cont}]"));
+        }
+        if snap.is_none() {
+            output.push_str("\n\n[no snapshot: file exceeds 4MB — hashline `Edit` is unavailable; use `Write` for changes]");
         }
         Ok(AgentToolResult::text(output))
     }

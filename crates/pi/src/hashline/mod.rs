@@ -24,11 +24,32 @@ mod integration_tests;
 pub use apply::{ApplyError, ApplyResult, apply};
 pub use block::BlockError;
 pub use hash::compute_tag;
-pub use parser::{FileOp, FilePatch, InsPos, Op, ParseError, parse_patch};
+pub use parser::{FileOp, FilePatch, InsPos, Op, ParseError, ParsedPatch, parse_patch};
 pub use recovery::{RecoverError, try_recover, try_recover_with_snapshot};
-pub use snapshot::{Snapshot, SnapshotStore};
+pub use snapshot::{Snapshot, SnapshotStore, canonical_path};
 
 use std::collections::HashSet;
+
+/// Upper bound on the normalized text a producer snapshots for hashline. A
+/// section tag fingerprints the WHOLE file, so tagging means holding the full
+/// text in the store. Files above this cap are served without a `[path#tag]`
+/// header — line-anchored editing is out of scope for them (use `Write`).
+pub const SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Record a read snapshot for `path` under the [`SNAPSHOT_MAX_BYTES`] cap.
+/// Returns the recorded snapshot, or `None` when the file is too large to
+/// snapshot — callers then omit the `[path#tag]` header so the model never
+/// anchors against a tag the store cannot resolve.
+pub fn record_read_snapshot(
+    store: &mut snapshot::SnapshotStore,
+    path: &std::path::Path,
+    text: &str,
+) -> Option<snapshot::Snapshot> {
+    if text.len() > SNAPSHOT_MAX_BYTES {
+        return None;
+    }
+    Some(store.record(path, text))
+}
 
 /// Parse the 1-indexed line numbers a numbered hashline body actually
 /// displayed. Only rows whose `digits:`-prefixed prefix parse contribute —
@@ -230,6 +251,94 @@ pub fn assert_seen_lines(
     ))
 }
 
+/// Context lines rendered on each side of an anchor in rejection diagnostics.
+const ANCHOR_CONTEXT_LINES: usize = 2;
+/// Upper bound on total `N:TEXT` rows a single rejection diagnostic renders.
+const ANCHOR_CONTEXT_MAX_ROWS: usize = 40;
+
+/// Collect every 1-indexed anchor line the ops reference, in order. Shared by
+/// the 3-way recovery path and the mismatch diagnostics so both report the
+/// same positions.
+pub fn collect_anchor_lines(ops: &[parser::Op]) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for op in ops {
+        match op {
+            parser::Op::Swap { start, end, .. }
+            | parser::Op::Del { start, end }
+            | parser::Op::Cut { start, end } => {
+                for l in *start..=*end {
+                    lines.push(l);
+                }
+            }
+            parser::Op::Ins {
+                anchor: Some(a), ..
+            }
+            | parser::Op::Paste {
+                anchor: Some(a), ..
+            } => lines.push(*a),
+            parser::Op::SwapBlk { start, .. }
+            | parser::Op::DelBlk { start }
+            | parser::Op::CutBlk { start }
+            | parser::Op::InsBlkPost { anchor: start, .. } => lines.push(*start),
+            parser::Op::Ins { anchor: None, .. } | parser::Op::Paste { anchor: None, .. } => {}
+        }
+    }
+    lines
+}
+
+/// Render the live file's content around an edit's anchor lines as `N:TEXT`
+/// rows — windows of ±2 lines, merged where they overlap, gaps marked `...` —
+/// so a rejected edit shows the model what actually sits at the positions it
+/// claimed. Returns an empty string when there are no anchors or no lines to
+/// show. Anchors beyond the file are clamped into it.
+pub fn anchored_context(ops: &[parser::Op], current: &str) -> String {
+    let total = current.lines().count();
+    if total == 0 {
+        return String::new();
+    }
+    let anchors = collect_anchor_lines(ops);
+    if anchors.is_empty() {
+        return String::new();
+    }
+    let mut anchors = anchors;
+    anchors.sort_unstable();
+    anchors.dedup();
+    // Merge each anchor's ±2 window into contiguous 1-indexed ranges. Anchors
+    // past EOF clamp into the file so no window is empty.
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for a in anchors {
+        let a = a.min(total);
+        let start = a.saturating_sub(ANCHOR_CONTEXT_LINES).max(1);
+        let end = (a + ANCHOR_CONTEXT_LINES).min(total);
+        if let Some(last) = windows.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            windows.push((start, end));
+        }
+    }
+    let lines: Vec<&str> = current.lines().collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut truncated = false;
+    'outer: for (wi, &(wstart, wend)) in windows.iter().enumerate() {
+        if wi > 0 {
+            rows.push("...".to_string());
+        }
+        for line_no in wstart..=wend {
+            rows.push(format!("{line_no}:{}", lines[line_no - 1]));
+            if rows.len() >= ANCHOR_CONTEXT_MAX_ROWS {
+                truncated = true;
+                break 'outer;
+            }
+        }
+    }
+    if truncated {
+        rows.push("... (context truncated)".to_string());
+    }
+    rows.join("\n")
+}
+
 /// A 1-indexed inclusive line range for partial display. `end: None` extends
 /// to the end of the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,17 +368,20 @@ pub fn has_bom(raw: &str) -> bool {
     raw.starts_with('\u{feff}')
 }
 
-/// Format a file for `read` output: a `[path#TAG]` header followed by
+/// Format a file for `read` output: an optional `[path#TAG]` header followed by
 /// `N:TEXT` numbered lines. The caller is responsible for recording the snapshot
-/// before formatting so the tag is stable.
-pub fn format_numbered(path: &str, text: &str, tag: &str) -> String {
+/// before formatting so the tag is stable. Pass `tag: None` to omit the header
+/// (files over [`SNAPSHOT_MAX_BYTES`] carry no tag, so no header).
+pub fn format_numbered(path: &str, text: &str, tag: Option<&str>) -> String {
     let mut out = String::with_capacity(text.len() + path.len() + 16);
-    out.push('[');
-    out.push_str(path);
-    out.push('#');
-    out.push_str(tag);
-    out.push(']');
-    out.push('\n');
+    if let Some(tag) = tag {
+        out.push('[');
+        out.push_str(path);
+        out.push('#');
+        out.push_str(tag);
+        out.push(']');
+        out.push('\n');
+    }
     for (i, line) in text.lines().enumerate() {
         use std::fmt::Write as _;
         let _ = write!(out, "{}:{}", i + 1, line);
@@ -294,7 +406,12 @@ const RANGE_TRAILING_CONTEXT: usize = 3;
 ///
 /// Snapshot is always computed from the full file text — this function only
 /// controls display. An empty `ranges` slice falls back to [`format_numbered`].
-pub fn format_numbered_range(path: &str, text: &str, tag: &str, ranges: &[LineRange]) -> String {
+pub fn format_numbered_range(
+    path: &str,
+    text: &str,
+    tag: Option<&str>,
+    ranges: &[LineRange],
+) -> String {
     if ranges.is_empty() {
         return format_numbered(path, text, tag);
     }
@@ -329,7 +446,9 @@ pub fn format_numbered_range(path: &str, text: &str, tag: &str, ranges: &[LineRa
 
     let mut out = String::with_capacity(text.len() / 2 + path.len() + 16);
     use std::fmt::Write as _;
-    let _ = writeln!(out, "[{path}#{tag}]");
+    if let Some(tag) = tag {
+        let _ = writeln!(out, "[{path}#{tag}]");
+    }
 
     for (wi, &(wstart, wend)) in windows.iter().enumerate() {
         if wi > 0 {
@@ -417,7 +536,7 @@ mod tests {
 
     #[test]
     fn format_numbered_shapes_header_and_lines() {
-        let out = format_numbered("a.rs", "fn main() {\n}", "1A2B3C");
+        let out = format_numbered("a.rs", "fn main() {\n}", Some("1A2B3C"));
         assert_eq!(out, "[a.rs#1A2B3C]\n1:fn main() {\n2:}");
     }
 
@@ -432,8 +551,8 @@ mod tests {
     fn format_numbered_range_empty_ranges_falls_back() {
         let text = ten_line_file();
         let tag = compute_tag(&text);
-        let out = format_numbered_range("f.rs", &text, &tag, &[]);
-        assert_eq!(out, format_numbered("f.rs", &text, &tag));
+        let out = format_numbered_range("f.rs", &text, Some(&tag), &[]);
+        assert_eq!(out, format_numbered("f.rs", &text, Some(&tag)));
     }
 
     #[test]
@@ -445,7 +564,7 @@ mod tests {
             start: 5,
             end: Some(7),
         }];
-        let out = format_numbered_range("f.rs", &text, &tag, &ranges);
+        let out = format_numbered_range("f.rs", &text, Some(&tag), &ranges);
         assert!(out.contains("4:line4"), "leading context: {out}");
         assert!(out.contains("5:line5"));
         assert!(out.contains("6:line6"));
@@ -473,7 +592,7 @@ mod tests {
                 end: Some(90),
             },
         ];
-        let out = format_numbered_range("f.rs", &text, &tag, &ranges);
+        let out = format_numbered_range("f.rs", &text, Some(&tag), &ranges);
         assert!(
             out.contains("...\n"),
             "gap marker between disjoint ranges: {out}"

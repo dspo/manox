@@ -75,11 +75,14 @@ impl AgentTool for WriteTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
 
-        // Record a snapshot so subsequent edit calls have a valid tag. The
-        // model authored the whole file, so every line counts as seen — a
-        // follow-up edit on the returned tag must not trip the seen-line gate.
         let normalized = hashline::normalize_to_lf(&content);
-        let snap = {
+        // The model authored the whole file, so every line counts as seen — a
+        // follow-up edit on the returned tag must not trip the seen-line gate.
+        // Files over the snapshot cap mint no tag (hashline editing is out of
+        // scope for them).
+        let snap = if normalized.len() > hashline::SNAPSHOT_MAX_BYTES {
+            None
+        } else {
             let mut store = ctx
                 .tool_state()
                 .snapshots
@@ -89,7 +92,7 @@ impl AgentTool for WriteTool {
             let all_lines: std::collections::HashSet<usize> =
                 (1..=normalized.lines().count()).collect();
             store.record_seen_lines(&path, &snap.tag, &all_lines);
-            snap
+            Some(snap)
         };
 
         let mut output = format!("Wrote file: {path}", path = path.display());
@@ -109,11 +112,15 @@ impl AgentTool for WriteTool {
             ));
         }
 
-        output.push_str(&format!(
-            "\n[{path_display}#{tag}]",
-            path_display = path.display(),
-            tag = snap.tag
-        ));
+        match snap {
+            Some(s) => output.push_str(&format!(
+                "\n[{path_display}#{tag}]",
+                path_display = path.display(),
+                tag = s.tag
+            )),
+            None => output
+                .push_str("\n(no snapshot: file exceeds 4MB — use `Write` for further changes)"),
+        }
 
         Ok(AgentToolResult::text(output))
     }

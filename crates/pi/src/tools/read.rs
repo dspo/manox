@@ -32,7 +32,9 @@ impl AgentTool for ReadTool {
         "Read a file with optional line-range paging. Output format: first line \
          `[<path>#<TAG>]` (6-hex snapshot tag for follow-up edits), followed by \
          `N:TEXT` numbered rows (1-indexed). Without offset/limit the first \
-         2000 lines are returned; use offset/limit to page through longer files."
+         2000 lines are returned; use offset/limit to page through longer files. \
+         Files over 4MB are served without the `[path#tag]` header (hashline Edit \
+         is unavailable for them; use Write)."
     }
     fn is_read_only(&self) -> bool {
         true
@@ -82,21 +84,25 @@ impl AgentTool for ReadTool {
         let text = hashline::normalize_to_lf(&raw);
         let path_display = path.display().to_string();
 
-        // The snapshot always fingerprints the full file — only display is sliced.
-        let snap = ctx
-            .tool_state()
-            .snapshots
-            .lock()
-            .expect("hashline snapshot store poisoned")
-            .record(&path, &text);
+        // The snapshot always fingerprints the full file — only display is
+        // sliced. Files over the snapshot cap carry no tag and no header.
+        let snap = {
+            let mut store = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned");
+            hashline::record_read_snapshot(&mut store, &path, &text)
+        };
+        let tag = snap.as_ref().map(|s| s.tag.as_str());
 
         let formatted = match (offset, limit) {
-            (None, None) => format_full_read(&path_display, &text, &snap.tag),
+            (None, None) => format_full_read(&path_display, &text, tag),
             _ => {
                 let start = offset.unwrap_or(1);
                 let end = limit.map(|l| start.saturating_add(l).saturating_sub(1));
                 let ranges = [LineRange { start, end }];
-                hashline::format_numbered_range(&path_display, &text, &snap.tag, &ranges)
+                hashline::format_numbered_range(&path_display, &text, tag, &ranges)
             }
         };
         let config = TruncateConfig {
@@ -109,7 +115,9 @@ impl AgentTool for ReadTool {
         // truncated body — intent ranges would over-claim when the byte/line
         // guard clipped rows the model never received.
         let displayed = hashline::parse_seen_lines_from_body(&result.content);
-        if !displayed.is_empty() {
+        if !displayed.is_empty()
+            && let Some(snap) = snap.as_ref()
+        {
             ctx.tool_state()
                 .snapshots
                 .lock()
@@ -124,6 +132,9 @@ impl AgentTool for ReadTool {
                 result.original_lines, result.original_bytes
             ));
         }
+        if snap.is_none() {
+            output.push_str("\n\n[no snapshot: file exceeds 4MB — hashline `Edit` is unavailable; use `Write` for changes]");
+        }
 
         Ok(AgentToolResult::text(output))
     }
@@ -132,7 +143,7 @@ impl AgentTool for ReadTool {
 /// Format an unqualified read. The output caps at [`ReadTool::MAX_READ_LINES`]
 /// lines — a full-file dump of a 100k-line file would flood the context; the
 /// hint points the model at offset/limit paging for the rest.
-fn format_full_read(path_display: &str, text: &str, tag: &str) -> String {
+fn format_full_read(path_display: &str, text: &str, tag: Option<&str>) -> String {
     const MAX: usize = ReadTool::MAX_READ_LINES;
     let line_count = text.lines().count();
     if line_count <= MAX {
@@ -159,7 +170,7 @@ mod tests {
     #[test]
     fn small_file_is_not_capped() {
         let text = "a\nb\nc";
-        let out = format_full_read("/tmp/f.txt", text, "AB12");
+        let out = format_full_read("/tmp/f.txt", text, Some("AB12"));
         assert!(out.contains("3:c"));
         assert!(!out.contains("Showing lines"));
     }
@@ -167,7 +178,7 @@ mod tests {
     #[test]
     fn large_file_caps_at_max_lines_with_paging_hint() {
         let text: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
-        let out = format_full_read("/tmp/big.txt", &text, "AB12");
+        let out = format_full_read("/tmp/big.txt", &text, Some("AB12"));
         assert!(out.contains("1:line 1"));
         assert!(out.contains("2000:line 2000"));
         // format_numbered_range appends 3 trailing context lines; nothing

@@ -462,7 +462,7 @@ impl ApprovalGatedTool {
                     return deny();
                 };
                 let file_patches = match pi::hashline::parse_patch(patch) {
-                    Ok(p) => p,
+                    Ok(p) => p.files,
                     // Unverifiable targets fail closed (the Edit tool
                     // rejects malformed hashline anyway).
                     Err(_) => return deny(),
