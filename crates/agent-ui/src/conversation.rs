@@ -1269,9 +1269,14 @@ impl ConversationState {
                     // `render_ask_user_card` while pending and a plain answered
                     // card once its result lands.
                     if let Some(ix) = self.find_tool(id, cx) {
+                        let carries_args = input.is_some();
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::ToolCall(t) = item.kind_mut() {
-                                t.title = title.clone();
+                                // Arg-less lifecycle events advance the status
+                                // only; the argument-derived title stays.
+                                if carries_args {
+                                    t.title = title.clone();
+                                }
                                 t.status = *status;
                                 t.name = name.clone();
                             }
@@ -1312,13 +1317,18 @@ impl ConversationState {
                         let name = name.clone();
                         let title = title.clone();
                         let status = *status;
-                        let input = input.clone().unwrap_or(serde_json::Value::Null);
+                        let input = input.clone();
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::ToolCall(t) = item.kind_mut() {
                                 t.name = name;
-                                t.title = title;
                                 t.status = status;
-                                t.input = input;
+                                // Status-only events carry no arguments: they
+                                // must not downgrade the argument-derived
+                                // title/input minted by the start event.
+                                if let Some(input) = input {
+                                    t.title = title;
+                                    t.input = input;
+                                }
                                 if matches!(
                                     status,
                                     ToolCallStatus::Success
@@ -1357,14 +1367,18 @@ impl ConversationState {
                         let name = name.clone();
                         let title = title.clone();
                         let status = *status;
-                        let entry_input = input.clone().unwrap_or(serde_json::Value::Null);
+                        let event_input = input.clone();
                         self.items[cix].update(cx, |item, cx| {
                             if let ConvItem::Thinking(t) = item.kind_mut() {
                                 if let Some(entry) = t.get_tool_entry_mut(&id) {
-                                    entry.title = title;
                                     entry.name = name;
                                     entry.status = status;
-                                    entry.input = entry_input;
+                                    // Arg-less events advance the status only;
+                                    // the start event's title/input stay.
+                                    if let Some(input) = event_input {
+                                        entry.title = title;
+                                        entry.input = input;
+                                    }
                                     if matches!(
                                         status,
                                         ToolCallStatus::Success
@@ -1384,7 +1398,7 @@ impl ConversationState {
                                         status,
                                         output: String::new(),
                                         is_error: false,
-                                        input: entry_input,
+                                        input: event_input.unwrap_or(serde_json::Value::Null),
                                         streaming: matches!(status, ToolCallStatus::Running),
                                         collapsed: !matches!(
                                             status,
@@ -3841,6 +3855,83 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(kinds, vec!["user", "segment", "notice"]);
+            });
+        });
+    }
+
+    /// The terminal tool-call event carries no arguments (`input: None`): it
+    /// advances the status only — the argument-derived title/input minted by
+    /// the start event stays, while argument-carrying events still redefine
+    /// the display (the rename flow relies on it).
+    #[gpui::test]
+    fn argless_tool_end_event_keeps_title_and_input(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx { weak, cwd: None };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let outcome = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        title: "Read src/main.rs".into(),
+                        status: ToolCallStatus::Running,
+                        input: Some(serde_json::json!({"path": "src/main.rs"})),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+
+                let outcome = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        title: "Read".into(),
+                        status: ToolCallStatus::Success,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Remeasure(0)));
+
+                let tool_entry = |c: &ConversationState, cx: &gpui::App| -> ToolCallItem {
+                    let ConvItem::Thinking(t) = c.items()[0].read(cx).kind() else {
+                        panic!("expected activity segment");
+                    };
+                    let Some(ActivityEntry::Tool(entry)) = t.entries.first() else {
+                        panic!("expected tool entry");
+                    };
+                    entry.clone()
+                };
+                let entry = tool_entry(c, cx);
+                assert_eq!(entry.title, "Read src/main.rs");
+                assert_eq!(entry.input, serde_json::json!({"path": "src/main.rs"}));
+                assert_eq!(entry.status, ToolCallStatus::Success);
+
+                // An argument-carrying event redefines the display again.
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        title: "Read src/lib.rs".into(),
+                        status: ToolCallStatus::Success,
+                        input: Some(serde_json::json!({"path": "src/lib.rs"})),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                let entry = tool_entry(c, cx);
+                assert_eq!(entry.title, "Read src/lib.rs");
+                assert_eq!(entry.input, serde_json::json!({"path": "src/lib.rs"}));
             });
         });
     }

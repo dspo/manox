@@ -454,10 +454,11 @@ fn message_error_text(message: &AgentMessage) -> String {
     }
 }
 
-/// Human-readable tool card title from the pi tool name + arguments.
-/// Browser tools (WebExplore* / ChromeUse*) surface their url, tab id, or
-/// element ref so interaction cards carry the decision-relevant target. Falls
-/// back to the bare name for tools without a recognized target field.
+/// Human-readable tool card title from the pi tool name + arguments. Each
+/// arm surfaces the tool's decision-relevant target (path, url, command,
+/// agent address, …); browser tools (WebExplore* / ChromeUse*) carry their
+/// url, tab id, or element ref. Unrecognized tools fall back to their first
+/// string argument, then to the bare name.
 pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| -> Option<String> {
         args.get(key)
@@ -470,9 +471,10 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(path) => format!("{name} {path}"),
             None => name.to_string(),
         },
-        "Edit" | "EditDiff" => match arg("path") {
-            Some(path) => format!("Edit {path}"),
-            None => "Edit".to_string(),
+        "Edit" => match edit_patch_paths(args).as_slice() {
+            [] => "Edit".to_string(),
+            [only] => format!("Edit {only}"),
+            [first, rest @ ..] => format!("Edit {first} +{}", rest.len()),
         },
         "Grep" => match (arg("pattern"), arg("path")) {
             (Some(pattern), Some(path)) => format!("Grep {pattern} {path}"),
@@ -487,11 +489,122 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(command) => format!("$ {command}"),
             None => "Bash".to_string(),
         },
-        "BashOutput" => "BashOutput".to_string(),
-        "TaskStop" => "TaskStop".to_string(),
+        "BashOutput" => match arg("shell_id") {
+            Some(shell_id) => format!("BashOutput {shell_id}"),
+            None => "BashOutput".to_string(),
+        },
+        "TaskStop" => match arg("task_id") {
+            Some(task_id) => format!("TaskStop {task_id}"),
+            None => "TaskStop".to_string(),
+        },
+        "Monitor" => {
+            let ws_url = || {
+                args.get("ws")
+                    .and_then(|w| w.get("url"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            match arg("command")
+                .or_else(ws_url)
+                .or_else(|| arg("description"))
+            {
+                Some(target) => format!("Monitor {target}"),
+                None => "Monitor".to_string(),
+            }
+        }
+        "WebFetch" => match arg("url") {
+            Some(url) => format!("WebFetch {url}"),
+            None => "WebFetch".to_string(),
+        },
+        "Steer" => {
+            let to = args.get("to");
+            let addr = to
+                .and_then(|t| t.get("agent_address"))
+                .and_then(|v| v.as_str());
+            let spawn = to.and_then(|t| t.get("spawn")).and_then(|v| v.as_str());
+            match (spawn, addr) {
+                (Some(spawn), Some(addr)) => format!("Steer {spawn} {addr}"),
+                (Some(spawn), None) => format!("Steer {spawn}"),
+                (None, Some(addr)) => match arg("reason") {
+                    Some(reason) => format!("Steer {reason} {addr}"),
+                    None => format!("Steer {addr}"),
+                },
+                (None, None) => "Steer".to_string(),
+            }
+        }
         "Agent" => match arg("subagent_type") {
             Some(kind) => format!("Agent {kind}"),
             None => "Agent".to_string(),
+        },
+        "Skill" => match arg("skill").or_else(|| arg("name")) {
+            Some(skill) => format!("Skill {skill}"),
+            None => "Skill".to_string(),
+        },
+        // Code carries a code body as its argument: the bare name keeps the
+        // body out of the header.
+        "Code" => "Code".to_string(),
+        "ProposePlan" => match arg("title").or_else(|| arg("slug")) {
+            Some(label) => format!("ProposePlan {label}"),
+            None => "ProposePlan".to_string(),
+        },
+        "UpdatePlan" => match args.get("plan").and_then(|v| v.as_array()) {
+            Some(steps) => format!("UpdatePlan ({} steps)", steps.len()),
+            None => "UpdatePlan".to_string(),
+        },
+        "TaskCreate" => match arg("subject") {
+            Some(subject) => format!("TaskCreate {subject}"),
+            None => "TaskCreate".to_string(),
+        },
+        "TaskUpdate" => match arg("id") {
+            Some(id) => match arg("status") {
+                Some(status) => format!("TaskUpdate {id}→{status}"),
+                None => format!("TaskUpdate {id}"),
+            },
+            None => "TaskUpdate".to_string(),
+        },
+        "TaskGet" => match arg("id") {
+            Some(id) => format!("TaskGet {id}"),
+            None => "TaskGet".to_string(),
+        },
+        "CreateGoal" => match arg("objective") {
+            Some(objective) => format!("CreateGoal {}", short_value(&objective, 40)),
+            None => "CreateGoal".to_string(),
+        },
+        "UpdateGoal" => match arg("status") {
+            Some(status) => format!("UpdateGoal {status}"),
+            None => "UpdateGoal".to_string(),
+        },
+        "EnterWorktree" => match arg("name").or_else(|| arg("path")) {
+            Some(target) => format!("EnterWorktree {target}"),
+            None => "EnterWorktree".to_string(),
+        },
+        "ExitWorktree" => match arg("action") {
+            Some(action) => format!("ExitWorktree {action}"),
+            None => "ExitWorktree".to_string(),
+        },
+        "LspStatus" | "LspEnsure" | "LspWaitReady" => match arg("language") {
+            Some(language) => format!("{name} {language}"),
+            None => name.to_string(),
+        },
+        "GoToDefinition" | "FindReferences" | "Hover" => {
+            let line = args.get("line").and_then(|v| v.as_u64());
+            match (arg("path"), line, arg("symbol")) {
+                (Some(path), Some(line), Some(symbol)) => {
+                    format!("{name} {path}:{line} {symbol}")
+                }
+                (Some(path), Some(line), None) => format!("{name} {path}:{line}"),
+                (Some(path), None, _) => format!("{name} {path}"),
+                _ => name.to_string(),
+            }
+        }
+        "DocumentSymbols" | "Diagnostics" => match arg("path") {
+            Some(path) => format!("{name} {path}"),
+            None => name.to_string(),
+        },
+        "WorkspaceSymbols" => match arg("query") {
+            Some(query) => format!("WorkspaceSymbols {query}"),
+            None => "WorkspaceSymbols".to_string(),
         },
         "WebExploreOpen" | "ChromeUseOpen" => match arg("url").or_else(|| arg("cdp_endpoint")) {
             Some(target) => format!("{name} {target}"),
@@ -509,8 +622,64 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
                 _ => other.to_string(),
             }
         }
-        _ => name.to_string(),
+        other => match first_string_arg(args) {
+            Some(value) => format!("{other} {}", short_value(&value, 40)),
+            None => other.to_string(),
+        },
     }
+}
+
+/// File paths a hashline patch touches, parsed from its `[<path>#<tag>]`
+/// section headers (display-only; the tag is not validated).
+fn edit_patch_paths(args: &serde_json::Value) -> Vec<String> {
+    let Some(patch) = args.get("patch").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    patch
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+            let (path, tag) = rest.rsplit_once('#')?;
+            if path.is_empty() || tag.is_empty() {
+                return None;
+            }
+            Some(unquote_path(path).to_string())
+        })
+        .collect()
+}
+
+/// One pair of surrounding single/double quotes stripped — hashline section
+/// headers quote paths containing spaces.
+fn unquote_path(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Char-capped copy of a string with an ellipsis when it was clipped.
+fn short_value(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// The first string-typed argument value of a tool call (unknown/MCP tools
+/// use it as a generic title hint). Iteration follows the model's argument
+/// order (workspace-wide serde_json `preserve_order`), so one call always
+/// resolves the same value.
+fn first_string_arg(args: &serde_json::Value) -> Option<String> {
+    args.as_object()?
+        .values()
+        .find_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
 }
 
 /// Map one child sub-agent `AgentEvent` onto the observation events the
@@ -715,5 +884,179 @@ mod tests {
         // Unrecognized shapes fall back to the bare name.
         assert_eq!(tool_title("ChromeUseClose", &json!({})), "ChromeUseClose");
         assert_eq!(tool_title("Bash", &json!({})), "Bash");
+    }
+
+    #[test]
+    fn tool_titles_surface_host_tool_targets() {
+        // Steer: a spawn carries the def name + address; Inject/Abort carry
+        // the reason + address.
+        assert_eq!(
+            tool_title(
+                "Steer",
+                &json!({
+                    "to": {"agent_address": "sailor-1", "spawn": "Sailor"},
+                    "reason": "Dispatch",
+                    "prompt": "fix the bug"
+                })
+            ),
+            "Steer Sailor sailor-1"
+        );
+        assert_eq!(
+            tool_title(
+                "Steer",
+                &json!({
+                    "to": {"agent_address": "sailor-1"},
+                    "reason": "Inject",
+                    "prompt": "a note"
+                })
+            ),
+            "Steer Inject sailor-1"
+        );
+        assert_eq!(tool_title("Steer", &json!({})), "Steer");
+
+        // Edit: paths come from the patch section headers.
+        assert_eq!(
+            tool_title(
+                "Edit",
+                &json!({"patch": "[/proj/src/main.rs#A1B2C3]\nSWAP 1.=2:\n+x"})
+            ),
+            "Edit /proj/src/main.rs"
+        );
+        assert_eq!(
+            tool_title(
+                "Edit",
+                &json!({"patch": "[/a.rs#A1B2C3]\nDEL 1.=1\n[/b.rs#D4E5F6]\nDEL 1.=1"})
+            ),
+            "Edit /a.rs +1"
+        );
+        assert_eq!(tool_title("Edit", &json!({})), "Edit");
+        // Quoted section headers (paths with spaces) surface unquoted.
+        assert_eq!(
+            tool_title(
+                "Edit",
+                &json!({"patch": "[\"/my docs/a b.rs\"#A1B2C3]\nDEL 1.=1"})
+            ),
+            "Edit /my docs/a b.rs"
+        );
+
+        assert_eq!(tool_title("Skill", &json!({"skill": "gpui"})), "Skill gpui");
+        // Code keeps the bare name — its argument is a code body.
+        assert_eq!(tool_title("Code", &json!({"code": "let x = 1;"})), "Code");
+
+        assert_eq!(
+            tool_title("ProposePlan", &json!({"slug": "s", "title": "My Plan"})),
+            "ProposePlan My Plan"
+        );
+        assert_eq!(
+            tool_title("ProposePlan", &json!({"slug": "my-slug"})),
+            "ProposePlan my-slug"
+        );
+        assert_eq!(
+            tool_title(
+                "UpdatePlan",
+                &json!({"plan": [
+                    {"status": "pending", "step": "a"},
+                    {"status": "pending", "step": "b"}
+                ]})
+            ),
+            "UpdatePlan (2 steps)"
+        );
+        assert_eq!(
+            tool_title("TaskCreate", &json!({"subject": "fix bug"})),
+            "TaskCreate fix bug"
+        );
+        assert_eq!(
+            tool_title("TaskUpdate", &json!({"id": "t1", "status": "completed"})),
+            "TaskUpdate t1→completed"
+        );
+        assert_eq!(tool_title("TaskGet", &json!({"id": "t1"})), "TaskGet t1");
+        assert_eq!(tool_title("TaskList", &json!({})), "TaskList");
+        assert_eq!(tool_title("GetGoal", &json!({})), "GetGoal");
+        assert_eq!(
+            tool_title("UpdateGoal", &json!({"status": "complete"})),
+            "UpdateGoal complete"
+        );
+        assert_eq!(
+            tool_title("EnterWorktree", &json!({"name": "wt-fix"})),
+            "EnterWorktree wt-fix"
+        );
+        assert_eq!(
+            tool_title("ExitWorktree", &json!({"action": "keep"})),
+            "ExitWorktree keep"
+        );
+        assert_eq!(
+            tool_title("WebFetch", &json!({"url": "https://example.com/doc"})),
+            "WebFetch https://example.com/doc"
+        );
+        assert_eq!(
+            tool_title(
+                "Monitor",
+                &json!({"description": "watch", "command": "cargo build"})
+            ),
+            "Monitor cargo build"
+        );
+        assert_eq!(
+            tool_title(
+                "Monitor",
+                &json!({"description": "watch", "ws": {"url": "wss://x/ws"}})
+            ),
+            "Monitor wss://x/ws"
+        );
+        assert_eq!(
+            tool_title("BashOutput", &json!({"shell_id": "sh_3"})),
+            "BashOutput sh_3"
+        );
+        assert_eq!(
+            tool_title("TaskStop", &json!({"task_id": "mon_2"})),
+            "TaskStop mon_2"
+        );
+        assert_eq!(
+            tool_title("LspEnsure", &json!({"language": "rust"})),
+            "LspEnsure rust"
+        );
+        assert_eq!(
+            tool_title(
+                "GoToDefinition",
+                &json!({"path": "src/main.rs", "line": 12, "symbol": "run"})
+            ),
+            "GoToDefinition src/main.rs:12 run"
+        );
+        assert_eq!(
+            tool_title("DocumentSymbols", &json!({"path": "src/main.rs"})),
+            "DocumentSymbols src/main.rs"
+        );
+        assert_eq!(
+            tool_title("WorkspaceSymbols", &json!({"query": "tool_title"})),
+            "WorkspaceSymbols tool_title"
+        );
+    }
+
+    #[test]
+    fn create_goal_title_caps_the_objective() {
+        let long = "x".repeat(60);
+        let title = tool_title("CreateGoal", &json!({"objective": long}));
+        let rest = title
+            .strip_prefix("CreateGoal ")
+            .expect("CreateGoal prefix");
+        assert_eq!(rest.chars().count(), 41, "40 kept chars + ellipsis");
+        assert!(rest.ends_with('…'));
+    }
+
+    #[test]
+    fn unknown_tools_fall_back_to_first_string_arg() {
+        assert_eq!(
+            tool_title(
+                "mcp_some_server_query",
+                &json!({"limit": 10, "query": "open issues"})
+            ),
+            "mcp_some_server_query open issues"
+        );
+        assert_eq!(
+            tool_title("mcp_no_strings", &json!({"limit": 10})),
+            "mcp_no_strings"
+        );
+        let long = "y".repeat(50);
+        let title = tool_title("mcp_long", &json!({"text": long}));
+        assert_eq!(title, format!("mcp_long {}…", "y".repeat(40)));
     }
 }
