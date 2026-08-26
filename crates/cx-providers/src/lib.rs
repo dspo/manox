@@ -882,11 +882,13 @@ pub fn migrate_legacy_provider_config(current_path: &Path, legacy_path: &Path) -
 /// Copy the provider config from the retired `~/.config/cx` root when the new
 /// `~/.manox` root has no config yet (first run after the root move). The old
 /// file is left in place — pruning the old root is the manual migration step.
-fn migrate_legacy_root_provider_config(current_path: &Path) -> Result<bool> {
+///
+/// `old_root` is the retired state dir supplied by the caller rather than read
+/// from the process-global `HOME`, so the function carries no ambient state.
+fn migrate_legacy_root_provider_config(current_path: &Path, old_root: &Path) -> Result<bool> {
     if current_path.exists() {
         return Ok(false);
     }
-    let old_root = legacy_cx_state_dir();
     if old_root.as_os_str().is_empty() {
         return Ok(false);
     }
@@ -917,7 +919,7 @@ pub fn active_provider_config_path() -> Result<PathBuf> {
     let current_path = default_config_path()?;
     let legacy_path = legacy_provider_config_path()?;
     migrate_legacy_provider_config(&current_path, &legacy_path)?;
-    migrate_legacy_root_provider_config(&current_path)?;
+    migrate_legacy_root_provider_config(&current_path, &legacy_cx_state_dir())?;
     Ok(current_path)
 }
 
@@ -1599,47 +1601,42 @@ providers:
 
     #[test]
     fn migrate_legacy_root_provider_config_copies_from_old_root() {
-        let old_home = std::env::var_os("HOME");
         let dir = tempfile::tempdir().expect("tempdir");
         let old_root = dir.path().join(".config/cx");
         let new_root = dir.path().join(".manox");
         std::fs::create_dir_all(&old_root).unwrap();
         let content = "providers: []\nagents: []\n";
         std::fs::write(old_root.join(PROVIDER_CONFIG_FILE_NAME), content).unwrap();
-        unsafe { std::env::set_var("HOME", dir.path()) };
 
         let current_path = new_root.join(PROVIDER_CONFIG_FILE_NAME);
-        let migrated = migrate_legacy_root_provider_config(&current_path).unwrap();
+        let migrated = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
         assert!(migrated);
         // The old root keeps its file — pruning it is the manual migration step.
         assert!(old_root.join(PROVIDER_CONFIG_FILE_NAME).exists());
         assert_eq!(std::fs::read_to_string(&current_path).unwrap(), content);
 
         // A second run is a no-op once the new root has a config.
-        let again = migrate_legacy_root_provider_config(&current_path).unwrap();
+        let again = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
         assert!(!again);
+    }
 
-        match old_home {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+    #[test]
+    fn migrate_legacy_root_provider_config_noop_with_empty_old_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current_path = dir.path().join(PROVIDER_CONFIG_FILE_NAME);
+        let migrated = migrate_legacy_root_provider_config(&current_path, Path::new("")).unwrap();
+        assert!(!migrated);
+        assert!(!current_path.exists());
     }
 
     #[test]
     fn migrate_legacy_root_provider_config_noop_without_old_root() {
-        let old_home = std::env::var_os("HOME");
         let dir = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("HOME", dir.path()) };
-
+        let old_root = dir.path().join(".config/cx");
         let current_path = dir.path().join(".manox").join(PROVIDER_CONFIG_FILE_NAME);
-        let migrated = migrate_legacy_root_provider_config(&current_path).unwrap();
+        let migrated = migrate_legacy_root_provider_config(&current_path, &old_root).unwrap();
         assert!(!migrated);
         assert!(!current_path.exists());
-
-        match old_home {
-            Some(home) => unsafe { std::env::set_var("HOME", home) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[test]
