@@ -31,10 +31,10 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# --- Ensure npm dependencies ---
-if [[ ! -d vscode/node_modules ]]; then
+# --- Ensure npm dependencies (npm ci when missing or lockfile newer) ---
+if [[ ! -d vscode/node_modules || vscode/package-lock.json -nt vscode/node_modules ]]; then
     echo "Installing npm dependencies"
-    (cd vscode && npm install)
+    (cd vscode && npm ci)
 fi
 
 # --- Build the extension (release napi binding) ---
@@ -56,3 +56,4 @@ echo "Installing ${vsix} via ${code_bin}"
 "$code_bin" --install-extension "$vsix" --force
 
 echo "Installed: ${vsix}"
+echo "Restart Visual Studio Code to activate the installed extension."

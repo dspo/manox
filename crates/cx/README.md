@@ -40,7 +40,12 @@ This builds the release binary and installs it to `~/.local/bin/cx`. If
 `~/.local/bin` is not already in `PATH`, add it before invoking `cx`.
 
 Alternatively, run `script/install-cx` from the repository root — it wraps
-the same `cargo install` command.
+the same `cargo install` command (`CX_INSTALL_DIR` overrides the install
+root).
+
+If you previously used the old `ccc` launcher, remove its leftovers
+manually: `rm -f ~/.local/bin/ccc` and delete any `ccc` shim functions
+from your shell rc file.
 
 ## Runtime provider config
 

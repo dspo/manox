@@ -7,7 +7,7 @@
 #   -h          Display this help and exit
 set -euo pipefail
 
-build_flag=""
+build_args=()
 profile_dir="debug"
 
 help_info() {
@@ -23,7 +23,7 @@ Options:
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --release) build_flag="--release"; profile_dir="release";;
+        --release) build_args+=(--release); profile_dir="release";;
         -h|--help) help_info; exit 0;;
         *) echo "Error: unknown option '$1'"; help_info; exit 1;;
     esac
@@ -34,7 +34,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # 1. Build the napi core (cdylib) and stage it next to the compiled extension.
-cargo build ${build_flag} -p manox-napi
+cargo build ${build_args[@]+"${build_args[@]}"} -p manox-napi
 LIB=""
 for candidate in target/${profile_dir}/libmanox_napi.dylib target/${profile_dir}/libmanox_napi.so target/${profile_dir}/manox_napi.dll; do
   if [ -f "$candidate" ]; then

@@ -7,6 +7,10 @@ set -euo pipefail
 # Usage: script/install-cx [options]
 # Options:
 #   -h    Display this help and exit
+#
+# Environment:
+#   CX_INSTALL_DIR    Override the install root (default: ~/.local); the
+#                     binary lands in <CX_INSTALL_DIR>/bin/cx.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -29,7 +33,8 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-cargo install --path crates/cx --root "$HOME/.local" --locked
+install_root="${CX_INSTALL_DIR:-$HOME/.local}"
+cargo install --path crates/cx --root "$install_root" --locked
 
-echo "Installed: $HOME/.local/bin/cx"
-echo "Make sure ~/.local/bin is on your PATH."
+echo "Installed: $install_root/bin/cx"
+echo "Make sure $install_root/bin is on your PATH."
