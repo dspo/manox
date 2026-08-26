@@ -9,7 +9,9 @@
 use std::ops::Range;
 
 use gpui::{FontStyle, FontWeight, HighlightStyle};
-use hyperlinks::{OverlaySpan, UrlKind, default_path_options, detect_paths, detect_urls, is_covered};
+use hyperlinks::{
+    OverlaySpan, UrlKind, default_path_options, detect_paths, detect_urls, is_covered,
+};
 use markdown::mdast::{AlignKind, Node};
 use markdown::{ParseOptions, to_mdast};
 /// The kind of a clickable link span.
@@ -649,4 +651,3 @@ mod tests {
         assert!(runs.link_spans.is_empty());
     }
 }
-

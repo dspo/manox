@@ -2,13 +2,24 @@
 
 use crate::shared::{OverlaySpan, UrlKind};
 
-
 /// Recognized URL schemes, longest prefix first so `https://` wins over
 /// `http:` inside a scan position. Schemes without `//` (mailto, ssh, …)
 /// still require content after the prefix to match.
 pub const SCHEMES: &[&str] = &[
-    "ipfs:", "ipns:", "magnet:", "mailto:", "gemini://", "gopher://", "https://",
-    "http://", "news:", "file://", "git://", "ssh:", "ftp://", "zed://",
+    "ipfs:",
+    "ipns:",
+    "magnet:",
+    "mailto:",
+    "gemini://",
+    "gopher://",
+    "https://",
+    "http://",
+    "news:",
+    "file://",
+    "git://",
+    "ssh:",
+    "ftp://",
+    "zed://",
 ];
 
 /// Characters that end a URL scan. Unlike trailing punctuation they are never
@@ -104,4 +115,3 @@ pub fn trim_url(raw: &str) -> &str {
     }
     &raw[start..end]
 }
-

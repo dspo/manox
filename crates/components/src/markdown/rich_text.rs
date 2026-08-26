@@ -1035,5 +1035,3 @@ mod tests {
         assert!(selection.hovered().is_some());
     }
 }
-
-

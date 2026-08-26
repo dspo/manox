@@ -143,4 +143,3 @@ pub fn default_path_options() -> PathOptions {
         known_extensions: Vec::new(),
     }
 }
-

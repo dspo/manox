@@ -565,4 +565,3 @@ mod tests {
         assert_eq!(ceil_char_boundary("é", 1), 2);
     }
 }
-

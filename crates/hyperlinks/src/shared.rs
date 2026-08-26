@@ -43,9 +43,9 @@ pub fn consolidate(spans: Vec<OverlaySpan>) -> Vec<OverlaySpan> {
     });
     let mut out: Vec<OverlaySpan> = Vec::new();
     for span in spans {
-        let overlaps = out
-            .last()
-            .is_some_and(|last| last.range.start < span.range.end && span.range.start < last.range.end);
+        let overlaps = out.last().is_some_and(|last| {
+            last.range.start < span.range.end && span.range.start < last.range.end
+        });
         if !overlaps {
             out.push(span);
         }

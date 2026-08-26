@@ -10,7 +10,10 @@ fn urls(text: &str) -> Vec<String> {
 }
 
 fn paths(text: &str, opts: &PathOptions) -> Vec<String> {
-    detect_paths(text, opts).into_iter().map(|s| s.href).collect()
+    detect_paths(text, opts)
+        .into_iter()
+        .map(|s| s.href)
+        .collect()
 }
 
 #[test]
@@ -21,7 +24,10 @@ fn multi_protocol_schemes() {
         urls("mail me mailto:dev@example.com now"),
         vec!["mailto:dev@example.com"]
     );
-    assert_eq!(urls("clone git://github.com/dspo/manox"), vec!["git://github.com/dspo/manox"]);
+    assert_eq!(
+        urls("clone git://github.com/dspo/manox"),
+        vec!["git://github.com/dspo/manox"]
+    );
     assert_eq!(urls("ssh:git@host:repo"), vec!["ssh:git@host:repo"]);
     assert_eq!(urls("ipfs ipfs:QmHash"), vec!["ipfs:QmHash"]);
     assert_eq!(urls("gemini gemini://capsule"), vec!["gemini://capsule"]);
@@ -110,10 +116,7 @@ fn path_with_extension_detected() {
 #[test]
 fn path_line_col_anchor_swallowed() {
     let opts = default_path_options();
-    assert_eq!(
-        paths("see src/main.rs:42", &opts),
-        vec!["src/main.rs:42"]
-    );
+    assert_eq!(paths("see src/main.rs:42", &opts), vec!["src/main.rs:42"]);
     assert_eq!(
         paths("see src/main.rs:42-100", &opts),
         vec!["src/main.rs:42-100"]
