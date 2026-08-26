@@ -54,7 +54,6 @@ impl Default for TerminalTheme {
 impl TerminalTheme {
     /// Build a terminal palette whose bg/fg/cursor track the app theme.
     pub fn from_app_theme(theme: &Theme) -> Self {
-
         let bg = theme.background;
         let fg = theme.foreground;
         // The link underline follows the theme accent, faded to 80% opacity.
@@ -283,4 +282,3 @@ mod tests {
         assert_eq!((rgb.r, rgb.g, rgb.b), (255, 0, 0));
     }
 }
-

@@ -143,6 +143,9 @@ pub struct Terminal {
     pub cwd: PathBuf,
     pub cols: usize,
     pub rows: usize,
+    /// Whether block characters render as sub-grid rects (settings-derived;
+    /// off falls back to font shaping).
+    block_char_render: bool,
     term: Arc<ManoxTermLock>,
     pty: Box<dyn PtySource>,
     output_processor: Processor<StdSyncHandler>,
@@ -275,6 +278,7 @@ impl Terminal {
                 cwd,
                 cols,
                 rows,
+                block_char_render: settings.block_char_render,
                 term,
                 pty,
                 output_processor: Processor::<StdSyncHandler>::new(),
@@ -334,6 +338,12 @@ impl Terminal {
     /// Send input bytes (keystrokes, paste) to the shell.
     pub fn input(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.pty.write(bytes)
+    }
+
+    /// Whether block characters (`▀▌▓…`) paint as sub-grid rects rather than
+    /// font-shaped glyphs. Mirrors the `[terminal] block_char_render` setting.
+    pub fn block_char_render(&self) -> bool {
+        self.block_char_render
     }
 
     /// Name of the process owning the foreground process group, when it is
@@ -698,7 +708,10 @@ fn word_target(term: &ManoxTerm, point: Point, cwd: Option<&Path>) -> Option<Hov
     let trimmed = trim_url(&text).to_owned();
     let span = classify(&trimmed, cwd)?;
     let (start_col, end_col) = if start.line == end.line {
-        (start.column.0, start.column.0 + trimmed.len().saturating_sub(1))
+        (
+            start.column.0,
+            start.column.0 + trimmed.len().saturating_sub(1),
+        )
     } else {
         // The underline covers the hovered row's fragment; trims only shorten
         // the last line's fragment.
@@ -708,18 +721,17 @@ fn word_target(term: &ManoxTerm, point: Point, cwd: Option<&Path>) -> Option<Hov
             0
         };
         let to = if end.line.0 == point.line.0 {
-            end.column.0.saturating_sub(text.len().saturating_sub(trimmed.len()))
+            end.column
+                .0
+                .saturating_sub(text.len().saturating_sub(trimmed.len()))
         } else {
             grid.columns() - 1
         };
         (from, to)
     };
     Some(HoverTarget::from_overlay(
-        &span,
-        // Stamped with the display row by `hover_target`.
-        0,
-        start_col,
-        end_col,
+        &span, // Stamped with the display row by `hover_target`.
+        0, start_col, end_col,
     ))
 }
 
@@ -957,17 +969,26 @@ mod tests {
 
     #[test]
     fn classify_rules() {
-        assert_eq!(classify("https://a.b/c", None), Some(OverlaySpan {
-            href: "https://a.b/c".into(),
-            range: 0..13,
-            kind: UrlKind::Url,
-        }));
-        assert_eq!(classify("http://a.b", None).map(|s| s.kind), Some(UrlKind::Url));
+        assert_eq!(
+            classify("https://a.b/c", None),
+            Some(OverlaySpan {
+                href: "https://a.b/c".into(),
+                range: 0..13,
+                kind: UrlKind::Url,
+            })
+        );
+        assert_eq!(
+            classify("http://a.b", None).map(|s| s.kind),
+            Some(UrlKind::Url)
+        );
         assert_eq!(
             classify("mailto:x@y.z", None).map(|s| s.kind),
             Some(UrlKind::Url)
         );
-        assert_eq!(classify("src/main.rs", None).map(|s| s.kind), Some(UrlKind::Path));
+        assert_eq!(
+            classify("src/main.rs", None).map(|s| s.kind),
+            Some(UrlKind::Path)
+        );
         // Extension-less, non-existent paths need a cwd to classify.
         assert_eq!(classify("/tmp/x", None), None);
         assert_eq!(classify("hello", None), None);
@@ -996,8 +1017,7 @@ mod tests {
         // second display line; hovering the first fragment must still yield
         // the whole URL as one target.
         let term = term_with_size("go https://example.com/verylong/path here\r\n", 20, 4);
-        let target =
-            word_target(&term, Point::new(Line(0), Column(8)), None).expect("wrapped url");
+        let target = word_target(&term, Point::new(Line(0), Column(8)), None).expect("wrapped url");
         assert_eq!(target.text, "https://example.com/verylong/path");
         assert_eq!(target.kind, HoverKind::Url);
         // The underline covers the hovered row's fragment (cols 3..=19).

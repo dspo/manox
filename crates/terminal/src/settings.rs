@@ -116,6 +116,11 @@ pub struct TerminalSettings {
         skip_serializing_if = "is_default_commands_to_skip_shell"
     )]
     pub commands_to_skip_shell: Vec<String>,
+    #[serde(
+        default = "default_block_char_render",
+        skip_serializing_if = "is_default_block_char_render"
+    )]
+    pub block_char_render: bool,
 }
 
 impl Default for TerminalSettings {
@@ -133,6 +138,7 @@ impl Default for TerminalSettings {
             osc52_access: Osc52Access::Allow,
             env: Vec::new(),
             commands_to_skip_shell: default_commands_to_skip_shell(),
+            block_char_render: true,
         }
     }
 }
@@ -225,6 +231,12 @@ fn is_default_commands_to_skip_shell(v: &Vec<String>) -> bool {
     *v == default_commands_to_skip_shell()
 }
 
+fn default_block_char_render() -> bool {
+    true
+}
+fn is_default_block_char_render(b: &bool) -> bool {
+    *b
+}
 /// Wrapper for parsing only the `[terminal]` table from the whole file.
 #[derive(Debug, Default, Deserialize)]
 struct Root {
@@ -288,6 +300,7 @@ mod tests {
         assert!(s.env.is_empty());
         assert!(s.shell.is_none());
         assert_eq!(s.commands_to_skip_shell, default_commands_to_skip_shell());
+        assert!(s.block_char_render);
     }
 
     #[test]
@@ -305,6 +318,7 @@ cursor_blink = "off"
 bell = "visual"
 osc52_access = "deny"
 commands_to_skip_shell = ["ctrl-g"]
+block_char_render = false
 "#;
         let root: Root = toml::from_str(raw).unwrap();
         let s = root.terminal;
@@ -317,5 +331,6 @@ commands_to_skip_shell = ["ctrl-g"]
         assert!(matches!(s.bell, BellMode::Visual));
         assert!(matches!(s.osc52_access, Osc52Access::Deny));
         assert_eq!(s.commands_to_skip_shell, vec!["ctrl-g".to_string()]);
+        assert!(!s.block_char_render);
     }
 }

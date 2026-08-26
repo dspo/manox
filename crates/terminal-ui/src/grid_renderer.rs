@@ -14,6 +14,7 @@
 use gpui::Hsla;
 use terminal::{Cell, Flags};
 
+use crate::block_chars::{BlockRect, COLS, SUBROWS, block_shape, expand};
 use crate::theme::{TerminalTheme, convert, is_default_background};
 
 /// A merged background rectangle in grid coordinates (line/col, not pixels).
@@ -101,19 +102,25 @@ impl BatchedTextRun {
 pub struct GridPlan {
     pub background: Vec<BackgroundRegion>,
     pub runs: Vec<BatchedTextRun>,
+    /// Block-character cells as sub-grid rects, one entry per cell.
+    pub block_rects: Vec<BlockRect>,
 }
 
-/// Batch visible cells into background regions and text runs.
+/// Batch visible cells into background regions, text runs, and block rects.
 ///
 /// `cells` yields `(display_line, column, &Cell)` in display order
 /// (top-to-bottom, left-to-right). The caller is responsible for applying
 /// the display offset when mapping from alacritty's `display_iter`.
+/// `block_char_render` gates the sub-grid path: when off, block characters
+/// fall back to font shaping (shaped as their fallback glyphs).
 pub fn layout_grid<'a>(
     cells: impl Iterator<Item = (i32, usize, &'a Cell)>,
     theme: &TerminalTheme,
+    block_char_render: bool,
 ) -> GridPlan {
     let mut background: Vec<BackgroundRegion> = Vec::new();
     let mut runs: Vec<BatchedTextRun> = Vec::new();
+    let mut block_rects: Vec<BlockRect> = Vec::new();
     let mut current: Option<BatchedTextRun> = None;
 
     for (line, col, cell) in cells {
@@ -157,6 +164,19 @@ pub fn layout_grid<'a>(
         let flags = cell.flags;
         let col = col as i32;
 
+        // Block characters paint as sub-grid rects, never as shaped glyphs.
+        if block_char_render && let Some(shape) = block_shape(cell.c) {
+            if let Some(batch) = current.take() {
+                runs.push(batch);
+            }
+            block_rects.push(BlockRect {
+                line,
+                col,
+                rects: expand(shape, fg, COLS, SUBROWS),
+            });
+            continue;
+        }
+
         if let Some(batch) = current.as_mut()
             && batch.can_append(fg, bg, flags)
             && batch.start_line == line
@@ -177,6 +197,7 @@ pub fn layout_grid<'a>(
     GridPlan {
         background: merge_background_regions(background),
         runs,
+        block_rects,
     }
 }
 
@@ -262,7 +283,11 @@ mod tests {
                 ),
             ),
         ];
-        let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            true,
+        );
         // One merged background region across cols 0..=2, one text run "abc".
         assert_eq!(plan.background.len(), 1);
         let bg = &plan.background[0];
@@ -298,7 +323,11 @@ mod tests {
                 ),
             ),
         ];
-        let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            true,
+        );
         assert_eq!(plan.background.len(), 2);
         assert_eq!(plan.runs.len(), 2);
     }
@@ -338,7 +367,11 @@ mod tests {
                 ),
             ),
         ];
-        let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            true,
+        );
         assert_eq!(plan.runs.len(), 2);
         assert_eq!(plan.runs[0].text, "a");
         assert_eq!(plan.runs[1].text, "b");
@@ -351,10 +384,121 @@ mod tests {
         let fg = Color::Named(NamedColor::Foreground);
         let bg = Color::Named(NamedColor::Background);
         let cell = cell('x', fg, bg, Flags::INVERSE);
-        let plan = layout_grid(std::iter::once((0, 0, &cell)), &theme());
+        let plan = layout_grid(std::iter::once((0, 0, &cell)), &theme(), true);
         // Inverse: the painted fg is the cell's bg (default bg → theme default_bg),
         // and the background region uses the cell's fg (default fg → theme default_fg).
         assert_eq!(plan.runs[0].fg, theme().default_bg);
         assert_eq!(plan.background[0].color, theme().default_fg);
+    }
+
+    #[test]
+    fn block_char_goes_to_rects_not_runs() {
+        let fg = Color::Named(NamedColor::Red);
+        let cells = [
+            (
+                0,
+                0,
+                cell(
+                    'a',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                1,
+                cell(
+                    '▀',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                2,
+                cell(
+                    'b',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+        ];
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            true,
+        );
+        // The `▀` cell is absent from text runs…
+        assert_eq!(plan.runs.len(), 2);
+        assert_eq!(plan.runs[0].text, "a");
+        assert_eq!(plan.runs[1].text, "b");
+        // …and present as one block rect with the top-half expansion.
+        assert_eq!(plan.block_rects.len(), 1);
+        let block = &plan.block_rects[0];
+        assert_eq!((block.line, block.col), (0, 1));
+        assert_eq!((block.rects[0].y0, block.rects[0].y1), (0, 12));
+        assert_eq!(block.rects[0].color, theme().ansi[1]);
+    }
+
+    #[test]
+    fn block_char_render_off_falls_back_to_shaping() {
+        let fg = Color::Named(NamedColor::Red);
+        let cells = [(
+            0,
+            0,
+            cell(
+                '▀',
+                fg,
+                Color::Named(NamedColor::Background),
+                Flags::empty(),
+            ),
+        )];
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            false,
+        );
+        assert!(plan.block_rects.is_empty());
+        assert_eq!(plan.runs.len(), 1);
+        assert_eq!(plan.runs[0].text, "▀");
+    }
+
+    #[test]
+    fn block_char_breaks_adjacent_run() {
+        let fg = Color::Named(NamedColor::Foreground);
+        let cells = [
+            (
+                0,
+                0,
+                cell(
+                    'x',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                1,
+                cell(
+                    '▌',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+        ];
+        let plan = layout_grid(
+            cells.iter().map(|(l, c, cell)| (*l, *c, cell)),
+            &theme(),
+            true,
+        );
+        // The run stops before the block char; no "x▌" merged run.
+        assert_eq!(plan.runs.len(), 1);
+        assert_eq!(plan.runs[0].text, "x");
+        assert_eq!(plan.block_rects.len(), 1);
     }
 }
