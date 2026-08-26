@@ -28,6 +28,17 @@ use crate::thread_engine::BackendNotice;
 /// `Error`, not the `Success` a plain delivery implies.
 pub const SUBAGENT_FAILED_DELIVERY_PREFIX: &str = "subagent failed: ";
 
+/// Prefix of the peer delivery a timed-out subagent run emits to the parent.
+/// Shared with `subagent_restore`, which keys the restored row's status off
+/// it: a timed-out run delivers (unlike an abort), and its row must read as
+/// `Error`, not the `Success` a plain delivery implies.
+pub const SUBAGENT_TIMED_OUT_DELIVERY_PREFIX: &str = "subagent timed out: ";
+
+/// The smallest wall-clock budget a Dispatch may attach — below it a
+/// subagent cannot even land one model turn, so the budget is an input
+/// error rather than an enforceable limit.
+pub const MIN_SUBAGENT_TIMEOUT_MS: u64 = 1_000;
+
 // ── AgentBus ─────────────────────────────────────────────────────────────
 
 /// A live in-thread subagent coroutine (transient, not a manox Thread).
@@ -118,12 +129,23 @@ impl AgentBus {
             (AgentId::Captain, SteerReason::Dispatch, Some(spawn_type))
                 if spawn_type != "TeamMember" =>
             {
-                self.dispatch_subagent(addr, spawn_type, isolation, &payload.text)
+                if to.timeout_ms.is_some_and(|t| t < MIN_SUBAGENT_TIMEOUT_MS) {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "timeout must be at least {MIN_SUBAGENT_TIMEOUT_MS}ms"
+                    )));
+                }
+                self.dispatch_subagent(addr, spawn_type, isolation, to.timeout_ms, &payload.text)
                     .await
             }
 
             // ── Dispatch: spawn TeamMember (real thread) ───────────────
             (AgentId::Captain, SteerReason::Dispatch, Some("TeamMember")) => {
+                if to.timeout_ms.is_some() {
+                    return Err(ToolError::InvalidArguments(
+                        "timeout applies only to in-thread subagents, not TeamMember threads"
+                            .into(),
+                    ));
+                }
                 self.dispatch_member(addr, &payload.text).await
             }
 
@@ -215,6 +237,7 @@ impl AgentBus {
         addr: &str,
         spawn_type: &str,
         isolation: Option<&str>,
+        timeout_ms: Option<u64>,
         prompt: &str,
     ) -> Result<AgentToolResult, ToolError> {
         let stage = Arc::new(std::sync::Mutex::new("entry"));
@@ -235,6 +258,7 @@ impl AgentBus {
                     &addr_s,
                     &spawn_s,
                     isolation_s.as_deref(),
+                    timeout_ms,
                     &prompt_s,
                     stage2,
                 ),
@@ -261,6 +285,7 @@ impl AgentBus {
         addr: &str,
         spawn_type: &str,
         isolation: Option<&str>,
+        timeout_ms: Option<u64>,
         prompt: &str,
         stage: Arc<std::sync::Mutex<&'static str>>,
     ) -> Result<AgentToolResult, ToolError> {
@@ -407,11 +432,35 @@ impl AgentBus {
                 let _ = ev_tx.send(event);
                 Box::pin(async move {})
             }));
+            let started_at = std::time::Instant::now();
+            let mut turns: u64 = 0;
+            let mut tool_calls: u64 = 0;
+            let mut last_activity: Option<String> = None;
+            // Salvaged inside the deadline arm while the prompt borrow is
+            // provably dead; the settle path only reads this `String`.
+            let mut timed_out_partial = String::new();
             let mut prompt_fut = Box::pin(session.prompt(&full_prompt));
+            // Wall-clock deadline: an armed dispatch gets a real sleep; an
+            // unbounded dispatch parks a never-ready branch in its place so
+            // the loop shape stays uniform.
+            let deadline = match timeout_ms {
+                Some(ms) => {
+                    futures::future::Either::Left(tokio::time::sleep(Duration::from_millis(ms)))
+                }
+                None => futures::future::Either::Right(std::future::pending::<()>()),
+            };
+            tokio::pin!(deadline);
+            let mut timed_out = false;
             let result = loop {
                 tokio::select! {
                     r = prompt_fut.as_mut() => break r,
                     Some(event) = ev_rx.recv() => {
+                        observe_child_event(
+                            &event,
+                            &mut turns,
+                            &mut tool_calls,
+                            &mut last_activity,
+                        );
                         for ev in crate::pi_engine::adapt::child_events_of(&addr_clone, &event) {
                             let _ = notice_tx.send(BackendNotice::Event(Box::new(ev)));
                         }
@@ -422,6 +471,23 @@ impl AgentBus {
                         drop(prompt_fut);
                         run_handle.abort();
                         break Err(anyhow::anyhow!("aborted"));
+                    }
+                    // Wall-clock budget expired: settle as a delivering
+                    // failure (not a silent abort) so the Captain sees the
+                    // budget ran out and decides what next. A prompt that
+                    // finished in the same instant the budget expired is a
+                    // success, not a timeout — re-check before killing
+                    // (select! picks a ready branch at random).
+                    () = deadline.as_mut() => {
+                        if let std::task::Poll::Ready(r) = futures::poll!(prompt_fut.as_mut()) {
+                            break r;
+                        }
+                        timed_out = true;
+                        drop(prompt_fut);
+                        run_handle.abort();
+                        timed_out_partial =
+                            truncate_final(&extract_final_text(session.harness_messages()));
+                        break Err(anyhow::anyhow!("timed out"));
                     }
                 }
             };
@@ -455,6 +521,40 @@ impl AgentBus {
                 )));
                 // Silent settle on explicit abort: no SteerDelivered, so the
                 // Captain is not revived for a cancellation it requested.
+            } else if timed_out {
+                let budget = timeout_ms.unwrap_or_default();
+                let partial = std::mem::take(&mut timed_out_partial);
+                let delivery = timed_out_delivery(
+                    budget,
+                    started_at.elapsed(),
+                    turns,
+                    tool_calls,
+                    last_activity.as_deref(),
+                    &partial,
+                    &kept_note,
+                );
+                task.set_failure_summary(format!("timed out after {budget}ms"));
+                task.set_terminal_status(TaskStatus::Failed);
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::BackgroundTaskUpdated {
+                        snapshot: task.snapshot(&task_id),
+                    },
+                )));
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                    ThreadEvent::SubagentProgress {
+                        id: addr_clone.clone(),
+                        subagent_type: spawn_type.clone(),
+                        tool_uses: 0,
+                        token_usage: crate::language_model::TokenUsage::default(),
+                        latest_activity: Some(format!("timed out after {budget}ms")),
+                        status: crate::thread::ToolCallStatus::Error,
+                    },
+                )));
+                let _ = notice_tx.send(BackendNotice::SteerDelivered {
+                    from: AgentId::Subagent(label),
+                    reason: SteerReason::Complete,
+                    payload: SteerPayload { text: delivery },
+                });
             } else {
                 match result {
                     Ok(messages) => {
@@ -652,6 +752,60 @@ fn truncate_final(text: &str) -> String {
     }
 }
 
+/// Build the timeout report delivered to the parent when a subagent's
+/// wall-clock budget expires: the budget, the observed run stats, and a
+/// best-effort salvage of whatever the subagent had already produced.
+fn timed_out_delivery(
+    budget_ms: u64,
+    elapsed: Duration,
+    turns: u64,
+    tool_calls: u64,
+    last_activity: Option<&str>,
+    partial: &str,
+    kept_note: &str,
+) -> String {
+    let secs = elapsed.as_secs_f64();
+    let mut delivery = format!(
+        "{SUBAGENT_TIMED_OUT_DELIVERY_PREFIX}budget {budget_ms}ms exceeded after \
+         {secs:.1}s ({turns} turns, {tool_calls} tool calls)"
+    );
+    if let Some(activity) = last_activity {
+        delivery.push_str(&format!("; last activity: {activity}"));
+    }
+    if !partial.is_empty() {
+        delivery.push_str(&format!("\n\nPartial result:\n{partial}"));
+    }
+    delivery.push_str(kept_note);
+    delivery
+}
+
+/// Fold one child event into the run-task's lifetime counters — the inputs
+/// of the timeout report: completed turns, started tool calls, and a
+/// one-line description of the most recent activity.
+fn observe_child_event(
+    event: &pi::types::AgentEvent,
+    turns: &mut u64,
+    tool_calls: &mut u64,
+    last_activity: &mut Option<String>,
+) {
+    use pi::types::AgentEvent;
+    match event {
+        AgentEvent::TurnEnd { .. } => *turns += 1,
+        AgentEvent::ToolExecutionStart {
+            tool_name,
+            arguments,
+            ..
+        } => {
+            *tool_calls += 1;
+            *last_activity = Some(match crate::pi_engine::adapt::arg_hint(arguments) {
+                Some((key, value)) => format!("{tool_name} {key}={value}"),
+                None => tool_name.clone(),
+            });
+        }
+        _ => {}
+    }
+}
+
 // ── SteerTool ────────────────────────────────────────────────────────────
 
 /// The model-facing Steer tool — unified inter-agent messaging + spawn.
@@ -678,8 +832,11 @@ impl AgentTool for SteerTool {
          set `to.spawn` to a capability def name (e.g. 'Sailor','Explore') to \
          create an in-thread subagent, or 'TeamMember' to create a real manox \
          Thread (process). Only the Captain may spawn. `reason` is Dispatch \
-         (start a task), Inject (mid-run message), or Abort (cancel). Complete \
-         is harness-emitted on subagent termination — not callable here."
+         (start a task), Inject (mid-run message), or Abort (cancel). Dispatch \
+         accepts an optional `timeout` (milliseconds, min 1000) bounding an \
+         in-thread subagent's wall-clock run: on expiry it is terminated and a \
+         timeout report is delivered. Complete is harness-emitted on subagent \
+         termination — not callable here."
     }
 
     fn is_read_only(&self) -> bool {
@@ -721,6 +878,10 @@ impl AgentTool for SteerTool {
                     "type": "string",
                     "enum": ["worktree"],
                     "description": "Optional throwaway git worktree for a spawned subagent. Only with to.spawn = a capability def (not TeamMember)."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Optional wall-clock budget in milliseconds (min 1000) for a spawned in-thread subagent. On expiry the subagent is terminated and a timeout report is delivered. Only with to.spawn = a capability def (not TeamMember)."
                 }
             },
             "required": ["to", "reason", "prompt"]
@@ -751,6 +912,7 @@ impl AgentTool for SteerTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidArguments("'prompt' is required".into()))?;
         let isolation = params.get("isolation").and_then(|v| v.as_str());
+        let timeout = params.get("timeout").and_then(|v| v.as_u64());
 
         if reason_str == "Complete" {
             return Err(ToolError::ExecutionFailed(
@@ -772,6 +934,7 @@ impl AgentTool for SteerTool {
             agent_address: agent_address.to_string(),
             spawn: spawn.map(String::from),
             isolation: isolation.map(String::from),
+            timeout_ms: timeout,
         };
         let reason = match reason_str {
             "Dispatch" => SteerReason::Dispatch,
@@ -807,6 +970,7 @@ mod tests {
             agent_address: addr.into(),
             spawn: spawn.map(String::from),
             isolation: None,
+            timeout_ms: None,
         }
     }
 
@@ -879,6 +1043,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_timeout_below_minimum_rejected() {
+        let bus = bus();
+        let mut spec = to("w", Some("Explore"));
+        spec.timeout_ms = Some(500);
+        let err = bus
+            .steer(AgentId::Captain, spec, SteerReason::Dispatch, payload("x"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn team_member_dispatch_with_timeout_rejected() {
+        let bus = bus();
+        let mut spec = to("m", Some("TeamMember"));
+        spec.timeout_ms = Some(60_000);
+        let err = bus
+            .steer(AgentId::Captain, spec, SteerReason::Dispatch, payload("x"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("TeamMember"), "{err}");
+    }
+
+    #[test]
+    fn timed_out_delivery_names_budget_stats_and_partial() {
+        let delivery = timed_out_delivery(
+            60_000,
+            Duration::from_millis(61_234),
+            3,
+            7,
+            Some("Read path=src/a.rs"),
+            "half an answer",
+            "",
+        );
+        assert!(
+            delivery.starts_with(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX),
+            "{delivery}"
+        );
+        assert!(delivery.contains("budget 60000ms"), "{delivery}");
+        assert!(delivery.contains("(3 turns, 7 tool calls)"), "{delivery}");
+        assert!(
+            delivery.contains("last activity: Read path=src/a.rs"),
+            "{delivery}"
+        );
+        assert!(
+            delivery.contains("Partial result:\nhalf an answer"),
+            "{delivery}"
+        );
+    }
+
+    #[test]
+    fn timed_out_delivery_omits_absent_fields_and_keeps_worktree_note() {
+        let delivery = timed_out_delivery(
+            1_000,
+            Duration::from_millis(1_000),
+            0,
+            0,
+            None,
+            "",
+            "\n\n[worktree kept: branch=b, path=/tmp/wt]",
+        );
+        assert!(!delivery.contains("last activity"), "{delivery}");
+        assert!(!delivery.contains("Partial result"), "{delivery}");
+        assert!(
+            delivery.ends_with("[worktree kept: branch=b, path=/tmp/wt]"),
+            "{delivery}"
+        );
     }
 
     /// The user-cancel fan-out fires one `AbortMember` per spawned member

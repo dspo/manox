@@ -37,6 +37,11 @@ pub struct ToSpec {
     pub agent_address: String,
     pub spawn: Option<String>,
     pub isolation: Option<String>,
+    /// Wall-clock budget for a spawned subagent coroutine, in milliseconds.
+    /// `None` leaves the run unbounded; the bus rejects budgets below its
+    /// minimum and budgets attached to non-coroutine spawns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The message payload. v1 carries text only (no images).
