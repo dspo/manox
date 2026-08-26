@@ -48,6 +48,17 @@ impl ToolState {
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
+
+    /// A tool state whose hashline snapshots persist under `snapshot_dir`, so
+    /// a rebuilt store (restart / fork / worktree re-entry) rehydrates tags.
+    pub fn with_snapshot_dir(snapshot_dir: std::path::PathBuf) -> Self {
+        ToolState {
+            snapshots: std::sync::Mutex::new(SnapshotStore::with_disk(snapshot_dir)),
+            mutation_queue: FileMutationQueue::new(),
+            clipboard: std::sync::Mutex::new(Vec::new()),
+            noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
 }
 
 impl Default for ToolState {
@@ -142,6 +153,12 @@ pub trait ToolContext: Send + Sync {
     fn cwd(&self) -> &std::path::Path;
     /// Session-scoped tool state (hashline snapshots + file mutation queue).
     fn tool_state(&self) -> &ToolState;
+    /// The tool state as a shared handle when the context owns one — lets the
+    /// harness carry the same state across tool-context rebuilds (cwd re-pin,
+    /// fork). Contexts that borrow rather than own return `None`.
+    fn tool_state_handle(&self) -> Option<std::sync::Arc<ToolState>> {
+        None
+    }
 }
 
 /// Production `ToolContext` shared across an entire session.
@@ -178,6 +195,9 @@ impl ToolContext for LocalToolContext {
     }
     fn tool_state(&self) -> &ToolState {
         &self.tool_state
+    }
+    fn tool_state_handle(&self) -> Option<std::sync::Arc<ToolState>> {
+        Some(std::sync::Arc::clone(&self.tool_state))
     }
 }
 

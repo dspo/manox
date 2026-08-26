@@ -25,6 +25,10 @@ const MAX_VERSIONS_PER_PATH: usize = 4;
 const MAX_PATHS: usize = 256;
 /// Global ceiling on retained snapshot text across all paths (UTF-8 bytes).
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum distinct path-key directories kept under the disk root. Beyond
+/// this, [`SnapshotStore::disk_gc`] drops the least-recently-modified dirs so
+/// the cache cannot grow unbounded over the application's lifetime.
+const MAX_DISK_PATHS: usize = 256;
 
 /// Canonical store key for a path. Realpath resolves symlinks and the macOS
 /// `/tmp` vs `/private/tmp` split, and collapses case-insensitive spellings onto
@@ -68,6 +72,12 @@ pub struct Snapshot {
 /// Session-scoped store of file snapshots, keyed by path with per-path version
 /// history. Interior mutability is supplied by the owner (a `Mutex` on
 /// `tool::ToolState`), not by this type.
+///
+/// An optional disk tier ([`SnapshotStore::enable_disk`]) mirrors recorded
+/// snapshot texts under a root directory so a rebuilt store (app restart,
+/// session fork, worktree re-entry) can rehydrate a tag it never minted in
+/// memory. Seen-line provenance is memory-only; a disk hit rehydrates without
+/// it, which the seen-line gate treats as "no provenance" (apply as before).
 #[derive(Debug, Default)]
 pub struct SnapshotStore {
     by_path: HashMap<PathBuf, Vec<Snapshot>>,
@@ -77,6 +87,9 @@ pub struct SnapshotStore {
     path_order: Vec<PathBuf>,
     /// Sum of `text.len()` across all retained snapshots.
     total_bytes: usize,
+    /// Optional disk-cache root. Snapshots mirror to `<root>/<pathkey>/<tag>`
+    /// so a fresh store can rehydrate tags across process/harness rebuilds.
+    disk: Option<PathBuf>,
 }
 
 impl SnapshotStore {
@@ -84,6 +97,26 @@ impl SnapshotStore {
         Self::default()
     }
 
+    /// A store whose recorded snapshots also persist under `root` and whose
+    /// misses rehydrate from disk. `root` is created lazily on first write.
+    pub fn with_disk(root: PathBuf) -> Self {
+        SnapshotStore {
+            by_path: HashMap::new(),
+            path_order: Vec::new(),
+            total_bytes: 0,
+            disk: Some(root),
+        }
+    }
+
+    /// Enable (or re-point) the disk tier on an existing store.
+    pub fn enable_disk(&mut self, root: PathBuf) {
+        self.disk = Some(root);
+    }
+
+    /// True when a disk tier is configured.
+    pub fn has_disk(&self) -> bool {
+        self.disk.is_some()
+    }
     /// Record a snapshot for `path` from normalized `text`. Computes the tag,
     /// appends a new version (evicting the oldest if over the per-path cap),
     /// refreshes path recency, and returns the recorded snapshot.
@@ -106,6 +139,7 @@ impl SnapshotStore {
             versions.retain(|s| s.tag != tag || s.text != text);
             versions.push(snap.clone());
             self.touch_path(&path);
+            self.disk_write(&path, &snap);
             return snap;
         }
 
@@ -128,12 +162,21 @@ impl SnapshotStore {
 
         self.touch_path(&path);
         self.evict_if_over_limit();
+        self.disk_write(&path, &snap);
         snap
     }
 
-    /// Look up a historical snapshot by `(path, tag)`. Does not refresh recency.
-    pub fn get(&self, path: &Path, tag: &str) -> Option<&Snapshot> {
+    /// Look up a historical snapshot by `(path, tag)`. Memory first; on a miss
+    /// with a disk tier configured, rehydrate from disk and retain it.
+    pub fn get(&mut self, path: &Path, tag: &str) -> Option<&Snapshot> {
         let path = canonical(path);
+        let in_memory = self
+            .by_path
+            .get(&path)
+            .is_some_and(|versions| versions.iter().any(|s| s.tag == tag));
+        if !in_memory {
+            self.disk_hydrate(&path, tag)?;
+        }
         self.by_path
             .get(&path)
             .and_then(|versions| versions.iter().find(|s| s.tag == tag))
@@ -252,6 +295,7 @@ impl SnapshotStore {
             }
         }
         self.path_order.retain(|p| p != &path);
+        self.disk_remove(&path);
     }
 
     /// Drop all version histories.
@@ -278,8 +322,130 @@ impl SnapshotStore {
             self.invalidate(&evicted);
         }
     }
+
+    // ── Disk tier ─────────────────────────────────────────────────────────
+
+    fn disk_dir(&self, path: &Path) -> Option<PathBuf> {
+        self.disk.as_ref().map(|root| root.join(disk_key(path)))
+    }
+
+    /// Mirror a recorded snapshot to disk (atomic temp+rename), best-effort,
+    /// then prune the path's mirrored versions to [`MAX_VERSIONS_PER_PATH`].
+    fn disk_write(&self, path: &Path, snap: &Snapshot) {
+        let Some(dir) = self.disk_dir(path) else {
+            return;
+        };
+        let is_new_dir = !dir.exists();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let tmp = dir.join(format!("{}.tmp", snap.tag));
+        let file = dir.join(&snap.tag);
+        if std::fs::write(&tmp, snap.text.as_bytes()).is_err() {
+            return;
+        }
+        let _ = std::fs::rename(&tmp, &file);
+        // Prune to the per-path cap, dropping the oldest mirrored versions.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut files: Vec<(PathBuf, std::time::SystemTime)> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit())
+                })
+                .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+                .collect();
+            if files.len() > MAX_VERSIONS_PER_PATH {
+                files.sort_by_key(|(_, m)| *m);
+                for (p, _) in files.iter().take(files.len() - MAX_VERSIONS_PER_PATH) {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        // A brand-new path-key dir may push the root past its cap; GC runs
+        // only on new dirs so it is amortized, not once per write.
+        if is_new_dir {
+            self.disk_gc();
+        }
+    }
+
+    /// Rehydrate a snapshot from disk on a memory miss and retain it in
+    /// memory. Returns the hydrated snapshot, or `None`. Seen-line provenance
+    /// is not persisted, so a hydrated snapshot carries none.
+    fn disk_hydrate(&mut self, path: &Path, tag: &str) -> Option<Snapshot> {
+        let dir = self.disk_dir(path)?;
+        let text = std::fs::read_to_string(dir.join(tag)).ok()?;
+        let normalized = super::normalize_to_lf(&text);
+        if compute_tag(&normalized) != tag {
+            return None;
+        }
+        let snap = Snapshot {
+            path: path.to_path_buf(),
+            text: normalized,
+            tag: tag.to_string(),
+            recorded_at: chrono::Utc::now().timestamp_millis(),
+            seen_lines: None,
+        };
+        let versions = self.by_path.entry(path.to_path_buf()).or_default();
+        versions.retain(|s| s.tag != tag);
+        versions.push(snap.clone());
+        // Keep the hydrated path within the per-path cap, mirroring record().
+        if versions.len() > MAX_VERSIONS_PER_PATH {
+            if let Some(evicted) = versions.first() {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.text.len());
+            }
+            versions.remove(0);
+        }
+        self.total_bytes += snap.text.len();
+        self.touch_path(path);
+        Some(snap)
+    }
+
+    /// Remove a path's mirrored snapshots from disk.
+    fn disk_remove(&self, path: &Path) {
+        if let Some(dir) = self.disk_dir(path) {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Bound the number of path-key directories under the disk root, evicting the
+    /// least-recently-modified ones past [`MAX_DISK_PATHS`]. Best-effort.
+    fn disk_gc(&self) {
+        let Some(root) = self.disk.as_ref() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+            .collect();
+        if dirs.len() <= MAX_DISK_PATHS {
+            return;
+        }
+        dirs.sort_by_key(|(_, m)| *m);
+        for (dir, _) in dirs.iter().take(dirs.len() - MAX_DISK_PATHS) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
+/// Stable directory name for a canonical path: a 16-hex fingerprint so
+/// arbitrary path characters never reach the filesystem layout. Uses FNV-1a
+/// (not `DefaultHasher`), whose output is fixed across std/toolchain versions
+/// — a persisted key must not silently orphan every snapshot on an upgrade.
+fn disk_key(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +563,93 @@ mod tests {
         assert!(store.total_bytes > 0);
         store.invalidate(&p("a.rs"));
         assert_eq!(store.total_bytes, 0);
+    }
+
+    #[test]
+    fn disk_tier_rehydrates_across_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let disk = dir.path().join("snapshots");
+
+        let mut store = SnapshotStore::with_disk(disk.clone());
+        let snap = store.record(&file, "fn main() {}\n");
+
+        // A brand-new store over the same disk root rehydrates the tag the
+        // first store minted, even though its memory is empty.
+        let mut fresh = SnapshotStore::with_disk(disk);
+        let hydrated = fresh.get(&file, &snap.tag).expect("disk rehydrate");
+        assert_eq!(hydrated.text, "fn main() {}\n");
+        assert_eq!(hydrated.tag, snap.tag);
+        // No provenance survives the disk round-trip.
+        assert!(hydrated.seen_lines.is_none());
+    }
+
+    #[test]
+    fn disk_tier_miss_without_match_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let disk = dir.path().join("snapshots");
+
+        let mut store = SnapshotStore::with_disk(disk);
+        assert!(store.get(&file, "DEAD00").is_none());
+    }
+
+    #[test]
+    fn disk_tier_invalidate_removes_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let disk = dir.path().join("snapshots");
+
+        let mut store = SnapshotStore::with_disk(disk.clone());
+        let snap = store.record(&file, "fn main() {}\n");
+        store.invalidate(&file);
+
+        // After invalidation a fresh store can no longer rehydrate the tag.
+        let mut fresh = SnapshotStore::with_disk(disk);
+        assert!(fresh.get(&file, &snap.tag).is_none());
+    }
+
+    #[test]
+    fn memory_only_store_never_touches_disk() {
+        let mut store = SnapshotStore::new();
+        assert!(!store.has_disk());
+        let snap = store.record(&p("a.rs"), "x\n");
+        assert_eq!(store.get(&p("a.rs"), &snap.tag).unwrap().tag, snap.tag);
+    }
+
+    #[test]
+    fn disk_key_is_stable_and_version_independent() {
+        // FNV-1a over the same path always yields the same 16-hex key, so a
+        // toolchain upgrade cannot orphan persisted snapshot dirs.
+        let key = disk_key(std::path::Path::new("/tmp/a.rs"));
+        assert_eq!(key, disk_key(std::path::Path::new("/tmp/a.rs")));
+        assert_eq!(key.len(), 16);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(key, disk_key(std::path::Path::new("/tmp/b.rs")));
+    }
+
+    #[test]
+    fn disk_gc_caps_pathkey_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("snapshots");
+        // Record snapshots for more paths than the disk cap, forcing GC.
+        let mut store = SnapshotStore::with_disk(disk.clone());
+        for i in 0..(MAX_DISK_PATHS + 8) {
+            let file = dir.path().join(format!("f{i}.rs"));
+            std::fs::write(&file, format!("v{i}\n")).unwrap();
+            store.record(&file, &format!("v{i}\n"));
+        }
+        let count = std::fs::read_dir(&disk)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        assert!(
+            count <= MAX_DISK_PATHS,
+            "disk GC must cap path dirs, found {count}"
+        );
     }
 }
