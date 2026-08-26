@@ -1,0 +1,40 @@
+[package]
+name = "zterm-core"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/terminal.rs"
+doctest = false
+
+[features]
+test-support = ["gpui/test-support", "collections/test-support"]
+
+[dependencies]
+gpui.workspace = true
+collections = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+util = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+async-channel = "2.5.0"
+anyhow = "1"
+futures = "0.3"
+futures-lite = "1.13"
+itertools = "0.14"
+libc = "0.2"
+log = "0.4"
+regex = "1.5"
+serde = { version = "1", features = ["derive"] }
+sysinfo = "0.37"
+thiserror = "2"
+url = "2.2"
+urlencoding = "2.1"
+vte = { version = "0.15", features = ["ansi"] }
+parking_lot = "0.12"
+percent-encoding = "2.3"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+rand = "0.9"
+util_macros = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

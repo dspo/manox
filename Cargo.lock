@@ -250,11 +250,35 @@ dependencies = [
  "piper",
  "polling",
  "regex-automata",
- "rustix-openpty",
+ "rustix-openpty 0.1.1",
  "serde",
- "signal-hook",
+ "signal-hook 0.3.18",
  "unicode-width 0.1.14",
- "vte",
+ "vte 0.13.1",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "alacritty_terminal"
+version = "0.26.1-dev"
+source = "git+https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667ce56611becdc82de6e28218c80e2e88f"
+dependencies = [
+ "base64",
+ "bitflags 2.13.0",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix 1.1.4",
+ "rustix-openpty 0.2.0",
+ "serde",
+ "signal-hook 0.4.4",
+ "unicode-width 0.2.0",
+ "vte 0.15.0",
  "windows-sys 0.59.0",
 ]
 
@@ -2087,7 +2111,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 0.38.44",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -2195,7 +2219,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "signal-hook",
+ "signal-hook 0.3.18",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -5508,7 +5532,7 @@ dependencies = [
  "markdown",
  "ropey",
  "unicode-linebreak",
- "vte",
+ "vte 0.13.1",
 ]
 
 [[package]]
@@ -8521,6 +8545,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix-openpty"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de16c7c59892b870a6336f185dc10943517f1327447096bbb7bb32cd85e2393"
+dependencies = [
+ "errno",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "rustls"
 version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9096,6 +9131,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9103,7 +9148,7 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -9674,6 +9719,20 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
+version = "0.37.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16607d5caffd1c07ce073528f9ed972d88db15dd44023fa57142963be3feb11f"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows 0.61.3",
+]
+
+[[package]]
+name = "sysinfo"
 version = "0.39.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
@@ -9826,7 +9885,7 @@ name = "terminal"
 version = "0.1.0"
 dependencies = [
  "agent",
- "alacritty_terminal",
+ "alacritty_terminal 0.24.2",
  "anyhow",
  "async-channel 2.5.0",
  "chrono",
@@ -11351,6 +11410,20 @@ dependencies = [
  "serde",
  "utf8parse",
  "vte_generate_state_changes",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.0",
+ "cursor-icon",
+ "log",
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -13337,6 +13410,47 @@ checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
 dependencies = [
  "cc",
  "pkg-config",
+]
+
+[[package]]
+name = "zterm-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal 0.26.1-dev",
+ "anyhow",
+ "async-channel 2.5.0",
+ "collections",
+ "futures",
+ "futures-lite 1.13.0",
+ "gpui",
+ "itertools 0.14.0",
+ "libc",
+ "log",
+ "parking_lot",
+ "percent-encoding",
+ "rand 0.9.4",
+ "regex",
+ "serde",
+ "sysinfo 0.37.2",
+ "thiserror 2.0.18",
+ "url",
+ "urlencoding",
+ "util",
+ "util_macros",
+ "vte 0.15.0",
+]
+
+[[package]]
+name = "zterm-ui"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "gpui",
+ "gpui_platform",
+ "regex",
+ "smol",
+ "util",
+ "zterm-core",
 ]
 
 [[package]]

@@ -20,6 +20,8 @@ members = [
     "crates/pi-extensions",
     "crates/terminal",
     "crates/terminal-ui",
+    "crates/zterm-core",
+    "crates/zterm-ui",
     "crates/components",
     "crates/supervisor",
     "crates/lsp",
