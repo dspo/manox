@@ -25,6 +25,7 @@ cx.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 supervisor.workspace = true
+manox-webui.workspace = true
 
 anyhow.workspace = true
 

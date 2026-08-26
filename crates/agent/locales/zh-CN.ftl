@@ -421,6 +421,7 @@ slash-new-desc = 归档当前会话并开始新会话，保留项目、权限模
 menu-settings = Settings…
 menu-quit = 退出
 menu-open-manox = 打开 Manox
+menu-webui = WebUI
 menu-file = File
 menu-about = 关于 Manox
 menu-tools = 工具
