@@ -51,7 +51,21 @@ const SUBAGENTS_PROSE: &str = "You can dispatch subagents via the `Steer` tool �
     won't clash).\n\n\
     Each subagent starts from a blank context, so pin any contract it \
     must honor (exact paths, signatures, gate requirements) directly in \
-    the prompt.";
+    the prompt.\n\n\
+    Time-box every dispatch: estimate how long each subtask should take \
+    and split work that won't fit one bounded slice into several bounded \
+    dispatches instead of a single open-ended giant. Give each dispatch a \
+    `timeout` sized to your estimate plus headroom — an expired budget \
+    terminates the subagent and delivers a timeout report you can act on, \
+    instead of a task that runs forever.\n\n\
+    Make every dispatch concrete and checkable: an explicit done-criterion \
+    (which question answered, which gate passed) and the shape of the \
+    summary you expect back.\n\n\
+    Dispatch is not fire-and-forget; you own each subagent's lifecycle. \
+    Watch for its Complete, timeout, or failure report, and when one \
+    arrives decide deliberately: re-dispatch with a narrower scope, widen \
+    the budget, or take the work over yourself. Abort a subagent the \
+    moment its work is no longer needed.";
 
 /// The process-global registry of built-in prompt templates. Parsed once;
 /// immutable thereafter. A parse failure panics at first use — these are
@@ -206,49 +220,63 @@ pub fn base_prompt_builder(base: String, cwd: PathBuf) -> pi::harness::SystemPro
     )
 }
 
+/// The golden fixture render — the single source of the byte-pinning
+/// test's input AND of `examples/dump_prompt_golden.rs`, so regenerating
+/// `testdata/captain_prompt.golden.txt` can never drift from what the
+/// test asserts.
+#[doc(hidden)]
+pub fn render_golden_fixture() -> String {
+    let builder = captain_prompt_builder(CaptainConfig {
+        cwd: PathBuf::from("/private/tmp/golden-proj"),
+        today: "2026-08-25".to_string(),
+        skills: vec![
+            SkillSummary {
+                name: "gitwork:deliver".into(),
+                description: "deliver a PR".into(),
+            },
+            SkillSummary {
+                name: "remora:task".into(),
+                description: "delegate a stuck problem".into(),
+            },
+        ],
+    });
+    let resources = pi::harness::HarnessResources {
+        skills: vec![],
+        prompt_templates: vec![],
+        context_files: vec![
+            pi::harness::ContextFile {
+                name: "CLAUDE.md".into(),
+                location: "/private/tmp/golden-proj/CLAUDE.md".into(),
+                content: "Keep changes minimal.\nLine two.".into(),
+            },
+            pi::harness::ContextFile {
+                name: "RULES.md".into(),
+                location: "/tmp/a&b<R>/rules.md".into(),
+                content: "r1".into(),
+            },
+        ],
+    };
+    let active_tools = vec![
+        "Read".to_string(),
+        "Bash".to_string(),
+        "Edit".to_string(),
+        "Write".to_string(),
+    ];
+    builder(&active_tools, &resources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The golden bytes were generated from the legacy (pre-template)
-    /// assembly via the host's `dump_prompt_golden`; they pin the rendered
-    /// system-prompt bytes — the leading cached prefix of every provider
-    /// request — against template drift.
+    /// The golden bytes pin the rendered system-prompt bytes — the leading
+    /// cached prefix of every provider request — against template drift;
+    /// regenerate via `examples/dump_prompt_golden.rs` (same fixture by
+    /// construction).
     #[test]
     fn captain_prompt_matches_golden_bytes() {
-        let builder = captain_prompt_builder(CaptainConfig {
-            cwd: PathBuf::from("/private/tmp/golden-proj"),
-            today: "2026-08-25".to_string(),
-            skills: vec![
-                SkillSummary {
-                    name: "gitwork:deliver".into(),
-                    description: "deliver a PR".into(),
-                },
-                SkillSummary {
-                    name: "remora:task".into(),
-                    description: "delegate a stuck problem".into(),
-                },
-            ],
-        });
-        let resources = pi::harness::HarnessResources {
-            skills: vec![],
-            prompt_templates: vec![],
-            context_files: vec![
-                pi::harness::ContextFile {
-                    name: "CLAUDE.md".into(),
-                    location: "/private/tmp/golden-proj/CLAUDE.md".into(),
-                    content: "Keep changes minimal.\nLine two.".into(),
-                },
-                pi::harness::ContextFile {
-                    name: "RULES.md".into(),
-                    location: "/tmp/a&b<R>/rules.md".into(),
-                    content: "r1".into(),
-                },
-            ],
-        };
-        let active_tools = vec!["Read".into(), "Bash".into(), "Edit".into(), "Write".into()];
         assert_eq!(
-            builder(&active_tools, &resources),
+            render_golden_fixture(),
             include_str!("../../testdata/captain_prompt.golden.txt"),
         );
     }

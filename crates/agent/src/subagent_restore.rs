@@ -26,10 +26,10 @@ pub struct RestoredSubagent {
     pub subagent_type: String,
     /// The Captain's dispatch prompt.
     pub prompt: String,
-    /// `Error` for a failure delivery; `Success` for a completion delivery;
-    /// `Cancelled` when the run ended without any delivery (quit-time kill
-    /// and explicit abort are indistinguishable after the fact). Never
-    /// `Running` on return.
+    /// `Error` for a failure or timeout delivery; `Success` for a completion
+    /// delivery; `Cancelled` when the run ended without any delivery
+    /// (quit-time kill and explicit abort are indistinguishable after the
+    /// fact). Never `Running` on return.
     pub status: ToolCallStatus,
     /// The delivered final answer, when one reached the parent.
     pub final_text: Option<String>,
@@ -77,14 +77,16 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
                 .display_text
                 .clone()
                 .unwrap_or_else(|| unwrap_peer_text(from, &text_of(m)));
-            // A failed run also delivers (unlike an abort): the bus prefixes
-            // the failure text, and the live rail showed an Error row for it.
-            row.status =
-                if final_text.starts_with(crate::steer_bus::SUBAGENT_FAILED_DELIVERY_PREFIX) {
-                    ToolCallStatus::Error
-                } else {
-                    ToolCallStatus::Success
-                };
+            // A failed or timed-out run also delivers (unlike an abort): the
+            // bus prefixes the report, and the live rail showed an Error row.
+            row.status = if final_text
+                .starts_with(crate::steer_bus::SUBAGENT_FAILED_DELIVERY_PREFIX)
+                || final_text.starts_with(crate::steer_bus::SUBAGENT_TIMED_OUT_DELIVERY_PREFIX)
+            {
+                ToolCallStatus::Error
+            } else {
+                ToolCallStatus::Success
+            };
             row.final_text = Some(final_text);
         }
     }
@@ -235,6 +237,23 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ToolCallStatus::Error);
         assert_eq!(rows[0].final_text.as_deref(), Some(failure.as_str()));
+    }
+
+    #[test]
+    fn timed_out_run_delivery_restores_error_not_success() {
+        let timeout = format!(
+            "{}budget 1000ms exceeded after 1.2s (2 turns, 3 tool calls)",
+            crate::steer_bus::SUBAGENT_TIMED_OUT_DELIVERY_PREFIX
+        );
+        let messages = vec![
+            steer_use("tu_1", "worker", "Explore", "Dispatch", "find it"),
+            tool_result("tu_1", false, "dispatched"),
+            delivery("worker", &timeout, Some(&timeout)),
+        ];
+        let rows = rebuild_from_messages(&messages);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ToolCallStatus::Error);
+        assert_eq!(rows[0].final_text.as_deref(), Some(timeout.as_str()));
     }
 
     #[test]

@@ -15,6 +15,12 @@ Prefer parallel subagents over serial self-work. For splittable tasks — review
 
 Each subagent starts from a blank context, so pin any contract it must honor (exact paths, signatures, gate requirements) directly in the prompt.
 
+Time-box every dispatch: estimate how long each subtask should take and split work that won't fit one bounded slice into several bounded dispatches instead of a single open-ended giant. Give each dispatch a `timeout` sized to your estimate plus headroom — an expired budget terminates the subagent and delivers a timeout report you can act on, instead of a task that runs forever.
+
+Make every dispatch concrete and checkable: an explicit done-criterion (which question answered, which gate passed) and the shape of the summary you expect back.
+
+Dispatch is not fire-and-forget; you own each subagent's lifecycle. Watch for its Complete, timeout, or failure report, and when one arrives decide deliberately: re-dispatch with a narrower scope, widen the budget, or take the work over yourself. Abort a subagent the moment its work is no longer needed.
+
 ## Available skills
 Installed skills, invocable by the user as `/name` slash commands:
 - gitwork:deliver: deliver a PR

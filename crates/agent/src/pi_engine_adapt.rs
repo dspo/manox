@@ -582,7 +582,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
 
 /// First object entry of a tool-call's arguments as a `(key, short value)`
 /// hint, mirroring the retired bridge's `summary_key`/`summary`.
-fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)> {
+pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)> {
     arguments.as_object()?.iter().next().map(|(key, value)| {
         let value = match value {
             serde_json::Value::String(s) => s.clone(),
