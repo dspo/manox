@@ -1976,6 +1976,11 @@ fn session_builder(
         .with_resources(instruction_resources(cwd))
         .with_tools(tools)
         .with_initial_active_tools(default_active);
+    // Persist hashline snapshots under the manox config dir so an edit tag
+    // survives an app restart, a session fork, or a worktree re-entry.
+    if let Ok(config_dir) = crate::paths::manox_config_dir() {
+        builder = builder.with_snapshot_dir(config_dir.join("hashline-snapshots"));
+    }
     // Every session a host creates is tagged with its identity so each
     // host's session list stays disjoint, and with its owning thread id so
     // the sidebar groups one thread's sessions (base + worktree forks) into

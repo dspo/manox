@@ -168,6 +168,9 @@ pub struct AgentSession {
     /// default model / thinking level to its global settings file (TS
     /// `setDefaultModelAndProvider`/`setDefaultThinkingLevel`).
     agent_dir: PathBuf,
+    /// Directory persisting hashline snapshots so a forked/rebuilt harness
+    /// rehydrates tags; `None` keeps snapshots memory-only.
+    snapshot_dir: Option<PathBuf>,
     /// Prepended to every `execute_bash` command, so a user-run command sees
     /// the same shell setup as the bash tool's.
     shell_command_prefix: Option<String>,
@@ -989,6 +992,7 @@ impl AgentSession {
                 settings_thinking_default: self.settings_thinking_default.clone(),
                 custom_prompt: self.custom_prompt,
                 agent_dir: self.agent_dir.clone(),
+                snapshot_dir: self.snapshot_dir.clone(),
                 shell_command_prefix: self.shell_command_prefix.clone(),
                 bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
             },
@@ -1017,6 +1021,9 @@ impl AgentSession {
         let mut harness = AgentHarness::new(session, self.system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
             .with_tool_cwd(self.cwd.clone());
+        if let Some(snapshot_dir) = self.snapshot_dir.clone() {
+            harness.set_snapshot_dir(snapshot_dir);
+        }
         // Re-install the system-prompt builder (not just the rendered
         // prompt), so a fork keeps rebuilding on active-tool/resource
         // changes.
@@ -1177,6 +1184,9 @@ pub struct AgentSessionBuilder {
     session_id: Option<String>,
     /// Free-form session header metadata written by `build()`.
     metadata: Option<serde_json::Value>,
+    /// Directory persisting hashline snapshots so a rebuilt store rehydrates
+    /// tags across restarts/forks. `None` keeps snapshots memory-only.
+    snapshot_dir: Option<PathBuf>,
 }
 
 impl AgentSessionBuilder {
@@ -1193,6 +1203,13 @@ impl AgentSessionBuilder {
     /// The global config directory (instructions / skills / templates).
     pub fn with_agent_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.agent_dir = Some(dir.into());
+        self
+    }
+
+    /// Persist hashline snapshots under `dir` so tags survive a rebuilt store
+    /// (app restart, session fork, worktree re-entry).
+    pub fn with_snapshot_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.snapshot_dir = Some(dir.into());
         self
     }
 
@@ -1479,6 +1496,9 @@ impl AgentSessionBuilder {
             .with_tools(Arc::from(tools.clone()))
             .with_tool_cwd(cwd.clone())
             .with_resources(resources);
+        if let Some(snapshot_dir) = self.snapshot_dir.clone() {
+            harness.set_snapshot_dir(snapshot_dir);
+        }
         if let Some(names) = facade_initial_active {
             // Initial active subset: the TS default four. In-memory only —
             // no `active_tools_change` entry is written for the default; a
@@ -1601,6 +1621,7 @@ impl AgentSessionBuilder {
             settings_thinking_default,
             custom_prompt,
             agent_dir,
+            snapshot_dir: self.snapshot_dir.clone(),
             shell_command_prefix: settings.shell_command_prefix.clone(),
             bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
         })

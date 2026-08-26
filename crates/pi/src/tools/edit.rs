@@ -238,12 +238,12 @@ impl AgentTool for EditTool {
                     })?
                     .text
             } else {
-                let store = ctx
+                let mut store = ctx
                     .tool_state()
                     .snapshots
                     .lock()
                     .expect("hashline snapshot store poisoned");
-                hashline::try_recover(&current, &fp.tag, &expanded_ops, &store, &path)
+                hashline::try_recover(&current, &fp.tag, &expanded_ops, &mut store, &path)
                     .map_err(|e| ToolError::ExecutionFailed(format!("edit {path_display}: {e}")))?
             };
 

@@ -1076,14 +1076,33 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Run tools against `cwd` instead of the process working directory —
     /// the session's project directory. Rebuilds the execution environment
     /// and tool context so read/bash/grep/find/ls resolve relative paths
-    /// there.
+    /// there. The existing tool state (snapshots, mutation queue, clipboard,
+    /// noop guard) is carried over so in-session edit context survives a
+    /// cwd re-pin or fork rebuild.
     pub fn with_tool_cwd(mut self, cwd: std::path::PathBuf) -> Self {
         let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
-        let tool_state = Arc::new(ToolState::new());
+        let tool_state = self
+            .agent
+            .tool_context()
+            .tool_state_handle()
+            .unwrap_or_else(|| Arc::new(ToolState::new()));
         let tool_ctx: Arc<dyn crate::tool::ToolContext> =
             Arc::new(LocalToolContext::new(env, cwd, tool_state));
         self.agent.set_tool_ctx(tool_ctx);
         self
+    }
+
+    /// Point the session's hashline snapshot store at a persistent directory,
+    /// so a rebuilt store (app restart, session fork, worktree re-entry) can
+    /// rehydrate tags it never minted in memory.
+    pub fn set_snapshot_dir(&mut self, root: std::path::PathBuf) {
+        self.agent
+            .tool_context()
+            .tool_state()
+            .snapshots
+            .lock()
+            .expect("hashline snapshot store poisoned")
+            .enable_disk(root);
     }
 
     /// Mount tools on the underlying agent.

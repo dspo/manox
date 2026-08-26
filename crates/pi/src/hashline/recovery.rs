@@ -37,7 +37,7 @@ pub fn try_recover(
     current: &str,
     claimed_tag: &str,
     ops: &[Op],
-    store: &SnapshotStore,
+    store: &mut SnapshotStore,
     path: &Path,
 ) -> Result<String, RecoverError> {
     let current_tag = super::hash::compute_tag(current);
@@ -412,8 +412,9 @@ mod tests {
 
     #[test]
     fn missing_snapshot_errors() {
-        let store = SnapshotStore::new();
-        let err = try_recover("A\nB\n", "FFFFFF", &[], &store, &PathBuf::from("x.rs")).unwrap_err();
+        let mut store = SnapshotStore::new();
+        let err =
+            try_recover("A\nB\n", "FFFFFF", &[], &mut store, &PathBuf::from("x.rs")).unwrap_err();
         assert!(
             err.message.contains("not from this session"),
             "{}",
