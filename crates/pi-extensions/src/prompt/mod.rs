@@ -65,7 +65,13 @@ const SUBAGENTS_PROSE: &str = "You can dispatch subagents via the `Steer` tool �
     Watch for its Complete, timeout, or failure report, and when one \
     arrives decide deliberately: re-dispatch with a narrower scope, widen \
     the budget, or take the work over yourself. Abort a subagent the \
-    moment its work is no longer needed.";
+    moment its work is no longer needed.\n\n\
+    When a subagent seems slow or silent, inspect it before acting: \
+    `SubagentStatus` reports each live subagent's health (working, tool \
+    running, stalled, looping) with its turns, tool calls, running time, \
+    and remaining budget. Act on what it reports — Inject guidance into a \
+    drifting run, Abort a stalled or looping one and re-dispatch narrower \
+    — instead of guessing or waiting indefinitely.";
 
 /// The process-global registry of built-in prompt templates. Parsed once;
 /// immutable thereafter. A parse failure panics at first use — these are

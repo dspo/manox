@@ -198,14 +198,16 @@ impl ContextRail {
 
     /// Upsert one sub-agent observation row from a `SubagentProgress` event
     /// (the pi harness emits these around its ephemeral nested sessions;
-    /// the retired manox harness maintains its list from child threads
-    /// instead).
+    /// the retired manox harness maintained its list from child threads
+    /// instead). `health` carries the watchdog's one-line verdict while the
+    /// run is live; `None` leaves the stored verdict untouched.
     pub(crate) fn apply_subagent_progress(
         &mut self,
         id: &str,
         subagent_type: &str,
         description: Option<&str>,
         status: agent::ToolCallStatus,
+        health: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         if let Some(info) = self.agents.iter_mut().find(|info| info.id == id) {
@@ -218,12 +220,16 @@ impl ContextRail {
             {
                 info.description = description.to_string();
             }
+            if let Some(health) = health {
+                info.health = Some(health.to_string());
+            }
         } else {
             self.agents.push(SubagentInfo {
                 id: id.to_string(),
                 subagent_type: subagent_type.to_string(),
                 description: description.unwrap_or_default().to_string(),
                 status,
+                health: health.map(str::to_string),
             });
         }
         cx.notify();
@@ -708,12 +714,27 @@ impl ContextRail {
         // nest deeper than one level, so no tree recursion is needed.
         for info in &self.agents {
             let title = subagent_display_title(info);
-            let tooltip_text = title.clone();
+            let tooltip_text = match &info.health {
+                Some(health) => format!("{title} — {health}"),
+                None => title.clone(),
+            };
             let weak = self.weak_workspace.clone();
             let id = info.id.clone();
             let subagent_type = info.subagent_type.clone();
             let topic = info.description.clone();
             let status = info.status;
+            // Health verdict coloring: stalls warn, loops alarm, plain
+            // activity stays muted.
+            let health_color = info.health.as_deref().map(|h| {
+                if h.starts_with("stalled") {
+                    theme.warning
+                } else if h.starts_with("looping") {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                }
+            });
+            let health = info.health.clone();
             let row = h_flex()
                 .id(SharedString::from(format!("context-agent-{}", info.id)))
                 .w_full()
@@ -741,7 +762,17 @@ impl ContextRail {
                         .text_xs()
                         .text_color(theme.foreground)
                         .child(title),
-                );
+                )
+                .when_some(health.zip(health_color), |el, (health, color)| {
+                    el.child(
+                        gpui::div()
+                            .max_w(px(160.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(color)
+                            .child(health),
+                    )
+                });
             rows.push(row.into_any_element());
         }
 

@@ -76,6 +76,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
                         .and_then(|v| v.as_str())
                         .map(crate::tools::subagent_topic),
                     status: ToolCallStatus::Running,
+                    health: None,
                 });
             }
             events
@@ -101,6 +102,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
                     token_usage: crate::language_model::TokenUsage::default(),
                     latest_activity: Some(text),
                     status: ToolCallStatus::Running,
+                    health: None,
                 };
                 match kind {
                     "text" => {
@@ -225,6 +227,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
                     token_usage: crate::language_model::TokenUsage::default(),
                     latest_activity: None,
                     status,
+                    health: None,
                 });
             }
             events
@@ -523,6 +526,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
         token_usage: crate::language_model::TokenUsage::default(),
         latest_activity: Some(text),
         status: ToolCallStatus::Running,
+        health: None,
     };
     match event {
         AgentEvent::MessageUpdate {

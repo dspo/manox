@@ -118,6 +118,7 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             tool_uses,
             latest_activity,
             status,
+            health,
             ..
         } => json!({
             "type": "subagent_progress",
@@ -126,6 +127,7 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             "tool_uses": tool_uses,
             "latest_activity": latest_activity,
             "status": status_str(status),
+            "health": health,
         }),
         ThreadEvent::WorktreeChanged { active, path } => {
             json!({"type": "worktree_changed", "active": active, "path": path})
@@ -338,6 +340,7 @@ mod tests {
                 token_usage: agent::TokenUsage::default(),
                 latest_activity: Some("reading files".into()),
                 status: agent::ToolCallStatus::Running,
+                health: Some("working".into()),
             },
             Some("s1"),
         )
@@ -347,6 +350,7 @@ mod tests {
         assert_eq!(v["agent_type"], "explorer");
         assert_eq!(v["tool_uses"], 3);
         assert_eq!(v["status"], "running");
+        assert_eq!(v["health"], "working");
     }
 
     #[test]

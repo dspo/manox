@@ -42,6 +42,27 @@ pub struct ToSpec {
     /// minimum and budgets attached to non-coroutine spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Idle budget for a spawned subagent coroutine, in milliseconds: the
+    /// longest stretch with no child event and no tool in flight before the
+    /// run is terminated as stalled. `None` leaves stall detection
+    /// report-only. Same minimum and spawn restrictions as `timeout_ms`.
+    /// Enforcement granularity is the watchdog tick (~5s), not the exact
+    /// millisecond value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u64>,
+}
+
+/// The armed time budgets of one subagent dispatch, bundled so the bus and
+/// its run task thread them as a single value. `None` on an axis leaves the
+/// run unbounded there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchBudgets {
+    /// Wall-clock budget (ms): the run is terminated at this elapsed time.
+    pub timeout_ms: Option<u64>,
+    /// Idle budget (ms): the run is terminated as stalled once it goes this
+    /// long with no child event and no tool in flight. `None` leaves stall
+    /// detection report-only.
+    pub idle_timeout_ms: Option<u64>,
 }
 
 /// The message payload. v1 carries text only (no images).

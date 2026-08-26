@@ -18,6 +18,9 @@ pub(crate) struct SubagentInfo {
     pub subagent_type: String,
     pub description: String,
     pub status: ToolCallStatus,
+    /// The watchdog's one-line health verdict (working / tool running /
+    /// stalled / looping) while the run is live; `None` for settled rows.
+    pub health: Option<String>,
 }
 
 pub(crate) fn subagent_display_title(info: &SubagentInfo) -> String {
