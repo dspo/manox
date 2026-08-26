@@ -73,10 +73,17 @@ pub struct AgentBus {
     subagent_tool: Mutex<Option<Arc<SubagentTool>>>,
     tool_ctx: Mutex<Option<Arc<dyn ToolContext>>>,
     /// Wires `subagent_tool` on first dispatch for sessions assembled
-    /// before a model resolved (resume-at-launch race); returns whether a
-    /// live model was available to wire with.
-    late_configure: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// before a model resolved (resume-at-launch race). Invoked with no
+    /// bus locks held; returns the freshly built tool (or `None` when no
+    /// live model is available) and the dispatch path caches it — the
+    /// configurator itself must never write into the bus.
+    late_configure: Mutex<Option<LateConfigure>>,
 }
+
+/// First-dispatch configurator for sessions assembled before a model
+/// resolved (resume-at-launch race): returns the freshly built subagent
+/// tool, or `None` while no live model is available.
+pub(crate) type LateConfigure = Arc<dyn Fn() -> Option<Arc<SubagentTool>> + Send + Sync>;
 
 /// Poison-tolerant lock: a holder that panicked must not take every later
 /// dispatch down with a secondary panic (which reads as a silent hang on
@@ -116,7 +123,7 @@ impl AgentBus {
         *self.tool_ctx.lock().unwrap() = Some(ctx);
     }
 
-    pub fn set_late_configure(&self, configure: Arc<dyn Fn() -> bool + Send + Sync>) {
+    pub fn set_late_configure(&self, configure: LateConfigure) {
         *self.late_configure.lock().unwrap() = Some(configure);
     }
 
@@ -339,29 +346,32 @@ impl AgentBus {
         let isolation = isolation.map(String::from);
         let prompt = prompt.to_string();
         *locked(&stage) = "subagent-tool";
-        let subagent_tool = match locked(&self.subagent_tool).clone() {
+        // Bind the clone before the match: a scrutinee temporary (the
+        // MutexGuard) lives until the match ends, and the None arm must
+        // reach configure + cache without a held lock on this mutex.
+        let existing = locked(&self.subagent_tool).clone();
+        let subagent_tool = match existing {
             Some(tool) => tool,
             None => {
                 *locked(&stage) = "late-configure";
                 let configure = locked(&self.late_configure).clone();
-                let wired = match configure {
+                let tool = match configure {
                     Some(configure) => match catch_unwind(AssertUnwindSafe(|| configure())) {
-                        Ok(wired) => wired,
+                        Ok(tool) => tool,
                         Err(_) => {
                             tracing::error!("late subagent configure panicked (addr={addr})");
-                            false
+                            None
                         }
                     },
-                    None => false,
+                    None => None,
                 };
-                if !wired {
+                let Some(tool) = tool else {
                     return Err(ToolError::ExecutionFailed(
                         "subagent tool not configured".into(),
                     ));
-                }
-                locked(&self.subagent_tool).clone().ok_or_else(|| {
-                    ToolError::ExecutionFailed("subagent tool not configured".into())
-                })?
+                };
+                self.set_subagent_tool(Arc::clone(&tool));
+                tool
             }
         };
         tracing::info!("steer dispatch: subagent tool resolved (addr={addr})");
@@ -1388,5 +1398,32 @@ mod tests {
         }
         aborted.sort();
         assert_eq!(aborted, vec!["m1", "m2", "m3"]);
+    }
+
+    /// A configurator that re-locks `subagent_tool` while running must not
+    /// deadlock the dispatch: the retired write-back wiring held the match
+    /// scrutinee's guard across configure and self-deadlocked (the 90s
+    /// dispatch timeout cannot cancel a synchronous mutex block). This test
+    /// hangs if that lock ordering regresses.
+    #[tokio::test]
+    async fn late_configure_runs_without_a_held_tool_lock() {
+        let bus = bus();
+        let probe = Arc::clone(&bus);
+        bus.set_late_configure(Arc::new(move || {
+            let _probe = locked(&probe.subagent_tool);
+            None::<Arc<SubagentTool>>
+        }));
+        let err = bus
+            .dispatch_subagent_inner(
+                "probe",
+                "Sailor",
+                None,
+                DispatchBudgets::default(),
+                "do the thing",
+                Arc::new(std::sync::Mutex::new("entry")),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"), "{err}");
     }
 }
