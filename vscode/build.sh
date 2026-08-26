@@ -5,6 +5,10 @@
 # Options:
 #   --release   Build the napi binding in release mode (default: debug)
 #   -h          Display this help and exit
+#
+# The webview bundle and contract modules are owned by webui/ and staged in
+# by webui/build.sh (which copies the contract output under vscode/dist so
+# the host's require()s resolve inside the vsix).
 set -euo pipefail
 
 build_args=()
@@ -33,6 +37,9 @@ done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# 0. Build the shared webui package (bundle + contract staging).
+bash webui/build.sh
+
 # 1. Build the napi core (cdylib) and stage it next to the compiled extension.
 cargo build ${build_args[@]+"${build_args[@]}"} -p manox-napi
 LIB=""
@@ -49,12 +56,9 @@ cp "$LIB" vscode/manox_napi.node
 # sections on both GNU and Apple strip; plain strip rejects macOS dylibs.
 strip -S vscode/manox_napi.node 2>/dev/null || true
 
-# 2. Compile the host TypeScript and bundle the webview frontend.
+# 2. Compile the host TypeScript (webview typecheck lives in webui/).
 cd vscode
 npx tsc -p ./
-npx tsc -p tsconfig.webview.json
-node esbuild.webview.mjs
-npx tailwindcss -i src/sidebar/webview/styles/tokens.css -o dist/webview/bundle.css --minify
 
 # 3. Package a local vsix (no network deps — the .node and bundles are packaged).
 npx vsce package --no-dependencies --out manox-vscode.vsix

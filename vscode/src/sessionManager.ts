@@ -15,8 +15,8 @@ import type {
   ModelInfo,
   ThreadInfoSnapshot,
   ThreadListItem,
-} from './protocol';
-import { isSessionEvent } from './protocol';
+} from '../dist/protocol';
+import { isSessionEvent } from '../dist/protocol';
 import type { Transport } from './transport/transport';
 import { NapiTransport } from './transport/napiTransport';
 

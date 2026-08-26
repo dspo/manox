@@ -9,7 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool, ModelInfo } from './protocol';
+import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool, ModelInfo } from '../dist/protocol';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;

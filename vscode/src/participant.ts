@@ -3,7 +3,7 @@
 // runs its own session on the same actor; the two never share a turn.
 
 import * as vscode from 'vscode';
-import type { ActorEvent } from './protocol';
+import type { ActorEvent } from '../dist/protocol';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const TURN_TIMEOUT_MS = 120_000;

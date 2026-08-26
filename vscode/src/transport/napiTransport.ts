@@ -5,7 +5,7 @@
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { ActorEvent } from '../protocol';
+import type { ActorEvent } from '../../dist/protocol';
 import type { Transport } from './transport';
 
 interface NapiBinding {

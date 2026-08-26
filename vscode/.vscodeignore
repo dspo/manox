@@ -10,7 +10,5 @@ dist/**/*.map
 *.vsix
 .gitignore
 build.sh
-esbuild.webview.mjs
 tsconfig.json
-tsconfig.webview.json
 vitest.config.mts

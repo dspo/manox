@@ -2,14 +2,14 @@
   "compilerOptions": {
     "module": "commonjs",
     "target": "ES2022",
-    "outDir": "out",
+    "moduleResolution": "node",
+    "outDir": "dist",
     "rootDir": "src",
-    "lib": ["ES2022"],
-    "sourceMap": true,
+    "declaration": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "moduleResolution": "node"
+    "types": []
   },
-  "include": ["src"]
+  "include": ["src/protocol.ts", "src/sidebar/messages.ts"]
 }
