@@ -66,7 +66,7 @@ pub(crate) async fn bind_and_serve() -> anyhow::Result<()> {
 pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/assets/*path", get(assets))
+        .route("/assets/{*path}", get(assets))
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }
