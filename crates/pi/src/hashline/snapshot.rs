@@ -25,6 +25,10 @@ const MAX_VERSIONS_PER_PATH: usize = 4;
 const MAX_PATHS: usize = 256;
 /// Global ceiling on retained snapshot text across all paths (UTF-8 bytes).
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum distinct path-key directories kept under the disk root. Beyond
+/// this, [`SnapshotStore::disk_gc`] drops the least-recently-modified dirs so
+/// the cache cannot grow unbounded over the application's lifetime.
+const MAX_DISK_PATHS: usize = 256;
 
 /// Canonical store key for a path. Realpath resolves symlinks and the macOS
 /// `/tmp` vs `/private/tmp` split, and collapses case-insensitive spellings onto
@@ -331,6 +335,7 @@ impl SnapshotStore {
         let Some(dir) = self.disk_dir(path) else {
             return;
         };
+        let is_new_dir = !dir.exists();
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -359,6 +364,11 @@ impl SnapshotStore {
                 }
             }
         }
+        // A brand-new path-key dir may push the root past its cap; GC runs
+        // only on new dirs so it is amortized, not once per write.
+        if is_new_dir {
+            self.disk_gc();
+        }
     }
 
     /// Rehydrate a snapshot from disk on a memory miss and retain it in
@@ -381,6 +391,13 @@ impl SnapshotStore {
         let versions = self.by_path.entry(path.to_path_buf()).or_default();
         versions.retain(|s| s.tag != tag);
         versions.push(snap.clone());
+        // Keep the hydrated path within the per-path cap, mirroring record().
+        if versions.len() > MAX_VERSIONS_PER_PATH {
+            if let Some(evicted) = versions.first() {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.text.len());
+            }
+            versions.remove(0);
+        }
         self.total_bytes += snap.text.len();
         self.touch_path(path);
         Some(snap)
@@ -392,15 +409,42 @@ impl SnapshotStore {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    /// Bound the number of path-key directories under the disk root, evicting the
+    /// least-recently-modified ones past [`MAX_DISK_PATHS`]. Best-effort.
+    fn disk_gc(&self) {
+        let Some(root) = self.disk.as_ref() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let mut dirs: Vec<(PathBuf, std::time::SystemTime)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+            .collect();
+        if dirs.len() <= MAX_DISK_PATHS {
+            return;
+        }
+        dirs.sort_by_key(|(_, m)| *m);
+        for (dir, _) in dirs.iter().take(dirs.len() - MAX_DISK_PATHS) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 /// Stable directory name for a canonical path: a 16-hex fingerprint so
-/// arbitrary path characters never reach the filesystem layout.
+/// arbitrary path characters never reach the filesystem layout. Uses FNV-1a
+/// (not `DefaultHasher`), whose output is fixed across std/toolchain versions
+/// — a persisted key must not silently orphan every snapshot on an upgrade.
 fn disk_key(path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 #[cfg(test)]
 mod tests {
@@ -574,5 +618,38 @@ mod tests {
         assert!(!store.has_disk());
         let snap = store.record(&p("a.rs"), "x\n");
         assert_eq!(store.get(&p("a.rs"), &snap.tag).unwrap().tag, snap.tag);
+    }
+
+    #[test]
+    fn disk_key_is_stable_and_version_independent() {
+        // FNV-1a over the same path always yields the same 16-hex key, so a
+        // toolchain upgrade cannot orphan persisted snapshot dirs.
+        let key = disk_key(std::path::Path::new("/tmp/a.rs"));
+        assert_eq!(key, disk_key(std::path::Path::new("/tmp/a.rs")));
+        assert_eq!(key.len(), 16);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(key, disk_key(std::path::Path::new("/tmp/b.rs")));
+    }
+
+    #[test]
+    fn disk_gc_caps_pathkey_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("snapshots");
+        // Record snapshots for more paths than the disk cap, forcing GC.
+        let mut store = SnapshotStore::with_disk(disk.clone());
+        for i in 0..(MAX_DISK_PATHS + 8) {
+            let file = dir.path().join(format!("f{i}.rs"));
+            std::fs::write(&file, format!("v{i}\n")).unwrap();
+            store.record(&file, &format!("v{i}\n"));
+        }
+        let count = std::fs::read_dir(&disk)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        assert!(
+            count <= MAX_DISK_PATHS,
+            "disk GC must cap path dirs, found {count}"
+        );
     }
 }

@@ -19,7 +19,7 @@ use crate::harness::{AgentHarness, HarnessResources, NavigateTreeOptions};
 use crate::session::jsonl::JsonlSessionMetadata;
 use crate::session::repository::SessionRepository;
 use crate::session::{SessionStorage, SessionTreeEntry};
-use crate::tool::AgentTool;
+use crate::tool::{AgentTool, ToolState};
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
 use crate::tools::glob::GlobTool;
@@ -973,7 +973,12 @@ impl AgentSession {
         };
         let session_path = session.storage().path().to_path_buf();
         let config = AssemblyConfig::capture(&self.harness);
-        let mut harness = self.build_harness(session, None, config).await?;
+        // Carry the parent's in-memory tool state (snapshots, mutation queue,
+        // clipboard, noop guard) into the fork so edit context survives.
+        let parent_tool_state = self.harness.tool_state_handle();
+        let mut harness = self
+            .build_harness(session, None, config, parent_tool_state)
+            .await?;
         // The fork's transcript comes from the new session's path.
         harness.restore().await?;
         Ok(ForkResult {
@@ -1014,6 +1019,7 @@ impl AgentSession {
         session: crate::session::Session<crate::session::jsonl::JsonlSessionStorage>,
         model: Option<Model>,
         config: AssemblyConfig,
+        parent_tool_state: Option<Arc<ToolState>>,
     ) -> Result<AgentHarness<crate::session::jsonl::JsonlSessionStorage>, anyhow::Error> {
         let model = model.unwrap_or_else(default_model);
         let stream_fn = self.runtime.resolver()(&model)?;
@@ -1021,6 +1027,11 @@ impl AgentSession {
         let mut harness = AgentHarness::new(session, self.system_prompt.clone(), model, stream_fn)
             .with_stream_resolver(resolver.clone())
             .with_tool_cwd(self.cwd.clone());
+        // Inherit the parent's in-memory tool state before pointing the store
+        // at disk, so the disk tier lands on the state that actually stays.
+        if let Some(parent_tool_state) = parent_tool_state {
+            harness.set_tool_state(parent_tool_state);
+        }
         if let Some(snapshot_dir) = self.snapshot_dir.clone() {
             harness.set_snapshot_dir(snapshot_dir);
         }

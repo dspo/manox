@@ -1105,6 +1105,24 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .enable_disk(root);
     }
 
+    /// The session's tool state as a shared handle, when the context owns one
+    /// — lets a fork carry the parent's snapshots, mutation queue, clipboard,
+    /// and noop guard instead of starting cold.
+    pub fn tool_state_handle(&self) -> Option<Arc<ToolState>> {
+        self.agent.tool_context().tool_state_handle()
+    }
+
+    /// Replace the tool context's state with `tool_state`, keeping the current
+    /// cwd and a matching execution environment. Used by a fork to inherit the
+    /// parent session's in-memory tool state.
+    pub fn set_tool_state(&mut self, tool_state: Arc<ToolState>) {
+        let cwd = self.agent.tool_context().cwd().to_path_buf();
+        let env: Arc<dyn ExecutionEnv> = Arc::new(TokioExecutionEnv::new(cwd.clone()));
+        let tool_ctx: Arc<dyn crate::tool::ToolContext> =
+            Arc::new(LocalToolContext::new(env, cwd, tool_state));
+        self.agent.set_tool_ctx(tool_ctx);
+    }
+
     /// Mount tools on the underlying agent.
     ///
     /// The harness keeps the full set; the agent receives only the active
