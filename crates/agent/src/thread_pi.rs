@@ -2282,8 +2282,8 @@ pub(crate) mod tests {
     /// entered context. Persistence must still dispatch through Manox's
     /// process-global runtime instead of requiring a current reactor.
     #[gpui::test]
-    fn registry_display_persistence_dispatches_off_runtime(cx: &mut gpui::TestAppContext) {
-        cx.update(crate::runtime::init);
+    fn registry_display_persistence_dispatches_off_runtime(_cx: &mut gpui::TestAppContext) {
+        crate::runtime::init();
 
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.jsonl");

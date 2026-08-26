@@ -146,9 +146,9 @@ mod tests {
         });
     }
 
-    fn init_globals(cx: &mut HeadlessAppContext) {
+    fn init_globals(_cx: &mut HeadlessAppContext) {
         INIT_ONCE.call_once(|| {
-            cx.update(agent::runtime::init);
+            agent::runtime::init();
             agent::pi_providers::init();
         });
     }

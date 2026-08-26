@@ -1,4 +1,4 @@
-//! `Keystroke` → terminal byte sequence, with `APP_CURSOR` / `APP_KEYPAD`
+//! Key event → terminal byte sequence, with `APP_CURSOR` / `APP_KEYPAD`
 //! mode branches. Hand-written for the manox subset.
 //!
 //! Coverage: enter/backspace/tab/escape/space, arrows + home/end with
@@ -6,12 +6,35 @@
 //! printable ASCII range (ctrl-a..z, alt-prefix, shift-uppercase). Modified
 //! enters encode as kitty CSI-u when the program pushed the disambiguate
 //! flag (`CSI > 1 u`); every other key keeps the legacy encoding.
+//!
+//! [`KeyEvent`] / [`Modifiers`] are terminal-owned value types so the crate
+//! never depends on the UI framework; the UI layer builds a [`KeyEvent`] from
+//! its native keystroke type before calling [`to_esc_str`].
 
 use alacritty_terminal::term::TermMode;
-use gpui::Keystroke;
+
+/// Modifier state that matters to terminal input, decoupled from the UI
+/// framework. `platform` (cmd/super) is handled by the caller before
+/// translation (it gates shortcuts rather than reaching the PTY), so only
+/// shift/alt/control are carried here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// A key press handed to the terminal, decoupled from the UI framework.
+/// `key` is the key name (`"enter"`, `"up"`, `"f5"`, …) or a single printable
+/// character, matching the names the UI layer reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub key: String,
+    pub modifiers: Modifiers,
+}
 
 /// xterm modifier code: `1 + shift + 2*alt + 4*control`. `1` means none.
-fn modifier_code(k: &Keystroke) -> u8 {
+fn modifier_code(k: &KeyEvent) -> u8 {
     let mut m = 1u8;
     if k.modifiers.shift {
         m += 1;
@@ -25,14 +48,14 @@ fn modifier_code(k: &Keystroke) -> u8 {
     m
 }
 
-fn has_modifier(k: &Keystroke) -> bool {
+fn has_modifier(k: &KeyEvent) -> bool {
     k.modifiers.shift || k.modifiers.alt || k.modifiers.control
 }
 
-/// Translate a gpui keystroke into the byte sequence the PTY expects, or
+/// Translate a key event into the byte sequence the PTY expects, or
 /// `None` if the keystroke produces no input (bare modifier press, unknown
 /// key).
-pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
+pub fn to_esc_str(k: &KeyEvent, mode: TermMode) -> Option<String> {
     if k.key.is_empty() {
         return None;
     }
@@ -42,7 +65,7 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
 
     // Single-char control keys — modifiers on these are not standard, except
     // enter under the kitty keyboard protocol.
-    match k.key.as_ref() {
+    match k.key.as_str() {
         "enter" | "return" => {
             // Kitty disambiguation: a modified enter is CSI 13;<mod>u
             // (shift+enter reads as newline in TUI agents); a plain enter
@@ -73,7 +96,7 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
 
     // Arrow + home/end cluster: \x1b[{L} (normal) / \x1bO{L} (app cursor),
     // or \x1b[1;{mod}{L} when a modifier is held.
-    let arrow_home_end = match k.key.as_ref() {
+    let arrow_home_end = match k.key.as_str() {
         "up" => Some('A'),
         "down" => Some('B'),
         "right" => Some('C'),
@@ -93,7 +116,7 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
     }
 
     // Tilde cluster (page up/down, insert, delete).
-    let tilde = match k.key.as_ref() {
+    let tilde = match k.key.as_str() {
         "pageup" => Some('5'),
         "pagedown" => Some('6'),
         "delete" => Some('3'),
@@ -109,7 +132,7 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
     }
 
     // F1–F12. F1–F4 use \x1bO{P..S} (or \x1b[1;{mod}{L}); F5–F12 use ~-seqs.
-    let fkey = match k.key.as_ref() {
+    let fkey = match k.key.as_str() {
         "f1" => Some((11u8, "P")),
         "f2" => Some((12, "Q")),
         "f3" => Some((13, "R")),
@@ -176,13 +199,11 @@ pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Keystroke, Modifiers};
 
-    fn ks(key: &str, mods: Modifiers) -> Keystroke {
-        Keystroke {
-            key: key.into(),
+    fn ks(key: &str, mods: Modifiers) -> KeyEvent {
+        KeyEvent {
+            key: key.to_string(),
             modifiers: mods,
-            ..Default::default()
         }
     }
 

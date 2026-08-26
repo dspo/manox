@@ -100,7 +100,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     register_lilex(cx);
     cx.update(|cx| {
-        agent::runtime::init(cx);
+        agent::runtime::init();
         agent::pi_providers::init();
         agent::thread_store::init(cx);
     });

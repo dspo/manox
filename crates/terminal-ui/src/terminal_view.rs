@@ -384,7 +384,15 @@ impl TerminalView {
             return true;
         }
 
-        if let Some(s) = keys::to_esc_str(k, mode) {
+        let key_event = keys::KeyEvent {
+            key: k.key.to_string(),
+            modifiers: keys::Modifiers {
+                shift: k.modifiers.shift,
+                alt: k.modifiers.alt,
+                control: k.modifiers.control,
+            },
+        };
+        if let Some(s) = keys::to_esc_str(&key_event, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
             self.note_input(cx);
             return true;
@@ -577,8 +585,13 @@ impl TerminalView {
             // Local scrollback scroll is a no-op on the alt screen the TUI
             // owns, so without this the wheel does nothing.
             let (row, col) = self.px_to_grid(ev.position, window);
+            let mods = terminal::Modifiers {
+                shift: ev.modifiers.shift,
+                alt: ev.modifiers.alt,
+                control: ev.modifiers.control,
+            };
             self.terminal.update(cx, |t, _| {
-                t.mouse_wheel(row, col, lines, &ev.modifiers);
+                t.mouse_wheel(row, col, lines, &mods);
             });
             return;
         }

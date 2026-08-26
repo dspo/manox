@@ -86,7 +86,7 @@ pub fn init(cx: &mut App) {
     // init work (provider shell credentials, MCP spawns) benefits as soon as
     // the resolver lands.
     path_env::install();
-    runtime::init(cx);
+    runtime::init();
     // i18n before anything that renders UI or builds a system prompt, so the
     // user's locale is settled before the first frame / first turn.
     i18n::init();
