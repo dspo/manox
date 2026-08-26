@@ -38,6 +38,9 @@ pub struct RichText {
     join_before: &'static str,
     link_spans: Vec<LinkSpan>,
     link_color: Hsla,
+    /// Wash painted behind the link currently under the cursor; `None` disables
+    /// the hover highlight.
+    hover_link_bg: Option<Hsla>,
 }
 
 impl RichText {
@@ -52,6 +55,7 @@ impl RichText {
             join_before: "\n\n",
             link_spans: Vec::new(),
             link_color: Hsla::default(),
+            hover_link_bg: None,
         }
     }
 
@@ -82,6 +86,10 @@ impl RichText {
 
     pub fn link_color(mut self, color: Hsla) -> Self {
         self.link_color = color;
+        self
+    }
+    pub fn hover_link_bg(mut self, bg: Option<Hsla>) -> Self {
+        self.hover_link_bg = bg;
         self
     }
 }
@@ -596,6 +604,16 @@ impl Element for RichText {
                 }
             }
         }
+        // Hover highlight: a wash behind the link under the cursor, painted
+        // before the underline so the wash sits under the link text.
+        if let (Some(link), Some(bg)) = (
+            hovered_link(&self.link_spans, self.doc_start, self.selection.hovered()),
+            self.hover_link_bg,
+        ) {
+            for quad in span_quads(&layout, link.range.start, link.range.end, px(0.)) {
+                window.paint_quad(fill(quad, bg));
+            }
+        }
         if self.link_color.a > 0.0 {
             for link in &self.link_spans {
                 for quad in span_quads(&layout, link.range.start, link.range.end, px(0.)) {
@@ -637,6 +655,19 @@ impl Element for RichText {
             origin.y += line.size(shaped.line_height).height;
         }
     }
+}
+
+/// The link span whose virtual-doc range contains `hovered`, if any.
+fn hovered_link<'a>(
+    link_spans: &'a [LinkSpan],
+    doc_start: usize,
+    hovered: Option<usize>,
+) -> Option<&'a LinkSpan> {
+    let hovered = hovered?;
+    link_spans.iter().find(|link| {
+        let abs = (doc_start + link.range.start)..(doc_start + link.range.end);
+        abs.contains(&hovered)
+    })
 }
 
 fn span_quads(
@@ -951,4 +982,57 @@ mod tests {
             "https://example.com"
         );
     }
+
+    #[test]
+    fn hovered_link_resolves_to_containing_span() {
+        let spans = vec![LinkSpan {
+            range: 5..9,
+            url: "https://example.com".into(),
+            kind: crate::markdown::ast::LinkKind::Url,
+        }];
+        // Inside the span (doc offsets 7..=8 resolve; 5 and 9 are the edges).
+        assert!(hovered_link(&spans, 0, Some(7)).is_some());
+        assert!(hovered_link(&spans, 0, Some(9)).is_none());
+        // Span with a nonzero doc start; the hovered index is doc-absolute.
+        assert!(hovered_link(&spans, 100, Some(106)).is_some());
+        assert!(hovered_link(&spans, 100, Some(109)).is_none());
+        assert!(hovered_link(&spans, 0, None).is_none());
+    }
+
+    /// The hover paint branch runs without panicking when a hovered link and a
+    /// wash are both set, and the hovered index resolves through the shared
+    /// selection state that the container's mouse-move listener writes.
+    #[gpui::test]
+    async fn hovered_link_paints_and_resolves(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let selection = DocSelection::new();
+        let selection_for_draw = selection.clone();
+        selection.set_hovered(Some(2));
+        let _ = visual.draw(
+            point(px(12.), px(20.)),
+            size(
+                AvailableSpace::Definite(px(480.)),
+                AvailableSpace::MinContent,
+            ),
+            |_window, _cx| {
+                RichText::new("link tail", 0, selection_for_draw)
+                    .link_spans(vec![LinkSpan {
+                        range: 0..4,
+                        url: "https://example.com".into(),
+                        kind: crate::markdown::ast::LinkKind::Url,
+                    }])
+                    .hover_link_bg(Some(Hsla::default()))
+            },
+        );
+        let hit = selection
+            .hit(point(px(14.), px(22.)))
+            .expect("paint registered shaped text geometry");
+        assert_eq!(
+            selection.link_at(hit).expect("link at hit").url,
+            "https://example.com"
+        );
+        assert!(selection.hovered().is_some());
+    }
 }
+
