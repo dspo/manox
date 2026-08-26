@@ -39,8 +39,8 @@ cargo install --path crates/cx --root ~/.local/ --locked
 This builds the release binary and installs it to `~/.local/bin/cx`. If
 `~/.local/bin` is not already in `PATH`, add it before invoking `cx`.
 
-Alternatively, `make -C crates/cx install` (or `crates/cx/scripts/install.sh`)
-builds the release binary and installs it to the same location.
+Alternatively, run `script/install-cx` from the repository root — it wraps
+the same `cargo install` command.
 
 ## Runtime provider config
 
@@ -81,12 +81,12 @@ The manox repo pins Rust 1.95.0 with `rust-toolchain.toml` and CI runs the
 same version.
 
 ```bash
-./scripts/build.sh
+cargo build
 cargo test
 ```
 
-For a local binary install from source:
+For a local binary install from source (run from the repository root):
 
 ```bash
-./scripts/install.sh
+script/install-cx
 ```

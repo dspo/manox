@@ -1,14 +1,42 @@
 #!/usr/bin/env bash
 # Build the manox napi core + package the VS Code extension into a vsix.
+#
+# Usage: vscode/build.sh [options]
+# Options:
+#   --release   Build the napi binding in release mode (default: debug)
+#   -h          Display this help and exit
 set -euo pipefail
+
+build_flag=""
+profile_dir="debug"
+
+help_info() {
+    echo "
+Usage: ${0##*/} [options]
+Build the manox napi core + package the VS Code extension into a vsix.
+
+Options:
+  --release   Build the napi binding in release mode (default: debug)
+  -h          Display this help and exit
+"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release) build_flag="--release"; profile_dir="release";;
+        -h|--help) help_info; exit 0;;
+        *) echo "Error: unknown option '$1'"; help_info; exit 1;;
+    esac
+    shift
+done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # 1. Build the napi core (cdylib) and stage it next to the compiled extension.
-cargo build -p manox-napi
+cargo build ${build_flag} -p manox-napi
 LIB=""
-for candidate in target/debug/libmanox_napi.dylib target/debug/libmanox_napi.so target/debug/manox_napi.dll; do
+for candidate in target/${profile_dir}/libmanox_napi.dylib target/${profile_dir}/libmanox_napi.so target/${profile_dir}/manox_napi.dll; do
   if [ -f "$candidate" ]; then
     LIB="$candidate"
     break
