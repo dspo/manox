@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::ops::Range as StdRange;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui::{
+use gpui::{App, 
     Context, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
     ScrollWheelEvent, Subscription, Task, Window, div, prelude::*,
 };
@@ -16,6 +17,9 @@ use util::paths::PathStyle;
 use crate::element::TerminalElement;
 
 const OPTION_AS_META: bool = false;
+/// Host-provided handler invoked when the shell exits.
+type ExitHandler = Rc<dyn Fn(&mut App)>;
+
 const SCROLL_MULTIPLIER: f32 = 1.0;
 const HYPERLINK_TIMEOUT: Duration = Duration::from_millis(1);
 
@@ -33,6 +37,7 @@ pub struct TerminalView {
     match_count: usize,
     active_match: usize,
     search_task: Option<Task<()>>,
+    on_exit: Option<ExitHandler>,
     _blink_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -60,6 +65,7 @@ impl TerminalView {
             match_count: 0,
             active_match: 0,
             search_task: None,
+            on_exit: None,
             _blink_task: None,
             _subscriptions: Vec::new(),
         };
@@ -142,6 +148,18 @@ impl TerminalView {
         }
     }
 
+    /// Hosts decide what happens when the shell exits; the component never
+    /// quits the host application itself.
+    pub fn set_on_exit(&mut self, f: impl Fn(&mut App) + 'static) {
+        self.on_exit = Some(Rc::new(f));
+    }
+
+    fn fire_exit(&self, cx: &mut Context<Self>) {
+        if let Some(f) = &self.on_exit {
+            f(cx);
+        }
+    }
+
     fn spawn_shell(&mut self, cx: &mut Context<Self>) {
         let (completion_tx, completion_rx) = async_channel::unbounded();
         let builder_task = TerminalBuilder::new(
@@ -185,11 +203,12 @@ impl TerminalView {
         })
         .detach();
 
-        cx.spawn(async move |_, cx| {
+        cx.spawn(async move |this, cx| {
             // Err means the channel closed without a shell exit (spawn
-            // failure); stay up so the error remains visible.
+            // failure); stay up so the error remains visible. The host decides
+            // what an actual shell exit means via `set_on_exit`.
             if completion_rx.recv().await.is_ok() {
-                cx.update(|cx| cx.quit());
+                this.update(cx, |this, cx| this.fire_exit(cx)).ok();
             }
         })
         .detach();
@@ -220,7 +239,7 @@ impl TerminalView {
                 }
                 cx.notify();
             }
-            TerminalEvent::CloseTerminal => cx.quit(),
+            TerminalEvent::CloseTerminal => self.fire_exit(cx),
             // Content-affecting events (Wakeup on PTY output, selection, title,
             // blink) must invalidate the view so output appears immediately.
             _ => cx.notify(),

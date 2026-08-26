@@ -22,7 +22,7 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title("zterm");
-                let view = cx.new(|cx| TerminalView::new(cx));
+                let view = cx.new(TerminalView::new);
                 window.focus(&view.read(cx).focus_handle(), cx);
                 view
             },

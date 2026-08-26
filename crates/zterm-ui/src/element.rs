@@ -1151,7 +1151,7 @@ impl Element for TerminalElement {
             }
 
             if !layout.matches.is_empty() {
-                let match_color: Hsla = gpui::yellow().into();
+                let match_color: Hsla = gpui::yellow();
                 for m in &layout.matches {
                     for rect in selection_rects(
                         *m,

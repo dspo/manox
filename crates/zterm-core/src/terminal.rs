@@ -1,3 +1,6 @@
+// zterm-core is vendored from zed (GPL). Suppress style-only lints so the
+// upstream diff stays minimal; behavioral lints remain enabled.
+#![allow(clippy::needless_borrow)]
 mod mappings;
 
 mod alacritty;
@@ -25,7 +28,6 @@ use collections::{HashMap, VecDeque};
 use futures::StreamExt;
 use pty_info::{ProcessIdGetter, PtyProcessInfo};
 use serde::{Deserialize, Serialize};
-use urlencoding;
 use util::{paths::PathStyle, truncate_and_trailoff};
 
 use std::{
@@ -918,6 +920,9 @@ impl TerminalBuilder {
         }
     }
 
+    // Mirrors the upstream zed TerminalBuilder signature; grouping into a params
+    // struct would diverge from the vendored source.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         working_directory: Option<PathBuf>,
         command: Option<(String, Vec<String>)>,
@@ -1910,15 +1915,8 @@ impl Terminal {
 
     fn mouse_changed(&mut self, point: Point, side: SelectionSide) -> bool {
         match self.last_mouse {
-            Some((old_point, old_side)) => {
-                if old_point == point && old_side == side {
-                    false
-                } else {
-                    self.last_mouse = Some((point, side));
-                    true
-                }
-            }
-            None => {
+            Some((old_point, old_side)) if old_point == point && old_side == side => false,
+            _ => {
                 self.last_mouse = Some((point, side));
                 true
             }
@@ -1982,7 +1980,7 @@ impl Terminal {
         let now = Instant::now();
         let throttle = !self
             .last_hyperlink_search_position
-            .map_or(true, |last_pos| {
+            .is_none_or(|last_pos| {
                 // Only search if mouse moved significantly or enough time passed
                 let distance_moved = ((position.x - last_pos.x).abs()
                     + (position.y - last_pos.y).abs())
@@ -4004,7 +4002,7 @@ mod tests {
                     terminal.with_renderable_cells(|cells| {
                         let mut text_lines = Vec::new();
                         let linegroups = cells.into_iter().chunk_by(|cell| cell.point.line);
-                        for (_, (_, line)) in linegroups.into_iter().enumerate() {
+                        for (_, line) in linegroups.into_iter() {
                             let mut previous_cell_had_extras = false;
                             let mut text = String::new();
                             for IndexedCell { cell, .. } in line {
@@ -4155,15 +4153,14 @@ mod tests {
                 let terminal_events_subscription = cx.subscribe_in(
                     terminal,
                     window,
-                    |test_view, terminal, event, window, cx| match event {
-                        Event::Wakeup => {
+                    |test_view, terminal, event, window, cx| {
+                        if let Event::Wakeup = event {
                             test_view.wakeups += 1;
                             cx.update_entity(terminal, |terminal, cx| {
                                 terminal.suppress_hyperlink_throttle_once = true;
                                 terminal.sync(window, cx)
                             })
                         }
-                        _ => {}
                     },
                 );
                 vec![terminal_subscription, terminal_events_subscription]

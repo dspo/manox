@@ -1035,3 +1035,14 @@ Thread-level reasoning effort, chosen in [ModelMenu](#modelmenu) (High / Max, cu
 
 #### High
 #### Max
+
+---
+
+## Standalone terminal component (not in main UI tree)
+
+`crates/zterm-ui` provides `TerminalView`, a self-contained, embeddable GPUI
+terminal (render/IME/search/blink/hover/vi) built on `zterm-core` (a GPL-3.0
+port of the zed terminal). It is intentionally NOT wired into the main manox
+UI tree; embed it via `TerminalView::new` and, for standalone use, see
+`cargo run -p zterm-ui --example zterm`. Shell-exit behavior is host-decided
+via `TerminalView::set_on_exit`.

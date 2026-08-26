@@ -1589,7 +1589,7 @@ mod tests {
         fn process_input(term: &mut Term<VoidListener>, c: char) {
             match c {
                 '\t' => term.put_tab(1),
-                c @ _ => term.input(c),
+                c => term.input(c),
             }
         }
 
@@ -1899,7 +1899,7 @@ mod tests {
 
                 match cell.c {
                     '\t' => result.push(' '),
-                    c @ _ => result.push(c),
+                    c => result.push(c),
                 }
             }
 
@@ -1967,8 +1967,7 @@ mod tests {
                 if expected_hyperlink.hyperlink_match.start()
                     != expected_hyperlink.hyperlink_match.end()
                 {
-                    assert!(
-                        false,
+                    panic!(
                         "No hyperlink found\n     at {source_location}:\n{}",
                         check_hyperlink_match.format_renderable_content()
                     )
