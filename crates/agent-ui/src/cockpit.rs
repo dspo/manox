@@ -119,6 +119,19 @@ pub fn cache_read_ratio(usage: TokenUsage) -> Option<f64> {
     Some(usage.cache_read_input_tokens as f64 / denom as f64)
 }
 
+/// Percentage rendering of a cache-hit ratio at the given decimal precision.
+/// An imperfect rate never rounds up to a full 100%: values inside the
+/// rounding-up band clamp to the top value representable at that precision
+/// (99.9% at one decimal), so only an exact 1.0 ratio reads as full.
+pub fn format_cache_hit(ratio: f64, decimals: usize) -> String {
+    let mut pct = ratio * 100.0;
+    if ratio < 1.0 {
+        let cap = 100.0 - 10f64.powi(-(decimals as i32));
+        pct = pct.min(cap);
+    }
+    format!("{:.*}%", decimals, pct)
+}
+
 /// Compact elapsed-time rendering: `1h 5m` / `10m 30s` / `3s`.
 pub fn format_elapsed(d: Duration) -> String {
     let s = d.as_secs();
@@ -256,5 +269,25 @@ mod tests {
             cache_read_input_tokens: 10_000,
         };
         assert_eq!(cache_read_ratio(usage), Some(1.0));
+    }
+
+    #[test]
+    fn format_cache_hit_one_decimal() {
+        assert_eq!(format_cache_hit(0.0, 1), "0.0%");
+        assert_eq!(format_cache_hit(0.8298, 1), "83.0%");
+        assert_eq!(format_cache_hit(0.999, 1), "99.9%");
+        // An imperfect rate inside the rounding-up band clamps to 99.9;
+        // only an exact 1.0 renders as the full rate.
+        assert_eq!(format_cache_hit(0.99951, 1), "99.9%");
+        assert_eq!(format_cache_hit(0.99999, 1), "99.9%");
+        assert_eq!(format_cache_hit(1.0, 1), "100.0%");
+    }
+
+    #[test]
+    fn format_cache_hit_zero_decimals() {
+        assert_eq!(format_cache_hit(0.5, 0), "50%");
+        assert_eq!(format_cache_hit(0.8298, 0), "83%");
+        assert_eq!(format_cache_hit(0.996, 0), "99%");
+        assert_eq!(format_cache_hit(1.0, 0), "100%");
     }
 }

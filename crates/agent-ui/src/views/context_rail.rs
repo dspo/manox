@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::Workspace;
-use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
+use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct, format_cache_hit};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
 use crate::views::subagents::{SubagentInfo, status_indicator, subagent_display_title};
 
@@ -472,7 +472,7 @@ impl ContextRail {
                 // (the tooltip convention) when there is no input to measure.
                 // With a priced model the cost row follows as the last child.
                 let cache_hit = crate::cockpit::cache_read_ratio(**usage)
-                    .map(|r| format!("{:.1}%", r * 100.0))
+                    .map(|r| format_cache_hit(r, 1))
                     .unwrap_or_else(|| "--".into());
                 let cost = per_model_cost.get(*model_name).copied().unwrap_or(0.0);
                 let token_branch = if cost > 0.0 { "├─" } else { "└─" };
@@ -1021,7 +1021,7 @@ fn call_tree_row(
     let prefix = if is_last { "╰─ " } else { "├─ " };
     let avg_ms = metric.latency_ms / metric.calls.max(1);
     let cache_pct = cache_read_ratio(metric.token_usage)
-        .map(|r| format!("{:.0}%", r * 100.0))
+        .map(|r| format_cache_hit(r, 0))
         .unwrap_or_else(|| "--".into());
     let calls_unit = i18n::t("context-tooltip-calls-unit");
     let text = match purpose_prefix {
