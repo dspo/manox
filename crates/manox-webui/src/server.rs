@@ -236,3 +236,72 @@ fn spawn_sender(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, State};
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn test_state() -> AppState {
+        AppState {
+            token: "tok123".to_string(),
+            conn_tx: unbounded_channel().0,
+            port: 4321,
+        }
+    }
+
+    /// `/` injects the per-boot token into the page so the webview bridge can
+    /// authenticate its socket — the single handshake entry point.
+    #[tokio::test]
+    async fn index_injects_token() {
+        let resp = index(State(test_state())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("__MANOX_TOKEN__ = 'tok123'"));
+        assert!(html.contains("/assets/webview/bundle.js"));
+    }
+
+    /// The committed `webui/dist` build is embedded; `/assets/webview/bundle.js`
+    /// must resolve so the browser actually boots the app (an empty shell is a
+    /// routing regression, not the intended home state).
+    #[tokio::test]
+    async fn assets_serves_embedded_bundle() {
+        let resp = assets(Path("webview/bundle.js".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(content_type, "application/javascript");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty(), "bundle.js must be non-empty");
+    }
+
+    #[tokio::test]
+    async fn assets_404s_unknown_path() {
+        let resp = assets(Path("nope/missing.js".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Only same-origin loopback browsers may open the socket.
+    #[test]
+    fn origin_allowed_checks_loopback_scheme_and_port() {
+        assert!(origin_allowed("http://127.0.0.1:4321", 4321));
+        assert!(origin_allowed("http://localhost:4321", 4321));
+        assert!(!origin_allowed("http://127.0.0.1:9999", 4321), "wrong port");
+        assert!(
+            !origin_allowed("https://127.0.0.1:4321", 4321),
+            "wrong scheme"
+        );
+        assert!(
+            !origin_allowed("http://evil.com:4321", 4321),
+            "foreign host"
+        );
+        assert!(!origin_allowed("", 4321), "missing origin");
+        assert!(!origin_allowed("file:///x", 4321), "non-http origin");
+    }
+}
