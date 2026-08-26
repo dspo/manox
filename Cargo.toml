@@ -31,6 +31,7 @@ members = [
     "crates/manox-actor",
     "crates/manox-session-core",
     "crates/manox-napi",
+    "crates/manox-webui",
 ]
 resolver = "2"
 
@@ -55,6 +56,7 @@ manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
 manox-actor = { path = "crates/manox-actor" }
 manox-session-core = { path = "crates/manox-session-core" }
+manox-webui = { path = "crates/manox-webui" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
@@ -65,8 +67,10 @@ cx-providers = { path = "crates/cx-providers" }
 
 anyhow = "1"
 async-channel = "2"
+axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
+include_dir = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"
 # brush: in-process bash-compatible shell used as the bash tool's execution engine.

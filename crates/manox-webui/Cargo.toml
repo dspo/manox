@@ -1,0 +1,27 @@
+[package]
+name = "manox-webui"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent = { workspace = true }
+manox-session-core = { workspace = true }
+gpui = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+include_dir = { workspace = true }
+open = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The pump tests run on a gpui test app and tear the process-global
+# ThreadStore down via `drop_global_for_test`; both require the test-support
+# features. Dev-dependencies never enter the release dependency graph.
+gpui = { workspace = true, features = ["test-support"] }
+agent = { workspace = true, features = ["test-support"] }

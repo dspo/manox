@@ -382,6 +382,7 @@ fn main() {
                     Ok(()) => {
                         cx.set_quit_mode(QuitMode::Explicit);
                         tray::spawn_pump(cx);
+                        manox_webui::spawn_pump(cx);
                     }
                     // The fallback sentence is platform-true: macOS keeps a
                     // window-less app alive by default (dock icon reopens),

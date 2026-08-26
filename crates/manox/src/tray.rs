@@ -21,6 +21,8 @@ use gpui::App;
 pub enum TrayCmd {
     /// Open the main window, or focus it when one already exists.
     Open,
+    /// Open the WebUI in the browser, starting the server on first use.
+    OpenWebUi,
     /// Quit the application.
     Quit,
 }
@@ -28,6 +30,8 @@ pub enum TrayCmd {
 /// Stable ids for the tray-icon menu items (macOS/Windows backends).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const OPEN_ID: &str = "tray-open";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const WEBUI_ID: &str = "tray-webui";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const QUIT_ID: &str = "tray-quit";
 
@@ -72,6 +76,7 @@ pub fn spawn_pump(cx: &mut App) {
                 quit |= matches!(cmd, TrayCmd::Quit);
                 cx.update(|cx| match cmd {
                     TrayCmd::Open => crate::open_or_focus_main_window(cx),
+                    TrayCmd::OpenWebUi => manox_webui::open_webui(),
                     TrayCmd::Quit => cx.quit(),
                 });
             }
@@ -100,7 +105,7 @@ fn app_icon_rgba(size: u32) -> anyhow::Result<Vec<u8>> {
 /// [`super::spawn_pump`].
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod backend {
-    use super::{OPEN_ID, QUIT_ID, TrayCmd, app_icon_rgba};
+    use super::{OPEN_ID, QUIT_ID, TrayCmd, WEBUI_ID, app_icon_rgba};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -145,8 +150,9 @@ mod backend {
 
     fn build_menu() -> anyhow::Result<Menu> {
         let open = MenuItem::with_id(OPEN_ID, agent::i18n::t("menu-open-manox"), true, None);
+        let webui = MenuItem::with_id(WEBUI_ID, agent::i18n::t("menu-webui"), true, None);
         let quit = MenuItem::with_id(QUIT_ID, agent::i18n::t("menu-quit"), true, None);
-        Menu::with_items(&[&open, &PredefinedMenuItem::separator(), &quit])
+        Menu::with_items(&[&open, &webui, &PredefinedMenuItem::separator(), &quit])
             .map_err(|e| anyhow::anyhow!("tray menu build failed: {e}"))
     }
 
@@ -166,6 +172,7 @@ mod backend {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             match event.id().0.as_str() {
                 OPEN_ID => cmds.push(TrayCmd::Open),
+                WEBUI_ID => cmds.push(TrayCmd::OpenWebUi),
                 QUIT_ID => cmds.push(TrayCmd::Quit),
                 _ => {}
             }
@@ -248,6 +255,12 @@ mod backend {
                 StandardItem {
                     label: agent::i18n::t("menu-open-manox").to_string(),
                     activate: Box::new(|this: &mut Self| this.send(TrayCmd::Open)),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: agent::i18n::t("menu-webui").to_string(),
+                    activate: Box::new(|this: &mut Self| this.send(TrayCmd::OpenWebUi)),
                     ..Default::default()
                 }
                 .into(),
