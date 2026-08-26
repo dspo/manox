@@ -23,6 +23,8 @@ use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor, StdSync
 use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, Task};
 
+use crate::mappings::keys::Modifiers;
+
 use crate::event::{ManoxListener, TerminalEvent};
 use crate::pty_source::PtySource;
 use crate::readiness::{ReadinessMode, ReadinessTracker};
@@ -379,13 +381,7 @@ impl Terminal {
     /// line, capped at a small burst so a single fling does not flood the PTY.
     /// `row`/`col` are the visible grid coords under the cursor. No-op when no
     /// mouse mode is active — callers should fall back to [`Self::scroll`].
-    pub fn mouse_wheel(
-        &self,
-        row: usize,
-        col: usize,
-        delta_lines: i32,
-        modifiers: &gpui::Modifiers,
-    ) {
+    pub fn mouse_wheel(&self, row: usize, col: usize, delta_lines: i32, modifiers: &Modifiers) {
         if delta_lines == 0 {
             return;
         }

@@ -32,6 +32,7 @@ members = [
     "crates/manox-session-core",
     "crates/manox-napi",
     "crates/manox-webui",
+    "crates/manox-protocol",
 ]
 resolver = "2"
 
@@ -57,6 +58,7 @@ http_proxy = { path = "crates/http_proxy" }
 manox-actor = { path = "crates/manox-actor" }
 manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
+manox-protocol = { path = "crates/manox-protocol" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
@@ -67,6 +69,8 @@ cx-providers = { path = "crates/cx-providers" }
 
 anyhow = "1"
 async-channel = "2"
+futures-lite = "2"
+ts-rs = { version = "10", features = ["serde-json-impl"] }
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
 include_dir = "0.7"

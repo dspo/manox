@@ -1,12 +1,11 @@
 //! Clipboard image -> provider-ready `MessageContent::Image`.
 //!
-//! Decodes a `gpui::Image` from the clipboard, resizes the long edge down to
-//! `ANTHROPIC_SIZE_LIMIT`, and re-encodes as PNG, looping with a shrinking
-//! factor until the encoded size fits `DEFAULT_IMAGE_MAX_BYTES`. CPU-bound --
-//! callers must run it on a background executor.
+//! Decodes a [`PastedImage`] handed over by the UI layer, resizes the long edge
+//! down to `ANTHROPIC_SIZE_LIMIT`, and re-encodes as PNG, looping with a
+//! shrinking factor until the encoded size fits `DEFAULT_IMAGE_MAX_BYTES`.
+//! CPU-bound -- callers must run it on a background executor.
 
 use std::io::Cursor;
-use std::sync::Arc;
 
 use base64::Engine as _;
 
@@ -25,17 +24,37 @@ const DOWNSCALE_FACTOR: f32 = 0.85;
 /// transient memory peak of `image::load_from_memory`.
 const MAX_INPUT_BYTES: usize = 50 * 1024 * 1024;
 
-/// Map a clipboard image format onto an `image` decoder. SVG yields `None`
-/// (vector, not raster-decodable); the caller drops the attachment.
-fn decode_format(format: gpui::ImageFormat) -> Option<image::ImageFormat> {
+/// Raster formats the UI adapter may hand over. Formats the `image` crate
+/// cannot raster-decode (SVG/ICO/PNM) are dropped by the adapter before a
+/// [`PastedImage`] is constructed, so every variant here is decodable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastedImageFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Gif,
+    Bmp,
+    Tiff,
+}
+
+/// A clipboard image handed to the agent, decoupled from the UI framework.
+/// The UI adapter builds one from its native image type; undecodable formats
+/// are dropped there rather than represented here.
+#[derive(Debug, Clone)]
+pub struct PastedImage {
+    pub format: PastedImageFormat,
+    pub bytes: Vec<u8>,
+}
+
+/// Map a pasted image format onto an `image` decoder.
+fn decode_format(format: PastedImageFormat) -> image::ImageFormat {
     match format {
-        gpui::ImageFormat::Png => Some(image::ImageFormat::Png),
-        gpui::ImageFormat::Jpeg => Some(image::ImageFormat::Jpeg),
-        gpui::ImageFormat::Webp => Some(image::ImageFormat::WebP),
-        gpui::ImageFormat::Gif => Some(image::ImageFormat::Gif),
-        gpui::ImageFormat::Bmp => Some(image::ImageFormat::Bmp),
-        gpui::ImageFormat::Tiff => Some(image::ImageFormat::Tiff),
-        gpui::ImageFormat::Svg | gpui::ImageFormat::Ico | gpui::ImageFormat::Pnm => None,
+        PastedImageFormat::Png => image::ImageFormat::Png,
+        PastedImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        PastedImageFormat::Webp => image::ImageFormat::WebP,
+        PastedImageFormat::Gif => image::ImageFormat::Gif,
+        PastedImageFormat::Bmp => image::ImageFormat::Bmp,
+        PastedImageFormat::Tiff => image::ImageFormat::Tiff,
     }
 }
 
@@ -65,16 +84,15 @@ fn resize_long_edge(
     image::imageops::resize(&rgba, new_w, new_h, image::imageops::FilterType::Triangle)
 }
 
-/// Clipboard `gpui::Image` -> a provider-ready `MessageContent::Image` (base64
-/// PNG, long edge <= `ANTHROPIC_SIZE_LIMIT`, encoded <=
-/// `DEFAULT_IMAGE_MAX_BYTES`). Returns `None` when the format is undecodable
-/// (e.g. SVG) or the image still exceeds the cap after
-/// `MAX_IMAGE_DOWNSCALE_PASSES`.
-pub fn gpui_image_to_message_content(image: Arc<gpui::Image>) -> Option<MessageContent> {
+/// Clipboard [`PastedImage`] -> a provider-ready `MessageContent::Image`
+/// (base64 PNG, long edge <= `ANTHROPIC_SIZE_LIMIT`, encoded <=
+/// `DEFAULT_IMAGE_MAX_BYTES`). Returns `None` when the image still exceeds the
+/// cap after `MAX_IMAGE_DOWNSCALE_PASSES`.
+pub fn pasted_image_to_message_content(image: &PastedImage) -> Option<MessageContent> {
     if image.bytes.len() > MAX_INPUT_BYTES {
         return None;
     }
-    let format = decode_format(image.format)?;
+    let format = decode_format(image.format);
     let loaded = image::load_from_memory_with_format(&image.bytes, format).ok()?;
     let mut rgba = resize_long_edge(loaded.to_rgba8(), ANTHROPIC_SIZE_LIMIT);
 
@@ -104,22 +122,22 @@ pub fn gpui_image_to_message_content(image: Arc<gpui::Image>) -> Option<MessageC
 mod tests {
     use super::*;
 
-    fn solid_png(w: u32, h: u32) -> Arc<gpui::Image> {
+    fn solid_png(w: u32, h: u32) -> PastedImage {
         let img = image::ImageBuffer::from_pixel(w, h, image::Rgba([255, 0, 0, 255]));
         let mut buf = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut buf, image::ImageFormat::Png)
             .unwrap();
-        Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Png,
-            buf.into_inner(),
-        ))
+        PastedImage {
+            format: PastedImageFormat::Png,
+            bytes: buf.into_inner(),
+        }
     }
 
     #[test]
     fn large_image_is_downscaled() {
         let img = solid_png(4000, 4000);
-        let content = gpui_image_to_message_content(img).expect("large png converts");
+        let content = pasted_image_to_message_content(&img).expect("large png converts");
         let (data, mime_type) = match content {
             MessageContent::Image { data, mime_type } => (data, mime_type),
             _ => unreachable!("expected image content"),
@@ -136,7 +154,7 @@ mod tests {
     #[test]
     fn small_image_passes_through_as_png() {
         let img = solid_png(100, 50);
-        let content = gpui_image_to_message_content(img).expect("small png converts");
+        let content = pasted_image_to_message_content(&img).expect("small png converts");
         let (data, mime_type) = match content {
             MessageContent::Image { data, mime_type } => (data, mime_type),
             _ => unreachable!("expected image content"),
@@ -151,12 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn svg_is_dropped() {
-        let svg = b"<?xml version=\"1.0\"?><svg></svg>";
-        let img = Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Svg,
-            svg.to_vec(),
-        ));
-        assert!(gpui_image_to_message_content(img).is_none());
+    fn oversized_payload_is_rejected_before_decode() {
+        let img = PastedImage {
+            format: PastedImageFormat::Png,
+            bytes: vec![0u8; MAX_INPUT_BYTES + 1],
+        };
+        assert!(pasted_image_to_message_content(&img).is_none());
     }
 }

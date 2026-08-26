@@ -129,7 +129,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     let mut cx = gpui::TestAppContext::single();
     cx.update(|cx| {
-        agent::runtime::init(cx);
+        agent::runtime::init();
         agent::settings::init_optimization();
         agent::i18n::init();
         agent::pi_providers::init();

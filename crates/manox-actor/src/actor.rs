@@ -179,9 +179,9 @@ mod tests {
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
     /// (`agent::init` would also boot MCP/LSP/plugin subsystems).
-    fn init_globals(cx: &mut HeadlessAppContext) {
+    fn init_globals(_cx: &mut HeadlessAppContext) {
         INIT_ONCE.call_once(|| {
-            cx.update(agent::runtime::init);
+            agent::runtime::init();
             agent::pi_providers::init();
         });
     }

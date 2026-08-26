@@ -1371,7 +1371,7 @@ mod tests {
     fn archive_survives_concurrent_pinned_write() {
         let (db, db_path) = temp_db();
         let mut cx = gpui::TestAppContext::single();
-        cx.update(crate::runtime::init);
+        crate::runtime::init();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         let store = store_entity(&mut cx, db.clone());
@@ -1416,7 +1416,7 @@ mod tests {
     fn set_thread_tag_persists_to_sidecar() {
         let (db, db_path) = temp_db();
         let mut cx = gpui::TestAppContext::single();
-        cx.update(crate::runtime::init);
+        crate::runtime::init();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         let store = store_entity(&mut cx, db.clone());

@@ -3908,9 +3908,37 @@ impl Workspace {
                     for att in &attachments {
                         match att {
                             PendingAttachment::ClipboardImage(img) => {
-                                match agent::image::gpui_image_to_message_content(
-                                    std::sync::Arc::new(img.clone()),
-                                ) {
+                                let format = match img.format {
+                                    gpui::ImageFormat::Png => {
+                                        Some(agent::image::PastedImageFormat::Png)
+                                    }
+                                    gpui::ImageFormat::Jpeg => {
+                                        Some(agent::image::PastedImageFormat::Jpeg)
+                                    }
+                                    gpui::ImageFormat::Webp => {
+                                        Some(agent::image::PastedImageFormat::Webp)
+                                    }
+                                    gpui::ImageFormat::Gif => {
+                                        Some(agent::image::PastedImageFormat::Gif)
+                                    }
+                                    gpui::ImageFormat::Bmp => {
+                                        Some(agent::image::PastedImageFormat::Bmp)
+                                    }
+                                    gpui::ImageFormat::Tiff => {
+                                        Some(agent::image::PastedImageFormat::Tiff)
+                                    }
+                                    // SVG/ICO/PNM aren't raster-decodable; drop them.
+                                    _ => None,
+                                };
+                                let content = format.and_then(|format| {
+                                    agent::image::pasted_image_to_message_content(
+                                        &agent::image::PastedImage {
+                                            format,
+                                            bytes: img.bytes.to_vec(),
+                                        },
+                                    )
+                                });
+                                match content {
                                     Some(content) => extra.push(content),
                                     None => failed += 1,
                                 }
@@ -9083,7 +9111,7 @@ mod tests {
             agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
         );
         cx.update(|cx| {
-            agent::runtime::init(cx);
+            agent::runtime::init();
             agent::pi_providers::init();
             agent::thread_store::init_for_test(db.clone(), cx);
         });
