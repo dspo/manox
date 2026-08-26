@@ -567,14 +567,14 @@ impl Element for TerminalElement {
         }
 
         // Hover target underline (OSC 8 link / URL / path), at the span's
-        // bottom edge.
+        // bottom edge, in the theme's link-hover color.
         if let Some(hover) = &self.hover {
             let x = origin.x + hover.start_col as f32 * cell_w;
             let y = origin.y + (hover.row + 1) as f32 * lh - px(2.);
             let w = (hover.end_col - hover.start_col + 1) as f32 * cell_w;
             window.paint_quad(fill(
                 Bounds::new(point(x, y), size(w, px(2.))),
-                rgba(0x3366ffcc),
+                self.theme.link_hover,
             ));
         }
 
@@ -736,3 +736,4 @@ mod tests {
         assert_eq!(thumb.origin.y, px(0.));
     }
 }
+
