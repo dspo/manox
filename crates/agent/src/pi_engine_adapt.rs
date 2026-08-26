@@ -534,6 +534,13 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(kind) => format!("Agent {kind}"),
             None => "Agent".to_string(),
         },
+        "Skill" => match arg("skill").or_else(|| arg("name")) {
+            Some(skill) => format!("Skill {skill}"),
+            None => "Skill".to_string(),
+        },
+        // Code carries a code body as its argument: the bare name keeps the
+        // body out of the header.
+        "Code" => "Code".to_string(),
         "ProposePlan" => match arg("title").or_else(|| arg("slug")) {
             Some(label) => format!("ProposePlan {label}"),
             None => "ProposePlan".to_string(),
@@ -633,9 +640,22 @@ fn edit_patch_paths(args: &serde_json::Value) -> Vec<String> {
             if path.is_empty() || tag.is_empty() {
                 return None;
             }
-            Some(path.to_string())
+            Some(unquote_path(path).to_string())
         })
         .collect()
+}
+
+/// One pair of surrounding single/double quotes stripped — hashline section
+/// headers quote paths containing spaces.
+fn unquote_path(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 /// Char-capped copy of a string with an ellipsis when it was clipped.
@@ -650,7 +670,9 @@ fn short_value(s: &str, max_chars: usize) -> String {
 }
 
 /// The first string-typed argument value of a tool call (unknown/MCP tools
-/// use it as a generic title hint).
+/// use it as a generic title hint). Iteration follows the model's argument
+/// order (workspace-wide serde_json `preserve_order`), so one call always
+/// resolves the same value.
 fn first_string_arg(args: &serde_json::Value) -> Option<String> {
     args.as_object()?
         .values()
@@ -904,6 +926,18 @@ mod tests {
             "Edit /a.rs +1"
         );
         assert_eq!(tool_title("Edit", &json!({})), "Edit");
+        // Quoted section headers (paths with spaces) surface unquoted.
+        assert_eq!(
+            tool_title(
+                "Edit",
+                &json!({"patch": "[\"/my docs/a b.rs\"#A1B2C3]\nDEL 1.=1"})
+            ),
+            "Edit /my docs/a b.rs"
+        );
+
+        assert_eq!(tool_title("Skill", &json!({"skill": "gpui"})), "Skill gpui");
+        // Code keeps the bare name — its argument is a code body.
+        assert_eq!(tool_title("Code", &json!({"code": "let x = 1;"})), "Code");
 
         assert_eq!(
             tool_title("ProposePlan", &json!({"slug": "s", "title": "My Plan"})),
