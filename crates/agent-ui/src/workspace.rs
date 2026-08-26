@@ -1769,6 +1769,13 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.set_thread_tag(id, tag.clone(), cx));
                 }
+                SidebarEvent::RemoveProject(path) => {
+                    // Unregister the folder; the sidebar drops the group and
+                    // its threads fall back to the loose Conversations list.
+                    // Conversation history is never touched.
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.remove_project(&path.to_string_lossy(), cx));
+                }
             },
         )
     }

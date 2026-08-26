@@ -177,6 +177,22 @@ impl ThreadStore {
         cx.notify();
     }
 
+    /// Unregister a project path: the sidebar folder disappears and threads
+    /// bound to the path fall back to the loose Conversations list. The
+    /// conversation history itself is never touched. No-op for an unknown
+    /// path.
+    pub fn remove_project(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !self.known_projects.iter().any(|p| p == path) {
+            return;
+        }
+        self.known_projects.retain(|p| p != path);
+        if let Err(e) = self.db.remove_project(path) {
+            tracing::warn!(error = %e, "failed to persist project removal");
+        }
+        cx.emit(ThreadStoreEvent::SummariesUpdated);
+        cx.notify();
+    }
+
     /// Whether the given thread id is currently running a turn.
     pub fn is_running(&self, id: &str) -> bool {
         self.running.contains(id)
@@ -876,6 +892,31 @@ mod tests {
         let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
         assert_eq!(db.list_projects().unwrap().len(), 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn remove_project_persists_and_survives_reopen() {
+        let (db, path) = temp_db();
+        let mut cx = gpui::TestAppContext::single();
+        let store = store_entity(&mut cx, db.clone());
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.register_project("/p/a".into(), cx);
+                s.register_project("/p/b".into(), cx);
+                s.remove_project("/p/a", cx);
+                // Removing an unknown path is a no-op.
+                s.remove_project("/p/missing", cx);
+            });
+        });
+        // Persisted to the db...
+        assert_eq!(db.list_projects().unwrap(), vec!["/p/b".to_string()]);
+        let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
+        assert_eq!(known, vec!["/p/b".to_string()]);
+        // ...and a freshly initialized store (simulated restart) sees it.
+        let reopened = store_entity(&mut cx, db.clone());
+        let known = cx.update(|cx| reopened.read(cx).known_projects().to_vec());
+        assert_eq!(known, vec!["/p/b".to_string()]);
         std::fs::remove_file(path).ok();
     }
 
