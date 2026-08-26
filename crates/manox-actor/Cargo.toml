@@ -9,15 +9,6 @@ publish = false
 # this host shuts the gpui context down on demand (window reload,
 # deactivate), unlike the app where it lives until process exit.
 agent = { workspace = true, features = ["test-support"] }
-pi.workspace = true
-pi-extensions.workspace = true
+manox-session-core.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
-async-trait = "0.1"
-chrono.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-
-[dev-dependencies]
-# The thread-subscription tests construct `ThreadEvent::Error` payloads.
-anyhow.workspace = true

@@ -29,6 +29,7 @@ members = [
     "crates/cx",
     "crates/cx-providers",
     "crates/manox-actor",
+    "crates/manox-session-core",
     "crates/manox-napi",
 ]
 resolver = "2"
@@ -53,6 +54,7 @@ manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
 manox-actor = { path = "crates/manox-actor" }
+manox-session-core = { path = "crates/manox-session-core" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY

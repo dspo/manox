@@ -5411,15 +5411,9 @@ name = "manox-actor"
 version = "0.1.0"
 dependencies = [
  "agent",
- "anyhow",
- "async-trait",
- "chrono",
  "gpui",
- "pi",
- "pi-extensions",
+ "manox-session-core",
  "serde_json",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -5443,6 +5437,22 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+]
+
+[[package]]
+name = "manox-session-core"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "gpui",
+ "pi",
+ "pi-extensions",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
