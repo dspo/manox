@@ -285,6 +285,19 @@ fn push_member(
     }
 }
 
+/// Whether an external session projects into the loose Conversations list
+/// instead of a folder group: unbound sessions, and sessions bound to a
+/// path that is not a registered project (a removed folder, or a session
+/// cwd never bound as a project). Mirrors the thread-side partitioning
+/// rule in [`Sidebar::render`].
+fn external_session_is_loose(project: Option<&std::path::Path>, known_projects: &[String]) -> bool {
+    project.is_none_or(|p| {
+        !known_projects
+            .iter()
+            .any(|kp| kp.as_str() == p.to_string_lossy().as_ref())
+    })
+}
+
 pub struct Sidebar {
     store: Entity<ThreadStore>,
     selected: Option<String>,
@@ -489,13 +502,14 @@ impl Sidebar {
                     }),
             );
             // Terminal: a plain shell session — no provider/model cascade,
-            // the click spawns immediately in the menu's project directory
-            // (workspace cwd when opened from the Conversations header).
+            // the click spawns immediately in the workspace cwd. Shares the
+            // project menu's `sidebar-new-terminal` label — both menus create
+            // a fresh terminal.
             {
                 let kind = crate::external_session::SessionKind::Terminal;
                 let sidebar_plain = sidebar.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(kind.label())
+                    PopupMenuItem::new(i18n::t("sidebar-new-terminal"))
                         .icon(
                             Icon::default()
                                 .path(kind.icon_asset())
@@ -1014,21 +1028,16 @@ impl Render for Sidebar {
                 projects.push((kp.clone(), Vec::new()));
             }
         }
-        // External sessions not bound to a project — or bound to one that is
-        // no longer registered — stay in the loose Conversations list; bound
-        // ones are pulled into their folder group inside
-        // `render_project_group` (filtered by project path there), so a
-        // removed folder never strands its live sessions.
+        // External sessions not bound to a *registered* project stay in the
+        // loose Conversations list — that covers unbound sessions, sessions
+        // whose folder was removed, and sessions bound to a cwd never
+        // registered as a project. Bound ones are pulled into their folder
+        // group inside `render_project_group` (filtered by project path
+        // there), so a removed folder never strands its live sessions.
         let loose_externals: Vec<crate::external_session::ExternalSessionSummary> = self
             .external_sessions
             .iter()
-            .filter(|s| {
-                s.project.as_deref().is_none_or(|p| {
-                    !known_projects
-                        .iter()
-                        .any(|kp| kp.as_str() == p.to_string_lossy().as_ref())
-                })
-            })
+            .filter(|s| external_session_is_loose(s.project.as_deref(), &known_projects))
             .cloned()
             .collect();
 
@@ -2417,6 +2426,28 @@ mod tests {
             pinned_section(true, px(500.), Some(px(200.))),
             PinnedSection::Conversations
         );
+    }
+
+    /// The loose/folder partition for external sessions: unbound rows and
+    /// rows bound to an unregistered path (removed folder, or a cwd never
+    /// bound as a project) stay loose; only a registered project pulls its
+    /// sessions into the folder group.
+    #[test]
+    fn external_session_is_loose_partitions_by_registered_projects() {
+        let known = vec!["/p/a".to_string()];
+        assert!(external_session_is_loose(None, &known));
+        assert!(!external_session_is_loose(
+            Some(std::path::Path::new("/p/a")),
+            &known
+        ));
+        assert!(external_session_is_loose(
+            Some(std::path::Path::new("/p/b")),
+            &known
+        ));
+        assert!(external_session_is_loose(
+            Some(std::path::Path::new("/home/user")),
+            &[]
+        ));
     }
 
     /// A sidecar-restored row carries its resumable/resuming states into the
