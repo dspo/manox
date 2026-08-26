@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Build the cx CLI from the repo sources and install it under ~/.local/.
+#
+# Usage: script/install-cx [options]
+# Options:
+#   -h    Display this help and exit
+#
+# Environment:
+#   CX_INSTALL_DIR    Override the install root (default: ~/.local); the
+#                     binary lands in <CX_INSTALL_DIR>/bin/cx.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+help_info() {
+    echo "
+Usage: ${0##*/} [options]
+Build the cx CLI from the repo sources and install it under ~/.local/.
+
+Options:
+  -h    Display this help and exit
+"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) help_info; exit 0;;
+        *) echo "Error: unknown option '$1'"; help_info; exit 1;;
+    esac
+    shift
+done
+
+install_root="${CX_INSTALL_DIR:-$HOME/.local}"
+cargo install --path crates/cx --root "$install_root" --locked
+
+echo "Installed: $install_root/bin/cx"
+echo "Make sure $install_root/bin is on your PATH."

@@ -38,8 +38,8 @@ bash vscode/build.sh
 code --install-extension vscode/manox-vscode.vsix --force
 ```
 
-`build.sh` uses a **debug** napi build for fast local iteration; switch it to
-`cargo build --release` before distributing.
+`build.sh` uses a **debug** napi build for fast local iteration; pass
+`--release` (`bash vscode/build.sh --release`) before distributing.
 
 ## Protocol
 

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Build the manox VS Code extension from the repo sources and install it
+# into the local Visual Studio Code.
+#
+# Usage: script/install-manox-vs-code-extension [options]
+# Options:
+#   -h    Display this help and exit
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+help_info() {
+    echo "
+Usage: ${0##*/} [options]
+Build the manox VS Code extension from the repo sources and install it
+into the local Visual Studio Code.
+
+Options:
+  -h    Display this help and exit
+"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) help_info; exit 0;;
+        *) echo "Error: unknown option '$1'"; help_info; exit 1;;
+    esac
+    shift
+done
+
+# --- Ensure npm dependencies (npm ci when missing or lockfile newer) ---
+if [[ ! -d vscode/node_modules || vscode/package-lock.json -nt vscode/node_modules ]]; then
+    echo "Installing npm dependencies"
+    (cd vscode && npm ci)
+fi
+
+# --- Build the extension (release napi binding) ---
+bash vscode/build.sh --release
+
+# --- Locate the VS Code CLI ---
+code_bin="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+if [[ ! -x "$code_bin" ]]; then
+    code_bin="$(command -v code || true)"
+fi
+if [[ -z "$code_bin" ]]; then
+    echo "Error: Visual Studio Code not found (looked at /Applications/Visual Studio Code.app and PATH)"
+    exit 1
+fi
+
+# --- Install the vsix ---
+vsix="$ROOT/vscode/manox-vscode.vsix"
+echo "Installing ${vsix} via ${code_bin}"
+"$code_bin" --install-extension "$vsix" --force
+
+echo "Installed: ${vsix}"
+echo "Restart Visual Studio Code to activate the installed extension."
