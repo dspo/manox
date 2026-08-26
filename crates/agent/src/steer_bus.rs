@@ -14,7 +14,9 @@ use pi::harness::HarnessHandle;
 use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use pi::types::{AgentMessage, ContentBlock};
 use pi_extensions::agents::SubagentTool;
-use pi_extensions::steer_bus::{AgentId, BusOp, SteerPayload, SteerReason, ToSpec};
+use pi_extensions::steer_bus::{
+    AgentId, BusOp, DispatchBudgets, SteerPayload, SteerReason, ToSpec,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -43,7 +45,8 @@ pub const MIN_SUBAGENT_TIMEOUT_MS: u64 = 1_000;
 
 /// A live in-thread subagent coroutine (transient, not a manox Thread).
 /// The `handle` allows Inject/Abort; the `cancel` token propagates
-/// parent-turn abort to the spawned task.
+/// parent-turn abort to the spawned task; the `watchdog` is the shared
+/// health state the run task writes and the status surfaces read.
 #[derive(Clone)]
 pub struct LiveSubagent {
     pub handle: HarnessHandle,
@@ -51,6 +54,11 @@ pub struct LiveSubagent {
     /// Monotonic dispatch generation; a settled run only removes its own
     /// entry so a same-address re-dispatch is not orphaned by the old run.
     pub run: u64,
+    pub spawn_type: String,
+    pub watchdog: Arc<std::sync::Mutex<crate::subagent_watchdog::SubagentWatchdog>>,
+    /// The dispatch's armed budgets (`None` per axis = unbounded), kept so
+    /// status queries can report the remaining wall-clock budget.
+    pub budgets: DispatchBudgets,
 }
 
 /// The host-side agent bus. One per thread (Captain or member). The
@@ -129,21 +137,29 @@ impl AgentBus {
             (AgentId::Captain, SteerReason::Dispatch, Some(spawn_type))
                 if spawn_type != "TeamMember" =>
             {
-                if to.timeout_ms.is_some_and(|t| t < MIN_SUBAGENT_TIMEOUT_MS) {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "timeout must be at least {MIN_SUBAGENT_TIMEOUT_MS}ms"
-                    )));
+                for (name, budget) in [
+                    ("timeout", to.timeout_ms),
+                    ("idle_timeout", to.idle_timeout_ms),
+                ] {
+                    if budget.is_some_and(|t| t < MIN_SUBAGENT_TIMEOUT_MS) {
+                        return Err(ToolError::InvalidArguments(format!(
+                            "{name} must be at least {MIN_SUBAGENT_TIMEOUT_MS}ms"
+                        )));
+                    }
                 }
-                self.dispatch_subagent(addr, spawn_type, isolation, to.timeout_ms, &payload.text)
+                let budgets = DispatchBudgets {
+                    timeout_ms: to.timeout_ms,
+                    idle_timeout_ms: to.idle_timeout_ms,
+                };
+                self.dispatch_subagent(addr, spawn_type, isolation, budgets, &payload.text)
                     .await
             }
 
             // ── Dispatch: spawn TeamMember (real thread) ───────────────
             (AgentId::Captain, SteerReason::Dispatch, Some("TeamMember")) => {
-                if to.timeout_ms.is_some() {
+                if to.timeout_ms.is_some() || to.idle_timeout_ms.is_some() {
                     return Err(ToolError::InvalidArguments(
-                        "timeout applies only to in-thread subagents, not TeamMember threads"
-                            .into(),
+                        "timeouts apply only to in-thread subagents, not TeamMember threads".into(),
                     ));
                 }
                 self.dispatch_member(addr, &payload.text).await
@@ -221,6 +237,35 @@ impl AgentBus {
         self.spawned_members.lock().unwrap().contains(addr)
     }
 
+    /// Snapshot the live subagents' health for the `SubagentStatus` tool:
+    /// one row per address with the watchdog's verdict and run stats.
+    pub fn subagent_status(&self) -> Vec<serde_json::Value> {
+        let now = std::time::Instant::now();
+        let live = locked(&self.live_subagents);
+        live.iter()
+            .map(|(addr, sub)| {
+                let wd = locked(&sub.watchdog);
+                let elapsed = now.saturating_duration_since(wd.started_at());
+                let mut row = serde_json::json!({
+                    "address": addr,
+                    "spawn_type": sub.spawn_type,
+                    "health": wd.health_line(now),
+                    "turns": wd.turns(),
+                    "tool_calls": wd.tool_calls(),
+                    "running_for_ms": elapsed.as_millis() as u64,
+                });
+                if let Some(activity) = wd.last_activity() {
+                    row["last_activity"] = serde_json::json!(activity);
+                }
+                if let Some(budget) = sub.budgets.timeout_ms {
+                    let remaining = Duration::from_millis(budget).saturating_sub(elapsed);
+                    row["timeout_remaining_ms"] = serde_json::json!(remaining.as_millis() as u64);
+                }
+                row
+            })
+            .collect()
+    }
+
     /// Dispatch a subagent coroutine: spawn session, register bg task,
     /// run in tokio, emit SteerDelivered on completion.
     ///
@@ -237,7 +282,7 @@ impl AgentBus {
         addr: &str,
         spawn_type: &str,
         isolation: Option<&str>,
-        timeout_ms: Option<u64>,
+        budgets: DispatchBudgets,
         prompt: &str,
     ) -> Result<AgentToolResult, ToolError> {
         let stage = Arc::new(std::sync::Mutex::new("entry"));
@@ -258,7 +303,7 @@ impl AgentBus {
                     &addr_s,
                     &spawn_s,
                     isolation_s.as_deref(),
-                    timeout_ms,
+                    budgets,
                     &prompt_s,
                     stage2,
                 ),
@@ -285,7 +330,7 @@ impl AgentBus {
         addr: &str,
         spawn_type: &str,
         isolation: Option<&str>,
-        timeout_ms: Option<u64>,
+        budgets: DispatchBudgets,
         prompt: &str,
         stage: Arc<std::sync::Mutex<&'static str>>,
     ) -> Result<AgentToolResult, ToolError> {
@@ -390,17 +435,27 @@ impl AgentBus {
                     first_line(&prompt).unwrap_or_else(|| format!("Subagent {spawn_type}")),
                 ),
                 status: crate::thread::ToolCallStatus::Running,
+                health: Some("starting".into()),
             },
         )));
 
-        // Track in live_subagents for Inject/Abort.
+        // Track in live_subagents for Inject/Abort and health queries.
         *locked(&stage) = "register-task";
+        let watchdog = Arc::new(std::sync::Mutex::new(
+            crate::subagent_watchdog::SubagentWatchdog::new(
+                std::time::Instant::now(),
+                budgets.idle_timeout_ms,
+            ),
+        ));
         locked(&self.live_subagents).insert(
             addr.to_string(),
             LiveSubagent {
                 handle: handle.clone(),
                 cancel: task_cancel.clone(),
                 run,
+                spawn_type: spawn_type.clone(),
+                watchdog: Arc::clone(&watchdog),
+                budgets,
             },
         );
         // Spawn the run task.
@@ -421,6 +476,8 @@ impl AgentBus {
         // inside it, and dropping it mid-run deletes the transcript.
         let run_cancel = task_cancel.clone();
         let run_handle = handle.clone();
+        let run_watchdog = Arc::clone(&watchdog);
+        let spawn_type2 = spawn_type.clone();
         crate::runtime::handle().spawn(async move {
             let _session_guard = session_guard; // hold the tempdir alive for the session lifetime
             // Bridge the child session's streamed events to the workspace so
@@ -432,35 +489,51 @@ impl AgentBus {
                 let _ = ev_tx.send(event);
                 Box::pin(async move {})
             }));
-            let started_at = std::time::Instant::now();
-            let mut turns: u64 = 0;
-            let mut tool_calls: u64 = 0;
-            let mut last_activity: Option<String> = None;
-            // Salvaged inside the deadline arm while the prompt borrow is
-            // provably dead; the settle path only reads this `String`.
+            // Salvaged inside the killing arms while the prompt borrow is
+            // provably dead; the settle path only reads these `String`s.
             let mut timed_out_partial = String::new();
+            let mut stalled_partial = String::new();
             let mut prompt_fut = Box::pin(session.prompt(&full_prompt));
             // Wall-clock deadline: an armed dispatch gets a real sleep; an
             // unbounded dispatch parks a never-ready branch in its place so
             // the loop shape stays uniform.
-            let deadline = match timeout_ms {
+            let deadline = match budgets.timeout_ms {
                 Some(ms) => {
                     futures::future::Either::Left(tokio::time::sleep(Duration::from_millis(ms)))
                 }
                 None => futures::future::Either::Right(std::future::pending::<()>()),
             };
             tokio::pin!(deadline);
+            let mut watchdog_tick = tokio::time::interval(crate::subagent_watchdog::WATCHDOG_TICK);
+            watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut timed_out = false;
+            let mut stalled = false;
             let result = loop {
                 tokio::select! {
                     r = prompt_fut.as_mut() => break r,
                     Some(event) = ev_rx.recv() => {
-                        observe_child_event(
-                            &event,
-                            &mut turns,
-                            &mut tool_calls,
-                            &mut last_activity,
-                        );
+                        // Health folds first; a state change publishes one
+                        // throttled progress event (the surfaces render the
+                        // health line; child_events_of keeps the transcript
+                        // activity as before).
+                        let health_change = {
+                            let mut wd = locked(&run_watchdog);
+                            let now = std::time::Instant::now();
+                            wd.observe(&event, now).then(|| wd.health_line(now))
+                        };
+                        if let Some(line) = health_change {
+                            let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                                ThreadEvent::SubagentProgress {
+                                    id: addr_clone.clone(),
+                                    subagent_type: spawn_type2.clone(),
+                                    tool_uses: 0,
+                                    token_usage: crate::language_model::TokenUsage::default(),
+                                    latest_activity: None,
+                                    status: crate::thread::ToolCallStatus::Running,
+                                    health: Some(line),
+                                },
+                            )));
+                        }
                         for ev in crate::pi_engine::adapt::child_events_of(&addr_clone, &event) {
                             let _ = notice_tx.send(BackendNotice::Event(Box::new(ev)));
                         }
@@ -488,6 +561,38 @@ impl AgentBus {
                         timed_out_partial =
                             truncate_final(&extract_final_text(session.harness_messages()));
                         break Err(anyhow::anyhow!("timed out"));
+                    }
+                    // Health tick: report a stall once; enforce an armed
+                    // idle budget through the same settle path as the
+                    // wall-clock timeout.
+                    _ = watchdog_tick.tick() => {
+                        let outcome = locked(&run_watchdog).tick(std::time::Instant::now());
+                        match outcome {
+                            crate::subagent_watchdog::TickOutcome::Idle => {}
+                            crate::subagent_watchdog::TickOutcome::ReportStall => {
+                                let line = locked(&run_watchdog)
+                                    .health_line(std::time::Instant::now());
+                                let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                                    ThreadEvent::SubagentProgress {
+                                        id: addr_clone.clone(),
+                                        subagent_type: spawn_type2.clone(),
+                                        tool_uses: 0,
+                                        token_usage: crate::language_model::TokenUsage::default(),
+                                        latest_activity: None,
+                                        status: crate::thread::ToolCallStatus::Running,
+                                        health: Some(line),
+                                    },
+                                )));
+                            }
+                            crate::subagent_watchdog::TickOutcome::EnforceStall => {
+                                stalled = true;
+                                drop(prompt_fut);
+                                run_handle.abort();
+                                stalled_partial =
+                                    truncate_final(&extract_final_text(session.harness_messages()));
+                                break Err(anyhow::anyhow!("stalled"));
+                            }
+                        }
                     }
                 }
             };
@@ -517,23 +622,52 @@ impl AgentBus {
                         token_usage: crate::language_model::TokenUsage::default(),
                         latest_activity: Some("aborted".into()),
                         status: crate::thread::ToolCallStatus::Cancelled,
+                        health: None,
                     },
                 )));
                 // Silent settle on explicit abort: no SteerDelivered, so the
                 // Captain is not revived for a cancellation it requested.
-            } else if timed_out {
-                let budget = timeout_ms.unwrap_or_default();
-                let partial = std::mem::take(&mut timed_out_partial);
-                let delivery = timed_out_delivery(
-                    budget,
-                    started_at.elapsed(),
-                    turns,
-                    tool_calls,
-                    last_activity.as_deref(),
-                    &partial,
-                    &kept_note,
-                );
-                task.set_failure_summary(format!("timed out after {budget}ms"));
+            } else if timed_out || stalled {
+                let now = std::time::Instant::now();
+                let (turns, tool_calls, last_activity, elapsed, idle) = {
+                    let wd = locked(&run_watchdog);
+                    (
+                        wd.turns(),
+                        wd.tool_calls(),
+                        wd.last_activity().map(str::to_string),
+                        now.saturating_duration_since(wd.started_at()),
+                        wd.idle_for(now),
+                    )
+                };
+                let (cause, delivery) = if stalled {
+                    (
+                        format!("stalled after {}ms idle", idle.as_millis()),
+                        stalled_delivery(
+                            idle,
+                            budgets.idle_timeout_ms.unwrap_or_default(),
+                            turns,
+                            tool_calls,
+                            last_activity.as_deref(),
+                            &stalled_partial,
+                            &kept_note,
+                        ),
+                    )
+                } else {
+                    let budget = budgets.timeout_ms.unwrap_or_default();
+                    (
+                        format!("timed out after {budget}ms"),
+                        timed_out_delivery(
+                            budget,
+                            elapsed,
+                            turns,
+                            tool_calls,
+                            last_activity.as_deref(),
+                            &timed_out_partial,
+                            &kept_note,
+                        ),
+                    )
+                };
+                task.set_failure_summary(cause.clone());
                 task.set_terminal_status(TaskStatus::Failed);
                 let _ = notice_tx.send(BackendNotice::Event(Box::new(
                     ThreadEvent::BackgroundTaskUpdated {
@@ -546,8 +680,9 @@ impl AgentBus {
                         subagent_type: spawn_type.clone(),
                         tool_uses: 0,
                         token_usage: crate::language_model::TokenUsage::default(),
-                        latest_activity: Some(format!("timed out after {budget}ms")),
+                        latest_activity: Some(cause),
                         status: crate::thread::ToolCallStatus::Error,
+                        health: None,
                     },
                 )));
                 let _ = notice_tx.send(BackendNotice::SteerDelivered {
@@ -576,6 +711,7 @@ impl AgentBus {
                                 token_usage: crate::language_model::TokenUsage::default(),
                                 latest_activity: Some(content.clone()),
                                 status: crate::thread::ToolCallStatus::Success,
+                                health: None,
                             },
                         )));
                         if !content.is_empty() {
@@ -603,6 +739,7 @@ impl AgentBus {
                                     format!("failed: {e}").chars().take(80).collect(),
                                 ),
                                 status: crate::thread::ToolCallStatus::Error,
+                                health: None,
                             },
                         )));
                         let _ = notice_tx.send(BackendNotice::SteerDelivered {
@@ -779,31 +916,31 @@ fn timed_out_delivery(
     delivery
 }
 
-/// Fold one child event into the run-task's lifetime counters — the inputs
-/// of the timeout report: completed turns, started tool calls, and a
-/// one-line description of the most recent activity.
-fn observe_child_event(
-    event: &pi::types::AgentEvent,
-    turns: &mut u64,
-    tool_calls: &mut u64,
-    last_activity: &mut Option<String>,
-) {
-    use pi::types::AgentEvent;
-    match event {
-        AgentEvent::TurnEnd { .. } => *turns += 1,
-        AgentEvent::ToolExecutionStart {
-            tool_name,
-            arguments,
-            ..
-        } => {
-            *tool_calls += 1;
-            *last_activity = Some(match crate::pi_engine::adapt::arg_hint(arguments) {
-                Some((key, value)) => format!("{tool_name} {key}={value}"),
-                None => tool_name.clone(),
-            });
-        }
-        _ => {}
+/// Build the stalled report delivered to the parent when a subagent's idle
+/// budget expires: the silent window, the observed run stats, and a
+/// best-effort salvage of whatever the subagent had already produced.
+fn stalled_delivery(
+    idle: Duration,
+    idle_budget_ms: u64,
+    turns: u64,
+    tool_calls: u64,
+    last_activity: Option<&str>,
+    partial: &str,
+    kept_note: &str,
+) -> String {
+    let secs = idle.as_secs_f64();
+    let mut delivery = format!(
+        "{SUBAGENT_TIMED_OUT_DELIVERY_PREFIX}stalled — no activity for {secs:.1}s \
+         (idle budget {idle_budget_ms}ms exceeded; {turns} turns, {tool_calls} tool calls)"
+    );
+    if let Some(activity) = last_activity {
+        delivery.push_str(&format!("; last activity: {activity}"));
     }
+    if !partial.is_empty() {
+        delivery.push_str(&format!("\n\nPartial result:\n{partial}"));
+    }
+    delivery.push_str(kept_note);
+    delivery
 }
 
 // ── SteerTool ────────────────────────────────────────────────────────────
@@ -833,10 +970,11 @@ impl AgentTool for SteerTool {
          create an in-thread subagent, or 'TeamMember' to create a real manox \
          Thread (process). Only the Captain may spawn. `reason` is Dispatch \
          (start a task), Inject (mid-run message), or Abort (cancel). Dispatch \
-         accepts an optional `timeout` (milliseconds, min 1000) bounding an \
-         in-thread subagent's wall-clock run: on expiry it is terminated and a \
-         timeout report is delivered. Complete is harness-emitted on subagent \
-         termination — not callable here."
+         accepts an optional `timeout` (wall-clock, ms, min 1000) and \
+         `idle_timeout` (max silence with no tool running, ms, min 1000, \
+         enforced at ~5s tick granularity): on expiry the subagent is \
+         terminated and a report is delivered. Complete is harness-emitted \
+         on subagent termination — not callable here."
     }
 
     fn is_read_only(&self) -> bool {
@@ -882,6 +1020,10 @@ impl AgentTool for SteerTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Optional wall-clock budget in milliseconds (min 1000) for a spawned in-thread subagent. On expiry the subagent is terminated and a timeout report is delivered. Only with to.spawn = a capability def (not TeamMember)."
+                },
+                "idle_timeout": {
+                    "type": "integer",
+                    "description": "Optional idle budget in milliseconds (min 1000): the longest stretch with no activity and no tool running before a spawned in-thread subagent is terminated as stalled and a report is delivered. Enforcement granularity is ~5s (watchdog tick), not the exact millisecond value. Only with to.spawn = a capability def (not TeamMember)."
                 }
             },
             "required": ["to", "reason", "prompt"]
@@ -913,6 +1055,7 @@ impl AgentTool for SteerTool {
             .ok_or_else(|| ToolError::InvalidArguments("'prompt' is required".into()))?;
         let isolation = params.get("isolation").and_then(|v| v.as_str());
         let timeout = params.get("timeout").and_then(|v| v.as_u64());
+        let idle_timeout = params.get("idle_timeout").and_then(|v| v.as_u64());
 
         if reason_str == "Complete" {
             return Err(ToolError::ExecutionFailed(
@@ -935,6 +1078,7 @@ impl AgentTool for SteerTool {
             spawn: spawn.map(String::from),
             isolation: isolation.map(String::from),
             timeout_ms: timeout,
+            idle_timeout_ms: idle_timeout,
         };
         let reason = match reason_str {
             "Dispatch" => SteerReason::Dispatch,
@@ -956,6 +1100,62 @@ impl AgentTool for SteerTool {
     }
 }
 
+/// The model-facing subagent health query — the watchdog's pull surface.
+/// Read-only and approval-free: it observes, never mutates.
+pub struct SubagentStatusTool {
+    bus: Arc<AgentBus>,
+}
+
+impl SubagentStatusTool {
+    pub fn new(bus: Arc<AgentBus>) -> Self {
+        Self { bus }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SubagentStatusTool {
+    fn name(&self) -> &str {
+        "SubagentStatus"
+    }
+
+    fn description(&self) -> &str {
+        "Report the health of this thread's live subagents: state (working, \
+         tool running, stalled, looping), turns, tool calls, running time, \
+         last activity, and remaining timeout budget. Check it when a \
+         subagent seems slow or silent before deciding to Inject, Abort, \
+         or re-dispatch — do not guess."
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> bool {
+        false
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: CancellationToken,
+        _ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        let rows = self.bus.subagent_status();
+        if rows.is_empty() {
+            return Ok(AgentToolResult::text("no live subagents".to_string()));
+        }
+        Ok(AgentToolResult::text(
+            serde_json::to_string_pretty(&rows)
+                .unwrap_or_else(|_| "subagent status unavailable".to_string()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,6 +1171,7 @@ mod tests {
             spawn: spawn.map(String::from),
             isolation: None,
             timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
 
@@ -1069,6 +1270,27 @@ mod tests {
         assert!(err.to_string().contains("TeamMember"), "{err}");
     }
 
+    #[tokio::test]
+    async fn dispatch_idle_timeout_below_minimum_rejected() {
+        let bus = bus();
+        let mut spec = to("w", Some("Sailor"));
+        spec.idle_timeout_ms = Some(999);
+        let err = bus
+            .steer(AgentId::Captain, spec, SteerReason::Dispatch, payload("x"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("idle_timeout") && err.to_string().contains("at least"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_status_is_empty_without_live_runs() {
+        let bus = bus();
+        assert!(bus.subagent_status().is_empty());
+    }
+
     #[test]
     fn timed_out_delivery_names_budget_stats_and_partial() {
         let delivery = timed_out_delivery(
@@ -1111,6 +1333,33 @@ mod tests {
         assert!(!delivery.contains("Partial result"), "{delivery}");
         assert!(
             delivery.ends_with("[worktree kept: branch=b, path=/tmp/wt]"),
+            "{delivery}"
+        );
+    }
+
+    #[test]
+    fn stalled_delivery_names_idle_window_and_stats() {
+        let delivery = stalled_delivery(
+            Duration::from_millis(31_500),
+            30_000,
+            2,
+            4,
+            Some("Grep pattern=foo"),
+            "",
+            "",
+        );
+        assert!(
+            delivery.starts_with(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX),
+            "{delivery}"
+        );
+        assert!(
+            delivery.contains("stalled — no activity for 31.5s"),
+            "{delivery}"
+        );
+        assert!(delivery.contains("idle budget 30000ms"), "{delivery}");
+        assert!(delivery.contains("2 turns, 4 tool calls"), "{delivery}");
+        assert!(
+            delivery.contains("last activity: Grep pattern=foo"),
             "{delivery}"
         );
     }

@@ -44,6 +44,7 @@ pub mod skill;
 pub mod slash_builtins;
 pub mod steer_bus;
 pub mod subagent_restore;
+pub mod subagent_watchdog;
 pub mod team;
 pub mod title;
 pub mod tools;

@@ -163,6 +163,10 @@ pub enum ThreadEvent {
         token_usage: TokenUsage,
         latest_activity: Option<String>,
         status: ToolCallStatus,
+        /// The watchdog's one-line health verdict (`working`, `tool: Bash
+        /// 3m12s`, `stalled 2m0s`, `looping: Read src/a.rs`) when the event
+        /// carries one; `None` for lifecycle-only progress events.
+        health: Option<String>,
     },
     /// A streamed child-session event from a running sub-agent (the pi
     /// bridge of the child's text/thinking deltas and tool lifecycle). The

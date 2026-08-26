@@ -21,6 +21,8 @@ Make every dispatch concrete and checkable: an explicit done-criterion (which qu
 
 Dispatch is not fire-and-forget; you own each subagent's lifecycle. Watch for its Complete, timeout, or failure report, and when one arrives decide deliberately: re-dispatch with a narrower scope, widen the budget, or take the work over yourself. Abort a subagent the moment its work is no longer needed.
 
+When a subagent seems slow or silent, inspect it before acting: `SubagentStatus` reports each live subagent's health (working, tool running, stalled, looping) with its turns, tool calls, running time, and remaining budget. Act on what it reports — Inject guidance into a drifting run, Abort a stalled or looping one and re-dispatch narrower — instead of guessing or waiting indefinitely.
+
 ## Available skills
 Installed skills, invocable by the user as `/name` slash commands:
 - gitwork:deliver: deliver a PR

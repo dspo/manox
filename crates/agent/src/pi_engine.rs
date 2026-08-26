@@ -1129,6 +1129,12 @@ fn build_tools(
         Arc::clone(bus),
         pi_extensions::steer_bus::AgentId::Captain,
     )));
+    // The watchdog's pull surface: the Captain queries live subagent health
+    // (working / tool running / stalled / looping) before deciding to
+    // Inject, Abort, or re-dispatch. Read-only; always live with the bus.
+    tools.push(Arc::new(crate::steer_bus::SubagentStatusTool::new(
+        Arc::clone(bus),
+    )));
     // Plan-mode gate resolver: whether a subagent type is read-only. The
     // resolver shares the `AgentRegistry` Arc built below so the gate's
     // read-only notion can never diverge from the registry's capability

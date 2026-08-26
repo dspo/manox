@@ -1409,18 +1409,21 @@ impl Workspace {
                         subagent_type,
                         latest_activity,
                         status,
+                        health,
                         ..
                     } = ev
                     {
                         let id = id.clone();
                         let subagent_type = subagent_type.clone();
                         let latest_activity = latest_activity.clone();
+                        let health = health.clone();
                         this.context_rail.update(cx, |r, cx| {
                             r.apply_subagent_progress(
                                 &id,
                                 &subagent_type,
                                 latest_activity.as_deref(),
                                 *status,
+                                health.as_deref(),
                                 cx,
                             );
                         });
@@ -5067,6 +5070,7 @@ impl Workspace {
                     &row.subagent_type,
                     first_line.as_deref(),
                     row.status,
+                    None,
                     cx,
                 );
             });
