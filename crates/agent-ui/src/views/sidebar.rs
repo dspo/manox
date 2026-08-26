@@ -1,9 +1,10 @@
 //! Conversation history sidebar.
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header and
-//! the "Conversations" section header opens a new-session popup menu (Manox / Claude Code /
-//! Codex / GitHub Copilot). Workspace subscribes to these events.
+//! conversation entry emits `OpenThread(id)`; the "Conversations" section header's "+" opens the
+//! flat new-session menu and each project folder header's ellipsis button opens the project
+//! action menu (new session / terminal / VS Code / remove project). Workspace subscribes to
+//! these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
 //! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
@@ -164,8 +165,8 @@ pub enum SidebarEvent {
     /// agent (`claude` / `codex` / `copilot`); the strings are provider name +
     /// model id; the optional wire key pins the endpoint variant of the model
     /// (`anthropic` / `responses` / `completions`); the optional PathBuf is
-    /// the project path to use as the CLI's cwd (when launched from a project
-    /// folder's `+` button).
+    /// the project path to use as the CLI's cwd (when launched from a
+    /// project folder's menu).
     SpawnExternalSession(
         crate::external_session::SessionKind,
         String,
@@ -174,8 +175,8 @@ pub enum SidebarEvent {
         Option<PathBuf>,
     ),
     /// Launch a plain PTY session with no cx provider injection — the user's
-    /// shell (`Terminal`). The optional PathBuf is the project path to use as
-    /// the session's cwd (when launched from a project folder's `+` button);
+    /// shell (`Terminal`). The optional PathBuf is the project path to use
+    /// as the session's cwd (when launched from a project folder's menu);
     /// `None` falls back to the workspace cwd.
     SpawnPlainSession(crate::external_session::SessionKind, Option<PathBuf>),
     /// Launch VS Code with injection resolved from the persisted
@@ -190,6 +191,11 @@ pub enum SidebarEvent {
     /// unified "Inbox" button threads also use): kill the agent and drop it
     /// from the sidebar — the same path as closing the tab.
     ArchiveExternalSession(String),
+    /// User removed a project folder from the sidebar (project action menu).
+    /// The store unregisters the path: the folder disappears and its threads
+    /// fall back to the loose Conversations list. Conversation history is
+    /// never touched.
+    RemoveProject(PathBuf),
 }
 
 /// Order threads as a team forest: top-level rows (threads + externals)
@@ -303,11 +309,12 @@ pub struct Sidebar {
     new_session_open: bool,
     new_session_menu: Option<Entity<PopupMenu>>,
     new_session_menu_sub: Option<Subscription>,
-    /// The project path the new-session menu was opened from. `None` when
-    /// opened from the Conversations header; `Some` when opened from a project
-    /// folder's `+` button. The menu closures read this to decide whether to
-    /// emit `NewThread` vs `NewThreadWithProject`, and to pass the project path
-    /// as the CWD for external CLI sessions.
+    /// The project path the menu was opened from. `None` when opened from
+    /// the Conversations header; `Some` when opened from a project folder's
+    /// ellipsis button. The menu closures read this to decide whether to
+    /// emit `NewThread` vs `NewThreadWithProject`, to pass the project path
+    /// as the CWD for external CLI sessions, and to identify the folder the
+    /// Remove-project row unregisters.
     new_session_project: Option<PathBuf>,
     /// The single inline tag edit in flight (one row at a time); `None`
     /// when no row is editing its tag.
@@ -437,10 +444,12 @@ impl Sidebar {
         )
     }
 
-    /// Open the new-session `PopupMenu`. `project` is `None` when opened from
-    /// the Conversations header, `Some(path)` when opened from a project
-    /// folder's `+` button — the path determines the CWD for external CLI
-    /// sessions and whether the new Manox session binds to the project.
+    /// Open the session-menu popup. `project` is `None` when opened from the
+    /// Conversations header — the flat new-session menu — and `Some(path)`
+    /// when opened from a project folder's ellipsis button — the project
+    /// action menu (new-session submenu / Terminal / VS Code / Remove
+    /// Project). The path determines the CWD for external CLI sessions and
+    /// whether the new Manox session binds to the project.
     fn open_new_session_menu(
         &mut self,
         project: Option<PathBuf>,
@@ -451,6 +460,9 @@ impl Sidebar {
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+            if project.is_some() {
+                return build_project_menu(menu, &sidebar, &theme, window, cx);
+            }
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
@@ -755,8 +767,8 @@ impl Sidebar {
             .and_then(|s| s.tag.clone())
     }
 
-    /// Build the new-session dropdown anchored below the `+` button that
-    /// opened it. Deferred so it paints above sibling rows; `top_full()` is
+    /// Build the session-menu dropdown anchored below the trigger button
+    /// that opened it. Deferred so it paints above sibling rows; `top_full()` is
     /// 100% of the wrapping `.relative()` div, so the menu sits just under the
     /// button rather than at the sidebar's bottom edge.
     fn render_new_session_dropdown(&self, id: SharedString) -> Option<AnyElement> {
@@ -799,9 +811,10 @@ impl Sidebar {
     }
 
     /// A collapsible project folder: a clickable header (chevron + folder icon +
-    /// basename) over its indented conversation rows when expanded. The `+`
-    /// button opens the new-session popup menu with the project path so the
-    /// workspace can set the CWD for external CLI sessions.
+    /// basename) over its indented conversation rows when expanded. The
+    /// trailing ellipsis button opens the project action menu with the
+    /// project path so the workspace can set the CWD for external CLI
+    /// sessions.
     fn render_project_group(
         &self,
         path: &str,
@@ -865,11 +878,11 @@ impl Sidebar {
                 gpui::div()
                     .relative()
                     .child(
-                        Button::new(format!("new-thread-in-project-{key}"))
+                        Button::new(format!("project-menu-{key}"))
                             .ghost()
                             .xsmall()
-                            .icon(IconName::Plus)
-                            .tooltip(i18n::t("sidebar-new-chat"))
+                            .icon(IconName::Ellipsis)
+                            .tooltip(i18n::t("sidebar-project-menu"))
                             .on_click(cx.listener({
                                 let path = path.to_string();
                                 move |this, _ev, window, cx| {
@@ -888,8 +901,8 @@ impl Sidebar {
                             })),
                     )
                     // Only render the dropdown here when the menu was opened
-                    // from *this* project folder's `+` button, so the menu
-                    // anchors below the clicked button instead of the
+                    // from *this* project folder's ellipsis button, so the
+                    // menu anchors below the clicked button instead of the
                     // Conversations header's `+`.
                     .children(
                         (self.new_session_open
@@ -915,7 +928,7 @@ impl Sidebar {
 
         let rows = expanded.then(|| {
             // Threads + this project's external sessions, merged by recency so
-            // an external CLI session launched from the folder's `+` sits
+            // an external CLI session launched from the folder's menu sits
             // among the folder's manox threads instead of in the loose list;
             // team members nest indented under their leader.
             let team_rows = self.order_rows(group, &externals);
@@ -1001,13 +1014,21 @@ impl Render for Sidebar {
                 projects.push((kp.clone(), Vec::new()));
             }
         }
-        // External sessions not bound to a project stay in the loose
-        // Conversations list; bound ones are pulled into their folder group
-        // inside `render_project_group` (filtered by project path there).
+        // External sessions not bound to a project — or bound to one that is
+        // no longer registered — stay in the loose Conversations list; bound
+        // ones are pulled into their folder group inside
+        // `render_project_group` (filtered by project path there), so a
+        // removed folder never strands its live sessions.
         let loose_externals: Vec<crate::external_session::ExternalSessionSummary> = self
             .external_sessions
             .iter()
-            .filter(|s| s.project.is_none())
+            .filter(|s| {
+                s.project.as_deref().is_none_or(|p| {
+                    !known_projects
+                        .iter()
+                        .any(|kp| kp.as_str() == p.to_string_lossy().as_ref())
+                })
+            })
             .cloned()
             .collect();
 
@@ -1255,6 +1276,162 @@ fn build_agent_model_cascade(
             });
         },
     )
+}
+
+/// A project folder's action menu (its ellipsis button): a new-session
+/// submenu (Manox + the external-agent model cascades), a plain terminal,
+/// VS Code, and a destructive Remove-project row. The session rows share
+/// the flat new-session menu's semantics, scoped to the sidebar's
+/// `new_session_project`.
+fn build_project_menu(
+    menu: PopupMenu,
+    sidebar: &WeakEntity<Sidebar>,
+    theme: &Theme,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let theme = theme.clone();
+    let sidebar = sidebar.clone();
+    let mut menu = menu.max_w(gpui::px(280.));
+    // New-session submenu: Manox flat row + one provider→model cascade per
+    // external agent kind.
+    let sidebar_new = sidebar.clone();
+    let theme_new = theme.clone();
+    menu = menu.submenu_with_icon(
+        Some(
+            Icon::new(IconName::Plus)
+                .small()
+                .text_color(theme.muted_foreground),
+        ),
+        i18n::t("sidebar-new-session-label"),
+        window,
+        cx,
+        move |submenu, window, cx| {
+            let mut submenu = submenu;
+            let sidebar_manox = sidebar_new.clone();
+            submenu = submenu.item(
+                PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
+                    .icon(
+                        Icon::default()
+                            .path("icons/manox.svg")
+                            .small()
+                            .text_color(theme_new.muted_foreground),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        let _ = sidebar_manox.update(cx, |this, cx| {
+                            let project = this.new_session_project.take();
+                            this.close_new_session_menu();
+                            if let Some(p) = project {
+                                cx.emit(SidebarEvent::NewThreadWithProject(p));
+                            } else {
+                                cx.emit(SidebarEvent::NewThread);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
+            for kind in [
+                crate::external_session::SessionKind::ClaudeCode,
+                crate::external_session::SessionKind::Codex,
+                crate::external_session::SessionKind::GithubCopilot,
+            ] {
+                let sidebar_agent = sidebar_new.clone();
+                let label = kind.label();
+                let agent_id = kind.agent_id();
+                submenu = submenu.submenu_with_icon(
+                    Some(
+                        Icon::default()
+                            .path(kind.icon_asset())
+                            .small()
+                            .text_color(theme_new.muted_foreground),
+                    ),
+                    label,
+                    window,
+                    cx,
+                    move |submenu, window, cx| {
+                        build_agent_model_cascade(
+                            submenu,
+                            kind,
+                            agent_id,
+                            &sidebar_agent,
+                            window,
+                            cx,
+                        )
+                    },
+                );
+            }
+            submenu
+        },
+    );
+    // Terminal: a plain shell session — no provider/model cascade, the
+    // click spawns immediately in the project directory.
+    {
+        let kind = crate::external_session::SessionKind::Terminal;
+        let sidebar_plain = sidebar.clone();
+        menu = menu.item(
+            PopupMenuItem::new(i18n::t("sidebar-new-terminal"))
+                .icon(
+                    Icon::default()
+                        .path(kind.icon_asset())
+                        .small()
+                        .text_color(theme.muted_foreground),
+                )
+                .on_click(move |_, _window, cx| {
+                    let _ = sidebar_plain.update(cx, |this, cx| {
+                        let project = this.new_session_project.take();
+                        this.close_new_session_menu();
+                        cx.emit(SidebarEvent::SpawnPlainSession(kind, project));
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+    // VS Code: single entry — injection resolves from the persisted
+    // `vscode_app:` settings; no provider/model cascade. Disabled outright
+    // when VS Code is not installed (parity with the flat menu).
+    {
+        let sidebar_vscode = sidebar.clone();
+        let icon = Icon::default()
+            .path("icons/vscode.svg")
+            .small()
+            .text_color(theme.muted_foreground);
+        menu = menu.item(
+            PopupMenuItem::new("VS Code")
+                .icon(icon)
+                .disabled(!cx::vscode_app_installed())
+                .on_click(move |_, _window, cx| {
+                    let _ = sidebar_vscode.update(cx, |this, cx| {
+                        let project = this.new_session_project.clone();
+                        cx.emit(SidebarEvent::LaunchVSCode(project));
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+    menu = menu.separator();
+    // Remove project: unregister the folder; the threads fall back to the
+    // loose Conversations list and the history stays on disk.
+    let sidebar_rm = sidebar.clone();
+    menu = menu.item(
+        PopupMenuItem::new(i18n::t("sidebar-remove-project"))
+            .icon(
+                Icon::default()
+                    .path("icons/trash-2.svg")
+                    .small()
+                    .text_color(theme.danger),
+            )
+            .on_click(move |_, _window, cx| {
+                let _ = sidebar_rm.update(cx, |this, cx| {
+                    let project = this.new_session_project.take();
+                    this.close_new_session_menu();
+                    if let Some(p) = project {
+                        cx.emit(SidebarEvent::RemoveProject(p));
+                    }
+                    cx.notify();
+                });
+            }),
+    );
+    menu
 }
 
 /// Leading icon for a unified sidebar row. Manox threads carry the brand

@@ -50,9 +50,9 @@ impl ThreadsDatabase {
         Ok(out)
     }
 
-    /// Remove a project path. Reserved for a future "remove project from
-    /// sidebar" interaction — currently unused.
-    #[allow(dead_code)]
+    /// Remove a project path. Backs the sidebar's "remove project" action:
+    /// the row is dropped from the sidebar's project list while thread rows
+    /// and their history remain untouched.
     pub fn remove_project(&self, path: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute("DELETE FROM projects WHERE path = ?1", params![path])
