@@ -3095,6 +3095,59 @@ mod tests {
         agent::thread_store::drop_global_for_test();
     }
 
+    /// Detaching a running session must not cancel the thread or clear the
+    /// store's running flag: a browser refresh would otherwise kill a turn
+    /// the desktop surface may still be showing. Contrast with
+    /// `dispose_session`, which cancels the turn and resets the store before
+    /// releasing it.
+    #[test]
+    fn detach_running_session_preserves_the_turn() {
+        let _guard = GLOBALS_LOCK.lock().unwrap();
+        hermetic_home();
+        let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
+        cx.allow_parking();
+        let mut state = state_with(PathBuf::from("/"));
+        let out = with_session_for_submit(&mut cx, &mut state);
+        let sink = sink_for(&out);
+
+        // Simulate the running turn the event subscription would have
+        // flagged: the actor's `turn_active` plus the store's running set.
+        state.sessions["s1"]
+            .turn_active
+            .store(true, Ordering::SeqCst);
+        cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.update(app, |s, cx| s.mark_running("s1", cx));
+        });
+
+        cmd(
+            &mut cx,
+            &mut state,
+            &sink,
+            r#"{"cmd":"detach_session","sessionId":"s1"}"#,
+        );
+        cx.run_until_parked();
+
+        assert!(!state.sessions.contains_key("s1"), "session released");
+        assert!(types(&out).contains(&"session_disposed".to_string()));
+        assert_eq!(
+            state.focused.lock().unwrap().as_deref(),
+            None,
+            "focus cleared"
+        );
+        // The turn is still streaming for the desktop surface: detach leaves
+        // the store's running flag untouched — only `dispose_session` (or the
+        // backend's own `TurnFinished`) resets it.
+        let running = cx.update(|app| {
+            let store = agent::thread_store::global();
+            store.read(app).is_running("s1")
+        });
+        assert!(running, "detach must not clear the store's running flag");
+
+        drop(state);
+        agent::thread_store::drop_global_for_test();
+    }
+
     #[test]
     fn running_submit_parks_into_pending_submits() {
         let _guard = GLOBALS_LOCK.lock().unwrap();
