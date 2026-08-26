@@ -32,6 +32,11 @@ pub struct ToolState {
     /// The anonymous register is batch-local; named registers persist across
     /// batches. For now, only the anonymous register is supported.
     pub clipboard: std::sync::Mutex<Vec<String>>,
+    /// No-op edit loop detector per path: `(payload hash, consecutive count)`.
+    /// A successful (changed) edit clears its path; an identical payload that
+    /// again produces no change increments the count so the edit tool can
+    /// escalate out of a spin.
+    pub noop_edits: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u32)>>,
 }
 
 impl ToolState {
@@ -40,6 +45,7 @@ impl ToolState {
             snapshots: std::sync::Mutex::new(SnapshotStore::new()),
             mutation_queue: FileMutationQueue::new(),
             clipboard: std::sync::Mutex::new(Vec::new()),
+            noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }

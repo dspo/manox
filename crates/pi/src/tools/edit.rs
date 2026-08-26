@@ -33,13 +33,30 @@ Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body r
 `SWAP.BLK N:` / `DEL.BLK N` / `CUT.BLK N` / `INS.BLK.POST N:` operate on the \
 bracket-block beginning at line N; `REM` deletes the file; `MV DEST` renames it. \
 Body rows are `+TEXT` (`+` alone = blank line; \
-`+-x`/`++x` escapes a literal leading `-`/`+`); a `-`-prefixed markdown list item is NOT a \
-body row — rewrite it with a `+` prefix. Line numbers reference the ORIGINAL file from read \
-and do not shift across hunks. Ranges cover only changed lines; pure additions use `INS`, \
-never a widened `SWAP`. On a stale-TAG rejection, re-`read` before retrying.\n\
+`+-x`/`++x` escapes a literal leading `-`/`+`). A `- `-prefixed Markdown bullet inside a \
+body is accepted as literal content, but prefer the explicit `+- item`. A bare `-old` row \
+is dropped when `+` rows are present — the range already deletes the old lines, the body is \
+only the NEW content. Line numbers reference the ORIGINAL file from read and do not shift \
+across hunks. Ranges cover only changed lines; pure additions use `INS`, never a widened \
+`SWAP`. On a stale-TAG rejection, re-`read` before retrying.\n\
 Format gotchas (common miswrites): the range separator is `.=` not `:` — write `SWAP 37.=48:` \
 not `SWAP 37:=48:`. The body starts on the NEXT line as `+`-prefixed rows, never on the same \
-line as the directive. Complete example:\n\
+line as the directive.\n\
+Anti-patterns:\n\
+- WRONG: empty `SWAP` to delete. RIGHT: `DEL N.=M`.\n\
+- WRONG: range sized to the post-edit content. RIGHT: range covers only the ORIGINAL touched \
+  lines; body length is irrelevant.\n\
+- WRONG: pure insertion as a widened `SWAP` (retypes keepers, drops lines). RIGHT: `INS.POST N:` \
+  touches nothing you keep.\n\
+- WRONG: pasting `read` output rows (`N:TEXT`) as the body. RIGHT: plain `+TEXT` rows.\n\
+- WRONG: `+`-less body rows / `-old` diff rows. RIGHT: every body row starts with `+`.\n\
+Critical:\n\
+1. RE-GROUND AFTER EVERY EDIT: each edit renumbers lines and changes `#TAG`. Take the next \
+   line numbers and tag from the edit's own `[path#newtag]` response, or re-`read`. Never \
+   reuse a tag from before that edit.\n\
+2. RANGES TIGHT: changed lines only. Whole construct: `SWAP.BLK N:`.\n\
+3. BODY FINAL CONTENT: every row starts `+`.\n\
+Complete example:\n\
 ```text\n\
 [/Users/me/proj/main.py#A55789]\n\
 SWAP 37.=48:\n\
@@ -88,7 +105,7 @@ impl AgentTool for EditTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("patch is required".into()))?;
 
-        let patches =
+        let parsed =
             hashline::parse_patch(patch).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         // Clear the clipboard at the start of each edit call — the anonymous
@@ -100,7 +117,7 @@ impl AgentTool for EditTool {
             .clear();
 
         let mut results: Vec<String> = Vec::new();
-        for fp in patches {
+        for fp in parsed.files {
             let path = resolve_path(ctx, &fp.path);
             let path_display = path.display().to_string();
 
@@ -118,8 +135,33 @@ impl AgentTool for EditTool {
                 let current = hashline::normalize_to_lf(&raw);
                 let current_tag = hashline::compute_tag(&current);
                 if current_tag != fp.tag {
+                    // Distinguish "file drifted" from "tag never minted this session".
+                    let known = ctx
+                        .tool_state()
+                        .snapshots
+                        .lock()
+                        .expect("hashline snapshot store poisoned")
+                        .get(&path, &fp.tag)
+                        .is_some();
+                    let reason = if known {
+                        format!(
+                            "file changed between read and edit (tag #{old} now #{new}). If a \
+                             prior edit this session changed it, copy that edit's [path#newtag] \
+                             header; otherwise re-read.",
+                            old = fp.tag,
+                            new = current_tag
+                        )
+                    } else {
+                        format!(
+                            "tag #{old} is not from this session (fabricated or carried over \
+                             from a prior session / app restart). The current file hashes to \
+                             #{new}; re-read to copy a fresh [path#tag] header — never invent a tag.",
+                            old = fp.tag,
+                            new = current_tag
+                        )
+                    };
                     return Err(ToolError::ExecutionFailed(format!(
-                        "edit {path_display}: file changed between read and edit (tag mismatch)"
+                        "edit {path_display}: {reason}"
                     )));
                 }
                 match file_op {
@@ -216,9 +258,12 @@ impl AgentTool for EditTool {
             // Record snapshot of LF-normalized text, consistent with Read tool.
             // The model authored the whole file through this patch (or the diff
             // it produced), so every line counts as seen — a follow-up edit on
-            // the returned tag must not trip the gate.
+            // the returned tag must not trip the gate. Files over the snapshot
+            // cap mint no tag (hashline editing is out of scope for them).
             let snap_text = hashline::normalize_to_lf(&new_text);
-            let new_snap = {
+            let new_snap = if snap_text.len() > hashline::SNAPSHOT_MAX_BYTES {
+                None
+            } else {
                 let mut store = ctx
                     .tool_state()
                     .snapshots
@@ -227,18 +272,61 @@ impl AgentTool for EditTool {
                 let snap = store.record(&path, &snap_text);
                 let all_lines: HashSet<usize> = (1..=snap_text.lines().count()).collect();
                 store.record_seen_lines(&path, &snap.tag, &all_lines);
-                snap
+                Some(snap)
             };
             let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
-            let diff = if edit_diff::is_diff_empty(&diff) {
-                "(no changes)".to_string()
+            let changed = !edit_diff::is_diff_empty(&diff);
+
+            // No-op loop guard: the same payload producing no change repeatedly
+            // means the model is spinning; escalate after a few identical no-ops.
+            if changed {
+                ctx.tool_state()
+                    .noop_edits
+                    .lock()
+                    .expect("noop guard poisoned")
+                    .remove(&path);
+                results.push(match new_snap {
+                    Some(s) => format!("[{path_display}#{}]\n{diff}", s.tag),
+                    None => format!("[{path_display}]\n{diff}\n(no snapshot: file exceeds 4MB)"),
+                });
             } else {
-                diff
-            };
-            results.push(format!("[{path_display}#{}]\n{diff}", new_snap.tag));
+                let payload_hash = hash_ops(&fp.ops);
+                let mut guard = ctx
+                    .tool_state()
+                    .noop_edits
+                    .lock()
+                    .expect("noop guard poisoned");
+                let entry = guard.entry(path.clone()).or_insert((payload_hash, 0));
+                if entry.0 == payload_hash {
+                    entry.1 += 1;
+                } else {
+                    entry.0 = payload_hash;
+                    entry.1 = 1;
+                }
+                let count = entry.1;
+                drop(guard);
+                if count >= NOOP_HARD_LIMIT {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "edit {path_display}: this patch made no changes {count} times in a row \
+                         with an identical payload — the file already matches your intent. Stop \
+                         re-issuing it; re-read the file if you expected a difference."
+                    )));
+                }
+                let hint = "(no changes — the targeted lines already match the body; re-read \
+                            before another edit)";
+                results.push(match new_snap {
+                    Some(s) => format!("[{path_display}#{}]\n{hint}", s.tag),
+                    None => format!("[{path_display}]\n{hint}\n(no snapshot: file exceeds 4MB)"),
+                });
+            }
         }
 
-        Ok(AgentToolResult::text(results.join("\n---\n")))
+        let mut out = results.join("\n---\n");
+        if !parsed.warnings.is_empty() {
+            out.push_str("\n\nWarnings:\n");
+            out.push_str(&parsed.warnings.join("\n"));
+        }
+        Ok(AgentToolResult::text(out))
     }
 }
 
@@ -249,6 +337,18 @@ fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
     } else {
         ctx.cwd().join(path)
     }
+}
+
+/// Consecutive identical no-op edits on one path before the guard escalates.
+const NOOP_HARD_LIMIT: u32 = 3;
+
+/// Fingerprint an edit's ops so the noop guard can tell a repeated payload
+/// from progress. Debug rendering is stable enough for in-session comparison.
+fn hash_ops(ops: &[Op]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{ops:?}").hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Expand Cut/Paste ops before apply. Cut captures the deleted lines to the

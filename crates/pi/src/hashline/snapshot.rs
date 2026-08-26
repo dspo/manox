@@ -19,9 +19,30 @@ use super::hash::compute_tag;
 /// Maximum versions retained per path (LRU eviction drops the oldest).
 const MAX_VERSIONS_PER_PATH: usize = 4;
 /// Maximum distinct paths tracked before the least-recently-touched is evicted.
-const MAX_PATHS: usize = 30;
+/// Wide sessions routinely touch far more than a few dozen files; evicting a
+/// path downgrades a genuinely in-session tag to a misleading "not from this
+/// session" rejection. Retention stays bounded by [`MAX_TOTAL_BYTES`].
+const MAX_PATHS: usize = 256;
 /// Global ceiling on retained snapshot text across all paths (UTF-8 bytes).
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Canonical store key for a path. Realpath resolves symlinks and the macOS
+/// `/tmp` vs `/private/tmp` split, and collapses case-insensitive spellings onto
+/// the on-disk form, so every spelling of one file fuses onto one snapshot
+/// entry. Missing paths (new-file writes) fall back to the parent's realpath
+/// plus the basename, then to the input unchanged.
+fn canonical(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if let Some(parent) = path.parent()
+        && let Ok(cp) = std::fs::canonicalize(parent)
+        && let Some(name) = path.file_name()
+    {
+        return cp.join(name);
+    }
+    path.to_path_buf()
+}
 
 /// A recorded file snapshot: its normalized text, the tag derived from it,
 /// and optional set of lines the read tool displayed.
@@ -63,6 +84,7 @@ impl SnapshotStore {
     /// texts that collide on the 6-hex tag are different snapshots — fusing
     /// them under one entry would corrupt seen-lines.
     pub fn record(&mut self, path: &Path, text: &str) -> Snapshot {
+        let path = canonical(path);
         let tag = compute_tag(text);
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -75,12 +97,12 @@ impl SnapshotStore {
             let snap = existing.clone();
             versions.retain(|s| s.tag != tag || s.text != text);
             versions.push(snap.clone());
-            self.touch_path(path);
+            self.touch_path(&path);
             return snap;
         }
 
         let snap = Snapshot {
-            path: path.to_path_buf(),
+            path: path.clone(),
             text: text.to_string(),
             tag,
             recorded_at: now,
@@ -96,36 +118,40 @@ impl SnapshotStore {
             versions.remove(0);
         }
 
-        self.touch_path(path);
+        self.touch_path(&path);
         self.evict_if_over_limit();
         snap
     }
 
     /// Look up a historical snapshot by `(path, tag)`. Does not refresh recency.
     pub fn get(&self, path: &Path, tag: &str) -> Option<&Snapshot> {
+        let path = canonical(path);
         self.by_path
-            .get(path)
+            .get(&path)
             .and_then(|versions| versions.iter().find(|s| s.tag == tag))
     }
 
     /// The most recently recorded snapshot for `path`, if any.
     pub fn head(&self, path: &Path) -> Option<&Snapshot> {
-        self.by_path.get(path).and_then(|v| v.last())
+        let path = canonical(path);
+        self.by_path.get(&path).and_then(|v| v.last())
     }
 
     /// Mutable lookup of a historical snapshot by `(path, tag)`. Used to merge
     /// revealed lines into `seen_lines` after a gate rejection surfaced them.
     pub fn get_mut(&mut self, path: &Path, tag: &str) -> Option<&mut Snapshot> {
+        let path = canonical(path);
         self.by_path
-            .get_mut(path)
+            .get_mut(&path)
             .and_then(|versions| versions.iter_mut().find(|s| s.tag == tag))
     }
 
     /// Look up a snapshot by `(path, full_text)` — exact text match. Does not
     /// refresh recency. Returns `None` when no version matches.
     pub fn by_content(&self, path: &Path, full_text: &str) -> Option<&Snapshot> {
+        let path = canonical(path);
         self.by_path
-            .get(path)
+            .get(&path)
             .and_then(|versions| versions.iter().find(|s| s.text == full_text))
     }
 
@@ -146,7 +172,8 @@ impl SnapshotStore {
     /// Record which lines of a snapshot were displayed by a read tool. Merges
     /// into the existing `seen_lines` set. No-op when the tag is not retained.
     pub fn record_seen_lines(&mut self, path: &Path, tag: &str, lines: &HashSet<usize>) {
-        let Some(versions) = self.by_path.get_mut(path) else {
+        let path = canonical(path);
+        let Some(versions) = self.by_path.get_mut(&path) else {
             return;
         };
         let Some(snapshot) = versions.iter_mut().find(|s| s.tag == tag) else {
@@ -163,18 +190,20 @@ impl SnapshotStore {
     /// No-op when `from` has no history. Used by file moves so tags minted from
     /// reads of the source path stay valid at the destination.
     pub fn relocate(&mut self, from: &Path, to: &Path) {
-        let Some(source_versions) = self.by_path.remove(from) else {
+        let from = canonical(from);
+        let to = canonical(to);
+        let Some(source_versions) = self.by_path.remove(&from) else {
             return;
         };
         let relocated: Vec<Snapshot> = source_versions
             .into_iter()
             .map(|mut s| {
-                s.path = to.to_path_buf();
+                s.path = to.clone();
                 s
             })
             .collect();
 
-        let dest_versions = self.by_path.entry(to.to_path_buf()).or_default();
+        let dest_versions = self.by_path.entry(to.clone()).or_default();
         // Merge: keep existing versions, append relocated, de-dup by hash+text.
         let mut seen = HashSet::new();
         let mut merged: Vec<Snapshot> = Vec::new();
@@ -203,17 +232,18 @@ impl SnapshotStore {
         // Re-sort by recorded_at ascending.
         merged.sort_by_key(|a| a.recorded_at);
         *dest_versions = merged;
-        self.touch_path(to);
+        self.touch_path(&to);
     }
 
     /// Drop all version history for a single path.
     pub fn invalidate(&mut self, path: &Path) {
-        if let Some(versions) = self.by_path.remove(path) {
+        let path = canonical(path);
+        if let Some(versions) = self.by_path.remove(&path) {
             for v in &versions {
                 self.total_bytes = self.total_bytes.saturating_sub(v.text.len());
             }
         }
-        self.path_order.retain(|p| p != path);
+        self.path_order.retain(|p| p != &path);
     }
 
     /// Drop all version histories.

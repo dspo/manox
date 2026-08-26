@@ -215,9 +215,10 @@ pub fn is_plan_mode_writable_param(
             let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
                 return false;
             };
-            let Ok(file_patches) = pi::hashline::parse_patch(patch) else {
+            let Ok(parsed) = pi::hashline::parse_patch(patch) else {
                 return false;
             };
+            let file_patches = parsed.files;
             !file_patches.is_empty()
                 && file_patches.iter().all(|file_patch| {
                     let target = if file_patch.path.is_absolute() {

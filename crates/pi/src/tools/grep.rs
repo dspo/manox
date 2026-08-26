@@ -151,6 +151,13 @@ impl AgentTool for GrepTool {
                 .lock()
                 .expect("hashline snapshot store poisoned");
             for path in matched_paths.iter().take(20) {
+                // Skip files over the snapshot cap — tagging them would hold the
+                // whole content for an out-of-scope hashline edit.
+                if let Ok(meta) = std::fs::metadata(path)
+                    && meta.len() as usize > hashline::SNAPSHOT_MAX_BYTES
+                {
+                    continue;
+                }
                 if let Ok(raw) = std::fs::read_to_string(path) {
                     let normalized = hashline::normalize_to_lf(&raw);
                     let tag = store.record(path, &normalized);

@@ -17,7 +17,7 @@ fn read(store: &mut SnapshotStore, path: &Path) -> (String, String) {
     let text = normalize_to_lf(&raw);
     let snap = store.record(path, &text);
     (
-        format_numbered(&path.display().to_string(), &text, &snap.tag),
+        format_numbered(&path.display().to_string(), &text, Some(&snap.tag)),
         snap.tag,
     )
 }
@@ -25,7 +25,7 @@ fn read(store: &mut SnapshotStore, path: &Path) -> (String, String) {
 /// Simulate `edit`: parse the patch, validate the tag, apply (or recover),
 /// write the result, and record the new snapshot. Returns the new tag.
 fn edit(store: &mut SnapshotStore, path: &Path, patch: &str) -> (String, String) {
-    let fp = parse_patch(patch).unwrap().pop().unwrap();
+    let fp = parse_patch(patch).unwrap().files.pop().unwrap();
     assert_eq!(fp.path, path);
     let raw = std::fs::read_to_string(path).unwrap();
     let current = normalize_to_lf(&raw);
