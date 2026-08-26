@@ -3898,7 +3898,7 @@ async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
 /// synchronous — the clear runs on the runtime and its outcome is only
 /// display chrome, so a lost write just narrows the reload window.
 fn clear_user_chrome_spawn(sessions_dir: PathBuf, session_path: PathBuf) {
-    tokio::spawn(async move {
+    crate::runtime::handle().spawn(async move {
         clear_user_chrome(&sessions_dir, &session_path).await;
     });
 }
