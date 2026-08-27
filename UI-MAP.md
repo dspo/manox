@@ -463,6 +463,9 @@ history). Composer history recall lives on `⌥↑` / `⌥↓` (`ComposerRecallU
 `composer > Input` key context the wrapper carries while the completion popover is closed). The walk is entered
 only by those keys — a running walk keeps stepping after an edit, and the text it leaves behind becomes the
 walk's working line, which `⌥↓` past the newest turn restores. Submitting or switching threads ends the walk.
+A [TurnNavigator](#capability-matrix) `⌘↵` fill is a walk landing too: the walk moves onto the filled turn, so
+the draft the fill displaced is the working line `⌥↓` returns — `InputState::set_value` clears the input's undo
+history, so nothing else survives that replacement.
 
 > Source: `agent-ui/src/workspace.rs`
 

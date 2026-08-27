@@ -3374,14 +3374,14 @@ impl Workspace {
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
         // thread that just submitted already cleared its input, storing "".
-        // Mid-walk the composer shows a past turn, so what the user was working
-        // on is the walk's draft rather than the input's content.
+        // While the walk runs the composer holds borrowed history — a recall
+        // step's turn or a navigator fill — so the user's draft is the walk's
+        // working line, not what is on screen.
         let outgoing = match self.recall_draft.as_deref() {
             Some(draft) if self.recall_index >= 0 => draft.to_string(),
             _ => self.input_state.read(cx).value().to_string(),
         };
         self.drafts.insert(old_id.clone(), outgoing);
-        // A recall walk belongs to the outgoing thread's input.
         self.end_recall_walk();
         // The editor pane is a right-side resource of the outgoing thread:
         // stash its text so a switch-back restores the draft (mirrors the
@@ -5887,10 +5887,13 @@ impl Workspace {
                     None => RecallStep::Clear,
                 },
             ),
-            (RecallDirection::Down, Some(ix)) => match turns.get(ix - 1) {
-                Some(newer) => (ix as i64 - 1, left, RecallStep::Recall(newer.clone())),
-                None => (index, left, RecallStep::None),
-            },
+            // A walked index always has a newer slot: `walked` came from
+            // `turns.get(ix)`, and `ix == 0` is the arm above.
+            (RecallDirection::Down, Some(ix)) => (
+                ix as i64 - 1,
+                left,
+                RecallStep::Recall(turns[ix - 1].clone()),
+            ),
             (RecallDirection::Down, None) => (-1, draft.map(str::to_string), RecallStep::None),
         }
     }
@@ -5957,15 +5960,33 @@ impl Workspace {
     }
 
     /// Refill the composer with a past turn picked in the turn navigator
-    /// (cmd/ctrl-Enter). The text no longer tracks a recall walk, so a running
-    /// walk ends here, and the composer takes focus for immediate editing.
+    /// (cmd/ctrl-Enter). A fill is a recall landing: the walk moves onto the
+    /// filled turn, so `alt-down` off the newest end hands back whatever the
+    /// fill displaced — `set_value` clears the input's undo history, and that
+    /// working line is otherwise the only surviving copy of the user's draft.
+    /// A turn with no text to recall is no fill at all, and a walk already
+    /// running keeps the draft it started with.
     fn fill_composer_from_turn(
         &mut self,
         text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.end_recall_walk();
+        let landed = self
+            .recall_turns(cx)
+            .iter()
+            .position(|turn| *turn == text)
+            .map(|ix| ix as i64);
+        if let Some(index) = landed {
+            let displaced = self.input_state.read(cx).value().to_string();
+            if self.recall_index < 0 {
+                self.recall_draft =
+                    (!displaced.is_empty() && displaced != text).then(|| displaced.clone());
+            }
+            self.recall_index = index;
+        } else {
+            self.end_recall_walk();
+        }
         self.close_completion(cx);
         self.set_composer_text(text, window, cx);
         self.input_state
@@ -9167,6 +9188,7 @@ mod tests {
         use super::{PersistedRightTab, RightTab};
         use gpui::AppContext as _;
 
+        let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path =
             std::env::temp_dir().join(format!("manox-right-pane-test-{}.db", uuid_like_id()));
@@ -9300,6 +9322,18 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
+    /// `thread_store::init_for_test` swaps a process-global, and a gpui test
+    /// runs on its own scheduler thread, so every test that builds a real
+    /// `Workspace` against a temp db holds this for its whole body.
+    static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Borrow the store lock and the temp db for one `Workspace` test. The
+    /// poisoned case recovers rather than cascading a failed assertion into
+    /// the other store-backed test.
+    fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Unique-ish id for temp files without pulling in a uuid dependency.
     fn uuid_like_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -9355,5 +9389,78 @@ mod tests {
         assert_eq!(ended, -1, "the walk ends once the draft is restored");
         assert_eq!(spent, None);
         assert_eq!(applied.as_deref(), Some("my draft"));
+    }
+
+    /// End to end: a navigator fill lands the recall walk on the turn it
+    /// filled, and `alt-down` off the walk's newest end hands back the draft
+    /// the fill displaced. The composer's own undo history cannot do this —
+    /// `set_value` clears it — so the working line is the only copy.
+    #[gpui::test]
+    async fn navigator_fill_lands_the_walk_and_hands_the_draft_back(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-fill-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| {
+            agent::runtime::init();
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone(), cx);
+        });
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace");
+
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                let weak = cx.entity().downgrade();
+                let meta = || crate::conversation::UserTurnMeta::new(0, String::new(), None);
+                ws.conversation.update(cx, |conv, cx| {
+                    conv.push_user("older turn".into(), vec![], meta(), weak.clone(), cx);
+                    conv.push_user("newest turn".into(), vec![], meta(), weak, cx);
+                });
+                ws.input_state.update(cx, |s, cx| {
+                    s.set_value("half a sentence", window, cx);
+                });
+
+                // ⌘↵ on the older of the two turns.
+                ws.fill_composer_from_turn("older turn".into(), window, cx);
+                assert_eq!(ws.input_state.read(cx).value().as_ref(), "older turn");
+                assert_eq!(ws.recall_index, 1, "newest-first puts it in slot 1");
+                assert_eq!(
+                    ws.recall_draft.as_deref(),
+                    Some("half a sentence"),
+                    "the displaced draft is the walk's working line"
+                );
+
+                // ⌥↓ to the newest turn, ⌥↓ again past it hands the draft back.
+                ws.apply_recall_step(RecallDirection::Down, window, cx);
+                assert_eq!(ws.input_state.read(cx).value().as_ref(), "newest turn");
+                ws.apply_recall_step(RecallDirection::Down, window, cx);
+                assert_eq!(ws.recall_index, -1, "the walk ends at its newest end");
+                assert_eq!(ws.recall_draft, None, "and its draft is spent");
+                assert_eq!(
+                    ws.input_state.read(cx).value().as_ref(),
+                    "half a sentence",
+                    "the user's own text is back in the composer"
+                );
+            });
+        });
+
+        agent::thread_store::drop_for_test();
+        let _ = std::fs::remove_file(&db_path);
     }
 }
