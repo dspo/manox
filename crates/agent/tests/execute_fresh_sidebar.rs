@@ -127,7 +127,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     let project = home.join("project");
     std::fs::create_dir_all(&project).unwrap();
 
-    let mut cx = gpui::TestAppContext::single();
+    let cx = gpui::TestAppContext::single();
     cx.update(|cx| {
         agent::runtime::init();
         agent::settings::init_optimization();
@@ -143,36 +143,31 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     // Mirror `respond_plan_review`'s ExecuteFresh arm: spawn a fresh
     // project-bound thread and seed the execution turn.
-    let thread: gpui::Entity<Thread> = cx.update(|cx| {
-        Thread::new_in_project(
-            ThreadId(uuid::Uuid::new_v4().to_string()),
-            project.clone(),
-            cx,
-        )
-    });
-    let new_id = cx.read(|cx| thread.read(cx).id.0.clone());
-    thread.update(&mut cx, |t, cx| {
+    let thread =
+        Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), project.clone());
+    let new_id = thread.read(|t| t.id.0.clone());
+    thread.with_mut(|t| {
         t.seed_plan_execution(
             "/tmp/test-plan.md".to_string(),
             "Reply with just OK.".to_string(),
             None,
-            cx,
         );
     });
 
     // Wait for the seeded turn to settle (the actor streams through the fake
     // endpoint, materializing the deferred session file on the first
-    // assistant message). The facade flips `running` false on `Settled`.
+    // assistant message). The facade flips `running` false on `Settled`. The
+    // engine pump runs on the tokio runtime, so poll `is_running` rather than
+    // park the gpui context.
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        cx.run_until_parked();
-        let done = cx.read(|cx| !thread.read(cx).is_running());
+        let done = thread.read(|t| !t.is_running());
         if done || Instant::now() > deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let running = cx.read(|cx| thread.read(cx).is_running());
+    let running = thread.read(|t| t.is_running());
     assert!(
         !running,
         "seeded execution turn did not settle within 120s (fake endpoint broken?)"

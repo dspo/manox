@@ -10,10 +10,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
 
 use crate::db::ThreadSummary;
-use crate::thread::{PermissionMode, Thread, ThreadId};
+use crate::thread::{PermissionMode, Thread, ThreadCore, ThreadHandle, ThreadId};
 
 /// Events emitted by `ThreadStore` to the sidebar.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ pub struct ThreadStore {
     /// running-task check.
     background_work: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
-    live_threads: HashMap<String, WeakEntity<Thread>>,
+    live_threads: HashMap<String, std::sync::Weak<ThreadCore>>,
     sessions_dir: PathBuf,
 }
 
@@ -334,36 +334,39 @@ impl ThreadStore {
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry).
-    pub fn load_thread(&mut self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
-        if let Some(entity) = self.live_threads.get(id).and_then(WeakEntity::upgrade) {
-            return Some(entity);
+    pub fn load_thread(&mut self, id: &str) -> Option<ThreadHandle> {
+        if let Some(weak) = self.live_threads.get(id)
+            && let Some(handle) = ThreadHandle::upgrade(weak)
+        {
+            return Some(handle);
         }
         let path = self.session_paths.get(id)?.clone();
         let cwd = self
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let entity = Thread::open_existing(ThreadId(id.to_string()), cwd, path, cx);
+        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path);
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
         {
             let dir = PathBuf::from(&sum.project);
-            entity.update(cx, |t, _| t.restore_project(dir));
+            handle.with_mut(|t| t.restore_project(dir));
         }
-        self.live_threads.insert(id.to_string(), entity.downgrade());
-        Some(entity)
+        self.live_threads.insert(id.to_string(), handle.downgrade());
+        Some(handle)
     }
 
-    /// The live (in-memory) thread for `id`, if its entity is still alive.
-    /// Unlike [`ThreadStore::load_thread`], never restores from disk.
-    pub fn live_thread(&self, id: &str) -> Option<Entity<Thread>> {
-        self.live_threads.get(id).and_then(WeakEntity::upgrade)
+    /// The live (in-memory) thread for `id`, if it is still alive. Unlike
+    /// [`ThreadStore::load_thread`], never restores from disk.
+    pub fn live_thread(&self, id: &str) -> Option<ThreadHandle> {
+        self.live_threads.get(id).and_then(ThreadHandle::upgrade)
     }
 
-    /// Track a live thread so the facade can address it by id alone.
-    pub fn register_live_thread(&mut self, id: &str, t: WeakEntity<Thread>) {
-        self.live_threads.insert(id.to_string(), t);
+    /// Track a live thread so the facade can address it by id alone. Stores
+    /// only a weak reference; the caller keeps the thread alive.
+    pub fn register_live_thread(&mut self, id: &str, t: &ThreadHandle) {
+        self.live_threads.insert(id.to_string(), t.downgrade());
     }
 
     /// Seed an active summary row without touching disk — lets foreign test
