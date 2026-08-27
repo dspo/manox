@@ -350,8 +350,10 @@ pub struct Thread {
     /// Events buffered by cx-free mutations, drained and broadcast to the
     /// handle's subscribers after each operation (replaces `cx.emit`).
     pending_events: Vec<ThreadEvent>,
-    /// Engine notice channel parked by `ensure_engine` (lazy engine), drained
-    /// onto the handle right after the mutation that materialized it.
+    /// Engine notice channel parked by `ensure_engine` (lazy engine). `open`
+    /// drains its engine directly at construction (no outer `with_mut` to
+    /// borrow); `ensure_engine` runs inside a `with_mut`, so it parks the
+    /// receiver here and that enclosing call spawns the pump.
     pending_engine_events: Option<tokio::sync::mpsc::UnboundedReceiver<BackendNotice>>,
 }
 
@@ -385,7 +387,14 @@ pub fn thread_registry() -> Option<&'static Arc<dyn ThreadRegistry>> {
 pub struct ThreadHandle(Arc<ThreadCore>);
 
 pub struct ThreadCore {
-    state: parking_lot::Mutex<Thread>,
+    /// Read-mostly state: the UI reads 25+ fields per render while the engine
+    /// pump writes during a turn, so reads share the `RwLock` and only
+    /// mutations take the exclusive write lock.
+    state: parking_lot::RwLock<Thread>,
+    /// Event subscribers. Carries `Arc<ThreadEvent>` — a transitional shell
+    /// because `ThreadEvent::Error(anyhow::Error)` (and, until it becomes a
+    /// `ThreadId`, `SubagentStarted.child`) are not `Clone`; once those land
+    /// the event can derive `Clone` and this `Arc` comes off.
     subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadEvent>>>>,
 }
 
@@ -393,7 +402,7 @@ impl ThreadHandle {
     /// Wrap a freshly built [`Thread`].
     pub fn new(thread: Thread) -> Self {
         Self(Arc::new(ThreadCore {
-            state: parking_lot::Mutex::new(thread),
+            state: parking_lot::RwLock::new(thread),
             subscribers: parking_lot::Mutex::new(Vec::new()),
         }))
     }
@@ -405,18 +414,18 @@ impl ThreadHandle {
         rx
     }
 
-    /// Read-lock the state.
+    /// Shared-read the state.
     pub fn read<R>(&self, f: impl FnOnce(&Thread) -> R) -> R {
-        let state = self.0.state.lock();
+        let state = self.0.state.read();
         f(&state)
     }
 
-    /// Mutate under lock, then broadcast the buffered events. Three-phase:
-    /// lock -> mutate (collecting `pending_events`) -> unlock -> emit. The
-    /// closure must never await.
+    /// Mutate under the write lock, then broadcast the buffered events.
+    /// Three-phase: lock -> mutate (collecting `pending_events`) -> unlock ->
+    /// emit. The closure must never await.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
         let (r, events, engine_events) = {
-            let mut state = self.0.state.lock();
+            let mut state = self.0.state.write();
             let r = f(&mut state);
             let events = std::mem::take(&mut state.pending_events);
             let engine_events = state.pending_engine_events.take();
@@ -433,7 +442,10 @@ impl ThreadHandle {
         if events.is_empty() {
             return;
         }
-        let subs = self.0.subscribers.lock();
+        let mut subs = self.0.subscribers.lock();
+        // Drop subscribers whose receiver is gone (view unmount); otherwise
+        // the list grows without bound on a long-lived thread.
+        subs.retain(|tx| !tx.is_closed());
         if subs.is_empty() {
             return;
         }
@@ -1707,8 +1719,9 @@ impl Thread {
 }
 
 /// Drain a spawned engine's notice channel on the runtime, dispatching each
-/// notice through [`ThreadHandle::handle_notice`]. Shared by `open` (engine
-/// present at construction) and `ensure_engine` (landing materialization).
+/// notice through the thread's `handle_notice` (re-homed onto the handle in a
+/// later slice). Shared by `open` (engine present at construction) and
+/// `ensure_engine` (landing materialization).
 fn drain_engine_notices(
     handle: ThreadHandle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
