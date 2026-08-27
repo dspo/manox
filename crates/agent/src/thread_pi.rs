@@ -1,12 +1,13 @@
 // The pi-backed `Thread` facade (built with `feature = "harness-pi"`).
 //
-// A gpui entity that owns a tokio actor around a pi `AgentSession` through
-// the `ThreadEngine` contract. Run events flow back through a channel, are
-// adapted into `ThreadEvent`s (see `pi_engine::adapt`), and are emitted on
-// this entity so the workspace's existing `subscribe_thread` handler renders
-// them unchanged. History is exposed as a display sequence (messages
-// interleaved with persisted UI annotation cards) so the rebuild path
-// (`ConversationState::rebuild_from_display`) replays it in order.
+// A gpui-free thread owned behind a `ThreadHandle` (`Arc<ThreadCore>`): the
+// state lives in a lock, and run events from the tokio actor around a pi
+// `AgentSession` (via the `ThreadEngine` contract) flow back through a
+// channel, are adapted into `ThreadEvent`s (see `pi_engine::adapt`), and
+// broadcast to the handle's subscribers. History is exposed as a display
+// sequence (messages interleaved with persisted UI annotation cards) so the
+// rebuild path (`ConversationState::rebuild_from_display`) replays it in
+// order.
 //
 // The public surface mirrors the manox `Thread`'s — the workspace compiles
 // against one shape. manox-only affordances (pin/archive/notes/goal/team/
@@ -18,7 +19,6 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
 use serde::{Deserialize, Serialize};
 
 use crate::background_task::TaskSnapshot;
@@ -2396,10 +2396,8 @@ pub(crate) mod tests {
     /// event; an actor-initiated `TurnStarted` (monitor wakeup, plan-approval
     /// seed) flips the running flag so a switch-away parks the thread instead
     /// of dropping it mid-run, and `Settled` clears it.
-    #[gpui::test]
-    fn live_history_refreshes_mirror_and_actor_turn_started_sets_running(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn live_history_refreshes_mirror_and_actor_turn_started_sets_running() {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::assistant(vec![MessageContent::Text(
                 "partial answer".into(),
@@ -2412,32 +2410,29 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
-        thread.update(cx, |t, cx| {
-            // Mid-run mirror refresh: the live partial lands in `messages`.
-            t.handle_notice(BackendNotice::LiveHistory, cx);
+        // Mid-run mirror refresh: the live partial lands in `messages`.
+        thread.handle_notice(BackendNotice::LiveHistory);
+        thread.read(|t| {
             assert_eq!(t.messages.len(), 1);
             assert!(matches!(
                 &t.messages[0].content[0],
                 MessageContent::Text(text) if text == "partial answer"
             ));
             assert!(!t.is_running());
-
-            // Actor-initiated run start mirrors onto the facade running flag.
-            t.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)), cx);
-            assert!(t.is_running());
-
-            // Settlement releases the slot (and refreshes the mirror).
-            t.handle_notice(
-                BackendNotice::Settled {
-                    cancelled: false,
-                    failed: false,
-                    steered: Vec::new(),
-                    stranded: Vec::new(),
-                },
-                cx,
-            );
-            assert!(!t.is_running());
         });
+
+        // Actor-initiated run start mirrors onto the facade running flag.
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        thread.read(|t| assert!(t.is_running()));
+
+        // Settlement releases the slot (and refreshes the mirror).
+        thread.handle_notice(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        });
+        thread.read(|t| assert!(!t.is_running()));
     }
 
     /// The headless slash router drives the same thread state the gpui host
@@ -2454,50 +2449,48 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| {
-            // The prompt form enters plan mode and runs the turn with the
-            // compact display form.
-            let ui = MessageUiMetadata {
-                display_text: Some("/plan fix it".into()),
-                ..Default::default()
-            };
-            assert!(t.run_slash_builtin("plan", "fix it", Some(ui.clone()), cx));
-            assert!(t.plan_mode(), "/plan <prompt> enters plan mode");
-            let runs = engine.runs.lock().unwrap();
-            assert_eq!(runs.len(), 1, "prompt form runs a turn");
-            assert_eq!(runs[0].0, "fix it");
-            drop(runs);
+        // The prompt form enters plan mode and runs the turn with the
+        // compact display form.
+        let ui = MessageUiMetadata {
+            display_text: Some("/plan fix it".into()),
+            ..Default::default()
+        };
+        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "fix it", Some(ui.clone()))));
+        thread.read(|t| assert!(t.plan_mode(), "/plan <prompt> enters plan mode"));
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "prompt form runs a turn");
+        assert_eq!(runs[0].0, "fix it");
+        drop(runs);
+        thread.read(|t| {
             let last = t.messages().last().expect("turn message inserted");
             assert_eq!(
                 last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
                 Some("/plan fix it")
             );
-
-            // A second invocation toggles plan mode back off, no new turn.
-            assert!(t.run_slash_builtin("plan", "", None, cx));
-            assert!(!t.plan_mode(), "/plan bare exits plan mode");
-            assert_eq!(engine.runs.lock().unwrap().len(), 1);
-
-            assert!(t.run_slash_builtin("mode", "", None, cx));
-            assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess);
-            // Named form sets the mode directly.
-            assert!(t.run_slash_builtin("mode", "read-only", None, cx));
-            assert_eq!(t.permission_mode(), PermissionMode::ReadOnly);
-            assert!(t.run_slash_builtin("compact", "focus", None, cx));
-            assert!(t.run_slash_builtin("goal", "clear", None, cx));
-
-            // Session-level commands and unknowns are not owned here.
-            assert!(!t.run_slash_builtin("exit", "", None, cx));
-            assert!(!t.run_slash_builtin("quit", "", None, cx));
-            assert!(!t.run_slash_builtin("new", "", None, cx));
-            assert!(!t.run_slash_builtin("nope", "", None, cx));
         });
+
+        // A second invocation toggles plan mode back off, no new turn.
+        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "", None)));
+        thread.read(|t| assert!(!t.plan_mode(), "/plan bare exits plan mode"));
+        assert_eq!(engine.runs.lock().unwrap().len(), 1);
+
+        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "", None)));
+        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess));
+        // Named form sets the mode directly.
+        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "read-only", None)));
+        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::ReadOnly));
+        assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
+        assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
+
+        // Session-level commands and unknowns are not owned here.
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("exit", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("quit", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("new", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("nope", "", None)));
     }
 
-    #[gpui::test]
-    fn live_history_reattaches_ui_metadata_to_prompt_not_tool_result(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn live_history_reattaches_ui_metadata_to_prompt_not_tool_result() {
         let engine = Arc::new(FakeEngine {
             history: vec![
                 Message::user("expanded registry prompt".to_string()),
@@ -2518,17 +2511,18 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.insert_user_message_with_ui_metadata(
                 "expanded registry prompt".to_string(),
                 Some(MessageUiMetadata {
                     display_text: Some("/gitwork:deliver fast".to_string()),
                     ..Default::default()
                 }),
-                cx,
             );
-            t.handle_notice(BackendNotice::LiveHistory, cx);
+        });
+        thread.handle_notice(BackendNotice::LiveHistory);
 
+        thread.read(|t| {
             assert_eq!(
                 t.messages[0]
                     .ui
@@ -2565,7 +2559,7 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.insert_user_message_with_content_and_ui_metadata(
                 vec![
                     MessageContent::Text("look at these".to_string()),
@@ -2573,9 +2567,8 @@ pub(crate) mod tests {
                     png_image("aW1hZ2Uy"),
                 ],
                 None,
-                cx,
             );
-            t.run_turn(cx);
+            t.run_turn();
         });
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "exactly one turn ran");
@@ -2583,36 +2576,28 @@ pub(crate) mod tests {
         assert_eq!(prompt, "look at these");
         assert_eq!(images.len(), 2, "both images ride the turn");
         drop(runs);
-        thread.update(cx, |t, _| {
+        thread.read(|t| {
             assert!(t.pending_prompts.is_empty(), "text queue drained");
             assert!(t.pending_images.is_empty(), "image queue drained");
         });
     }
 
-    #[gpui::test]
-    fn sailor_completed_notice_injects_peer_message_and_fires_turn(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn sailor_completed_notice_injects_peer_message_and_fires_turn() {
         let engine = Arc::new(FakeEngine::new());
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::SteerDelivered {
-                    from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
-                    reason: pi_extensions::steer_bus::SteerReason::Complete,
-                    payload: pi_extensions::steer_bus::SteerPayload {
-                        text: "PR #601 LGTM".into(),
-                    },
-                },
-                cx,
-            );
+        thread.handle_notice(BackendNotice::SteerDelivered {
+            from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
+            reason: pi_extensions::steer_bus::SteerReason::Complete,
+            payload: pi_extensions::steer_bus::SteerPayload {
+                text: "PR #601 LGTM".into(),
+            },
         });
-        cx.run_until_parked();
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "the Sailor completion fired one turn");
         assert!(runs[0].0.contains("PR #601 LGTM"), "final text rode the prompt: {:?}", runs[0].0);
         drop(runs);
-        let has_user = thread.read_with(cx, |t, _| {
+        let has_user = thread.read(|t| {
             t.messages.iter().any(|m| matches!(m.role, crate::language_model::Role::User))
         });
         assert!(has_user, "a user message was injected for the completion");
@@ -2633,13 +2618,12 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.insert_user_message_with_content_and_ui_metadata(
                 vec![png_image("aW1hZ2Ux")],
                 None,
-                cx,
             );
-            t.run_turn(cx);
+            t.run_turn();
         });
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "image-only turn ran");
@@ -2661,7 +2645,7 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| t.run_turn(cx));
+        thread.with_mut(|t| t.run_turn());
         assert!(engine.runs.lock().unwrap().is_empty(), "no turn ran");
     }
 
@@ -2669,10 +2653,8 @@ pub(crate) mod tests {
     /// may have streamed before it — replaces the mirror with the engine's
     /// authoritative history and clears `Loading`, so the workspace leaves
     /// the spinner and re-enables input.
-    #[gpui::test]
-    fn ready_replaces_preview_with_authoritative_history_and_clears_loading(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn ready_replaces_preview_with_authoritative_history_and_clears_loading() {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
@@ -2684,25 +2666,21 @@ pub(crate) mod tests {
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.messages = vec![Message::user("preview-only".to_string())];
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
         });
-        let (phase, texts) = cx.read(|cx| {
-            let t = thread.read(cx);
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
+        let (phase, texts) = thread.read(|t| {
             let texts: Vec<String> = t
                 .messages()
                 .iter()
@@ -2737,14 +2715,11 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.messages = vec![Message::user("stale-preview".to_string())];
-            t.handle_notice(BackendNotice::Fatal(anyhow::anyhow!("no model configured")), cx);
         });
-        let (phase, count) = cx.read(|cx| {
-            let t = thread.read(cx);
-            (t.history_phase(), t.messages().len())
-        });
+        thread.handle_notice(BackendNotice::Fatal(anyhow::anyhow!("no model configured")));
+        let (phase, count) = thread.read(|t| (t.history_phase(), t.messages().len()));
         assert_eq!(phase, HistoryPhase::Ready, "input gate opens");
         assert_eq!(count, 0, "stale preview is dropped");
     }
@@ -2764,29 +2739,22 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
-        thread.update(cx, |t, _cx| {
-            t.set_permission_mode(PermissionMode::ReadOnly, _cx);
-        });
+        thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
         // The fresh session's sidecar reports the default at Ready; the
         // user's ReadOnly choice must not be overwritten.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: false,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
-        });
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: false,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).permission_mode()),
+            thread.read(|t| t.permission_mode()),
             PermissionMode::ReadOnly
         );
     }
@@ -2814,16 +2782,13 @@ pub(crate) mod tests {
                 status: crate::plan::PlanStepStatus::InProgress,
             }],
         };
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
-                    snapshot: snapshot.clone(),
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            crate::thread::ThreadEvent::PlanUpdated {
+                snapshot: snapshot.clone(),
+            },
+        )));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), Some(&snapshot));
         });
         let persists = engine_ref.plan_persists.lock().unwrap();
         assert_eq!(persists.len(), 1);
@@ -2833,19 +2798,16 @@ pub(crate) mod tests {
         drop(persists);
 
         // Empty snapshot = the model cleared its plan → mirror + sidecar clear.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
-                    snapshot: crate::plan::PlanSnapshot {
-                        explanation: None,
-                        steps: Vec::new(),
-                    },
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), None);
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            crate::thread::ThreadEvent::PlanUpdated {
+                snapshot: crate::plan::PlanSnapshot {
+                    explanation: None,
+                    steps: Vec::new(),
+                },
+            },
+        )));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), None);
         });
         let persists = engine_ref.plan_persists.lock().unwrap();
         assert_eq!(persists.len(), 2);
@@ -2874,24 +2836,19 @@ pub(crate) mod tests {
             }],
         };
         let value = serde_json::to_value(&snapshot).unwrap();
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: Some(value),
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: Some(value),
+        })));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), Some(&snapshot));
         });
     }
 
@@ -2909,29 +2866,22 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
-        thread.update(cx, |t, _cx| {
-            t.set_reasoning_effort(ReasoningEffort::Max, _cx);
-        });
+        thread.with_mut(|t| t.set_reasoning_effort(ReasoningEffort::Max));
         // The fresh session's sidecar reports High at Ready; the user's Max
         // choice must not be overwritten.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: false,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
-        });
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: false,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            thread.read(|t| t.reasoning_effort()),
             ReasoningEffort::Max
         );
     }
@@ -2950,24 +2900,19 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::Max,
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
-        });
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::Max,
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).reasoning_effort()),
+            thread.read(|t| t.reasoning_effort()),
             ReasoningEffort::Max
         );
     }
@@ -2978,13 +2923,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn landing_browser_suite_toggle_parks_in_mirror() {
         crate::pi_providers::init_for_test();
-        let thread = cx.update(|cx| Thread::landing(PathBuf::from("/tmp"), cx));
-        thread.update(cx, |t, cx| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true, cx);
+        let thread = Thread::landing(PathBuf::from("/tmp"));
+        thread.with_mut(|t| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true);
         });
-        cx.read(|cx| {
+        thread.read(|t| {
             assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
+                t.browser_suites().to_vec(),
                 vec![crate::pi_engine::BrowserSuite::ChromeUse]
             );
         });
@@ -2995,25 +2940,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn ready_seeds_browser_suites_from_projection() {
         let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()));
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
+        thread.read(|t| {
             assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
+                t.browser_suites().to_vec(),
                 vec![crate::pi_engine::BrowserSuite::ChromeUse]
             );
         });
@@ -3022,31 +2962,26 @@ pub(crate) mod tests {
     /// A toggle since construction outranks the `Ready` projection: the
     /// queued engine command has not settled when Ready lands, so the
     /// projection cannot know about it and must not clobber the mirror.
-    #[gpui::test]
-    fn explicit_browser_suite_toggle_outranks_ready_projection(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn explicit_browser_suite_toggle_outranks_ready_projection() {
         let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()));
-        thread.update(cx, |t, cx| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true, cx);
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                })),
-                cx,
-            );
+        thread.with_mut(|t| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true);
         });
-        cx.read(|cx| {
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+        })));
+        thread.read(|t| {
             assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
+                t.browser_suites().to_vec(),
                 vec![crate::pi_engine::BrowserSuite::WebExplore]
             );
         });
@@ -3066,7 +3001,7 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
-        thread.update(cx, |t, cx| t.cancel(cx));
+        thread.with_mut(|t| t.cancel());
         assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
 }
