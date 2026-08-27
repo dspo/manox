@@ -149,11 +149,13 @@ pub enum ThreadEvent {
     },
     /// A sub-agent's child thread was constructed. Not produced by the pi
     /// backend in this stage (sub-agent observation panels are not wired).
+    /// Carries the child's [`ThreadId`] (value type) — the event crosses the
+    /// kernel boundary, so no handle/entity rides it.
     SubagentStarted {
         id: String,
         subagent_type: String,
         description: String,
-        child: Entity<Thread>,
+        child: ThreadId,
     },
     /// A spawned sub-agent's aggregated progress.
     SubagentProgress {
@@ -458,6 +460,105 @@ impl ThreadHandle {
     }
 }
 
+impl ThreadHandle {
+    /// Handle one backend notice. State-mutating arms run under `with_mut` so
+    /// the events they buffer broadcast at the call's exit — this closes the
+    /// pump→notice→`pending_events`→broadcast chain. Bus / browser /
+    /// session-list arms are handled at handle level (registry / capability),
+    /// never under the state lock.
+    pub fn handle_notice(&self, notice: BackendNotice) {
+        match notice {
+            BackendNotice::BusRequest { op, responder } => {
+                self.handle_bus_request(op, responder);
+            }
+            BackendNotice::BrowserRequest { op, responder } => {
+                self.handle_browser_request(op, responder);
+            }
+            BackendNotice::SessionListDirty => {
+                if let Some(reg) = thread_registry() {
+                    reg.refresh();
+                }
+            }
+            other => self.with_mut(|t| t.handle_notice_inner(other)),
+        }
+    }
+
+    /// Steer-bus member ops: spawn / inject / abort team member threads through
+    /// the live-thread registry (never the gpui thread_store global).
+    fn handle_bus_request(
+        &self,
+        op: pi_extensions::steer_bus::BusOp,
+        responder: Option<async_channel::Sender<Result<String, String>>>,
+    ) {
+        use pi_extensions::steer_bus::BusOp;
+        let result: Result<String, String> = match op {
+            BusOp::SpawnMember { name, prompt } => {
+                let member = self.read(|t| t.new_team_member(name.clone()));
+                let mid = member.read(|t| t.id.0.clone());
+                if let Some(reg) = thread_registry() {
+                    reg.register(&mid, member.clone());
+                    reg.refresh();
+                }
+                let ui = crate::MessageUiMetadata {
+                    author: Some(crate::team::author_for("captain")),
+                    ..Default::default()
+                };
+                member.with_mut(|t| {
+                    t.insert_user_message_with_ui_metadata(prompt, Some(ui));
+                    t.run_turn();
+                });
+                Ok(mid)
+            }
+            BusOp::InjectMember { thread_id, payload } => {
+                let Some(member) = thread_registry().and_then(|r| r.lookup(&thread_id)) else {
+                    if let Some(r) = &responder {
+                        let _ = r.try_send(Err(format!("member {thread_id} not found")));
+                    }
+                    return;
+                };
+                member.with_mut(|t| {
+                    t.deliver_peer_messages(vec![crate::team::PeerMessage {
+                        from: "captain".into(),
+                        content: payload,
+                    }]);
+                });
+                Ok("injected".into())
+            }
+            BusOp::AbortMember { thread_id } => {
+                let Some(member) = thread_registry().and_then(|r| r.lookup(&thread_id)) else {
+                    if let Some(r) = &responder {
+                        let _ = r.try_send(Err(format!("member {thread_id} not found")));
+                    }
+                    return;
+                };
+                member.with_mut(|t| t.cancel());
+                Ok("aborted".into())
+            }
+        };
+        if let Some(r) = responder {
+            let _ = r.try_send(result);
+        }
+    }
+
+    /// Browser ops are a frontend capability: hand the op to the registered
+    /// provider and relay its reply on the runtime; fail closed when no
+    /// provider is registered (headless contexts).
+    fn handle_browser_request(
+        &self,
+        op: crate::thread_engine::BrowserOp,
+        responder: async_channel::Sender<Result<crate::thread_engine::BrowserReply, String>>,
+    ) {
+        let Some(caps) = crate::capability::provider().cloned() else {
+            let _ = responder.try_send(Err("browser capability not available".to_string()));
+            return;
+        };
+        crate::runtime::handle().spawn(async move {
+            let result = caps.browser_op(op).await;
+            let _ = responder.send(result).await;
+        });
+    }
+}
+
 impl Thread {
     /// The startup landing state: a detached thread with no engine. No
     /// session is loaded at launch — the user picks a conversation from the
@@ -632,9 +733,11 @@ impl Thread {
         self.pending_engine_events = Some(events);
     }
 
-    /// Handle one backend notice on the gpui thread: mirror state and re-emit
-    /// the UI-facing event.
-    fn handle_notice(&mut self, notice: BackendNotice) {
+    /// Handle one backend notice's state-mutating arms. Invoked by
+    /// [`ThreadHandle::handle_notice`] under `with_mut`, so the events each
+    /// arm buffers broadcast at the call's exit. Bus / browser / session-list
+    /// arms live on the handle (registry / capability) and never reach here.
+    fn handle_notice_inner(&mut self, notice: BackendNotice) {
         match notice {
             BackendNotice::Event(event) => {
                 // Mirror the gate policy before the chip hears about the
@@ -667,9 +770,10 @@ impl Thread {
                 // facade's own `run_turn` (which emits `TurnStarted`
                 // synchronously before the engine picks up the prompt).
                 if matches!(&*event, ThreadEvent::TurnStarted) {
-                    self.running = true;                if let ThreadEvent::WorktreeChanged { active, path } = &*event {
-                    self.worktree_path = if *active { path.clone() } else { None };
+                    self.running = true;
                 }
+                if let ThreadEvent::WorktreeChanged { active, path } = &*event {
+                    self.worktree_path = if *active { path.clone() } else { None };
                 }
                 self.pending_events.push(*event);
             }
@@ -679,80 +783,7 @@ impl Thread {
                 // while still generating shows current progress instead of the
                 // last settled snapshot. The authoritative `Settled` refresh
                 // replaces this mirror.
-                self.refresh_history(cx);
-            }
-            BackendNotice::BusRequest { op, responder } => {
-                use pi_extensions::steer_bus::BusOp;
-                let result: Result<String, String> = match op {
-                    BusOp::SpawnMember { name, prompt } => {
-                        let member = self.new_team_member(name.clone(), cx);
-                        let mid = member.read(cx).id.0.clone();
-                        let store = crate::thread_store::global();
-                        store.update(cx, |s, cx| {
-                            s.register_live_thread(&mid, member.downgrade());
-                            s.refresh(cx);
-                        });
-                        member.update(cx, |t, cx| {
-                            let ui = crate::MessageUiMetadata {
-                                author: Some(crate::team::author_for("captain")),
-                                ..Default::default()
-                            };
-                            t.insert_user_message_with_ui_metadata(prompt, Some(ui), cx);
-                            t.run_turn(cx);
-                        });
-                        Ok(mid)
-                    }
-                    BusOp::InjectMember { thread_id, payload } => {
-                        let store = crate::thread_store::global();
-                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            if let Some(r) = &responder {
-                                let _ =
-                                    r.try_send(Err(format!("member {thread_id} not found")));
-                            }
-                            return;
-                        };
-                        thread.update(cx, |t, cx| {
-                            t.deliver_peer_messages(
-                                vec![crate::team::PeerMessage {
-                                    from: "captain".into(),
-                                    content: payload,
-                                }],
-                                cx,
-                            );
-                        });
-                        Ok("injected".into())
-                    }
-                    BusOp::AbortMember { thread_id } => {
-                        let store = crate::thread_store::global();
-                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            if let Some(r) = &responder {
-                                let _ =
-                                    r.try_send(Err(format!("member {thread_id} not found")));
-                            }
-                            return;
-                        };
-                        thread.update(cx, |t, cx| t.cancel(cx));
-                        Ok("aborted".into())
-                    }
-                };
-                if let Some(r) = responder {
-                    let _ = r.try_send(result);
-                }
-            }
-            BackendNotice::BrowserRequest { op, responder } => {
-                // The browser is a frontend capability: hand the op to the
-                // registered capability provider (today the gpui host, later the
-                // protocol's `ServerCall::BrowserOp` owner) and relay its reply.
-                // Fail closed when no provider is registered (headless contexts).
-                let Some(caps) = crate::capability::provider().cloned() else {
-                    let _ = responder.try_send(Err("browser capability not available".to_string()));
-                    return;
-                };
-                cx.spawn(async move |_this, _cx| {
-                    let result = caps.browser_op(op).await;
-                    let _ = responder.send(result).await;
-                })
-                .detach();
+                self.refresh_history();
             }
             BackendNotice::Ready(notice) => {
                 let ReadyInfo {
@@ -810,7 +841,7 @@ impl Thread {
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
-                self.refresh_history(cx);
+                self.refresh_history();
                 // Rebuild on restore, and also after a failed restore — the
                 // preview may have streamed a corrupt file's partial content
                 // and the fresh fallback session is empty, so the workspace
@@ -822,7 +853,7 @@ impl Thread {
             }
             BackendNotice::HistoryProgress => {
                 if self.history_phase.is_loading() {
-                    self.refresh_history(cx);
+                    self.refresh_history();
                     self.pending_events.push(ThreadEvent::HistoryProgress);
                 }
             }
@@ -837,7 +868,7 @@ impl Thread {
                 }
                 self.running = false;
                 self.pending_steers.clear();
-                self.refresh_history(cx);
+                self.refresh_history();
                 self.pending_events.push(ThreadEvent::TurnFinished {
                     cancelled,
                     failed,
@@ -862,10 +893,6 @@ impl Thread {
                 self.pending_events.push(ThreadEvent::HistoryRestored);
                 self.pending_events.push(ThreadEvent::Error(err));
             }
-            BackendNotice::SessionListDirty => {
-                let store = crate::thread_store::global();
-                store.update(cx, |s, cx| s.refresh(cx));
-            }
             BackendNotice::SteerDelivered { from, reason: _, payload } => {
                 // Deliver the subagent's final text as a peer message and
                 // let a turn fire — the Captain reliably observes the
@@ -875,14 +902,14 @@ impl Thread {
                     pi_extensions::steer_bus::AgentId::Captain => "captain".to_string(),
                     pi_extensions::steer_bus::AgentId::User => "user".to_string(),
                 };
-                self.deliver_peer_messages(
-                    vec![crate::team::PeerMessage {
-                        from: sender,
-                        content: payload.text,
-                    }],
-                    cx,
-                );
+                self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                    from: sender,
+                    content: payload.text,
+                }]);
             }
+            // Bus / browser / session-list arms are dispatched at the handle
+            // level (`ThreadHandle::handle_notice`); they never reach here.
+            _ => {}
         }
     }
 
@@ -1018,7 +1045,7 @@ impl Thread {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
         }
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
         self.running = true;
@@ -1263,7 +1290,7 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.create_goal(objective, token_budget, max_rounds, actor)?;
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
@@ -1276,7 +1303,7 @@ impl Thread {
     /// Convenience for `/goal <objective>`: create with no budget and no
     /// round cap as the user.
     pub fn set_goal(&mut self, objective: String) -> anyhow::Result<()> {
-        self.create_goal(objective, None, None, crate::goal::GoalActor::User, cx)
+        self.create_goal(objective, None, None, crate::goal::GoalActor::User)
     }
 
     /// Edit objective/budget/rounds in place (keeps id and status).
@@ -1304,7 +1331,7 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.replace_goal(objective, token_budget, max_rounds, actor)?;
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
@@ -1520,11 +1547,11 @@ impl Thread {
         seed_text: String,
         ui: Option<MessageUiMetadata>,
     ) {
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.start_plan_execution(plan_file);
         }
-        self.insert_user_message_with_ui_metadata(seed_text, ui, cx);
+        self.insert_user_message_with_ui_metadata(seed_text, ui);
         self.run_turn();
     }
 
@@ -1552,7 +1579,6 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.set_plan_review_pending(pending);
         }
-        let _ = cx;
     }
 
     /// Toggle plan mode: the engine persists the flag in the session
@@ -1633,7 +1659,7 @@ impl Thread {
         } else {
             // Landing thread: materialize a project-bound fresh engine in
             // one step (no orphaned pre-project session file).
-            self.ensure_engine(Some(dir), cx);
+            self.ensure_engine(Some(dir));
         }
     }
 
@@ -1786,7 +1812,7 @@ impl Thread {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
         };
-        self.insert_slash_turn(cmd.render(args), ui, cx);
+        self.insert_slash_turn(cmd.render(args), ui);
         true
     }
 
@@ -1812,7 +1838,7 @@ impl Thread {
             },
         )
         .expect("skill body render");
-        self.insert_slash_turn(rendered, ui, cx);
+        self.insert_slash_turn(rendered, ui);
         true
     }
 
@@ -1838,7 +1864,7 @@ impl Thread {
                         PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
                         PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
                     };
-                    self.set_permission_mode(next, cx);
+                    self.set_permission_mode(next);
                 } else {
                     let (name, rest) = match trimmed.split_once(char::is_whitespace) {
                         Some((head, tail)) => (head, tail.trim()),
@@ -1848,9 +1874,9 @@ impl Thread {
                         serde_json::from_value(serde_json::Value::String(name.to_string()));
                     match parsed {
                         Ok(mode) => {
-                            self.set_permission_mode(mode, cx);
+                            self.set_permission_mode(mode);
                             if !rest.is_empty() {
-                                self.insert_slash_turn(rest.to_string(), ui, cx);
+                                self.insert_slash_turn(rest.to_string(), ui);
                             }
                         }
                         Err(_) => {
@@ -1865,11 +1891,11 @@ impl Thread {
             }
             Some("plan") => {
                 if self.plan_mode() {
-                    self.set_plan_mode(false, cx);
+                    self.set_plan_mode(false);
                 } else {
-                    self.set_plan_mode(true, cx);
+                    self.set_plan_mode(true);
                     if !args.trim().is_empty() {
-                        self.insert_slash_turn(args.to_string(), ui, cx);
+                        self.insert_slash_turn(args.to_string(), ui);
                     }
                 }
                 true
@@ -1877,11 +1903,11 @@ impl Thread {
             Some("compact") => {
                 let trimmed = args.trim();
                 let instructions = (!trimmed.is_empty()).then(|| trimmed.to_string());
-                self.compact(instructions, cx);
+                self.compact(instructions);
                 true
             }
             Some("goal") => {
-                self.run_goal_slash(args, ui, cx);
+                self.run_goal_slash(args, ui);
                 true
             }
             _ => false,
@@ -1895,7 +1921,7 @@ impl Thread {
     fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>) {
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
-            if let Err(error) = self.replace_goal(objective.to_string(), None, None, crate::goal::GoalActor::User, cx)
+            if let Err(error) = self.replace_goal(objective.to_string(), None, None, crate::goal::GoalActor::User)
             {
                 self.pending_events.push(ThreadEvent::Error(error));
             }
@@ -1905,7 +1931,7 @@ impl Thread {
             let current = self.goal();
             let budget = current.as_ref().and_then(|goal| goal.token_budget);
             let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
-            if let Err(error) = self.edit_goal(objective.to_string(), budget, max_rounds, crate::goal::GoalActor::User, cx)
+            if let Err(error) = self.edit_goal(objective.to_string(), budget, max_rounds, crate::goal::GoalActor::User)
             {
                 self.pending_events.push(ThreadEvent::Error(error));
             }
@@ -1927,7 +1953,7 @@ impl Thread {
                     }
                 }
             };
-            if let Err(error) = self.edit_goal(goal.objective, budget, goal.max_rounds, crate::goal::GoalActor::User, cx)
+            if let Err(error) = self.edit_goal(goal.objective, budget, goal.max_rounds, crate::goal::GoalActor::User)
             {
                 self.pending_events.push(ThreadEvent::Error(error));
             }
@@ -1949,7 +1975,7 @@ impl Thread {
                     }
                 }
             };
-            if let Err(error) = self.edit_goal(goal.objective, goal.token_budget, max_rounds, crate::goal::GoalActor::User, cx)
+            if let Err(error) = self.edit_goal(goal.objective, goal.token_budget, max_rounds, crate::goal::GoalActor::User)
             {
                 self.pending_events.push(ThreadEvent::Error(error));
             }
@@ -1958,7 +1984,7 @@ impl Thread {
         match trimmed.to_lowercase().as_str() {
             "" | "edit" | "replace" | "rounds" => {}
             "clear" => {
-                if let Err(error) = self.clear_goal(crate::goal::GoalActor::User, cx) {
+                if let Err(error) = self.clear_goal(crate::goal::GoalActor::User) {
                     self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
@@ -1970,7 +1996,6 @@ impl Thread {
                         message: "paused by user".into(),
                     }),
                     crate::goal::GoalActor::User,
-                    cx,
                 ) {
                     self.pending_events.push(ThreadEvent::Error(error));
                 }
@@ -1980,13 +2005,12 @@ impl Thread {
                     crate::goal::GoalStatus::Active,
                     None,
                     crate::goal::GoalActor::User,
-                    cx,
                 ) {
                     self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
-            _ => match self.set_goal(trimmed.to_string(), cx) {
-                Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui, cx),
+            _ => match self.set_goal(trimmed.to_string()) {
+                Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui),
                 Err(error) => self.pending_events.push(ThreadEvent::Error(error)),
             },
         }
@@ -2001,7 +2025,7 @@ impl Thread {
     ) {
         let ordinal = self.user_prompt_ordinal();
         let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
-        self.insert_user_message_with_ui_metadata(text, ui, cx);
+        self.insert_user_message_with_ui_metadata(text, ui);
         self.persist_registry_display(ordinal, display);
         self.run_turn();
     }
