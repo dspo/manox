@@ -425,6 +425,18 @@ impl ThreadHandle {
         }))
     }
 
+    /// Downgrade to a weak reference for the live-thread registry index. The
+    /// registry never by itself keeps the thread alive; the strong reference
+    /// sits with the live-thread holder.
+    pub fn downgrade(&self) -> std::sync::Weak<ThreadCore> {
+        Arc::downgrade(&self.0)
+    }
+
+    /// Re-upgrade a weak reference, if the thread is still alive.
+    pub fn upgrade(weak: &std::sync::Weak<ThreadCore>) -> Option<Self> {
+        weak.upgrade().map(Self)
+    }
+
     /// Subscribe to this thread's event stream.
     pub fn subscribe(&self) -> async_channel::Receiver<Arc<ThreadEvent>> {
         let (tx, rx) = async_channel::unbounded();
@@ -2356,11 +2368,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// Registry turns originate on the GPUI main thread, outside Tokio's
-    /// entered context. Persistence must still dispatch through Manox's
-    /// process-global runtime instead of requiring a current reactor.
-    #[tokio::test]
-    async fn registry_display_persistence_dispatches_off_runtime() {
+    /// Persistence must dispatch through Manox's process-global runtime even
+    /// when no Tokio reactor is entered on the calling thread. Kept a plain
+    /// `#[test]` (not `#[tokio::test]`) on purpose: entering a reactor here
+    /// would defeat the very condition under test.
+    #[test]
+    fn registry_display_persistence_dispatches_off_runtime() {
         crate::runtime::init();
 
         let dir = tempfile::tempdir().unwrap();
