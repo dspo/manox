@@ -1515,10 +1515,15 @@ where
                     session_path: target,
                     title,
                 }) if target == session_path => {
-                    if let Err(error) = persist_title(sessions_dir, &target, title).await {
+                    if let Err(error) = persist_title(sessions_dir, &target, title.clone()).await {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
                         let _ = notice_tx.send(BackendNotice::SessionListDirty);
+                        // The facade mirrors the persisted title so the
+                        // title bar tracks the sidebar without a reload.
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::TitleChanged { title },
+                        )));
                     }
                 }
                 Some(SessionCmd::AppendUiNote(record)) => {
@@ -2330,6 +2335,10 @@ async fn run_actor(
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
+    let restored_title = pi_extensions::session_meta::load(&sessions_dir, session.path())
+        .await
+        .ok()
+        .and_then(|meta| meta.title);
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
     // facade's Ready handler reads `history()` immediately, and a drainer
@@ -2358,6 +2367,7 @@ async fn run_actor(
         plan_file: plan_file_restored,
         plan_review_pending,
         plan_snapshot,
+        title: restored_title,
     })));
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -2662,10 +2672,15 @@ async fn run_actor(
                 title,
             } => {
                 if session.path() == &session_path {
-                    if let Err(error) = persist_title(&sessions_dir, &session_path, title).await {
+                    if let Err(error) =
+                        persist_title(&sessions_dir, &session_path, title.clone()).await
+                    {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
                         let _ = notice_tx.send(BackendNotice::SessionListDirty);
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::TitleChanged { title },
+                        )));
                     }
                 }
             }

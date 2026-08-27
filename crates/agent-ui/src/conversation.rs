@@ -1782,6 +1782,9 @@ impl ConversationState {
                     ApplyOutcome::Appended
                 }
             }
+            // Title metadata rides the chrome (title bar / sidebar), not the
+            // transcript; no conversation item.
+            ThreadEvent::TitleChanged { .. } => ApplyOutcome::Unchanged,
         };
         if popped_retry {
             match outcome {
