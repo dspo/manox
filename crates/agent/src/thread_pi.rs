@@ -847,7 +847,7 @@ impl Thread {
                 // (pending_prompts non-empty), start a follow-up turn.
                 // Mirrors manox-actor pending_submits drain.
                 if !self.pending_prompts.is_empty() {
-                    self.run_turn(cx);
+                    self.run_turn();
                 }
             }
             BackendNotice::Fatal(err) => {
@@ -1389,13 +1389,13 @@ impl Thread {
                 display_text: Some(msg.content.clone()),
                 ..Default::default()
             };
-            self.insert_user_message_with_ui_metadata(rendered, Some(ui), cx);
+            self.insert_user_message_with_ui_metadata(rendered, Some(ui));
             self.pending_events.push(ThreadEvent::PeerMessage {
                 from: msg.from.clone(),
                 content: msg.content.clone(),
             });
         }
-        self.run_turn(cx);
+        self.run_turn();
     }
 
     /// Construct a team worker thread: a fresh pi session inheriting this
@@ -1405,7 +1405,7 @@ impl Thread {
     /// leader's user-facing conversation. The member session header records
     /// this leader's session id (`team.parent`), persisting the affiliation
     /// with the jsonl file so it survives restarts and team disband.
-    pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
+    pub fn new_team_member(&self, name: String) -> ThreadHandle {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
         let model = self.model.clone();
@@ -1431,41 +1431,42 @@ impl Thread {
         if reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(reasoning_effort.wire_value().to_string()));
         }
-        cx.new(|cx| {
-            drain_engine_notices(cx, events);
-            Self {
-                id,
-                cwd,
-                project: None,
-                model,
-                permission_mode,
-                messages: Vec::new(),
-                reasoning_effort,
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: HistoryPhase::Ready,
-                permission_mode_explicitly_set: true,
-                reasoning_effort_explicitly_set: true,
-                browser_suites: Vec::new(),
-                // Members never mount browser suites; the explicit flag keeps
-                // even an empty-mirror seed from the Ready projection out.
-                browser_suites_explicitly_set: true,
-                plan_mode: false,
-                persisted_plan: None,
-                goal_bridge: None,
-                label: name,
-                worktree_path: None,
-            }
-        })
+        let handle = ThreadHandle::new(Self {
+            id,
+            cwd,
+            project: None,
+            model,
+            permission_mode,
+            messages: Vec::new(),
+            reasoning_effort,
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: HistoryPhase::Ready,
+            permission_mode_explicitly_set: true,
+            reasoning_effort_explicitly_set: true,
+            browser_suites: Vec::new(),
+            // Members never mount browser suites; the explicit flag keeps
+            // even an empty-mirror seed from the Ready projection out.
+            browser_suites_explicitly_set: true,
+            plan_mode: false,
+            persisted_plan: None,
+            goal_bridge: None,
+            label: name,
+            worktree_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
+        });
+        drain_engine_notices(handle.clone(), events);
+        handle
     }
     pub fn background_task_snapshots(&self) -> Vec<TaskSnapshot> {
         Vec::new()
@@ -1524,7 +1525,7 @@ impl Thread {
             engine.start_plan_execution(plan_file);
         }
         self.insert_user_message_with_ui_metadata(seed_text, ui, cx);
-        self.run_turn(cx);
+        self.run_turn();
     }
 
     /// Plan mode active for this thread (mirrored from the engine).
@@ -2002,7 +2003,7 @@ impl Thread {
         let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
         self.insert_user_message_with_ui_metadata(text, ui, cx);
         self.persist_registry_display(ordinal, display);
-        self.run_turn(cx);
+        self.run_turn();
     }
 
     /// The ordinal the next inserted user prompt will occupy among user-role
