@@ -29,7 +29,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 后台线程（ctrl-b 置底 / 切换自动 park） | ✅ | `background_threads` + `attach_thread` parking |
 | 外部会话（Claude Code / Codex / GitHub Copilot CLI / VS Code 注入 / 终端纯 PTY） | ✅ | 侧栏 provider→model 级联（agents）+ 终端直接入口（`SpawnPlainSession`）+ `ViewMode::ExternalSession`；agent 会话退出后可从侧栏恢复（sidecar 记录 CLI session id，`claude --resume <id>` / `codex resume <id>` 定向恢复；未捕获时走 CLI picker；copilot `--continue`） |
 | Browser 标签 / Terminal 标签 | ✅ | webview host notify/inbound 桥；平台 terminal surface |
-| TurnNavigator | ✅ | cmd-m / cmd-shift-; |
+| TurnNavigator | ✅ | cmd-m 打开；↑/↓ 选条、enter 定位、⌘↵ 回填 composer、⌘C 复制；历史回溯另有 ⌥↑/⌥↓ |
 | 图片附件 | ✅ | 剪贴板粘贴 / plus 选择 → chip → 气泡渲染 → 内核 `ContentBlock::Image` 投递（TS `prompt(text, {images})` parity，#438）；steer 带图同路 |
 | MCP | ✅ | 连接核心共享化 + pi AgentTool 桥（#442）；Settings → MCP servers 面板（列表/连接状态/持久开关） |
 | Plus 菜单（文件 / 目标 / 插件） | ✅ 部分 | 文件 → native picker → pending attachments；目标 → seed `/goal`；Plugins 组为静态装饰（待与插件面板 #474 整合） |
@@ -457,7 +457,12 @@ Vertical flex, `flex_shrink_0`, `py_2`, contains [Composer](#composer) or [AskDr
 
 #### Composer
 
-Centered wrapper around the input row + chips.
+Centered wrapper around the input row + chips. Its `Input` keeps the bare arrows for the caret: `up` / `down`
+always move the cursor inside the multi-line draft (first line's start and last line's end included, never
+history). Composer history recall lives on `⌥↑` / `⌥↓` (`ComposerRecallUp` / `ComposerRecallDown`, bound on the
+`composer > Input` key context the wrapper carries while the completion popover is closed). The walk is entered
+only by those keys — a running walk keeps stepping after an edit, and the text it leaves behind becomes the
+walk's working line, which `⌥↓` past the newest turn restores. Submitting or switching threads ends the walk.
 
 > Source: `agent-ui/src/workspace.rs`
 

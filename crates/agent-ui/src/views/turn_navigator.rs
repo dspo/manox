@@ -18,11 +18,11 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::CopySelectedTurn;
 use crate::conversation::ConvItem;
 use crate::views::popup_menu::{
     self, EMPTY_HEIGHT, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT, ROW_HEIGHT, SEARCH_HEIGHT,
 };
+use crate::{CopySelectedTurn, FillComposerTurn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TurnEntry {
@@ -84,7 +84,13 @@ fn filter_turns(turns: &[TurnEntry], query: &str) -> Vec<usize> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TurnNavigatorEvent {
-    Navigate { item_ix: usize },
+    Navigate {
+        item_ix: usize,
+    },
+    /// Refill the composer with a past turn's text instead of locating it.
+    FillComposer {
+        text: String,
+    },
     Dismiss,
 }
 
@@ -154,7 +160,13 @@ impl TurnNavigator {
                 }
                 cx.notify();
             }
-            InputEvent::PressEnter { shift: false, .. } => {
+            // Only the unmodified Enter locates a turn; the secondary modifier
+            // (`cmd-enter` / `ctrl-enter`) arrives as the `FillComposerTurn`
+            // action instead, and the Input still emits its Enter event.
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } => {
                 self.confirm(cx);
             }
             _ => {}
@@ -174,22 +186,22 @@ impl TurnNavigator {
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
     }
 
+    /// The item the selection points at, resolved through the active filter.
+    fn selected_turn(&self) -> Option<&TurnEntry> {
+        let &entry_ix = self.filtered.get(self.selected)?;
+        self.all.get(entry_ix)
+    }
+
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        let Some(&entry_ix) = self.filtered.get(self.selected) else {
+        let Some(turn) = self.selected_turn() else {
             return;
         };
-        let Some(turn) = self.all.get(entry_ix) else {
-            return;
-        };
+        let item_ix = turn.item_ix;
         #[cfg(test)]
         {
-            self.last_event = Some(TurnNavigatorEvent::Navigate {
-                item_ix: turn.item_ix,
-            });
+            self.last_event = Some(TurnNavigatorEvent::Navigate { item_ix });
         }
-        cx.emit(TurnNavigatorEvent::Navigate {
-            item_ix: turn.item_ix,
-        });
+        cx.emit(TurnNavigatorEvent::Navigate { item_ix });
     }
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
@@ -243,14 +255,30 @@ impl TurnNavigator {
     }
 
     fn copy_selected(&mut self, _: &CopySelectedTurn, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(&entry_ix) = self.filtered.get(self.selected) else {
-            return;
-        };
-        let Some(turn) = self.all.get(entry_ix) else {
+        let Some(turn) = self.selected_turn() else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(turn.text.clone()));
         window.push_notification(Notification::success(i18n::t("turn-navigator-copied")), cx);
+        cx.stop_propagation();
+    }
+
+    /// Hand the selected turn's text to the workspace for composer refill.
+    /// The panel closes and the composer takes focus on the receiving side.
+    fn fill_composer_selected(
+        &mut self,
+        _: &FillComposerTurn,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self.selected_turn().map(|turn| turn.text.clone()) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.last_event = Some(TurnNavigatorEvent::FillComposer { text: text.clone() });
+        }
+        cx.emit(TurnNavigatorEvent::FillComposer { text });
         cx.stop_propagation();
     }
 }
@@ -347,6 +375,7 @@ impl Render for TurnNavigator {
             .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::confirm_selected))
             .on_action(cx.listener(Self::copy_selected))
+            .on_action(cx.listener(Self::fill_composer_selected))
             .child(
                 gpui::div()
                     .h(SEARCH_HEIGHT)
@@ -496,6 +525,17 @@ mod tests {
             .update(|_window, cx| cx.read_from_clipboard())
             .and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("older needle\nwith detail"));
+
+        // Cmd/Ctrl-Enter refills the composer rather than jumping to the turn.
+        cx.dispatch_action(FillComposerTurn);
+        navigator.read_with(cx, |navigator, _| {
+            assert_eq!(
+                navigator.last_event,
+                Some(TurnNavigatorEvent::FillComposer {
+                    text: "older needle\nwith detail".to_string()
+                })
+            );
+        });
 
         cx.simulate_keystrokes("escape");
         navigator.read_with(cx, |navigator, _| {
