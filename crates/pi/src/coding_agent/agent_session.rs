@@ -603,6 +603,31 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Apply a reasoning tier to this session only — the same clamp and
+    /// `thinking_level_change` entry as [`Self::set_thinking_level`], minus
+    /// the write to the agent's global settings default. A subagent session
+    /// applying its pinned effort must not touch the shared
+    /// `~/.pi/agent/settings.json`.
+    pub async fn set_thinking_level_local(
+        &mut self,
+        level: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        let desired = Some(level.unwrap_or_else(|| "off".into()));
+        let model = self.harness.model().clone();
+        let levels = self.runtime.thinking_levels(&model);
+        let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
+        let wire = effective.clone().unwrap_or_else(|| "off".into());
+        let previous = self.harness.agent().state().thinking_level.clone();
+        if effective != previous {
+            self.harness
+                .session()
+                .append_thinking_level_change(&wire)
+                .await?;
+        }
+        self.harness.set_initial_thinking_level(effective);
+        Ok(())
+    }
+
     /// Patch the global settings file at the field level: the raw JSON is
     /// read, the closure mutates specific top-level keys, and the whole
     /// object is written back atomically (temp file + rename). Fields the
@@ -4110,5 +4135,62 @@ mod tests {
         let messages = session.prompt("never runs").await.unwrap();
         assert!(messages.is_empty(), "handled input runs no turn");
         assert!(!*later_ran.lock().unwrap(), "handled stops the chain");
+    }
+
+    fn test_thinking_model() -> Model {
+        Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            ..test_model()
+        }
+    }
+
+    /// The local setter clamps like the persisting one but never writes the
+    /// agent's global settings: a pinned subagent effort must not leak into
+    /// `~/.pi/agent/settings.json`.
+    #[tokio::test]
+    async fn set_thinking_level_local_applies_without_global_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_thinking_model())
+            .build()
+            .await
+            .unwrap();
+        session
+            .set_thinking_level_local(Some("max".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.thinking_level().as_deref(), Some("max"));
+        assert!(
+            !dir.path().join("agent/settings.json").exists(),
+            "the local setter must not write the agent's global settings"
+        );
+    }
+
+    /// A non-thinking model clamps any pinned effort to off, so the session
+    /// level stays unset.
+    #[tokio::test]
+    async fn set_thinking_level_local_clamps_non_thinking_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session
+            .set_thinking_level_local(Some("high".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.thinking_level(), None);
     }
 }

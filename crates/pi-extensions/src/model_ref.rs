@@ -83,6 +83,104 @@ pub fn resolve_model_ref(
     models.into_iter().find(|m| matches_segment(&m.id, probe))
 }
 
+/// A parsed `provider::model::effort` spec — the value of a dedicated
+/// subagent-model config entry. The effort part is optional.
+#[derive(Debug)]
+pub struct ModelSpec {
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+/// A spec resolved against the registry: the model plus the optional effort
+/// tier (absent when the spec carried none).
+#[derive(Debug)]
+pub struct ResolvedModelSpec {
+    pub model: pi::types::Model,
+    pub effort: Option<String>,
+}
+
+/// Split `provider::model` / `provider::model::effort` on `::`. Exactly two
+/// or three parts; the effort, when present, must be a user-facing effort
+/// level (`low`/`medium`/`high`/`max`).
+pub fn parse_model_spec(spec: &str) -> Result<ModelSpec, String> {
+    let parts: Vec<&str> = spec.split("::").map(str::trim).collect();
+    let (provider, model, effort) = match parts.as_slice() {
+        [p, m] => (*p, *m, None),
+        [p, m, e] => (*p, *m, Some(*e)),
+        _ => {
+            return Err(format!(
+                "expected `provider::model` or `provider::model::effort`, got `{spec}`"
+            ));
+        }
+    };
+    if provider.is_empty() || model.is_empty() {
+        return Err(format!("provider and model must be non-empty: `{spec}`"));
+    }
+    if let Some(e) = effort
+        && !matches!(e, "low" | "medium" | "high" | "max")
+    {
+        return Err(format!(
+            "unknown effort `{e}` (expected low|medium|high|max)"
+        ));
+    }
+    Ok(ModelSpec {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        effort: effort.map(str::to_string),
+    })
+}
+
+/// Resolve a `provider::model::effort` spec: the provider is matched by
+/// registration name or metadata `provider_display_name`; the model by exact
+/// id (case-insensitive) then first-token segment probe, scoped to that
+/// provider's models. The alias table (`sonnet`/`haiku`/`opus`) is
+/// deliberately not applied — those are not provider-scoped concepts. `Err`
+/// is loud so the caller fails closed instead of silently falling back.
+pub fn resolve_model_spec(
+    registry: &pi::ProviderRegistry,
+    spec: &str,
+) -> Result<ResolvedModelSpec, String> {
+    let parsed = parse_model_spec(spec)?;
+    let scoped: Vec<pi::types::Model> = registry
+        .models()
+        .into_iter()
+        .filter(|m| {
+            m.provider == parsed.provider
+                || m.metadata
+                    .get("provider_display_name")
+                    .and_then(|v| v.as_str())
+                    == Some(parsed.provider.as_str())
+        })
+        .collect();
+    if scoped.is_empty() {
+        return Err(format!(
+            "no provider `{}` (by name or display name)",
+            parsed.provider
+        ));
+    }
+    let wanted = parsed.model.to_lowercase();
+    let model = scoped
+        .iter()
+        .find(|m| m.id.to_lowercase() == wanted)
+        .or_else(|| {
+            scoped
+                .iter()
+                .find(|m| matches_segment(&m.id, &parsed.model))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "model `{}` not found under provider `{}`",
+                parsed.model, parsed.provider
+            )
+        })?;
+    Ok(ResolvedModelSpec {
+        model,
+        effort: parsed.effort,
+    })
+}
+
 /// Agent visibility from registration metadata: missing metadata (a
 /// registration without domain visibility notes) means visible; otherwise
 /// the effective agent list must contain `agent_id`.
@@ -275,5 +373,116 @@ mod tests {
         assert!(!visible_to_agent(&model("codex-only"), "claude"));
         // An empty effective list hides the model from every agent.
         assert!(!visible_to_agent(&model("hidden"), "claude"));
+    }
+
+    fn register_displayed(
+        registry: &pi::ProviderRegistry,
+        reg_name: &str,
+        display: &str,
+        id: &str,
+    ) {
+        registry
+            .register_provider(
+                reg_name,
+                ProviderConfig {
+                    name: Some(display.into()),
+                    base_url: Some("https://p.example".into()),
+                    api_key: Some("k".into()),
+                    api: Some(pi::provider_registry::Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![ProviderModelConfig {
+                        id: id.into(),
+                        name: id.into(),
+                        reasoning: false,
+                        input: vec![pi::provider_registry::InputModality::Text],
+                        context_window: 1000,
+                        max_tokens: 100,
+                        cost: Cost::default(),
+                        api: None,
+                        base_url: None,
+                        metadata: std::collections::HashMap::new(),
+                    }],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_model_spec_shapes() {
+        let s = parse_model_spec("DeepSeek::deepseek-v4-flash::high").unwrap();
+        assert_eq!(s.provider, "DeepSeek");
+        assert_eq!(s.model, "deepseek-v4-flash");
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        // The effort part is optional, and parts are trimmed.
+        let s = parse_model_spec(" 百炼 :: glm-5.3 ").unwrap();
+        assert_eq!(s.provider, "百炼");
+        assert_eq!(s.model, "glm-5.3");
+        assert_eq!(s.effort, None);
+        let err = parse_model_spec("a::b::c::d").unwrap_err();
+        assert!(
+            err.contains("expected `provider::model` or `provider::model::effort`"),
+            "{err}"
+        );
+        let err = parse_model_spec("::m::high").unwrap_err();
+        assert!(
+            err.contains("provider and model must be non-empty"),
+            "{err}"
+        );
+        let err = parse_model_spec("p::m::ultra").unwrap_err();
+        assert!(err.contains("unknown effort `ultra`"), "{err}");
+    }
+
+    #[test]
+    fn resolve_model_spec_scopes_by_display_or_registration_name() {
+        let registry = pi::ProviderRegistry::new();
+        register_displayed(
+            &registry,
+            "DeepSeek-anthropic",
+            "DeepSeek",
+            "deepseek-v4-pro",
+        );
+        register_displayed(
+            &registry,
+            "DeepSeek-responses",
+            "DeepSeek",
+            "deepseek-v4-pro",
+        );
+        register_displayed(&registry, "Other-anthropic", "Other", "deepseek-v4-pro");
+        // Display-name scoping pins the first registration of that provider.
+        let by_display = resolve_model_spec(&registry, "DeepSeek::deepseek-v4-pro::high").unwrap();
+        assert_eq!(by_display.model.provider, "DeepSeek-anthropic");
+        assert_eq!(by_display.effort.as_deref(), Some("high"));
+        // Registration-name scoping pins the exact endpoint.
+        let by_reg = resolve_model_spec(&registry, "DeepSeek-responses::deepseek-v4-pro").unwrap();
+        assert_eq!(by_reg.model.provider, "DeepSeek-responses");
+        assert_eq!(by_reg.effort, None);
+        // A different display name resolves its own registration.
+        let other = resolve_model_spec(&registry, "Other::deepseek-v4-pro").unwrap();
+        assert_eq!(other.model.provider, "Other-anthropic");
+    }
+
+    #[test]
+    fn resolve_model_spec_probes_segments_and_fails_loudly() {
+        let registry = pi::ProviderRegistry::new();
+        register(&registry, "sonnet-4-6", None);
+        // No alias table — the ref probes as a segment token; exact ids are
+        // matched case-insensitively.
+        let probed = resolve_model_spec(&registry, "P::sonnet").unwrap();
+        assert_eq!(probed.model.id, "sonnet-4-6");
+        let exact = resolve_model_spec(&registry, "P::SONNET-4-6").unwrap();
+        assert_eq!(exact.model.id, "sonnet-4-6");
+        let err = resolve_model_spec(&registry, "Nope::m").unwrap_err();
+        assert!(
+            err.contains("no provider `Nope` (by name or display name)"),
+            "{err}"
+        );
+        let err = resolve_model_spec(&registry, "P::no-such-model").unwrap_err();
+        assert!(
+            err.contains("model `no-such-model` not found under provider `P`"),
+            "{err}"
+        );
+        let err = resolve_model_spec(&registry, "P::sonnet::ultra").unwrap_err();
+        assert!(err.contains("unknown effort"), "{err}");
     }
 }

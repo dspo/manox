@@ -6,6 +6,7 @@
 // registry, mounting the definition's tool subset, and collecting the
 // subagent's final text.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -85,6 +86,12 @@ pub struct SubagentTool {
     /// override (id or alias). Assembly-layer concern per `AgentDef.model`;
     /// injected by the harness that owns the registry.
     provider_registry: Option<Arc<pi::ProviderRegistry>>,
+    /// Dedicated per-type model specs (`subagent_type` → raw
+    /// `provider::model::effort` string) injected by the host from the cx
+    /// providers config. A configured entry wins over the definition's
+    /// frontmatter override and the caller's inherited model; resolution
+    /// happens at dispatch against the injected provider registry.
+    model_overrides: HashMap<String, String>,
     /// Host-rendered description override. When set, `description()` returns
     /// this (a live-rendered list of registered subagent types) instead of
     /// the static default — so the model sees the available
@@ -105,6 +112,7 @@ impl SubagentTool {
             model: None,
             model_slot: None,
             provider_registry: None,
+            model_overrides: HashMap::new(),
             description_override: None,
             session_dir: None,
         }
@@ -139,6 +147,15 @@ impl SubagentTool {
     /// the caller's model would hide the manifest's intent).
     pub fn with_provider_registry(mut self, registry: Arc<pi::ProviderRegistry>) -> Self {
         self.provider_registry = Some(registry);
+        self
+    }
+
+    /// Inject dedicated per-type model specs (raw `provider::model::effort`
+    /// strings). Resolution happens at dispatch against the injected
+    /// provider registry — a spec that cannot be honored fails loudly
+    /// instead of silently falling back to the caller's model.
+    pub fn with_model_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.model_overrides = overrides;
         self
     }
 
@@ -180,6 +197,28 @@ impl SubagentTool {
         })?;
         let model_override =
             resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
+        let (configured_model, configured_effort) = match self
+            .model_overrides
+            .get(subagent_type)
+            .map(|s| s.as_str())
+        {
+            Some(spec) => {
+                let registry = self.provider_registry.as_ref().ok_or_else(|| {
+                    ToolError::ExecutionFailed(format!(
+                        "agent `{subagent_type}` has a dedicated model config `{spec}` but no provider registry is available to resolve it"
+                    ))
+                })?;
+                let resolved = crate::model_ref::resolve_model_spec(registry, spec).map_err(
+                    |inner| {
+                        ToolError::ExecutionFailed(format!(
+                            "agent `{subagent_type}` dedicated model config `{spec}` did not resolve: {inner}"
+                        ))
+                    },
+                )?;
+                (Some(resolved.model), resolved.effort)
+            }
+            None => (None, None),
+        };
         let mut selected = select_tools(&self.tools, def);
         selected.extend(extra_tools);
         let worktree = if isolation == Some("worktree") {
@@ -222,15 +261,42 @@ impl SubagentTool {
             .model_slot
             .as_ref()
             .and_then(|slot| slot.lock().unwrap().clone());
-        if let Some(model) = model_override.or_else(|| inherited.or_else(|| self.model.clone())) {
+        if let Some(model) = effective_model(
+            configured_model,
+            model_override,
+            inherited,
+            self.model.clone(),
+        ) {
             builder = builder.with_model(model);
         }
-        let session = builder
+        let mut session = builder
             .build()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to start subagent: {e}")))?;
+        if let Some(effort) = configured_effort {
+            session
+                .set_thinking_level_local(Some(effort))
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to apply dedicated effort for `{subagent_type}`: {e}"
+                    ))
+                })?;
+        }
         Ok((session, temp_guard, worktree))
     }
+}
+
+/// The dispatch-time model precedence: a dedicated config spec wins, then
+/// the definition's frontmatter override, then the caller's inherited live
+/// model, then the assembled explicit model.
+fn effective_model(
+    configured: Option<pi::types::Model>,
+    frontmatter: Option<pi::types::Model>,
+    inherited: Option<pi::types::Model>,
+    explicit: Option<pi::types::Model>,
+) -> Option<pi::types::Model> {
+    configured.or(frontmatter).or(inherited).or(explicit)
 }
 
 /// An isolated git worktree a subagent runs in when the caller passes
@@ -698,5 +764,172 @@ mod tests {
         let def = def_with_model(Some("haiku"));
         let err = resolve_model_override(&def, "worker", None).unwrap_err();
         assert!(err.to_string().contains("no provider registry"), "{err}");
+    }
+
+    // ── dedicated per-type model config ──
+
+    fn test_model(id: &str) -> pi::types::Model {
+        pi::types::Model {
+            provider: "test".into(),
+            api: "test".into(),
+            id: id.into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::Enabled,
+            metadata: Default::default(),
+        }
+    }
+
+    struct StaticStream;
+
+    #[async_trait::async_trait]
+    impl pi::agent_loop::StreamFn for StaticStream {
+        async fn stream(
+            &self,
+            _context: &pi::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<pi::types::AgentEvent>,
+        ) -> Result<pi::types::AgentMessage, anyhow::Error> {
+            Ok(pi::types::AgentMessage::Assistant {
+                content: vec![pi::types::ContentBlock::Text {
+                    text: "ok".into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(pi::types::StopReason::Stop),
+                usage: Box::new(pi::types::Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    fn fake_runtime() -> ModelRuntime {
+        let resolver: pi::agent_loop::StreamResolver = Arc::new(|_m: &pi::types::Model| {
+            Ok(Arc::new(StaticStream) as Arc<dyn pi::agent_loop::StreamFn>)
+        });
+        ModelRuntime::new(resolver)
+    }
+
+    fn spawn_ctx(cwd: &std::path::Path) -> pi::tool::LocalToolContext {
+        pi::tool::LocalToolContext::new(
+            Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
+            cwd.to_path_buf(),
+            Arc::new(pi::tool::ToolState::new()),
+        )
+    }
+
+    #[test]
+    fn effective_model_precedence() {
+        let m = |id| Some(test_model(id));
+        // The dedicated config spec wins, then frontmatter, then inherited,
+        // then the explicit assembled model.
+        assert_eq!(
+            effective_model(m("cfg"), m("fm"), m("inh"), m("exp"))
+                .unwrap()
+                .id,
+            "cfg"
+        );
+        assert_eq!(
+            effective_model(None, m("fm"), m("inh"), m("exp"))
+                .unwrap()
+                .id,
+            "fm"
+        );
+        assert_eq!(
+            effective_model(None, None, m("inh"), m("exp")).unwrap().id,
+            "inh"
+        );
+        assert_eq!(
+            effective_model(None, None, None, m("exp")).unwrap().id,
+            "exp"
+        );
+        assert!(effective_model(None, None, None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_spec_wins_and_applies_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+        let registry = registry_with_model("glm-5.3");
+        let mut agent_registry = AgentRegistry::new();
+        // Frontmatter pins the same model; the inherited slot pins another.
+        agent_registry.register(def_with_model(Some("glm-5.3")));
+        let tool = SubagentTool::new(Arc::new(agent_registry), vec![])
+            .with_model_runtime(fake_runtime())
+            .with_provider_registry(registry)
+            .with_model_slot(Arc::new(std::sync::Mutex::new(Some(test_model(
+                "inherited",
+            )))))
+            .with_model_overrides(HashMap::from([(
+                "worker".to_string(),
+                "P::glm-5.3::high".to_string(),
+            )]));
+        let (session, _guard, _worktree) = tool
+            .spawn_subagent_session("worker", None, &ctx, vec![], None)
+            .await
+            .unwrap();
+        // The configured spec pins the model over the frontmatter override
+        // and the inherited slot...
+        assert_eq!(session.model().id, "glm-5.3");
+        assert_eq!(session.model().provider, "p-glm-5.3");
+        // ...and applies its effort as the session thinking level.
+        assert_eq!(session.thinking_level().as_deref(), Some("high"));
+    }
+    #[tokio::test]
+    async fn unresolvable_configured_spec_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+        let registry = registry_with_model("glm-5.3");
+        let mut agent_registry = AgentRegistry::new();
+        agent_registry.register(def_with_model(None));
+        let tool = SubagentTool::new(Arc::new(agent_registry), vec![])
+            .with_model_runtime(fake_runtime())
+            .with_provider_registry(registry)
+            .with_model_overrides(HashMap::from([(
+                "worker".to_string(),
+                "P::no-such::high".to_string(),
+            )]));
+        let err = match tool
+            .spawn_subagent_session("worker", None, &ctx, vec![], None)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an unresolvable dedicated spec must fail the dispatch"),
+        };
+        assert!(
+            err.to_string()
+                .contains("dedicated model config `P::no-such::high` did not resolve"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_spec_without_registry_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+        let mut agent_registry = AgentRegistry::new();
+        agent_registry.register(def_with_model(None));
+        let tool = SubagentTool::new(Arc::new(agent_registry), vec![]).with_model_overrides(
+            HashMap::from([("worker".to_string(), "P::glm-5.3::high".to_string())]),
+        );
+        let err = match tool
+            .spawn_subagent_session("worker", None, &ctx, vec![], None)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a dedicated spec without a registry must fail the dispatch"),
+        };
+        assert!(
+            err.to_string()
+                .contains("no provider registry is available to resolve it"),
+            "{err}"
+        );
     }
 }
