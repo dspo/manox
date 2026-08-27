@@ -81,16 +81,18 @@ pub fn block_shape(c: char) -> Option<BlockShape> {
         '▝' => Some(Quadrant { bits: 0b0010 }),
         '▖' => Some(Quadrant { bits: 0b0100 }),
         '▗' => Some(Quadrant { bits: 0b1000 }),
-        '▚' => Some(Quadrant { bits: 0b0101 }),
-        '▞' => Some(Quadrant { bits: 0b1010 }),
+        '▚' => Some(Quadrant { bits: 0b1001 }),
+        '▞' => Some(Quadrant { bits: 0b0110 }),
         '▛' => Some(Quadrant { bits: 0b0111 }),
         '▜' => Some(Quadrant { bits: 0b1011 }),
         '▙' => Some(Quadrant { bits: 0b1101 }),
         '▟' => Some(Quadrant { bits: 0b1110 }),
         c if ('\u{1FB00}'..='\u{1FB3B}').contains(&c) => {
-            // The 60 sextant codepoints encode the non-empty, non-full 6-bit
-            // cell masks in binary order starting at mask 1 (upper-left).
-            let mask = c as u32 - 0x1FB00 + 1;
+            // The 60 sextant codepoints encode the 6-bit cell masks in binary
+            // order, skipping the four masks already covered by block
+            // elements (empty, ▌ = 0b010101, ▐ = 0b101010, █ = 0b111111).
+            let offset = c as u32 - 0x1FB00;
+            let mask = offset + 1 + u32::from(offset >= 20) + u32::from(offset >= 40);
             Some(Sextant { bits: mask as u16 })
         }
         _ => None,
@@ -229,28 +231,93 @@ mod tests {
     }
 
     #[test]
-    fn quadrant_upper_left_and_combined() {
+    fn quadrant_upper_left_and_diagonal_pairs() {
         let ul = expand(block_shape('▘').unwrap(), color(), COLS, SUBROWS);
         assert_eq!(ul.len(), 1);
         assert_eq!((ul[0].x0, ul[0].y0, ul[0].x1, ul[0].y1), (0, 0, 4, 12));
-        let both = expand(block_shape('▚').unwrap(), color(), COLS, SUBROWS);
-        assert_eq!(both.len(), 2);
-        assert!(both.iter().all(|r| r.x0 == 0 && r.x1 == 4));
+        // ▚ (U+259A) = upper-left + lower-right — the diagonal pair.
+        let diag = expand(block_shape('▚').unwrap(), color(), COLS, SUBROWS);
+        assert_eq!(diag.len(), 2);
+        assert!(
+            diag.iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (0, 0, 4, 12))
+        );
+        assert!(
+            diag.iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 12, 8, 24))
+        );
+        // ▞ (U+259E) = upper-right + lower-left — the other diagonal.
+        let other = expand(block_shape('▞').unwrap(), color(), COLS, SUBROWS);
+        assert_eq!(other.len(), 2);
+        assert!(
+            other
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 0, 8, 12))
+        );
+        assert!(
+            other
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (0, 12, 4, 24))
+        );
     }
 
     #[test]
-    fn sextant_masks_follow_binary_order() {
-        // U+1FB00 = mask 1 = upper-left; U+1FB01 = mask 2 = upper-right.
+    fn sextant_masks_follow_binary_order_with_skipped_masks() {
+        // U+1FB00 = offset 0 → mask 1 = upper-left; U+1FB01 → mask 2 =
+        // upper-right. No gap before offset 20.
         let ul = expand(block_shape('\u{1FB00}').unwrap(), color(), COLS, SUBROWS);
         assert_eq!(ul.len(), 1);
         assert_eq!((ul[0].x0, ul[0].y0, ul[0].x1, ul[0].y1), (0, 0, 4, 8));
         let ur = expand(block_shape('\u{1FB01}').unwrap(), color(), COLS, SUBROWS);
         assert_eq!((ur[0].x0, ur[0].x1), (4, 8));
-        // A mask with all six cells (0x1FB3B = 60 = 0b111100 is NOT full; use
-        // the four-corner mask 0b010101 = left column) — check left column.
-        let left = expand(block_shape('\u{1FB14}').unwrap(), color(), COLS, SUBROWS);
-        assert_eq!(left.len(), 3);
-        assert!(left.iter().all(|r| r.x0 == 0 && r.x1 == 4));
+        // The ▌ mask (0b010101 = 21) is skipped, so U+1FB14 (offset 20) maps
+        // to mask 22 = 0b010110 (UR, ML, LL).
+        let after_gap = expand(block_shape('\u{1FB14}').unwrap(), color(), COLS, SUBROWS);
+        assert_eq!(after_gap.len(), 3);
+        assert!(
+            after_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 0, 8, 8))
+        );
+        assert!(
+            after_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (0, 8, 4, 16))
+        );
+        assert!(
+            after_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (0, 16, 4, 24))
+        );
+        // The ▐ mask (0b101010 = 42) is skipped too: U+1FB28 (offset 40) maps
+        // to mask 43 = 0b101011 (UL, UR, MR, LR).
+        let second_gap = expand(block_shape('\u{1FB28}').unwrap(), color(), COLS, SUBROWS);
+        assert_eq!(second_gap.len(), 4);
+        assert!(
+            second_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (0, 0, 4, 8))
+        );
+        assert!(
+            second_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 0, 8, 8))
+        );
+        assert!(
+            second_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 8, 8, 16))
+        );
+        assert!(
+            second_gap
+                .iter()
+                .any(|r| (r.x0, r.y0, r.x1, r.y1) == (4, 16, 8, 24))
+        );
+        // The last codepoint encodes the near-full mask 62 (0b111110): all
+        // but the upper-left cell.
+        let near_full = expand(block_shape('\u{1FB3B}').unwrap(), color(), COLS, SUBROWS);
+        assert_eq!(near_full.len(), 5);
+        assert!(!near_full.iter().any(|r| (r.x0, r.y0) == (0, 0)));
     }
 
     #[test]
