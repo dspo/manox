@@ -817,8 +817,15 @@ static NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// Kick off the LSP registry PATH probe on a background thread (called from
 /// `agent::init`); sessions await [`wait_ready`] (bounded) before tool
 /// registration so startup never blocks on server probes.
+///
+/// Waits for [`crate::path_env::wait_installed`] before probing so the
+/// login-shell PATH (including `~/.cargo/bin`) is in effect — the LSP
+/// registry `OnceLock` is set once per process and never re-checked, so
+/// probing before the PATH install completes would permanently miss
+/// servers resolvable only through the user's shell PATH.
 pub fn init_background() {
     std::thread::spawn(|| {
+        crate::path_env::wait_installed();
         lsp::registry::init();
         READY.set(()).ok();
         NOTIFY.notify_waiters();
