@@ -11,9 +11,9 @@
 //! `MainCallMetricsUpdated`, `CompactionStarted`, `PeerMessage`,
 //! `BrowserNotification`, `InboundAuthorization`, `HistoryRestored`.
 //! `HistoryRestored` stays out of this pure projection: the actor pairs it
-//! with a full `thread_history` snapshot that needs `App` access to read the
-//! thread's messages. `GoalChanged` likewise pairs with a rich `goal_changed`
-//! snapshot emitted by the actor's subscription. `BackgroundTaskUpdated` and
+//! with a full `thread_history` snapshot that reads the thread's messages.
+//! `GoalChanged` likewise pairs with a rich `goal_changed` snapshot emitted
+//! by the actor's event pump. `BackgroundTaskUpdated` and
 //! `SubagentChild` are projected here (the mini-panel and task cards consume
 //! them).
 
