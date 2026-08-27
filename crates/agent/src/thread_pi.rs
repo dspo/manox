@@ -2299,38 +2299,38 @@ pub(crate) mod tests {
     pub(crate) fn thread_with_engine(
         phase: HistoryPhase,
         engine: Arc<dyn ThreadEngine>,
-        cx: &mut gpui::TestAppContext,
-    ) -> Entity<Thread> {
-        cx.update(|cx| {
-            cx.new(|_| Thread {
-                id: ThreadId("test-thread".to_string()),
-                cwd: PathBuf::from("/tmp"),
-                project: None,
-                model: None,
-                permission_mode: PermissionMode::default(),
-                messages: Vec::new(),
-                reasoning_effort: ReasoningEffort::default(),
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: phase,
-                permission_mode_explicitly_set: false,
-                reasoning_effort_explicitly_set: false,
-                browser_suites: Vec::new(),
-                browser_suites_explicitly_set: false,
-                plan_mode: false,
-                persisted_plan: None,
-                label: "lead".into(),
-                goal_bridge: None,            worktree_path: None,
-            })
+    ) -> ThreadHandle {
+        ThreadHandle::new(Thread {
+            id: ThreadId("test-thread".to_string()),
+            cwd: PathBuf::from("/tmp"),
+            project: None,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            messages: Vec::new(),
+            reasoning_effort: ReasoningEffort::default(),
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: phase,
+            permission_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
+            browser_suites: Vec::new(),
+            browser_suites_explicitly_set: false,
+            plan_mode: false,
+            persisted_plan: None,
+            label: "lead".into(),
+            goal_bridge: None,
+            worktree_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
         })
     }
 
@@ -2359,8 +2359,8 @@ pub(crate) mod tests {
     /// Registry turns originate on the GPUI main thread, outside Tokio's
     /// entered context. Persistence must still dispatch through Manox's
     /// process-global runtime instead of requiring a current reactor.
-    #[gpui::test]
-    fn registry_display_persistence_dispatches_off_runtime(_cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn registry_display_persistence_dispatches_off_runtime() {
         crate::runtime::init();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2411,7 +2411,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.update(cx, |t, cx| {
             // Mid-run mirror refresh: the live partial lands in `messages`.
             t.handle_notice(BackendNotice::LiveHistory, cx);
@@ -2442,8 +2442,8 @@ pub(crate) mod tests {
 
     /// The headless slash router drives the same thread state the gpui host
     /// toggles: plan mode, permission mode, compact, and goal lifecycle.
-    #[gpui::test]
-    fn run_slash_builtin_plan_mode_compact_and_unowned(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_slash_builtin_plan_mode_compact_and_unowned() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2453,7 +2453,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| {
             // The prompt form enters plan mode and runs the turn with the
             // compact display form.
@@ -2517,7 +2517,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.update(cx, |t, cx| {
             t.insert_user_message_with_ui_metadata(
                 "expanded registry prompt".to_string(),
@@ -2553,8 +2553,8 @@ pub(crate) mod tests {
     /// TS parity: images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
-    #[gpui::test]
-    fn run_turn_drains_pending_text_and_images(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_drains_pending_text_and_images() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2564,7 +2564,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| {
             t.insert_user_message_with_content_and_ui_metadata(
                 vec![
@@ -2594,7 +2594,7 @@ pub(crate) mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let engine = Arc::new(FakeEngine::new());
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| {
             t.handle_notice(
                 BackendNotice::SteerDelivered {
@@ -2621,8 +2621,8 @@ pub(crate) mod tests {
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
     /// the image (kernel pushes the empty text block, TS parity).
-    #[gpui::test]
-    fn run_turn_image_only_insert_still_starts_turn(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_image_only_insert_still_starts_turn() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2632,7 +2632,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| {
             t.insert_user_message_with_content_and_ui_metadata(
                 vec![png_image("aW1hZ2Ux")],
@@ -2649,8 +2649,8 @@ pub(crate) mod tests {
     }
 
     /// With neither text nor images pending, `run_turn` is a no-op.
-    #[gpui::test]
-    fn run_turn_noop_when_nothing_pending(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_noop_when_nothing_pending() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2660,7 +2660,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| t.run_turn(cx));
         assert!(engine.runs.lock().unwrap().is_empty(), "no turn ran");
     }
@@ -2682,7 +2682,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
         thread.update(cx, |t, cx| {
             t.messages = vec![Message::user("preview-only".to_string())];
@@ -2725,8 +2725,8 @@ pub(crate) mod tests {
     /// failed — the actor bails without `Ready`) must clear `Loading` and
     /// drop any stale preview, so the workspace returns to the hero instead
     /// of spinning forever with input gated.
-    #[gpui::test]
-    fn fatal_before_ready_clears_loading_and_preview(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn fatal_before_ready_clears_loading_and_preview() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2736,7 +2736,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.update(cx, |t, cx| {
             t.messages = vec![Message::user("stale-preview".to_string())];
             t.handle_notice(BackendNotice::Fatal(anyhow::anyhow!("no model configured")), cx);
@@ -2752,8 +2752,8 @@ pub(crate) mod tests {
     /// I3: an explicit user permission-mode choice on a landing thread
     /// survives the sidecar default arriving at `Ready`
     /// (`permission_mode_explicitly_set`).
-    #[gpui::test]
-    fn explicit_permission_mode_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn explicit_permission_mode_survives_ready_sidecar_default() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2763,7 +2763,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.update(cx, |t, _cx| {
             t.set_permission_mode(PermissionMode::ReadOnly, _cx);
         });
@@ -2793,8 +2793,8 @@ pub(crate) mod tests {
 
     /// P1: `PlanUpdated` mirrors onto the facade and persists through the
     /// engine; an empty snapshot clears both (the model dropped its plan).
-    #[gpui::test]
-    fn plan_updated_mirrors_and_persists(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn plan_updated_mirrors_and_persists() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2805,7 +2805,7 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let engine_ref = Arc::clone(&engine);
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
 
         let snapshot = crate::plan::PlanSnapshot {
             explanation: None,
@@ -2854,8 +2854,8 @@ pub(crate) mod tests {
 
     /// P2: `Ready` restores the persisted plan snapshot (post-restart /
     /// thread-switch source for the rail's fallback).
-    #[gpui::test]
-    fn ready_restores_persisted_plan_snapshot(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn ready_restores_persisted_plan_snapshot() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2865,7 +2865,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         let snapshot = crate::plan::PlanSnapshot {
             explanation: None,
             steps: vec![crate::plan::PlanStep {
@@ -2897,8 +2897,8 @@ pub(crate) mod tests {
 
     /// I4: an explicit user reasoning-effort choice survives the sidecar
     /// default arriving at `Ready` (`reasoning_effort_explicitly_set`).
-    #[gpui::test]
-    fn explicit_reasoning_effort_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn explicit_reasoning_effort_survives_ready_sidecar_default() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2908,7 +2908,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.update(cx, |t, _cx| {
             t.set_reasoning_effort(ReasoningEffort::Max, _cx);
         });
@@ -2938,8 +2938,8 @@ pub(crate) mod tests {
 
     /// I5: without an explicit choice, `Ready` restores the persisted
     /// effort from the sidecar.
-    #[gpui::test]
-    fn ready_restores_reasoning_effort_when_not_explicitly_set(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn ready_restores_reasoning_effort_when_not_explicitly_set() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2949,7 +2949,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.update(cx, |t, cx| {
             t.handle_notice(
                 BackendNotice::Ready(Box::new(ReadyInfo {
@@ -2975,8 +2975,8 @@ pub(crate) mod tests {
     /// P0 regression: a browser-suite toggle on an engine-less landing
     /// thread parks in the facade mirror (replayed at `ensure_engine`)
     /// instead of being dropped.
-    #[gpui::test]
-    fn landing_browser_suite_toggle_parks_in_mirror(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn landing_browser_suite_toggle_parks_in_mirror() {
         crate::pi_providers::init_for_test();
         let thread = cx.update(|cx| Thread::landing(PathBuf::from("/tmp"), cx));
         thread.update(cx, |t, cx| {
@@ -2992,9 +2992,9 @@ pub(crate) mod tests {
 
     /// The `Ready` projection seeds the suite mirror so restored sessions
     /// surface their active suites (the composer chips derive from it).
-    #[gpui::test]
-    fn ready_seeds_browser_suites_from_projection(cx: &mut gpui::TestAppContext) {
-        let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()), cx);
+    #[tokio::test]
+    async fn ready_seeds_browser_suites_from_projection() {
+        let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()));
         thread.update(cx, |t, cx| {
             t.handle_notice(
                 BackendNotice::Ready(Box::new(ReadyInfo {
@@ -3026,7 +3026,7 @@ pub(crate) mod tests {
     fn explicit_browser_suite_toggle_outranks_ready_projection(
         cx: &mut gpui::TestAppContext,
     ) {
-        let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()));
         thread.update(cx, |t, cx| {
             t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true, cx);
             t.handle_notice(
@@ -3054,8 +3054,8 @@ pub(crate) mod tests {
 
     /// `Thread::cancel` aborts the engine; the actor relies on this when
     /// disposal must not wait for the in-flight turn.
-    #[gpui::test]
-    fn cancel_aborts_engine(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn cancel_aborts_engine() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -3065,7 +3065,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.update(cx, |t, cx| t.cancel(cx));
         assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
     }
